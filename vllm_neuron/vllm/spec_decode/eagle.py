@@ -73,6 +73,41 @@ class EagleProposer:
             world_rank, dtype=torch.int32, device=self.device
         )
 
+    def draft_graph_input_tokens(self, batch_size: int) -> int:
+        """Token count of the drafter graph's INPUT WINDOW for a decode bucket.
+
+        This is the number of tokens ``propose``/``graph_extract`` receive as
+        ``target_token_ids`` — i.e. the target model's per-step verify window,
+        ``batch_size * (1 + num_speculative_tokens)``. It is identical for
+        sequential and parallel (P-EAGLE) drafting: the input window is the
+        target verify shape and is drafting-method-agnostic (DESIGN 1).
+
+        The parallel vs. sequential difference lives ENTIRELY inside the traced
+        drafter forward (``Eagle3LlamaForCausalLM._forward_parallel`` vs. the
+        unrolled recurrent loop), not in this outer bucket shape. Changing this
+        to ``batch_size * num_speculative_tokens`` for parallel mode would make
+        the traced graph's input window disagree with the runtime input (the
+        target still feeds ``bs * (1 + num_spec)``), forcing a recompile on the
+        first real decode. See change-set.md Increment 4.
+        """
+        return batch_size * (1 + self.num_speculative_tokens)
+
+    def parallel_backbone_tokens(self, batch_size: int) -> int:
+        """Token count of the drafter's INTERNAL single backbone pass.
+
+        Upstream analog of ``extra_slots_per_request`` applied to a batch
+        (vllm/v1/spec_decode/llm_base_proposer.py:96): in parallel (P-EAGLE)
+        mode the drafter runs ONE backbone pass over
+        ``batch_size * num_speculative_tokens`` masked slots
+        (``extra_slots_per_request == num_speculative_tokens``); in sequential
+        mode ``extra_slots_per_request == 1`` and there is no single fused
+        backbone pass of this width (the recurrent loop instead runs K passes
+        of ``batch_size`` tokens each). Exposed for bucket-arithmetic tests and
+        for any drafter token-budget derivation that must account for the
+        parallel masked slots.
+        """
+        return batch_size * self.extra_slots_per_request
+
     def _resolve_ptd_token_id(self) -> int | None:
         """Resolve the parallel-drafting mask token id from the draft model's
         hf_config, mirroring upstream SpecDecodeBaseProposer

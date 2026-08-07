@@ -4739,8 +4739,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
             # === Draft model decode graph capture ===
             logger.info("Capturing EAGLE3 decode graphs for batch size: %d", batch_size)
-            num_spec_tokens = self.speculative_config.num_speculative_tokens
-            draft_num_tokens = batch_size * (1 + num_spec_tokens)
+            # DESIGN 1: drafter graph input window = target verify
+            # window bs*(1+num_spec), method-agnostic; parallel-ness is
+            # internal to the traced forward. See
+            # EagleProposer.draft_graph_input_tokens.
+            draft_num_tokens = self.drafter.draft_graph_input_tokens(
+                batch_size
+            )
 
             draft_attn_metadata = self._build_warmup_attention_metadata(
                 num_tokens=draft_num_tokens,
@@ -4862,8 +4867,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
             # === Draft model warmup ===
             logger.info("Warming up EAGLE3 for batch size: %d", batch_size)
-            num_spec_tokens = self.speculative_config.num_speculative_tokens
-            draft_num_tokens = batch_size * (1 + num_spec_tokens)
+            # DESIGN 1: drafter graph input window = target verify
+            # window bs*(1+num_spec), method-agnostic; parallel-ness is
+            # internal to the traced forward. See
+            # EagleProposer.draft_graph_input_tokens.
+            draft_num_tokens = self.drafter.draft_graph_input_tokens(
+                batch_size
+            )
 
             draft_attn_metadata = self._build_warmup_attention_metadata(
                 num_tokens=draft_num_tokens,
@@ -7564,6 +7574,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 num_total_tokens=input_ids.shape[0],
             )
 
+        # DESIGN 1: parallel (P-EAGLE) routing is internal to the
+        # traced drafter forward. When parallel_drafting is on, the
+        # drafter's Eagle3LlamaForCausalLM.forward gates to
+        # _forward_parallel (threaded via compile_and_load_draft_model),
+        # which uses the accepted/bonus token per request as the K-slot
+        # seed and returns K draft ids per request in this same
+        # (draft_token_ids, drafts_only) contract. The call site is
+        # therefore identical for sequential and parallel drafting: the
+        # input window (input_ids) is the target verify window
+        # bs*(1+num_spec) either way (see draft_graph_input_tokens).
         draft_token_ids, drafts_only = self.drafter.propose(
             target_token_ids=input_ids,
             target_positions=positions,
