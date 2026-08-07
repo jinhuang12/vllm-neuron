@@ -377,6 +377,11 @@ class EagleProposer:
                 neuron_config=neuron_config,
             )
         self.model.num_speculative_tokens = self.num_speculative_tokens
+        # P-EAGLE: thread the parallel-drafting flag + mask token id into
+        # the drafter so load_weights loads mask_hidden and forward runs the
+        # single-pass parallel path. Sequential eagle3 leaves the defaults.
+        self.model.parallel_drafting = self.parallel_drafting
+        self.model.ptd_token_id = self.ptd_token_id
         load_start = time.perf_counter()
         if not cpu_compile:
             self.model.load_weights(

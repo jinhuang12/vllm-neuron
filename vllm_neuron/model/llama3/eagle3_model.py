@@ -657,6 +657,12 @@ class Eagle3LlamaForCausalLM(nn.Module):
                 on_device_sampling_config, process_group=get_tp_group().device_group
             )
 
+        # P-EAGLE (parallel drafting). Defaults keep the sequential path
+        # byte-identical; EagleProposer sets these before load_weights when
+        # parallel_drafting is enabled, and load_weights loads mask_hidden.
+        self.parallel_drafting = False
+        self.ptd_token_id = None
+
     def _sample_draft_token(self, logits: torch.Tensor) -> torch.Tensor:
         """Sample a draft token from logits (greedy or on-device)."""
         if self.on_device_sampling:
@@ -768,6 +774,19 @@ class Eagle3LlamaForCausalLM(nn.Module):
             initial_target_hidden_states
         )
 
+        # P-EAGLE single-pass parallel drafting. Opt-in via parallel_drafting;
+        # the sequential recurrent path below is unchanged when the flag is off.
+        if self.parallel_drafting:
+            return self._forward_parallel(
+                input_ids=input_ids,
+                positions=positions,
+                target_hidden_states=target_hidden_states,
+                attn_metadata=attn_metadata,
+                sampling_positions=sampling_positions,
+                rank=rank,
+                bonus_token_ids=bonus_token_ids,
+            )
+
         hidden_states, recurrent_state = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -875,6 +894,184 @@ class Eagle3LlamaForCausalLM(nn.Module):
             torch.stack(all_logits, dim=1) if all_logits is not None else None
         )
         return stacked_tokens, drafts_only_stacked, stacked_logits
+
+    def _forward_parallel(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.LongTensor,
+        target_hidden_states: torch.Tensor,
+        attn_metadata: object,
+        sampling_positions: torch.Tensor,
+        rank: torch.Tensor | None,
+        bonus_token_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """P-EAGLE single-pass parallel-drafting forward.
+
+        Replaces the sequential recurrent loop with ONE backbone pass over
+        ``num_speculative_tokens`` (K) slots per request. Slot 0 carries the
+        real seed token and its fc-combined target hidden state; slots
+        ``1..K-1`` carry ``ptd_token_id`` and the learned ``mask_hidden``
+        vector (also fc-combined). All K draft tokens are sampled from the
+        single pass.
+
+        Mirrors upstream ``SpecDecodeBaseProposer.propose`` parallel branch
+        (vllm/v1/spec_decode/llm_base_proposer.py:471-473, one forward then
+        greedy-sample all K) and mask-hidden substitution (:743-753 with the
+        fc projection of mask_hidden at :1208-1218). Static shapes as functions
+        of ``(batch, K)``; no data-dependent control flow.
+        """
+        assert self.ptd_token_id is not None, (
+            "parallel_drafting forward requires ptd_token_id; EagleProposer "
+            "resolves it from the draft config."
+        )
+        assert hasattr(self, "mask_hidden"), (
+            "parallel_drafting forward requires the mask_hidden buffer; it is "
+            "loaded from the drafter checkpoint in load_weights."
+        )
+        K = self.num_speculative_tokens
+        bs = sampling_positions.shape[0]
+        hidden_dim = target_hidden_states.shape[-1]
+
+        # Per-request seed: the real token, its position, and combined hidden.
+        seed_tokens = input_ids[sampling_positions].to(torch.int32)
+        if self.has_vocab_mapping:
+            seed_tokens = self._draft_to_target[seed_tokens.long()].to(torch.int32)
+        seed_positions = positions[sampling_positions]
+        seed_hidden = target_hidden_states[sampling_positions]  # [bs, H]
+
+        # Expand into the K-slot parallel-draft layout (increment-2 ops):
+        # slot 0 = real seed token, slots 1..K-1 = ptd_token_id.
+        expanded_ids = NF.build_parallel_draft_input_ids(
+            seed_tokens, K, self.ptd_token_id
+        )  # [bs, K]
+        expanded_positions = NF.build_parallel_draft_positions(seed_positions, K)
+        hidden_mask = NF.build_parallel_draft_hidden_mask(
+            bs, K, device=seed_hidden.device
+        )  # [bs, K]
+
+        # fc-project the learned mask_hidden the same way real aux hidden
+        # states are combined, then substitute it into the masked slots.
+        mask_hidden_combined = self.model.combine_hidden_states(self.mask_hidden)
+        expanded_hidden = seed_hidden.unsqueeze(1).expand(bs, K, hidden_dim)
+        expanded_hidden = NF.substitute_mask_hidden(
+            expanded_hidden, hidden_mask, mask_hidden_combined.view(-1)
+        )  # [bs, K, H]
+
+        flat_input_ids = expanded_ids.reshape(-1)  # [bs*K]
+        flat_positions = expanded_positions.reshape(-1)  # [bs*K]
+        flat_hidden = expanded_hidden.reshape(-1, hidden_dim)  # [bs*K, H]
+
+        # Decode-style attn_metadata over K query tokens per request. Slot
+        # mapping is computed per expanded slot; the block table is repeated
+        # per slot for the gather, matching the sequential loop convention.
+        first_layer_name = f"layers.{self.model.layers[0].layer_idx}.self_attn"
+        base_meta = attn_metadata[first_layer_name]
+        block_table_tensor = base_meta["block_table_tensor"]
+        block_size = base_meta["block_size"]
+        max_blocks_per_seq = base_meta["max_blocks_per_seq"]
+
+        block_table_per_slot = block_table_tensor.repeat_interleave(K, dim=0)
+        slot_mapping = compute_slot_mapping(
+            flat_positions, block_table_per_slot, block_size
+        )
+
+        parallel_attn_metadata = {}
+        for layer in self.model.layers:
+            ln = f"layers.{layer.layer_idx}.self_attn"
+            parallel_attn_metadata[ln] = {
+                "block_table_tensor": block_table_tensor,
+                "slot_mapping": slot_mapping,
+                "max_query_len": K,
+                "block_size": block_size,
+                "max_blocks_per_seq": max_blocks_per_seq,
+                "decode_token_threshold": K,
+            }
+
+        hidden_states, _ = self.model(
+            input_ids=flat_input_ids,
+            positions=flat_positions,
+            target_hidden_states=flat_hidden,
+            attn_metadata=parallel_attn_metadata,
+            rank=rank,
+        )
+
+        logits = self.lm_head(hidden_states)  # [bs*K, vocab]
+        draft_token_ids = self._sample_draft_token(logits)  # [bs*K]
+        drafts_only_stacked = draft_token_ids.view(bs, K)  # [bs, K]
+
+        # Match the sequential output contract: prepend the bonus token when
+        # available so stacked_tokens is [bs, 1+K], drafts_only is [bs, K].
+        if bonus_token_ids is not None:
+            stacked_tokens = torch.cat(
+                [bonus_token_ids.view(bs, 1), drafts_only_stacked], dim=1
+            )
+        else:
+            stacked_tokens = drafts_only_stacked
+
+        stacked_tokens, drafts_only_stacked = (
+            self._map_output_token_ids_to_target_vocab(
+                stacked_tokens, drafts_only_stacked, bonus_token_ids
+            )
+        )
+        # Parallel path returns no per-pass logits stack (debug-logits are a
+        # sequential-only feature); keep the 3-tuple output contract.
+        return stacked_tokens, drafts_only_stacked, None
+
+    def _load_mask_hidden(self, checkpoint_path: str) -> None:
+        """Load the learned ``mask_hidden`` vector for parallel drafting.
+
+        Mirrors upstream ``Eagle3LlamaForCausalLM.load_weights``
+        (vllm/model_executor/models/llama_eagle3.py:404-409): when
+        ``parallel_drafting`` is enabled the drafter checkpoint MUST contain a
+        ``mask_hidden`` tensor, else raise a clear ValueError. When
+        ``parallel_drafting`` is off this is a no-op, so existing sequential
+        EAGLE3 checkpoints (which need not ship mask_hidden) load unchanged.
+        """
+        if not self.parallel_drafting:
+            return
+        import os
+
+        from safetensors import safe_open
+
+        files = sorted(
+            f for f in os.listdir(checkpoint_path) if f.endswith(".safetensors")
+        )
+        mask_hidden = None
+        for f in files:
+            with safe_open(os.path.join(checkpoint_path, f), framework="pt") as sf:
+                if "mask_hidden" in sf.keys():
+                    mask_hidden = sf.get_tensor("mask_hidden")
+                    break
+        if mask_hidden is None:
+            raise ValueError(
+                "mask_hidden not found in the drafter checkpoint but the model "
+                "is configured for parallel drafting (P-EAGLE). A "
+                "parallel-drafting EAGLE3 checkpoint must ship a mask_hidden "
+                "tensor (e.g. amazon/GPT-OSS-20B-P-EAGLE)."
+            )
+        padded = self._pad_mask_hidden(mask_hidden)
+        self.register_buffer(
+            "mask_hidden", padded.to(self.config.torch_dtype), persistent=False
+        )
+
+    def _pad_mask_hidden(self, mask_hidden: torch.Tensor) -> torch.Tensor:
+        """Pad checkpoint mask_hidden to the (padded) fc input layout.
+
+        The checkpoint stores mask_hidden as 3 concatenated aux hidden states
+        at the unpadded hidden size. When the drafter runs with a padded hidden
+        size (e.g. GPT-OSS 2880->3072), each aux segment is padded independently
+        to match fc's interleaved-padded input layout (see
+        ``fc_interleaved_padding_weight_loader``). Returns ``[1, 3*padded]``
+        (or ``[1, N]`` unchanged when no padding applies).
+        """
+        unpadded = self.config.unpadded_hidden_size
+        padded = self.config.hidden_size
+        flat = mask_hidden.reshape(-1)
+        if flat.numel() == 3 * unpadded and padded != unpadded:
+            aux = torch.split(flat, unpadded)
+            pad = padded - unpadded
+            flat = torch.cat([torch.nn.functional.pad(a, (0, pad)) for a in aux])
+        return flat.view(1, -1)
 
     def _extract_accepted_tokens(
         self,
@@ -1009,6 +1206,11 @@ class Eagle3LlamaForCausalLM(nn.Module):
                             "_draft_to_target",
                             (draft_ids + d2t).to(torch.int32),
                         )
+
+        # P-EAGLE: load the learned mask_hidden vector when parallel drafting
+        # is enabled (no-op otherwise; raises clearly if the checkpoint lacks
+        # it). Mirrors upstream llama_eagle3.py:404-409.
+        self._load_mask_hidden(checkpoint_path)
 
     def get_kv_spec(self):
         """Returns KV cache specification for vLLM integration.
