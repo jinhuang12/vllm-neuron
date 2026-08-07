@@ -731,8 +731,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # TODO add more spec decode methods
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
+                # parallel_drafting (P-EAGLE) is an eagle3-compatible mode. The
+                # flag is an upstream SpeculativeConfig field at this pin;
+                # getattr keeps a safe default if a future config drops it.
+                # False => behaviorally-unchanged sequential eagle3.
+                parallel_drafting = getattr(
+                    self.speculative_config, "parallel_drafting", False
+                )
                 self.drafter = EagleProposer(
-                    self.vllm_config, self.device, self.on_device_sampling
+                    self.vllm_config,
+                    self.device,
+                    self.on_device_sampling,
+                    parallel_drafting=parallel_drafting,
                 )
                 self.rejection_sampler = RejectionSampler()
             else:

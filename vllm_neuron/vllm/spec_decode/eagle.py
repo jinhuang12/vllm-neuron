@@ -34,6 +34,7 @@ class EagleProposer:
         vllm_config: VllmConfig,
         device: torch.device,
         on_device_sampling: bool = True,
+        parallel_drafting: bool = False,
     ):
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
@@ -47,6 +48,20 @@ class EagleProposer:
         self.on_device_sampling = on_device_sampling
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
+        # P-EAGLE (parallel drafting) plumbing. Sequential eagle3 keeps
+        # parallel_drafting=False and is behaviorally unchanged: ptd_token_id
+        # stays None and extra_slots_per_request stays 1.
+        self.parallel_drafting = parallel_drafting
+        self.ptd_token_id = self._resolve_ptd_token_id()
+        # Extra drafter slots per request. Upstream analog of
+        # SpecDecodeBaseProposer.extra_slots_per_request
+        # (vllm/v1/spec_decode/llm_base_proposer.py:96): one masked slot per
+        # speculative token in parallel mode, a single shift slot otherwise.
+        # Consumed by drafter token-budget/bucket derivation (later increment).
+        self.extra_slots_per_request = (
+            self.num_speculative_tokens if self.parallel_drafting else 1
+        )
+
         self.attn_layer_names: list[str] = []
         self.capture_backend_model = None
 
@@ -56,6 +71,32 @@ class EagleProposer:
         world_rank = world_group.rank if world_group else 0
         self.rank_tensor = torch.tensor(
             world_rank, dtype=torch.int32, device=self.device
+        )
+
+    def _resolve_ptd_token_id(self) -> int | None:
+        """Resolve the parallel-drafting mask token id from the draft model's
+        hf_config, mirroring upstream SpecDecodeBaseProposer
+        _init_parallel_drafting_params
+        (vllm/v1/spec_decode/llm_base_proposer.py:305-329) minus the dflash
+        branch (the plugin has no dflash support). `pard_token` takes
+        precedence over `ptd_token_id`, matching the upstream order.
+
+        Returns None for the sequential path (parallel_drafting=False). Raises
+        ValueError if parallel drafting is requested but no mask token id is
+        available, so the flag is never silently inert.
+        """
+        if not self.parallel_drafting:
+            return None
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if hf_config is not None and hasattr(hf_config, "pard_token"):
+            return hf_config.pard_token
+        if hf_config is not None and hasattr(hf_config, "ptd_token_id"):
+            return hf_config.ptd_token_id
+        raise ValueError(
+            "parallel_drafting is enabled but the draft model config has "
+            "neither `pard_token` nor `ptd_token_id`; a parallel-drafting "
+            "(P-EAGLE) checkpoint must specify the mask token id in its "
+            "config.json."
         )
 
     def _build_noop_async_spec_correction_kwargs(
