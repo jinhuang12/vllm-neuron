@@ -11,6 +11,7 @@ parallel-draft slot layout: per request, slot 0 is the real seed token, slots
 
 Runs without Neuron hardware (pure torch on CPU).
 """
+
 import pytest
 import torch
 

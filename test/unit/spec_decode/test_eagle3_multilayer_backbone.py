@@ -23,6 +23,7 @@ Coverage:
       layers per step (multi-layer sequential is an upstream-supported config).
   (d) parallel forward shape: 4-layer single-pass P-EAGLE forward.
 """
+
 import os
 
 os.environ.setdefault("VLLM_NEURON_CPU_MODE", "1")
@@ -62,9 +63,7 @@ def _neuron_cpu_parallel_state():
     ctx.__exit__(None, None, None)
 
 
-def _make_drafter(
-    n_layers, hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2
-):
+def _make_drafter(n_layers, hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2):
     from vllm_neuron.model.llama3.config import LlamaConfig
     from vllm_neuron.model.llama3.eagle3_model import Eagle3LlamaForCausalLM
 
@@ -89,8 +88,16 @@ def _make_drafter(
     return model, lc
 
 
-def _write_checkpoint(tmp_path, n_layers, hidden=16, n_heads=4, n_kv=2, head_dim=4,
-                      vocab=32, with_mask_hidden=False):
+def _write_checkpoint(
+    tmp_path,
+    n_layers,
+    hidden=16,
+    n_heads=4,
+    n_kv=2,
+    head_dim=4,
+    vocab=32,
+    with_mask_hidden=False,
+):
     """Write a synthetic drafter checkpoint: midlayer.* + layers.{1..N-1}.*."""
     inter = hidden * 2
     qout = n_heads * head_dim

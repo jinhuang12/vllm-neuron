@@ -31,6 +31,7 @@ NKI attention kernel falls back to the torch implementation on CPU
 (``can_run_kernel`` returns False under CPU mode), so the real backbone forward
 runs end-to-end.
 """
+
 import os
 
 os.environ.setdefault("VLLM_NEURON_CPU_MODE", "1")
@@ -298,7 +299,7 @@ def test_mask_substitution_propagates_through_all_layers():
     model.ptd_token_id = PTD
     _bind_cache(model)
     assert model.model.layers[0].is_fusion_layer is True
-    assert all(not l.is_fusion_layer for l in model.model.layers[1:])
+    assert all(not layer.is_fusion_layer for layer in model.model.layers[1:])
 
     torch.manual_seed(2)
     mh_zero = torch.zeros(1, lc.hidden_size * 3)

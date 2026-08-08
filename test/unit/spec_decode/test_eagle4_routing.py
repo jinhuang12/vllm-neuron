@@ -22,6 +22,7 @@ increment-3 forward test uses (the drafter attention layer needs Neuron parallel
 groups to instantiate; the NKI kernel falls back to torch under
 VLLM_NEURON_CPU_MODE).
 """
+
 import os
 
 os.environ.setdefault("VLLM_NEURON_CPU_MODE", "1")
@@ -90,7 +91,10 @@ def _make_drafter_model(
     for layer in model.model.layers:
         attn = layer.self_attn
         k = torch.zeros(
-            8, attn.num_key_value_heads_per_rank, BLOCK_SIZE, attn.head_dim,
+            8,
+            attn.num_key_value_heads_per_rank,
+            BLOCK_SIZE,
+            attn.head_dim,
             dtype=torch.bfloat16,
         )
         v = torch.zeros_like(k)
@@ -125,7 +129,9 @@ def _make_bare_proposer(model, lc, K, parallel):
     model.ptd_token_id = PTD if parallel else None
     if parallel and "mask_hidden" not in dict(model.named_buffers()):
         model.register_buffer(
-            "mask_hidden", torch.randn(1, lc.hidden_size * 3, dtype=torch.bfloat16), persistent=False
+            "mask_hidden",
+            torch.randn(1, lc.hidden_size * 3, dtype=torch.bfloat16),
+            persistent=False,
         )
     return p
 

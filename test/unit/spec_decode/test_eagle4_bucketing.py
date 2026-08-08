@@ -24,6 +24,7 @@ Two groups here, both CPU-only, no Neuron parallel state required:
       branch (1 column). This is the tripwire that stops anyone reintroducing
       the ``bs * num_spec`` window later.
 """
+
 from types import SimpleNamespace
 from unittest import mock
 
@@ -129,11 +130,9 @@ def test_sequential_backbone_tokens(batch, K):
 def test_bucket_table_full_matrix():
     """One consolidated (batch,K,parallel)->(input_window, backbone) table."""
     rows = []
-    for (batch, K) in sorted(_INPUT_WINDOW_GOLDEN):
+    for batch, K in sorted(_INPUT_WINDOW_GOLDEN):
         for parallel in (False, True):
-            p = _build_proposer(
-                parallel_drafting=parallel, num_speculative_tokens=K
-            )
+            p = _build_proposer(parallel_drafting=parallel, num_speculative_tokens=K)
             rows.append(
                 (
                     batch,

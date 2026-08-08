@@ -4743,9 +4743,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # window bs*(1+num_spec), method-agnostic; parallel-ness is
             # internal to the traced forward. See
             # EagleProposer.draft_graph_input_tokens.
-            draft_num_tokens = self.drafter.draft_graph_input_tokens(
-                batch_size
-            )
+            draft_num_tokens = self.drafter.draft_graph_input_tokens(batch_size)
 
             draft_attn_metadata = self._build_warmup_attention_metadata(
                 num_tokens=draft_num_tokens,
@@ -4871,9 +4869,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # window bs*(1+num_spec), method-agnostic; parallel-ness is
             # internal to the traced forward. See
             # EagleProposer.draft_graph_input_tokens.
-            draft_num_tokens = self.drafter.draft_graph_input_tokens(
-                batch_size
-            )
+            draft_num_tokens = self.drafter.draft_graph_input_tokens(batch_size)
 
             draft_attn_metadata = self._build_warmup_attention_metadata(
                 num_tokens=draft_num_tokens,

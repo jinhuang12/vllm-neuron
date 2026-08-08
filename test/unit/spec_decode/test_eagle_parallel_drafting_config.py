@@ -8,6 +8,7 @@ without Neuron hardware: distributed init is not available on CPU, so
 patched to a stub. The parallel-drafting mask-token resolution runs before that
 call, so the flag-without-token-id error path needs no patching.
 """
+
 from types import SimpleNamespace
 from unittest import mock
 
@@ -88,7 +89,9 @@ def test_default_parallel_drafting_is_false():
     vllm_config = _make_vllm_config()
     fake_world_group = SimpleNamespace(rank=0)
     with mock.patch.object(eagle_mod, "get_world_group", return_value=fake_world_group):
-        proposer = EagleProposer(vllm_config, torch.device("cpu"), on_device_sampling=False)
+        proposer = EagleProposer(
+            vllm_config, torch.device("cpu"), on_device_sampling=False
+        )
     assert proposer.parallel_drafting is False
     assert proposer.ptd_token_id is None
     assert proposer.extra_slots_per_request == 1

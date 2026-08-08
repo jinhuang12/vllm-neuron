@@ -1526,9 +1526,7 @@ class NeuronWorker(WorkerBase):
             # bs*(1+num_spec), identical for sequential and parallel
             # (P-EAGLE) drafting; parallel-ness lives inside the traced
             # drafter forward. See EagleProposer.draft_graph_input_tokens.
-            draft_num_tokens = runner.drafter.draft_graph_input_tokens(
-                batch_size
-            )
+            draft_num_tokens = runner.drafter.draft_graph_input_tokens(batch_size)
             draft_attn_metadata = runner._build_warmup_attention_metadata(
                 num_tokens=draft_num_tokens,
                 num_reqs=batch_size,
