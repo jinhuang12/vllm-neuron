@@ -309,51 +309,89 @@ def _eagle3_qkv_weight_loader(
 class Eagle3LlamaDecoderLayer(LlamaDecoderLayer):
     """Eagle3 decoder layer that extends LlamaDecoderLayer.
 
-    Key differences from standard LlamaDecoderLayer:
+    Dual-mode, mirroring upstream ``llama_eagle3.py`` ``LlamaDecoderLayer``
+    (:51, :95-108). The mode is selected by ``is_fusion_layer``:
+
+    Fusion mode (logical layer 0 — the eagle3 ``midlayer``):
     1. Takes both `embeds` (token embeddings) and `hidden_states` (from target model)
     2. Concatenates them before attention: [embeds, hidden_states] -> 2x hidden_size
     3. Additional `hidden_norm` for normalizing target hidden states
     4. Overrides QKV projection to accept 2x hidden_size input
+
+    Plain mode (logical layers 1..N-1 — ordinary Llama decoder layers):
+    1. Ignores `embeds`; consumes `hidden_states` only (1x hidden_size QKV)
+    2. No `hidden_norm`, no embeds concat — a standard residual-chained
+       Llama decoder layer (``input_layernorm(hidden) -> attn -> residual ->
+       post_attention_layernorm -> mlp -> residual``).
+
+    ``is_fusion_layer`` defaults to True so the single-layer construction path
+    (RedHat-style 1-layer drafters, and every prior caller) is unchanged.
     """
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(
+        self, config: LlamaConfig, layer_idx: int, is_fusion_layer: bool = True
+    ):
         super().__init__(config, layer_idx)
         self.config = config
+        self.is_fusion_layer = is_fusion_layer
+
+        padded = config.hidden_size != config.unpadded_hidden_size
 
         # Override norms with padding-aware variants when hidden_size is padded
-        if config.hidden_size != config.unpadded_hidden_size:
+        if padded:
             self.input_layernorm = _make_rmsnorm(config)
             self.post_attention_layernorm = _make_rmsnorm(config)
 
-        # Override QKV projection weight to accept 2x hidden_size input
         attn = self.self_attn
-        qkv_size = attn.q_size + 2 * attn.kv_size
-        qkv_input_size = 2 * config.hidden_size
+        if is_fusion_layer:
+            # Fusion layer: override QKV projection weight to accept 2x
+            # hidden_size input (concat of embeds + target hidden states).
+            qkv_size = attn.q_size + 2 * attn.kv_size
+            qkv_input_size = 2 * config.hidden_size
 
-        attn.qkv_proj_weight = nn.Parameter(
-            torch.empty(qkv_input_size, qkv_size, dtype=config.torch_dtype)
-        )
+            attn.qkv_proj_weight = nn.Parameter(
+                torch.empty(qkv_input_size, qkv_size, dtype=config.torch_dtype)
+            )
 
-        # Re-setup weight loader for the wider QKV.
-        # Use interleaved padding: the input is concat(embeds, hidden_states),
-        # each padded independently, so zeros appear at positions
-        # [unpadded:hidden] and [hidden+unpadded:2*hidden], not at the end.
-        set_weight_loader(
-            attn.qkv_proj_weight,
-            _eagle3_qkv_weight_loader(
-                q_size=attn.q_size,
-                kv_size=attn.kv_size,
-                shard_dim=1,
-                num_shards=attn.world_size,
-                is_storage_transposed=True,
-                num_kv_replicas=attn.num_kv_replicas,
-                padded_hidden_size=config.hidden_size,
-                unpadded_hidden_size=config.unpadded_hidden_size,
-            ),
-        )
+            # Re-setup weight loader for the wider QKV.
+            # Use interleaved padding: the input is concat(embeds, hidden_states),
+            # each padded independently, so zeros appear at positions
+            # [unpadded:hidden] and [hidden+unpadded:2*hidden], not at the end.
+            set_weight_loader(
+                attn.qkv_proj_weight,
+                _eagle3_qkv_weight_loader(
+                    q_size=attn.q_size,
+                    kv_size=attn.kv_size,
+                    shard_dim=1,
+                    num_shards=attn.world_size,
+                    is_storage_transposed=True,
+                    num_kv_replicas=attn.num_kv_replicas,
+                    padded_hidden_size=config.hidden_size,
+                    unpadded_hidden_size=config.unpadded_hidden_size,
+                ),
+            )
+        elif padded:
+            # Plain layer: base LlamaAttention already built a 1x-hidden QKV,
+            # but its loader has no hidden-dim padding. Re-set with end-padding
+            # on the single hidden input segment (no interleave — there is only
+            # one hidden segment, not concat(embeds, hidden)).
+            set_weight_loader(
+                attn.qkv_proj_weight,
+                fused_qkv_weight_loader(
+                    q_size=attn.q_size,
+                    kv_size=attn.kv_size,
+                    shard_dim=1,
+                    num_shards=attn.world_size,
+                    is_storage_transposed=True,
+                    num_kv_replicas=attn.num_kv_replicas,
+                    padded_hidden_size=config.hidden_size,
+                    unpadded_hidden_size=config.unpadded_hidden_size,
+                ),
+            )
+        # else (plain + unpadded): base loader is already correct.
 
         # Override weight loaders for o_proj and MLP when hidden_size is padded
-        if config.hidden_size != config.unpadded_hidden_size:
+        if padded:
             # o_proj: [num_heads*head_dim // tp, hidden_size] — pad hidden_size dim (dim 1)
             set_weight_loader(
                 attn.o_proj_weight,
@@ -397,41 +435,56 @@ class Eagle3LlamaDecoderLayer(LlamaDecoderLayer):
                 ),
             )
 
-        # Additional norm for target hidden states
-        self.hidden_norm = _make_rmsnorm(config)
+        # Additional norm for target hidden states — fusion layer only.
+        # Plain layers (1..N-1) do NOT fuse target hidden states, so they
+        # carry no ``hidden_norm`` param (the checkpoint has none, and
+        # ``load_state_dict(strict=True)`` must not see an extra param).
+        if is_fusion_layer:
+            self.hidden_norm = _make_rmsnorm(config)
 
     def forward(
         self,
-        embeds: torch.Tensor,  # [T, hidden_size]
+        embeds: torch.Tensor,  # [T, hidden_size] (fusion layer only)
         hidden_states: torch.Tensor,  # [T, hidden_size]
         positions: torch.LongTensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: object | None = None,
     ) -> torch.Tensor:
-        """Forward pass with Eagle3 concatenation logic.
+        """Forward pass.
+
+        Fusion layer: eagle3 concat(embeds, target-hidden) attention.
+        Plain layer: ordinary Llama decoder layer over ``hidden_states``.
 
         Returns:
             hidden_states: Output tensor of shape [T, hidden_size].
         """
         is_decode = self._is_decode(attn_metadata)
 
-        # Normalize token embeddings
-        embeds = self.input_layernorm(embeds)
+        if self.is_fusion_layer:
+            # Normalize token embeddings
+            embeds = self.input_layernorm(embeds)
 
-        # Normalize target hidden states and save residual
-        if self.config.norm_before_residual:
-            hidden_states = self.hidden_norm(hidden_states)
-            residual = hidden_states
+            # Normalize target hidden states and save residual
+            if self.config.norm_before_residual:
+                hidden_states = self.hidden_norm(hidden_states)
+                residual = hidden_states
+            else:
+                residual = hidden_states
+                hidden_states = self.hidden_norm(hidden_states)
+
+            # Eagle3: concatenate embeddings with hidden states
+            attn_input = torch.cat(
+                [embeds, hidden_states], dim=-1
+            )  # [T, 2*hidden_size]
         else:
+            # Plain Llama decoder layer: pre-attention norm on hidden only,
+            # no embeds concat, no hidden_norm (upstream :106-108).
             residual = hidden_states
-            hidden_states = self.hidden_norm(hidden_states)
+            attn_input = self.input_layernorm(hidden_states)
 
-        # Eagle3: concatenate embeddings with hidden states
-        concat_hidden = torch.cat([embeds, hidden_states], dim=-1)  # [T, 2*hidden_size]
-
-        # Self Attention (QKV handles 2x input size)
+        # Self Attention (QKV input width matches the layer mode)
         hidden_states = self.self_attn(
-            hidden_states=concat_hidden,
+            hidden_states=attn_input,
             positions=positions,
             position_embeddings=position_embeddings,
             attn_metadata=attn_metadata,
@@ -476,9 +529,23 @@ class Eagle3LlamaModel(nn.Module):
             tp_group=get_tp_group().device_group,
         )
 
-        assert config.num_hidden_layers == 1
+        # N-layer eagle3 backbone (upstream llama_eagle3.py :163-171). Logical
+        # layer 0 is the eagle3 fusion layer (``midlayer`` in the checkpoint:
+        # 2x-width qkv, hidden_norm, embeds concat); logical layers 1..N-1 are
+        # plain Llama decoder layers (1x-width qkv, no hidden_norm). Absolute
+        # ``layer_idx`` starts at ``start_layer_idx`` (the drafter's KV/graph
+        # layer names are offset past the target's layers), so fusion selection
+        # keys on the LOGICAL index, not the absolute one.
+        assert config.num_hidden_layers >= 1
         self.layers = nn.ModuleList(
-            [Eagle3LlamaDecoderLayer(config, layer_idx=start_layer_idx)]
+            [
+                Eagle3LlamaDecoderLayer(
+                    config,
+                    layer_idx=start_layer_idx + logical_idx,
+                    is_fusion_layer=(logical_idx == 0),
+                )
+                for logical_idx in range(config.num_hidden_layers)
+            ]
         )
 
         # Combine 3 auxiliary hidden states from target model
@@ -511,9 +578,12 @@ class Eagle3LlamaModel(nn.Module):
                 layer.input_layernorm.weight,
                 last_dim_padding_weight_loader(hidden_size),
             )
-            set_weight_loader(
-                layer.hidden_norm.weight, last_dim_padding_weight_loader(hidden_size)
-            )
+            # hidden_norm exists only on the fusion layer (logical layer 0).
+            if layer.is_fusion_layer:
+                set_weight_loader(
+                    layer.hidden_norm.weight,
+                    last_dim_padding_weight_loader(hidden_size),
+                )
             set_weight_loader(
                 layer.post_attention_layernorm.weight,
                 last_dim_padding_weight_loader(hidden_size),
@@ -562,14 +632,21 @@ class Eagle3LlamaModel(nn.Module):
             positions, device=embeds.device, dtype=embeds.dtype
         )
 
-        # Forward through Eagle3 decoder layer
-        hidden_states = self.layers[0](
-            embeds=embeds,
-            hidden_states=target_hidden_states,
-            positions=positions,
-            position_embeddings=position_embeddings,
-            attn_metadata=attn_metadata,
-        )
+        # Residual-chained forward over all N layers (upstream
+        # llama_eagle3.py :210-218). Logical layer 0 (fusion) consumes both
+        # ``embeds`` and the target hidden states; logical layers 1..N-1
+        # (plain) ignore ``embeds`` and chain on the running hidden state.
+        # Each plugin decoder layer owns its residual internally, so chaining
+        # is a plain hidden-state hand-off.
+        hidden_states = target_hidden_states
+        for layer in self.layers:
+            hidden_states = layer(
+                embeds=embeds,
+                hidden_states=hidden_states,
+                positions=positions,
+                position_embeddings=position_embeddings,
+                attn_metadata=attn_metadata,
+            )
 
         # Save pre-norm state for recurrent (matches vLLM's hidden_prenorm)
         hidden_prenorm = hidden_states
@@ -1179,9 +1256,14 @@ class Eagle3LlamaForCausalLM(nn.Module):
             mappings[f"model.layers.{layer_id}.post_attention_layernorm.weight"] = (
                 f"{ckpt_prefix}.post_attention_layernorm.weight"
             )
-            mappings[f"model.layers.{layer_id}.hidden_norm.weight"] = (
-                f"{ckpt_prefix}.hidden_norm.weight"
-            )
+            # hidden_norm exists only on the fusion layer (logical layer 0).
+            # Plain layers (1..N-1) carry no hidden_norm — neither the param
+            # nor a checkpoint tensor — so mapping it would break the strict
+            # load on both the param side (missing) and checkpoint side.
+            if self.model.layers[layer_id].is_fusion_layer:
+                mappings[f"model.layers.{layer_id}.hidden_norm.weight"] = (
+                    f"{ckpt_prefix}.hidden_norm.weight"
+                )
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path)
         rank_sharded_checkpoint = checkpoint.load_sharded_pipelined(
