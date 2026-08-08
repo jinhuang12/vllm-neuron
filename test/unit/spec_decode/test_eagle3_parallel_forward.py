@@ -69,7 +69,7 @@ def _neuron_cpu_parallel_state():
     ctx.__exit__(None, None, None)
 
 
-def _make_drafter(hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2):
+def _make_drafter(hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2, n_layers=1):
     from vllm_neuron.model.llama3.config import LlamaConfig
     from vllm_neuron.model.llama3.eagle3_model import Eagle3LlamaForCausalLM
 
@@ -78,7 +78,7 @@ def _make_drafter(hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2):
         draft_vocab_size=None,
         hidden_size=hidden,
         intermediate_size=hidden * 2,
-        num_hidden_layers=1,
+        num_hidden_layers=n_layers,
         num_attention_heads=n_heads,
         num_key_value_heads=n_kv,
         head_dim=head_dim,
@@ -96,13 +96,18 @@ def _make_drafter(hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2):
     return model, lc
 
 
-def _bind_cache(model, hidden_layer_idx=1, num_blocks=8):
-    attn = model.model.layers[0].self_attn
-    k = torch.zeros(
-        num_blocks, attn.num_key_value_heads_per_rank, BLOCK_SIZE, attn.head_dim
-    )
-    v = torch.zeros_like(k)
-    model.bind_kv_cache({f"layers.{hidden_layer_idx}.self_attn": [k, v]})
+def _bind_cache(model, num_blocks=8):
+    # bind_kv_cache loops ALL model layers and needs every layer name in one
+    # dict; build caches for all N drafter layers (layer_idx = 1..N).
+    caches = {}
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        k = torch.zeros(
+            num_blocks, attn.num_key_value_heads_per_rank, BLOCK_SIZE, attn.head_dim
+        )
+        v = torch.zeros_like(k)
+        caches[f"layers.{layer.layer_idx}.self_attn"] = [k, v]
+    model.bind_kv_cache(caches)
 
 
 def _run_parallel_forward(model, lc, bs, K):
@@ -115,15 +120,20 @@ def _run_parallel_forward(model, lc, bs, K):
     sampling_positions = torch.arange(bs, dtype=torch.long)
     block_table = torch.arange(bs, dtype=torch.int32).view(bs, 1)
     # slots: each request in its own block, position 0 -> slot block_id*BLOCK.
+    # _forward_parallel reads base_meta from the fusion-layer key then builds
+    # its own per-layer metadata, but the model.forward gate reads the fusion
+    # key first — supply an entry per drafter layer for robustness.
+    slot = (block_table.view(-1) * BLOCK_SIZE).to(torch.int64)
     meta = {
-        "layers.1.self_attn": {
+        f"layers.{layer.layer_idx}.self_attn": {
             "block_table_tensor": block_table,
-            "slot_mapping": (block_table.view(-1) * BLOCK_SIZE).to(torch.int64),
+            "slot_mapping": slot,
             "max_query_len": 1,
             "block_size": BLOCK_SIZE,
             "max_blocks_per_seq": 1,
             "decode_token_threshold": 1,
         }
+        for layer in model.model.layers
     }
     rank = torch.tensor(0, dtype=torch.int32)
     stacked, drafts_only, logits = model(
@@ -196,10 +206,14 @@ def test_load_mask_hidden_parallel_off_missing_noop(tmp_path):
 # --------------------------------------------------------------------------
 
 
+# n_layers=4 = P-EAGLE (fusion + 3 plain); n_layers=1 = RedHat-style
+# regression. Both must run the single-pass parallel forward (inc-4 re-base:
+# the parallel path survives on the N-layer backbone unchanged).
+@pytest.mark.parametrize("n_layers", [1, 4])
 @pytest.mark.parametrize("bs", [1, 2])
 @pytest.mark.parametrize("K", [2, 4])
-def test_parallel_forward_shape(bs, K):
-    model, lc = _make_drafter(K=K)
+def test_parallel_forward_shape(n_layers, bs, K):
+    model, lc = _make_drafter(K=K, n_layers=n_layers)
     model.parallel_drafting = True
     model.ptd_token_id = PTD
     model.register_buffer(
@@ -220,18 +234,20 @@ def test_parallel_forward_shape(bs, K):
 # --------------------------------------------------------------------------
 
 
-def test_mask_hidden_substitution_reaches_forward():
+@pytest.mark.parametrize("n_layers", [1, 4])
+def test_mask_hidden_substitution_reaches_forward(n_layers):
     """Different mask_hidden -> different draft tokens.
 
     Proves the substituted mask-hidden states are actually consumed by the
     forward: running the identical parallel pass with two different
     ``mask_hidden`` vectors must produce different draft token ids. If the
     substitution were dropped (masked slots kept the seed hidden), the two runs
-    would be byte-identical.
+    would be byte-identical. Run on BOTH shapes so the inc-4 re-base is proven
+    on the multi-layer backbone too.
     """
     K = 4
     bs = 2
-    model, lc = _make_drafter(K=K)
+    model, lc = _make_drafter(K=K, n_layers=n_layers)
     model.parallel_drafting = True
     model.ptd_token_id = PTD
     _bind_cache(model)
@@ -250,4 +266,53 @@ def test_mask_hidden_substitution_reaches_forward():
     # the substituted hidden states flow through the single-pass forward.
     assert not torch.equal(drafts_a, drafts_b), (
         "draft tokens must depend on the substituted mask_hidden"
+    )
+
+
+# --------------------------------------------------------------------------
+# (d) inc-4 re-base: substitution point vs. the residual chain (4-layer)
+# --------------------------------------------------------------------------
+
+
+def test_mask_substitution_propagates_through_all_layers():
+    """The mask substitution lands at the FUSION-layer input and must then
+    propagate through the residual chain of ALL N layers to the output.
+
+    Semantics (upstream llama_eagle3.py): mask_hidden is fc-combined and
+    substituted into the target-hidden input BEFORE the backbone runs
+    (llm_base_proposer.py:743-753 + :1208-1218). The fusion layer (logical 0)
+    consumes concat(embeds, substituted-hidden); plain layers 1..N-1 then chain
+    on the resulting residual stream — they never re-inject the raw target
+    hidden, so the substitution is felt end-to-end.
+
+    Guard: with a 4-layer backbone, changing mask_hidden must still change the
+    drafts. If the substitution were dropped anywhere along the chain (e.g. a
+    plain layer reset the stream to the un-substituted hidden), the two runs
+    would coincide. This is the multi-layer analog of the reaches-forward test,
+    kept separate to document the residual-propagation contract inc-4 verifies.
+    """
+    K = 4
+    bs = 2
+    model, lc = _make_drafter(K=K, n_layers=4)
+    model.parallel_drafting = True
+    model.ptd_token_id = PTD
+    _bind_cache(model)
+    assert model.model.layers[0].is_fusion_layer is True
+    assert all(not l.is_fusion_layer for l in model.model.layers[1:])
+
+    torch.manual_seed(2)
+    mh_zero = torch.zeros(1, lc.hidden_size * 3)
+    mh_big = torch.randn(1, lc.hidden_size * 3) * 5.0
+
+    model.register_buffer("mask_hidden", mh_zero, persistent=False)
+    drafts_zero = _run_parallel_forward(model, lc, bs, K)[1].clone()
+
+    model.register_buffer("mask_hidden", mh_big, persistent=False)
+    drafts_big = _run_parallel_forward(model, lc, bs, K)[1].clone()
+
+    # The masked slots (columns 1..K-1) must differ; the substitution reached
+    # the output through all 4 layers' residual chain.
+    assert not torch.equal(drafts_zero[:, 1:], drafts_big[:, 1:]), (
+        "mask_hidden substitution must propagate through all 4 layers to the "
+        "masked-slot drafts"
     )

@@ -34,7 +34,16 @@ from vllm_neuron.vllm.spec_decode import eagle as eagle_mod
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 
 
-def _make_vllm_config(num_speculative_tokens=4, hf_config=None, method="eagle3"):
+def _make_vllm_config(
+    num_speculative_tokens=4, hf_config=None, method="eagle3", draft_num_layers=1
+):
+    # draft_num_layers exercises the multi-layer backbone dimension (inc-5):
+    # the drafter's hf_config carries num_hidden_layers, but the bucket/window
+    # arithmetic must be INDEPENDENT of it (DESIGN 1 — the window is the target
+    # verify shape; the backbone depth lives inside the traced forward).
+    if hf_config is None:
+        hf_config = SimpleNamespace()
+    hf_config.num_hidden_layers = draft_num_layers
     draft_model_config = SimpleNamespace(hf_config=hf_config)
     speculative_config = SimpleNamespace(
         draft_model_config=draft_model_config,
@@ -45,11 +54,15 @@ def _make_vllm_config(num_speculative_tokens=4, hf_config=None, method="eagle3")
     return SimpleNamespace(speculative_config=speculative_config)
 
 
-def _build_proposer(parallel_drafting=False, num_speculative_tokens=4):
+def _build_proposer(
+    parallel_drafting=False, num_speculative_tokens=4, draft_num_layers=1
+):
     # Parallel needs a resolvable mask token id.
     hf_config = SimpleNamespace(ptd_token_id=201020) if parallel_drafting else None
     vllm_config = _make_vllm_config(
-        num_speculative_tokens=num_speculative_tokens, hf_config=hf_config
+        num_speculative_tokens=num_speculative_tokens,
+        hf_config=hf_config,
+        draft_num_layers=draft_num_layers,
     )
     fake_world_group = SimpleNamespace(rank=0)
     with mock.patch.object(eagle_mod, "get_world_group", return_value=fake_world_group):
@@ -175,3 +188,51 @@ def test_superseded_bs_times_K_window_falls_to_prefill_branch(batch, K):
     assert kwargs["raw_sampled_token_ids"].shape == (batch, 1)
     # And it disagrees with the real decode window, proving the mismatch.
     assert wrong_num_tokens != batch * (1 + K)
+
+
+# ---------------------------------------------------------------------------
+# (3) layer-dimension invariance (increment 5, revision 1)
+# ---------------------------------------------------------------------------
+#
+# The multi-layer eagle3 backbone (inc-3-rev1) changes the drafter's
+# num_hidden_layers from 1 (RedHat) to 4 (P-EAGLE). DESIGN 1 holds that the
+# drafter graph's input WINDOW (bs*(1+K)) and internal backbone token count
+# (bs*K parallel / bs sequential) are functions of (batch, K) ONLY — backbone
+# depth lives inside the traced forward, not in the outer bucket shape. These
+# tests encode that invariance: 1-layer and 4-layer proposers produce IDENTICAL
+# window/backbone numbers.
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("batch,K", sorted(_INPUT_WINDOW_GOLDEN))
+def test_bucket_numbers_invariant_to_drafter_layer_count(parallel, batch, K):
+    """1-layer and 4-layer drafters give identical window + backbone counts."""
+    p1 = _build_proposer(
+        parallel_drafting=parallel, num_speculative_tokens=K, draft_num_layers=1
+    )
+    p4 = _build_proposer(
+        parallel_drafting=parallel, num_speculative_tokens=K, draft_num_layers=4
+    )
+    # Input window: identical, and equal to the DESIGN-1 verify shape.
+    assert p1.draft_graph_input_tokens(batch) == p4.draft_graph_input_tokens(batch)
+    assert p4.draft_graph_input_tokens(batch) == batch * (1 + K)
+    # Internal backbone token count: identical (depth-independent).
+    assert p1.parallel_backbone_tokens(batch) == p4.parallel_backbone_tokens(batch)
+    assert p4.parallel_backbone_tokens(batch) == (batch * K if parallel else batch)
+    # extra_slots_per_request is also depth-independent.
+    assert p1.extra_slots_per_request == p4.extra_slots_per_request
+
+
+def test_draft_num_layers_wired_but_does_not_enter_bucket_math():
+    """Sanity: the drafter hf_config carries num_hidden_layers (consumed by the
+    worker to build per-layer KV/graph names), but the proposer's bucket math
+    never reads it — proven by the invariance above. This documents that the
+    1->4 layer change is absorbed by the per-layer KV/graph loops
+    (get_kv_spec / attn_layer_names), not by the window arithmetic."""
+    p4 = _build_proposer(
+        parallel_drafting=True, num_speculative_tokens=4, draft_num_layers=4
+    )
+    assert p4.draft_model_config.hf_config.num_hidden_layers == 4
+    # The proposer stores no layer-count field that feeds bucket sizing.
+    assert p4.draft_graph_input_tokens(2) == 2 * (1 + 4)
+    assert p4.parallel_backbone_tokens(2) == 2 * 4

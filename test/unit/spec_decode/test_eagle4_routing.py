@@ -61,7 +61,9 @@ def _neuron_cpu_parallel_state():
     ctx.__exit__(None, None, None)
 
 
-def _make_drafter_model(hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2):
+def _make_drafter_model(
+    hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2, n_layers=1
+):
     from vllm_neuron.model.llama3.config import LlamaConfig
     from vllm_neuron.model.llama3.eagle3_model import Eagle3LlamaForCausalLM
 
@@ -70,7 +72,7 @@ def _make_drafter_model(hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2)
         draft_vocab_size=None,
         hidden_size=hidden,
         intermediate_size=hidden * 2,
-        num_hidden_layers=1,
+        num_hidden_layers=n_layers,
         num_attention_heads=n_heads,
         num_key_value_heads=n_kv,
         head_dim=head_dim,
@@ -83,11 +85,17 @@ def _make_drafter_model(hidden=16, n_heads=4, n_kv=2, head_dim=4, vocab=32, K=2)
         for p in model.parameters():
             if not p.is_meta:
                 p.copy_(torch.randn_like(p) * 0.05)
-    # KV cache bind (single block per request, position 0).
-    attn = model.model.layers[0].self_attn
-    k = torch.zeros(8, attn.num_key_value_heads_per_rank, BLOCK_SIZE, attn.head_dim, dtype=torch.bfloat16)
-    v = torch.zeros_like(k)
-    model.bind_kv_cache({"layers.1.self_attn": [k, v]})
+    # KV cache bind for ALL N drafter layers (single block per request, pos 0).
+    caches = {}
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        k = torch.zeros(
+            8, attn.num_key_value_heads_per_rank, BLOCK_SIZE, attn.head_dim,
+            dtype=torch.bfloat16,
+        )
+        v = torch.zeros_like(k)
+        caches[f"layers.{layer.layer_idx}.self_attn"] = [k, v]
+    model.bind_kv_cache(caches)
     return model, lc
 
 
@@ -99,7 +107,11 @@ def _make_bare_proposer(model, lc, K, parallel):
     p.device = torch.device("cpu")
     p.num_speculative_tokens = K
     p.on_device_sampling = False
-    p.attn_layer_names = ["layers.1.self_attn"]
+    # One attn layer name per drafter layer (mirrors EagleProposer.load_model,
+    # eagle.py:191-196, which derives these from draft num_hidden_layers).
+    p.attn_layer_names = [
+        f"layers.{layer.layer_idx}.self_attn" for layer in model.model.layers
+    ]
     p.rank_tensor = torch.tensor(0, dtype=torch.int32)
     p.parallel_drafting = parallel
     p.ptd_token_id = PTD if parallel else None
@@ -118,17 +130,24 @@ def _make_bare_proposer(model, lc, K, parallel):
     return p
 
 
-def _decode_attn_metadata(bs):
+def _decode_attn_metadata(bs, model=None):
     block_table = torch.arange(bs, dtype=torch.int32).view(bs, 1)
+    slot = (block_table.view(-1) * BLOCK_SIZE).to(torch.int64)
+    entry = {
+        "block_table_tensor": block_table,
+        "slot_mapping": slot,
+        "max_query_len": 1,
+        "block_size": BLOCK_SIZE,
+        "max_blocks_per_seq": 1,
+        "decode_token_threshold": 1,
+    }
+    # Default 1-layer key preserves the original single-layer callers; when a
+    # model is supplied, key an entry per drafter layer (N-layer backbone).
+    if model is None:
+        return {"layers.1.self_attn": dict(entry)}
     return {
-        "layers.1.self_attn": {
-            "block_table_tensor": block_table,
-            "slot_mapping": (block_table.view(-1) * BLOCK_SIZE).to(torch.int64),
-            "max_query_len": 1,
-            "block_size": BLOCK_SIZE,
-            "max_blocks_per_seq": 1,
-            "decode_token_threshold": 1,
-        }
+        f"layers.{layer.layer_idx}.self_attn": dict(entry)
+        for layer in model.model.layers
     }
 
 
@@ -199,3 +218,57 @@ def test_warmup_entrypoint_traces_parallel(bs, K):
         # warmup builds synthetic inputs internally and calls propose().
         p.warmup(num_tokens=num_tokens, num_reqs=bs, attn_metadata=meta)
     assert spy.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Increment 5 (rev 1): warmup trace-spy on the 4-layer (P-EAGLE) backbone
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bs,K", [(1, 2), (2, 4)])
+def test_warmup_traces_parallel_on_4layer_backbone(bs, K):
+    """Warmup routes to _forward_parallel exactly once on the 4-layer backbone.
+
+    Same trace-spy proof as the 1-layer case, but the drafter is the P-EAGLE
+    shape (1 fusion + 3 plain layers). Confirms the DESIGN-1 dispatch is
+    unchanged by backbone depth: the input window is still bs*(1+K), warmup
+    still hits _forward_parallel once, and the single masked pass now traverses
+    all 4 layers internally (verified end-to-end since the spy uses the real
+    _forward_parallel via side_effect)."""
+    model, lc = _make_drafter_model(K=K, n_layers=4)
+    assert len(model.model.layers) == 4
+    assert model.model.layers[0].is_fusion_layer is True
+    p = _make_bare_proposer(model, lc, K, parallel=True)
+    num_tokens = p.draft_graph_input_tokens(bs)
+    assert num_tokens == bs * (1 + K)  # depth-independent window
+    meta = _decode_attn_metadata(bs, model=model)  # keys all 4 layers
+
+    real_parallel = model._forward_parallel
+    with mock.patch.object(
+        model, "_forward_parallel", side_effect=real_parallel, autospec=False
+    ) as spy:
+        p.warmup(num_tokens=num_tokens, num_reqs=bs, attn_metadata=meta)
+    assert spy.call_count == 1
+
+
+@pytest.mark.parametrize("bs,K", [(1, 2), (2, 4)])
+def test_synthetic_path_routes_parallel_on_4layer(bs, K):
+    """Synthetic-input propose path routes to _forward_parallel and returns the
+    [bs, K] contract on the 4-layer backbone."""
+    model, lc = _make_drafter_model(K=K, n_layers=4)
+    p = _make_bare_proposer(model, lc, K, parallel=True)
+    num_tokens = p.draft_graph_input_tokens(bs)
+    kwargs = p._build_synthetic_inputs(num_tokens, bs)
+    assert kwargs["raw_sampled_token_ids"].shape == (bs, K + 1)
+    meta = _decode_attn_metadata(bs, model=model)
+
+    real_parallel = model._forward_parallel
+    with mock.patch.object(
+        model, "_forward_parallel", side_effect=real_parallel, autospec=False
+    ) as spy:
+        draft_token_ids, drafts_only = p.propose(
+            attn_metadata=meta, is_warmup=True, **kwargs
+        )
+    assert spy.call_count == 1
+    assert drafts_only.shape == (bs, K)
+    assert drafts_only.dtype == torch.int32
