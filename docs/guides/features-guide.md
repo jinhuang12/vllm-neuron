@@ -579,6 +579,7 @@ outputs = llm.generate(["Explain quantum computing"], sampling_params)
 | `method`                    | Speculative method; `eagle3` is supported in 2.31            |
 | `model`                     | Path or name of the EAGLE3 draft model                       |
 | `num_speculative_tokens`    | Number of tokens the draft proposes per step (typically 3-7) |
+| `parallel_drafting`         | Optional bool (default `false`). Draft `K` tokens in a single masked forward pass instead of `K` sequential draft steps. See [Parallel drafting (P-EAGLE)](#parallel-drafting-p-eagle) |
 | `on_device_sampling_config` | Required for on-device rejection sampling                    |
 
 ### On-device vs CPU sampling
@@ -594,6 +595,67 @@ logits to CPU. This requires `on_device_sampling_config` to be set.
   latency matters
 - Workloads where the draft model acceptance rate is high (structured
   outputs, code generation)
+
+### Parallel drafting (P-EAGLE)
+
+Parallel drafting changes how the draft model produces its `K` speculative
+tokens. Sequential EAGLE3 unrolls `K` draft steps, feeding each drafted
+token back into the draft model for the next step. Parallel drafting
+instead runs the draft model **once**, over `K` slots per request in a
+single masked forward pass: slot 0 holds the real seed token, slots 1
+through `K-1` are filled with the checkpoint's mask token and a learned
+`mask_hidden` state, and all `K` draft tokens come out of that one pass.
+Target-side verification is unchanged: the target model still verifies
+all `K` tokens in one forward pass and the rejection sampler accepts
+tokens sequentially until the first mismatch, exactly as in sequential
+EAGLE3.
+
+Enable it by adding `"parallel_drafting": true` to `--speculative-config`:
+
+```bash
+--speculative-config '{"method": "eagle3", "model": "amazon/GPT-OSS-20B-P-EAGLE", "num_speculative_tokens": 2, "parallel_drafting": true}'
+```
+
+Tested configuration: GPT-OSS-20B target with the
+`amazon/GPT-OSS-20B-P-EAGLE` draft model, `num_speculative_tokens=2`,
+`--tensor-parallel-size 8`, on Trn2. In this configuration parallel
+drafting reached higher acceptance than sequential EAGLE3 on the same
+draft model (22.8% vs 19.5%) while running 2.64x faster end to end, because
+the single masked pass replaces `K` sequential draft-model invocations
+with one.
+
+#### Drafter checkpoint requirements
+
+Parallel drafting requires a draft checkpoint built for it:
+
+- A mask-token id read from the draft model's `config.json`: `pard_token`
+  if present, otherwise `ptd_token_id`. `pard_token` takes precedence when
+  both are set. If `parallel_drafting` is requested and neither key
+  resolves to a token id, startup fails with an explicit error rather than
+  silently falling back to sequential drafting.
+- A `mask_hidden` weight in the checkpoint. If `parallel_drafting` is set
+  and the checkpoint has no `mask_hidden` weight, weight loading fails with
+  a clear error instead of loading a partially-initialized draft model.
+
+#### Multi-layer drafters
+
+The draft model backbone supports one or more layers. Layer 0 is always
+the EAGLE3 fusion layer (concatenates target embeddings with the target
+hidden state, double-width QKV, its own `hidden_norm`); any additional
+layers are plain Llama decoder layers chained by residual connections, the
+same dual-mode layout upstream EAGLE3 uses. This applies to both drafting
+modes. For parallel drafting, the single masked pass runs through all
+layers of the backbone: the mask-hidden substitution is applied once, at
+the fusion layer's input, and carries forward through the rest of the
+backbone via the residual stream.
+
+#### Constraints
+
+- **Mutually exclusive with async scheduling**, same as sequential EAGLE3:
+  setting `--speculative-config` disables async scheduling automatically
+  with a startup warning, whether or not `parallel_drafting` is set.
+- `parallel_drafting` defaults to `false`. Existing sequential EAGLE3
+  deployments are unaffected unless the flag is explicitly set.
 
 ## Structured outputs and tool calling
 

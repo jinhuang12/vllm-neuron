@@ -15,7 +15,7 @@ For configuration details, see the [features guide](features-guide.md).
 | [Continuous batching](features-guide.md#continuous-batching) | ✅ | ✅ |
 | [Segmented prefill](features-guide.md#segmented-prefill) | ✅ | ✅ |
 | [Prefix caching (APC)](features-guide.md#prefix-caching) | ✅ | ✅ |
-| [Speculative decoding (EAGLE3)](features-guide.md#speculative-decoding-eagle3) | ✅ | ❌ |
+| [Speculative decoding (EAGLE3)](features-guide.md#speculative-decoding-eagle3) | ✅ ² | ❌ |
 | [FP8 weight quantization (static)](features-guide.md#fp8-static-weight-quantization) | ❌ | ❌ |
 | [MXFP8 weight quantization](features-guide.md#quantization) | ❌ | ✅ |
 | [MXFP4 weight quantization](features-guide.md#mxfp4-weight-quantization-gpt-oss-on-trn3) | ✅ ¹ | ❌ |
@@ -30,6 +30,7 @@ For configuration details, see the [features guide](features-guide.md).
 | [Vision encoder parallelism](features-guide.md#tensor-data-and-expert-parallelism) | N/A | ✅ |
 
 ¹ Trn3 only.
+² Includes parallel drafting (P-EAGLE): tested with GPT-OSS-20B + `amazon/GPT-OSS-20B-P-EAGLE`.
 
 ## Legend
 
