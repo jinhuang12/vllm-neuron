@@ -416,6 +416,12 @@ class EagleProposer:
         # the drafter so load_weights loads mask_hidden and forward runs the
         # single-pass parallel path. Sequential eagle3 leaves the defaults.
         self.model.parallel_drafting = self.parallel_drafting
+        # Drafter-only: bound decode KV gather to active context. Both the
+        # KV-prime pass and the parallel draft pass run through these self_attn
+        # modules, so setting the flag here covers both.
+        if self.parallel_drafting:
+            for _layer in self.model.model.layers:
+                _layer.self_attn.bounded_gather = True
         self.model.ptd_token_id = self.ptd_token_id
         load_start = time.perf_counter()
         if not cpu_compile:

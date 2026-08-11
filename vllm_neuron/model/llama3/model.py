@@ -379,6 +379,9 @@ class LlamaAttention(nn.Module):
 
         self._setup_weight_loaders()
 
+        # Drafter-only: bound decode KV gather to active context via the fused pos_ids kernel path. Default False keeps target models unchanged.
+        self.bounded_gather = False
+
     def _setup_weight_loaders(self):
         """Attach weight loaders for checkpoint → parameter transformation.
 
@@ -816,17 +819,37 @@ class LlamaAttention(nn.Module):
             dcp_active_mask = (owner == R).float()
 
         pos_ids = positions.view(1, B_local * S_decode)
-        attention_mask = NF.gen_attention_decode_mask(
-            pos_ids=pos_ids.to(torch.float32),
-            bs=B_local,
-            q_head=mask_q_heads,
-            s_active=S_decode,
-            s_prior=S_ctx,
-            start_pos=None,
-            block_len=block_size,
-            local_filled_slots=local_filled,
-            dcp_active_mask=dcp_active_mask if dcp_decode_active else None,
-        )
+        if self.bounded_gather:
+            # Drafter-only fused path: the kernel builds the prior mask on-chip
+            # from pos_ids and early-exits after ceil(max_context_len/tile)
+            # tiles, bounding the prior-KV gather to the active context length
+            # instead of the full max_model_len.
+            if dcp_decode_active:
+                raise NotImplementedError(
+                    "bounded_gather (active-context KV bound) is not supported "
+                    "with DCP decode"
+                )
+            # [1] int32 active-context scalar the kernel expects. batch-max is
+            # correct: the kernel early-exits after ceil(max_context_len/tile)
+            # tiles.
+            max_context_len = (positions.max() + 1).reshape(1).to(torch.int32)
+            attention_mask = None
+        else:
+            attention_mask = NF.gen_attention_decode_mask(
+                pos_ids=pos_ids.to(torch.float32),
+                bs=B_local,
+                q_head=mask_q_heads,
+                s_active=S_decode,
+                s_prior=S_ctx,
+                start_pos=None,
+                block_len=block_size,
+                local_filled_slots=local_filled,
+                dcp_active_mask=dcp_active_mask if dcp_decode_active else None,
+            )
+            # False branch: keep behavior identical to before by passing
+            # pos_ids=None (external mask path) and max_context_len=None.
+            pos_ids = None
+            max_context_len = None
 
         active_blocks_table = block_table
 
@@ -852,6 +875,8 @@ class LlamaAttention(nn.Module):
             K_cache=self.k_cache,
             V_cache=self.v_cache,
             attention_mask=attention_mask,
+            pos_ids=pos_ids,
+            max_context_len=max_context_len,
             # Kernel currently requires fusing the K scale dequantization into softmax scale for KV quantization
             softmax_scale=self.scaling / self.k_scale_float,
             sink=None,
