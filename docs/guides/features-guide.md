@@ -630,14 +630,15 @@ length 3.39) at 2.3x the generation throughput of sequential EAGLE3 with
 the same draft model, because two draft passes replace `K` sequential
 draft-model invocations per step.
 
-**Performance caveat (measured, batch size 1):** on the current stack,
-per-invocation overhead of each draft-model call is large relative to a
-target decode step. At `max_num_seqs=1` every measured speculative
-configuration (parallel and sequential, `K` of 2 and 5, TP8 and TP16) has
-lower generation throughput than running the target model without
-speculation. Enable parallel drafting for acceptance-rate/latency profiles
-only after benchmarking your configuration against a no-speculation
-baseline.
+**Performance caveat (measured, batch size 1):** speculative decoding is
+memory-bandwidth-bound on this stack: the target's verify pass re-streams
+its expert weights for the widened 1+K token window (costing several times
+a single-token decode step), and the draft model adds its own device cost.
+At `max_num_seqs=1` every measured speculative configuration (parallel and
+sequential, `K` of 2 and 5, TP8 and TP16) has lower generation throughput
+than running the target model without speculation. Enable parallel
+drafting only after benchmarking your configuration against a
+no-speculation baseline.
 
 #### Drafter checkpoint requirements
 
