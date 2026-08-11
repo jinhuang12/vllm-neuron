@@ -631,14 +631,15 @@ the same draft model, because two draft passes replace `K` sequential
 draft-model invocations per step.
 
 **Performance caveat (measured, batch size 1):** speculative decoding is
-memory-bandwidth-bound on this stack: the target's verify pass re-streams
-its expert weights for the widened 1+K token window (costing several times
-a single-token decode step), and the draft model adds its own device cost.
-At `max_num_seqs=1` every measured speculative configuration (parallel and
-sequential, `K` of 2 and 5, TP8 and TP16) has lower generation throughput
-than running the target model without speculation. Enable parallel
-drafting only after benchmarking your configuration against a
-no-speculation baseline.
+memory-bandwidth-bound on this stack. Profiling shows the draft model's
+NEFF dominates the decode step: it runs almost entirely DMA-busy,
+re-streaming several gigabytes of weight/KV data per step despite the
+draft model's small compute footprint, and the target's widened verify
+window adds roughly 2x a single-token step on top. At `max_num_seqs=1`
+every measured speculative configuration (parallel and sequential, `K` of
+2 and 5, TP8 and TP16) has lower generation throughput than running the
+target model without speculation. Enable parallel drafting only after
+benchmarking your configuration against a no-speculation baseline.
 
 #### Drafter checkpoint requirements
 
