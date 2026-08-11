@@ -851,9 +851,32 @@ class Eagle3LlamaForCausalLM(nn.Module):
             initial_target_hidden_states
         )
 
-        # P-EAGLE single-pass parallel drafting. Opt-in via parallel_drafting;
+        # P-EAGLE two-pass parallel drafting. Opt-in via parallel_drafting;
         # the sequential recurrent path below is unchanged when the flag is off.
         if self.parallel_drafting:
+            # Pass 1 (KV-prime): run the full incoming window through the
+            # backbone exactly as the sequential path does below, so the
+            # drafter context KV is written from the REAL per-token hidden
+            # states via the in-kernel update_cache path. The hidden-state
+            # outputs are DISCARDED — this pass only primes the KV cache; no
+            # sampling and no recurrent loop. Without it the draft pass alone
+            # (Pass 2) only ever touches bs*K slots seeded from the single
+            # bonus token, so full-prompt (prefill) and interior-accepted
+            # (decode) positions never get real-hidden KV. target_hidden_states
+            # is already fc-combined (above); pass it as-is to avoid a second
+            # combine_hidden_states. Static shapes; unconditional in parallel
+            # mode at both prefill and decode (the incoming attn_metadata
+            # differs by shape only).
+            self.model(
+                input_ids=input_ids,
+                positions=positions,
+                target_hidden_states=target_hidden_states,
+                attn_metadata=attn_metadata,
+                rank=rank,
+            )
+            # Pass 2 (draft): unchanged single-pass parallel drafting — seed
+            # from the bonus token, ptd_token_id + mask_hidden for slots
+            # 1..K-1, positions p..p+K-1.
             return self._forward_parallel(
                 input_ids=input_ids,
                 positions=positions,
