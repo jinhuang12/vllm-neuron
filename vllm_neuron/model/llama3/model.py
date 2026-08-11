@@ -833,6 +833,10 @@ class LlamaAttention(nn.Module):
             # correct: the kernel early-exits after ceil(max_context_len/tile)
             # tiles.
             max_context_len = (positions.max() + 1).reshape(1).to(torch.int32)
+            # The fused-mask kernel path requires float32 pos_ids (see
+            # attention_decode docstring and every other fused caller); the
+            # int64 view above would trip the kernel dtype dispatch.
+            pos_ids = pos_ids.to(torch.float32)
             attention_mask = None
         else:
             attention_mask = NF.gen_attention_decode_mask(
