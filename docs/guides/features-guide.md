@@ -601,14 +601,19 @@ logits to CPU. This requires `on_device_sampling_config` to be set.
 Parallel drafting changes how the draft model produces its `K` speculative
 tokens. Sequential EAGLE3 unrolls `K` draft steps, feeding each drafted
 token back into the draft model for the next step. Parallel drafting
-instead runs the draft model **once**, over `K` slots per request in a
-single masked forward pass: slot 0 holds the real seed token, slots 1
-through `K-1` are filled with the checkpoint's mask token and a learned
-`mask_hidden` state, and all `K` draft tokens come out of that one pass.
-Target-side verification is unchanged: the target model still verifies
-all `K` tokens in one forward pass and the rejection sampler accepts
-tokens sequentially until the first mismatch, exactly as in sequential
-EAGLE3.
+instead produces all `K` draft tokens from one masked draft pass over `K`
+slots per request: slot 0 holds the real seed token, slots 1 through `K-1`
+are filled with the checkpoint's mask token and a learned `mask_hidden`
+state. Each step the draft model runs twice: a KV-prime pass first
+re-processes the incoming window (the prompt at prefill; the verify window
+at decode) with the real per-token target hidden states, so the drafter's
+context KV cache always derives from real hidden states; the masked draft
+pass then produces the `K` tokens. Without the KV-prime pass, context
+positions retain `mask_hidden`-derived KV and acceptance degrades severely
+at every draft position. Target-side verification is unchanged: the target
+model still verifies all `K` tokens in one forward pass and the rejection
+sampler accepts tokens sequentially until the first mismatch, exactly as
+in sequential EAGLE3.
 
 Enable it by adding `"parallel_drafting": true` to `--speculative-config`:
 
@@ -617,12 +622,22 @@ Enable it by adding `"parallel_drafting": true` to `--speculative-config`:
 ```
 
 Tested configuration: GPT-OSS-20B target with the
-`amazon/GPT-OSS-20B-P-EAGLE` draft model, `num_speculative_tokens=2`,
-`--tensor-parallel-size 8`, on Trn2. In this configuration parallel
-drafting reached higher acceptance than sequential EAGLE3 on the same
-draft model (22.8% vs 19.5%) while running 2.64x faster end to end, because
-the single masked pass replaces `K` sequential draft-model invocations
-with one.
+`amazon/GPT-OSS-20B-P-EAGLE` draft model on Trn2. At
+`num_speculative_tokens=5`, `--tensor-parallel-size 16`, offline batched
+generation over MT-Bench prompts, parallel drafting reaches 47.8% overall
+draft acceptance (first-position acceptance rate 0.77, mean acceptance
+length 3.39) at 2.3x the generation throughput of sequential EAGLE3 with
+the same draft model, because two draft passes replace `K` sequential
+draft-model invocations per step.
+
+**Performance caveat (measured, batch size 1):** on the current stack,
+per-invocation overhead of each draft-model call is large relative to a
+target decode step. At `max_num_seqs=1` every measured speculative
+configuration (parallel and sequential, `K` of 2 and 5, TP8 and TP16) has
+lower generation throughput than running the target model without
+speculation. Enable parallel drafting for acceptance-rate/latency profiles
+only after benchmarking your configuration against a no-speculation
+baseline.
 
 #### Drafter checkpoint requirements
 
@@ -644,7 +659,7 @@ the EAGLE3 fusion layer (concatenates target embeddings with the target
 hidden state, double-width QKV, its own `hidden_norm`); any additional
 layers are plain Llama decoder layers chained by residual connections, the
 same dual-mode layout upstream EAGLE3 uses. This applies to both drafting
-modes. For parallel drafting, the single masked pass runs through all
+modes. For parallel drafting, the masked draft pass runs through all
 layers of the backbone: the mask-hidden substitution is applied once, at
 the fusion layer's input, and carries forward through the rest of the
 backbone via the residual stream.
