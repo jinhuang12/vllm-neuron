@@ -288,8 +288,7 @@ def test_two_step_interior_kv_matches_independent_real_projection():
     k_prime, v_prime = _kv_at(caches_prime, ln, 11)
 
     assert torch.allclose(k_full, k_prime, atol=1e-5), (
-        "two-pass interior K-cache must equal the isolated real-window "
-        "KV-prime write"
+        "two-pass interior K-cache must equal the isolated real-window KV-prime write"
     )
     assert torch.allclose(v_full, v_prime, atol=1e-5)
     assert k_prime.abs().sum() > 0
