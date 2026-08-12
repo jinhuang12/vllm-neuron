@@ -24,6 +24,9 @@ from .cache import (
 )
 
 
+_DSA_SCORE_TILE_SIZE = 256
+
+
 def _kernel_assert(condition: bool, error_text: str) -> None:
     assert condition, (
         "[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: " + error_text
@@ -615,9 +618,9 @@ def causal_topk_indices(
     """Return causal DSA positions, padded with -1 when the prefix is short.
 
     Scores match the pinned upstream path: Q and K are independently quantized
-    to e4m3 using UE8M0 power-of-two scales, Q scale is folded into the learned
-    head weights, K scale is applied to each cached key, and per-head scores are
-    summed.
+    to e4m3 using UE8M0 power-of-two scales, each dequantized per-head dot
+    product is scaled and passed through ReLU, and learned head weights reduce
+    the per-head scores.
     """
 
     if queries.ndim != 4:
@@ -630,6 +633,26 @@ def causal_topk_indices(
         raise ValueError("head_weights must have shape [batch, queries, heads]")
     if topk <= 0:
         raise ValueError("topk must be positive")
+
+    if query_positions.ndim == 1:
+        query_positions = query_positions.unsqueeze(0).expand(queries.shape[0], -1)
+    if key_positions.ndim == 1:
+        key_positions = key_positions.unsqueeze(0).expand(keys.shape[0], -1)
+
+    # GLM-5.2 selects up to 2048 keys. When the static key bucket is no wider
+    # than topk, every causal key is selected, so score ranking cannot change
+    # the attention result. Build the selection from absolute positions. This
+    # also handles segmented prefill, whose query positions do not restart at
+    # zero for each segment, without materializing the DSA score graph.
+    if keys.shape[1] <= topk:
+        key_indices = torch.arange(
+            keys.shape[1], dtype=torch.int64, device=keys.device
+        ).view(1, 1, -1)
+        causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(-1)
+        selected = torch.where(causal, key_indices, -torch.ones_like(key_indices))
+        if keys.shape[1] < topk:
+            selected = F.pad(selected, (0, topk - keys.shape[1]), value=-1)
+        return selected
 
     if can_run_kernel(queries):
         q_quant = wrap_nki(_unpack_ue8m0_nki)[1](
@@ -645,61 +668,76 @@ def causal_topk_indices(
         k_quant, k_scale = _quantize_ue8m0_values(keys, eps=1.0e-4)
     batch, query_count, head_count, head_dim = q_quant.shape
     q_for_matmul = q_quant.float().reshape(batch, query_count * head_count, head_dim)
-    k_for_matmul = k_quant.float().transpose(1, 2)
-    scores_per_head = torch.matmul(q_for_matmul, k_for_matmul).reshape(
-        batch, query_count, head_count, keys.shape[1]
-    )
-    scores_per_head = scores_per_head * k_scale.squeeze(-1)[:, None, None, :]
-    folded_head_weights = head_weights.float() * q_scale.squeeze(-1)
-    scale = queries.shape[-1] ** -0.5 * queries.shape[-2] ** -0.5
-    scores = (scores_per_head * folded_head_weights.unsqueeze(-1)).sum(dim=2) * scale
-
-    if query_positions.ndim == 1:
-        query_positions = query_positions.unsqueeze(0).expand(queries.shape[0], -1)
-    if key_positions.ndim == 1:
-        key_positions = key_positions.unsqueeze(0).expand(keys.shape[0], -1)
-    causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(-1)
+    scaled_head_weights = head_weights.float() * queries.shape[-2] ** -0.5
     score_floor = torch.full(
         (),
         torch.finfo(torch.float32).min,
         dtype=torch.float32,
-        device=scores.device,
+        device=queries.device,
     )
-    scores = torch.where(causal, scores, score_floor)
-    valid_positions = causal
 
-    available = min(topk, keys.shape[1])
-    # The pinned rotational NKI kernel requires k < width. Pad short prefixes
-    # to the frozen 4096 score width so top-2048 never enters torch.topk on XLA.
-    nki_score_width = max(keys.shape[1], 4096)
-    if scores.shape[-1] < nki_score_width:
-        pad_width = nki_score_width - scores.shape[-1]
-        score_padding = torch.full(
-            scores.shape[:-1] + (pad_width,),
-            torch.finfo(torch.float32).min,
-            dtype=torch.float32,
-            device=scores.device,
+    # Keep only the current global top-k while visiting fixed-width key tiles.
+    # This bounds the largest QK intermediate to [B, Q, H, 256] instead of
+    # materializing [B, Q, H, T].  The Python loop is over static shapes, so
+    # torch.compile unrolls a fixed graph for each frozen context bucket.
+    candidate_values = None
+    candidate_indices = None
+    candidate_validity = None
+    for key_start in range(0, keys.shape[1], _DSA_SCORE_TILE_SIZE):
+        key_stop = min(key_start + _DSA_SCORE_TILE_SIZE, keys.shape[1])
+        key_tile = k_quant[:, key_start:key_stop]
+        tile_scores_per_head = torch.matmul(
+            q_for_matmul,
+            key_tile.float().transpose(1, 2),
+        ).reshape(batch, query_count, head_count, key_stop - key_start)
+        tile_scores_per_head = tile_scores_per_head * q_scale.squeeze(-1).unsqueeze(-1)
+        tile_scores_per_head = (
+            tile_scores_per_head
+            * k_scale[:, key_start:key_stop].squeeze(-1)[:, None, None, :]
         )
-        validity_padding = torch.zeros(
-            valid_positions.shape[:-1] + (pad_width,),
-            dtype=torch.bool,
-            device=scores.device,
+        tile_scores_per_head = F.relu(tile_scores_per_head * queries.shape[-1] ** -0.5)
+        tile_scores = (tile_scores_per_head * scaled_head_weights.unsqueeze(-1)).sum(
+            dim=2
         )
-        scores = torch.cat((scores, score_padding), dim=-1)
-        valid_positions = torch.cat((valid_positions, validity_padding), dim=-1)
-    _, selected = neuron_topk(
-        scores,
-        k=available,
-        dim=-1,
-        gather_dim=-1,
-    )
-    selected = selected.to(torch.int64)
-    selected_is_valid = torch.gather(valid_positions, -1, selected)
+        tile_key_positions = key_positions[:, None, key_start:key_stop]
+        tile_validity = tile_key_positions <= query_positions.unsqueeze(-1)
+        tile_scores = torch.where(tile_validity, tile_scores, score_floor)
+        tile_indices = torch.arange(
+            key_start,
+            key_stop,
+            dtype=torch.int64,
+            device=keys.device,
+        ).view(1, 1, -1)
+        tile_indices = tile_indices.expand(batch, query_count, -1)
+
+        if candidate_values is None:
+            candidate_values = tile_scores
+            candidate_indices = tile_indices
+            candidate_validity = tile_validity
+        else:
+            candidate_values = torch.cat((candidate_values, tile_scores), dim=-1)
+            candidate_indices = torch.cat((candidate_indices, tile_indices), dim=-1)
+            candidate_validity = torch.cat((candidate_validity, tile_validity), dim=-1)
+
+        if candidate_values.shape[-1] > topk:
+            candidate_values, retained = neuron_topk(
+                candidate_values,
+                k=topk,
+                dim=-1,
+                gather_dim=-1,
+            )
+            retained = retained.to(torch.int64)
+            candidate_indices = torch.gather(candidate_indices, -1, retained)
+            candidate_validity = torch.gather(candidate_validity, -1, retained)
+
+    assert candidate_indices is not None
+    assert candidate_validity is not None
     selected = torch.where(
-        selected_is_valid,
-        selected,
-        -torch.ones_like(selected),
+        candidate_validity,
+        candidate_indices,
+        -torch.ones_like(candidate_indices),
     )
+    available = min(topk, keys.shape[1])
     if available < topk:
         selected = F.pad(selected, (0, topk - available), value=-1)
     return selected

@@ -22,13 +22,18 @@ import vllm_neuron.nn.cpl as cpl_module
 import vllm_neuron.vllm.worker.neuron_model_runner as runner_module
 from vllm_neuron.model.glm_moe_dsa.cache import (
     INDEXER_CACHE_BYTES,
+    INDEXER_CACHE_PART_BYTES,
     MAIN_INDEXER_LAYER_INDICES,
     MLA_CACHE_HEAD_SIZE,
+    MLA_CACHE_PART_SIZE,
     build_glm_mla_cache_spec,
+    gather_paged_cache_pair,
     write_paged_cache,
+    write_paged_cache_pair,
 )
 from vllm_neuron.model.glm_moe_dsa.config import GlmMoeDsaConfig
 from vllm_neuron.model.glm_moe_dsa.factory import GlmMoeDsaForCausalLM
+from vllm_neuron.model.glm_moe_dsa.indexer import pack_indexer_keys
 from vllm_neuron.model.glm_moe_dsa.model import (
     GlmMoeDsaDecoderLayer,
     WeightLoadReport,
@@ -235,10 +240,12 @@ def _tiny_bound_model() -> GlmMoeDsaModelForCausalLM:
     model = GlmMoeDsaModelForCausalLM(_tiny_config(), 1)
     layer = model.model.layers[0]
     layer.mla_k_cache = torch.zeros(
-        2, 1, 4, MLA_CACHE_HEAD_SIZE, dtype=torch.float8_e4m3fn
+        2, 1, 4, MLA_CACHE_PART_SIZE, dtype=torch.float8_e4m3fn
     )
     layer.mla_v_cache = torch.zeros_like(layer.mla_k_cache)
-    layer.indexer_k_cache = torch.zeros(2, 1, 4, INDEXER_CACHE_BYTES, dtype=torch.uint8)
+    layer.indexer_k_cache = torch.zeros(
+        2, 1, 4, INDEXER_CACHE_PART_BYTES, dtype=torch.uint8
+    )
     layer.indexer_v_cache = torch.zeros_like(layer.indexer_k_cache)
     return model
 
@@ -246,7 +253,7 @@ def _tiny_bound_model() -> GlmMoeDsaModelForCausalLM:
 def test_prefill_writes_only_scheduler_slot_mapping() -> None:
     model = _tiny_bound_model()
     layer = model.model.layers[0]
-    before = layer.mla_k_cache.clone()
+    mla_before = (layer.mla_k_cache.clone(), layer.mla_v_cache.clone())
     model(
         torch.tensor([1, 2, 3]),
         torch.tensor([0, 1, 2]),
@@ -255,13 +262,13 @@ def test_prefill_writes_only_scheduler_slot_mapping() -> None:
         ),
         sampling_positions=torch.tensor([2]),
     )
-    changed = (layer.mla_k_cache != before).any(dim=-1).squeeze(1)
-    assert changed.flatten().nonzero().flatten().tolist() == [1, 5]
-    assert layer.indexer_k_cache.flatten(0, 2).any(
-        dim=-1
-    ).nonzero().flatten().tolist() == [1, 5]
-    assert torch.count_nonzero(layer.mla_v_cache.float()) == 0
-    assert torch.count_nonzero(layer.indexer_v_cache) == 0
+    for cache, before in zip(
+        (layer.mla_k_cache, layer.mla_v_cache), mla_before, strict=True
+    ):
+        changed = (cache != before).any(dim=-1).squeeze(1)
+        assert changed.flatten().nonzero().flatten().tolist() == [1, 5]
+    for cache in (layer.indexer_k_cache, layer.indexer_v_cache):
+        assert cache.flatten(0, 2).any(dim=-1).nonzero().flatten().tolist() == [1, 5]
 
 
 def test_sentinel_cannot_overwrite_a_valid_final_cache_slot() -> None:
@@ -293,6 +300,25 @@ def test_sentinel_cannot_overwrite_a_valid_final_cache_slot() -> None:
     )
     assert torch.equal(indexer_cache[1, 0, 31], indexer_values[0])
     assert torch.count_nonzero(indexer_cache) == 4
+
+
+def test_paired_cache_round_trip_preserves_logical_payload_and_slots() -> None:
+    k_cache = torch.zeros(3, 1, 4, 3, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    values = torch.arange(24, dtype=torch.bfloat16).reshape(4, 6)
+    slots = torch.tensor([8, 9, -1, 3], dtype=torch.int64)
+
+    write_paged_cache_pair(k_cache, v_cache, values, slots, block_size=4)
+    gathered = gather_paged_cache_pair(
+        k_cache,
+        v_cache,
+        torch.tensor([[2, 0, -1]], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(gathered[0, :2], values[:2])
+    torch.testing.assert_close(gathered[0, 4 + 3], values[3])
+    assert torch.count_nonzero(gathered[0, 2:4]) == 0
+    assert torch.count_nonzero(gathered[0, 8:]) == 0
 
 
 def test_prior_cache_changes_one_token_decode_logits() -> None:
@@ -332,10 +358,12 @@ def test_two_request_cache_slots_are_isolated() -> None:
     model = _tiny_bound_model()
     layer = model.model.layers[0]
     layer.mla_k_cache = torch.zeros(
-        4, 1, 4, MLA_CACHE_HEAD_SIZE, dtype=torch.float8_e4m3fn
+        4, 1, 4, MLA_CACHE_PART_SIZE, dtype=torch.float8_e4m3fn
     )
     layer.mla_v_cache = torch.full_like(layer.mla_k_cache, 17)
-    layer.indexer_k_cache = torch.zeros(4, 1, 4, INDEXER_CACHE_BYTES, dtype=torch.uint8)
+    layer.indexer_k_cache = torch.zeros(
+        4, 1, 4, INDEXER_CACHE_PART_BYTES, dtype=torch.uint8
+    )
     layer.indexer_v_cache = torch.full_like(layer.indexer_k_cache, 19)
     meta = _paged_meta(
         torch.tensor([12, 13, 0, -1]),
@@ -357,8 +385,10 @@ def test_two_request_cache_slots_are_isolated() -> None:
     changed = layer.mla_k_cache.flatten(0, 2).any(dim=-1)
     assert changed.nonzero().flatten().tolist() == [0, 12, 13]
     assert not torch.equal(layer.mla_k_cache[3, 0, 0], layer.mla_k_cache[0, 0, 0])
-    assert torch.all(layer.mla_v_cache == 17)
-    assert torch.all(layer.indexer_v_cache == 19)
+    assert torch.all(layer.mla_v_cache.flatten(0, 2)[1:12] == 17)
+    assert torch.all(layer.indexer_v_cache.flatten(0, 2)[1:12] == 19)
+    assert torch.any(layer.mla_v_cache.flatten(0, 2)[[0, 12, 13]] != 17)
+    assert torch.any(layer.indexer_v_cache.flatten(0, 2)[[0, 12, 13]] != 19)
     decode_meta = _paged_meta(
         torch.tensor([14, 1]), max_query_len=1, cached_seq_len=torch.tensor([2, 1])
     )
@@ -391,6 +421,242 @@ def test_two_request_cache_slots_are_isolated() -> None:
     assert not torch.equal(request1_changed[1], baseline[1])
     torch.testing.assert_close(request0_changed[1], baseline[1])
     assert not torch.equal(request0_changed[0], baseline[0])
+
+
+def test_four_512_prefills_preserve_paged_indexer_cache_and_absolute_selection(
+    monkeypatch,
+) -> None:
+    """The <=2048 bypass keeps request-local index K cache state complete."""
+
+    torch.manual_seed(53)
+    config = _tiny_config()
+    config.index_topk = 2048
+    layer = GlmMoeDsaDecoderLayer(
+        config,
+        0,
+        tensor_parallel_size=1,
+        expert_parallel_size=1,
+        expert_parallel_rank=0,
+    )
+
+    block_size = 32
+    logical_block_count = 2048 // block_size
+    request_count = 2
+    physical_block_count = logical_block_count * request_count + 9
+    request_blocks = torch.stack(
+        (
+            torch.arange(65, 129, dtype=torch.int64).roll(11),
+            torch.arange(1, 65, dtype=torch.int64).roll(23),
+        )
+    )
+    assert torch.all(request_blocks > 0)
+    assert not torch.equal(request_blocks[0], torch.arange(65, 129))
+    assert not torch.equal(request_blocks[1], torch.arange(1, 65))
+    assert not set(request_blocks[0].tolist()) & set(request_blocks[1].tolist())
+
+    layer.mla_k_cache = torch.zeros(
+        physical_block_count,
+        1,
+        block_size,
+        MLA_CACHE_PART_SIZE,
+        dtype=torch.float8_e4m3fn,
+    )
+    layer.mla_v_cache = torch.zeros_like(layer.mla_k_cache)
+    layer.indexer_k_cache = torch.zeros(
+        physical_block_count,
+        1,
+        block_size,
+        INDEXER_CACHE_PART_BYTES,
+        dtype=torch.uint8,
+    )
+    layer.indexer_v_cache = torch.zeros_like(layer.indexer_k_cache)
+
+    def skip_attention(
+        queries: torch.Tensor,
+        latent_cache: torch.Tensor,
+        selected_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        del latent_cache, selected_indices
+        return torch.zeros(
+            queries.shape[0],
+            queries.shape[1],
+            config.hidden_size,
+            dtype=queries.dtype,
+            device=queries.device,
+        )
+
+    monkeypatch.setattr(layer.self_attn, "attend", skip_attention)
+    indexer = layer.self_attn.indexer
+    assert indexer is not None
+    original_gather = model_module.gather_paged_cache_pair
+    indexer_gathers: list[torch.Tensor] = []
+    mla_gather_shapes: list[torch.Size] = []
+
+    def record_gather(
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        gathered = original_gather(k_cache, v_cache, block_table)
+        if k_cache.shape[-1] == INDEXER_CACHE_PART_BYTES:
+            indexer_gathers.append(gathered.detach().clone())
+        elif k_cache.shape[-1] == MLA_CACHE_PART_SIZE:
+            mla_gather_shapes.append(gathered.shape)
+        return gathered
+
+    monkeypatch.setattr(model_module, "gather_paged_cache_pair", record_gather)
+    original_project = indexer.project
+    original_select = indexer.select
+    packed_keys: list[torch.Tensor] = []
+
+    def record_packed_keys(*args, **kwargs):
+        projection = original_project(*args, **kwargs)
+        packed_keys.append(pack_indexer_keys(projection.keys).detach().clone())
+        return projection
+
+    monkeypatch.setattr(indexer, "project", record_packed_keys)
+
+    def select_without_scoring(*args, **kwargs):
+        def fail_if_dsa_scores(*score_args, **score_kwargs):
+            del score_args, score_kwargs
+            raise AssertionError("the <=2048 causal bypass must not score index QK")
+
+        with patch.object(torch, "matmul", side_effect=fail_if_dsa_scores):
+            return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "select", select_without_scoring)
+    positions = torch.arange(2048, dtype=torch.int64)
+    prior_slots = torch.empty(0, dtype=torch.int64)
+    prior_rows = torch.empty(0, INDEXER_CACHE_BYTES, dtype=torch.uint8)
+    assigned_blocks = set(request_blocks.flatten().tolist())
+    unused_blocks = sorted(set(range(physical_block_count)) - assigned_blocks)
+
+    for segment in range(4):
+        start = segment * 512
+        stop = start + 512
+        chunk_positions = positions[start:stop].expand(request_count, -1)
+        hidden_states = torch.stack(
+            (
+                F.one_hot((positions[start:stop] + 1) % 16, num_classes=16),
+                F.one_hot((positions[start:stop] + 7) % 16, num_classes=16),
+            )
+        ).to(torch.bfloat16)
+
+        logical_positions = positions[start:stop]
+        logical_pages = logical_positions // block_size
+        offsets = logical_positions % block_size
+        slot_mapping = (
+            request_blocks[:, logical_pages] * block_size + offsets
+        ).reshape(-1)
+        filled_blocks = (stop + block_size - 1) // block_size
+        block_table = torch.full(
+            (request_count, logical_block_count),
+            -1,
+            dtype=torch.int32,
+        )
+        block_table[:, :filled_blocks] = request_blocks[:, :filled_blocks].to(
+            torch.int32
+        )
+        assert torch.all(block_table[:, filled_blocks:] == -1)
+
+        metadata = {
+            "slot_mapping": slot_mapping,
+            "block_size": block_size,
+            "block_table_tensor": block_table,
+            "max_query_len": 512,
+            "decode_token_threshold": 1,
+            "cached_seq_len": torch.full((request_count,), start, dtype=torch.int32),
+        }
+        attn_metadata = {
+            "model.layers.0.self_attn.mla_cache": metadata,
+            "model.layers.0.self_attn.indexer.k_cache": dict(metadata),
+        }
+
+        _, selected_indices = layer(
+            hidden_states,
+            chunk_positions,
+            attn_metadata=attn_metadata,
+        )
+
+        assert len(packed_keys) == segment + 1
+        assert len(indexer_gathers) == segment + 1
+        assert len(mla_gather_shapes) == segment + 1
+        assert mla_gather_shapes[-1] == torch.Size(
+            (request_count, 2048, MLA_CACHE_HEAD_SIZE)
+        )
+        expected_packed = packed_keys[-1].reshape(
+            request_count, 512, INDEXER_CACHE_BYTES
+        )
+        assert not torch.equal(expected_packed[0], expected_packed[1])
+        for request_index in range(request_count):
+            physical_slots = slot_mapping.view(request_count, 512)[request_index]
+            actual_rows = torch.cat(
+                (
+                    layer.indexer_k_cache.flatten(0, 2)[physical_slots],
+                    layer.indexer_v_cache.flatten(0, 2)[physical_slots],
+                ),
+                dim=-1,
+            )
+            assert torch.equal(actual_rows, expected_packed[request_index])
+            assert torch.count_nonzero(actual_rows) > 0
+
+        gathered_indexer = indexer_gathers[-1]
+        assert gathered_indexer.shape == (
+            request_count,
+            2048,
+            INDEXER_CACHE_BYTES,
+        )
+        expected_logical_prefix = torch.cat(
+            [
+                chunk.reshape(request_count, 512, INDEXER_CACHE_BYTES)
+                for chunk in packed_keys
+            ],
+            dim=1,
+        )
+        assert torch.equal(gathered_indexer[:, :stop], expected_logical_prefix)
+        assert torch.count_nonzero(gathered_indexer[:, stop:]) == 0
+
+        flat_cache = torch.cat(
+            (
+                layer.indexer_k_cache.flatten(0, 2),
+                layer.indexer_v_cache.flatten(0, 2),
+            ),
+            dim=-1,
+        )
+        assert torch.equal(flat_cache[prior_slots], prior_rows)
+        prior_slots = torch.cat((prior_slots, slot_mapping))
+        prior_rows = flat_cache[prior_slots].clone()
+
+        expected_indices = torch.arange(2048).view(1, 1, -1)
+        expected_selection = torch.where(
+            expected_indices <= chunk_positions.unsqueeze(-1),
+            expected_indices,
+            -torch.ones_like(expected_indices),
+        )
+        assert torch.equal(selected_indices, expected_selection)
+        assert torch.all(selected_indices[..., stop:] == -1)
+        future_blocks = request_blocks[:, filled_blocks:].flatten()
+        assert torch.count_nonzero(layer.indexer_k_cache[future_blocks]) == 0
+        assert torch.count_nonzero(layer.indexer_v_cache[future_blocks]) == 0
+        assert torch.count_nonzero(layer.indexer_k_cache[unused_blocks]) == 0
+        assert torch.count_nonzero(layer.indexer_v_cache[unused_blocks]) == 0
+
+    request_0_rows = torch.cat(
+        (
+            layer.indexer_k_cache[request_blocks[0], 0].flatten(0, 1),
+            layer.indexer_v_cache[request_blocks[0], 0].flatten(0, 1),
+        ),
+        dim=-1,
+    )
+    request_1_rows = torch.cat(
+        (
+            layer.indexer_k_cache[request_blocks[1], 0].flatten(0, 1),
+            layer.indexer_v_cache[request_blocks[1], 0].flatten(0, 1),
+        ),
+        dim=-1,
+    )
+    assert not torch.equal(request_0_rows, request_1_rows)
+    assert torch.count_nonzero(layer.indexer_v_cache) > 0
 
 
 def test_metadata_controls_prefill_decode_dispatch_not_token_count() -> None:
@@ -493,16 +759,20 @@ def test_runner_forward_signature_and_cache_binding(production_model) -> None:
     mla = [layer for layer in spec.layers if layer.name.endswith("mla_cache")]
     indexer = [layer for layer in spec.layers if layer.name.endswith("indexer.k_cache")]
     assert len(mla) == 78
-    assert all(layer.head_size == MLA_CACHE_HEAD_SIZE for layer in mla)
+    assert all(layer.head_size == MLA_CACHE_PART_SIZE for layer in mla)
     assert len(indexer) == len(MAIN_INDEXER_LAYER_INDICES)
-    assert all(layer.head_size == INDEXER_CACHE_BYTES for layer in indexer)
+    assert all(layer.head_size == INDEXER_CACHE_PART_BYTES for layer in indexer)
 
     caches = {layer.name: [torch.empty(1), torch.empty(1)] for layer in spec.layers}
     production_model.bind_kv_cache(caches)
     first = production_model.model.layers[0]
     assert first.mla_k_cache is caches["model.layers.0.self_attn.mla_cache"][0]
+    assert first.mla_v_cache is caches["model.layers.0.self_attn.mla_cache"][1]
     assert (
         first.indexer_k_cache is caches["model.layers.0.self_attn.indexer.k_cache"][0]
+    )
+    assert (
+        first.indexer_v_cache is caches["model.layers.0.self_attn.indexer.k_cache"][1]
     )
     with pytest.raises(ValueError, match="not initialized"):
         production_model.bind_kv_cache({})
@@ -540,10 +810,10 @@ def test_runner_fp8_cache_inventory_preserves_packed_indexer_dtype() -> None:
         * torch.empty((), dtype=spec.dtype).element_size()
         for spec in inventory.values()
     )
-    assert bytes_per_token_rank == 95_400
+    assert bytes_per_token_rank == 47_700
     observed_cache_byte_budget = 7_106_918_400
     token_capacity = observed_cache_byte_budget // bytes_per_token_rank
-    assert token_capacity == 74_496
+    assert token_capacity == 148_992
     assert token_capacity >= 2_048 * 32
 
 

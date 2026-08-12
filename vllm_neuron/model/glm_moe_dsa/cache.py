@@ -3,8 +3,8 @@
 
 The main attention cache stores one normalized 512-wide latent vector and one
 64-wide rotary key per token.  Indexer layers store one packed FP8 key plus a
-four-byte FP32 inverse scale.  The two cache kinds remain separate so vLLM can
-plan their memory independently.
+four-byte FP32 inverse scale.  Each logical payload is split evenly across the
+physical K and V tensors that vLLM allocates for one LayerSpec.
 """
 
 from __future__ import annotations
@@ -22,8 +22,10 @@ from vllm_neuron.nki.nki_hop import can_run_kernel, wrap_nki
 
 MAIN_LAYER_COUNT = 78
 MLA_CACHE_HEAD_SIZE = 576
+MLA_CACHE_PART_SIZE = MLA_CACHE_HEAD_SIZE // 2
 INDEXER_KEY_DIM = 128
 INDEXER_CACHE_BYTES = 132
+INDEXER_CACHE_PART_BYTES = INDEXER_CACHE_BYTES // 2
 MAIN_INDEXER_LAYER_INDICES = (
     0,
     1,
@@ -197,6 +199,54 @@ def gather_paged_cache(
     return pages.flatten(1, 2)
 
 
+def write_paged_cache_pair(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    values: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Split one logical payload evenly across paired paged-cache tensors."""
+
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("paired cache tensors must have identical shapes")
+    part_size = k_cache.shape[-1]
+    if values.shape[-1] != part_size * 2:
+        raise ValueError(
+            f"logical cache width must be twice physical width {part_size}"
+        )
+    write_paged_cache(
+        k_cache,
+        values[..., :part_size].contiguous(),
+        slot_mapping,
+        block_size,
+    )
+    write_paged_cache(
+        v_cache,
+        values[..., part_size:].contiguous(),
+        slot_mapping,
+        block_size,
+    )
+
+
+def gather_paged_cache_pair(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+) -> torch.Tensor:
+    """Reassemble one logical payload from paired paged-cache tensors."""
+
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("paired cache tensors must have identical shapes")
+    return torch.cat(
+        (
+            gather_paged_cache(k_cache, block_table),
+            gather_paged_cache(v_cache, block_table),
+        ),
+        dim=-1,
+    )
+
+
 def build_glm_mla_cache_spec(
     *,
     dtype: torch.dtype = torch.bfloat16,
@@ -212,7 +262,7 @@ def build_glm_mla_cache_spec(
         LayerSpec(
             name=f"{prefix}.{layer}.self_attn.mla_cache",
             num_kv_heads=1,
-            head_size=MLA_CACHE_HEAD_SIZE,
+            head_size=MLA_CACHE_PART_SIZE,
             dtype=dtype,
         )
         for layer in range(MAIN_LAYER_COUNT)
@@ -221,7 +271,7 @@ def build_glm_mla_cache_spec(
         LayerSpec(
             name=f"{prefix}.{layer}.self_attn.indexer.k_cache",
             num_kv_heads=1,
-            head_size=INDEXER_CACHE_BYTES,
+            head_size=INDEXER_CACHE_PART_BYTES,
             dtype=torch.uint8,
         )
         for layer in MAIN_INDEXER_LAYER_INDICES

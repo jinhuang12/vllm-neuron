@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import vllm_neuron.model.glm_moe_dsa.indexer as indexer_module
 from vllm_neuron.model.glm_moe_dsa.attention import (
     GlmMoeDsaAttention,
     _sparse_score_matmul,
@@ -23,8 +24,10 @@ from vllm_neuron.model.glm_moe_dsa.block_fp8 import (
 )
 from vllm_neuron.model.glm_moe_dsa.cache import (
     INDEXER_CACHE_BYTES,
+    INDEXER_CACHE_PART_BYTES,
     MAIN_INDEXER_LAYER_INDICES,
     MLA_CACHE_HEAD_SIZE,
+    MLA_CACHE_PART_SIZE,
     DualCacheState,
     build_glm_mla_cache_spec,
 )
@@ -597,7 +600,7 @@ def test_causal_topk_matches_independent_score_reference() -> None:
         head_weights,
         query_positions,
         key_positions,
-        topk=5,
+        topk=2,
     )
 
     expected_rows = []
@@ -607,21 +610,43 @@ def test_causal_topk_matches_independent_score_reference() -> None:
     k_absmax = keys.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
     k_scale = torch.exp2(torch.ceil(torch.log2(k_absmax / 448.0)))
     k_quant = (keys / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    score_scale = 4**-0.5 * 2**-0.5
     for query in range(3):
         score = torch.zeros(5)
         for head in range(2):
-            score += (q_quant[0, query, head].float() @ k_quant[0].float().T) * (
-                head_weights[0, query, head]
-                * q_scale[0, query, head, 0]
-                * k_scale[0, :, 0]
+            # Transformers computes ReLU on each scaled head score before
+            # applying the learned head weight and reducing across heads.
+            per_head = (q_quant[0, query, head].float() @ k_quant[0].float().T) * (
+                q_scale[0, query, head, 0] * k_scale[0, :, 0] * 4**-0.5
             )
-        score *= score_scale
+            score += torch.relu(per_head) * (head_weights[0, query, head] * 2**-0.5)
         score[key_positions[0] > query_positions[0, query]] = float("-inf")
-        values, indices = torch.topk(score, 5)
+        values, indices = torch.topk(score, 2)
         expected_rows.append(torch.where(torch.isfinite(values), indices, -1))
     expected = torch.stack(expected_rows).unsqueeze(0)
     assert torch.equal(actual, expected)
+
+
+def test_causal_topk_applies_relu_before_head_reduction() -> None:
+    """Counterexample for the pre-fix signed per-head score reduction."""
+
+    queries = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
+    keys = torch.tensor([[[-10.0, -20.0], [1.0, 0.0]]])
+    head_weights = torch.tensor([[[1.0, -1.0]]])
+    positions = torch.tensor([[1]])
+    key_positions = torch.tensor([[0, 1]])
+
+    actual = causal_topk_indices(
+        queries,
+        keys,
+        head_weights,
+        positions,
+        key_positions,
+        topk=1,
+    )
+
+    # Upstream ReLU removes both negative scores for key 0, so key 1 wins.
+    # The old signed reduction ranked key 0 first: -10 - (-20) > 1 - 0.
+    assert torch.equal(actual, torch.tensor([[[1]]]))
 
 
 def test_pinned_ue8m0_top2048_membership_probe() -> None:
@@ -650,12 +675,113 @@ def test_pinned_ue8m0_top2048_membership_probe() -> None:
     k_quant = (keys / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     logits = torch.zeros(4096)
     for head in range(32):
-        logits += (q_quant[0, 0, head].float() @ k_quant[0].float().T) * (
-            head_weights[0, 0, head] * q_scale[0, 0, head, 0] * k_scale[0, :, 0]
+        per_head = (q_quant[0, 0, head].float() @ k_quant[0].float().T) * (
+            q_scale[0, 0, head, 0] * k_scale[0, :, 0] * 128**-0.5
         )
-    logits *= 128**-0.5 * 32**-0.5
+        logits += torch.relu(per_head) * (head_weights[0, 0, head] * 32**-0.5)
     expected = torch.topk(logits, 2048).indices
-    assert torch.equal(actual[0, 0], expected)
+    assert torch.equal(actual[0, 0].sort().values, expected.sort().values)
+
+
+def test_long_context_dsa_streams_exact_scores_in_bounded_key_tiles(
+    monkeypatch,
+) -> None:
+    """>2048 DSA preserves exact top-k without a full-width QK tensor."""
+
+    torch.manual_seed(2049)
+    queries = torch.randn(1, 2, 2, 128)
+    keys = torch.randn(1, 2305, 128)
+    head_weights = torch.randn(1, 2, 2)
+    query_positions = torch.tensor([[1023, 2304]])
+    key_positions = torch.arange(2305).unsqueeze(0)
+    topk = 16
+
+    q_absmax = queries.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-10)
+    q_scale = torch.exp2(torch.ceil(torch.log2(q_absmax / 448.0)))
+    q_quant = (queries / q_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    k_absmax = keys.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
+    k_scale = torch.exp2(torch.ceil(torch.log2(k_absmax / 448.0)))
+    k_quant = (keys / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    direct_scores = torch.zeros(1, 2, 2305)
+    for query in range(2):
+        for head in range(2):
+            per_head = (q_quant[0, query, head].float() @ k_quant[0].float().T) * (
+                q_scale[0, query, head, 0] * k_scale[0, :, 0] * 128**-0.5
+            )
+            direct_scores[0, query] += torch.relu(per_head) * (
+                head_weights[0, query, head] * 2**-0.5
+            )
+    direct_scores = direct_scores.masked_fill(
+        key_positions.unsqueeze(1) > query_positions.unsqueeze(-1),
+        torch.finfo(torch.float32).min,
+    )
+    expected = torch.topk(direct_scores, topk, dim=-1).indices
+
+    direct_matmul = torch.matmul
+    qk_widths = []
+
+    def recording_matmul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        qk_widths.append(rhs.shape[-1])
+        return direct_matmul(lhs, rhs)
+
+    original_topk = indexer_module.neuron_topk
+    merge_widths = []
+
+    def recording_topk(tensor: torch.Tensor, *args, **kwargs):
+        merge_widths.append(tensor.shape[-1])
+        return original_topk(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "matmul", recording_matmul)
+    monkeypatch.setattr(indexer_module, "neuron_topk", recording_topk)
+    actual = causal_topk_indices(
+        queries,
+        keys,
+        head_weights,
+        query_positions,
+        key_positions,
+        topk=topk,
+    )
+
+    assert torch.equal(actual.sort().values, expected.sort().values)
+    assert max(qk_widths) == 256
+    assert max(merge_widths) <= topk + 256
+    assert len(qk_widths) == 10
+
+
+def test_causal_topk_bypasses_scores_for_four_absolute_prefill_segments(
+    monkeypatch,
+) -> None:
+    """Four 512-token segments select absolute causal indices through 2048."""
+
+    def fail_if_scored(*args, **kwargs):
+        raise AssertionError("the <=2048 causal bypass must not score QK")
+
+    monkeypatch.setattr(torch, "matmul", fail_if_scored)
+    keys = torch.zeros(1, 2048, 2)
+    key_positions = torch.arange(2048).unsqueeze(0)
+
+    for segment in range(4):
+        start = segment * 512
+        stop = start + 512
+        query_positions = torch.arange(start, stop).unsqueeze(0)
+        queries = torch.zeros(1, 512, 1, 2)
+        head_weights = torch.ones(1, 512, 1)
+        selected = causal_topk_indices(
+            queries,
+            keys,
+            head_weights,
+            query_positions,
+            key_positions,
+            topk=2048,
+        )
+
+        expected_indices = torch.arange(2048).view(1, 1, -1)
+        expected = torch.where(
+            expected_indices <= query_positions.unsqueeze(-1),
+            expected_indices,
+            -torch.ones_like(expected_indices),
+        )
+        assert torch.equal(selected, expected)
 
 
 def test_cache_spec_has_separate_mla_and_indexer_entries_and_no_mtp() -> None:
@@ -664,10 +790,10 @@ def test_cache_spec_has_separate_mla_and_indexer_entries_and_no_mtp() -> None:
     indexer = [layer for layer in spec.layers if layer.name.endswith("indexer.k_cache")]
     assert len(mla) == 78
     assert all(layer.num_kv_heads == 1 for layer in mla)
-    assert all(layer.head_size == MLA_CACHE_HEAD_SIZE for layer in mla)
+    assert all(layer.head_size == MLA_CACHE_PART_SIZE for layer in mla)
     assert all(layer.dtype is torch.bfloat16 for layer in mla)
     assert len(indexer) == len(MAIN_INDEXER_LAYER_INDICES) == 21
-    assert all(layer.head_size == INDEXER_CACHE_BYTES for layer in indexer)
+    assert all(layer.head_size == INDEXER_CACHE_PART_BYTES for layer in indexer)
     assert all(layer.dtype is torch.uint8 for layer in indexer)
     assert not any("layers.78." in layer.name for layer in spec.layers)
 
@@ -1258,6 +1384,71 @@ def test_neuron_compile_and_execute_production_block_fp8_cached_expansion() -> N
         torch.testing.assert_close(
             actual_tensor.float(), expected_tensor.float(), rtol=0.13, atol=0.08
         )
+
+
+@pytest.mark.skipif(
+    os.environ.get("GLM_STAGE3_RUN_NEURON_COMPILE") != "1",
+    reason="explicit scoped Neuron compile smoke",
+)
+def test_neuron_compile_and_execute_long_context_streaming_dsa() -> None:
+    """Compile the smallest production-shaped >2048 DSA selection graph."""
+
+    class StreamingDsaSmoke(torch.nn.Module):
+        def forward(
+            self,
+            queries,
+            keys,
+            head_weights,
+            query_positions,
+            key_positions,
+        ):
+            return causal_topk_indices(
+                queries,
+                keys,
+                head_weights,
+                query_positions,
+                key_positions,
+                topk=2048,
+            )
+
+    torch.manual_seed(2050)
+    queries = torch.randn(1, 1, 32, 128, dtype=torch.bfloat16)
+    keys = torch.randn(1, 4096, 128, dtype=torch.bfloat16)
+    head_weights = torch.randn(1, 1, 32, dtype=torch.bfloat16)
+    query_positions = torch.tensor([[4095]], dtype=torch.int64)
+    key_positions = torch.arange(4096, dtype=torch.int64).unsqueeze(0)
+    smoke = StreamingDsaSmoke()
+    expected = smoke(
+        queries,
+        keys,
+        head_weights,
+        query_positions,
+        key_positions,
+    )
+
+    device = torch.device("neuron:0")
+    compiled = torch.compile(
+        smoke.to(device),
+        backend="vllm_neuron",
+        fullgraph=True,
+        dynamic=False,
+        options={
+            "compiler_workdir": os.path.join(
+                os.environ["GLM_STAGE3_COMPILE_DIR"],
+                "long_context_streaming_dsa",
+            )
+        },
+    )
+    actual = compiled(
+        queries.to(device),
+        keys.to(device),
+        head_weights.to(device),
+        query_positions.to(device),
+        key_positions.to(device),
+    ).cpu()
+
+    assert actual.shape == (1, 1, 2048)
+    assert torch.equal(actual.sort().values, expected.sort().values)
 
 
 @pytest.mark.skipif(

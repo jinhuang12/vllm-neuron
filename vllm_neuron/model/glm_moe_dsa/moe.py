@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import nki
 import nki.language as nl
 import torch
@@ -20,8 +22,12 @@ import vllm_neuron.functional as NF
 from vllm_neuron.nki.nki_hop import can_run_kernel, wrap_nki
 
 from .block_fp8 import BlockFP8Linear
+from .block_fp8_moe import selective_block_fp8_moe_nki
 from .config import GlmMoeDsaConfig
 from .mlp import GlmMoeDsaSwiGLUMLP
+
+
+_SELECTIVE_BLOCK_FP8_ENV = "GLM_ENABLE_EXPERIMENTAL_SELECTIVE_FP8_MOE"
 
 
 class _SingleRankMoEGroup:
@@ -265,6 +271,202 @@ class GlmMoeDsaRoutedExperts(nn.Module):
             output = output + self.experts[local_id](hidden_states) * weight
         return output
 
+    @property
+    def _uses_block_fp8(self) -> bool:
+        return isinstance(self.experts[0].gate_proj, BlockFP8Linear)
+
+    def _block_fp8_contract_violations(
+        self,
+        hidden_states: torch.Tensor,
+        affinities: torch.Tensor,
+    ) -> list[str]:
+        """Return reasons the production selective kernel cannot run."""
+
+        violations = []
+        if self.num_experts != 256:
+            violations.append(f"num_experts={self.num_experts}, expected 256")
+        if self.top_k != 8:
+            violations.append(f"top_k={self.top_k}, expected 8")
+        if self.expert_parallel_size != 64:
+            violations.append(
+                f"expert_parallel_size={self.expert_parallel_size}, expected 64"
+            )
+        if self.num_local_experts != 4:
+            violations.append(f"num_local_experts={self.num_local_experts}, expected 4")
+        if self.hidden_size != 6144:
+            violations.append(f"hidden_size={self.hidden_size}, expected 6144")
+        if self.intermediate_size != 2048:
+            violations.append(
+                f"intermediate_size={self.intermediate_size}, expected 2048"
+            )
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != self.hidden_size:
+            violations.append(
+                f"hidden_states.shape={tuple(hidden_states.shape)}, expected [T,6144]"
+            )
+        elif not 1 <= hidden_states.shape[0] <= 512:
+            violations.append(
+                f"token_count={hidden_states.shape[0]}, expected a value in 1..512"
+            )
+        if hidden_states.dtype is not torch.bfloat16:
+            violations.append(
+                f"hidden_states.dtype={hidden_states.dtype}, expected torch.bfloat16"
+            )
+        if tuple(affinities.shape) != (hidden_states.shape[0], self.num_experts):
+            violations.append(
+                f"affinities.shape={tuple(affinities.shape)}, expected "
+                f"[{hidden_states.shape[0]},256]"
+            )
+
+        for local_id, expert in enumerate(self.experts):
+            projections = {
+                "gate": expert.gate_proj,
+                "up": expert.up_proj,
+                "down": expert.down_proj,
+            }
+            all_block_fp8 = True
+            for name, projection in projections.items():
+                if not isinstance(projection, BlockFP8Linear):
+                    violations.append(f"expert {local_id} {name} is not block FP8")
+                    all_block_fp8 = False
+                    continue
+                if projection.weight.dtype is not torch.float8_e4m3fn:
+                    violations.append(
+                        f"expert {local_id} {name} weight dtype is "
+                        f"{projection.weight.dtype}, expected float8_e4m3fn"
+                    )
+                if projection.weight_scale_inv.dtype is not torch.float32:
+                    violations.append(
+                        f"expert {local_id} {name} scale dtype is "
+                        f"{projection.weight_scale_inv.dtype}, expected float32"
+                    )
+                if projection.row_offset != 0 or projection.col_offset != 0:
+                    violations.append(
+                        f"expert {local_id} {name} uses nonzero block offsets"
+                    )
+            if not all_block_fp8:
+                continue
+            expected_gate_shape = (self.intermediate_size, self.hidden_size)
+            expected_down_shape = (self.hidden_size, self.intermediate_size)
+            expected_gate_scale_shape = (
+                self.intermediate_size // 128,
+                self.hidden_size // 128,
+            )
+            expected_down_scale_shape = (
+                self.hidden_size // 128,
+                self.intermediate_size // 128,
+            )
+            if tuple(expert.gate_proj.weight.shape) != expected_gate_shape:
+                violations.append(f"expert {local_id} gate weight shape mismatch")
+            if tuple(expert.up_proj.weight.shape) != expected_gate_shape:
+                violations.append(f"expert {local_id} up weight shape mismatch")
+            if tuple(expert.down_proj.weight.shape) != expected_down_shape:
+                violations.append(f"expert {local_id} down weight shape mismatch")
+            if (
+                tuple(expert.gate_proj.weight_scale_inv.shape)
+                != expected_gate_scale_shape
+            ):
+                violations.append(f"expert {local_id} gate scale grid mismatch")
+            if (
+                tuple(expert.up_proj.weight_scale_inv.shape)
+                != expected_gate_scale_shape
+            ):
+                violations.append(f"expert {local_id} up scale grid mismatch")
+            if (
+                tuple(expert.down_proj.weight_scale_inv.shape)
+                != expected_down_scale_shape
+            ):
+                violations.append(f"expert {local_id} down scale grid mismatch")
+        return violations
+
+    def _block_fp8_nki(
+        self,
+        hidden_states: torch.Tensor,
+        affinities: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch only routed local experts using checkpoint FP8 blocks."""
+
+        token_count = hidden_states.shape[0]
+        block_size = 128
+        padded_count = max(block_size, token_count)
+        padded_count = ((padded_count + block_size - 1) // block_size) * block_size
+        if padded_count != token_count:
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    torch.zeros(
+                        padded_count - token_count,
+                        self.hidden_size,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                ],
+                dim=0,
+            )
+            affinities = torch.cat(
+                [
+                    affinities,
+                    torch.zeros(
+                        padded_count - token_count,
+                        self.num_experts,
+                        dtype=affinities.dtype,
+                        device=affinities.device,
+                    ),
+                ],
+                dim=0,
+            )
+
+        local_affinities = affinities[
+            :,
+            self.local_expert_start : self.local_expert_start + self.num_local_experts,
+        ].contiguous()
+        (
+            affinities_masked,
+            token_position_to_id,
+            block_to_expert,
+            conditions,
+        ) = NF.build_blockwise_mapping(
+            expert_affinities=local_affinities,
+            num_local_experts=self.num_local_experts,
+            num_experts_per_token=min(self.top_k, self.num_local_experts),
+            block_size=block_size,
+            moe_group=_SingleRankMoEGroup(),
+            tp_degree=1,
+        )
+        expert_0, expert_1, expert_2, expert_3 = self.experts
+        output = selective_block_fp8_moe_nki(
+            hidden_states,
+            affinities_masked,
+            token_position_to_id,
+            block_to_expert,
+            conditions,
+            expert_0.gate_proj.weight,
+            expert_0.gate_proj.weight_scale_inv,
+            expert_0.up_proj.weight,
+            expert_0.up_proj.weight_scale_inv,
+            expert_0.down_proj.weight,
+            expert_0.down_proj.weight_scale_inv,
+            expert_1.gate_proj.weight,
+            expert_1.gate_proj.weight_scale_inv,
+            expert_1.up_proj.weight,
+            expert_1.up_proj.weight_scale_inv,
+            expert_1.down_proj.weight,
+            expert_1.down_proj.weight_scale_inv,
+            expert_2.gate_proj.weight,
+            expert_2.gate_proj.weight_scale_inv,
+            expert_2.up_proj.weight,
+            expert_2.up_proj.weight_scale_inv,
+            expert_2.down_proj.weight,
+            expert_2.down_proj.weight_scale_inv,
+            expert_3.gate_proj.weight,
+            expert_3.gate_proj.weight_scale_inv,
+            expert_3.up_proj.weight,
+            expert_3.up_proj.weight_scale_inv,
+            expert_3.down_proj.weight,
+            expert_3.down_proj.weight_scale_inv,
+            block_size=block_size,
+        )
+        return output[:token_count]
+
     def _decode_nki(
         self,
         hidden_states: torch.Tensor,
@@ -369,8 +571,18 @@ class GlmMoeDsaRoutedExperts(nn.Module):
         *,
         is_decode: bool,
     ) -> torch.Tensor:
-        if isinstance(self.experts[0].gate_proj, BlockFP8Linear):
-            return self._torch_forward(hidden_states, affinities)
+        if self._uses_block_fp8:
+            if not can_run_kernel(hidden_states):
+                return self._torch_forward(hidden_states, affinities)
+            if os.getenv(_SELECTIVE_BLOCK_FP8_ENV) != "1":
+                return self._torch_forward(hidden_states, affinities)
+            violations = self._block_fp8_contract_violations(hidden_states, affinities)
+            if violations:
+                raise RuntimeError(
+                    "Selective GLM-5.2 block-FP8 MoE contract violation: "
+                    + "; ".join(violations)
+                )
+            return self._block_fp8_nki(hidden_states, affinities)
         if not can_run_kernel(hidden_states):
             return self._torch_forward(hidden_states, affinities)
         if is_decode:
@@ -381,8 +593,8 @@ class GlmMoeDsaRoutedExperts(nn.Module):
 class GlmMoeDsaMoE(nn.Module):
     """One rank-local GLM-5.2 MoE contribution.
 
-    Routed experts use pure EP64. The shared expert uses TP64. A later decoder
-    The decoder sums this local result across the common 64-rank group.
+    Routed experts use pure EP64. The shared expert uses TP64. The decoder
+    sums this local result across the common 64-rank group.
     """
 
     def __init__(

@@ -31,8 +31,8 @@ from .block_fp8 import (
 from .cache import (
     MAIN_INDEXER_LAYER_INDICES,
     build_glm_mla_cache_spec,
-    gather_paged_cache,
-    write_paged_cache,
+    gather_paged_cache_pair,
+    write_paged_cache_pair,
 )
 from .config import GlmMoeDsaConfig
 from .indexer import GlmMoeDsaIndexer, pack_indexer_keys, unpack_indexer_keys
@@ -205,14 +205,17 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         mla_name = f"model.layers.{self.layer_idx}.self_attn.mla_cache"
         mla_meta = attn_metadata.get(mla_name) if attn_metadata else None
         if mla_meta is not None:
-            write_paged_cache(
+            write_paged_cache_pair(
                 self.mla_k_cache,
+                self.mla_v_cache,
                 projection.latent_cache,
                 mla_meta["slot_mapping"],
                 int(mla_meta["block_size"]),
             )
-            attention_latents = gather_paged_cache(
-                self.mla_k_cache, mla_meta["block_table_tensor"]
+            attention_latents = gather_paged_cache_pair(
+                self.mla_k_cache,
+                self.mla_v_cache,
+                mla_meta["block_table_tensor"],
             )
         else:
             attention_latents = projection.latent_cache
@@ -225,15 +228,18 @@ class GlmMoeDsaDecoderLayer(nn.Module):
                     f"model.layers.{self.layer_idx}.self_attn.indexer.k_cache"
                 )
                 indexer_meta = attn_metadata[indexer_name]
-                write_paged_cache(
+                packed_indexer_keys = pack_indexer_keys(index_projection.keys)
+                write_paged_cache_pair(
                     self.indexer_k_cache,
-                    pack_indexer_keys(index_projection.keys),
+                    self.indexer_v_cache,
+                    packed_indexer_keys,
                     indexer_meta["slot_mapping"],
                     int(indexer_meta["block_size"]),
                 )
                 cached_indexer_keys = unpack_indexer_keys(
-                    gather_paged_cache(
+                    gather_paged_cache_pair(
                         self.indexer_k_cache,
+                        self.indexer_v_cache,
                         indexer_meta["block_table_tensor"],
                     ),
                     dtype=index_projection.keys.dtype,
