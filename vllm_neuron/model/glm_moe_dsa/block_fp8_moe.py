@@ -133,49 +133,11 @@ def _selective_block_fp8_moe_nki(
     """
 
     _kernel_assert(len(hidden_states.shape) == 2, "hidden_states must be [T,H]")
-    direct_experts = (
-        (
-            gate_weight_0,
-            gate_scale_0,
-            up_weight_0,
-            up_scale_0,
-            down_weight_0,
-            down_scale_0,
-        ),
-        (
-            gate_weight_1,
-            gate_scale_1,
-            up_weight_1,
-            up_scale_1,
-            down_weight_1,
-            down_scale_1,
-        ),
-        (
-            gate_weight_2,
-            gate_scale_2,
-            up_weight_2,
-            up_scale_2,
-            down_weight_2,
-            down_scale_2,
-        ),
-        (
-            gate_weight_3,
-            gate_scale_3,
-            up_weight_3,
-            up_scale_3,
-            down_weight_3,
-            down_scale_3,
-        ),
-    )
-    for direct_expert in direct_experts:
-        gate_weight, gate_scale, up_weight, up_scale, down_weight, down_scale = (
-            direct_expert
-        )
-        _kernel_assert(len(gate_weight.shape) == 2, "gate weight must be [I,H]")
-        _kernel_assert(len(up_weight.shape) == 2, "up weight must be [I,H]")
-        _kernel_assert(len(down_weight.shape) == 2, "down weight must be [H,I]")
-        _kernel_assert(gate_weight.shape == up_weight.shape, "gate/up shape mismatch")
-        _kernel_assert(gate_scale.shape == up_scale.shape, "gate/up scale mismatch")
+    _kernel_assert(len(gate_weight_0.shape) == 2, "gate weight must be [I,H]")
+    _kernel_assert(len(up_weight_0.shape) == 2, "up weight must be [I,H]")
+    _kernel_assert(len(down_weight_0.shape) == 2, "down weight must be [H,I]")
+    _kernel_assert(gate_weight_0.shape == up_weight_0.shape, "gate/up shape mismatch")
+    _kernel_assert(gate_scale_0.shape == up_scale_0.shape, "gate/up scale mismatch")
     _kernel_assert(block_size <= 128, "block_size must fit the partition dimension")
     _kernel_assert(block_size > 0, "block_size must be positive")
     _kernel_assert(nl.num_programs(axes=0) == 2, "selective MoE requires LNC2")
@@ -217,32 +179,6 @@ def _selective_block_fp8_moe_nki(
         == (hidden_size // BLOCK_ROWS, intermediate_size // BLOCK_COLS),
         "down scale grid mismatch",
     )
-    for direct_expert in direct_experts[1:]:
-        gate_weight, gate_scale, up_weight, up_scale, down_weight, down_scale = (
-            direct_expert
-        )
-        _kernel_assert(
-            gate_weight.shape == gate_weight_0.shape,
-            "gate expert shape mismatch",
-        )
-        _kernel_assert(up_weight.shape == up_weight_0.shape, "up expert shape mismatch")
-        _kernel_assert(
-            down_weight.shape == down_weight_0.shape,
-            "down expert shape mismatch",
-        )
-        _kernel_assert(
-            gate_scale.shape == gate_scale_0.shape,
-            "gate scale expert shape mismatch",
-        )
-        _kernel_assert(
-            up_scale.shape == up_scale_0.shape,
-            "up scale expert shape mismatch",
-        )
-        _kernel_assert(
-            down_scale.shape == down_scale_0.shape,
-            "down scale expert shape mismatch",
-        )
-
     shard_id = nl.program_id(axis=0)
     output_rows_per_shard = BLOCK_ROWS // 2
 
@@ -274,582 +210,551 @@ def _selective_block_fp8_moe_nki(
         (1, conditions.shape[0]), dtype=nl.int32, buffer=nl.sbuf
     )
     nisa.dma_copy(dst=condition_tile, src=conditions.reshape((1, conditions.shape[0])))
-    active_count = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_reduce(dst=active_count, data=condition_tile, op=nl.add, axis=1)
-    active_count_register = nisa.register_alloc()
-    nisa.register_load(dst=active_count_register, src=active_count)
-
+    block_expert_tile = nl.ndarray(
+        (1, block_to_expert.shape[0]), dtype=nl.int32, buffer=nl.sbuf
+    )
+    nisa.dma_copy(
+        dst=block_expert_tile,
+        src=block_to_expert.reshape((1, block_to_expert.shape[0])),
+    )
     block_index = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.memset(dst=block_index, value=0)
-    expert_id_register = nisa.register_alloc()
-    for _ in nl.dynamic_range(0, active_count_register):
-        expert_id = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=expert_id,
-            src=block_to_expert.reshape((block_to_expert.shape[0], 1)).ap(
-                pattern=[[1, 1]],
-                offset=0,
-                scalar_offset=block_index,
-                indirect_dim=0,
-            ),
-        )
-        nisa.register_load(dst=expert_id_register, src=expert_id)
-        token_ids = nl.ndarray((block_size, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=token_ids,
-            src=token_position_to_id.reshape((num_mapping_blocks, block_size)).ap(
-                pattern=[[1, block_size]],
-                offset=0,
-                scalar_offset=block_index,
-                indirect_dim=0,
-            ),
-        )
-        hidden_block = nl.ndarray(
-            (block_size, hidden_size), dtype=hidden_states.dtype, buffer=nl.sbuf
-        )
-        nisa.memset(dst=hidden_block, value=0.0)
-        nisa.dma_copy(
-            dst=hidden_block,
-            src=hidden_states.ap(
-                pattern=[[hidden_size, block_size], [1, hidden_size]],
-                offset=0,
-                vector_offset=token_ids,
-                indirect_dim=0,
-            ),
-            oob_mode=oob_mode.skip,
-        )
 
-        intermediate_hbm = nl.ndarray(
-            (2, intermediate_size, block_size),
-            dtype=hidden_states.dtype,
-            buffer=nl.shared_hbm,
+    # Each phase is compile-time specialized to one direct expert. Only the
+    # number of active blocks remains runtime dynamic.
+    for expert_phase in range(num_experts):
+        if expert_phase == 0:
+            expert_gate_weight = gate_weight_0
+            expert_gate_scale = gate_scale_0
+            expert_up_weight = up_weight_0
+            expert_up_scale = up_scale_0
+            expert_down_weight = down_weight_0
+            expert_down_scale = down_scale_0
+        elif expert_phase == 1:
+            expert_gate_weight = gate_weight_1
+            expert_gate_scale = gate_scale_1
+            expert_up_weight = up_weight_1
+            expert_up_scale = up_scale_1
+            expert_down_weight = down_weight_1
+            expert_down_scale = down_scale_1
+        elif expert_phase == 2:
+            expert_gate_weight = gate_weight_2
+            expert_gate_scale = gate_scale_2
+            expert_up_weight = up_weight_2
+            expert_up_scale = up_scale_2
+            expert_down_weight = down_weight_2
+            expert_down_scale = down_scale_2
+        else:
+            expert_gate_weight = gate_weight_3
+            expert_gate_scale = gate_scale_3
+            expert_up_weight = up_weight_3
+            expert_up_scale = up_scale_3
+            expert_down_weight = down_weight_3
+            expert_down_scale = down_scale_3
+
+        expert_blocks = nl.ndarray(
+            (1, num_mapping_blocks), dtype=nl.int32, buffer=nl.sbuf
         )
-        for intermediate_block in nl.sequential_range(intermediate_size // BLOCK_ROWS):
-            gate_accumulated = nl.ndarray(
-                (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
-            )
-            up_accumulated = nl.ndarray(
-                (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
-            )
-            nisa.memset(dst=gate_accumulated, value=0.0)
-            nisa.memset(dst=up_accumulated, value=0.0)
-            for hidden_block_index in nl.sequential_range(hidden_size // BLOCK_COLS):
-                hidden_transposed = nl.ndarray(
-                    (BLOCK_COLS, block_size),
-                    dtype=hidden_states.dtype,
-                    buffer=nl.sbuf,
-                )
-                nisa.dma_transpose(
-                    dst=hidden_transposed,
-                    src=hidden_block[
-                        0:block_size,
-                        hidden_block_index
-                        * BLOCK_COLS : (hidden_block_index + 1)
-                        * BLOCK_COLS,
-                    ],
-                    axes=(1, 0),
-                )
-                # Expert id controls only these direct branches. It never
-                # participates in a weight or scale address calculation.
-                gate_weight_row_major = nl.ndarray(
-                    (BLOCK_ROWS, BLOCK_COLS),
-                    dtype=gate_weight_0.dtype,
-                    buffer=nl.sbuf,
-                )
-                up_weight_row_major = nl.ndarray(
-                    (BLOCK_ROWS, BLOCK_COLS),
-                    dtype=up_weight_0.dtype,
-                    buffer=nl.sbuf,
-                )
-                weight_offset = (
-                    intermediate_block * BLOCK_ROWS * hidden_size
-                    + hidden_block_index * BLOCK_COLS
-                )
-                weight_pattern = [
-                    [hidden_size, BLOCK_ROWS],
-                    [1, BLOCK_COLS],
-                ]
-                if expert_id_register == 0:
-                    nisa.dma_copy(
-                        dst=gate_weight_row_major,
-                        src=gate_weight_0.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                    nisa.dma_copy(
-                        dst=up_weight_row_major,
-                        src=up_weight_0.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                elif expert_id_register == 1:
-                    nisa.dma_copy(
-                        dst=gate_weight_row_major,
-                        src=gate_weight_1.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                    nisa.dma_copy(
-                        dst=up_weight_row_major,
-                        src=up_weight_1.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                elif expert_id_register == 2:
-                    nisa.dma_copy(
-                        dst=gate_weight_row_major,
-                        src=gate_weight_2.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                    nisa.dma_copy(
-                        dst=up_weight_row_major,
-                        src=up_weight_2.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                else:
-                    nisa.dma_copy(
-                        dst=gate_weight_row_major,
-                        src=gate_weight_3.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                    nisa.dma_copy(
-                        dst=up_weight_row_major,
-                        src=up_weight_3.ap(
-                            pattern=weight_pattern, offset=weight_offset
-                        ),
-                    )
-                gate_weight_bf16 = nl.ndarray(
-                    (BLOCK_ROWS, BLOCK_COLS), dtype=nl.bfloat16, buffer=nl.sbuf
-                )
-                up_weight_bf16 = nl.ndarray(
-                    (BLOCK_ROWS, BLOCK_COLS), dtype=nl.bfloat16, buffer=nl.sbuf
-                )
-                nisa.tensor_copy(dst=gate_weight_bf16, src=gate_weight_row_major)
-                nisa.tensor_copy(dst=up_weight_bf16, src=up_weight_row_major)
-                gate_weight_transposed = nl.ndarray(
-                    (BLOCK_COLS, BLOCK_ROWS),
-                    dtype=nl.bfloat16,
-                    buffer=nl.psum,
-                )
-                up_weight_transposed = nl.ndarray(
-                    (BLOCK_COLS, BLOCK_ROWS),
-                    dtype=nl.bfloat16,
-                    buffer=nl.psum,
-                )
-                nisa.nc_transpose(
-                    dst=gate_weight_transposed,
-                    data=gate_weight_bf16,
-                )
-                nisa.nc_transpose(
-                    dst=up_weight_transposed,
-                    data=up_weight_bf16,
-                )
-                gate_weight = nl.ndarray(
-                    (BLOCK_COLS, BLOCK_ROWS),
-                    dtype=gate_weight_0.dtype,
-                    buffer=nl.sbuf,
-                )
-                up_weight = nl.ndarray(
-                    (BLOCK_COLS, BLOCK_ROWS),
-                    dtype=up_weight_0.dtype,
-                    buffer=nl.sbuf,
-                )
-                nisa.tensor_copy(dst=gate_weight, src=gate_weight_transposed)
-                nisa.tensor_copy(dst=up_weight, src=up_weight_transposed)
-                gate_partial_psum = nl.ndarray(
-                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.psum
-                )
-                up_partial_psum = nl.ndarray(
-                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.psum
-                )
-                nisa.nc_matmul(
-                    dst=gate_partial_psum,
-                    stationary=gate_weight,
-                    moving=hidden_transposed,
-                    accumulate=False,
-                )
-                nisa.nc_matmul(
-                    dst=up_partial_psum,
-                    stationary=up_weight,
-                    moving=hidden_transposed,
-                    accumulate=False,
-                )
-                gate_partial = nl.ndarray(
-                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
-                )
-                up_partial = nl.ndarray(
-                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
-                )
-                nisa.tensor_copy(dst=gate_partial, src=gate_partial_psum)
-                nisa.tensor_copy(dst=up_partial, src=up_partial_psum)
-                gate_scale_scalar = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-                up_scale_scalar = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-                scale_offset = (
-                    intermediate_block * (hidden_size // BLOCK_COLS)
-                    + hidden_block_index
-                )
-                if expert_id_register == 0:
-                    nisa.dma_copy(
-                        dst=gate_scale_scalar,
-                        src=gate_scale_0.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                    nisa.dma_copy(
-                        dst=up_scale_scalar,
-                        src=up_scale_0.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                elif expert_id_register == 1:
-                    nisa.dma_copy(
-                        dst=gate_scale_scalar,
-                        src=gate_scale_1.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                    nisa.dma_copy(
-                        dst=up_scale_scalar,
-                        src=up_scale_1.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                elif expert_id_register == 2:
-                    nisa.dma_copy(
-                        dst=gate_scale_scalar,
-                        src=gate_scale_2.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                    nisa.dma_copy(
-                        dst=up_scale_scalar,
-                        src=up_scale_2.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                else:
-                    nisa.dma_copy(
-                        dst=gate_scale_scalar,
-                        src=gate_scale_3.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                    nisa.dma_copy(
-                        dst=up_scale_scalar,
-                        src=up_scale_3.ap(pattern=[[1, 1]], offset=scale_offset),
-                    )
-                gate_scale = nl.ndarray(
-                    (BLOCK_ROWS, 1), dtype=nl.float32, buffer=nl.sbuf
-                )
-                up_scale = nl.ndarray((BLOCK_ROWS, 1), dtype=nl.float32, buffer=nl.sbuf)
-                scale_shuffle_mask = [0] * 32
-                for scale_channel in range(4):
-                    scale_channel_start = scale_channel * 32
-                    nisa.nc_stream_shuffle(
-                        dst=gate_scale[
-                            scale_channel_start : scale_channel_start + 32, 0:1
-                        ],
-                        src=gate_scale_scalar,
-                        shuffle_mask=scale_shuffle_mask,
-                    )
-                    nisa.nc_stream_shuffle(
-                        dst=up_scale[
-                            scale_channel_start : scale_channel_start + 32, 0:1
-                        ],
-                        src=up_scale_scalar,
-                        shuffle_mask=scale_shuffle_mask,
-                    )
-                gate_scaled = nl.ndarray(
-                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
-                )
-                up_scaled = nl.ndarray(
-                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
-                )
-                nisa.tensor_scalar(
-                    dst=gate_scaled,
-                    data=gate_partial,
-                    op0=nl.multiply,
-                    operand0=gate_scale,
-                )
-                nisa.tensor_scalar(
-                    dst=up_scaled,
-                    data=up_partial,
-                    op0=nl.multiply,
-                    operand0=up_scale,
-                )
-                nisa.tensor_tensor(
-                    dst=gate_accumulated,
-                    data1=gate_accumulated,
-                    data2=gate_scaled,
-                    op=nl.add,
-                )
-                nisa.tensor_tensor(
-                    dst=up_accumulated,
-                    data1=up_accumulated,
-                    data2=up_scaled,
-                    op=nl.add,
-                )
-
-            gate_rounded = nl.ndarray(
-                (BLOCK_ROWS, block_size),
-                dtype=hidden_states.dtype,
-                buffer=nl.sbuf,
-            )
-            up_rounded = nl.ndarray(
-                (BLOCK_ROWS, block_size), dtype=hidden_states.dtype, buffer=nl.sbuf
-            )
-            nisa.tensor_copy(dst=gate_rounded, src=gate_accumulated)
-            nisa.tensor_copy(dst=up_rounded, src=up_accumulated)
-            gate_activated = nl.ndarray(
-                (BLOCK_ROWS, block_size),
-                dtype=hidden_states.dtype,
-                buffer=nl.sbuf,
-            )
-            intermediate = nl.ndarray(
-                (BLOCK_ROWS, block_size), dtype=hidden_states.dtype, buffer=nl.sbuf
-            )
-            nisa.activation(dst=gate_activated, data=gate_rounded, op=nl.silu)
-            nisa.tensor_tensor(
-                dst=intermediate,
-                data1=gate_activated,
-                data2=up_rounded,
-                op=nl.multiply,
-            )
-            nisa.dma_copy(
-                dst=intermediate_hbm[
-                    shard_id,
-                    intermediate_block
-                    * BLOCK_ROWS : (intermediate_block + 1)
-                    * BLOCK_ROWS,
-                    0:block_size,
-                ],
-                src=intermediate,
-            )
-
-        affinity = nl.ndarray((block_size, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=affinity, value=0.0)
-        affinity_address = nl.ndarray((block_size, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.tensor_scalar(
-            dst=affinity_address,
-            data=token_ids,
-            op0=nl.multiply,
-            operand0=num_experts,
+            dst=expert_blocks,
+            data=block_expert_tile,
+            op0=nl.equal,
+            operand0=expert_phase,
         )
-        expert_id_broadcast = nl.ndarray(
-            (BLOCK_ROWS, 1), dtype=nl.int32, buffer=nl.sbuf
+        active_expert_blocks = nl.ndarray(
+            (1, num_mapping_blocks), dtype=nl.int32, buffer=nl.sbuf
         )
-        shuffle_mask = [0] * 32
-        for channel_index in range(4):
-            channel_start = channel_index * 32
-            nisa.nc_stream_shuffle(
-                dst=expert_id_broadcast[channel_start : channel_start + 32, 0:1],
-                src=expert_id.ap(pattern=[[1, 1], [1, 1]], offset=0),
-                shuffle_mask=shuffle_mask,
-            )
         nisa.tensor_tensor(
-            dst=affinity_address,
-            data1=affinity_address,
-            data2=expert_id_broadcast[0:block_size, 0:1],
+            dst=active_expert_blocks,
+            data1=expert_blocks,
+            data2=condition_tile,
+            op=nl.multiply,
+        )
+        expert_block_count = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_reduce(
+            dst=expert_block_count,
+            data=active_expert_blocks,
             op=nl.add,
+            axis=1,
         )
-        nisa.dma_copy(
-            dst=affinity,
-            src=expert_affinities_masked.ap(
-                pattern=[[1, block_size], [1, 1]],
-                offset=0,
-                vector_offset=affinity_address,
-                indirect_dim=0,
-            ),
-            oob_mode=oob_mode.skip,
+        expert_block_count_register = nisa.register_alloc()
+        nisa.register_load(
+            dst=expert_block_count_register,
+            src=expert_block_count,
         )
-
-        for output_block in nl.sequential_range(hidden_size // BLOCK_ROWS):
-            output_accumulated = nl.ndarray(
-                (output_rows_per_shard, block_size),
-                dtype=nl.float32,
-                buffer=nl.sbuf,
+        expert_id = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=expert_id, value=expert_phase)
+        for _ in nl.dynamic_range(0, expert_block_count_register):
+            token_ids = nl.ndarray((block_size, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=token_ids,
+                src=token_position_to_id.reshape((num_mapping_blocks, block_size)).ap(
+                    pattern=[[1, block_size]],
+                    offset=0,
+                    scalar_offset=block_index,
+                    indirect_dim=0,
+                ),
             )
-            nisa.memset(dst=output_accumulated, value=0.0)
-            for intermediate_block in nl.sequential_range(
-                intermediate_size // BLOCK_COLS
-            ):
-                intermediate = nl.ndarray(
-                    (BLOCK_COLS, block_size),
-                    dtype=hidden_states.dtype,
-                    buffer=nl.sbuf,
-                )
-                nisa.dma_copy(
-                    dst=intermediate,
-                    src=intermediate_hbm[
-                        shard_id,
-                        intermediate_block
-                        * BLOCK_COLS : (intermediate_block + 1)
-                        * BLOCK_COLS,
-                        0:block_size,
-                    ],
-                )
-                down_weight_row_major = nl.ndarray(
-                    (output_rows_per_shard, BLOCK_COLS),
-                    dtype=down_weight_0.dtype,
-                    buffer=nl.sbuf,
-                )
-                down_offset = (
-                    output_block * BLOCK_ROWS * intermediate_size
-                    + shard_id * output_rows_per_shard * intermediate_size
-                    + intermediate_block * BLOCK_COLS
-                )
-                down_weight_pattern = [
-                    [intermediate_size, output_rows_per_shard],
-                    [1, BLOCK_COLS],
-                ]
-                if expert_id_register == 0:
-                    nisa.dma_copy(
-                        dst=down_weight_row_major,
-                        src=down_weight_0.ap(
-                            pattern=down_weight_pattern, offset=down_offset
-                        ),
-                    )
-                elif expert_id_register == 1:
-                    nisa.dma_copy(
-                        dst=down_weight_row_major,
-                        src=down_weight_1.ap(
-                            pattern=down_weight_pattern, offset=down_offset
-                        ),
-                    )
-                elif expert_id_register == 2:
-                    nisa.dma_copy(
-                        dst=down_weight_row_major,
-                        src=down_weight_2.ap(
-                            pattern=down_weight_pattern, offset=down_offset
-                        ),
-                    )
-                else:
-                    nisa.dma_copy(
-                        dst=down_weight_row_major,
-                        src=down_weight_3.ap(
-                            pattern=down_weight_pattern, offset=down_offset
-                        ),
-                    )
-                down_weight_bf16 = nl.ndarray(
-                    (output_rows_per_shard, BLOCK_COLS),
-                    dtype=nl.bfloat16,
-                    buffer=nl.sbuf,
-                )
-                nisa.tensor_copy(dst=down_weight_bf16, src=down_weight_row_major)
-                down_weight_transposed = nl.ndarray(
-                    (BLOCK_COLS, output_rows_per_shard),
-                    dtype=nl.bfloat16,
-                    buffer=nl.psum,
-                )
-                nisa.nc_transpose(
-                    dst=down_weight_transposed,
-                    data=down_weight_bf16,
-                )
-                down_weight = nl.ndarray(
-                    (BLOCK_COLS, output_rows_per_shard),
-                    dtype=down_weight_0.dtype,
-                    buffer=nl.sbuf,
-                )
-                nisa.tensor_copy(dst=down_weight, src=down_weight_transposed)
-                down_partial_psum = nl.ndarray(
-                    (output_rows_per_shard, block_size),
-                    dtype=nl.float32,
-                    buffer=nl.psum,
-                )
-                nisa.nc_matmul(
-                    dst=down_partial_psum,
-                    stationary=down_weight,
-                    moving=intermediate,
-                    accumulate=False,
-                )
-                down_partial = nl.ndarray(
-                    (output_rows_per_shard, block_size),
-                    dtype=nl.float32,
-                    buffer=nl.sbuf,
-                )
-                nisa.tensor_copy(dst=down_partial, src=down_partial_psum)
-                down_scale_scalar = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-                down_scale_offset = (
-                    output_block * (intermediate_size // BLOCK_COLS)
-                    + intermediate_block
-                )
-                if expert_id_register == 0:
-                    nisa.dma_copy(
-                        dst=down_scale_scalar,
-                        src=down_scale_0.ap(pattern=[[1, 1]], offset=down_scale_offset),
-                    )
-                elif expert_id_register == 1:
-                    nisa.dma_copy(
-                        dst=down_scale_scalar,
-                        src=down_scale_1.ap(pattern=[[1, 1]], offset=down_scale_offset),
-                    )
-                elif expert_id_register == 2:
-                    nisa.dma_copy(
-                        dst=down_scale_scalar,
-                        src=down_scale_2.ap(pattern=[[1, 1]], offset=down_scale_offset),
-                    )
-                else:
-                    nisa.dma_copy(
-                        dst=down_scale_scalar,
-                        src=down_scale_3.ap(pattern=[[1, 1]], offset=down_scale_offset),
-                    )
-                down_scale = nl.ndarray(
-                    (output_rows_per_shard, 1), dtype=nl.float32, buffer=nl.sbuf
-                )
-                down_scale_shuffle_mask = [0] * 32
-                for down_scale_channel in range(2):
-                    down_scale_start = down_scale_channel * 32
-                    nisa.nc_stream_shuffle(
-                        dst=down_scale[down_scale_start : down_scale_start + 32, 0:1],
-                        src=down_scale_scalar,
-                        shuffle_mask=down_scale_shuffle_mask,
-                    )
-                down_scaled = nl.ndarray(
-                    (output_rows_per_shard, block_size),
-                    dtype=nl.float32,
-                    buffer=nl.sbuf,
-                )
-                nisa.tensor_scalar(
-                    dst=down_scaled,
-                    data=down_partial,
-                    op0=nl.multiply,
-                    operand0=down_scale,
-                )
-                nisa.tensor_tensor(
-                    dst=output_accumulated,
-                    data1=output_accumulated,
-                    data2=down_scaled,
-                    op=nl.add,
-                )
-
-            output_transpose_psum = nl.ndarray(
-                (block_size, output_rows_per_shard),
-                dtype=nl.float32,
-                buffer=nl.psum,
+            hidden_block = nl.ndarray(
+                (block_size, hidden_size), dtype=hidden_states.dtype, buffer=nl.sbuf
             )
-            nisa.nc_transpose(dst=output_transpose_psum, data=output_accumulated)
-            output_block_sbuf = nl.ndarray(
-                (block_size, output_rows_per_shard),
-                dtype=hidden_states.dtype,
-                buffer=nl.sbuf,
-            )
-            nisa.tensor_copy(dst=output_block_sbuf, src=output_transpose_psum)
-            scaled_output = nl.ndarray(
-                (block_size, output_rows_per_shard),
-                dtype=hidden_states.dtype,
-                buffer=nl.sbuf,
-            )
-            nisa.tensor_scalar(
-                dst=scaled_output,
-                data=output_block_sbuf,
-                op0=nl.multiply,
-                operand0=affinity,
-            )
-            output_access = output.ap(
-                pattern=[[hidden_size, block_size], [1, output_rows_per_shard]],
-                offset=(output_block * BLOCK_ROWS + shard_id * output_rows_per_shard),
-                vector_offset=token_ids,
-                indirect_dim=0,
-            )
-            nisa.dma_compute(
-                dst=output_access,
-                srcs=[output_access, scaled_output],
-                reduce_op=nl.add,
-                unique_indices=True,
+            nisa.memset(dst=hidden_block, value=0.0)
+            nisa.dma_copy(
+                dst=hidden_block,
+                src=hidden_states.ap(
+                    pattern=[[hidden_size, block_size], [1, hidden_size]],
+                    offset=0,
+                    vector_offset=token_ids,
+                    indirect_dim=0,
+                ),
                 oob_mode=oob_mode.skip,
             )
 
-        nisa.tensor_scalar(dst=block_index, data=block_index, op0=nl.add, operand0=1)
+            intermediate_hbm = nl.ndarray(
+                (2, intermediate_size, block_size),
+                dtype=hidden_states.dtype,
+                buffer=nl.shared_hbm,
+            )
+            for intermediate_block in nl.sequential_range(
+                intermediate_size // BLOCK_ROWS
+            ):
+                gate_accumulated = nl.ndarray(
+                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
+                )
+                up_accumulated = nl.ndarray(
+                    (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.memset(dst=gate_accumulated, value=0.0)
+                nisa.memset(dst=up_accumulated, value=0.0)
+                for hidden_block_index in nl.sequential_range(
+                    hidden_size // BLOCK_COLS
+                ):
+                    hidden_transposed = nl.ndarray(
+                        (BLOCK_COLS, block_size),
+                        dtype=hidden_states.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.dma_transpose(
+                        dst=hidden_transposed,
+                        src=hidden_block[
+                            0:block_size,
+                            hidden_block_index
+                            * BLOCK_COLS : (hidden_block_index + 1)
+                            * BLOCK_COLS,
+                        ],
+                        axes=(1, 0),
+                    )
+                    # The compile-time expert phase binds direct checkpoint tensors.
+                    gate_weight_row_major = nl.ndarray(
+                        (BLOCK_ROWS, BLOCK_COLS),
+                        dtype=expert_gate_weight.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    up_weight_row_major = nl.ndarray(
+                        (BLOCK_ROWS, BLOCK_COLS),
+                        dtype=expert_up_weight.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    weight_offset = (
+                        intermediate_block * BLOCK_ROWS * hidden_size
+                        + hidden_block_index * BLOCK_COLS
+                    )
+                    weight_pattern = [
+                        [hidden_size, BLOCK_ROWS],
+                        [1, BLOCK_COLS],
+                    ]
+                    nisa.dma_copy(
+                        dst=gate_weight_row_major,
+                        src=expert_gate_weight.ap(
+                            pattern=weight_pattern, offset=weight_offset
+                        ),
+                    )
+                    nisa.dma_copy(
+                        dst=up_weight_row_major,
+                        src=expert_up_weight.ap(
+                            pattern=weight_pattern, offset=weight_offset
+                        ),
+                    )
+                    gate_weight_bf16 = nl.ndarray(
+                        (BLOCK_ROWS, BLOCK_COLS), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    up_weight_bf16 = nl.ndarray(
+                        (BLOCK_ROWS, BLOCK_COLS), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(dst=gate_weight_bf16, src=gate_weight_row_major)
+                    nisa.tensor_copy(dst=up_weight_bf16, src=up_weight_row_major)
+                    gate_weight_transposed = nl.ndarray(
+                        (BLOCK_COLS, BLOCK_ROWS),
+                        dtype=nl.bfloat16,
+                        buffer=nl.psum,
+                    )
+                    up_weight_transposed = nl.ndarray(
+                        (BLOCK_COLS, BLOCK_ROWS),
+                        dtype=nl.bfloat16,
+                        buffer=nl.psum,
+                    )
+                    nisa.nc_transpose(
+                        dst=gate_weight_transposed,
+                        data=gate_weight_bf16,
+                    )
+                    nisa.nc_transpose(
+                        dst=up_weight_transposed,
+                        data=up_weight_bf16,
+                    )
+                    gate_weight = nl.ndarray(
+                        (BLOCK_COLS, BLOCK_ROWS),
+                        dtype=expert_gate_weight.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    up_weight = nl.ndarray(
+                        (BLOCK_COLS, BLOCK_ROWS),
+                        dtype=expert_up_weight.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_copy(dst=gate_weight, src=gate_weight_transposed)
+                    nisa.tensor_copy(dst=up_weight, src=up_weight_transposed)
+                    gate_partial_psum = nl.ndarray(
+                        (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.psum
+                    )
+                    up_partial_psum = nl.ndarray(
+                        (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.psum
+                    )
+                    nisa.nc_matmul(
+                        dst=gate_partial_psum,
+                        stationary=gate_weight,
+                        moving=hidden_transposed,
+                        accumulate=False,
+                    )
+                    nisa.nc_matmul(
+                        dst=up_partial_psum,
+                        stationary=up_weight,
+                        moving=hidden_transposed,
+                        accumulate=False,
+                    )
+                    gate_partial = nl.ndarray(
+                        (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    up_partial = nl.ndarray(
+                        (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(dst=gate_partial, src=gate_partial_psum)
+                    nisa.tensor_copy(dst=up_partial, src=up_partial_psum)
+                    gate_scale_scalar = nl.ndarray(
+                        (1, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    up_scale_scalar = nl.ndarray(
+                        (1, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    scale_offset = (
+                        intermediate_block * (hidden_size // BLOCK_COLS)
+                        + hidden_block_index
+                    )
+                    nisa.dma_copy(
+                        dst=gate_scale_scalar,
+                        src=expert_gate_scale.ap(pattern=[[1, 1]], offset=scale_offset),
+                    )
+                    nisa.dma_copy(
+                        dst=up_scale_scalar,
+                        src=expert_up_scale.ap(pattern=[[1, 1]], offset=scale_offset),
+                    )
+                    gate_scale = nl.ndarray(
+                        (BLOCK_ROWS, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    up_scale = nl.ndarray(
+                        (BLOCK_ROWS, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    scale_shuffle_mask = [0] * 32
+                    for scale_channel in range(4):
+                        scale_channel_start = scale_channel * 32
+                        nisa.nc_stream_shuffle(
+                            dst=gate_scale[
+                                scale_channel_start : scale_channel_start + 32, 0:1
+                            ],
+                            src=gate_scale_scalar,
+                            shuffle_mask=scale_shuffle_mask,
+                        )
+                        nisa.nc_stream_shuffle(
+                            dst=up_scale[
+                                scale_channel_start : scale_channel_start + 32, 0:1
+                            ],
+                            src=up_scale_scalar,
+                            shuffle_mask=scale_shuffle_mask,
+                        )
+                    gate_scaled = nl.ndarray(
+                        (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    up_scaled = nl.ndarray(
+                        (BLOCK_ROWS, block_size), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_scalar(
+                        dst=gate_scaled,
+                        data=gate_partial,
+                        op0=nl.multiply,
+                        operand0=gate_scale,
+                    )
+                    nisa.tensor_scalar(
+                        dst=up_scaled,
+                        data=up_partial,
+                        op0=nl.multiply,
+                        operand0=up_scale,
+                    )
+                    nisa.tensor_tensor(
+                        dst=gate_accumulated,
+                        data1=gate_accumulated,
+                        data2=gate_scaled,
+                        op=nl.add,
+                    )
+                    nisa.tensor_tensor(
+                        dst=up_accumulated,
+                        data1=up_accumulated,
+                        data2=up_scaled,
+                        op=nl.add,
+                    )
 
+                gate_rounded = nl.ndarray(
+                    (BLOCK_ROWS, block_size),
+                    dtype=hidden_states.dtype,
+                    buffer=nl.sbuf,
+                )
+                up_rounded = nl.ndarray(
+                    (BLOCK_ROWS, block_size), dtype=hidden_states.dtype, buffer=nl.sbuf
+                )
+                nisa.tensor_copy(dst=gate_rounded, src=gate_accumulated)
+                nisa.tensor_copy(dst=up_rounded, src=up_accumulated)
+                gate_activated = nl.ndarray(
+                    (BLOCK_ROWS, block_size),
+                    dtype=hidden_states.dtype,
+                    buffer=nl.sbuf,
+                )
+                intermediate = nl.ndarray(
+                    (BLOCK_ROWS, block_size), dtype=hidden_states.dtype, buffer=nl.sbuf
+                )
+                nisa.activation(dst=gate_activated, data=gate_rounded, op=nl.silu)
+                nisa.tensor_tensor(
+                    dst=intermediate,
+                    data1=gate_activated,
+                    data2=up_rounded,
+                    op=nl.multiply,
+                )
+                nisa.dma_copy(
+                    dst=intermediate_hbm[
+                        shard_id,
+                        intermediate_block
+                        * BLOCK_ROWS : (intermediate_block + 1)
+                        * BLOCK_ROWS,
+                        0:block_size,
+                    ],
+                    src=intermediate,
+                )
+
+            affinity = nl.ndarray((block_size, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=affinity, value=0.0)
+            affinity_address = nl.ndarray(
+                (block_size, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=affinity_address,
+                data=token_ids,
+                op0=nl.multiply,
+                operand0=num_experts,
+            )
+            expert_id_broadcast = nl.ndarray(
+                (BLOCK_ROWS, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            shuffle_mask = [0] * 32
+            for channel_index in range(4):
+                channel_start = channel_index * 32
+                nisa.nc_stream_shuffle(
+                    dst=expert_id_broadcast[channel_start : channel_start + 32, 0:1],
+                    src=expert_id.ap(pattern=[[1, 1], [1, 1]], offset=0),
+                    shuffle_mask=shuffle_mask,
+                )
+            nisa.tensor_tensor(
+                dst=affinity_address,
+                data1=affinity_address,
+                data2=expert_id_broadcast[0:block_size, 0:1],
+                op=nl.add,
+            )
+            nisa.dma_copy(
+                dst=affinity,
+                src=expert_affinities_masked.ap(
+                    pattern=[[1, block_size], [1, 1]],
+                    offset=0,
+                    vector_offset=affinity_address,
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.skip,
+            )
+
+            for output_block in nl.sequential_range(hidden_size // BLOCK_ROWS):
+                output_accumulated = nl.ndarray(
+                    (output_rows_per_shard, block_size),
+                    dtype=nl.float32,
+                    buffer=nl.sbuf,
+                )
+                nisa.memset(dst=output_accumulated, value=0.0)
+                for intermediate_block in nl.sequential_range(
+                    intermediate_size // BLOCK_COLS
+                ):
+                    intermediate = nl.ndarray(
+                        (BLOCK_COLS, block_size),
+                        dtype=hidden_states.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.dma_copy(
+                        dst=intermediate,
+                        src=intermediate_hbm[
+                            shard_id,
+                            intermediate_block
+                            * BLOCK_COLS : (intermediate_block + 1)
+                            * BLOCK_COLS,
+                            0:block_size,
+                        ],
+                    )
+                    down_weight_row_major = nl.ndarray(
+                        (output_rows_per_shard, BLOCK_COLS),
+                        dtype=expert_down_weight.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    down_offset = (
+                        output_block * BLOCK_ROWS * intermediate_size
+                        + shard_id * output_rows_per_shard * intermediate_size
+                        + intermediate_block * BLOCK_COLS
+                    )
+                    down_weight_pattern = [
+                        [intermediate_size, output_rows_per_shard],
+                        [1, BLOCK_COLS],
+                    ]
+                    nisa.dma_copy(
+                        dst=down_weight_row_major,
+                        src=expert_down_weight.ap(
+                            pattern=down_weight_pattern, offset=down_offset
+                        ),
+                    )
+                    down_weight_bf16 = nl.ndarray(
+                        (output_rows_per_shard, BLOCK_COLS),
+                        dtype=nl.bfloat16,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_copy(dst=down_weight_bf16, src=down_weight_row_major)
+                    down_weight_transposed = nl.ndarray(
+                        (BLOCK_COLS, output_rows_per_shard),
+                        dtype=nl.bfloat16,
+                        buffer=nl.psum,
+                    )
+                    nisa.nc_transpose(
+                        dst=down_weight_transposed,
+                        data=down_weight_bf16,
+                    )
+                    down_weight = nl.ndarray(
+                        (BLOCK_COLS, output_rows_per_shard),
+                        dtype=expert_down_weight.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_copy(dst=down_weight, src=down_weight_transposed)
+                    down_partial_psum = nl.ndarray(
+                        (output_rows_per_shard, block_size),
+                        dtype=nl.float32,
+                        buffer=nl.psum,
+                    )
+                    nisa.nc_matmul(
+                        dst=down_partial_psum,
+                        stationary=down_weight,
+                        moving=intermediate,
+                        accumulate=False,
+                    )
+                    down_partial = nl.ndarray(
+                        (output_rows_per_shard, block_size),
+                        dtype=nl.float32,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_copy(dst=down_partial, src=down_partial_psum)
+                    down_scale_scalar = nl.ndarray(
+                        (1, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    down_scale_offset = (
+                        output_block * (intermediate_size // BLOCK_COLS)
+                        + intermediate_block
+                    )
+                    nisa.dma_copy(
+                        dst=down_scale_scalar,
+                        src=expert_down_scale.ap(
+                            pattern=[[1, 1]], offset=down_scale_offset
+                        ),
+                    )
+                    down_scale = nl.ndarray(
+                        (output_rows_per_shard, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    down_scale_shuffle_mask = [0] * 32
+                    for down_scale_channel in range(2):
+                        down_scale_start = down_scale_channel * 32
+                        nisa.nc_stream_shuffle(
+                            dst=down_scale[
+                                down_scale_start : down_scale_start + 32, 0:1
+                            ],
+                            src=down_scale_scalar,
+                            shuffle_mask=down_scale_shuffle_mask,
+                        )
+                    down_scaled = nl.ndarray(
+                        (output_rows_per_shard, block_size),
+                        dtype=nl.float32,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_scalar(
+                        dst=down_scaled,
+                        data=down_partial,
+                        op0=nl.multiply,
+                        operand0=down_scale,
+                    )
+                    nisa.tensor_tensor(
+                        dst=output_accumulated,
+                        data1=output_accumulated,
+                        data2=down_scaled,
+                        op=nl.add,
+                    )
+
+                output_transpose_psum = nl.ndarray(
+                    (block_size, output_rows_per_shard),
+                    dtype=nl.float32,
+                    buffer=nl.psum,
+                )
+                nisa.nc_transpose(dst=output_transpose_psum, data=output_accumulated)
+                output_block_sbuf = nl.ndarray(
+                    (block_size, output_rows_per_shard),
+                    dtype=hidden_states.dtype,
+                    buffer=nl.sbuf,
+                )
+                nisa.tensor_copy(dst=output_block_sbuf, src=output_transpose_psum)
+                scaled_output = nl.ndarray(
+                    (block_size, output_rows_per_shard),
+                    dtype=hidden_states.dtype,
+                    buffer=nl.sbuf,
+                )
+                nisa.tensor_scalar(
+                    dst=scaled_output,
+                    data=output_block_sbuf,
+                    op0=nl.multiply,
+                    operand0=affinity,
+                )
+                output_access = output.ap(
+                    pattern=[[hidden_size, block_size], [1, output_rows_per_shard]],
+                    offset=(
+                        output_block * BLOCK_ROWS + shard_id * output_rows_per_shard
+                    ),
+                    vector_offset=token_ids,
+                    indirect_dim=0,
+                )
+                nisa.dma_compute(
+                    dst=output_access,
+                    srcs=[output_access, scaled_output],
+                    reduce_op=nl.add,
+                    unique_indices=True,
+                    oob_mode=oob_mode.skip,
+                )
+
+            nisa.tensor_scalar(
+                dst=block_index, data=block_index, op0=nl.add, operand0=1
+            )
     return output
 
 

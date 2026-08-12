@@ -368,13 +368,59 @@ def test_selective_block_fp8_kernel_has_no_scalar_indirect_expert_weights() -> N
     assert "gate_weights.ap(" not in kernel_source
     assert "up_weights.ap(" not in kernel_source
     assert "down_weights.ap(" not in kernel_source
+    assert "expert_gate_weight.ap(" in kernel_source
+    assert "expert_gate_scale.ap(" in kernel_source
+    assert "expert_up_weight.ap(" in kernel_source
+    assert "expert_up_scale.ap(" in kernel_source
+    assert "expert_down_weight.ap(" in kernel_source
+    assert "expert_down_scale.ap(" in kernel_source
     for expert_id in range(4):
-        assert f"gate_weight_{expert_id}.ap(" in kernel_source
-        assert f"gate_scale_{expert_id}.ap(" in kernel_source
-        assert f"up_weight_{expert_id}.ap(" in kernel_source
-        assert f"up_scale_{expert_id}.ap(" in kernel_source
-        assert f"down_weight_{expert_id}.ap(" in kernel_source
-        assert f"down_scale_{expert_id}.ap(" in kernel_source
+        assert f"expert_gate_weight = gate_weight_{expert_id}" in kernel_source
+        assert f"expert_gate_scale = gate_scale_{expert_id}" in kernel_source
+        assert f"expert_up_weight = up_weight_{expert_id}" in kernel_source
+        assert f"expert_up_scale = up_scale_{expert_id}" in kernel_source
+        assert f"expert_down_weight = down_weight_{expert_id}" in kernel_source
+        assert f"expert_down_scale = down_scale_{expert_id}" in kernel_source
+
+
+def test_selective_block_fp8_kernel_uses_compile_time_expert_phases() -> None:
+    source = Path(block_fp8_moe.__file__).read_text()
+    kernel_source = source.split("def _selective_block_fp8_moe_nki(", 1)[1].split(
+        "_wrapped_selective_block_fp8_moe", 1
+    )[0]
+
+    assert "direct_experts" not in kernel_source
+    assert "for expert_phase in range(num_experts):" in kernel_source
+    assert "op0=nl.equal" in kernel_source
+    assert "expert_block_count_register" in kernel_source
+    assert "nl.dynamic_range(0, expert_block_count_register)" in kernel_source
+    assert "expert_id_register" not in kernel_source
+    assert "if expert_id_register" not in kernel_source
+
+
+def test_selective_block_fp8_compile_time_phases_preserve_block_order() -> None:
+    block_to_expert = torch.tensor([0, 0, 1, 2, 2, 3, 3, 3])
+    conditions = torch.tensor([1, 1, 1, 1, 1, 1, 0, 0])
+    active_block_ids = torch.nonzero(conditions, as_tuple=False).flatten()
+
+    phase_counts = [
+        torch.count_nonzero(
+            (block_to_expert == expert_id) & conditions.to(torch.bool)
+        ).item()
+        for expert_id in range(4)
+    ]
+    phase_offsets = [0]
+    for count in phase_counts:
+        phase_offsets.append(phase_offsets[-1] + count)
+    phased_block_ids = torch.cat(
+        [
+            torch.arange(phase_offsets[expert_id], phase_offsets[expert_id + 1])
+            for expert_id in range(4)
+        ]
+    )
+
+    assert phase_counts == [2, 1, 2, 1]
+    assert torch.equal(phased_block_ids, active_block_ids)
 
 
 class _SelectiveBlockFP8CompileProbe(nn.Module):

@@ -21,6 +21,7 @@ from vllm_neuron.nki.nki_hop import wrap_nki
 
 
 _CACHE_WIDTH = 576
+_CACHE_HALF_WIDTH = _CACHE_WIDTH // 2
 _LATENT_WIDTH = 512
 _ROPE_WIDTH = 64
 _QK_NOPE_WIDTH = 192
@@ -40,27 +41,34 @@ def _kernel_assert(condition: bool, error_text: str) -> None:
 @nki.jit
 def _selected_latent_mla_decode_nki(
     queries,
-    latent_cache,
+    mla_k_cache,
+    mla_v_cache,
+    block_table,
     selected_indices,
     weight,
     weight_scale_inv,
+    block_size,
     row_offset=0,
 ):
-    """Compute one-head MLA decode from selected logical latent rows.
+    """Compute one-head MLA decode directly from selected paged-cache rows.
 
     Dimensions:
         B: Static batch size.
-        T: Logical cache length, greater than 2048 for this spike.
+        P: Number of physical cache blocks.
+        L: Maximum logical blocks per request.
         K: Selected width, a multiple of 128 and at most 2048.
 
     Args:
         queries: ``[B, 1, 1, 256]`` BF16 query tensor in HBM.
-        latent_cache: ``[B, T, 576]`` BF16 logical MLA cache in HBM.
+        mla_k_cache: ``[P, 1, block_size, 288]`` BF16 first cache half.
+        mla_v_cache: ``[P, 1, block_size, 288]`` BF16 second cache half.
+        block_table: ``[B, L]`` int32 logical-to-physical block mapping.
         selected_indices: ``[B, 1, K]`` int32 logical row indices in HBM.
         weight: ``[448, 512]`` raw E4M3 rank-local kv_b projection weight in
             HBM. The first 192 rows project keys and the final 256 rows project
             values.
         weight_scale_inv: ``[4, 4]`` FP32 128x128 inverse-scale grid in HBM.
+        block_size: Static number of rows per physical cache block.
         row_offset: Rank-local first-row offset in its global 128-row FP8
             block. TP64 uses zero on even ranks and 64 on odd ranks.
 
@@ -68,7 +76,8 @@ def _selected_latent_mla_decode_nki(
         ``[B, 1, 1, 256]`` BF16 attention output in shared HBM.
 
     Notes:
-        - Negative and out-of-range indices are padding and contribute zero.
+        - Negative/out-of-range indices and invalid physical blocks are
+          padding and contribute zero.
         - The largest selected-latent allocation is one ``[128, 576]`` SBUF
           tile.  No selected-latent tensor is materialized in HBM.
         - Block-FP8 scales are applied to FP32 matmul partials before
@@ -78,9 +87,17 @@ def _selected_latent_mla_decode_nki(
 
     _kernel_assert(len(queries.shape) == 4, "queries must be rank four")
     _kernel_assert(queries.shape[1:] == (1, 1, _QK_WIDTH), "query shape mismatch")
-    _kernel_assert(len(latent_cache.shape) == 3, "latent cache must be rank three")
-    _kernel_assert(latent_cache.shape[0] == queries.shape[0], "batch mismatch")
-    _kernel_assert(latent_cache.shape[2] == _CACHE_WIDTH, "cache width mismatch")
+    _kernel_assert(len(mla_k_cache.shape) == 4, "K cache must be rank four")
+    _kernel_assert(mla_v_cache.shape == mla_k_cache.shape, "cache halves mismatch")
+    _kernel_assert(mla_k_cache.shape[1] == 1, "cache must have one head")
+    _kernel_assert(
+        mla_k_cache.shape[3] == _CACHE_HALF_WIDTH,
+        "cache half width mismatch",
+    )
+    _kernel_assert(block_size == 16, "pinned cache block size must be 16")
+    _kernel_assert(block_size == mla_k_cache.shape[2], "cache block size mismatch")
+    _kernel_assert(len(block_table.shape) == 2, "block table must be rank two")
+    _kernel_assert(block_table.shape[0] == queries.shape[0], "batch mismatch")
     _kernel_assert(
         selected_indices.shape[:2] == queries.shape[:2],
         "selection/query shape mismatch",
@@ -99,7 +116,10 @@ def _selected_latent_mla_decode_nki(
     _kernel_assert(selected_count % _SELECTED_TILE == 0, "selected width alignment")
 
     batch_size = queries.shape[0]
-    key_count = latent_cache.shape[1]
+    physical_block_count = mla_k_cache.shape[0]
+    logical_block_count = block_table.shape[1]
+    logical_key_count = logical_block_count * block_size
+    physical_row_count = physical_block_count * block_size
     scale = _QK_WIDTH**-0.5
     output = nl.ndarray(
         (batch_size, 1, 1, _VALUE_WIDTH),
@@ -109,6 +129,9 @@ def _selected_latent_mla_decode_nki(
 
     flat_queries = queries.reshape((batch_size, _QK_WIDTH))
     flat_selected = selected_indices.reshape((batch_size, selected_count))
+    flat_k_cache = mla_k_cache.reshape((physical_row_count, _CACHE_HALF_WIDTH))
+    flat_v_cache = mla_v_cache.reshape((physical_row_count, _CACHE_HALF_WIDTH))
+    flat_block_table = block_table.reshape((batch_size * logical_block_count, 1))
 
     for batch_index in nl.affine_range(batch_size):
         # q_nope @ W_k -> absorbed 512-wide latent query.  Accumulate each
@@ -226,7 +249,6 @@ def _selected_latent_mla_decode_nki(
         nisa.memset(dst=running_sum, value=0.0)
         nisa.memset(dst=latent_accumulator, value=0.0)
 
-        cache_rows = latent_cache[batch_index].reshape((key_count, _CACHE_WIDTH))
         for selected_tile_index in nl.sequential_range(
             selected_count // _SELECTED_TILE
         ):
@@ -241,20 +263,146 @@ def _selected_latent_mla_decode_nki(
                 axes=(1, 0),
             )
 
+            logical_blocks = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=logical_blocks,
+                data=index_rows,
+                op0=nl.right_shift,
+                operand0=4,
+                engine=nisa.engine.vector,
+            )
+            logical_rows_in_block = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=logical_rows_in_block,
+                data=index_rows,
+                op0=nl.bitwise_and,
+                operand0=15,
+                engine=nisa.engine.vector,
+            )
+            block_table_rows = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            logical_block_valid_low = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            logical_block_valid_high = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            logical_block_valid_float = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            logical_block_valid = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=logical_block_valid_low,
+                data=logical_blocks,
+                op0=nl.greater,
+                operand0=-1,
+            )
+            nisa.tensor_scalar(
+                dst=logical_block_valid_high,
+                data=logical_blocks,
+                op0=nl.less,
+                operand0=logical_block_count,
+            )
+            nisa.tensor_tensor(
+                dst=logical_block_valid_float,
+                data1=logical_block_valid_low,
+                data2=logical_block_valid_high,
+                op=nl.multiply,
+            )
+            nisa.tensor_copy(
+                dst=logical_block_valid,
+                src=logical_block_valid_float,
+            )
+            block_table_rows_plus_one = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=block_table_rows_plus_one,
+                data=logical_blocks,
+                op0=nl.add,
+                operand0=batch_index * logical_block_count + 1,
+            )
+            nisa.tensor_tensor(
+                dst=block_table_rows,
+                data1=block_table_rows_plus_one,
+                data2=logical_block_valid,
+                op=nl.multiply,
+            )
+            nisa.tensor_scalar(
+                dst=block_table_rows,
+                data=block_table_rows,
+                op0=nl.add,
+                operand0=-1,
+            )
+            physical_blocks = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.memset(dst=physical_blocks, value=-1)
+            nisa.dma_copy(
+                dst=physical_blocks,
+                src=flat_block_table.ap(
+                    pattern=[[1, _SELECTED_TILE], [1, 1]],
+                    vector_offset=block_table_rows,
+                    indirect_dim=0,
+                ),
+                dge_mode=nisa.dge_mode.swdge,
+                oob_mode=nisa.oob_mode.skip,
+            )
+            physical_block_offsets = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=physical_block_offsets,
+                data=physical_blocks,
+                op0=nl.multiply,
+                operand0=block_size,
+            )
+            physical_rows = nl.ndarray(
+                (_SELECTED_TILE, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_tensor(
+                dst=physical_rows,
+                data1=physical_block_offsets,
+                data2=logical_rows_in_block,
+                op=nl.add,
+            )
+
             selected_cache = nl.ndarray(
                 (_SELECTED_TILE, _CACHE_WIDTH),
-                dtype=latent_cache.dtype,
+                dtype=mla_k_cache.dtype,
                 buffer=nl.sbuf,
             )
             nisa.memset(dst=selected_cache, value=0.0)
-            selected_source = cache_rows.ap(
-                pattern=[[_CACHE_WIDTH, _SELECTED_TILE], [1, _CACHE_WIDTH]],
-                vector_offset=index_rows,
-                indirect_dim=0,
+            nisa.dma_copy(
+                dst=selected_cache[0:_SELECTED_TILE, 0:_CACHE_HALF_WIDTH],
+                src=flat_k_cache.ap(
+                    pattern=[
+                        [_CACHE_HALF_WIDTH, _SELECTED_TILE],
+                        [1, _CACHE_HALF_WIDTH],
+                    ],
+                    vector_offset=physical_rows,
+                    indirect_dim=0,
+                ),
+                dge_mode=nisa.dge_mode.swdge,
+                oob_mode=nisa.oob_mode.skip,
             )
             nisa.dma_copy(
-                dst=selected_cache,
-                src=selected_source,
+                dst=selected_cache[0:_SELECTED_TILE, _CACHE_HALF_WIDTH:_CACHE_WIDTH],
+                src=flat_v_cache.ap(
+                    pattern=[
+                        [_CACHE_HALF_WIDTH, _SELECTED_TILE],
+                        [1, _CACHE_HALF_WIDTH],
+                    ],
+                    vector_offset=physical_rows,
+                    indirect_dim=0,
+                ),
                 dge_mode=nisa.dge_mode.swdge,
                 oob_mode=nisa.oob_mode.skip,
             )
@@ -267,7 +415,7 @@ def _selected_latent_mla_decode_nki(
                 latent_start = latent_tile_index * _SELECTED_TILE
                 latent_transpose = nl.ndarray(
                     (_SELECTED_TILE, _SELECTED_TILE),
-                    dtype=latent_cache.dtype,
+                    dtype=mla_k_cache.dtype,
                     buffer=nl.sbuf,
                 )
                 nisa.dma_transpose(
@@ -297,7 +445,7 @@ def _selected_latent_mla_decode_nki(
 
             rope_transpose = nl.ndarray(
                 (_ROPE_WIDTH, _SELECTED_TILE),
-                dtype=latent_cache.dtype,
+                dtype=mla_k_cache.dtype,
                 buffer=nl.sbuf,
             )
             nisa.dma_transpose(
@@ -326,6 +474,20 @@ def _selected_latent_mla_decode_nki(
             valid_high = nl.ndarray(
                 (1, _SELECTED_TILE), dtype=nl.float32, buffer=nl.sbuf
             )
+            physical_block_columns = nl.ndarray(
+                (1, _SELECTED_TILE), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.dma_transpose(
+                dst=physical_block_columns,
+                src=physical_blocks,
+                axes=(1, 0),
+            )
+            valid_physical_low = nl.ndarray(
+                (1, _SELECTED_TILE), dtype=nl.float32, buffer=nl.sbuf
+            )
+            valid_physical_high = nl.ndarray(
+                (1, _SELECTED_TILE), dtype=nl.float32, buffer=nl.sbuf
+            )
             valid = nl.ndarray((1, _SELECTED_TILE), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(
                 dst=valid_low,
@@ -337,10 +499,34 @@ def _selected_latent_mla_decode_nki(
                 dst=valid_high,
                 data=index_columns,
                 op0=nl.less,
-                operand0=key_count,
+                operand0=logical_key_count,
+            )
+            nisa.tensor_scalar(
+                dst=valid_physical_low,
+                data=physical_block_columns,
+                op0=nl.greater,
+                operand0=-1,
+            )
+            nisa.tensor_scalar(
+                dst=valid_physical_high,
+                data=physical_block_columns,
+                op0=nl.less,
+                operand0=physical_block_count,
             )
             nisa.tensor_tensor(
                 dst=valid, data1=valid_low, data2=valid_high, op=nl.multiply
+            )
+            nisa.tensor_tensor(
+                dst=valid,
+                data1=valid,
+                data2=valid_physical_low,
+                op=nl.multiply,
+            )
+            nisa.tensor_tensor(
+                dst=valid,
+                data1=valid,
+                data2=valid_physical_high,
+                op=nl.multiply,
             )
             invalid_bias = nl.ndarray(
                 (1, _SELECTED_TILE), dtype=nl.float32, buffer=nl.sbuf
@@ -598,21 +784,27 @@ def _selected_latent_mla_decode_nki(
 
 def selected_latent_mla_decode(
     queries: torch.Tensor,
-    latent_cache: torch.Tensor,
+    mla_k_cache: torch.Tensor,
+    mla_v_cache: torch.Tensor,
+    block_table: torch.Tensor,
     selected_indices: torch.Tensor,
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     *,
+    block_size: int,
     row_offset: int = 0,
 ) -> torch.Tensor:
-    """Launch the bounded selected-latent MLA decode spike."""
+    """Launch selected-latent MLA directly against physical paged caches."""
 
     return wrap_nki(_selected_latent_mla_decode_nki)[1](
         queries,
-        latent_cache,
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
         selected_indices,
         weight,
         weight_scale_inv,
+        block_size,
         row_offset=row_offset,
     )
 
