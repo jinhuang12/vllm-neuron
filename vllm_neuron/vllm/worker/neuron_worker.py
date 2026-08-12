@@ -1521,9 +1521,12 @@ class NeuronWorker(WorkerBase):
                 "_extract_decode_drafter_graphs called without a drafter "
                 "attached; gate the call on self.model_runner.drafter."
             )
-        num_spec_tokens = runner.speculative_config.num_speculative_tokens
         for batch_size, ctx_bucket in targets:
-            draft_num_tokens = batch_size * (1 + num_spec_tokens)
+            # DESIGN 1: input-window shape is the target verify window
+            # bs*(1+num_spec), identical for sequential and parallel
+            # (P-EAGLE) drafting; parallel-ness lives inside the traced
+            # drafter forward. See EagleProposer.draft_graph_input_tokens.
+            draft_num_tokens = runner.drafter.draft_graph_input_tokens(batch_size)
             draft_attn_metadata = runner._build_warmup_attention_metadata(
                 num_tokens=draft_num_tokens,
                 num_reqs=batch_size,

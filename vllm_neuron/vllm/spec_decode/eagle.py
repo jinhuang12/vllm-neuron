@@ -34,6 +34,7 @@ class EagleProposer:
         vllm_config: VllmConfig,
         device: torch.device,
         on_device_sampling: bool = True,
+        parallel_drafting: bool = False,
     ):
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
@@ -47,6 +48,20 @@ class EagleProposer:
         self.on_device_sampling = on_device_sampling
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
+        # P-EAGLE (parallel drafting) plumbing. Sequential eagle3 keeps
+        # parallel_drafting=False and is behaviorally unchanged: ptd_token_id
+        # stays None and extra_slots_per_request stays 1.
+        self.parallel_drafting = parallel_drafting
+        self.ptd_token_id = self._resolve_ptd_token_id()
+        # Extra drafter slots per request. Upstream analog of
+        # SpecDecodeBaseProposer.extra_slots_per_request
+        # (vllm/v1/spec_decode/llm_base_proposer.py:96): one masked slot per
+        # speculative token in parallel mode, a single shift slot otherwise.
+        # Consumed by drafter token-budget/bucket derivation (later increment).
+        self.extra_slots_per_request = (
+            self.num_speculative_tokens if self.parallel_drafting else 1
+        )
+
         self.attn_layer_names: list[str] = []
         self.capture_backend_model = None
 
@@ -56,6 +71,67 @@ class EagleProposer:
         world_rank = world_group.rank if world_group else 0
         self.rank_tensor = torch.tensor(
             world_rank, dtype=torch.int32, device=self.device
+        )
+
+    def draft_graph_input_tokens(self, batch_size: int) -> int:
+        """Token count of the drafter graph's INPUT WINDOW for a decode bucket.
+
+        This is the number of tokens ``propose``/``graph_extract`` receive as
+        ``target_token_ids`` — i.e. the target model's per-step verify window,
+        ``batch_size * (1 + num_speculative_tokens)``. It is identical for
+        sequential and parallel (P-EAGLE) drafting: the input window is the
+        target verify shape and is drafting-method-agnostic (DESIGN 1).
+
+        The parallel vs. sequential difference lives ENTIRELY inside the traced
+        drafter forward (``Eagle3LlamaForCausalLM._forward_parallel`` vs. the
+        unrolled recurrent loop), not in this outer bucket shape. Changing this
+        to ``batch_size * num_speculative_tokens`` for parallel mode would make
+        the traced graph's input window disagree with the runtime input (the
+        target still feeds ``bs * (1 + num_spec)``), forcing a recompile on the
+        first real decode. See change-set.md Increment 4.
+        """
+        return batch_size * (1 + self.num_speculative_tokens)
+
+    def parallel_backbone_tokens(self, batch_size: int) -> int:
+        """Token count of the drafter's INTERNAL single backbone pass.
+
+        Upstream analog of ``extra_slots_per_request`` applied to a batch
+        (vllm/v1/spec_decode/llm_base_proposer.py:96): in parallel (P-EAGLE)
+        mode the drafter runs ONE backbone pass over
+        ``batch_size * num_speculative_tokens`` masked slots
+        (``extra_slots_per_request == num_speculative_tokens``); in sequential
+        mode ``extra_slots_per_request == 1`` and there is no single fused
+        backbone pass of this width (the recurrent loop instead runs K passes
+        of ``batch_size`` tokens each). Exposed for bucket-arithmetic tests and
+        for any drafter token-budget derivation that must account for the
+        parallel masked slots.
+        """
+        return batch_size * self.extra_slots_per_request
+
+    def _resolve_ptd_token_id(self) -> int | None:
+        """Resolve the parallel-drafting mask token id from the draft model's
+        hf_config, mirroring upstream SpecDecodeBaseProposer
+        _init_parallel_drafting_params
+        (vllm/v1/spec_decode/llm_base_proposer.py:305-329) minus the dflash
+        branch (the plugin has no dflash support). `pard_token` takes
+        precedence over `ptd_token_id`, matching the upstream order.
+
+        Returns None for the sequential path (parallel_drafting=False). Raises
+        ValueError if parallel drafting is requested but no mask token id is
+        available, so the flag is never silently inert.
+        """
+        if not self.parallel_drafting:
+            return None
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if hf_config is not None and hasattr(hf_config, "pard_token"):
+            return hf_config.pard_token
+        if hf_config is not None and hasattr(hf_config, "ptd_token_id"):
+            return hf_config.ptd_token_id
+        raise ValueError(
+            "parallel_drafting is enabled but the draft model config has "
+            "neither `pard_token` nor `ptd_token_id`; a parallel-drafting "
+            "(P-EAGLE) checkpoint must specify the mask token id in its "
+            "config.json."
         )
 
     def _build_noop_async_spec_correction_kwargs(
@@ -336,6 +412,17 @@ class EagleProposer:
                 neuron_config=neuron_config,
             )
         self.model.num_speculative_tokens = self.num_speculative_tokens
+        # P-EAGLE: thread the parallel-drafting flag + mask token id into
+        # the drafter so load_weights loads mask_hidden and forward runs the
+        # single-pass parallel path. Sequential eagle3 leaves the defaults.
+        self.model.parallel_drafting = self.parallel_drafting
+        # Drafter-only: bound decode KV gather to active context. Both the
+        # KV-prime pass and the parallel draft pass run through these self_attn
+        # modules, so setting the flag here covers both.
+        if self.parallel_drafting:
+            for _layer in self.model.model.layers:
+                _layer.self_attn.bounded_gather = True
+        self.model.ptd_token_id = self.ptd_token_id
         load_start = time.perf_counter()
         if not cpu_compile:
             self.model.load_weights(

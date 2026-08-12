@@ -107,6 +107,7 @@ def _torch_compatible_attention_block_tkg_kernel(
     #    attention_mask carries only the active-only portion)
     pos_ids: Tensor = None,
     swa_start_pos_ids: Tensor = None,
+    max_context_len: Tensor = None,
     # -- KV cache update
     update_cache: bool = False,
     kv_cache_update_idx: Tensor = None,
@@ -191,6 +192,7 @@ def _torch_compatible_attention_block_tkg_kernel(
         pos_ids=pos_ids,
         swa_start_pos_ids=swa_start_pos_ids,
         S_ctx=None,
+        max_context_len=max_context_len,
     )
 
 
@@ -955,6 +957,7 @@ def attention_decode(
     # -- in-kernel mask generation (fused path)
     pos_ids: Optional[Tensor] = None,
     swa_start_pos_ids: Optional[Tensor] = None,
+    max_context_len: Optional[Tensor] = None,
     # -- KV cache update
     update_cache: bool = False,
     kv_cache_update_idx: Optional[Tensor] = None,
@@ -1235,6 +1238,7 @@ def attention_decode(
             KVDP=attention_dp,
             pos_ids=pos_ids,
             swa_start_pos_ids=swa_start_pos_ids,
+            max_context_len=max_context_len,
         )
         # The NKI kernel always returns (output, K, V). When update_cache=True
         # the K/V outputs are the in-place-written caches (kept live so the FX

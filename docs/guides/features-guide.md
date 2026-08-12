@@ -579,6 +579,7 @@ outputs = llm.generate(["Explain quantum computing"], sampling_params)
 | `method`                    | Speculative method; `eagle3` is supported in 2.31            |
 | `model`                     | Path or name of the EAGLE3 draft model                       |
 | `num_speculative_tokens`    | Number of tokens the draft proposes per step (typically 3-7) |
+| `parallel_drafting`         | Optional bool (default `false`). Draft `K` tokens in a single masked forward pass instead of `K` sequential draft steps. See [Parallel drafting (P-EAGLE)](#parallel-drafting-p-eagle) |
 | `on_device_sampling_config` | Required for on-device rejection sampling                    |
 
 ### On-device vs CPU sampling
@@ -594,6 +595,84 @@ logits to CPU. This requires `on_device_sampling_config` to be set.
   latency matters
 - Workloads where the draft model acceptance rate is high (structured
   outputs, code generation)
+
+### Parallel drafting (P-EAGLE)
+
+Parallel drafting changes how the draft model produces its `K` speculative
+tokens. Sequential EAGLE3 unrolls `K` draft steps, feeding each drafted
+token back into the draft model for the next step. Parallel drafting
+instead produces all `K` draft tokens from one masked draft pass over `K`
+slots per request: slot 0 holds the real seed token, slots 1 through `K-1`
+are filled with the checkpoint's mask token and a learned `mask_hidden`
+state. Each step the draft model runs twice: a KV-prime pass first
+re-processes the incoming window (the prompt at prefill; the verify window
+at decode) with the real per-token target hidden states, so the drafter's
+context KV cache always derives from real hidden states; the masked draft
+pass then produces the `K` tokens. Without the KV-prime pass, context
+positions retain `mask_hidden`-derived KV and acceptance degrades severely
+at every draft position. Target-side verification is unchanged: the target
+model still verifies all `K` tokens in one forward pass and the rejection
+sampler accepts tokens sequentially until the first mismatch, exactly as
+in sequential EAGLE3.
+
+Enable it by adding `"parallel_drafting": true` to `--speculative-config`:
+
+```bash
+--speculative-config '{"method": "eagle3", "model": "amazon/GPT-OSS-20B-P-EAGLE", "num_speculative_tokens": 2, "parallel_drafting": true}'
+```
+
+Tested configuration: GPT-OSS-20B target with the
+`amazon/GPT-OSS-20B-P-EAGLE` draft model on Trn2. At
+`num_speculative_tokens=5`, `--tensor-parallel-size 16`, offline batched
+generation over MT-Bench prompts, parallel drafting reaches 47.8% overall
+draft acceptance (first-position acceptance rate 0.77, mean acceptance
+length 3.39) at 2.3x the generation throughput of sequential EAGLE3 with
+the same draft model, because two draft passes replace `K` sequential
+draft-model invocations per step.
+
+**Performance caveat (measured, batch size 1):** speculative decoding is
+memory-bandwidth-bound on this stack. Profiling shows the draft model's
+NEFF dominates the decode step: it runs almost entirely DMA-busy,
+re-streaming several gigabytes of weight/KV data per step despite the
+draft model's small compute footprint, and the target's widened verify
+window adds roughly 2x a single-token step on top. At `max_num_seqs=1`
+every measured speculative configuration (parallel and sequential, `K` of
+2 and 5, TP8 and TP16) has lower generation throughput than running the
+target model without speculation. Enable parallel drafting only after
+benchmarking your configuration against a no-speculation baseline.
+
+#### Drafter checkpoint requirements
+
+Parallel drafting requires a draft checkpoint built for it:
+
+- A mask-token id read from the draft model's `config.json`: `pard_token`
+  if present, otherwise `ptd_token_id`. `pard_token` takes precedence when
+  both are set. If `parallel_drafting` is requested and neither key
+  resolves to a token id, startup fails with an explicit error rather than
+  silently falling back to sequential drafting.
+- A `mask_hidden` weight in the checkpoint. If `parallel_drafting` is set
+  and the checkpoint has no `mask_hidden` weight, weight loading fails with
+  a clear error instead of loading a partially-initialized draft model.
+
+#### Multi-layer drafters
+
+The draft model backbone supports one or more layers. Layer 0 is always
+the EAGLE3 fusion layer (concatenates target embeddings with the target
+hidden state, double-width QKV, its own `hidden_norm`); any additional
+layers are plain Llama decoder layers chained by residual connections, the
+same dual-mode layout upstream EAGLE3 uses. This applies to both drafting
+modes. For parallel drafting, the masked draft pass runs through all
+layers of the backbone: the mask-hidden substitution is applied once, at
+the fusion layer's input, and carries forward through the rest of the
+backbone via the residual stream.
+
+#### Constraints
+
+- **Mutually exclusive with async scheduling**, same as sequential EAGLE3:
+  setting `--speculative-config` disables async scheduling automatically
+  with a startup warning, whether or not `parallel_drafting` is set.
+- `parallel_drafting` defaults to `false`. Existing sequential EAGLE3
+  deployments are unaffected unless the flag is explicitly set.
 
 ## Structured outputs and tool calling
 

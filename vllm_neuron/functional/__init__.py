@@ -3,6 +3,12 @@ from .argsort_unstable import argsort_unstable
 from .spec_decode_correction import (
     correct_spec_decode_positions_and_slot_mapping as correct_spec_decode_positions_and_slot_mapping,
 )  # noqa: F401
+from .parallel_draft_inputs import (
+    build_parallel_draft_hidden_mask,
+    build_parallel_draft_input_ids,
+    build_parallel_draft_positions,
+    substitute_mask_hidden,
+)
 from .attention.attention_decode_mask import gen_attention_decode_mask
 from .attention.attention_decode import attention_decode
 from .attention.qkv import qkv_proj
@@ -41,6 +47,10 @@ from .process_groups import create_row_col_groups, get_group_slice_indices
 # Alphabetical
 __all__ = [
     "argsort_unstable",
+    "build_parallel_draft_hidden_mask",
+    "build_parallel_draft_input_ids",
+    "build_parallel_draft_positions",
+    "substitute_mask_hidden",
     "all_to_all",
     "all_to_all_v",
     "attention_decode",
