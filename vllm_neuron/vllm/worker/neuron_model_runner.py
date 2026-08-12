@@ -63,6 +63,7 @@ from vllm_neuron.metrics import (
     NEFF_EXECUTION_COUNT,
 )
 from vllm_neuron.model.interfaces import SupportsMRoPE
+from vllm_neuron.model.kv_cache import resolve_layer_cache_dtype
 from vllm_neuron.model.neuron_config import (
     NeuronConfig,
 )
@@ -7828,6 +7829,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
+            layer_cache_dtype = resolve_layer_cache_dtype(
+                layer.dtype, kv_cache_dtype
+            )
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
             # this enables block clipping in the NiXL connector.
@@ -7836,7 +7840,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
                     head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
+                    dtype=layer_cache_dtype,
                     sliding_window=layer.sliding_window_size,
                     attention_chunk_size=layer.chunk_size,
                 )
@@ -7845,7 +7849,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
                     head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
+                    dtype=layer_cache_dtype,
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
@@ -7856,11 +7860,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             drafter_kv_spec = self.drafter.model.get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
+                layer_cache_dtype = resolve_layer_cache_dtype(
+                    layer.dtype, kv_cache_dtype
+                )
                 all_kv_cache_specs[layer_name] = FullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
                     head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
+                    dtype=layer_cache_dtype,
                     sliding_window=layer.sliding_window_size,
                     attention_chunk_size=layer.chunk_size,
                 )

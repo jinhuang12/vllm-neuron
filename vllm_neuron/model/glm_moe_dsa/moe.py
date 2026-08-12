@@ -1,0 +1,440 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Direct vLLM-Neuron GLM-5.2 routed and shared expert components."""
+
+from __future__ import annotations
+
+import nki
+import nki.language as nl
+import torch
+import torch.nn.functional as F
+from nkilib.core.moe.moe_cte.moe_cte import MoECTEImplementation
+from nkilib.core.router_topk.router_topk import router_topk
+from nkilib.core.utils.common_types import (
+    ActFnType,
+    ExpertAffinityScaleMode,
+    RouterActFnType,
+)
+from torch import nn
+
+import vllm_neuron.functional as NF
+from vllm_neuron.nki.nki_hop import can_run_kernel, wrap_nki
+
+from .block_fp8 import BlockFP8Linear
+from .config import GlmMoeDsaConfig
+from .mlp import GlmMoeDsaSwiGLUMLP
+
+
+class _SingleRankMoEGroup:
+    """The pure-EP local mapping has no intermediate-dimension collective."""
+
+    rank_in_group = 0
+    world_size = 1
+
+
+_router_topk_nki = nki.jit(router_topk)
+
+
+class GlmMoeDsaNoAuxRouter(nn.Module):
+    """Pinned sigmoid noaux_tc routing.
+
+    Correction bias affects expert selection only. The selected uncorrected
+    sigmoid scores are normalized and then multiplied by the routed scale.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        *,
+        routed_scaling_factor: float = 2.5,
+        norm_topk_prob: bool = True,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        if not 0 < top_k <= num_experts:
+            raise ValueError(f"top_k={top_k} must be in 1..{num_experts}")
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.routed_scaling_factor = routed_scaling_factor
+        self.norm_topk_prob = norm_topk_prob
+        self.gate = nn.Linear(
+            hidden_size,
+            num_experts,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.zeros(num_experts, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "selection_identity",
+            torch.eye(num_experts, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+
+    @property
+    def correction_bias(self) -> torch.Tensor:
+        return self.gate.e_score_correction_bias
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = torch.sigmoid(self.gate(hidden_states).float())
+        selection_scores = scores + self.correction_bias
+        if can_run_kernel(scores):
+            selected_experts = self._select_nki(scores)
+        else:
+            _, selected_experts = torch.topk(
+                selection_scores, self.top_k, dim=-1, sorted=False
+            )
+            selected_experts = selected_experts.to(torch.int32)
+        selected_weights = torch.gather(scores, -1, selected_experts.to(torch.long))
+        if self.norm_topk_prob:
+            denominator = selected_weights.sum(dim=-1, keepdim=True)
+            denominator = denominator + (denominator == 0).to(denominator.dtype)
+            selected_weights = selected_weights / denominator
+        routed_scale = scores.new_full((), self.routed_scaling_factor)
+        selected_weights = selected_weights * routed_scale
+        affinities = torch.zeros_like(scores).scatter(
+            -1, selected_experts, selected_weights
+        )
+        return affinities, selected_experts
+
+    def _select_nki(self, scores: torch.Tensor) -> torch.Tensor:
+        """Select on sigmoid scores plus correction bias without HLO sort."""
+        token_count = scores.shape[0]
+        router_logits = torch.zeros_like(scores)
+        scratch_affinities = torch.zeros_like(scores)
+        expert_index = torch.zeros(
+            token_count,
+            self.top_k,
+            dtype=torch.int32,
+            device=scores.device,
+        )
+        wrapped = wrap_nki(_router_topk_nki)
+        _, expert_index, _ = wrapped[2](
+            x=scores,
+            w=self.selection_identity,
+            w_bias=self.correction_bias.unsqueeze(0),
+            router_logits=router_logits,
+            expert_affinities=scratch_affinities,
+            expert_index=expert_index,
+            act_fn=RouterActFnType.SIGMOID,
+            k=self.top_k,
+            x_hbm_layout=1,
+            x_sb_layout=0,
+            router_pre_norm=False,
+            norm_topk_prob=False,
+            use_indirect_dma_scatter=True,
+            use_column_tiling=False,
+            shard_on_tokens=token_count >= 128,
+            skip_store_router_logits=True,
+            skip_store_expert_index=False,
+            use_PE_broadcast_w_bias=False,
+        )
+        return expert_index
+
+
+class GlmMoeDsaExpertMLP(nn.Module):
+    """One full-width routed expert owned by one EP64 rank."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        fp8_weights: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        if fp8_weights:
+            self.gate_proj = BlockFP8Linear(
+                hidden_size, intermediate_size, device=device
+            )
+            self.up_proj = BlockFP8Linear(hidden_size, intermediate_size, device=device)
+            self.down_proj = BlockFP8Linear(
+                intermediate_size, hidden_size, device=device
+            )
+        else:
+            self.gate_proj = nn.Linear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                dtype=dtype,
+                device=device,
+            )
+            self.up_proj = nn.Linear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                dtype=dtype,
+                device=device,
+            )
+            self.down_proj = nn.Linear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                dtype=dtype,
+                device=device,
+            )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(
+            F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        )
+
+
+class GlmMoeDsaRoutedExperts(nn.Module):
+    """Four full local experts for one rank of the frozen EP64 topology."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        num_experts: int = 256,
+        top_k: int = 8,
+        expert_parallel_size: int = 64,
+        expert_parallel_rank: int = 0,
+        fp8_weights: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device | str | None = None,
+        block_size: int = 256,
+    ) -> None:
+        super().__init__()
+        if num_experts % expert_parallel_size:
+            raise ValueError(
+                f"num_experts={num_experts} is not divisible by "
+                f"EP={expert_parallel_size}"
+            )
+        if not 0 <= expert_parallel_rank < expert_parallel_size:
+            raise ValueError(
+                f"expert_parallel_rank={expert_parallel_rank} is outside "
+                f"EP={expert_parallel_size}"
+            )
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.expert_parallel_size = expert_parallel_size
+        self.expert_parallel_rank = expert_parallel_rank
+        self.num_local_experts = num_experts // expert_parallel_size
+        self.local_expert_start = expert_parallel_rank * self.num_local_experts
+        self.block_size = block_size
+        self.experts = nn.ModuleList(
+            GlmMoeDsaExpertMLP(
+                hidden_size,
+                intermediate_size,
+                fp8_weights=fp8_weights,
+                dtype=dtype,
+                device=device,
+            )
+            for _ in range(self.num_local_experts)
+        )
+
+    @property
+    def global_expert_ids(self) -> tuple[int, ...]:
+        return tuple(
+            range(
+                self.local_expert_start,
+                self.local_expert_start + self.num_local_experts,
+            )
+        )
+
+    def _kernel_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        gate_up = torch.stack(
+            [
+                torch.stack([expert.gate_proj.weight.T, expert.up_proj.weight.T], dim=1)
+                for expert in self.experts
+            ],
+            dim=0,
+        )
+        down = torch.stack(
+            [expert.down_proj.weight.T for expert in self.experts], dim=0
+        )
+        return gate_up, down
+
+    def _torch_forward(
+        self, hidden_states: torch.Tensor, affinities: torch.Tensor
+    ) -> torch.Tensor:
+        output = torch.zeros_like(hidden_states)
+        for local_id, global_id in enumerate(self.global_expert_ids):
+            weight = affinities[:, global_id : global_id + 1].to(hidden_states.dtype)
+            output = output + self.experts[local_id](hidden_states) * weight
+        return output
+
+    def _decode_nki(
+        self,
+        hidden_states: torch.Tensor,
+        affinities: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        gate_up, down = self._kernel_weights()
+        rank_id = torch.tensor(
+            [[self.expert_parallel_rank]],
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        return NF.moe_tkg(
+            hidden_input=hidden_states,
+            expert_gate_up_weights=gate_up,
+            expert_down_weights=down,
+            expert_affinities=affinities,
+            expert_index=selected_experts,
+            is_all_expert=True,
+            rank_id=rank_id,
+            mask_unselected_experts=True,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            activation_fn=ActFnType.SiLU,
+            output_dtype=hidden_states.dtype,
+        )
+
+    def _prefill_nki(
+        self, hidden_states: torch.Tensor, affinities: torch.Tensor
+    ) -> torch.Tensor:
+        token_count = hidden_states.shape[0]
+        padded_count = max(self.block_size, token_count)
+        padded_count = (
+            (padded_count + self.block_size - 1) // self.block_size
+        ) * self.block_size
+        if padded_count != token_count:
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    torch.zeros(
+                        padded_count - token_count,
+                        self.hidden_size,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    ),
+                ],
+                dim=0,
+            )
+            affinities = torch.cat(
+                [
+                    affinities,
+                    torch.zeros(
+                        padded_count - token_count,
+                        self.num_experts,
+                        dtype=affinities.dtype,
+                        device=affinities.device,
+                    ),
+                ],
+                dim=0,
+            )
+
+        local_affinities = affinities[
+            :,
+            self.local_expert_start : self.local_expert_start + self.num_local_experts,
+        ].contiguous()
+        (
+            affinities_masked,
+            token_position_to_id,
+            block_to_expert,
+            conditions,
+        ) = NF.build_blockwise_mapping(
+            expert_affinities=local_affinities,
+            num_local_experts=self.num_local_experts,
+            num_experts_per_token=min(self.top_k, self.num_local_experts),
+            block_size=self.block_size,
+            moe_group=_SingleRankMoEGroup(),
+            tp_degree=1,
+        )
+        gate_up, down = self._kernel_weights()
+        output = NF.moe_cte(
+            implementation=MoECTEImplementation.shard_on_block,
+            conditions=conditions,
+            hidden_states=hidden_states,
+            expert_affinities_masked=affinities_masked,
+            gate_up_proj_weight=gate_up,
+            down_proj_weight=down,
+            activation_function=ActFnType.SiLU,
+            block_size=self.block_size,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            skip_token=True,
+            is_tensor_update_accumulating=True,
+            compute_dtype=nl.bfloat16,
+        )
+        return output[:token_count]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        affinities: torch.Tensor,
+        selected_experts: torch.Tensor,
+        *,
+        is_decode: bool,
+    ) -> torch.Tensor:
+        if isinstance(self.experts[0].gate_proj, BlockFP8Linear):
+            return self._torch_forward(hidden_states, affinities)
+        if not can_run_kernel(hidden_states):
+            return self._torch_forward(hidden_states, affinities)
+        if is_decode:
+            return self._decode_nki(hidden_states, affinities, selected_experts)
+        return self._prefill_nki(hidden_states, affinities)
+
+
+class GlmMoeDsaMoE(nn.Module):
+    """One rank-local GLM-5.2 MoE contribution.
+
+    Routed experts use pure EP64. The shared expert uses TP64. A later decoder
+    The decoder sums this local result across the common 64-rank group.
+    """
+
+    def __init__(
+        self,
+        config: GlmMoeDsaConfig,
+        *,
+        tensor_parallel_size: int = 64,
+        expert_parallel_size: int = 64,
+        expert_parallel_rank: int = 0,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        if config.hidden_act != "silu":
+            raise ValueError("GLM-5.2 supports only hidden_act='silu'")
+        if config.scoring_func != "sigmoid" or config.topk_method != "noaux_tc":
+            raise ValueError("GLM-5.2 requires sigmoid noaux_tc routing")
+        if config.n_group != 1 or config.topk_group != 1:
+            raise ValueError("GLM-5.2 grouped routing is frozen to one group")
+        self.router = GlmMoeDsaNoAuxRouter(
+            config.hidden_size,
+            config.n_routed_experts,
+            config.num_experts_per_tok,
+            routed_scaling_factor=config.routed_scaling_factor,
+            norm_topk_prob=config.norm_topk_prob,
+            dtype=config.torch_dtype,
+            device=device,
+        )
+        self.experts = GlmMoeDsaRoutedExperts(
+            config.hidden_size,
+            config.moe_intermediate_size,
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            expert_parallel_size=expert_parallel_size,
+            expert_parallel_rank=expert_parallel_rank,
+            fp8_weights=bool(config.quantization_config),
+            dtype=config.torch_dtype,
+            device=device,
+        )
+        self.shared_experts = GlmMoeDsaSwiGLUMLP.shared_from_config(
+            config,
+            tensor_parallel_size=tensor_parallel_size,
+            tensor_parallel_rank=expert_parallel_rank,
+            device=device,
+        )
+
+    def forward(self, hidden_states: torch.Tensor, *, is_decode: bool) -> torch.Tensor:
+        affinities, selected_experts = self.router(hidden_states)
+        routed = self.experts(
+            hidden_states,
+            affinities,
+            selected_experts,
+            is_decode=is_decode,
+        )
+        shared = self.shared_experts(hidden_states)
+        return routed + shared
