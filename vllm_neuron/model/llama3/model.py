@@ -824,6 +824,17 @@ class LlamaAttention(nn.Module):
             # from pos_ids and early-exits after ceil(max_context_len/tile)
             # tiles, bounding the prior-KV gather to the active context length
             # instead of the full max_model_len.
+            #
+            # DORMANT at max_model_len <= 8192: nkilib gates the max_context_len
+            # early-exit on use_fa = (s_prior > _FA_TILE_SIZE=8192)
+            # (attention_tkg_utils.py uses_flash_attention). Here s_prior =
+            # max_blocks_per_seq*block_size <= max_model_len, so use_fa is False
+            # and the kernel runs the static full-extent gather regardless. This
+            # path is a verified no-op below 8192 (measured: gather bytes
+            # unchanged) but correct and harmless; it activates only if a future
+            # config runs s_prior > 8192. Bounding the gather below 8192 needs a
+            # genuinely narrower block table baked at warmup, not this runtime
+            # scalar.
             if dcp_decode_active:
                 raise NotImplementedError(
                     "bounded_gather (active-context KV bound) is not supported "
