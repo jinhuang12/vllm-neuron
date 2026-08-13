@@ -18,7 +18,7 @@ from vllm_neuron.model.glm_moe_dsa.attention import (
 )
 from vllm_neuron.model.glm_moe_dsa.model import GlmMoeDsaDecoderLayer
 
-from test.vllm_neuron.model.glm_moe_dsa.test_sparse_mla import (
+from test_sparse_mla import (
     _deterministic_inputs,
     _poison_unselected_physical_rows,
     _tiled_online_reference,
