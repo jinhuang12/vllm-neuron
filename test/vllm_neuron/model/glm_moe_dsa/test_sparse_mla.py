@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_neuron.model.glm_moe_dsa.sparse_mla import (
     _selected_latent_mla_decode_nki,
@@ -20,6 +22,7 @@ _BLOCK_SIZE = 16
 _LOGICAL_LENGTH = 4096
 _LOGICAL_BLOCKS = _LOGICAL_LENGTH // _BLOCK_SIZE
 _PHYSICAL_BLOCKS = 520
+_VALUE_SHARD_WIDTH = 128
 
 
 def _reference(
@@ -42,6 +45,35 @@ def _reference(
     chosen = cache[batch, safe]
     chosen = torch.where(valid[..., None], chosen, torch.zeros_like(chosen))
     return _selected_attention_reference(
+        queries,
+        chosen,
+        valid,
+        weight,
+        weight_scale_inv,
+        row_offset=row_offset,
+    )
+
+
+def _tiled_online_reference(
+    queries: torch.Tensor,
+    cache: torch.Tensor,
+    selected: torch.Tensor,
+    block_table: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    *,
+    row_offset: int,
+) -> torch.Tensor:
+    valid = (selected >= 0) & (selected < cache.shape[1])
+    safe = selected.clamp(0, cache.shape[1] - 1)
+    logical_blocks = torch.div(safe, _BLOCK_SIZE, rounding_mode="floor")
+    expanded_table = block_table[:, None, :].expand(-1, selected.shape[1], -1)
+    physical_blocks = torch.gather(expanded_table, 2, logical_blocks)
+    valid &= (physical_blocks >= 0) & (physical_blocks < _PHYSICAL_BLOCKS)
+    batch = torch.arange(cache.shape[0], device=cache.device)[:, None, None]
+    chosen = cache[batch, safe]
+    chosen = torch.where(valid[..., None], chosen, torch.zeros_like(chosen))
+    return _selected_attention_tiled_online_reference(
         queries,
         chosen,
         valid,
@@ -123,6 +155,106 @@ def _selected_attention_reference(
             output[..., value_start:value_end].add_(
                 partial * weight_scale_inv[output_block, latent_block]
             )
+    return output.to(queries.dtype)
+
+
+def _selected_attention_tiled_online_reference(
+    queries: torch.Tensor,
+    chosen: torch.Tensor,
+    valid: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    *,
+    row_offset: int,
+) -> torch.Tensor:
+    """Mirror the kernel's sequential 128-row online-softmax order."""
+
+    latent = chosen[..., :512].float()
+    rope = chosen[..., 512:].float()
+    q_nope = queries[..., :192].float()
+    q_rope = queries[..., 192:].float()
+
+    absorbed_query = torch.zeros(*q_nope.shape[:-1], 512, dtype=torch.float32)
+    for latent_block in range(4):
+        latent_start = latent_block * _VALUE_SHARD_WIDTH
+        absorbed_tile = torch.zeros(
+            *q_nope.shape[:-1], _VALUE_SHARD_WIDTH, dtype=torch.float32
+        )
+        for output_block in range(4):
+            key_start = max(0, output_block * _VALUE_SHARD_WIDTH - row_offset)
+            key_end = min(192, (output_block + 1) * _VALUE_SHARD_WIDTH - row_offset)
+            if key_end <= key_start:
+                continue
+            partial = torch.matmul(
+                q_nope[..., key_start:key_end],
+                weight[
+                    key_start:key_end,
+                    latent_start : latent_start + _VALUE_SHARD_WIDTH,
+                ].float(),
+            )
+            absorbed_tile.add_(partial * weight_scale_inv[output_block, latent_block])
+        absorbed_query[..., latent_start : latent_start + _VALUE_SHARD_WIDTH].copy_(
+            absorbed_tile
+        )
+    absorbed_query = absorbed_query.to(queries.dtype).float()
+
+    running_max = torch.full((*queries.shape[:-1], 1), -9984.0, dtype=torch.float32)
+    running_sum = torch.zeros_like(running_max)
+    latent_accumulator = torch.zeros(*queries.shape[:-1], 512, dtype=torch.float32)
+    for selected_start in range(0, chosen.shape[-2], _VALUE_SHARD_WIDTH):
+        selected_end = selected_start + _VALUE_SHARD_WIDTH
+        latent_tile = latent[..., selected_start:selected_end, :]
+        rope_tile = rope[..., selected_start:selected_end, :]
+        valid_tile = valid[..., selected_start:selected_end].unsqueeze(-2)
+        scores = torch.matmul(absorbed_query, latent_tile.transpose(-1, -2)).add(
+            torch.matmul(q_rope, rope_tile.transpose(-1, -2))
+        ) * (256**-0.5)
+        valid_float = valid_tile.float()
+        scores = scores * valid_float + valid_float * 9984.0 - 9984.0
+
+        tile_max = scores.max(dim=-1, keepdim=True).values
+        new_max = torch.maximum(running_max, tile_max)
+        old_scale = torch.exp(running_max - new_max)
+        probabilities = torch.exp(scores - new_max) * valid_float
+        tile_sum = probabilities.sum(dim=-1, keepdim=True)
+        running_sum = running_sum * old_scale + tile_sum
+
+        probabilities_compute = probabilities.to(queries.dtype).float()
+        weighted_latent = torch.matmul(probabilities_compute, latent_tile)
+        latent_accumulator = latent_accumulator * old_scale + weighted_latent
+        running_max = new_max
+
+    safe_sum = torch.maximum(running_sum, torch.full_like(running_sum, 1.0e-20))
+    normalized_latent = (
+        (latent_accumulator * torch.reciprocal(safe_sum)).to(queries.dtype).float()
+    )
+
+    output = torch.zeros(*normalized_latent.shape[:-1], 256, dtype=torch.float32)
+    for output_block in range(4):
+        value_row_start = max(192, output_block * _VALUE_SHARD_WIDTH - row_offset)
+        value_row_end = min(448, (output_block + 1) * _VALUE_SHARD_WIDTH - row_offset)
+        if value_row_end <= value_row_start:
+            continue
+        value_start = value_row_start - 192
+        value_end = value_row_end - 192
+        value_block = torch.zeros(
+            *normalized_latent.shape[:-1], value_end - value_start, dtype=torch.float32
+        )
+        for latent_block in range(4):
+            latent_start = latent_block * _VALUE_SHARD_WIDTH
+            partial = torch.matmul(
+                normalized_latent[
+                    ..., latent_start : latent_start + _VALUE_SHARD_WIDTH
+                ],
+                weight[
+                    value_row_start:value_row_end,
+                    latent_start : latent_start + _VALUE_SHARD_WIDTH,
+                ]
+                .float()
+                .t(),
+            )
+            value_block.add_(partial * weight_scale_inv[output_block, latent_block])
+        output[..., value_start:value_end].copy_(value_block)
     return output.to(queries.dtype)
 
 
@@ -348,6 +480,183 @@ def test_block_fp8_reference_reads_only_selected_latent_rows(
     torch.testing.assert_close(padded, torch.zeros_like(padded))
 
 
+class _SelectedLatentMLADecodeProbe(nn.Module):
+    """Minimal full-graph wrapper for the standalone selected-MLA kernel."""
+
+    def __init__(self, row_offset: int) -> None:
+        super().__init__()
+        self.row_offset = row_offset
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        mla_k_cache: torch.Tensor,
+        mla_v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        selected_indices: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale_inv: torch.Tensor,
+    ) -> torch.Tensor:
+        return selected_latent_mla_decode(
+            queries,
+            mla_k_cache,
+            mla_v_cache,
+            block_table,
+            selected_indices,
+            weight,
+            weight_scale_inv,
+            block_size=_BLOCK_SIZE,
+            row_offset=self.row_offset,
+        )
+
+
+def _error_metrics(
+    actual: torch.Tensor, reference: torch.Tensor
+) -> dict[str, float | None]:
+    actual_fp32 = actual.float().flatten()
+    reference_fp32 = reference.float().flatten()
+    absolute_error = (actual_fp32 - reference_fp32).abs()
+    denominator = torch.linalg.vector_norm(actual_fp32) * torch.linalg.vector_norm(
+        reference_fp32
+    )
+    cosine = None
+    if denominator.item() != 0.0:
+        cosine = torch.dot(actual_fp32, reference_fp32).div(denominator).item()
+    return {
+        "max_abs": absolute_error.max().item(),
+        "mean_abs": absolute_error.mean().item(),
+        "cosine": cosine,
+    }
+
+
+def _bf16_ordered_bits(tensor: torch.Tensor) -> torch.Tensor:
+    assert tensor.dtype is torch.bfloat16
+    bits = tensor.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    magnitude = bits & 0x7FFF
+    return torch.where((bits & 0x8000) != 0, 0x8000 - magnitude, 0x8000 + bits)
+
+
+def _unravel_index(flat_index: int, shape: torch.Size) -> list[int]:
+    index = []
+    for dimension in reversed(shape):
+        index.append(flat_index % dimension)
+        flat_index //= dimension
+    return list(reversed(index))
+
+
+def _print_numeric_diagnostics(
+    actual_calls: list[torch.Tensor],
+    whole_softmax_reference: torch.Tensor,
+    tiled_online_reference: torch.Tensor,
+    padded_actual: torch.Tensor,
+) -> None:
+    actual = actual_calls[0]
+    regions: dict[str, object] = {
+        "whole_softmax": _error_metrics(actual, whole_softmax_reference),
+        "tiled_online": _error_metrics(actual, tiled_online_reference),
+    }
+    batches = []
+    for batch_index in range(actual.shape[0]):
+        batch = {
+            "batch": batch_index,
+            "whole_softmax": _error_metrics(
+                actual[batch_index], whole_softmax_reference[batch_index]
+            ),
+            "tiled_online": _error_metrics(
+                actual[batch_index], tiled_online_reference[batch_index]
+            ),
+            "shards": [],
+        }
+        for shard_index, start in enumerate(
+            range(0, actual.shape[-1], _VALUE_SHARD_WIDTH)
+        ):
+            end = min(start + _VALUE_SHARD_WIDTH, actual.shape[-1])
+            batch["shards"].append(
+                {
+                    "shard": shard_index,
+                    "start": start,
+                    "end": end,
+                    "whole_softmax": _error_metrics(
+                        actual[batch_index, ..., start:end],
+                        whole_softmax_reference[batch_index, ..., start:end],
+                    ),
+                    "tiled_online": _error_metrics(
+                        actual[batch_index, ..., start:end],
+                        tiled_online_reference[batch_index, ..., start:end],
+                    ),
+                }
+            )
+        batches.append(batch)
+    regions["batches"] = batches
+
+    ulp_distance = (
+        _bf16_ordered_bits(actual) - _bf16_ordered_bits(tiled_online_reference)
+    ).abs()
+    ulp_values, ulp_counts = torch.unique(ulp_distance, return_counts=True)
+    ulp_histogram = {
+        str(value): count
+        for value, count in zip(ulp_values.tolist(), ulp_counts.tolist(), strict=True)
+    }
+
+    absolute_error = (actual.float() - tiled_online_reference.float()).abs()
+    close = torch.isclose(actual, tiled_online_reference, rtol=2.0e-2, atol=2.0e-2)
+    top_mismatches = []
+    for flat_index in torch.argsort(absolute_error.flatten(), descending=True)[
+        : min(16, absolute_error.numel())
+    ].tolist():
+        index = _unravel_index(flat_index, actual.shape)
+        coordinate = tuple(index)
+        top_mismatches.append(
+            {
+                "index": index,
+                "actual": actual[coordinate].float().item(),
+                "reference": tiled_online_reference[coordinate].float().item(),
+                "abs_error": absolute_error[coordinate].item(),
+                "bf16_ulp": ulp_distance[coordinate].item(),
+                "within_tolerance": close[coordinate].item(),
+            }
+        )
+
+    repeatability = []
+    for call_index, repeated in enumerate(actual_calls):
+        repeatability.append(
+            {
+                "call": call_index,
+                "exact": torch.equal(repeated, actual),
+                **_error_metrics(repeated, actual),
+                "batch_exact": [
+                    torch.equal(repeated[batch_index], actual[batch_index])
+                    for batch_index in range(actual.shape[0])
+                ],
+            }
+        )
+
+    payload = {
+        "regions": regions,
+        "tiled_acceptance_mismatch_count": torch.count_nonzero(~close).item(),
+        "bf16_ulp_histogram": ulp_histogram,
+        "top_mismatches": top_mismatches,
+        "repeatability": repeatability,
+        "all_padding": {
+            "exact_zero": torch.equal(padded_actual, torch.zeros_like(padded_actual)),
+            "finite": torch.isfinite(padded_actual).all().item(),
+            "nonzero_count": torch.count_nonzero(padded_actual).item(),
+        },
+    }
+    print("GLM_STAGE3_SPARSE_MLA_DIAGNOSTIC=" + json.dumps(payload, sort_keys=True))
+
+
+def test_hardware_probe_uses_pinned_fullgraph_compile_contract() -> None:
+    source = inspect.getsource(test_selected_latent_mla_t4096_q1_k2048_neuron)
+
+    assert 'backend="vllm_neuron"' in source
+    assert "fullgraph=True" in source
+    assert "dynamic=False" in source
+    assert 'os.environ["GLM_STAGE3_SPARSE_MLA_COMPILE_DIR"]' in source
+    assert 'os.environ.get("GLM_STAGE3_SPARSE_MLA_DIAGNOSTIC") == "1"' in source
+    assert 'torch.device("neuron:0")' in source
+
+
 @pytest.mark.skipif(
     os.environ.get("GLM_STAGE3_SPARSE_MLA_HARDWARE") != "1"
     or not Path("/dev/neuron0").exists(),
@@ -355,7 +664,7 @@ def test_block_fp8_reference_reads_only_selected_latent_rows(
 )
 @pytest.mark.parametrize("row_offset", (0, 64))
 def test_selected_latent_mla_t4096_q1_k2048_neuron(row_offset: int):
-    device = torch.device("xla")
+    device = torch.device("neuron:0")
     (
         queries,
         logical_cache,
@@ -366,7 +675,16 @@ def test_selected_latent_mla_t4096_q1_k2048_neuron(row_offset: int):
         weight,
         weight_scale_inv,
     ) = _deterministic_inputs()
-    reference = _reference(
+    whole_softmax_reference = _reference(
+        queries,
+        logical_cache,
+        selected,
+        block_table,
+        weight,
+        weight_scale_inv,
+        row_offset=row_offset,
+    )
+    tiled_online_reference = _tiled_online_reference(
         queries,
         logical_cache,
         selected,
@@ -382,7 +700,16 @@ def test_selected_latent_mla_t4096_q1_k2048_neuron(row_offset: int):
         selected,
     )
 
-    actual = selected_latent_mla_decode(
+    compile_root = Path(os.environ["GLM_STAGE3_SPARSE_MLA_COMPILE_DIR"])
+    module = _SelectedLatentMLADecodeProbe(row_offset).eval().to(device)
+    compiled = torch.compile(
+        module,
+        backend="vllm_neuron",
+        fullgraph=True,
+        dynamic=False,
+        options={"compiler_workdir": str(compile_root / f"row-offset-{row_offset}")},
+    )
+    device_inputs = (
         queries.to(device),
         poisoned_k.to(device),
         poisoned_v.to(device),
@@ -390,15 +717,17 @@ def test_selected_latent_mla_t4096_q1_k2048_neuron(row_offset: int):
         selected.to(device),
         weight.to(device),
         weight_scale_inv.to(device),
-        block_size=_BLOCK_SIZE,
-        row_offset=row_offset,
-    ).cpu()
+    )
+    actual = compiled(*device_inputs).cpu()
 
     assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, reference, rtol=2.0e-2, atol=2.0e-2)
+    actual_calls = [actual]
+    diagnostic_enabled = os.environ.get("GLM_STAGE3_SPARSE_MLA_DIAGNOSTIC") == "1"
+    if diagnostic_enabled:
+        actual_calls.extend(compiled(*device_inputs).cpu() for _ in range(4))
 
     all_padding = torch.full_like(selected, -1)
-    padded_actual = selected_latent_mla_decode(
+    padded_actual = compiled(
         queries.to(device),
         torch.full_like(mla_k_cache, torch.nan).to(device),
         torch.full_like(mla_v_cache, torch.nan).to(device),
@@ -406,7 +735,13 @@ def test_selected_latent_mla_t4096_q1_k2048_neuron(row_offset: int):
         all_padding.to(device),
         weight.to(device),
         weight_scale_inv.to(device),
-        block_size=_BLOCK_SIZE,
-        row_offset=row_offset,
     ).cpu()
+    if diagnostic_enabled:
+        _print_numeric_diagnostics(
+            actual_calls,
+            whole_softmax_reference,
+            tiled_online_reference,
+            padded_actual,
+        )
     torch.testing.assert_close(padded_actual, torch.zeros_like(padded_actual))
+    torch.testing.assert_close(actual, tiled_online_reference, rtol=2.0e-2, atol=2.0e-2)

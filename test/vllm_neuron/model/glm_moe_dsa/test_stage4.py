@@ -544,6 +544,108 @@ class _SelectiveBlockFP8CompileProbe(nn.Module):
         )
 
 
+def _expert_0_3_numeric_probe(token_count: int) -> _SelectiveBlockFP8CompileProbe:
+    """Build the 128-wide probe with valid routes for experts 0 and 3."""
+
+    module = _SelectiveBlockFP8CompileProbe(
+        token_count,
+        hidden_size=128,
+        intermediate_size=128,
+    ).eval()
+    _, gate, gate_scales, up, up_scales, down, down_scales = _selective_fp8_fixture(
+        token_count
+    )
+    fixture_tensors = {
+        "gate_weights": gate,
+        "gate_scales": gate_scales,
+        "up_weights": up,
+        "up_scales": up_scales,
+        "down_weights": down,
+        "down_scales": down_scales,
+    }
+    for name, fixture in fixture_tensors.items():
+        tensor = getattr(module, name)
+        tensor[1:3].fill_(float("nan"))
+        tensor[3].copy_(fixture[3])
+
+    affinities = module.expert_affinities_masked.reshape(token_count, 4)
+    affinities.zero_()
+    affinities[:, 0] = 0.25
+    affinities[:, 3] = 0.55
+    mapping = module.token_position_to_id.reshape(4, 128)
+    mapping.fill_(-1)
+    token_ids = torch.arange(token_count, dtype=torch.int32)
+    mapping[0, :token_count] = token_ids
+    mapping[3, :token_count] = token_ids
+    module.conditions.copy_(torch.tensor([1, 0, 0, 1], dtype=torch.int32))
+    return module
+
+
+def _expert_0_3_cpu_reference(
+    module: _SelectiveBlockFP8CompileProbe,
+    hidden: torch.Tensor,
+    active_experts: tuple[int, ...],
+) -> torch.Tensor:
+    affinities = module.expert_affinities_masked.reshape(hidden.shape[0], 4)
+    active_affinities = torch.zeros_like(affinities)
+    for expert_id in active_experts:
+        active_affinities[:, expert_id] = affinities[:, expert_id]
+    return _selective_block_fp8_kernel_order_reference(
+        hidden,
+        active_affinities,
+        module.gate_weights,
+        module.gate_scales,
+        module.up_weights,
+        module.up_scales,
+        module.down_weights,
+        module.down_scales,
+        round_gate_up=True,
+    ).float()
+
+
+def test_selective_block_fp8_expert_0_3_numeric_probe_contract() -> None:
+    token_count = 8
+    module = _expert_0_3_numeric_probe(token_count)
+    mapping = module.token_position_to_id.reshape(4, 128)
+    token_ids = torch.arange(token_count, dtype=torch.int32)
+
+    assert module.conditions.tolist() == [1, 0, 0, 1]
+    assert torch.equal(mapping[0, :token_count], token_ids)
+    assert torch.equal(mapping[3, :token_count], token_ids)
+    assert mapping[:, token_count:].eq(-1).all()
+    assert mapping[1:3, :token_count].eq(-1).all()
+    for name in (
+        "gate_weights",
+        "gate_scales",
+        "up_weights",
+        "up_scales",
+        "down_weights",
+        "down_scales",
+    ):
+        tensor = getattr(module, name)
+        tensor_float = tensor.float()
+        assert torch.isfinite(tensor_float[0]).all()
+        assert torch.isnan(tensor_float[1:3]).all()
+        assert torch.isfinite(tensor_float[3]).all()
+
+    hidden = torch.randn(
+        token_count,
+        128,
+        generator=torch.Generator().manual_seed(911),
+        dtype=torch.bfloat16,
+    )
+    references = {
+        "expert0": _expert_0_3_cpu_reference(module, hidden, (0,)),
+        "expert3": _expert_0_3_cpu_reference(module, hidden, (3,)),
+        "expert0_expert3": _expert_0_3_cpu_reference(module, hidden, (0, 3)),
+    }
+    assert all(torch.isfinite(reference).all() for reference in references.values())
+    assert all(torch.count_nonzero(reference) > 0 for reference in references.values())
+    assert not torch.equal(references["expert0"], references["expert3"])
+    assert not torch.equal(references["expert0_expert3"], references["expert0"])
+    assert not torch.equal(references["expert0_expert3"], references["expert3"])
+
+
 @pytest.mark.skipif(
     os.getenv("GLM_STAGE4_SELECTIVE_FP8") != "1",
     reason="explicit selective block-FP8 MoE compile discriminator",
@@ -565,6 +667,68 @@ def test_neuron_compile_selective_block_fp8_moe_production_shape() -> None:
     assert output.shape == hidden.shape
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output) > 0
+
+
+@pytest.mark.skipif(
+    os.getenv("GLM_STAGE4_SELECTIVE_FP8_EXPERT3_NUMERIC") != "1",
+    reason="explicit expert-0/expert-3 selective block-FP8 numeric discriminator",
+)
+def test_neuron_selective_block_fp8_moe_expert_0_3_matches_cpu() -> None:
+    token_count = 8
+    module = _expert_0_3_numeric_probe(token_count)
+    hidden = torch.randn(
+        token_count,
+        128,
+        generator=torch.Generator().manual_seed(911),
+        dtype=torch.bfloat16,
+    )
+    routes = {
+        "expert0": ((0,), torch.tensor([1, 0, 0, 0], dtype=torch.int32)),
+        "expert3": ((3,), torch.tensor([0, 0, 0, 1], dtype=torch.int32)),
+        "expert0_expert3": (
+            (0, 3),
+            torch.tensor([1, 0, 0, 1], dtype=torch.int32),
+        ),
+    }
+    expected = {
+        name: _expert_0_3_cpu_reference(module, hidden, active_experts)
+        for name, (active_experts, _) in routes.items()
+    }
+
+    compiled = torch.compile(
+        module.to("neuron:0"),
+        backend="vllm_neuron",
+        fullgraph=True,
+        dynamic=False,
+        options={"compiler_workdir": os.environ["GLM_STAGE4_EXPERT3_COMPILE_DIR"]},
+    )
+    hidden_neuron = hidden.to("neuron:0")
+    actual = {
+        name: compiled(hidden_neuron, conditions.to("neuron:0")).cpu().float()
+        for name, (_, conditions) in routes.items()
+    }
+
+    numeric_evidence = {}
+    for name in routes:
+        absolute_error = (actual[name] - expected[name]).abs()
+        numeric_evidence[name] = {
+            "max_abs": absolute_error.max().item(),
+            "mean_abs": absolute_error.mean().item(),
+            "cosine": F.cosine_similarity(
+                actual[name].flatten(), expected[name].flatten(), dim=0
+            ).item(),
+        }
+    print(f"selective block-FP8 expert-0/expert-3 evidence: {numeric_evidence}")
+
+    for name, metrics in numeric_evidence.items():
+        assert torch.isfinite(actual[name]).all(), name
+        assert torch.count_nonzero(actual[name]) > 0, name
+        assert metrics["max_abs"] <= 0.125, {"route": name, **metrics}
+        assert metrics["mean_abs"] <= 0.002, {"route": name, **metrics}
+        assert metrics["cosine"] >= 0.99999, {"route": name, **metrics}
+    assert not torch.equal(actual["expert0"], actual["expert3"])
+    assert not torch.equal(actual["expert0_expert3"], actual["expert0"])
+    assert not torch.equal(actual["expert0_expert3"], actual["expert3"])
 
 
 @pytest.mark.skipif(
