@@ -181,9 +181,12 @@ def gather_paged_cache(
     """Gather request-local pages and zero invalid physical block IDs."""
 
     if can_run_kernel(cache):
+        valid = (block_table >= 0) & (block_table < cache.shape[0])
+        oob_sentinel = torch.full_like(block_table, cache.shape[0])
+        safe_table = torch.where(valid, block_table, oob_sentinel)
         pages = wrap_nki(_paged_cache_gather_nki)[1](
             cache,
-            block_table.to(torch.uint32),
+            safe_table.to(torch.uint32),
         )
         return pages.reshape(
             block_table.shape[0],

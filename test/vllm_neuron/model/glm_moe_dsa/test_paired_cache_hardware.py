@@ -152,6 +152,16 @@ def _expected_round_trip(
     return expected.to(values.dtype)
 
 
+def _assert_invalid_pages_are_zero(
+    actual_mla: torch.Tensor,
+    actual_indexer: torch.Tensor,
+) -> None:
+    for actual in (actual_mla, actual_indexer):
+        # Request 0 maps logical block 2 to -1 and block 3 to one-past-end.
+        assert torch.count_nonzero(actual[0, 32:48].float()) == 0
+        assert torch.count_nonzero(actual[0, 48:64].float()) == 0
+
+
 def test_paired_cache_round_trip_cpu_contract() -> None:
     inputs = _round_trip_inputs()
     actual_mla, actual_indexer = _PairedCacheRoundTripProbe()(*inputs)
@@ -162,6 +172,7 @@ def test_paired_cache_round_trip_cpu_contract() -> None:
         _expected_round_trip(inputs[4].to(torch.float8_e4m3fn)),
     )
     assert torch.equal(actual_indexer, _expected_round_trip(inputs[5]))
+    _assert_invalid_pages_are_zero(actual_mla, actual_indexer)
 
 
 def test_paired_cache_probe_is_one_production_fullgraph() -> None:
@@ -204,3 +215,4 @@ def test_paired_cache_round_trip_fullgraph_neuron() -> None:
 
     assert torch.equal(actual_mla, expected_mla)
     assert torch.equal(actual_indexer, expected_indexer)
+    _assert_invalid_pages_are_zero(actual_mla, actual_indexer)
