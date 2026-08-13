@@ -666,26 +666,29 @@ def _independent_dsa_membership_reference(
     k_absmax = keys.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
     k_scale = torch.exp2(torch.ceil(torch.log2(k_absmax / 448.0)))
     k_quant = (keys / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    transposed_keys = k_quant.float().transpose(1, 2)
+    batch, query_count, head_count, head_dim = q_quant.shape
+    q_for_matmul = q_quant.float().reshape(batch, query_count * head_count, head_dim)
+    scaled_head_weights = head_weights.float() * head_count**-0.5
     score_tiles = []
     for key_start in range(0, keys.shape[1], 256):
         key_stop = min(key_start + 256, keys.shape[1])
-        tile_scores = torch.zeros(
-            queries.shape[0],
-            queries.shape[1],
+        tile_scores_per_head = torch.matmul(
+            q_for_matmul,
+            k_quant[:, key_start:key_stop].float().transpose(1, 2),
+        ).reshape(
+            batch,
+            query_count,
+            head_count,
             key_stop - key_start,
-            dtype=torch.float32,
         )
-        for head in range(queries.shape[2]):
-            per_head = torch.matmul(
-                q_quant[:, :, head].float(),
-                transposed_keys[:, :, key_start:key_stop],
-            )
-            per_head = per_head * q_scale[:, :, head]
-            per_head = per_head * k_scale[:, key_start:key_stop].transpose(1, 2)
-            tile_scores += torch.relu(per_head * queries.shape[-1] ** -0.5) * (
-                head_weights[:, :, head].unsqueeze(-1) * queries.shape[2] ** -0.5
-            )
+        tile_scores_per_head *= q_scale.squeeze(-1).unsqueeze(-1)
+        tile_scores_per_head *= k_scale[:, key_start:key_stop].squeeze(-1)[
+            :, None, None, :
+        ]
+        tile_scores = (
+            torch.relu(tile_scores_per_head * head_dim**-0.5)
+            * scaled_head_weights.unsqueeze(-1)
+        ).sum(dim=2)
         score_tiles.append(tile_scores)
     logits = torch.cat(score_tiles, dim=-1)
     logits = logits.masked_fill(
