@@ -486,8 +486,8 @@ def test_raw_fp8_cache_matches_bf16_selected_tile_oracle(
 
     assert mla_k_cache.dtype is torch.float8_e4m3fn
     assert mla_v_cache.dtype is torch.float8_e4m3fn
-    assert torch.isfinite(poisoned_k).all()
-    assert torch.isfinite(poisoned_v).all()
+    assert torch.isfinite(poisoned_k.float()).all()
+    assert torch.isfinite(poisoned_v.float()).all()
     torch.testing.assert_close(actual, expected)
 
 
