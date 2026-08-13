@@ -12,6 +12,7 @@ import torch
 
 import vllm_neuron.model.glm_moe_dsa.attention as attention_module
 from vllm_neuron.model.glm_moe_dsa.attention import (
+    SELECTED_LATENT_MLA_CONTEXT_BUCKETS,
     SELECTED_LATENT_MLA_ENV,
     GlmMoeDsaAttention,
 )
@@ -91,15 +92,22 @@ def _pinned_attention() -> GlmMoeDsaAttention:
     return attention
 
 
-def _pinned_inputs(*, is_decode: bool = True):
+def _pinned_inputs(
+    *,
+    is_decode: bool = True,
+    logical_length: int = 4096,
+    cache_dtype: torch.dtype = torch.float8_e4m3fn,
+):
     del is_decode
+    assert logical_length % 16 == 0
     queries = torch.zeros(1, 1, 1, 256, dtype=torch.bfloat16)
-    k_cache = torch.zeros(258, 1, 16, 288, dtype=torch.bfloat16)
+    k_cache = torch.zeros(258, 1, 16, 288, dtype=torch.bfloat16).to(cache_dtype)
     v_cache = torch.zeros_like(k_cache)
+    logical_blocks = logical_length // 16
     block_table = torch.remainder(
-        torch.arange(255, -1, -1, dtype=torch.int32) * 73 + 1,
+        torch.arange(logical_blocks - 1, -1, -1, dtype=torch.int32) * 73 + 1,
         257,
-    ).view(1, 256)
+    ).view(1, logical_blocks)
     selected = torch.arange(2048, dtype=torch.int64).view(1, 1, 2048)
     return queries, selected, k_cache, v_cache, block_table
 
@@ -145,16 +153,20 @@ def test_default_off_uses_existing_dense_attention(monkeypatch) -> None:
     assert fallback_calls == ["expand", "attention"]
 
 
+@pytest.mark.parametrize("logical_length", SELECTED_LATENT_MLA_CONTEXT_BUCKETS)
 @pytest.mark.parametrize("row_offset", (0, 64))
 def test_opt_in_long_decode_dispatches_without_dense_expansion(
     monkeypatch,
     row_offset: int,
+    logical_length: int,
 ) -> None:
     monkeypatch.setenv(SELECTED_LATENT_MLA_ENV, "1")
     monkeypatch.setattr(attention_module, "can_run_kernel", lambda tensor: True)
     attention = _pinned_attention()
     attention.kv_b_proj.row_offset = row_offset
-    queries, selected, k_cache, v_cache, block_table = _pinned_inputs()
+    queries, selected, k_cache, v_cache, block_table = _pinned_inputs(
+        logical_length=logical_length
+    )
     launches: list[dict[str, object]] = []
 
     def fail_dense(*args, **kwargs):
@@ -221,11 +233,12 @@ def test_opt_in_long_decode_dispatches_without_dense_expansion(
     assert launch["scales"] is attention.kv_b_proj.weight_scale_inv
     assert launch["block_size"] == 16
     assert launch["row_offset"] == row_offset
+    assert k_cache.dtype is torch.float8_e4m3fn
 
 
 @pytest.mark.parametrize(
     ("is_decode", "query_count", "logical_blocks"),
-    ((False, 1, 256), (True, 2, 256), (True, 1, 128), (True, 1, 257)),
+    ((False, 1, 256), (True, 2, 256), (True, 1, 128)),
 )
 def test_opt_in_unsupported_shapes_preserve_fallback(
     monkeypatch,
@@ -251,6 +264,32 @@ def test_opt_in_unsupported_shapes_preserve_fallback(
         block_size=16,
         is_decode=is_decode,
     )
+
+
+@pytest.mark.parametrize("logical_length", (4096 - 16, 6144, 16384))
+def test_opt_in_unsupported_long_bucket_fails_closed(
+    monkeypatch,
+    logical_length: int,
+) -> None:
+    monkeypatch.setenv(SELECTED_LATENT_MLA_ENV, "1")
+    monkeypatch.setattr(attention_module, "can_run_kernel", lambda tensor: True)
+    attention = _pinned_attention()
+    queries, selected, k_cache, v_cache, block_table = _pinned_inputs(
+        logical_length=logical_length
+    )
+
+    with pytest.raises(
+        ValueError, match=f"unsupported context bucket {logical_length}"
+    ):
+        attention.should_use_selected_latent_mla(
+            queries,
+            selected,
+            mla_k_cache=k_cache,
+            mla_v_cache=v_cache,
+            block_table=block_table,
+            block_size=16,
+            is_decode=True,
+        )
 
 
 def test_opt_in_long_decode_invalid_contract_fails_closed(monkeypatch) -> None:
@@ -291,7 +330,9 @@ def test_dispatch_decision_is_fullgraph_static() -> None:
 
     assert "os.environ" not in source
     assert "os.getenv" not in source
-    assert "logical_key_count != 4096" in source
+    assert "logical_key_count <= 2048" in source
+    assert "logical_key_count not in SELECTED_LATENT_MLA_CONTEXT_BUCKETS" in source
+    assert SELECTED_LATENT_MLA_CONTEXT_BUCKETS == (4096, 8192)
 
 
 def test_integrated_fullgraph_probe_has_no_dense_mla_path() -> None:
@@ -380,8 +421,12 @@ def test_integrated_selected_latent_mla_t4096_q1_k2048_row64_neuron() -> None:
     all_padding = torch.full_like(selected, -1)
     padded_actual = compiled(
         queries.to(device),
-        torch.full_like(mla_k_cache, torch.nan).to(device),
-        torch.full_like(mla_v_cache, torch.nan).to(device),
+        torch.full(mla_k_cache.shape, 240.0, dtype=torch.bfloat16)
+        .to(mla_k_cache.dtype)
+        .to(device),
+        torch.full(mla_v_cache.shape, 240.0, dtype=torch.bfloat16)
+        .to(mla_v_cache.dtype)
+        .to(device),
         block_table.to(device),
         all_padding.to(device),
     ).cpu()

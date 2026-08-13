@@ -72,8 +72,14 @@ def _round_trip_inputs() -> tuple[torch.Tensor, ...]:
         _BLOCK_SIZE,
         MLA_CACHE_PART_SIZE,
         dtype=torch.bfloat16,
-    )
-    mla_v_cache = torch.zeros_like(mla_k_cache)
+    ).to(torch.float8_e4m3fn)
+    mla_v_cache = torch.zeros(
+        _PHYSICAL_BLOCKS,
+        1,
+        _BLOCK_SIZE,
+        MLA_CACHE_PART_SIZE,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
     indexer_k_cache = torch.zeros(
         _PHYSICAL_BLOCKS,
         1,
@@ -130,9 +136,9 @@ def _expected_round_trip(
         2,
         _LOGICAL_BLOCKS * _BLOCK_SIZE,
         values.shape[-1],
-        dtype=values.dtype,
+        dtype=torch.bfloat16 if values.dtype is torch.float8_e4m3fn else values.dtype,
     )
-    flat_values = values.reshape(_TOKEN_COUNT, values.shape[-1])
+    flat_values = values.reshape(_TOKEN_COUNT, values.shape[-1]).to(expected.dtype)
     for request, logical_row, value_row in (
         (0, 3, 0),
         (0, 7, 1),
@@ -143,14 +149,18 @@ def _expected_round_trip(
         (1, 63, 6),
     ):
         expected[request, logical_row] = flat_values[value_row]
-    return expected
+    return expected.to(values.dtype)
 
 
 def test_paired_cache_round_trip_cpu_contract() -> None:
     inputs = _round_trip_inputs()
     actual_mla, actual_indexer = _PairedCacheRoundTripProbe()(*inputs)
 
-    assert torch.equal(actual_mla, _expected_round_trip(inputs[4]))
+    assert actual_mla.dtype is torch.float8_e4m3fn
+    assert torch.equal(
+        actual_mla,
+        _expected_round_trip(inputs[4].to(torch.float8_e4m3fn)),
+    )
     assert torch.equal(actual_indexer, _expected_round_trip(inputs[5]))
 
 
@@ -160,6 +170,7 @@ def test_paired_cache_probe_is_one_production_fullgraph() -> None:
 
     assert forward_source.count("write_paged_cache_pair(") == 2
     assert forward_source.count("gather_paged_cache_pair(") == 2
+    assert ").to(torch.float8_e4m3fn)" in inspect.getsource(_round_trip_inputs)
     assert 'backend="vllm_neuron"' in hardware_source
     assert "fullgraph=True" in hardware_source
     assert "dynamic=False" in hardware_source
@@ -175,7 +186,7 @@ def test_paired_cache_probe_is_one_production_fullgraph() -> None:
 def test_paired_cache_round_trip_fullgraph_neuron() -> None:
     device = torch.device("neuron:0")
     cpu_inputs = _round_trip_inputs()
-    expected_mla = _expected_round_trip(cpu_inputs[4])
+    expected_mla = _expected_round_trip(cpu_inputs[4].to(torch.float8_e4m3fn))
     expected_indexer = _expected_round_trip(cpu_inputs[5])
     module = _PairedCacheRoundTripProbe().eval().to(device)
     compile_root = Path(os.environ["GLM_STAGE5_PAIRED_CACHE_COMPILE_DIR"])

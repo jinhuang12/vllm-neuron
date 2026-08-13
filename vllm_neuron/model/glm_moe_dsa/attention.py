@@ -31,6 +31,7 @@ from .sparse_mla import (
 
 
 SELECTED_LATENT_MLA_ENV = "GLM_ENABLE_EXPERIMENTAL_SELECTED_LATENT_MLA"
+SELECTED_LATENT_MLA_CONTEXT_BUCKETS = (4096, 8192)
 
 
 class GlmMoeDsaRMSNorm(nn.Module):
@@ -502,19 +503,26 @@ class GlmMoeDsaAttention(nn.Module):
         block_size: int,
         is_decode: bool,
     ) -> bool:
-        """Select the exact hardware-proven path, or preserve the fallback."""
+        """Select an evidenced decode bucket, or preserve the fallback."""
 
         if not self.enable_selected_latent_mla:
             return False
-        logical_key_count = block_table.shape[1] * block_size
         if (
             not is_decode
             or queries.ndim != 4
             or queries.shape[1] != 1
-            or logical_key_count != 4096
             or not can_run_kernel(queries)
         ):
             return False
+        logical_key_count = block_table.shape[1] * block_size
+        if logical_key_count <= 2048:
+            return False
+        if logical_key_count not in SELECTED_LATENT_MLA_CONTEXT_BUCKETS:
+            raise ValueError(
+                "selected-latent MLA production contract violation: "
+                f"unsupported context bucket {logical_key_count}; expected one of "
+                f"{SELECTED_LATENT_MLA_CONTEXT_BUCKETS}"
+            )
 
         errors: list[str] = []
         if mla_k_cache is None or mla_v_cache is None:

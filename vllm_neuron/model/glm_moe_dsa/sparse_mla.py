@@ -5,9 +5,10 @@ The kernel absorbs the non-rotary query into the MLA projection, gathers only
 the DSA-selected latent rows, and performs online softmax.  It never exports a
 ``[batch, query, selected, 576]`` tensor to Torch/HBM.
 
-This kernel is deliberately narrow: one query, one TP-local head, BF16 cache,
-checkpoint-native block-FP8 projection weights, and at most 2048 selected
-positions. Production dispatch is guarded by an exact default-off contract.
+This kernel is deliberately narrow: one query, one TP-local head, BF16 or raw
+E4M3 cache, checkpoint-native block-FP8 projection weights, and at most 2048
+selected positions. Production dispatch is guarded by an exact default-off
+contract.
 """
 
 from __future__ import annotations
@@ -60,8 +61,10 @@ def _selected_latent_mla_decode_nki(
 
     Args:
         queries: ``[B, 1, 1, 256]`` BF16 query tensor in HBM.
-        mla_k_cache: ``[P, 1, block_size, 288]`` BF16 first cache half.
-        mla_v_cache: ``[P, 1, block_size, 288]`` BF16 second cache half.
+        mla_k_cache: ``[P, 1, block_size, 288]`` BF16 or raw E4M3 first cache
+            half.
+        mla_v_cache: ``[P, 1, block_size, 288]`` BF16 or raw E4M3 second cache
+            half.
         block_table: ``[B, L]`` int32 logical-to-physical block mapping.
         selected_indices: ``[B, 1, K]`` int32 logical row indices in HBM.
         weight: ``[448, 512]`` raw E4M3 rank-local kv_b projection weight in
@@ -89,6 +92,14 @@ def _selected_latent_mla_decode_nki(
     _kernel_assert(queries.shape[1:] == (1, 1, _QK_WIDTH), "query shape mismatch")
     _kernel_assert(len(mla_k_cache.shape) == 4, "K cache must be rank four")
     _kernel_assert(mla_v_cache.shape == mla_k_cache.shape, "cache halves mismatch")
+    _kernel_assert(
+        mla_v_cache.dtype == mla_k_cache.dtype,
+        "cache half dtypes mismatch",
+    )
+    _kernel_assert(
+        mla_k_cache.dtype == queries.dtype or mla_k_cache.dtype == nl.float8_e4m3,
+        "cache dtype must be BF16 or raw E4M3",
+    )
     _kernel_assert(mla_k_cache.shape[1] == 1, "cache must have one head")
     _kernel_assert(
         mla_k_cache.shape[3] == _CACHE_HALF_WIDTH,
@@ -374,14 +385,14 @@ def _selected_latent_mla_decode_nki(
                 op=nl.add,
             )
 
-            selected_cache = nl.ndarray(
+            selected_cache_storage = nl.ndarray(
                 (_SELECTED_TILE, _CACHE_WIDTH),
                 dtype=mla_k_cache.dtype,
                 buffer=nl.sbuf,
             )
-            nisa.memset(dst=selected_cache, value=0.0)
+            nisa.memset(dst=selected_cache_storage, value=0.0)
             nisa.dma_copy(
-                dst=selected_cache[0:_SELECTED_TILE, 0:_CACHE_HALF_WIDTH],
+                dst=selected_cache_storage[0:_SELECTED_TILE, 0:_CACHE_HALF_WIDTH],
                 src=flat_k_cache.ap(
                     pattern=[
                         [_CACHE_HALF_WIDTH, _SELECTED_TILE],
@@ -394,7 +405,9 @@ def _selected_latent_mla_decode_nki(
                 oob_mode=nisa.oob_mode.skip,
             )
             nisa.dma_copy(
-                dst=selected_cache[0:_SELECTED_TILE, _CACHE_HALF_WIDTH:_CACHE_WIDTH],
+                dst=selected_cache_storage[
+                    0:_SELECTED_TILE, _CACHE_HALF_WIDTH:_CACHE_WIDTH
+                ],
                 src=flat_v_cache.ap(
                     pattern=[
                         [_CACHE_HALF_WIDTH, _SELECTED_TILE],
@@ -406,6 +419,12 @@ def _selected_latent_mla_decode_nki(
                 dge_mode=nisa.dge_mode.swdge,
                 oob_mode=nisa.oob_mode.skip,
             )
+            selected_cache = nl.ndarray(
+                (_SELECTED_TILE, _CACHE_WIDTH),
+                dtype=queries.dtype,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_copy(dst=selected_cache, src=selected_cache_storage)
 
             # Scores = absorbed_q @ latent.T + q_rope @ cached_rope.T.
             score_psum = nl.ndarray(
@@ -415,7 +434,7 @@ def _selected_latent_mla_decode_nki(
                 latent_start = latent_tile_index * _SELECTED_TILE
                 latent_transpose = nl.ndarray(
                     (_SELECTED_TILE, _SELECTED_TILE),
-                    dtype=mla_k_cache.dtype,
+                    dtype=queries.dtype,
                     buffer=nl.sbuf,
                 )
                 nisa.dma_transpose(
@@ -445,7 +464,7 @@ def _selected_latent_mla_decode_nki(
 
             rope_transpose = nl.ndarray(
                 (_ROPE_WIDTH, _SELECTED_TILE),
-                dtype=mla_k_cache.dtype,
+                dtype=queries.dtype,
                 buffer=nl.sbuf,
             )
             nisa.dma_transpose(
@@ -846,11 +865,10 @@ def validate_selected_latent_mla_decode_contract(
         errors.append("MLA K cache must have shape [blocks, 1, block_size, 288]")
     if mla_v_cache.shape != mla_k_cache.shape:
         errors.append("MLA cache halves must have identical shapes")
-    if (
-        mla_k_cache.dtype is not torch.bfloat16
-        or mla_v_cache.dtype is not torch.bfloat16
-    ):
-        errors.append("MLA cache halves must be BF16")
+    if mla_v_cache.dtype is not mla_k_cache.dtype:
+        errors.append("MLA cache halves must have identical dtypes")
+    if mla_k_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        errors.append("MLA cache halves must be BF16 or raw E4M3")
     if block_size != 16:
         errors.append("block_size must be 16")
     if block_table.ndim != 2 or (

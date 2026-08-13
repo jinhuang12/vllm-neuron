@@ -15,14 +15,26 @@ from torch import nn
 from vllm_neuron.model.glm_moe_dsa.sparse_mla import (
     _selected_latent_mla_decode_nki,
     selected_latent_mla_decode,
+    validate_selected_latent_mla_decode_contract,
 )
 
 
 _BLOCK_SIZE = 16
 _LOGICAL_LENGTH = 4096
-_LOGICAL_BLOCKS = _LOGICAL_LENGTH // _BLOCK_SIZE
 _PHYSICAL_BLOCKS = 520
 _VALUE_SHARD_WIDTH = 128
+
+
+def _physical_block_count(logical_length: int) -> int:
+    return (logical_length // _BLOCK_SIZE) * 2 + 8
+
+
+def _cache_poison_value(dtype: torch.dtype) -> float:
+    return 240.0 if dtype is torch.float8_e4m3fn else torch.nan
+
+
+def _fp8_poisoned_cache(cache: torch.Tensor) -> torch.Tensor:
+    return torch.full(cache.shape, 240.0, dtype=torch.bfloat16).to(cache.dtype)
 
 
 def _reference(
@@ -40,7 +52,9 @@ def _reference(
     logical_blocks = torch.div(safe, _BLOCK_SIZE, rounding_mode="floor")
     expanded_table = block_table[:, None, :].expand(-1, selected.shape[1], -1)
     physical_blocks = torch.gather(expanded_table, 2, logical_blocks)
-    valid &= (physical_blocks >= 0) & (physical_blocks < _PHYSICAL_BLOCKS)
+    valid &= (physical_blocks >= 0) & (
+        physical_blocks < _physical_block_count(cache.shape[1])
+    )
     batch = torch.arange(cache.shape[0], device=cache.device)[:, None, None]
     chosen = cache[batch, safe]
     chosen = torch.where(valid[..., None], chosen, torch.zeros_like(chosen))
@@ -69,7 +83,9 @@ def _tiled_online_reference(
     logical_blocks = torch.div(safe, _BLOCK_SIZE, rounding_mode="floor")
     expanded_table = block_table[:, None, :].expand(-1, selected.shape[1], -1)
     physical_blocks = torch.gather(expanded_table, 2, logical_blocks)
-    valid &= (physical_blocks >= 0) & (physical_blocks < _PHYSICAL_BLOCKS)
+    valid &= (physical_blocks >= 0) & (
+        physical_blocks < _physical_block_count(cache.shape[1])
+    )
     batch = torch.arange(cache.shape[0], device=cache.device)[:, None, None]
     chosen = cache[batch, safe]
     chosen = torch.where(valid[..., None], chosen, torch.zeros_like(chosen))
@@ -262,21 +278,25 @@ def _page_logical_cache(
     logical_cache: torch.Tensor,
     block_table: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    physical_block_count = _physical_block_count(logical_cache.shape[1])
     physical = torch.full(
-        (_PHYSICAL_BLOCKS, 1, _BLOCK_SIZE, 576),
-        torch.nan,
-        dtype=logical_cache.dtype,
+        (physical_block_count, 1, _BLOCK_SIZE, 576),
+        _cache_poison_value(logical_cache.dtype),
+        dtype=torch.bfloat16,
     )
     for request_index in range(logical_cache.shape[0]):
-        for logical_block in range(_LOGICAL_BLOCKS):
+        for logical_block in range(block_table.shape[1]):
             physical_block = int(block_table[request_index, logical_block])
-            if 0 <= physical_block < _PHYSICAL_BLOCKS:
+            if 0 <= physical_block < physical_block_count:
                 logical_start = logical_block * _BLOCK_SIZE
                 physical[physical_block, 0] = logical_cache[
                     request_index,
                     logical_start : logical_start + _BLOCK_SIZE,
-                ]
-    return physical[..., :288].contiguous(), physical[..., 288:].contiguous()
+                ].to(torch.bfloat16)
+    return (
+        physical[..., :288].to(logical_cache.dtype).contiguous(),
+        physical[..., 288:].to(logical_cache.dtype).contiguous(),
+    )
 
 
 def _gather_paged_selected(
@@ -285,15 +305,19 @@ def _gather_paged_selected(
     block_table: torch.Tensor,
     selected: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    valid = (selected >= 0) & (selected < _LOGICAL_LENGTH)
-    safe = selected.clamp(0, _LOGICAL_LENGTH - 1)
+    logical_length = block_table.shape[1] * _BLOCK_SIZE
+    physical_block_count = mla_k_cache.shape[0]
+    valid = (selected >= 0) & (selected < logical_length)
+    safe = selected.clamp(0, logical_length - 1)
     logical_blocks = torch.div(safe, _BLOCK_SIZE, rounding_mode="floor")
     expanded_table = block_table[:, None, :].expand(-1, selected.shape[1], -1)
     physical_blocks = torch.gather(expanded_table, 2, logical_blocks)
-    valid &= (physical_blocks >= 0) & (physical_blocks < _PHYSICAL_BLOCKS)
+    valid &= (physical_blocks >= 0) & (physical_blocks < physical_block_count)
     physical_rows = physical_blocks * _BLOCK_SIZE + torch.remainder(safe, _BLOCK_SIZE)
-    safe_rows = physical_rows.clamp(0, _PHYSICAL_BLOCKS * _BLOCK_SIZE - 1)
-    physical_cache = torch.cat((mla_k_cache, mla_v_cache), dim=-1).reshape(-1, 576)
+    safe_rows = physical_rows.clamp(0, physical_block_count * _BLOCK_SIZE - 1)
+    physical_cache = torch.cat(
+        (mla_k_cache.to(torch.bfloat16), mla_v_cache.to(torch.bfloat16)), dim=-1
+    ).reshape(-1, 576)
     chosen = physical_cache[safe_rows]
     return torch.where(valid[..., None], chosen, torch.zeros_like(chosen)), valid
 
@@ -304,43 +328,59 @@ def _poison_unselected_physical_rows(
     block_table: torch.Tensor,
     selected: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    physical = torch.cat((mla_k_cache, mla_v_cache), dim=-1).clone()
+    cache_dtype = mla_k_cache.dtype
+    physical = torch.cat(
+        (mla_k_cache.to(torch.bfloat16), mla_v_cache.to(torch.bfloat16)), dim=-1
+    )
+    logical_length = block_table.shape[1] * _BLOCK_SIZE
+    physical_block_count = mla_k_cache.shape[0]
     row_is_selected = torch.zeros(
-        _PHYSICAL_BLOCKS * _BLOCK_SIZE,
+        physical_block_count * _BLOCK_SIZE,
         dtype=torch.bool,
     )
-    valid = (selected >= 0) & (selected < _LOGICAL_LENGTH)
-    safe = selected.clamp(0, _LOGICAL_LENGTH - 1)
+    valid = (selected >= 0) & (selected < logical_length)
+    safe = selected.clamp(0, logical_length - 1)
     logical_blocks = torch.div(safe, _BLOCK_SIZE, rounding_mode="floor")
     expanded_table = block_table[:, None, :].expand(-1, selected.shape[1], -1)
     physical_blocks = torch.gather(expanded_table, 2, logical_blocks)
-    valid &= (physical_blocks >= 0) & (physical_blocks < _PHYSICAL_BLOCKS)
+    valid &= (physical_blocks >= 0) & (physical_blocks < physical_block_count)
     physical_rows = physical_blocks * _BLOCK_SIZE + torch.remainder(safe, _BLOCK_SIZE)
     row_is_selected[physical_rows[valid].to(torch.long)] = True
-    physical.reshape(-1, 576)[~row_is_selected] = torch.nan
-    return physical[..., :288].contiguous(), physical[..., 288:].contiguous()
+    physical.reshape(-1, 576)[~row_is_selected] = _cache_poison_value(cache_dtype)
+    return (
+        physical[..., :288].to(cache_dtype).contiguous(),
+        physical[..., 288:].to(cache_dtype).contiguous(),
+    )
 
 
-def _deterministic_inputs():
+def _deterministic_inputs(
+    *,
+    logical_length: int = _LOGICAL_LENGTH,
+    cache_dtype: torch.dtype = torch.bfloat16,
+):
+    assert logical_length % _BLOCK_SIZE == 0
     generator = torch.Generator().manual_seed(11)
     queries = torch.randn(2, 1, 1, 256, dtype=torch.bfloat16, generator=generator)
-    logical_cache = torch.randn(
+    logical_cache_storage = torch.randn(
         2,
-        _LOGICAL_LENGTH,
+        logical_length,
         576,
         dtype=torch.bfloat16,
         generator=generator,
-    )
-    logical_blocks = torch.arange(_LOGICAL_BLOCKS, dtype=torch.int32)
+    ).to(cache_dtype)
+    logical_cache = logical_cache_storage.to(torch.bfloat16)
+    logical_block_count = logical_length // _BLOCK_SIZE
+    physical_block_count = _physical_block_count(logical_length)
+    logical_blocks = torch.arange(logical_block_count, dtype=torch.int32)
     block_table = torch.stack(
         (
-            torch.remainder(logical_blocks * 73, _LOGICAL_BLOCKS) * 2,
-            torch.remainder(logical_blocks * 151 + 1, _LOGICAL_BLOCKS) * 2 + 1,
+            torch.remainder(logical_blocks * 73, logical_block_count) * 2,
+            torch.remainder(logical_blocks * 151 + 1, logical_block_count) * 2 + 1,
         )
     )
     block_table[0, 11] = -1
-    block_table[1, 23] = _PHYSICAL_BLOCKS + 5
-    mla_k_cache, mla_v_cache = _page_logical_cache(logical_cache, block_table)
+    block_table[1, 23] = physical_block_count + 5
+    mla_k_cache, mla_v_cache = _page_logical_cache(logical_cache_storage, block_table)
 
     raw_values = torch.arange(448 * 512, dtype=torch.int32).reshape(448, 512)
     weight = (((raw_values % 31) - 15).float() / 16).to(torch.float8_e4m3fn)
@@ -357,12 +397,17 @@ def _deterministic_inputs():
     selected = torch.stack(
         (
             torch.arange(2047, -1, -1, dtype=torch.int32),
-            torch.arange(4095, 2047, -1, dtype=torch.int32),
+            torch.arange(
+                logical_length - 1,
+                logical_length - 2049,
+                -1,
+                dtype=torch.int32,
+            ),
         )
     ).unsqueeze(1)
     selected[0, 0, 17] = 11 * _BLOCK_SIZE + 3
     selected[1, 0, 19] = 23 * _BLOCK_SIZE + 2
-    selected[0, 0, 31] = _LOGICAL_LENGTH + 9
+    selected[0, 0, 31] = logical_length + 9
     selected[:, 0, 43] = selected[:, 0, 42]
     selected[:, :, -31:] = -1
     return (
@@ -384,8 +429,106 @@ def test_kernel_maps_logical_indices_to_physical_sbuf_rows() -> None:
     assert "vector_offset=block_table_rows" in source
     assert source.count("vector_offset=physical_rows") == 2
     assert source.count("buffer=nl.shared_hbm") == 1
+    assert "selected_cache_storage = nl.ndarray" in source
+    assert "dtype=mla_k_cache.dtype" in source
     assert "selected_cache = nl.ndarray" in source
+    assert "dtype=queries.dtype" in source
+    assert "nisa.tensor_copy(dst=selected_cache, src=selected_cache_storage)" in source
     assert "latent_cache" not in source
+
+
+@pytest.mark.parametrize("logical_length", (4096, 8192))
+def test_raw_fp8_cache_matches_bf16_selected_tile_oracle(
+    logical_length: int,
+) -> None:
+    (
+        queries,
+        logical_cache,
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected,
+        weight,
+        weight_scale_inv,
+    ) = _deterministic_inputs(
+        logical_length=logical_length,
+        cache_dtype=torch.float8_e4m3fn,
+    )
+    expected = _tiled_online_reference(
+        queries,
+        logical_cache,
+        selected,
+        block_table,
+        weight,
+        weight_scale_inv,
+        row_offset=64,
+    )
+    poisoned_k, poisoned_v = _poison_unselected_physical_rows(
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected,
+    )
+    chosen, valid = _gather_paged_selected(
+        poisoned_k,
+        poisoned_v,
+        block_table,
+        selected,
+    )
+    actual = _selected_attention_tiled_online_reference(
+        queries,
+        chosen.to(queries.dtype),
+        valid,
+        weight,
+        weight_scale_inv,
+        row_offset=64,
+    )
+
+    assert mla_k_cache.dtype is torch.float8_e4m3fn
+    assert mla_v_cache.dtype is torch.float8_e4m3fn
+    assert torch.isfinite(poisoned_k).all()
+    assert torch.isfinite(poisoned_v).all()
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("cache_dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_contract_accepts_only_supported_paired_cache_dtype(
+    cache_dtype: torch.dtype,
+) -> None:
+    (
+        queries,
+        _,
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected,
+        weight,
+        weight_scale_inv,
+    ) = _deterministic_inputs(cache_dtype=cache_dtype)
+    validate_selected_latent_mla_decode_contract(
+        queries,
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected,
+        weight,
+        weight_scale_inv,
+        block_size=_BLOCK_SIZE,
+        row_offset=64,
+    )
+
+    with pytest.raises(ValueError, match="identical dtypes"):
+        validate_selected_latent_mla_decode_contract(
+            queries,
+            mla_k_cache,
+            mla_v_cache.to(torch.float32),
+            block_table,
+            selected,
+            weight,
+            weight_scale_inv,
+            block_size=_BLOCK_SIZE,
+            row_offset=64,
+        )
 
 
 @pytest.mark.parametrize("row_offset", (0, 64))
@@ -655,6 +798,109 @@ def test_hardware_probe_uses_pinned_fullgraph_compile_contract() -> None:
     assert 'os.environ["GLM_STAGE3_SPARSE_MLA_COMPILE_DIR"]' in source
     assert 'os.environ.get("GLM_STAGE3_SPARSE_MLA_DIAGNOSTIC") == "1"' in source
     assert 'torch.device("neuron:0")' in source
+
+
+def test_fp8_hardware_nodes_use_bounded_fullgraph_contract() -> None:
+    source = inspect.getsource(_run_fp8_selected_latent_mla_neuron)
+
+    assert 'backend="vllm_neuron"' in source
+    assert "fullgraph=True" in source
+    assert "dynamic=False" in source
+    assert 'os.environ["GLM_STAGE3_SPARSE_MLA_FP8_COMPILE_DIR"]' in source
+    assert "cache_dtype=torch.float8_e4m3fn" in source
+    assert "row_offset=64" in source
+    assert "_fp8_poisoned_cache(mla_k_cache)" in source
+
+    t4096_source = inspect.getsource(test_selected_latent_mla_fp8_t4096_q1_k2048_neuron)
+    t8192_source = inspect.getsource(test_selected_latent_mla_fp8_t8192_q1_k2048_neuron)
+    assert "GLM_STAGE3_SPARSE_MLA_FP8_T4096_HARDWARE" in t4096_source
+    assert "GLM_STAGE3_SPARSE_MLA_FP8_T8192_HARDWARE" in t8192_source
+
+
+def _run_fp8_selected_latent_mla_neuron(logical_length: int) -> None:
+    device = torch.device("neuron:0")
+    (
+        queries,
+        logical_cache,
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected,
+        weight,
+        weight_scale_inv,
+    ) = _deterministic_inputs(
+        logical_length=logical_length,
+        cache_dtype=torch.float8_e4m3fn,
+    )
+    expected = _tiled_online_reference(
+        queries,
+        logical_cache,
+        selected,
+        block_table,
+        weight,
+        weight_scale_inv,
+        row_offset=64,
+    )
+    poisoned_k, poisoned_v = _poison_unselected_physical_rows(
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected,
+    )
+
+    compile_root = Path(os.environ["GLM_STAGE3_SPARSE_MLA_FP8_COMPILE_DIR"])
+    module = _SelectedLatentMLADecodeProbe(row_offset=64).eval().to(device)
+    compiled = torch.compile(
+        module,
+        backend="vllm_neuron",
+        fullgraph=True,
+        dynamic=False,
+        options={
+            "compiler_workdir": str(compile_root / f"fp8-t{logical_length}-row64")
+        },
+    )
+
+    all_padding = torch.full_like(selected, -1)
+    padded_actual = compiled(
+        queries.to(device),
+        _fp8_poisoned_cache(mla_k_cache).to(device),
+        _fp8_poisoned_cache(mla_v_cache).to(device),
+        block_table.to(device),
+        all_padding.to(device),
+        weight.to(device),
+        weight_scale_inv.to(device),
+    ).cpu()
+    torch.testing.assert_close(padded_actual, torch.zeros_like(padded_actual))
+
+    actual = compiled(
+        queries.to(device),
+        poisoned_k.to(device),
+        poisoned_v.to(device),
+        block_table.to(device),
+        selected.to(device),
+        weight.to(device),
+        weight_scale_inv.to(device),
+    ).cpu()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
+
+
+@pytest.mark.skipif(
+    os.environ.get("GLM_STAGE3_SPARSE_MLA_FP8_T4096_HARDWARE") != "1"
+    or not Path("/dev/neuron0").exists(),
+    reason="requires explicit FP8 T4096 selected-MLA Neuron opt-in",
+)
+def test_selected_latent_mla_fp8_t4096_q1_k2048_neuron() -> None:
+    _run_fp8_selected_latent_mla_neuron(4096)
+
+
+@pytest.mark.skipif(
+    os.environ.get("GLM_STAGE3_SPARSE_MLA_FP8_T8192_HARDWARE") != "1"
+    or not Path("/dev/neuron0").exists(),
+    reason="requires explicit FP8 T8192 selected-MLA Neuron opt-in",
+)
+def test_selected_latent_mla_fp8_t8192_q1_k2048_neuron() -> None:
+    _run_fp8_selected_latent_mla_neuron(8192)
 
 
 @pytest.mark.skipif(
