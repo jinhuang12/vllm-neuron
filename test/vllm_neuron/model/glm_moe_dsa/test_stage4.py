@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from vllm_neuron.model.glm_moe_dsa.moe import (
     GlmMoeDsaNoAuxRouter,
     GlmMoeDsaRoutedExperts,
 )
+from vllm_neuron.nki.nki_hop import wrap_nki
 
 MODEL_PATH_VALUE = os.environ.get("GLM52_MODEL_PATH")
 MODEL_PATH = Path(MODEL_PATH_VALUE or ".")
@@ -553,6 +555,103 @@ class _SelectiveBlockFP8CompileProbe(nn.Module):
         )
 
 
+def _build_literal_expert0_kernel() -> tuple[object, str]:
+    """Build a test-only expert-0 kernel with one literal block iteration.
+
+    Keep the production kernel byte-for-byte unchanged. This discriminator
+    removes only runtime loop-count preparation and the four dynamic-loop
+    transitions while preserving the exact production compute body and ABI.
+    """
+
+    production_kernel = block_fp8_moe._selective_block_fp8_moe_nki.func
+    source = inspect.getsource(production_kernel)
+    replacements = {
+        "def _selective_block_fp8_moe_nki(": "def _literal_expert0_moe_nki(",
+        "for expert_phase in range(num_experts):": "for expert_phase in range(1):",
+        "for _ in nl.dynamic_range(0, expert_block_count_register):": (
+            "for _ in range(1):"
+        ),
+    }
+    for old, new in replacements.items():
+        assert source.count(old) == 1, old
+        source = source.replace(old, new, 1)
+    count_start = source.index("        expert_blocks = nl.ndarray(")
+    count_end = source.index("        expert_id = nl.ndarray", count_start)
+    source = source[:count_start] + source[count_end:]
+    assert "nl.dynamic_range" not in source
+    assert "for expert_phase in range(num_experts)" not in source
+    assert "expert_block_count" not in source
+
+    namespace = dict(vars(block_fp8_moe))
+    exec(compile(source, "<test-only-literal-expert0>", "exec"), namespace)
+    return namespace["_literal_expert0_moe_nki"], source
+
+
+_literal_expert0_moe_kernel, _LITERAL_EXPERT0_KERNEL_SOURCE = (
+    _build_literal_expert0_kernel()
+)
+_wrapped_literal_expert0_moe = wrap_nki(_literal_expert0_moe_kernel)
+
+
+class _LiteralExpert0FP8CompileProbe(_SelectiveBlockFP8CompileProbe):
+    """Exact production-shape probe with static expert-0 control flow."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        token_position_to_id: torch.Tensor,
+        block_to_expert: torch.Tensor,
+        conditions: torch.Tensor,
+    ) -> torch.Tensor:
+        return _wrapped_literal_expert0_moe[2](
+            hidden_states=hidden_states,
+            expert_affinities_masked=self.expert_affinities_masked,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            conditions=conditions,
+            gate_weight_0=self.gate_weight_0,
+            gate_scale_0=self.gate_scale_0,
+            up_weight_0=self.up_weight_0,
+            up_scale_0=self.up_scale_0,
+            down_weight_0=self.down_weight_0,
+            down_scale_0=self.down_scale_0,
+            gate_weight_1=self.gate_weight_1,
+            gate_scale_1=self.gate_scale_1,
+            up_weight_1=self.up_weight_1,
+            up_scale_1=self.up_scale_1,
+            down_weight_1=self.down_weight_1,
+            down_scale_1=self.down_scale_1,
+            gate_weight_2=self.gate_weight_2,
+            gate_scale_2=self.gate_scale_2,
+            up_weight_2=self.up_weight_2,
+            up_scale_2=self.up_scale_2,
+            down_weight_2=self.down_weight_2,
+            down_scale_2=self.down_scale_2,
+            gate_weight_3=self.gate_weight_3,
+            gate_scale_3=self.gate_scale_3,
+            up_weight_3=self.up_weight_3,
+            up_scale_3=self.up_scale_3,
+            down_weight_3=self.down_weight_3,
+            down_scale_3=self.down_scale_3,
+            block_size=self.block_size,
+        )
+
+
+def test_literal_expert0_discriminator_removes_dynamic_control_only() -> None:
+    production_source = inspect.getsource(
+        block_fp8_moe._selective_block_fp8_moe_nki.func
+    )
+
+    assert "for expert_phase in range(num_experts):" in production_source
+    assert "nl.dynamic_range(0, expert_block_count_register)" in production_source
+    assert "for expert_phase in range(1):" in _LITERAL_EXPERT0_KERNEL_SOURCE
+    assert "for _ in range(1):" in _LITERAL_EXPERT0_KERNEL_SOURCE
+    assert "nl.dynamic_range" not in _LITERAL_EXPERT0_KERNEL_SOURCE
+    assert "expert_block_count" not in _LITERAL_EXPERT0_KERNEL_SOURCE
+    assert _LITERAL_EXPERT0_KERNEL_SOURCE.count("for expert_phase in range(1):") == 1
+    assert _LITERAL_EXPERT0_KERNEL_SOURCE.count("for _ in range(1):") == 1
+
+
 def _stack_expert_buffers(
     module: _SelectiveBlockFP8CompileProbe, name: str
 ) -> torch.Tensor:
@@ -768,6 +867,38 @@ def test_neuron_compile_selective_block_fp8_moe_production_shape() -> None:
         module.conditions,
     ).cpu()
     assert output.shape == hidden.shape
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output) > 0
+
+
+@pytest.mark.skipif(
+    os.getenv("GLM_STAGE4_SELECTIVE_FP8_EXPERT0_LITERAL") != "1",
+    reason="explicit literal-one-iteration expert-0 discriminator",
+)
+def test_neuron_selective_block_fp8_moe_literal_expert0_production_shape() -> None:
+    module = _LiteralExpert0FP8CompileProbe(
+        1, hidden_size=6144, intermediate_size=2048
+    ).eval()
+    _, mapping, block_to_expert, conditions = _expert_0_3_routes(1)["expert0"]
+    compiled = torch.compile(
+        module.to("neuron:0"),
+        backend="vllm_neuron",
+        fullgraph=True,
+        dynamic=False,
+        options={
+            "compiler_workdir": os.environ["GLM_STAGE4_EXPERT0_LITERAL_COMPILE_DIR"]
+        },
+    )
+    hidden = torch.ones(1, 6144, dtype=torch.bfloat16, device="neuron:0")
+
+    output = compiled(
+        hidden,
+        mapping.to("neuron:0"),
+        block_to_expert.to("neuron:0"),
+        conditions.to("neuron:0"),
+    ).cpu()
+
+    assert output.shape == (1, 6144)
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output) > 0
 
