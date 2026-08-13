@@ -212,11 +212,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
                 mla_meta["slot_mapping"],
                 int(mla_meta["block_size"]),
             )
-            attention_latents = gather_paged_cache_pair(
-                self.mla_k_cache,
-                self.mla_v_cache,
-                mla_meta["block_table_tensor"],
-            )
+            attention_latents = None
         else:
             attention_latents = projection.latent_cache
 
@@ -267,9 +263,41 @@ class GlmMoeDsaDecoderLayer(nn.Module):
                 hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
             )
 
-        attention_output = self.self_attn.attend(
-            projection.queries, attention_latents, selected_indices
-        )
+        if mla_meta is not None:
+            use_selected_latent_mla = self.self_attn.should_use_selected_latent_mla(
+                projection.queries,
+                selected_indices,
+                mla_k_cache=self.mla_k_cache,
+                mla_v_cache=self.mla_v_cache,
+                block_table=mla_meta["block_table_tensor"],
+                block_size=int(mla_meta["block_size"]),
+                is_decode=is_decode,
+            )
+            if not use_selected_latent_mla:
+                attention_latents = gather_paged_cache_pair(
+                    self.mla_k_cache,
+                    self.mla_v_cache,
+                    mla_meta["block_table_tensor"],
+                )
+        else:
+            use_selected_latent_mla = False
+        if use_selected_latent_mla:
+            assert mla_meta is not None
+            assert self.mla_k_cache is not None
+            assert self.mla_v_cache is not None
+            attention_output = self.self_attn.attend_selected_latents(
+                projection.queries,
+                selected_indices,
+                self.mla_k_cache,
+                self.mla_v_cache,
+                mla_meta["block_table_tensor"],
+                int(mla_meta["block_size"]),
+            )
+        else:
+            assert attention_latents is not None
+            attention_output = self.self_attn.attend(
+                projection.queries, attention_latents, selected_indices
+            )
         hidden_states = residual + attention_output
         residual = hidden_states
         mlp_input = self.post_attention_layernorm(hidden_states)

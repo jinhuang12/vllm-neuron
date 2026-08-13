@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import nki
@@ -23,6 +24,13 @@ from .block_fp8 import (
 )
 from .cache import MLA_CACHE_HEAD_SIZE
 from .indexer import apply_interleaved_rope, rotary_cos_sin
+from .sparse_mla import (
+    selected_latent_mla_decode,
+    validate_selected_latent_mla_decode_contract,
+)
+
+
+SELECTED_LATENT_MLA_ENV = "GLM_ENABLE_EXPERIMENTAL_SELECTED_LATENT_MLA"
 
 
 class GlmMoeDsaRMSNorm(nn.Module):
@@ -276,6 +284,7 @@ class GlmMoeDsaAttention(nn.Module):
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.rope_theta = rope_theta
+        self.enable_selected_latent_mla = os.environ.get(SELECTED_LATENT_MLA_ENV) == "1"
 
         if fp8_weights:
             tp_size = self.num_heads // local_heads
@@ -457,3 +466,95 @@ class GlmMoeDsaAttention(nn.Module):
             scale=self.qk_head_dim**-0.5,
         )
         return self.o_proj(output.flatten(-2))
+
+    def attend_selected_latents(
+        self,
+        queries: torch.Tensor,
+        selected_indices: torch.Tensor,
+        mla_k_cache: torch.Tensor,
+        mla_v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Attend directly from selected physical cache rows."""
+
+        output = selected_latent_mla_decode(
+            queries,
+            mla_k_cache,
+            mla_v_cache,
+            block_table,
+            selected_indices.to(torch.int32),
+            self.kv_b_proj.weight,
+            self.kv_b_proj.weight_scale_inv,
+            block_size=block_size,
+            row_offset=self.kv_b_proj.row_offset,
+        )
+        return self.o_proj(output.flatten(-2))
+
+    def should_use_selected_latent_mla(
+        self,
+        queries: torch.Tensor,
+        selected_indices: torch.Tensor,
+        *,
+        mla_k_cache: torch.Tensor | None,
+        mla_v_cache: torch.Tensor | None,
+        block_table: torch.Tensor,
+        block_size: int,
+        is_decode: bool,
+    ) -> bool:
+        """Select the exact hardware-proven path, or preserve the fallback."""
+
+        if not self.enable_selected_latent_mla:
+            return False
+        logical_key_count = block_table.shape[1] * block_size
+        if (
+            not is_decode
+            or queries.ndim != 4
+            or queries.shape[1] != 1
+            or logical_key_count != 4096
+            or not can_run_kernel(queries)
+        ):
+            return False
+
+        errors: list[str] = []
+        if mla_k_cache is None or mla_v_cache is None:
+            errors.append("paired physical MLA caches must be allocated")
+        if (
+            self.num_heads != 64
+            or self.local_heads != 1
+            or self.kv_lora_rank != 512
+            or self.qk_nope_head_dim != 192
+            or self.qk_rope_head_dim != 64
+            or self.qk_head_dim != 256
+            or self.v_head_dim != 256
+        ):
+            errors.append("attention dimensions must match pinned GLM TP64")
+        if not isinstance(self.kv_b_proj, BlockFP8ColumnParallelLinear):
+            errors.append("kv_b projection must use block FP8")
+        else:
+            if self.kv_b_proj.tp_size != 64:
+                errors.append("kv_b projection must use TP64")
+            if self.kv_b_proj.col_offset != 0:
+                errors.append("kv_b column offset must be zero")
+        if errors:
+            raise ValueError(
+                "selected-latent MLA production contract violation: "
+                + "; ".join(errors)
+            )
+
+        assert mla_k_cache is not None
+        assert mla_v_cache is not None
+
+        selected_for_kernel = selected_indices.to(torch.int32)
+        validate_selected_latent_mla_decode_contract(
+            queries,
+            mla_k_cache,
+            mla_v_cache,
+            block_table,
+            selected_for_kernel,
+            self.kv_b_proj.weight,
+            self.kv_b_proj.weight_scale_inv,
+            block_size=block_size,
+            row_offset=self.kv_b_proj.row_offset,
+        )
+        return True

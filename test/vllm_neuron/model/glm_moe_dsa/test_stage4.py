@@ -500,48 +500,96 @@ class _SelectiveBlockFP8CompileProbe(nn.Module):
             down_scales,
         ):
             tensor[2:].fill_(float("nan"))
-        self.register_buffer("gate_weights", gate)
-        self.register_buffer("gate_scales", gate_scales)
-        self.register_buffer("up_weights", up)
-        self.register_buffer("up_scales", up_scales)
-        self.register_buffer("down_weights", down)
-        self.register_buffer("down_scales", down_scales)
+        expert_tensors = {
+            "gate_weight": gate,
+            "gate_scale": gate_scales,
+            "up_weight": up,
+            "up_scale": up_scales,
+            "down_weight": down,
+            "down_scale": down_scales,
+        }
+        for name, tensor in expert_tensors.items():
+            for expert_id in range(num_local_experts):
+                self.register_buffer(f"{name}_{expert_id}", tensor[expert_id].clone())
 
     def forward(
-        self, hidden_states: torch.Tensor, conditions: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        token_position_to_id: torch.Tensor,
+        block_to_expert: torch.Tensor,
+        conditions: torch.Tensor,
     ) -> torch.Tensor:
         return selective_block_fp8_moe_nki(
             hidden_states,
             self.expert_affinities_masked,
-            self.token_position_to_id,
-            self.block_to_expert,
+            token_position_to_id,
+            block_to_expert,
             conditions,
-            self.gate_weights[0],
-            self.gate_scales[0],
-            self.up_weights[0],
-            self.up_scales[0],
-            self.down_weights[0],
-            self.down_scales[0],
-            self.gate_weights[1],
-            self.gate_scales[1],
-            self.up_weights[1],
-            self.up_scales[1],
-            self.down_weights[1],
-            self.down_scales[1],
-            self.gate_weights[2],
-            self.gate_scales[2],
-            self.up_weights[2],
-            self.up_scales[2],
-            self.down_weights[2],
-            self.down_scales[2],
-            self.gate_weights[3],
-            self.gate_scales[3],
-            self.up_weights[3],
-            self.up_scales[3],
-            self.down_weights[3],
-            self.down_scales[3],
+            self.gate_weight_0,
+            self.gate_scale_0,
+            self.up_weight_0,
+            self.up_scale_0,
+            self.down_weight_0,
+            self.down_scale_0,
+            self.gate_weight_1,
+            self.gate_scale_1,
+            self.up_weight_1,
+            self.up_scale_1,
+            self.down_weight_1,
+            self.down_scale_1,
+            self.gate_weight_2,
+            self.gate_scale_2,
+            self.up_weight_2,
+            self.up_scale_2,
+            self.down_weight_2,
+            self.down_scale_2,
+            self.gate_weight_3,
+            self.gate_scale_3,
+            self.up_weight_3,
+            self.up_scale_3,
+            self.down_weight_3,
+            self.down_scale_3,
             block_size=self.block_size,
         )
+
+
+def _stack_expert_buffers(
+    module: _SelectiveBlockFP8CompileProbe, name: str
+) -> torch.Tensor:
+    """Stack direct buffers for CPU references outside compiled forward."""
+
+    return torch.stack(
+        [getattr(module, f"{name}_{expert_id}") for expert_id in range(4)]
+    )
+
+
+def test_selective_block_fp8_probe_uses_direct_expert_buffers() -> None:
+    source = Path(__file__).read_text()
+    class_source = source.split("class _SelectiveBlockFP8CompileProbe", 1)[1].split(
+        "def _stack_expert_buffers", 1
+    )[0]
+    forward_source = class_source.split("    def forward(", 1)[1]
+    direct_names = [
+        f"{projection}_{kind}_{expert_id}"
+        for expert_id in range(4)
+        for projection in ("gate", "up", "down")
+        for kind in ("weight", "scale")
+    ]
+    module = _SelectiveBlockFP8CompileProbe(1, hidden_size=128, intermediate_size=128)
+
+    for stacked_name in (
+        "gate_weights",
+        "gate_scales",
+        "up_weights",
+        "up_scales",
+        "down_weights",
+        "down_scales",
+    ):
+        assert f"self.{stacked_name}[" not in forward_source
+        assert stacked_name not in module._buffers
+    assert len(direct_names) == 24
+    assert all(name in module._buffers for name in direct_names)
+    assert all(forward_source.count(f"self.{name}") == 1 for name in direct_names)
 
 
 def _expert_0_3_numeric_probe(token_count: int) -> _SelectiveBlockFP8CompileProbe:
@@ -556,29 +604,53 @@ def _expert_0_3_numeric_probe(token_count: int) -> _SelectiveBlockFP8CompileProb
         token_count
     )
     fixture_tensors = {
-        "gate_weights": gate,
-        "gate_scales": gate_scales,
-        "up_weights": up,
-        "up_scales": up_scales,
-        "down_weights": down,
-        "down_scales": down_scales,
+        "gate_weight": gate,
+        "gate_scale": gate_scales,
+        "up_weight": up,
+        "up_scale": up_scales,
+        "down_weight": down,
+        "down_scale": down_scales,
     }
     for name, fixture in fixture_tensors.items():
-        tensor = getattr(module, name)
-        tensor[1:3].fill_(float("nan"))
-        tensor[3].copy_(fixture[3])
+        for expert_id in range(4):
+            tensor = getattr(module, f"{name}_{expert_id}")
+            if expert_id in (1, 2):
+                tensor.fill_(float("nan"))
+            else:
+                tensor.copy_(fixture[expert_id])
 
     affinities = module.expert_affinities_masked.reshape(token_count, 4)
     affinities.zero_()
     affinities[:, 0] = 0.25
     affinities[:, 3] = 0.55
-    mapping = module.token_position_to_id.reshape(4, 128)
-    mapping.fill_(-1)
-    token_ids = torch.arange(token_count, dtype=torch.int32)
-    mapping[0, :token_count] = token_ids
-    mapping[3, :token_count] = token_ids
-    module.conditions.copy_(torch.tensor([1, 0, 0, 1], dtype=torch.int32))
     return module
+
+
+def _expert_0_3_routes(
+    token_count: int,
+) -> dict[str, tuple[tuple[int, ...], torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def route(
+        active_experts: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
+        mapping = torch.full((4, 128), -1, dtype=torch.int32)
+        token_ids = torch.arange(token_count, dtype=torch.int32)
+        for block_id in range(len(active_experts)):
+            mapping[block_id, :token_count] = token_ids
+        block_to_expert = torch.tensor(
+            (*active_experts, *(0 for _ in range(4 - len(active_experts)))),
+            dtype=torch.int32,
+        )
+        conditions = torch.tensor(
+            (1,) * len(active_experts) + (0,) * (4 - len(active_experts)),
+            dtype=torch.int32,
+        )
+        return active_experts, mapping.flatten(), block_to_expert, conditions
+
+    return {
+        "expert0": route((0,)),
+        "expert3": route((3,)),
+        "expert0_expert3": route((0, 3)),
+    }
 
 
 def _expert_0_3_cpu_reference(
@@ -593,12 +665,12 @@ def _expert_0_3_cpu_reference(
     return _selective_block_fp8_kernel_order_reference(
         hidden,
         active_affinities,
-        module.gate_weights,
-        module.gate_scales,
-        module.up_weights,
-        module.up_scales,
-        module.down_weights,
-        module.down_scales,
+        _stack_expert_buffers(module, "gate_weight"),
+        _stack_expert_buffers(module, "gate_scale"),
+        _stack_expert_buffers(module, "up_weight"),
+        _stack_expert_buffers(module, "up_scale"),
+        _stack_expert_buffers(module, "down_weight"),
+        _stack_expert_buffers(module, "down_scale"),
         round_gate_up=True,
     ).float()
 
@@ -606,27 +678,30 @@ def _expert_0_3_cpu_reference(
 def test_selective_block_fp8_expert_0_3_numeric_probe_contract() -> None:
     token_count = 8
     module = _expert_0_3_numeric_probe(token_count)
-    mapping = module.token_position_to_id.reshape(4, 128)
+    routes = _expert_0_3_routes(token_count)
     token_ids = torch.arange(token_count, dtype=torch.int32)
 
-    assert module.conditions.tolist() == [1, 0, 0, 1]
-    assert torch.equal(mapping[0, :token_count], token_ids)
-    assert torch.equal(mapping[3, :token_count], token_ids)
-    assert mapping[:, token_count:].eq(-1).all()
-    assert mapping[1:3, :token_count].eq(-1).all()
+    for active_experts, mapping, block_to_expert, conditions in routes.values():
+        mapping = mapping.reshape(4, 128)
+        active_count = len(active_experts)
+        assert conditions.tolist() == [1] * active_count + [0] * (4 - active_count)
+        assert block_to_expert[:active_count].tolist() == list(active_experts)
+        for block_id in range(active_count):
+            assert torch.equal(mapping[block_id, :token_count], token_ids)
+        assert mapping[:active_count, token_count:].eq(-1).all()
+        assert mapping[active_count:].eq(-1).all()
     for name in (
-        "gate_weights",
-        "gate_scales",
-        "up_weights",
-        "up_scales",
-        "down_weights",
-        "down_scales",
+        "gate_weight",
+        "gate_scale",
+        "up_weight",
+        "up_scale",
+        "down_weight",
+        "down_scale",
     ):
-        tensor = getattr(module, name)
-        tensor_float = tensor.float()
-        assert torch.isfinite(tensor_float[0]).all()
-        assert torch.isnan(tensor_float[1:3]).all()
-        assert torch.isfinite(tensor_float[3]).all()
+        assert torch.isfinite(getattr(module, f"{name}_0").float()).all()
+        assert torch.isnan(getattr(module, f"{name}_1").float()).all()
+        assert torch.isnan(getattr(module, f"{name}_2").float()).all()
+        assert torch.isfinite(getattr(module, f"{name}_3").float()).all()
 
     hidden = torch.randn(
         token_count,
@@ -663,7 +738,12 @@ def test_neuron_compile_selective_block_fp8_moe_production_shape() -> None:
         dynamic=False,
         options={"compiler_workdir": os.environ["GLM_STAGE4_COMPILE_DIR"]},
     )
-    output = compiled(hidden, module.conditions).cpu()
+    output = compiled(
+        hidden,
+        module.token_position_to_id,
+        module.block_to_expert,
+        module.conditions,
+    ).cpu()
     assert output.shape == hidden.shape
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output) > 0
@@ -682,17 +762,10 @@ def test_neuron_selective_block_fp8_moe_expert_0_3_matches_cpu() -> None:
         generator=torch.Generator().manual_seed(911),
         dtype=torch.bfloat16,
     )
-    routes = {
-        "expert0": ((0,), torch.tensor([1, 0, 0, 0], dtype=torch.int32)),
-        "expert3": ((3,), torch.tensor([0, 0, 0, 1], dtype=torch.int32)),
-        "expert0_expert3": (
-            (0, 3),
-            torch.tensor([1, 0, 0, 1], dtype=torch.int32),
-        ),
-    }
+    routes = _expert_0_3_routes(token_count)
     expected = {
         name: _expert_0_3_cpu_reference(module, hidden, active_experts)
-        for name, (active_experts, _) in routes.items()
+        for name, (active_experts, _, _, _) in routes.items()
     }
 
     compiled = torch.compile(
@@ -704,8 +777,15 @@ def test_neuron_selective_block_fp8_moe_expert_0_3_matches_cpu() -> None:
     )
     hidden_neuron = hidden.to("neuron:0")
     actual = {
-        name: compiled(hidden_neuron, conditions.to("neuron:0")).cpu().float()
-        for name, (_, conditions) in routes.items()
+        name: compiled(
+            hidden_neuron,
+            mapping.to("neuron:0"),
+            block_to_expert.to("neuron:0"),
+            conditions.to("neuron:0"),
+        )
+        .cpu()
+        .float()
+        for name, (_, mapping, block_to_expert, conditions) in routes.items()
     }
 
     numeric_evidence = {}
@@ -743,14 +823,14 @@ def test_neuron_selective_block_fp8_moe_matches_cpu_with_poisoned_experts() -> N
         intermediate_size=128,
     ).eval()
     cpu_reference_tensors = {
-        name: getattr(module, name).detach().clone()
-        for name in (
-            "gate_weights",
-            "gate_scales",
-            "up_weights",
-            "up_scales",
-            "down_weights",
-            "down_scales",
+        plural_name: _stack_expert_buffers(module, singular_name).detach().clone()
+        for plural_name, singular_name in (
+            ("gate_weights", "gate_weight"),
+            ("gate_scales", "gate_scale"),
+            ("up_weights", "up_weight"),
+            ("up_scales", "up_scale"),
+            ("down_weights", "down_weight"),
+            ("down_scales", "down_scale"),
         )
     }
     assert all(tensor.device.type == "cpu" for tensor in cpu_reference_tensors.values())
@@ -764,24 +844,24 @@ def test_neuron_selective_block_fp8_moe_matches_cpu_with_poisoned_experts() -> N
     framework_expected_two = selective_block_fp8_moe_reference(
         hidden,
         local_affinities,
-        module.gate_weights,
-        module.gate_scales,
-        module.up_weights,
-        module.up_scales,
-        module.down_weights,
-        module.down_scales,
+        cpu_reference_tensors["gate_weights"],
+        cpu_reference_tensors["gate_scales"],
+        cpu_reference_tensors["up_weights"],
+        cpu_reference_tensors["up_scales"],
+        cpu_reference_tensors["down_weights"],
+        cpu_reference_tensors["down_scales"],
     ).float()
     one_expert_affinities = local_affinities.clone()
     one_expert_affinities[:, 1:] = 0
     framework_expected_one = selective_block_fp8_moe_reference(
         hidden,
         one_expert_affinities,
-        module.gate_weights,
-        module.gate_scales,
-        module.up_weights,
-        module.up_scales,
-        module.down_weights,
-        module.down_scales,
+        cpu_reference_tensors["gate_weights"],
+        cpu_reference_tensors["gate_scales"],
+        cpu_reference_tensors["up_weights"],
+        cpu_reference_tensors["up_scales"],
+        cpu_reference_tensors["down_weights"],
+        cpu_reference_tensors["down_scales"],
     ).float()
     expected_two = _selective_block_fp8_kernel_order_reference(
         hidden,
@@ -834,8 +914,8 @@ def test_neuron_selective_block_fp8_moe_matches_cpu_with_poisoned_experts() -> N
     assert torch.isfinite(expected_one).all()
     assert torch.count_nonzero(expected_two) > 0
     assert torch.count_nonzero(expected_one) > 0
-    assert torch.isnan(module.gate_weights[2:]).all()
-    assert torch.isnan(module.gate_scales[2:]).all()
+    assert torch.isnan(cpu_reference_tensors["gate_weights"][2:]).all()
+    assert torch.isnan(cpu_reference_tensors["gate_scales"][2:]).all()
     assert module.conditions.tolist() == [1, 1, 0, 0]
     mapping = module.token_position_to_id.reshape(4, 128)
     assert mapping[0, token_count:].eq(-1).all()
@@ -859,9 +939,29 @@ def test_neuron_selective_block_fp8_moe_matches_cpu_with_poisoned_experts() -> N
     active_two_neuron = active_two.to("neuron:0")
     active_one_neuron = active_one.to("neuron:0")
     active_zero_neuron = active_zero.to("neuron:0")
-    actual_two = compiled(hidden_neuron, active_two_neuron).cpu().float()
-    actual_one = compiled(hidden_neuron, active_one_neuron).cpu().float()
-    actual_zero = compiled(hidden_neuron, active_zero_neuron).cpu().float()
+    mapping_neuron = module.token_position_to_id
+    block_to_expert_neuron = module.block_to_expert
+    actual_two = (
+        compiled(
+            hidden_neuron, mapping_neuron, block_to_expert_neuron, active_two_neuron
+        )
+        .cpu()
+        .float()
+    )
+    actual_one = (
+        compiled(
+            hidden_neuron, mapping_neuron, block_to_expert_neuron, active_one_neuron
+        )
+        .cpu()
+        .float()
+    )
+    actual_zero = (
+        compiled(
+            hidden_neuron, mapping_neuron, block_to_expert_neuron, active_zero_neuron
+        )
+        .cpu()
+        .float()
+    )
 
     def numeric_metrics(
         actual: torch.Tensor, expected: torch.Tensor
@@ -996,13 +1096,28 @@ def test_neuron_selective_block_fp8_moe_matches_cpu_with_poisoned_experts() -> N
         for _ in range(4):
             diagnostic_runs.append(
                 {
-                    "active_two": compiled(hidden_neuron, active_two_neuron)
+                    "active_two": compiled(
+                        hidden_neuron,
+                        mapping_neuron,
+                        block_to_expert_neuron,
+                        active_two_neuron,
+                    )
                     .cpu()
                     .float(),
-                    "active_one": compiled(hidden_neuron, active_one_neuron)
+                    "active_one": compiled(
+                        hidden_neuron,
+                        mapping_neuron,
+                        block_to_expert_neuron,
+                        active_one_neuron,
+                    )
                     .cpu()
                     .float(),
-                    "active_zero": compiled(hidden_neuron, active_zero_neuron)
+                    "active_zero": compiled(
+                        hidden_neuron,
+                        mapping_neuron,
+                        block_to_expert_neuron,
+                        active_zero_neuron,
+                    )
                     .cpu()
                     .float(),
                 }
@@ -1111,15 +1226,15 @@ def test_neuron_selective_block_fp8_moe_matches_cpu_with_poisoned_experts() -> N
         for active_mapping in swapped_mapping[:2]:
             valid_token_ids = active_mapping[active_mapping >= 0]
             assert valid_token_ids.unique().numel() == valid_token_ids.numel()
-        for name in (
-            "gate_weights",
-            "gate_scales",
-            "up_weights",
-            "up_scales",
-            "down_weights",
-            "down_scales",
+        for name, singular_name in (
+            ("gate_weights", "gate_weight"),
+            ("gate_scales", "gate_scale"),
+            ("up_weights", "up_weight"),
+            ("up_scales", "up_scale"),
+            ("down_weights", "down_weight"),
+            ("down_scales", "down_scale"),
         ):
-            tensor = getattr(swapped_module, name)
+            tensor = _stack_expert_buffers(swapped_module, singular_name)
             assert torch.equal(tensor[:2], cpu_reference_tensors[name][:2])
             assert torch.isnan(tensor[2:]).all()
 
@@ -1160,7 +1275,12 @@ def test_neuron_selective_block_fp8_moe_matches_cpu_with_poisoned_experts() -> N
         for _ in range(5):
             swapped_runs.append(
                 {
-                    name: swapped_compiled(hidden_neuron, condition).cpu()
+                    name: swapped_compiled(
+                        hidden_neuron,
+                        swapped_module.token_position_to_id,
+                        swapped_module.block_to_expert,
+                        condition,
+                    ).cpu()
                     for name, condition in swapped_conditions.items()
                 }
             )

@@ -5,9 +5,9 @@ The kernel absorbs the non-rotary query into the MLA projection, gathers only
 the DSA-selected latent rows, and performs online softmax.  It never exports a
 ``[batch, query, selected, 576]`` tensor to Torch/HBM.
 
-This spike is deliberately narrow: one query, one TP-local head, BF16 cache,
+This kernel is deliberately narrow: one query, one TP-local head, BF16 cache,
 checkpoint-native block-FP8 projection weights, and at most 2048 selected
-positions. Production wiring must wait for a hardware numeric gate.
+positions. Production dispatch is guarded by an exact default-off contract.
 """
 
 from __future__ import annotations
@@ -796,6 +796,18 @@ def selected_latent_mla_decode(
 ) -> torch.Tensor:
     """Launch selected-latent MLA directly against physical paged caches."""
 
+    validate_selected_latent_mla_decode_contract(
+        queries,
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected_indices,
+        weight,
+        weight_scale_inv,
+        block_size=block_size,
+        row_offset=row_offset,
+    )
+
     return wrap_nki(_selected_latent_mla_decode_nki)[1](
         queries,
         mla_k_cache,
@@ -809,4 +821,78 @@ def selected_latent_mla_decode(
     )
 
 
-__all__ = ["selected_latent_mla_decode"]
+def validate_selected_latent_mla_decode_contract(
+    queries: torch.Tensor,
+    mla_k_cache: torch.Tensor,
+    mla_v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    selected_indices: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    *,
+    block_size: int,
+    row_offset: int = 0,
+) -> None:
+    """Fail before NKI lowering when the proven decode contract is not exact."""
+
+    errors: list[str] = []
+    if queries.ndim != 4 or queries.shape[1:] != (1, 1, _QK_WIDTH):
+        errors.append("queries must have shape [batch, 1, 1, 256]")
+    if queries.dtype is not torch.bfloat16:
+        errors.append("queries must be BF16")
+    if mla_k_cache.ndim != 4:
+        errors.append("MLA K cache must be rank four")
+    elif mla_k_cache.shape[1:] != (1, block_size, _CACHE_HALF_WIDTH):
+        errors.append("MLA K cache must have shape [blocks, 1, block_size, 288]")
+    if mla_v_cache.shape != mla_k_cache.shape:
+        errors.append("MLA cache halves must have identical shapes")
+    if (
+        mla_k_cache.dtype is not torch.bfloat16
+        or mla_v_cache.dtype is not torch.bfloat16
+    ):
+        errors.append("MLA cache halves must be BF16")
+    if block_size != 16:
+        errors.append("block_size must be 16")
+    if block_table.ndim != 2 or (
+        queries.ndim == 4 and block_table.shape[0] != queries.shape[0]
+    ):
+        errors.append("block table must have shape [batch, logical_blocks]")
+    if block_table.dtype is not torch.int32:
+        errors.append("block table must be int32")
+    if selected_indices.ndim != 3 or (
+        queries.ndim == 4 and selected_indices.shape[:2] != queries.shape[:2]
+    ):
+        errors.append("selected indices must have shape [batch, 1, selected]")
+    elif selected_indices.shape[2] != 2048:
+        errors.append("selected width must be 2048")
+    if selected_indices.dtype is not torch.int32:
+        errors.append("selected indices must be int32")
+    if weight.shape != (_WEIGHT_WIDTH, _LATENT_WIDTH):
+        errors.append("kv_b weight must have shape [448, 512]")
+    if weight.dtype is not torch.float8_e4m3fn:
+        errors.append("kv_b weight must be raw E4M3")
+    if weight_scale_inv.shape != (4, 4):
+        errors.append("kv_b inverse scales must have shape [4, 4]")
+    if weight_scale_inv.dtype is not torch.float32:
+        errors.append("kv_b inverse scales must be FP32")
+    if row_offset not in (0, 64):
+        errors.append("kv_b row offset must be 0 or 64")
+
+    tensors = (
+        mla_k_cache,
+        mla_v_cache,
+        block_table,
+        selected_indices,
+        weight,
+        weight_scale_inv,
+    )
+    if any(tensor.device != queries.device for tensor in tensors):
+        errors.append("all selected-MLA tensors must use the query device")
+    if errors:
+        raise ValueError("selected-latent MLA contract violation: " + "; ".join(errors))
+
+
+__all__ = [
+    "selected_latent_mla_decode",
+    "validate_selected_latent_mla_decode_contract",
+]
