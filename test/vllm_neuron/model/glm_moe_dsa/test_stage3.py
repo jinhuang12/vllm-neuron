@@ -649,6 +649,47 @@ def test_causal_topk_applies_relu_before_head_reduction() -> None:
     assert torch.equal(actual, torch.tensor([[[1]]]))
 
 
+def _independent_dsa_membership_reference(
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    head_weights: torch.Tensor,
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    *,
+    topk: int,
+) -> torch.Tensor:
+    """Compute pinned DSA membership without the streaming implementation."""
+
+    q_absmax = queries.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-10)
+    q_scale = torch.exp2(torch.ceil(torch.log2(q_absmax / 448.0)))
+    q_quant = (queries / q_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    k_absmax = keys.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
+    k_scale = torch.exp2(torch.ceil(torch.log2(k_absmax / 448.0)))
+    k_quant = (keys / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    logits = torch.zeros(
+        queries.shape[0],
+        queries.shape[1],
+        keys.shape[1],
+        dtype=torch.float32,
+    )
+    transposed_keys = k_quant.float().transpose(1, 2)
+    for head in range(queries.shape[2]):
+        per_head = torch.matmul(
+            q_quant[:, :, head].float(),
+            transposed_keys,
+        )
+        per_head = per_head * q_scale[:, :, head]
+        per_head = per_head * k_scale.transpose(1, 2)
+        logits += torch.relu(per_head * queries.shape[-1] ** -0.5) * (
+            head_weights[:, :, head].unsqueeze(-1) * queries.shape[2] ** -0.5
+        )
+    logits = logits.masked_fill(
+        key_positions.unsqueeze(1) > query_positions.unsqueeze(-1),
+        torch.finfo(torch.float32).min,
+    )
+    return torch.topk(logits, topk, dim=-1).indices
+
+
 def test_pinned_ue8m0_top2048_membership_probe() -> None:
     """Pinned-style 4096-key probe that detects raw-scale/full-Q scoring."""
 
@@ -666,21 +707,15 @@ def test_pinned_ue8m0_top2048_membership_probe() -> None:
         key_positions,
         topk=2048,
     )
-
-    q_absmax = queries.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-10)
-    q_scale = torch.exp2(torch.ceil(torch.log2(q_absmax / 448.0)))
-    q_quant = (queries / q_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    k_absmax = keys.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
-    k_scale = torch.exp2(torch.ceil(torch.log2(k_absmax / 448.0)))
-    k_quant = (keys / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    logits = torch.zeros(4096)
-    for head in range(32):
-        per_head = (q_quant[0, 0, head].float() @ k_quant[0].float().T) * (
-            q_scale[0, 0, head, 0] * k_scale[0, :, 0] * 128**-0.5
-        )
-        logits += torch.relu(per_head) * (head_weights[0, 0, head] * 32**-0.5)
-    expected = torch.topk(logits, 2048).indices
-    assert torch.equal(actual[0, 0].sort().values, expected.sort().values)
+    expected = _independent_dsa_membership_reference(
+        queries,
+        keys,
+        head_weights,
+        positions,
+        key_positions,
+        topk=2048,
+    )
+    assert torch.equal(actual.sort().values, expected.sort().values)
 
 
 def test_long_context_dsa_streams_exact_scores_in_bounded_key_tiles(
@@ -1387,10 +1422,10 @@ def test_neuron_compile_and_execute_production_block_fp8_cached_expansion() -> N
 
 
 @pytest.mark.skipif(
-    os.environ.get("GLM_STAGE3_RUN_NEURON_COMPILE") != "1",
-    reason="explicit scoped Neuron compile smoke",
+    os.environ.get("GLM_STAGE3_RUN_LONG_CONTEXT_DSA") != "1",
+    reason="explicit long-context streaming DSA hardware smoke",
 )
-def test_neuron_compile_and_execute_long_context_streaming_dsa() -> None:
+def test_neuron_compile_and_execute_long_context_streaming_dsa(monkeypatch) -> None:
     """Compile the smallest production-shaped >2048 DSA selection graph."""
 
     class StreamingDsaSmoke(torch.nn.Module):
@@ -1418,13 +1453,41 @@ def test_neuron_compile_and_execute_long_context_streaming_dsa() -> None:
     query_positions = torch.tensor([[4095]], dtype=torch.int64)
     key_positions = torch.arange(4096, dtype=torch.int64).unsqueeze(0)
     smoke = StreamingDsaSmoke()
-    expected = smoke(
+    expected = _independent_dsa_membership_reference(
         queries,
         keys,
         head_weights,
         query_positions,
         key_positions,
+        topk=2048,
     )
+
+    direct_matmul = torch.matmul
+    original_topk = indexer_module.neuron_topk
+    qk_widths = []
+    merge_widths = []
+
+    def recording_matmul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        qk_widths.append(rhs.shape[-1])
+        return direct_matmul(lhs, rhs)
+
+    def recording_topk(tensor: torch.Tensor, *args, **kwargs):
+        merge_widths.append(tensor.shape[-1])
+        return original_topk(tensor, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "matmul", recording_matmul)
+        patch.setattr(indexer_module, "neuron_topk", recording_topk)
+        eager = smoke(
+            queries,
+            keys,
+            head_weights,
+            query_positions,
+            key_positions,
+        )
+    assert torch.equal(eager.sort().values, expected.sort().values)
+    assert qk_widths == [indexer_module._DSA_SCORE_TILE_SIZE] * 16
+    assert max(merge_widths) <= 2048 + indexer_module._DSA_SCORE_TILE_SIZE
 
     device = torch.device("neuron:0")
     compiled = torch.compile(
@@ -1433,10 +1496,7 @@ def test_neuron_compile_and_execute_long_context_streaming_dsa() -> None:
         fullgraph=True,
         dynamic=False,
         options={
-            "compiler_workdir": os.path.join(
-                os.environ["GLM_STAGE3_COMPILE_DIR"],
-                "long_context_streaming_dsa",
-            )
+            "compiler_workdir": os.environ["GLM_STAGE3_LONG_CONTEXT_DSA_COMPILE_DIR"]
         },
     )
     actual = compiled(

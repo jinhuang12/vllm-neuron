@@ -626,6 +626,29 @@ def _expert_0_3_numeric_probe(token_count: int) -> _SelectiveBlockFP8CompileProb
     return module
 
 
+def _expert_0_3_production_probe() -> _SelectiveBlockFP8CompileProbe:
+    """Build the production-shape T=1 probe with experts 0 and 3 usable."""
+
+    module = _SelectiveBlockFP8CompileProbe(
+        1,
+        hidden_size=6144,
+        intermediate_size=2048,
+    ).eval()
+    for projection in ("gate", "up", "down"):
+        for kind in ("weight", "scale"):
+            name = f"{projection}_{kind}"
+            getattr(module, f"{name}_1").fill_(float("nan"))
+            getattr(module, f"{name}_2").fill_(float("nan"))
+            expert_3 = getattr(module, f"{name}_3")
+            expert_3.fill_(0.03125 if kind == "weight" else 0.02)
+
+    affinities = module.expert_affinities_masked.reshape(1, 4)
+    affinities.zero_()
+    affinities[0, 0] = 0.25
+    affinities[0, 3] = 0.55
+    return module
+
+
 def _expert_0_3_routes(
     token_count: int,
 ) -> dict[str, tuple[tuple[int, ...], torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -747,6 +770,68 @@ def test_neuron_compile_selective_block_fp8_moe_production_shape() -> None:
     assert output.shape == hidden.shape
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output) > 0
+
+
+@pytest.mark.skipif(
+    os.getenv("GLM_STAGE4_SELECTIVE_FP8_EXPERT3_PRODUCTION") != "1",
+    reason="explicit production-shape expert-0/expert-3 MoE smoke",
+)
+def test_neuron_selective_block_fp8_moe_expert_0_3_production_smoke() -> None:
+    module = _expert_0_3_production_probe()
+    routes = _expert_0_3_routes(1)
+    for projection in ("gate", "up", "down"):
+        for kind in ("weight", "scale"):
+            name = f"{projection}_{kind}"
+            assert torch.isfinite(getattr(module, f"{name}_0").float()).all()
+            assert torch.isnan(getattr(module, f"{name}_1").float()).all()
+            assert torch.isnan(getattr(module, f"{name}_2").float()).all()
+            assert torch.isfinite(getattr(module, f"{name}_3").float()).all()
+
+    compiled = torch.compile(
+        module.to("neuron:0"),
+        backend="vllm_neuron",
+        fullgraph=True,
+        dynamic=False,
+        options={
+            "compiler_workdir": os.environ["GLM_STAGE4_EXPERT3_PRODUCTION_COMPILE_DIR"]
+        },
+    )
+    hidden = torch.ones(1, 6144, dtype=torch.bfloat16, device="neuron:0")
+    actual = {
+        name: compiled(
+            hidden,
+            mapping.to("neuron:0"),
+            block_to_expert.to("neuron:0"),
+            conditions.to("neuron:0"),
+        ).cpu()
+        for name, (_, mapping, block_to_expert, conditions) in routes.items()
+    }
+    evidence = {
+        name: {
+            "max_abs": output.float().abs().max().item(),
+            "mean_abs": output.float().abs().mean().item(),
+            "nonzero": torch.count_nonzero(output).item(),
+        }
+        for name, output in actual.items()
+    }
+    print(f"production-shape expert-0/expert-3 smoke evidence: {evidence}")
+
+    for name, output in actual.items():
+        assert output.shape == (1, 6144), name
+        assert torch.isfinite(output).all(), name
+        assert torch.count_nonzero(output) > 0, name
+    assert not torch.equal(actual["expert0"], actual["expert3"])
+    assert not torch.equal(actual["expert0_expert3"], actual["expert0"])
+    assert not torch.equal(actual["expert0_expert3"], actual["expert3"])
+    device_sum = (actual["expert0"].float() + actual["expert3"].float()).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(
+        actual["expert0_expert3"],
+        device_sum,
+        rtol=0.01,
+        atol=0.5,
+    )
 
 
 @pytest.mark.skipif(
