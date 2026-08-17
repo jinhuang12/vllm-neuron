@@ -438,8 +438,10 @@ def test_kernel_maps_logical_indices_to_physical_sbuf_rows() -> None:
 
 
 @pytest.mark.parametrize("logical_length", (4096, 8192))
+@pytest.mark.parametrize("row_offset", (0, 64))
 def test_raw_fp8_cache_matches_bf16_selected_tile_oracle(
     logical_length: int,
+    row_offset: int,
 ) -> None:
     (
         queries,
@@ -461,7 +463,7 @@ def test_raw_fp8_cache_matches_bf16_selected_tile_oracle(
         block_table,
         weight,
         weight_scale_inv,
-        row_offset=64,
+        row_offset=row_offset,
     )
     poisoned_k, poisoned_v = _poison_unselected_physical_rows(
         mla_k_cache,
@@ -481,14 +483,60 @@ def test_raw_fp8_cache_matches_bf16_selected_tile_oracle(
         valid,
         weight,
         weight_scale_inv,
-        row_offset=64,
+        row_offset=row_offset,
     )
 
     assert mla_k_cache.dtype is torch.float8_e4m3fn
     assert mla_v_cache.dtype is torch.float8_e4m3fn
     assert torch.isfinite(poisoned_k.float()).all()
     assert torch.isfinite(poisoned_v.float()).all()
+    assert not valid[0, 0, 17]
+    assert not valid[1, 0, 19]
+    assert not valid[0, 0, 31]
+    assert not valid[:, :, -31:].any()
     torch.testing.assert_close(actual, expected)
+
+    physical_block_count = mla_k_cache.shape[0]
+    request_one_blocks = block_table[1]
+    request_one_blocks = request_one_blocks[
+        (request_one_blocks >= 0) & (request_one_blocks < physical_block_count)
+    ].to(torch.long)
+    isolated_k = poisoned_k.clone()
+    isolated_v = poisoned_v.clone()
+    isolated_k[request_one_blocks] = _cache_poison_value(isolated_k.dtype)
+    isolated_v[request_one_blocks] = _cache_poison_value(isolated_v.dtype)
+    isolated_chosen, isolated_valid = _gather_paged_selected(
+        isolated_k,
+        isolated_v,
+        block_table,
+        selected,
+    )
+    isolated = _selected_attention_tiled_online_reference(
+        queries,
+        isolated_chosen.to(queries.dtype),
+        isolated_valid,
+        weight,
+        weight_scale_inv,
+        row_offset=row_offset,
+    )
+    assert torch.equal(isolated[0], actual[0])
+
+    all_padding = torch.full_like(selected, -1)
+    padded_chosen, padded_valid = _gather_paged_selected(
+        _fp8_poisoned_cache(mla_k_cache),
+        _fp8_poisoned_cache(mla_v_cache),
+        block_table,
+        all_padding,
+    )
+    padded = _selected_attention_tiled_online_reference(
+        queries,
+        padded_chosen.to(queries.dtype),
+        padded_valid,
+        weight,
+        weight_scale_inv,
+        row_offset=row_offset,
+    )
+    torch.testing.assert_close(padded, torch.zeros_like(padded))
 
 
 @pytest.mark.parametrize("cache_dtype", (torch.bfloat16, torch.float8_e4m3fn))
@@ -808,8 +856,9 @@ def test_fp8_hardware_nodes_use_bounded_fullgraph_contract() -> None:
     assert "dynamic=False" in source
     assert 'os.environ["GLM_STAGE3_SPARSE_MLA_FP8_COMPILE_DIR"]' in source
     assert "cache_dtype=torch.float8_e4m3fn" in source
-    assert "row_offset=64" in source
+    assert "row_offset=row_offset" in source
     assert "_fp8_poisoned_cache(mla_k_cache)" in source
+    assert "isolated_actual[0]" in source
 
     t4096_source = inspect.getsource(test_selected_latent_mla_fp8_t4096_q1_k2048_neuron)
     t8192_source = inspect.getsource(test_selected_latent_mla_fp8_t8192_q1_k2048_neuron)
@@ -817,7 +866,10 @@ def test_fp8_hardware_nodes_use_bounded_fullgraph_contract() -> None:
     assert "GLM_STAGE3_SPARSE_MLA_FP8_T8192_HARDWARE" in t8192_source
 
 
-def _run_fp8_selected_latent_mla_neuron(logical_length: int) -> None:
+def _run_fp8_selected_latent_mla_neuron(
+    logical_length: int,
+    row_offset: int,
+) -> None:
     device = torch.device("neuron:0")
     (
         queries,
@@ -839,7 +891,7 @@ def _run_fp8_selected_latent_mla_neuron(logical_length: int) -> None:
         block_table,
         weight,
         weight_scale_inv,
-        row_offset=64,
+        row_offset=row_offset,
     )
     poisoned_k, poisoned_v = _poison_unselected_physical_rows(
         mla_k_cache,
@@ -849,14 +901,16 @@ def _run_fp8_selected_latent_mla_neuron(logical_length: int) -> None:
     )
 
     compile_root = Path(os.environ["GLM_STAGE3_SPARSE_MLA_FP8_COMPILE_DIR"])
-    module = _SelectedLatentMLADecodeProbe(row_offset=64).eval().to(device)
+    module = _SelectedLatentMLADecodeProbe(row_offset=row_offset).eval().to(device)
     compiled = torch.compile(
         module,
         backend="vllm_neuron",
         fullgraph=True,
         dynamic=False,
         options={
-            "compiler_workdir": str(compile_root / f"fp8-t{logical_length}-row64")
+            "compiler_workdir": str(
+                compile_root / f"fp8-t{logical_length}-row{row_offset}"
+            )
         },
     )
 
@@ -884,14 +938,35 @@ def _run_fp8_selected_latent_mla_neuron(logical_length: int) -> None:
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
 
+    physical_block_count = mla_k_cache.shape[0]
+    request_one_blocks = block_table[1]
+    request_one_blocks = request_one_blocks[
+        (request_one_blocks >= 0) & (request_one_blocks < physical_block_count)
+    ].to(torch.long)
+    isolated_k = poisoned_k.clone()
+    isolated_v = poisoned_v.clone()
+    isolated_k[request_one_blocks] = _cache_poison_value(isolated_k.dtype)
+    isolated_v[request_one_blocks] = _cache_poison_value(isolated_v.dtype)
+    isolated_actual = compiled(
+        queries.to(device),
+        isolated_k.to(device),
+        isolated_v.to(device),
+        block_table.to(device),
+        selected.to(device),
+        weight.to(device),
+        weight_scale_inv.to(device),
+    ).cpu()
+    assert torch.equal(isolated_actual[0], actual[0])
+
 
 @pytest.mark.skipif(
     os.environ.get("GLM_STAGE3_SPARSE_MLA_FP8_T4096_HARDWARE") != "1"
     or not Path("/dev/neuron0").exists(),
     reason="requires explicit FP8 T4096 selected-MLA Neuron opt-in",
 )
-def test_selected_latent_mla_fp8_t4096_q1_k2048_neuron() -> None:
-    _run_fp8_selected_latent_mla_neuron(4096)
+@pytest.mark.parametrize("row_offset", (0, 64))
+def test_selected_latent_mla_fp8_t4096_q1_k2048_neuron(row_offset: int) -> None:
+    _run_fp8_selected_latent_mla_neuron(4096, row_offset)
 
 
 @pytest.mark.skipif(
@@ -899,8 +974,9 @@ def test_selected_latent_mla_fp8_t4096_q1_k2048_neuron() -> None:
     or not Path("/dev/neuron0").exists(),
     reason="requires explicit FP8 T8192 selected-MLA Neuron opt-in",
 )
-def test_selected_latent_mla_fp8_t8192_q1_k2048_neuron() -> None:
-    _run_fp8_selected_latent_mla_neuron(8192)
+@pytest.mark.parametrize("row_offset", (0, 64))
+def test_selected_latent_mla_fp8_t8192_q1_k2048_neuron(row_offset: int) -> None:
+    _run_fp8_selected_latent_mla_neuron(8192, row_offset)
 
 
 @pytest.mark.skipif(
