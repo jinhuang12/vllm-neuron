@@ -1,0 +1,30 @@
+# Core dependencies with Neuron-compatible constraints
+setuptools-scm>=8
+urllib3>=2.6.0
+
+# Neuron torch compile/runtime framework
+# Left unpinned to resolve based on vLLM's torch requirement
+libtorch-neuronx-lite
+
+# vLLM installation
+vllm==0.24.0
+
+# Pin <0.137: 0.137's `_IncludedRouter` breaks prometheus-fastapi-instrumentator
+fastapi[standard]>=0.115.0,<0.137
+
+# Force transformers v5 upgrade
+transformers>=5.5.1,<6.0.0
+
+# Prometheus metrics
+prometheus_client
+
+# NKI CPU simulator dtype support
+ml_dtypes
+
+# NIXL KV transfer (disaggregated inference)
+nixl==1.3.2
+
+# benchmark dependency
+psutil
+requests
+boto3

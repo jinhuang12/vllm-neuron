@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Factory for GptOss model selection based on platform and configuration."""
+
+import torch.nn as nn
+from transformers import PretrainedConfig
+
+from libtorch_neuronx_lite.compile.platform import get_platform_target
+from vllm_neuron.model.neuron_config import NeuronConfig
+
+
+class GptOssForCausalLM(nn.Module):
+    """Factory that validates config and selects the appropriate GptOss implementation.
+
+    This class extends nn.Module to satisfy vLLM's ModelRegistry requirements.
+    The factory stores the selected implementation and delegates forward() calls to it.
+    """
+
+    def __init__(
+        self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+    ) -> None:
+        super().__init__()
+        self._model = self._select_implementation(hf_config, neuron_config)
+
+    def forward(self, *args, **kwargs):
+        """Delegate forward pass to the selected implementation."""
+        return self._model(*args, **kwargs)
+
+    @classmethod
+    def from_configs(
+        cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+    ) -> nn.Module:
+        """Create model from configs. Returns the selected implementation directly."""
+        return cls._select_implementation(hf_config, neuron_config)
+
+    @classmethod
+    def _select_implementation(
+        cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+    ) -> nn.Module:
+        """Select and instantiate the appropriate implementation based on config."""
+        cls._validate_config(hf_config, neuron_config)
+
+        # TODO: Below is a preliminary logic and needs to be made more robust
+        platform = get_platform_target()
+        quantization = neuron_config.quantization if neuron_config else None
+
+        if quantization == "mxfp4":
+            from .model_mxfp4 import GptOssForCausalLM as Model
+
+            return Model.from_configs(hf_config, neuron_config)
+
+        if quantization == "bf16":
+            from .model_bf16 import GptOssForCausalLM as Model
+
+            return Model.from_configs(hf_config, neuron_config)
+
+        if platform.startswith("trn3"):
+            from .model_mxfp4 import GptOssForCausalLM as Model
+
+            return Model.from_configs(hf_config, neuron_config)
+
+        from .model_bf16 import GptOssForCausalLM as Model
+
+        return Model.from_configs(hf_config, neuron_config)
+
+    @classmethod
+    def _validate_config(
+        cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+    ) -> None:
+        """Validate that the configuration is supported. Add rules as needed."""
+        # TODO: Below is one example rule, but we need to add more and make user errors clear
+
+        quantization = neuron_config.quantization if neuron_config else None
+        platform = get_platform_target()
+
+        if quantization == "mxfp4" and platform == "trn2":
+            raise ValueError(
+                "quantization='mxfp4' is not supported on TRN2. "
+                "Please use quantization='bf16'"
+            )
