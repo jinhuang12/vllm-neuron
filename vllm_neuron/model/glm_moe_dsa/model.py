@@ -240,24 +240,22 @@ class GlmMoeDsaDecoderLayer(nn.Module):
                     ),
                     dtype=index_projection.keys.dtype,
                 )
-                key_positions = (
-                    torch.arange(
-                        cached_indexer_keys.shape[1],
-                        dtype=positions.dtype,
-                        device=positions.device,
-                    )
-                    .unsqueeze(0)
-                    .expand(cached_indexer_keys.shape[0], -1)
+                selected_indices = indexer.select_paged(
+                    index_projection,
+                    cached_indexer_keys,
+                    positions,
+                    indexer_meta["block_table_tensor"],
+                    block_size=int(indexer_meta["block_size"]),
+                    physical_block_count=self.indexer_k_cache.shape[0],
                 )
             else:
                 cached_indexer_keys = index_projection.keys
-                key_positions = positions
-            selected_indices = indexer.select(
-                index_projection,
-                cached_indexer_keys,
-                positions,
-                key_positions,
-            )
+                selected_indices = indexer.select(
+                    index_projection,
+                    cached_indexer_keys,
+                    positions,
+                    positions,
+                )
         elif selected_indices is None:
             selected_indices = _causal_selection(
                 hidden_states.shape[0], hidden_states.shape[1], hidden_states.device

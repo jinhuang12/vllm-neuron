@@ -30,13 +30,17 @@ from vllm_neuron.model.glm_moe_dsa.cache import (
     MLA_CACHE_PART_SIZE,
     DualCacheState,
     build_glm_mla_cache_spec,
+    gather_paged_cache_pair,
+    write_paged_cache_pair,
 )
 from vllm_neuron.model.glm_moe_dsa.indexer import (
     GlmMoeDsaIndexer,
+    IndexerProjection,
     apply_interleaved_rope,
     causal_topk_indices,
     latest_indexer_layer,
     pack_indexer_keys,
+    paged_key_positions,
     quantize_ue8m0_fp8,
     rotary_cos_sin,
     unpack_indexer_keys,
@@ -789,6 +793,209 @@ def test_long_context_dsa_streams_exact_scores_in_bounded_key_tiles(
     assert max(qk_widths) == 256
     assert max(merge_widths) <= topk + 256
     assert len(qk_widths) == 10
+
+
+def test_paged_key_positions_preserve_absolute_order_and_mask_invalid_pages() -> None:
+    block_table = torch.tensor(
+        [[7, 2, -1], [5, 99, 1]],
+        dtype=torch.int32,
+    )
+    positions = paged_key_positions(
+        block_table,
+        block_size=4,
+        physical_block_count=8,
+        position_offsets=torch.tensor([1024, 8192]),
+    )
+    sentinel = torch.iinfo(torch.int64).max
+    assert torch.equal(
+        positions,
+        torch.tensor(
+            [
+                [1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031] + [sentinel] * 4,
+                [8192, 8193, 8194, 8195] + [sentinel] * 4 + [8200, 8201, 8202, 8203],
+            ],
+            dtype=torch.int64,
+        ),
+    )
+
+
+def test_paged_selection_preserves_le2048_all_token_bypass(monkeypatch) -> None:
+    def fail_if_scored(*args, **kwargs):
+        raise AssertionError("the <=2048 paged-cache bypass must not score QK")
+
+    monkeypatch.setattr(torch, "matmul", fail_if_scored)
+    block_table = torch.tensor([[3, 1], [2, -1]], dtype=torch.int32)
+    position_offsets = torch.tensor([100, 900], dtype=torch.int64)
+    query_positions = torch.tensor([[105], [902]], dtype=torch.int64)
+    projection = IndexerProjection(
+        queries=torch.zeros(2, 1, 1, 128),
+        keys=torch.zeros(2, 1, 128),
+        head_weights=torch.ones(2, 1, 1),
+    )
+    indexer = GlmMoeDsaIndexer(
+        hidden_size=16,
+        q_lora_rank=16,
+        num_heads=1,
+        head_dim=128,
+        topk=2048,
+    )
+    selected = indexer.select_paged(
+        projection,
+        torch.zeros(2, 8, 128),
+        query_positions,
+        block_table,
+        block_size=4,
+        physical_block_count=4,
+        position_offsets=position_offsets,
+    )
+
+    expected = torch.full((2, 1, 2048), -1, dtype=torch.int64)
+    expected[0, 0, :6] = torch.arange(6)
+    expected[1, 0, :3] = torch.arange(3)
+    assert torch.equal(selected, expected)
+
+
+def test_streaming_dsa_selects_from_paged_cache_metadata_with_b2_isolation(
+    monkeypatch,
+) -> None:
+    """B2 selection uses logical cache order and excludes partial buckets."""
+
+    torch.manual_seed(2052)
+    batch = 2
+    block_size = 32
+    logical_token_count = 2304
+    logical_block_count = logical_token_count // block_size
+    valid_lengths = torch.tensor([2177, 2209], dtype=torch.int64)
+    position_offsets = torch.tensor([4096, 12288], dtype=torch.int64)
+    physical_block_count = 160
+
+    request_blocks = torch.stack(
+        (
+            torch.arange(1, 74, dtype=torch.int64).roll(11),
+            torch.arange(81, 154, dtype=torch.int64).roll(19),
+        )
+    )
+    block_table = torch.full(
+        (batch, logical_block_count),
+        -1,
+        dtype=torch.int32,
+    )
+    for request_index in range(batch):
+        valid_block_count = (
+            int(valid_lengths[request_index]) + block_size - 1
+        ) // block_size
+        block_table[request_index, :valid_block_count] = request_blocks[
+            request_index, :valid_block_count
+        ].to(torch.int32)
+
+    logical_keys = torch.randn(batch, logical_token_count, 128)
+    packed_keys = pack_indexer_keys(logical_keys)
+    k_cache = torch.full(
+        (physical_block_count, 1, block_size, INDEXER_CACHE_PART_BYTES),
+        255,
+        dtype=torch.uint8,
+    )
+    v_cache = torch.full_like(k_cache, 255)
+    written_slots = []
+    written_values = []
+    for request_index in range(batch):
+        length = int(valid_lengths[request_index])
+        logical_positions = torch.arange(length, dtype=torch.int64)
+        physical_slots = (
+            request_blocks[request_index, logical_positions // block_size] * block_size
+            + logical_positions % block_size
+        )
+        written_slots.append(physical_slots)
+        written_values.append(packed_keys[request_index, :length])
+    write_paged_cache_pair(
+        k_cache,
+        v_cache,
+        torch.cat(written_values),
+        torch.cat(written_slots),
+        block_size,
+    )
+    gathered_packed = gather_paged_cache_pair(k_cache, v_cache, block_table)
+    cached_keys = unpack_indexer_keys(gathered_packed, dtype=torch.float32)
+    key_positions = paged_key_positions(
+        block_table,
+        block_size=block_size,
+        physical_block_count=physical_block_count,
+        position_offsets=position_offsets,
+    )
+
+    for request_index in range(batch):
+        length = int(valid_lengths[request_index])
+        valid_block_count = (length + block_size - 1) // block_size
+        valid_block_end = valid_block_count * block_size
+        expected_valid = unpack_indexer_keys(
+            packed_keys[request_index, :length], dtype=torch.float32
+        )
+        torch.testing.assert_close(cached_keys[request_index, :length], expected_valid)
+        expected_future_tail = torch.arange(
+            position_offsets[request_index] + length,
+            position_offsets[request_index] + valid_block_end,
+            dtype=torch.int64,
+        )
+        assert torch.equal(
+            key_positions[request_index, length:valid_block_end],
+            expected_future_tail,
+        )
+        assert torch.all(
+            key_positions[request_index, length:valid_block_end]
+            > position_offsets[request_index] + length - 1
+        )
+        assert torch.all(
+            key_positions[request_index, valid_block_end:]
+            == torch.iinfo(torch.int64).max
+        )
+
+    queries = torch.randn(batch, 1, 2, 128)
+    head_weights = torch.randn(batch, 1, 2)
+    query_positions = (position_offsets + valid_lengths - 1).unsqueeze(-1)
+    projection = IndexerProjection(
+        queries=queries,
+        keys=torch.zeros(batch, 1, 128),
+        head_weights=head_weights,
+    )
+    indexer = GlmMoeDsaIndexer(
+        hidden_size=16,
+        q_lora_rank=16,
+        num_heads=2,
+        head_dim=128,
+        topk=2048,
+    )
+
+    direct_matmul = torch.matmul
+    qk_widths = []
+
+    def recording_matmul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        qk_widths.append(rhs.shape[-1])
+        return direct_matmul(lhs, rhs)
+
+    monkeypatch.setattr(torch, "matmul", recording_matmul)
+    actual = indexer.select_paged(
+        projection,
+        cached_keys,
+        query_positions,
+        block_table,
+        block_size=block_size,
+        physical_block_count=physical_block_count,
+        position_offsets=position_offsets,
+    )
+    expected = _independent_dsa_membership_reference(
+        queries,
+        cached_keys,
+        head_weights,
+        query_positions,
+        key_positions,
+        topk=2048,
+    )
+
+    assert torch.equal(actual.sort().values, expected.sort().values)
+    assert max(qk_widths) <= indexer_module._DSA_SCORE_TILE_SIZE
+    assert torch.all(actual[0] < valid_lengths[0])
+    assert torch.all(actual[1] < valid_lengths[1])
+    assert not torch.equal(actual[0], actual[1])
 
 
 def test_causal_topk_bypasses_scores_for_four_absolute_prefill_segments(

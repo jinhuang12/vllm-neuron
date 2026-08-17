@@ -743,6 +743,64 @@ def causal_topk_indices(
     return selected
 
 
+def paged_key_positions(
+    block_table: torch.Tensor,
+    *,
+    block_size: int,
+    physical_block_count: int,
+    position_offsets: torch.Tensor | None = None,
+    dtype: torch.dtype = torch.int64,
+) -> torch.Tensor:
+    """Build absolute logical positions and mask invalid paged-cache entries.
+
+    The paged cache gather returns rows in logical block-table order, not in
+    physical page order.  Valid positions therefore advance monotonically by
+    logical token offset.  Invalid physical page IDs receive the largest
+    representable position so the causal predicate excludes every row from
+    an absent page, including fully padded requests.
+    """
+
+    if block_table.ndim != 2:
+        raise ValueError("block_table must have shape [batch, logical blocks]")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if physical_block_count <= 0:
+        raise ValueError("physical_block_count must be positive")
+    if dtype not in (torch.int32, torch.int64):
+        raise ValueError("paged key positions require an int32 or int64 dtype")
+
+    batch, logical_block_count = block_table.shape
+    logical_token_count = logical_block_count * block_size
+    logical_positions = torch.arange(
+        logical_token_count,
+        dtype=dtype,
+        device=block_table.device,
+    ).unsqueeze(0)
+
+    if position_offsets is None:
+        offsets = torch.zeros(batch, 1, dtype=dtype, device=block_table.device)
+    else:
+        offsets = position_offsets.to(device=block_table.device, dtype=dtype)
+        if offsets.ndim == 0:
+            offsets = offsets.expand(batch)
+        if offsets.shape != (batch,):
+            raise ValueError("position_offsets must be scalar or have shape [batch]")
+        offsets = offsets.unsqueeze(-1)
+
+    absolute_positions = logical_positions + offsets
+    valid_blocks = (block_table >= 0) & (block_table < physical_block_count)
+    valid_tokens = (
+        valid_blocks.unsqueeze(-1)
+        .expand(batch, logical_block_count, block_size)
+        .reshape(batch, logical_token_count)
+    )
+    invalid_position = torch.full_like(
+        absolute_positions,
+        torch.iinfo(dtype).max,
+    )
+    return torch.where(valid_tokens, absolute_positions, invalid_position)
+
+
 def latest_indexer_layer(layer_index: int) -> int:
     """Return the indexer result reused by one main decoder layer."""
 
@@ -849,4 +907,40 @@ class GlmMoeDsaIndexer(nn.Module):
             query_positions,
             key_positions,
             topk=self.topk,
+        )
+
+    def select_paged(
+        self,
+        projection: IndexerProjection,
+        cached_keys: torch.Tensor,
+        query_positions: torch.Tensor,
+        block_table: torch.Tensor,
+        *,
+        block_size: int,
+        physical_block_count: int,
+        position_offsets: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Select from a gathered paged indexer cache with request-local masks."""
+
+        if cached_keys.ndim != 3:
+            raise ValueError("cached_keys must have shape [batch, logical tokens, dim]")
+        if cached_keys.shape[0] != block_table.shape[0]:
+            raise ValueError("cached key batch must match the block table")
+        expected_tokens = block_table.shape[1] * block_size
+        if cached_keys.shape[1] != expected_tokens:
+            raise ValueError(
+                "cached key length must equal block_table width times block_size"
+            )
+        key_positions = paged_key_positions(
+            block_table,
+            block_size=block_size,
+            physical_block_count=physical_block_count,
+            position_offsets=position_offsets,
+            dtype=query_positions.dtype,
+        )
+        return self.select(
+            projection,
+            cached_keys,
+            query_positions,
+            key_positions,
         )
