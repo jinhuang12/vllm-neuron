@@ -46,6 +46,7 @@ up. <<<
 """
 
 import math
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -469,6 +470,93 @@ def _gather_scale_columns(
     return expanded.reshape(slot_ids.shape[0], slot_ids.shape[1], num_scales * group)
 
 
+def _gather_cache_rows(
+    cache: torch.Tensor, slot_ids: torch.Tensor, width: int
+) -> torch.Tensor:
+    """Read whole slots out of a paged cache: ``[B, S]`` slots -> ``[B, S, width]``.
+
+    Indexes FIRST and casts after, so the whole cache is never materialized in
+    fp32. fp8 tensors cannot be fancy-indexed
+    (``attention_decode.py:610-620``), so the gather goes through a
+    column-identical int8 view and is relabelled back.
+    """
+    num_blocks, num_kv_heads, block_size, stored = cache.shape
+    flat = cache.reshape(num_blocks * num_kv_heads * block_size, stored)
+    rows = slot_ids.clamp(0, flat.shape[0] - 1).reshape(-1)
+    if cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        gathered = torch.index_select(flat.view(torch.int8), 0, rows).view(cache.dtype)
+    else:
+        gathered = torch.index_select(flat, 0, rows)
+    return (
+        gathered[:, :width]
+        .to(torch.float32)
+        .reshape(slot_ids.shape[0], slot_ids.shape[1], width)
+    )
+
+
+class CompressorState(NamedTuple):
+    """Everything a compressor needs to reach its raw rows from EARLIER steps.
+
+    R-12, candidate A. A compression window is ``coff * compress_ratio`` RAW
+    tokens wide, but a decode forward carries ONE token per sequence, so the
+    window can only ever be assembled by reading rows the previous steps
+    wrote. This is that channel: a paged KV leg of its own, declared by
+    :meth:`DeepseekV4Attention.kv_layer_specs` under the layer's
+    ``.compressor`` / ``.indexer_compressor`` name, written every token and
+    read back by absolute position.
+
+    Two consequences of using a runner-allocated KV leg rather than an
+    ``nn.Module`` buffer, both recorded because they are numerics-visible:
+
+    1. The rows are stored at ``--kv-cache-dtype`` (FP8 for this family;
+       the runner overrides ``LayerSpec.dtype``, see ``kv_layer_specs``),
+       whereas the reference holds them fp32 (``dsv4_ref/model.py:309-310``).
+       Rows reached from the state therefore carry FP8 group-64 error into
+       the pooling softmax; rows visible in the CURRENT forward keep full
+       fp32 and are always preferred.
+    2. The reference marks absent rows with a ``-inf`` SCORE sentinel
+       (``:346-347``). FP8 has no ``-inf``, so validity here is derived from
+       absolute positions instead and applied as a mask after the read.
+
+    A module buffer would avoid (1) — the runner only forces buffers to meta
+    on the ``cpu_compile`` path (``neuron_model_runner.py:1249``), so a real
+    buffer does survive on the serving path. It is NOT used because a
+    ``self.``-held tensor mutated in place must alias the same device
+    allocation across every bucketed NEFF, and that is a compiler-aliasing
+    property this port only demonstrates for runner-passed cache tensors.
+    Verifying it needs hardware, which authoring does not have.
+
+    Attributes:
+        k_cache: ``[nb, 1, bs, 2 * proj_width]`` — FP8 codes, ``kv`` rows in
+            columns ``[0:proj_width]`` and gate rows in the upper half.
+        v_cache: same shape — the matching group-64 UE8M0 dequant scales in
+            the leading ``2 * proj_width // 64`` columns.
+        slot_mapping: ``[T]`` destination slot per token, ``-1`` to skip. The
+            RAW per-token mapping, not the coarse one: every token's rows are
+            state, only the window-closing token's POOLED value is a cache
+            entry.
+        block_table: ``[B, blocks]`` this leg's table. The leg is a
+            ``SlidingWindowSpec``, so at decode the runner has already
+            trimmed it and ``pos_offset`` says by how much.
+        block_size: Slots per block.
+        pos_offset: ``[B]`` int32 ``swa_kv_pos_offset`` for this leg, or
+            ``None`` when nothing was trimmed.
+        seq_ids: ``[T]`` which ``block_table`` row each token belongs to.
+        is_decode: Whether this forward is the one-token-per-sequence shape.
+            It selects how many leading rows need a state read at all; see
+            :meth:`DeepseekV4KVCompressor.forward`.
+    """
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    block_size: int
+    pos_offset: torch.Tensor | None
+    seq_ids: torch.Tensor
+    is_decode: bool
+
+
 # ---------------------------------------------------------------------------
 # Per-layer KV compressor
 # ---------------------------------------------------------------------------
@@ -513,22 +601,32 @@ class DeepseekV4KVCompressor(nn.Module):
     plain ``Linear``; the pooled latent IS the cache content, which every
     core needs whole. <<<
 
-    RECORDED GAP — decode-time window state. The reference keeps the raw
-    per-token ``(kv, score)`` rows in two persistent buffers so a window can
-    span forward passes (``:309-310``)::
+    CROSS-STEP WINDOW STATE (R-12, candidate A — WIRED). The reference keeps
+    the raw per-token ``(kv, score)`` rows in two persistent buffers so a
+    window can span forward passes (``:309-310``)::
 
         kv_state:    [max_batch, coff * ratio, coff * head_dim] fp32, zeros
         score_state: [max_batch, coff * ratio, coff * head_dim] fp32, -inf
 
     with the decode update at ``:350-365`` and the half-window roll at
-    ``:359-360``. Those buffers have no row in the recorded KV layout, and
-    this module cannot create them: the runner forces every buffer to meta
-    (``neuron_model_runner.py:1231-1232``), so a real-valued buffer built in
-    ``__init__`` would arrive with no data. This implementation therefore
-    pools over the windows visible in the CURRENT forward — exact for a full
-    prefill and for any window wholly inside the current chunk.
-    ``prev_state`` is accepted as a keyword-only hook so the persistent state
-    can be wired in later without changing this class's public signature.
+    ``:359-360``. Here those rows live in a paged KV leg of their own —
+    :class:`CompressorState`, handed in as ``prev_state`` — because a
+    ``self.``-held buffer mutated in place is not a persistence mechanism this
+    port can prove off hardware. Read that class for the two recorded
+    consequences (FP8 storage of the rows; position-derived validity in place
+    of the ``-inf`` sentinel) and for why a module buffer was refused.
+
+    An EARLIER version of this docstring recorded the gap as unfixable and
+    attributed it to the runner forcing every buffer to meta. That reason was
+    wrong: the ``.to("meta")`` call is on the ``cpu_compile`` branch only
+    (``neuron_model_runner.py:1249``), where every parameter is meta too. The
+    real obstacle is graph aliasing across bucketed NEFFs, which is what
+    candidate A routes around.
+
+    Without ``prev_state`` this module still pools over the windows visible in
+    the CURRENT forward only. That is exact for a full prefill from position
+    0 and wrong at every decode step, so ``prev_state=None`` is a CPU/test
+    convenience, not a serving configuration.
     """
 
     def __init__(
@@ -602,12 +700,43 @@ class DeepseekV4KVCompressor(nn.Module):
             torch.empty(self.head_dim, dtype=self.dtype), requires_grad=False
         )
 
+    @property
+    def state_pair_width(self) -> int:
+        """``head_size`` of this compressor's :class:`CompressorState` leg.
+
+        Both raw rows are ``proj_width`` wide and both are needed, so one KV
+        pair carries them side by side: ``kv`` in the lower half of
+        ``k_cache``, the gate row in the upper half, and the matching group-64
+        scales in the same column order in ``v_cache``. Concatenating the
+        scales in that order is what makes
+        :func:`_gather_scale_columns`'s in-order group expansion line up with
+        the concatenated codes, which is why the halves are not interleaved.
+        """
+        return 2 * self.proj_width
+
+    @property
+    def state_window(self) -> int:
+        """RAW-token reach the state leg must keep, i.e. the window width.
+
+        Row ``t``'s window is raw positions ``[t - window + 1 .. t]``, so
+        ``window`` slots per sequence is exactly enough and the leg is
+        declared ``SlidingWindowSpec`` at this size. The runner rounds the
+        window UP to whole blocks when it trims
+        (``_compute_swa_num_blocks``), so the allocation is
+        ``ceil(window / block_size) + 1`` blocks — for the ratio-4 layers,
+        whose window is 8, that rounding is the whole cost and the leg is
+        block-granular rather than 8-slots-granular. Reading more slots than
+        the window needs is harmless: validity is derived from absolute
+        positions, not from the table extent.
+        """
+        return self.window
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         *,
-        prev_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prev_state: CompressorState | None = None,
     ) -> torch.Tensor:
         """Compress the window ENDING at each token.
 
@@ -621,38 +750,48 @@ class DeepseekV4KVCompressor(nn.Module):
         Args:
             hidden_states: ``[T, hidden_size]`` — the layer's normed input.
             positions: ``[T]`` int64 absolute positions.
-            prev_state: Reserved for the persistent raw-row buffers; see the
-                class docstring. Ignored today.
+            prev_state: The cross-step raw-row state (R-12). Required for a
+                correct decode step and for any prefill chunk that does not
+                start at position 0; see :class:`CompressorState`. ``None``
+                pools over this forward only, which is exact just for a whole
+                sequence prefilled from position 0.
 
         Returns:
             ``[T, head_dim]`` fp32: RMSNormed, RoPEd at the window's base
             position, and through the output quantize/dequantize round trip
             the reference applies in place.
         """
-        del prev_state  # see class docstring
-
         tokens = hidden_states.shape[0]
         ratio = self.compress_ratio
         window = self.window
         head_dim = self.head_dim
+        device = hidden_states.device
 
         # ── Per-token raw rows, fp32 (dsv4_ref/model.py:328-330) ────────
         hidden32 = hidden_states.to(torch.float32)
         kv_rows = hidden32 @ self.wkv_weight.to(torch.float32).t()
         score_rows = hidden32 @ self.wgate_weight.to(torch.float32).t()
 
-        phase = torch.remainder(positions.to(torch.long), ratio)
+        positions_l = positions.to(torch.long)
+        phase = torch.remainder(positions_l, ratio)
         score_rows = score_rows + torch.index_select(
             self.ape.to(torch.float32), 0, phase
         )
 
+        # ── Publish this step's rows for LATER steps to read (R-12) ──────
+        # Written before the read below purely for readability: this forward's
+        # own rows are always taken from ``kv_rows``/``score_rows`` directly,
+        # at full fp32, never round-tripped through the FP8 state.
+        if prev_state is not None:
+            self._write_state(prev_state, kv_rows, score_rows)
+
         # ── Window gather: rows [t-window+1 .. t] for every t ───────────
         # Built purely from arange arithmetic, so the shape is static and the
         # sequence head is handled by a mask rather than a short gather.
-        token_idx = torch.arange(tokens, device=hidden_states.device).unsqueeze(1)
-        lag = torch.arange(window - 1, -1, -1, device=hidden_states.device).unsqueeze(0)
-        gather_idx = token_idx - lag  # [T, window]
-        in_range = gather_idx >= 0
+        token_idx = torch.arange(tokens, device=device).unsqueeze(1)
+        lag = torch.arange(window - 1, -1, -1, device=device).unsqueeze(0)
+        gather_idx = token_idx - lag  # [T, window] index into THIS forward
+        abs_src = positions_l.unsqueeze(1) - lag  # [T, window] absolute position
         gather_flat = torch.clamp(gather_idx, min=0).reshape(-1)
 
         kv_win = torch.index_select(kv_rows, 0, gather_flat).view(
@@ -661,6 +800,46 @@ class DeepseekV4KVCompressor(nn.Module):
         score_win = torch.index_select(score_rows, 0, gather_flat).view(
             tokens, window, self.proj_width
         )
+
+        # A row gathered at ``t - lag`` is the row actually WANTED only when it
+        # is the same sequence's token at ``abs_src``. ``gather_idx >= 0``
+        # alone is not that test, and the difference is a correctness bug, not
+        # a refinement: at decode every row of this forward belongs to a
+        # DIFFERENT sequence, so ``t - lag`` pools other sequences' tokens
+        # whenever their positions line up. Comparing the gathered position AND
+        # sequence id is what rejects those.
+        seq_ids = (
+            prev_state.seq_ids.to(torch.long)
+            if prev_state is not None
+            else torch.zeros(tokens, dtype=torch.long, device=device)
+        )
+        in_forward = (
+            (gather_idx >= 0)
+            & (
+                torch.index_select(positions_l, 0, gather_flat).view(tokens, window)
+                == abs_src
+            )
+            & (
+                torch.index_select(seq_ids, 0, gather_flat).view(tokens, window)
+                == seq_ids.unsqueeze(1)
+            )
+        )
+
+        # Absolute validity: a window slot before the start of the sequence has
+        # no row anywhere and takes the softmax's ``-inf``. This is what
+        # REPLACES the reference's ``-inf`` score sentinel in ``score_state``
+        # (``dsv4_ref/model.py:346-347``), which FP8 state cannot carry.
+        valid = abs_src >= 0
+
+        if prev_state is None:
+            # No cross-step channel: a slot this forward does not hold has no
+            # source at all, so it must be masked rather than pooled. That is
+            # the pre-R-12 behaviour, kept only for CPU tests.
+            valid = valid & in_forward
+        else:
+            kv_win, score_win = self._merge_state(
+                prev_state, kv_win, score_win, abs_src, (~in_forward) & valid
+            )
 
         # ── Role-dependent column selection (dsv4_ref/model.py:313-320) ─
         # C4: window slots [0:ratio] are the OLDER group and read columns
@@ -682,7 +861,7 @@ class DeepseekV4KVCompressor(nn.Module):
         # Out-of-range slots take -inf on the score (weight 0), matching the
         # reference's ``overlap_transform(score, float("-inf"))``.
         score_sel = torch.where(
-            in_range.unsqueeze(-1),
+            valid.unsqueeze(-1),
             score_sel,
             torch.full_like(score_sel, float("-inf")),
         )
@@ -693,7 +872,7 @@ class DeepseekV4KVCompressor(nn.Module):
         # dtype BEFORE the norm, so the bf16 round trip is part of the
         # numerics.
         normed = _rms_norm(pooled.to(self.dtype), self.norm_weight, self.eps)
-        base_positions = (positions.to(torch.long) // ratio) * ratio
+        base_positions = (positions_l // ratio) * ratio
         cos, sin = _cos_sin(
             base_positions,
             self.rope_dim,
@@ -718,6 +897,122 @@ class DeepseekV4KVCompressor(nn.Module):
         codes, scales = _quant_fp8_ue8m0(roped[..., :nope])
         return torch.cat(
             (_dequant_fp8(codes, scales, _KV_QUANT_GROUP), roped[..., nope:]), dim=-1
+        )
+
+    # ------------------------------------------------------------------
+    # Cross-step raw-row state (R-12, candidate A)
+    # ------------------------------------------------------------------
+    def _write_state(
+        self,
+        state: CompressorState,
+        kv_rows: torch.Tensor,
+        score_rows: torch.Tensor,
+    ) -> None:
+        """Store this forward's raw ``(kv, gate)`` rows for later steps.
+
+        Both rows go into ONE pair: codes side by side in ``k_cache``, their
+        group-64 UE8M0 scales in the same column order in ``v_cache``. The
+        codes are cast to fp32 before the concat because ``torch.cat`` on FP8
+        is avoided port-wide (the SWA write does the same); the cast is exact,
+        every FP8 value being representable in fp32, and
+        :func:`_masked_scatter_rows` casts back.
+
+        The mapping is the RAW per-token one, not
+        :meth:`DeepseekV4Attention._coarse_slots`: every token's rows are
+        state, while only a window-CLOSING token's pooled value is a
+        compressed-cache entry.
+        """
+        kv_codes, kv_scales = _quant_fp8_ue8m0(kv_rows)
+        score_codes, score_scales = _quant_fp8_ue8m0(score_rows)
+        _masked_scatter_rows(
+            state.k_cache,
+            state.slot_mapping,
+            torch.cat(
+                (kv_codes.to(torch.float32), score_codes.to(torch.float32)), dim=-1
+            ),
+        )
+        _masked_scatter_rows(
+            state.v_cache,
+            state.slot_mapping,
+            torch.cat((kv_scales, score_scales), dim=-1),
+        )
+
+    def _merge_state(
+        self,
+        state: CompressorState,
+        kv_win: torch.Tensor,
+        score_win: torch.Tensor,
+        abs_src: torch.Tensor,
+        from_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fill window slots this forward does not hold from the paged state.
+
+        Args:
+            state: The state leg and its page geometry.
+            kv_win: ``[T, window, proj_width]`` value rows gathered in-forward.
+            score_win: the same for the gate rows.
+            abs_src: ``[T, window]`` absolute position each slot wants.
+            from_state: ``[T, window]`` bool — slot is absolutely valid but is
+                NOT held by this forward, so it must come from the state.
+
+        Returns:
+            ``(kv_win, score_win)`` with those slots replaced.
+
+        How many leading rows are read is a shape decision, not a correctness
+        one, and the two forward shapes differ:
+
+        * decode — one token per sequence, so EVERY row needs the whole window
+          from state and ``lead == T`` (T is the padded request count, tens of
+          rows, so the gather is small).
+        * prefill — one contiguous sequence per forward (the port-wide prefill
+          contract: :meth:`DeepseekV4Attention.forward`'s prefill ops take no
+          sequence ids), so only the first ``window - 1`` rows can reach before
+          the chunk start. Reading only those keeps the gather constant-sized
+          instead of ``T * window * 2 * proj_width``, which at an 8k chunk and
+          a 128-wide window would be gigabytes.
+
+        Slots outside ``from_state`` keep their in-forward row, which is always
+        finite. That matters because an unwritten FP8 slot can decode to NaN,
+        and ``torch.where`` discards a NaN in a non-selected lane whereas a
+        multiply would propagate it.
+        """
+        window = self.window
+        tokens = kv_win.shape[0]
+        lead = tokens if state.is_decode else min(tokens, window - 1)
+        if lead <= 0:
+            return kv_win, score_win
+
+        block_size = state.block_size
+        seq = state.seq_ids[:lead].to(torch.long)
+        local = abs_src[:lead]
+        if state.pos_offset is not None:
+            # The leg is a SlidingWindowSpec, so at decode the runner has
+            # already replaced its block table with a window-relevant gather
+            # and published the offset of the first block it kept
+            # (``neuron_model_runner.py:3983-3999``). Absolute positions index
+            # the untrimmed table; subtracting the offset is what makes them
+            # index the trimmed one.
+            local = local - state.pos_offset.to(torch.long).index_select(
+                0, seq
+            ).unsqueeze(1)
+        table = state.block_table.to(torch.long).index_select(0, seq)
+        span = table.shape[1] * block_size
+        local = torch.clamp(local, 0, span - 1)
+        blocks = torch.gather(table, 1, torch.div(local, block_size, rounding_mode="floor"))
+        slots = blocks * block_size + torch.remainder(local, block_size)
+
+        width = self.state_pair_width
+        rows = _gather_cache_rows(state.k_cache, slots, width) * _gather_scale_columns(
+            state.v_cache, slots, width // _KV_QUANT_GROUP, _KV_QUANT_GROUP
+        )
+        pick = from_state[:lead].unsqueeze(-1)
+        head_kv = torch.where(pick, rows[..., : self.proj_width], kv_win[:lead])
+        head_score = torch.where(pick, rows[..., self.proj_width :], score_win[:lead])
+        if lead == tokens:
+            return head_kv, head_score
+        return (
+            torch.cat((head_kv, kv_win[lead:]), dim=0),
+            torch.cat((head_score, score_win[lead:]), dim=0),
         )
 
 
@@ -820,6 +1115,7 @@ class DeepseekV4Indexer(nn.Module):
         pool_span: int = 0,
         block_table: torch.Tensor | None = None,
         block_size: int = 0,
+        compressor_state: CompressorState | None = None,
     ) -> torch.Tensor:
         """Select the top-``index_topk`` compressed slots per query token.
 
@@ -843,6 +1139,12 @@ class DeepseekV4Indexer(nn.Module):
                 which is what decode needs.
             block_table: ``[B, max_blocks_per_seq]`` for the paged read.
             block_size: Slots per block, for the paged read.
+            compressor_state: Cross-step raw-row state for the NESTED
+                compressor (R-12). It is a leg of its own —
+                ``layers.{i}.self_attn.indexer_compressor`` — because this
+                compressor has different weights and a narrower ``head_dim``
+                than the layer's main one, so neither can be recovered from
+                the other's rows.
 
         Returns:
             ``[T, index_topk]`` int32 POOL-LOCAL compressed-slot indices,
@@ -855,7 +1157,9 @@ class DeepseekV4Indexer(nn.Module):
         # round trip; FP8 group-32 is only the transport format into the
         # cache, and the group size matches the FP4 group so no group's
         # dynamic range gets merged.
-        fresh = self.compressor(hidden_states, positions)  # [T, 128] fp32
+        fresh = self.compressor(
+            hidden_states, positions, prev_state=compressor_state
+        )  # [T, 128] fp32
         codes, scales = _quant_fp8_ue8m0(fresh, _FP4_QUANT_GROUP)
         _masked_scatter_rows(index_k_cache, index_slot_mapping, codes)
         _masked_scatter_rows(index_v_cache, index_slot_mapping, scales)
@@ -1147,6 +1451,11 @@ class DeepseekV4Attention(nn.Module):
         self.swa_v_cache: torch.Tensor | None = None
         self.index_k_cache: torch.Tensor | None = None
         self.index_v_cache: torch.Tensor | None = None
+        # R-12: the two compressors' cross-step raw-row state.
+        self.compressor_state_k: torch.Tensor | None = None
+        self.compressor_state_v: torch.Tensor | None = None
+        self.indexer_state_k: torch.Tensor | None = None
+        self.indexer_state_v: torch.Tensor | None = None
 
         # ── Weight loaders ──────────────────────────────────────────────
         # Declared here, implemented in weight_loaders.py: this module owns
@@ -1180,12 +1489,14 @@ class DeepseekV4Attention(nn.Module):
         the reference's single 512-wide row has to be re-expressed as
         same-shape pairs here.
 
-        | name                             | heads | head_size | window | when       |
-        |----------------------------------|-------|-----------|--------|------------|
-        | ``layers.{i}.self_attn``         | 1     | 224       | None   | compressed |
-        | ``layers.{i}.self_attn.rope``    | 1     | 128       | None   | compressed |
-        | ``layers.{i}.self_attn.swa``     | 1     | 512       | 128    | every layer|
-        | ``layers.{i}.self_attn.indexer`` | 1     | 128       | None   | C4 layer   |
+        | name                                        | heads | head_size | window | when       |
+        |---------------------------------------------|-------|-----------|--------|------------|
+        | ``layers.{i}.self_attn``                    | 1     | 224       | None   | compressed |
+        | ``layers.{i}.self_attn.rope``               | 1     | 128       | None   | compressed |
+        | ``layers.{i}.self_attn.swa``                | 1     | 512       | 128    | every layer|
+        | ``layers.{i}.self_attn.indexer``            | 1     | 128       | None   | C4 layer   |
+        | ``layers.{i}.self_attn.compressor``         | 1     | 2048/1024 | 8/128  | compressed |
+        | ``layers.{i}.self_attn.indexer_compressor`` | 1     | 512       | 8      | C4 layer   |
 
         Column layout, written by this module and read by the ``NF`` ops
         through their ``*_widths`` / ``*_scale_cache`` arguments:
@@ -1199,6 +1510,17 @@ class DeepseekV4Attention(nn.Module):
           + 64 RoPE), ``v_cache[0:7]`` = its 7 scales. ``swa_widths=(512,)``.
         * ``self_attn.indexer``: ``k_cache[0:128]`` = the index-K columns,
           ``v_cache[0:4]`` = its 4 group-32 scales.
+        * ``self_attn.compressor`` / ``self_attn.indexer_compressor``: the two
+          compressors' RAW per-token rows, the cross-step state R-12 candidate
+          A introduces. ``k_cache`` = ``[kv codes | gate codes]``, each
+          ``proj_width`` wide (``coff * head_dim``: 1024 at ratio 4, 512 at
+          ratio 128, 256 for the indexer's nested copy); ``v_cache`` = their
+          group-64 UE8M0 scales in the same column order. Both are
+          ``SlidingWindowSpec`` at ``window`` raw slots, so they are
+          window-bounded, not context-bounded. Read
+          :class:`CompressorState` for the FP8-storage and validity
+          consequences and for why an ``nn.Module`` buffer was not used
+          instead.
 
         Per-slot bytes at ``fp8`` (1 B per column): compressed leg
         ``2*224 + 2*128 = 704`` B with 519 used; SWA leg ``2*512 = 1024`` B
@@ -1270,6 +1592,31 @@ class DeepseekV4Attention(nn.Module):
                     chunk_size=None,
                 )
             )
+            specs.append(
+                LayerSpec(
+                    name=f"{prefix}.indexer_compressor",
+                    num_kv_heads=1,
+                    head_size=self.indexer.compressor.state_pair_width,
+                    dtype=_FP8_DTYPE,
+                    sliding_window_size=self.indexer.compressor.state_window,
+                    chunk_size=None,
+                )
+            )
+
+        # R-12: declared LAST so the four pre-existing names keep their
+        # declaration order, which the recorded KV layout and the compiled
+        # cache-group ordering both read.
+        if self.compressor is not None:
+            specs.append(
+                LayerSpec(
+                    name=f"{prefix}.compressor",
+                    num_kv_heads=1,
+                    head_size=self.compressor.state_pair_width,
+                    dtype=_FP8_DTYPE,
+                    sliding_window_size=self.compressor.state_window,
+                    chunk_size=None,
+                )
+            )
         return specs
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
@@ -1302,6 +1649,14 @@ class DeepseekV4Attention(nn.Module):
 
         if self.indexer is not None:
             self.index_k_cache, self.index_v_cache = _pair(f"{prefix}.indexer")
+            self.indexer_state_k, self.indexer_state_v = _pair(
+                f"{prefix}.indexer_compressor"
+            )
+
+        if self.compressor is not None:
+            self.compressor_state_k, self.compressor_state_v = _pair(
+                f"{prefix}.compressor"
+            )
 
     # ------------------------------------------------------------------
     # Forward
@@ -1406,7 +1761,17 @@ class DeepseekV4Attention(nn.Module):
         # ── Compressed cache write (coarse cadence) ─────────────────────
         if self.compressor is not None:
             self._write_compressed_cache(
-                self.compressor(hidden_states, positions_l),
+                self.compressor(
+                    hidden_states,
+                    positions_l,
+                    prev_state=self._compressor_state(
+                        self.compressor_state_k,
+                        self.compressor_state_v,
+                        attn_metadata[f"{prefix}.compressor"],
+                        hidden_states.shape[0],
+                        is_decode,
+                    ),
+                ),
                 self._coarse_slots(attn_metadata[prefix]["slot_mapping"], positions_l),
                 self._coarse_slots(
                     attn_metadata[f"{prefix}.rope"]["slot_mapping"], positions_l
@@ -1439,6 +1804,13 @@ class DeepseekV4Attention(nn.Module):
                 pool_span=span,
                 block_table=index_md["block_table_tensor"],
                 block_size=index_md["block_size"],
+                compressor_state=self._compressor_state(
+                    self.indexer_state_k,
+                    self.indexer_state_v,
+                    attn_metadata[f"{prefix}.indexer_compressor"],
+                    hidden_states.shape[0],
+                    is_decode,
+                ),
             )
 
         # ── Attention ───────────────────────────────────────────────────
@@ -1669,6 +2041,45 @@ class DeepseekV4Attention(nn.Module):
             bias=None,
         )
         return _rms_norm(latent, self.q_norm_weight, self.eps).to(self.dtype)
+
+    def _compressor_state(
+        self,
+        k_cache: torch.Tensor | None,
+        v_cache: torch.Tensor | None,
+        metadata: dict,
+        tokens: int,
+        is_decode: bool,
+    ) -> CompressorState | None:
+        """Assemble one compressor's :class:`CompressorState` for this step.
+
+        Returns ``None`` when the pair is unbound, which happens only under a
+        CPU/unit construction that never called :meth:`bind_kv_cache`; the
+        compressor then falls back to in-forward pooling and says so.
+
+        ``seq_ids`` is derived, not read: at decode the runner lays out exactly
+        one token per sequence in block-table row order, so ``arange`` IS the
+        mapping; at prefill one forward carries one sequence, which is the
+        same contract the prefill attention ops rely on by taking no sequence
+        ids at all.
+        """
+        if k_cache is None or v_cache is None:
+            return None
+        device = metadata["slot_mapping"].device
+        seq_ids = (
+            torch.arange(tokens, dtype=torch.long, device=device)
+            if is_decode
+            else torch.zeros(tokens, dtype=torch.long, device=device)
+        )
+        return CompressorState(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            slot_mapping=metadata["slot_mapping"],
+            block_table=metadata["block_table_tensor"],
+            block_size=metadata["block_size"],
+            pos_offset=metadata.get("swa_kv_pos_offset"),
+            seq_ids=seq_ids,
+            is_decode=is_decode,
+        )
 
     def _coarse_slots(
         self, slot_mapping: torch.Tensor, positions: torch.Tensor

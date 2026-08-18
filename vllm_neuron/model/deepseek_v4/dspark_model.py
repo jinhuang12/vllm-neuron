@@ -98,6 +98,7 @@ from .attention import (
     _FP8_DTYPE,
     _KV_QUANT_GROUP,
     _cos_sin,
+    _gather_cache_rows,
     _gather_scale_columns,
     _gptj_rope,
     _masked_scatter_rows,
@@ -196,30 +197,6 @@ def _window_indices(
     base = positions.reshape(-1, 1).to(torch.int64)
     idx = (base - window + 1).clamp_min(0) + offsets.unsqueeze(0)
     return idx, idx <= base
-
-
-def _gather_cache_rows(
-    cache: torch.Tensor, slot_ids: torch.Tensor, width: int
-) -> torch.Tensor:
-    """Read whole slots out of a paged cache: ``[B, S]`` slots -> ``[B, S, width]``.
-
-    Indexes FIRST and casts after, so the whole cache is never materialized in
-    fp32. fp8 tensors cannot be fancy-indexed
-    (``attention_decode.py:610-620``), so the gather goes through a
-    column-identical int8 view and is relabelled back.
-    """
-    num_blocks, num_kv_heads, block_size, stored = cache.shape
-    flat = cache.reshape(num_blocks * num_kv_heads * block_size, stored)
-    rows = slot_ids.clamp(0, flat.shape[0] - 1).reshape(-1)
-    if cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        gathered = torch.index_select(flat.view(torch.int8), 0, rows).view(cache.dtype)
-    else:
-        gathered = torch.index_select(flat, 0, rows)
-    return (
-        gathered[:, :width]
-        .to(torch.float32)
-        .reshape(slot_ids.shape[0], slot_ids.shape[1], width)
-    )
 
 
 # =============================================================================

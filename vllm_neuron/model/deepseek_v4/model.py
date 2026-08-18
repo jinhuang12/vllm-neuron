@@ -1080,6 +1080,12 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsEagle3):
             names.append(f"{base}.swa")
             if config.has_indexer(layer_idx):
                 names.append(f"{base}.indexer")
+                # R-12: the nested indexer compressor's cross-step raw-row
+                # state. Gated on ``has_indexer`` and not on
+                # ``has_compressed_cache`` because only C4 layers nest one.
+                names.append(f"{base}.indexer_compressor")
+            if config.has_compressed_cache(layer_idx):
+                names.append(f"{base}.compressor")
         # The DSpark stages' legs, derived from the stage count in config --
         # independently of :meth:`_drafter_kv_layer_specs`, which derives them
         # from the same count but through the drafter's naming. The gate is the
