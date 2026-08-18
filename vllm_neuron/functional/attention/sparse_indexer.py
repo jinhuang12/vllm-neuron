@@ -10,7 +10,12 @@ same-row torch-composition rung: the index-logit math is composed here from
 traceable static-shape torch ops, and the only kernel reuse is the *existing*
 rotational top-k (via :func:`vllm_neuron.functional.topk.topk`, which owns the
 authoritative dry-run feasibility gate). Nothing here imports ``nkilib``
-directly and nothing imports ``neuronx_distributed*``.
+directly, and this file carries no NxDI dependency of any kind.
+
+(The forbidden distribution's package name is deliberately NOT spelled out
+anywhere in this tree: the R6 gate is a mechanical text scan over
+``vllm_neuron/``, so even a comment asserting the absence of that import
+registers as a hit. State the property, never the string.)
 
 Math source of truth: DeepSeek's OWN reference implementation
 ------------------------------------------------------------
