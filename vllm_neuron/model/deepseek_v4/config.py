@@ -392,15 +392,16 @@ class DeepseekV4Config:
           granularity because ``q_lora_rank`` (1024) is a whole number of
           blocks -- the same argument, and the same precedent, as the main
           stack's ``DeepseekV4Attention._q_latent``.
-        * stage 0 adds ``main_proj`` ``[hidden_size, 12288]``, replicated in
-          BOTH axes. K replication is forced, not chosen: 12288 / 64 = 192 and
-          192 % 128 != 0, so a row shard breaks the block-alignment invariant
-          this list exists to check. N stays replicated too -- see the
-          PARALLELISM note on
-          :func:`~.weight_loaders.attach_dspark_stage_loaders` for why the
-          admissible ``N_local = 64`` column shard is declined (it would split a
-          128-row scale block and owe an all-gather), and for the recorded
-          footprint lever if that 48 MiB/core ever binds.
+        * stage 0 adds ``main_proj`` ``[hidden_size, 12288]``, column-parallel in
+          N and replicated in K, per LD-18. K replication is forced, not chosen:
+          12288 / 64 = 192 and 192 % 128 != 0, so a row shard breaks the
+          block-alignment invariant this list exists to check -- which is why
+          this row's ``k_local`` equals its ``k_full``. The ``N_local = 64``
+          shard is half a 128-row scale block, the one place in the family where
+          two cores legitimately SHARE a scale row; see
+          :func:`~.weight_loaders._grid_shard` for why that is exact and
+          :func:`~.weight_loaders.attach_dspark_stage_loaders` for the
+          all-gather it owes.
         """
         return [
             (

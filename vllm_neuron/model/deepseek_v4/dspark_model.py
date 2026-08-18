@@ -805,16 +805,28 @@ class DeepseekV4DSparkStage(nn.Module):
 
         if self.is_first:
             # <-- MODEL-SPECIFIC: ``main_proj`` [hidden, 3 * hidden] block-FP8,
-            # K = 12288 replicated (12288 % 128 == 0), then ``main_norm``
-            # (``dsv4_ref/model.py:832-833``).
+            # then ``main_norm`` (``dsv4_ref/model.py:832-833``).
+            # >>> PARALLELISM: column-parallel in N per LD-18 (N_local = 64 at
+            # TP=64), K replicated because 12288 / 64 = 192 is not a multiple of
+            # 128. This module owns the all-gather; see
+            # ``attach_dspark_stage_loaders`` for why the N shard is admissible
+            # despite being half a scale block. <<<
             main_in = config.dspark_main_hidden_size
+            world = self.self_attn.world_size
+            if config.hidden_size % world != 0:
+                raise ValueError(
+                    f"tensor_parallel_size={world} does not divide "
+                    f"hidden_size={config.hidden_size}; main_proj's column "
+                    "shard would not tile."
+                )
+            self.main_proj_n_local = config.hidden_size // world
             self.main_proj_weight = nn.Parameter(
-                torch.empty(config.hidden_size, main_in, dtype=_FP8_DTYPE),
+                torch.empty(self.main_proj_n_local, main_in, dtype=_FP8_DTYPE),
                 requires_grad=False,
             )
             self.main_proj_scale = nn.Parameter(
                 torch.empty(
-                    _num_blocks(config.hidden_size),
+                    _num_blocks(self.main_proj_n_local),
                     _num_blocks(main_in),
                     dtype=torch.float32,
                 ),
@@ -923,19 +935,27 @@ class DeepseekV4DSparkStage(nn.Module):
     def project_main_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         """``main_norm(main_proj(main_hidden))`` (``dsv4_ref/model.py:853``).
 
+        The GEMM is column-sharded (LD-18), so this method owes the all-gather
+        that turns the ``[T, N_local]`` partial back into the REPLICATED
+        ``[T, hidden_size]`` stream every downstream consumer assumes --
+        ``NF.mla_qkv``'s ``hidden`` is documented replicated, and the hc bundle
+        the stages carry is replicated too. Gathering along the feature axis in
+        rank order is exactly the inverse of the loader's row shard
+        (core ``r`` owns output columns ``[64r, 64r + 64)``).
+
         Args:
             main_hidden: ``[T, 3 * hidden_size]`` -- the target's concatenated
-                hc-bundle means at ``dspark_target_layer_ids``.
+                hc-bundle means at ``dspark_target_layer_ids``. Replicated.
 
         Returns:
-            ``[T, hidden_size]``.
+            ``[T, hidden_size]``, replicated.
         """
         if not self.is_first:
             raise RuntimeError(
                 "main_proj lives on DSpark stage 0 only "
                 f"(this is stage {self.stage_idx})."
             )
-        projected = NF.block_fp8_linear(
+        partial = NF.block_fp8_linear(
             main_hidden,
             self.main_proj_weight,
             self.main_proj_scale,
@@ -945,7 +965,9 @@ class DeepseekV4DSparkStage(nn.Module):
             out_dtype=self.config.torch_dtype,
             bias=None,
         )
-        return self.main_norm(projected)
+        if self.self_attn.world_size > 1:
+            partial = self.self_attn.tp_group.all_gather(partial, dim=1)
+        return self.main_norm(partial)
 
     # ── Last-stage exit: the block head ────────────────────────────────────
     def forward_head(

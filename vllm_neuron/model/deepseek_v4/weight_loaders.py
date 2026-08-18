@@ -391,34 +391,57 @@ def _grid_extent(size: int) -> int:
 def _grid_shard(
     shard: _Shard, param_name: str, ckpt_key: str
 ) -> tuple[slice, slice]:
-    """Map a weight shard onto the block-scale grid, asserting 128-alignment.
+    """Map a weight shard onto the block-scale grid.
 
     A weight sharded along an axis takes the matching slice of the scale grid,
-    divided by 128; a replicated weight takes the whole grid. Every shard
-    boundary must therefore fall on a block boundary. If it does not, the
-    weight's 128x128 block straddles two cores and one scalar scale would have
-    to be replicated with a partial block -- which no longer matches what
-    ``NF.block_fp8_linear`` dequantizes, so we refuse instead of guessing.
+    divided by 128; a replicated weight takes the whole grid.
+
+    Two admissible cases per axis, and one refusal:
+
+    * **Block-aligned** (``start`` and ``size`` both multiples of 128): the
+      exact matching grid slice. Every main-stack weight is this case.
+    * **Contained sub-block** (the shard is finer than 128 but lies entirely
+      inside ONE scale block): the containing block's single row/column, taken
+      whole. The scale is then SHARED between the cores that split that block,
+      not divided -- and sharing is exactly right, because
+      ``NF.block_fp8_linear`` dequantizes every element of a block by that one
+      scalar, so each core's dequantized rows are bit-identical to the
+      corresponding rows of the full-tensor dequant. The DSpark stage-0
+      ``main_proj`` needs this: LD-18 records it column-parallel at
+      ``N_local = hidden_size / tp_size`` = 64 at TP=64, which is half a scale
+      block, and cores ``2k``/``2k+1`` legitimately share scale row ``k``.
+    * **Straddling** (finer than 128 AND crossing a block boundary): refused.
+      Here the local grid genuinely cannot be expressed -- the core would need
+      a partial of each of two blocks -- so we refuse rather than guess.
+
+    The old form of this helper refused BOTH sub-block cases on the grounds
+    that a sub-block shard "no longer matches what ``NF.block_fp8_linear``
+    dequantizes". That reasoning holds only for the straddling case; a
+    contained shard matches exactly. The guard is narrowed here, not removed.
     """
-    for label, value in (
-        ("row_start", shard.row_start),
-        ("row_size", shard.row_size),
-        ("col_start", shard.col_start),
-        ("col_size", shard.col_size),
-    ):
-        if value % _BLOCK != 0:
+
+    def axis(start: int, size: int, label: str) -> slice:
+        if start % _BLOCK == 0 and size % _BLOCK == 0:
+            return slice(start // _BLOCK, (start + size) // _BLOCK)
+        first = start // _BLOCK
+        last = (start + size - 1) // _BLOCK
+        if first != last:
             raise ValueError(
                 f"Block-scale misalignment for parameter {param_name!r} "
-                f"(checkpoint key {ckpt_key!r}): {label}={value} is not a "
-                f"multiple of {_BLOCK}. The 128x128 weight-scale grid cannot be "
-                "split below a block; re-check this weight's row in the family "
-                "contract's sharding table (and note the family's "
-                "K_local % 128 == 0 invariant in "
+                f"(checkpoint key {ckpt_key!r}): the {label} shard "
+                f"[{start}, {start + size}) is finer than the {_BLOCK}-wide "
+                f"scale block AND straddles blocks {first}..{last}, so this "
+                "core would need a partial of each. A sub-block shard is only "
+                "admissible when it lies entirely inside one block. Re-check "
+                "this weight's row in the family contract's sharding table "
+                "(and note the K_local % 128 == 0 invariant in "
                 "DeepseekV4Config.block_fp8_linear_plan)."
             )
+        return slice(first, first + 1)
+
     return (
-        slice(shard.row_start // _BLOCK, (shard.row_start + shard.row_size) // _BLOCK),
-        slice(shard.col_start // _BLOCK, (shard.col_start + shard.col_size) // _BLOCK),
+        axis(shard.row_start, shard.row_size, "row (N)"),
+        axis(shard.col_start, shard.col_size, "column (K)"),
     )
 
 
@@ -513,12 +536,17 @@ def _block_fp8_scale_loader(
     """
     grid_shape = (_grid_extent(full_shape[0]), _grid_extent(full_shape[1]))
     grid_key = _grid_shard(shard, param_name, ckpt_key)
-    # The local grid extent is exact, not a ceil: _grid_shard has already
-    # refused any shard whose boundaries are not 128-multiples. Checked
-    # explicitly because a mis-sharded scale grid is not a crash -- it is a
-    # wrong-numbers result found only after a multi-thousand-second compile.
-    # At shared_expert_tp = 16 this pins w1/w3 to [1, 32] and w2 to [32, 1].
-    local_grid = (shard.row_size // _BLOCK, shard.col_size // _BLOCK)
+    # Derived FROM the resolved slices rather than recomputed from the shard
+    # sizes: a contained sub-block shard yields one grid row/column that the
+    # sharing cores take whole, so ``size // 128`` would say 0 (see
+    # _grid_shard). Checked explicitly because a mis-sharded scale grid is not
+    # a crash -- it is a wrong-numbers result found only after a
+    # multi-thousand-second compile. At shared_expert_tp = 16 this pins w1/w3
+    # to [1, 32] and w2 to [32, 1]; DSpark's main_proj at TP=64 to [1, 96].
+    local_grid = (
+        grid_key[0].stop - grid_key[0].start,
+        grid_key[1].stop - grid_key[1].start,
+    )
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         del rank
@@ -1701,27 +1729,32 @@ def attach_dspark_stage_loaders(
     ``sharding_weight_loader`` at construction, because they shard by the
     embedding / lm-head group's rank rather than the attention TP rank.
 
-    >>> PARALLELISM: ``main_proj`` is REPLICATED in both axes. K replication is
-    forced -- 12288 / 64 = 192 and 192 % 128 != 0, so a row shard would break
-    the block-FP8 alignment invariant. N replication is a CHOICE over the
-    admissible ``N_local = 64`` column shard, for two reasons: the shard would
-    split a 128-row scale block between two cores (a sub-block scale-grid case
-    no other tensor in this family has, and one ``_grid_shard`` refuses
-    outright), and the output must be the full replicated hidden stream that
-    ``NF.mla_qkv`` requires, so a column shard would owe an extra all-gather on
-    the drafter's critical path. The price is 48 MiB/core of fp8 weight, which
-    the recorded 21.6 GiB/core budget absorbs. If drafter residency ever
-    becomes the binding constraint, the column shard plus all-gather is the
-    recorded lever -- a footprint/latency trade inside the plan, not a
-    plan-level change. <<<
+    >>> PARALLELISM: ``main_proj`` is COLUMN-PARALLEL in N and REPLICATED in K,
+    as LD-18 records: ``N_local = hidden_size / tp_size`` = 64 at TP=64.
+
+    K replication is forced rather than chosen -- 12288 / 64 = 192 and
+    192 % 128 != 0, so a row shard would break the block-FP8 alignment
+    invariant this family maintains everywhere.
+
+    The N shard is half a 128-row scale block, so cores ``2k`` and ``2k+1``
+    SHARE scale row ``k``. That is the contained-sub-block case
+    :func:`_grid_shard` admits, and sharing is exact: every element of a block
+    dequantizes by that one scalar, so each core's rows are bit-identical to
+    the matching rows of a full-tensor dequant. The alternative -- replicating
+    both axes -- would cost 48 MiB/core of fp8 weight AND make all 64 cores
+    redundantly evaluate a ``[T, 12288] x [12288, 4096]`` GEMM that is the
+    drafter's single largest, which on a long prefill is the dominant term. The
+    shard's price is one all-gather of the ``[T, hidden_size]`` result, which
+    :meth:`DeepseekV4DSparkStage.project_main_hidden` owns, because the
+    downstream ``NF.mla_qkv`` needs the hidden stream replicated. <<<
 
     Args:
         module: The :class:`DeepseekV4DSparkStage` instance.
         config: The family config.
         stage_idx: Which stage this is; decides which tensors exist.
-        tp_size / tp_rank: Attention tensor-parallel degree and rank. Accepted
-            and validated for signature symmetry with the other attach
-            functions; nothing bound here is sharded by them.
+        tp_size / tp_rank: Attention tensor-parallel degree and rank.
+            ``main_proj``'s N shard is taken by them; nothing else here is
+            sharded.
     """
     if tp_size <= 0 or not (0 <= tp_rank < tp_size):
         raise ValueError(
@@ -1744,7 +1777,14 @@ def attach_dspark_stage_loaders(
                 f"({main_shape[1]}) must be a multiple of {_BLOCK} for the "
                 "block-FP8 scale grid."
             )
-        main_shard = _Shard.replicated(*main_shape)
+        if main_shape[0] % tp_size != 0:
+            raise ValueError(
+                "attach_dspark_stage_loaders: main_proj N "
+                f"({main_shape[0]}) must be divisible by tp_size={tp_size} for "
+                "the column shard LD-18 records."
+            )
+        n_local = main_shape[0] // tp_size
+        main_shard = _Shard.rows(tp_rank * n_local, n_local, main_shape[1])
         weight_key = f"{prefix}.main_proj.weight"
         scale_key = f"{prefix}.main_proj.scale"
         _bind(
