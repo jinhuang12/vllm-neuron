@@ -1016,13 +1016,13 @@ def _bind(
 def _layer_key_prefix(layer_idx: int) -> str:
     """Checkpoint prefix for one main-stack transformer block.
 
-    Only ``layers.{i}`` exists here on purpose. The MTP draft blocks
-    (``mtp.0`` .. ``mtp.2``) are OUT OF SCOPE for this port: the checkpoint
-    ships three of them while ``config.json`` declares
-    ``num_nextn_predict_layers = 1``, and that contradiction is a recorded plan
-    defect rather than something a loader may resolve by guessing. Their keys
-    simply go unreferenced, which the checkpoint reader reports as
-    ``unexpected_keys`` and does not treat as an error.
+    This is the MAIN-STACK spelling only. The DSpark draft stages live under
+    ``mtp.{s}`` and are reached by passing ``key_prefix="mtp.{s}"`` to the
+    attach functions, not by index arithmetic here: the drafter's stage index
+    and the ``layer_idx`` it hands the MoE (``num_hidden_layers + stage``, so
+    ``is_hash_moe_layer`` is False and the ``gate.bias`` branch is taken, which
+    is what the ``mtp.*`` key census shows) are deliberately different numbers,
+    and folding them together here would make one of the two wrong.
     """
     return f"layers.{layer_idx}"
 
@@ -1061,6 +1061,7 @@ def attach_attention_loaders(
     group_size: int,
     shared_tp_size: int,
     shared_tp_rank: int,
+    key_prefix: str | None = None,
 ) -> None:
     """Attach every checkpoint loader a :class:`DeepseekV4Attention` needs.
 
@@ -1113,7 +1114,10 @@ def attach_attention_loaders(
         )
 
     layer_idx = _resolve_layer_idx(module, "attention")
-    prefix = _layer_key_prefix(layer_idx)
+    # ``key_prefix`` overrides the main-stack spelling so the DSpark stages can
+    # bind the same parameter set under ``mtp.{s}`` (the checkpoint's own
+    # namespace) while still reporting a layer_idx to the sharding math.
+    prefix = _layer_key_prefix(layer_idx) if key_prefix is None else key_prefix
 
     hidden = config.hidden_size
     q_lora = config.q_lora_rank
@@ -1432,6 +1436,7 @@ def attach_moe_loaders(
     ep_rank: int,
     shared_tp_size: int,
     shared_tp_rank: int,
+    key_prefix: str | None = None,
 ) -> None:
     """Attach every checkpoint loader a :class:`DeepseekV4MoE` needs.
 
@@ -1479,7 +1484,9 @@ def attach_moe_loaders(
         raise TypeError(
             f"attach_moe_loaders: layer_idx must be an int, got {layer_idx!r}."
         )
-    prefix = _layer_key_prefix(layer_idx)
+    # See ``_layer_key_prefix``: the DSpark stages pass ``mtp.{s}`` while still
+    # handing the hash/no-hash decision the out-of-range ``layer_idx``.
+    prefix = _layer_key_prefix(layer_idx) if key_prefix is None else key_prefix
 
     hidden = config.hidden_size
     inter = config.moe_intermediate_size
@@ -1660,6 +1667,120 @@ def attach_moe_loaders(
 
 
 # ---------------------------------------------------------------------------
+# Public: DSpark draft stages (the stage-conditional tensors only)
+# ---------------------------------------------------------------------------
+
+
+def attach_dspark_stage_loaders(
+    module: nn.Module,
+    config: "DeepseekV4Config",
+    *,
+    stage_idx: int,
+    tp_size: int,
+    tp_rank: int,
+) -> None:
+    """Attach loaders for the tensors only SOME DSpark stages own.
+
+    The shared per-stage set -- fused ``wq_a``+``wkv``, ``wq_b``, ``wo_a``,
+    ``wo_b``, the norms, the hc mixes, the 256 routed experts and the shared
+    expert -- is bound by :func:`attach_attention_loaders`,
+    :func:`attach_hash_context_loaders` and :func:`attach_moe_loaders` with
+    ``key_prefix="mtp.{s}"``, unchanged. Only these are extra:
+
+    * stage 0: ``main_proj`` ``[hidden_size, 12288]`` block-FP8 + its scale
+      grid (``dsv4_ref/model.py:832``).
+    * last stage: ``confidence_head.proj`` ``[1, hidden_size + markov_rank]``
+      (``:810``).
+
+    Two tensors that deliberately get NO loader here: ``main_norm.weight`` and
+    the last stage's ``norm.weight``. Both are replicated, unquantized and
+    shape-identical to their checkpoint tensors, so the pipelined load's
+    identity default is already correct -- the same treatment the main stack's
+    final ``norm.weight`` gets. The Markov head's two vocab-sharded tensors and
+    the drafter's ``embed_tokens``/``lm_head`` copies get theirs from
+    ``sharding_weight_loader`` at construction, because they shard by the
+    embedding / lm-head group's rank rather than the attention TP rank.
+
+    >>> PARALLELISM: ``main_proj`` is REPLICATED in both axes. K replication is
+    forced -- 12288 / 64 = 192 and 192 % 128 != 0, so a row shard would break
+    the block-FP8 alignment invariant. N replication is a CHOICE over the
+    admissible ``N_local = 64`` column shard, for two reasons: the shard would
+    split a 128-row scale block between two cores (a sub-block scale-grid case
+    no other tensor in this family has, and one ``_grid_shard`` refuses
+    outright), and the output must be the full replicated hidden stream that
+    ``NF.mla_qkv`` requires, so a column shard would owe an extra all-gather on
+    the drafter's critical path. The price is 48 MiB/core of fp8 weight, which
+    the recorded 21.6 GiB/core budget absorbs. If drafter residency ever
+    becomes the binding constraint, the column shard plus all-gather is the
+    recorded lever -- a footprint/latency trade inside the plan, not a
+    plan-level change. <<<
+
+    Args:
+        module: The :class:`DeepseekV4DSparkStage` instance.
+        config: The family config.
+        stage_idx: Which stage this is; decides which tensors exist.
+        tp_size / tp_rank: Attention tensor-parallel degree and rank. Accepted
+            and validated for signature symmetry with the other attach
+            functions; nothing bound here is sharded by them.
+    """
+    if tp_size <= 0 or not (0 <= tp_rank < tp_size):
+        raise ValueError(
+            f"attach_dspark_stage_loaders: invalid tp_rank={tp_rank} for "
+            f"tp_size={tp_size}."
+        )
+    if not (0 <= stage_idx < config.num_dspark_stages):
+        raise ValueError(
+            f"attach_dspark_stage_loaders: stage_idx={stage_idx} outside the "
+            f"{config.num_dspark_stages} stages the weights record."
+        )
+
+    prefix = f"mtp.{stage_idx}"
+
+    if stage_idx == 0:
+        main_shape = (config.hidden_size, config.dspark_main_hidden_size)
+        if main_shape[1] % _BLOCK != 0:
+            raise ValueError(
+                "attach_dspark_stage_loaders: main_proj K "
+                f"({main_shape[1]}) must be a multiple of {_BLOCK} for the "
+                "block-FP8 scale grid."
+            )
+        main_shard = _Shard.replicated(*main_shape)
+        weight_key = f"{prefix}.main_proj.weight"
+        scale_key = f"{prefix}.main_proj.scale"
+        _bind(
+            module,
+            "main_proj_weight",
+            (weight_key,),
+            _block_fp8_weight_loader(
+                "main_proj_weight", weight_key, main_shape, main_shard
+            ),
+        )
+        _bind(
+            module,
+            "main_proj_scale",
+            (scale_key,),
+            _block_fp8_scale_loader(
+                "main_proj_scale", scale_key, main_shape, main_shard
+            ),
+        )
+
+    if stage_idx == config.num_dspark_stages - 1:
+        # fp32 destination on purpose: the reference promotes this projection to
+        # fp32 because that is what the confidence score needs
+        # (``dsv4_ref/model.py:810``). The checkpoint ships it bf16, so the cast
+        # happens in the model's ``_cast_to_model_dtype`` -- widening, so it is
+        # lossless.
+        conf_key = f"{prefix}.confidence_head.proj.weight"
+        conf_shape = (1, config.hidden_size + config.dspark_markov_rank)
+        _bind(
+            module,
+            "confidence_head.proj_weight",
+            (conf_key,),
+            _replicated_loader("confidence_head.proj_weight", conf_key, conf_shape),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Public: hash-context (mhc) residual stream
 # ---------------------------------------------------------------------------
 
@@ -1670,6 +1791,7 @@ def attach_hash_context_loaders(
     *,
     layer_idx: int | None = None,
     scope: str | None = None,
+    key_prefix: str | None = None,
 ) -> None:
     """Attach loaders for the hash-context parameters and the block norms.
 
@@ -1751,7 +1873,9 @@ def attach_hash_context_loaders(
                     "are layer-qualified, so layer_idx (or module.layer_idx) is "
                     f"required; got {layer_idx!r}."
                 )
-            prefix = _layer_key_prefix(layer_idx)
+            prefix = (
+                _layer_key_prefix(layer_idx) if key_prefix is None else key_prefix
+            )
             for attr, suffix, shape in block_specs + norm_specs:
                 key = f"{prefix}.{suffix}"
                 _bind(
@@ -1763,13 +1887,15 @@ def attach_hash_context_loaders(
                 )
 
     if do_head:
-        # Top-level keys: no layer prefix. On the MTP side they belong to the
-        # LAST draft block (mtp.2 in this checkpoint), which this port does not
-        # load, so the head set is main-stack-only here.
+        # Top-level keys on the main stack (no prefix). On the DSpark side the
+        # SAME three tensors belong to the LAST draft stage
+        # (``mtp.2.hc_head_*``, ``dsv4_ref/model.py:834-841``), which is
+        # reached by passing ``key_prefix="mtp.2"``.
+        head_prefix = "" if key_prefix is None else f"{key_prefix}."
         for attr, key, shape in (
-            ("hc_head_base", "hc_head_base", (hc_mult,)),
-            ("hc_head_fn", "hc_head_fn", (hc_mult, hc_dim)),
-            ("hc_head_scale", "hc_head_scale", (1,)),
+            ("hc_head_base", f"{head_prefix}hc_head_base", (hc_mult,)),
+            ("hc_head_fn", f"{head_prefix}hc_head_fn", (hc_mult, hc_dim)),
+            ("hc_head_scale", f"{head_prefix}hc_head_scale", (1,)),
         ):
             _bind(
                 module,
@@ -1812,38 +1938,30 @@ def build_checkpoint_mappings(
 
     Args:
         config: The family config.
-        num_layers: Number of main-stack decoder layers.
-        mtp: Must be ``False``. ``True`` raises :class:`NotImplementedError`:
-            the MTP drafter is out of scope for this port because the plan is
-            defective there -- ``config.json`` declares
-            ``num_nextn_predict_layers = 1`` while the checkpoint ships three
-            ``mtp.*`` blocks, the third of which additionally carries
-            ``confidence_head.*``, ``markov_head.*`` and its own ``hc_head_*``.
-            Guessing which block to load is exactly the kind of silent
-            wrong-weights choice this loader refuses to make.
+        num_layers: Number of main-stack decoder layers. Ignored when
+            ``mtp=True`` (the stage count then comes from
+            ``config.num_dspark_stages``, which is ruled by the weights --
+            see :data:`~.config.CONTRADICTED_CHECKPOINT_FIELDS`).
+        mtp: Emit the DSPARK DRAFTER's mapping instead of the main stack's.
+            The drafter is a separate top-level module with its own parameter
+            tree (``stages.{s}.*``, plus its own ``embed_tokens``/``lm_head``),
+            so its mapping is disjoint from the main stack's rather than an
+            addition to it; call it once per module. Each stage reuses
+            :func:`add_block` verbatim against ``key_prefix = "mtp.{s}"`` and
+            ``layer_idx = config.num_hidden_layers + s`` -- which is what makes
+            every stage emit ``ffn.gate.bias`` and no ``ffn.gate.tid2eid``
+            (``is_hash_moe_layer`` is False past layer 2) and no compressor or
+            indexer keys (``compress_ratios[43:46] == [0, 0, 0]``), exactly as
+            the ``mtp.*`` key census reports.
         prefix: Dotted attribute path of the backbone inside the top-level
             module whose ``named_parameters()`` will be matched (llama3's
             equivalent is the literal ``"model"``). Keyword-only with a default
-            so the recorded call form stays valid.
+            so the recorded call form stays valid. The drafter passes ``""``:
+            its stages hang off the top-level module directly.
 
     Returns:
         ``{parameter name: checkpoint key | [checkpoint keys]}``.
-
-    Raises:
-        NotImplementedError: if ``mtp=True``.
     """
-    if mtp:
-        raise NotImplementedError(
-            "build_checkpoint_mappings(mtp=True) is not implemented: the "
-            "DeepSeek-V4-Flash MTP drafter is out of scope for this port. "
-            "RECORDED PLAN DEFECT: config.json declares "
-            "num_nextn_predict_layers = 1 but the pinned checkpoint ships three "
-            "draft blocks (mtp.0, mtp.1, mtp.2 -- the last also carrying "
-            "confidence_head.*, markov_head.* and its own hc_head_*), so there "
-            "is no unambiguous mapping to emit. The only supported call is "
-            "mtp=False."
-        )
-
     mappings: dict[str, str | list[str]] = {}
     p = prefix.rstrip(".")
 
@@ -1953,6 +2071,54 @@ def build_checkpoint_mappings(
                 f"{moe}.shared_expert.{leaf}_scale",
                 f"{key_prefix}.ffn.shared_experts.{leaf}.scale",
             )
+
+    if mtp:
+        # ── DSpark drafter ───────────────────────────────────────────────
+        # Every stage's shared parameter set comes from ``add_block`` above,
+        # unchanged: same fused wq_a+wkv pair, same wq_b/wo_a/wo_b, same 256
+        # routed experts + shared expert + gate.bias, same hc mixes and block
+        # norms. Only the three stage-specific groups below are extra.
+        last = config.num_dspark_stages - 1
+        for stage in range(config.num_dspark_stages):
+            add_block(
+                f"stages.{stage}",
+                f"mtp.{stage}",
+                layer_idx=config.num_hidden_layers + stage,
+            )
+
+        # Stage 0: the target-hidden down-projection (``dsv4_ref/model.py:832``).
+        put("stages.0.main_proj_weight", "mtp.0.main_proj.weight")
+        put("stages.0.main_proj_scale", "mtp.0.main_proj.scale")
+        put("stages.0.main_norm.weight", "mtp.0.main_norm.weight")
+        put("stages.0.main_norm_weight", "mtp.0.main_norm.weight")
+
+        # Last stage: final norm, its OWN hc_head set (top-level on the main
+        # stack, ``mtp.2``-qualified here -- ``dsv4_ref/model.py:834-841``),
+        # the Markov head and the confidence head.
+        put(f"stages.{last}.norm.weight", f"mtp.{last}.norm.weight")
+        put(f"stages.{last}.norm_weight", f"mtp.{last}.norm.weight")
+        for attr in ("hc_head_base", "hc_head_fn", "hc_head_scale"):
+            put(f"stages.{last}.{attr}", f"mtp.{last}.{attr}")
+        put(
+            f"stages.{last}.markov_head.w1.weight",
+            f"mtp.{last}.markov_head.markov_w1.weight",
+        )
+        put(
+            f"stages.{last}.markov_head.w2.weight",
+            f"mtp.{last}.markov_head.markov_w2.weight",
+        )
+        put(
+            f"stages.{last}.confidence_head.proj_weight",
+            f"mtp.{last}.confidence_head.proj.weight",
+        )
+
+        # The drafter is a separately compiled module, so it cannot share the
+        # target's parameter tensors the way the reference does
+        # (``dsv4_ref/model.py:903-904`` assigns the same objects). It loads
+        # its own copy of the SAME two checkpoint tensors.
+        put("embed_tokens.weight", "embed.weight")
+        put("lm_head.weight", "head.weight")
+        return mappings
 
     for layer_idx in range(num_layers):
         add_block(

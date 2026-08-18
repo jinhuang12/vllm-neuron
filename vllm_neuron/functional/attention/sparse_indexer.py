@@ -145,6 +145,7 @@ def sparse_indexer_topk(
     positions: Tensor | None = None,
     rope_cos: Tensor | None = None,
     rope_sin: Tensor | None = None,
+    rope_tables_pregathered: bool = False,
     q_scale: Tensor | None = None,
     n_index_heads: int = 64,
     index_head_dim: int = 128,
@@ -217,11 +218,21 @@ def sparse_indexer_topk(
             ``[T, S]``. AND-ed with the causal and slot-padding masks.
         positions: ``[T]`` int positions. Drives the Q RoPE table lookup and
             the causal cap ``(pos + 1) // compress_ratio``.
-        rope_cos: GPT-J RoPE cosine table. Indexed by ``positions`` when
-            ``positions`` is given, otherwise taken as already per-token.
-            Trailing dim ``rope_head_dim // 2`` (or ``rope_head_dim``, in which
-            case the first half is used).
+        rope_cos: GPT-J RoPE cosine table, one row per POSITION by default and
+            indexed by ``positions``. Trailing dim ``rope_head_dim // 2`` (or
+            ``rope_head_dim``, in which case the first half is used).
         rope_sin: Matching sine table.
+        rope_tables_pregathered: set True when the tables already carry one row
+            per TOKEN, so the position lookup is skipped. Dropping ``positions``
+            is NOT an alternative here -- it also drives the causal cap
+            ``(pos + 1) // compress_ratio``, so a caller holding per-token
+            tables has no way to opt out of the lookup without this flag, and
+            feeding them with the lookup on is silently correct only for a
+            single sequence prefilled from position 0. Same flag and same
+            reason as :func:`~vllm_neuron.functional.attention.mla_qkv.mla_qkv`;
+            the two ops share the convention so a caller cannot get one right
+            and the other wrong. DeepSeek-V4's ``_cos_sin`` is per-token, so its
+            callers pass True.
         q_scale: Optional per-token fp8 dequant scale for Q, ``[T]`` or
             ``[T, 1]``, folded into the head weights exactly as
             ``fused_indexer_q.py:165`` does.
@@ -264,7 +275,13 @@ def sparse_indexer_topk(
 
     # 1. Index queries: x [T, 1024] -> [T, 64, 128], then GPT-J RoPE.
     q = _index_queries(x, wq_b, wq_b_scale, n_index_heads, index_head_dim)
-    q = _apply_gptj_rope(q, rope_cos, rope_sin, positions, rope_head_dim)
+    q = _apply_gptj_rope(
+        q,
+        rope_cos,
+        rope_sin,
+        None if rope_tables_pregathered else positions,
+        rope_head_dim,
+    )
 
     # 2. Index keys: [S, 128] or [T, S, 128], plus their padding validity.
     keys, slot_valid = _index_keys(

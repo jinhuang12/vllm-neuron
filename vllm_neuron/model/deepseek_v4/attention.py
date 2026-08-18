@@ -894,6 +894,10 @@ class DeepseekV4Indexer(nn.Module):
             positions=positions,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            # Per-token tables (``_cos_sin``), so the op must skip its own
+            # position lookup while still using ``positions`` for the causal
+            # cap. Same defect class as the ``NF.mla_qkv`` call below.
+            rope_tables_pregathered=True,
             n_index_heads=self.n_heads,
             index_head_dim=self.head_dim,
             rope_head_dim=self.rope_dim,
@@ -1372,6 +1376,13 @@ class DeepseekV4Attention(nn.Module):
             apply_q_head_norm=True,
             kv_nope_fp8_qat=True,
             kv_qat_group_size=_KV_QUANT_GROUP,
+            # ``_cos_sin`` (and ``DeepseekV4RotaryEmbedding.forward``) return
+            # ONE ROW PER TOKEN, not one row per position, so the op must not
+            # look the rows up again by ``positions``. Without this the decode
+            # path index_selects context lengths in the thousands out of a
+            # ``batch``-row table; see ``rope_tables_pregathered`` in
+            # ``NF.mla_qkv``.
+            rope_tables_pregathered=True,
         )
         # [T, heads_local, head_dim]: NoPE columns first, RoPE tail last —
         # the ordering both the caches and the inverse RoPE assume.

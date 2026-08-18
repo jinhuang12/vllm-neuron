@@ -377,22 +377,38 @@ class DeepseekV4Config:
 
         Two shape facts that differ from the main stack and matter:
 
-        * ``wq_a`` and ``wkv`` are NOT fused here. The main stack fuses them
-          because both consume the same normed hidden state; the drafter's
-          ``wkv`` runs on ``main_x`` (the projected target hidden) at one
-          cadence and on the draft block at another
-          (``dsv4_ref/model.py:766-780``), so a fused stack would have to be
-          evaluated twice on different inputs. The checkpoint agrees: it
-          ships ``mtp.{s}.attn.wq_a`` and ``mtp.{s}.attn.wkv`` as separate
-          tensors with separate scales (key census §A).
+        * ``wq_a`` and ``wkv`` ARE fused, exactly as on the main stack, even
+          though the checkpoint ships ``mtp.{s}.attn.wq_a`` and
+          ``mtp.{s}.attn.wkv`` as separate tensors with separate scales (key
+          census §A) and even though the drafter evaluates the ``wkv`` half on
+          two different inputs at two different cadences: on ``main_x`` once
+          per REAL token (``dsv4_ref/model.py:759``) and on the draft block
+          once per BLOCK position (``:778``). Fusing still holds because the
+          draft-block path needs BOTH halves on one shared input, which is the
+          only place the fused GEMM is actually evaluated as a whole; the
+          ``main_x`` path reads the ``wkv`` half as a 512-row slice of the
+          fused stack with its matching 4-row scale slice. Row-slicing is a
+          static shape and the scale grid slices with it at 128-row
+          granularity because ``q_lora_rank`` (1024) is a whole number of
+          blocks -- the same argument, and the same precedent, as the main
+          stack's ``DeepseekV4Attention._q_latent``.
         * stage 0 adds ``main_proj`` ``[hidden_size, 12288]``, replicated in
-          K. 12288 % 128 == 0, so the block-alignment invariant holds and the
-          column-parallel ``N_local = 64`` shard is admissible under the
-          LD-11 envelope (assessment §3).
+          BOTH axes. K replication is forced, not chosen: 12288 / 64 = 192 and
+          192 % 128 != 0, so a row shard breaks the block-alignment invariant
+          this list exists to check. N stays replicated too -- see the
+          PARALLELISM note on
+          :func:`~.weight_loaders.attach_dspark_stage_loaders` for why the
+          admissible ``N_local = 64`` column shard is declined (it would split a
+          128-row scale block and owe an all-gather), and for the recorded
+          footprint lever if that 48 MiB/core ever binds.
         """
         return [
-            ("attn.wq_a", self.hidden_size, "replicated", self.hidden_size),
-            ("attn.wkv", self.hidden_size, "replicated", self.hidden_size),
+            (
+                "attn.fused_wqa_wkv",
+                self.hidden_size,
+                "replicated",
+                self.hidden_size,
+            ),
             ("attn.wq_b", self.q_lora_rank, "column", self.q_lora_rank),
             ("attn.wo_a", self.kv_lora_rank, "column", self.kv_lora_rank),
             (

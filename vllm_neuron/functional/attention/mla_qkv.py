@@ -157,6 +157,7 @@ def _gather_rope_tables(
     rope_sin: Tensor,
     positions: Tensor,
     rope_head_dim: int,
+    pregathered: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Gather the per-token cos/sin rows at ``positions``, in fp32.
 
@@ -168,12 +169,28 @@ def _gather_rope_tables(
     ``[max_pos, rope_head_dim]`` are accepted; for the latter the leading half
     is taken, matching upstream's single ``cos_sin_cache`` whose cos block is
     ``[0:HALF_ROPE]`` (``fused_inv_rope_fp8_quant.py:88-89``).
+
+    ``pregathered=True`` says the caller has ALREADY produced one row per
+    TOKEN, so the position lookup must be skipped. The two conventions are
+    indistinguishable from the tensors alone -- both are 2-D and
+    ``[T, half]`` is a legal table shape -- so the caller must say which it
+    holds, and the default stays the table convention this helper was written
+    for. See ``rope_tables_pregathered`` in :func:`mla_qkv`.
     """
     half = rope_head_dim // 2
-    index = positions.reshape(-1).to(torch.long)
 
-    cos = rope_cos.index_select(0, index).to(torch.float32)
-    sin = rope_sin.index_select(0, index).to(torch.float32)
+    if pregathered:
+        cos = rope_cos.to(torch.float32)
+        sin = rope_sin.to(torch.float32)
+        assert cos.shape[0] == positions.reshape(-1).shape[0], (
+            "rope_tables_pregathered=True means one cos/sin row per token, so "
+            f"rope_cos.shape[0]={cos.shape[0]} must equal the token count "
+            f"{positions.reshape(-1).shape[0]}"
+        )
+    else:
+        index = positions.reshape(-1).to(torch.long)
+        cos = rope_cos.index_select(0, index).to(torch.float32)
+        sin = rope_sin.index_select(0, index).to(torch.float32)
 
     assert cos.shape[-1] in (half, rope_head_dim), (
         f"rope_cos last dim must be {half} (per-pair) or {rope_head_dim} "
@@ -319,6 +336,7 @@ def mla_qkv(
     kv_nope_fp8_qat: bool = True,
     kv_qat_group_size: int = 64,
     kv_qat_fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    rope_tables_pregathered: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """DeepSeek-V4 MLA input projections: fused down-proj, q/kv norm, RoPE.
@@ -395,6 +413,26 @@ def mla_qkv(
         kv_qat_fp8_dtype: storage dtype of the round trip. ``float8_e4m3fn``
             (OCP) per ``kernel.py:47-48, 116``; TRN2's non-OCP fp8 is a
             different type, hence the knob. KEYWORD-ONLY EXTENSION.
+        rope_tables_pregathered: set True when ``rope_cos``/``rope_sin`` already
+            carry ONE ROW PER TOKEN (``[T, qk_rope_head_dim // 2]``) rather than
+            one row per POSITION (``[max_position, ...]``), so the position
+            lookup is skipped. KEYWORD-ONLY EXTENSION.
+
+            This is not a convenience: the two conventions are
+            indistinguishable from the tensors alone, and feeding a per-token
+            table with ``pregathered=False`` is silently correct for exactly
+            one input shape -- a single sequence prefilled from position 0,
+            where ``positions == arange(T)`` -- and wrong everywhere else. At
+            decode, ``positions`` holds context lengths in the thousands while
+            the table has ``batch`` rows, so ``index_select`` goes out of
+            range. Both in-tree DeepSeek-V4 callers build their tables with
+            ``model/deepseek_v4/attention.py``'s ``_cos_sin`` (or the
+            equivalent ``DeepseekV4RotaryEmbedding.forward``), both of which
+            are per-TOKEN, so both pass True.
+
+            ``sparse_indexer_topk`` takes the identically named flag for the
+            same reason; the two ops share the convention so a caller cannot
+            get one right and the other wrong.
         out_dtype: store dtype for every returned tensor. KEYWORD-ONLY
             EXTENSION.
 
@@ -464,7 +502,9 @@ def mla_qkv(
 
     # --- Step 4: GPT-J RoPE on the trailing rope dims of q and of the KV latent
     # dsv4_ref/model.py:505 and :510 apply ONE rotation (same freqs_cis) to both.
-    cos, sin = _gather_rope_tables(rope_cos, rope_sin, positions, qk_rope_head_dim)
+    cos, sin = _gather_rope_tables(
+        rope_cos, rope_sin, positions, qk_rope_head_dim, rope_tables_pregathered
+    )
 
     q_nope = q[..., :nope_head_dim]
     q_rope = _apply_gptj_rope(q[..., nope_head_dim:], cos, sin)

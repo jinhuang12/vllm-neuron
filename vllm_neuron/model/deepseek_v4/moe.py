@@ -784,10 +784,16 @@ class DeepseekV4MoE(nn.Module):
         shared_group,
         shared_group_rank: int,
         shared_group_size: int,
+        key_prefix: str | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        # Checkpoint namespace override. ``None`` = the main stack's
+        # ``layers.{layer_idx}``; the DSpark drafter passes ``"mtp.{stage}"``
+        # while still reporting the out-of-range ``layer_idx`` that makes
+        # ``is_hash_moe_layer`` False. See ``weight_loaders._layer_key_prefix``.
+        self.key_prefix = key_prefix
 
         self.hidden_size = config.hidden_size
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -920,6 +926,7 @@ class DeepseekV4MoE(nn.Module):
             ep_rank=ep_rank,
             shared_tp_size=shared_group_size,
             shared_tp_rank=shared_group_rank,
+            key_prefix=self.key_prefix,
         )
 
     # ------------------------------------------------------------------
