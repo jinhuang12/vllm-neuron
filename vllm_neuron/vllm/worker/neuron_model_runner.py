@@ -735,6 +735,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "mtp":
+                # DeepSeek-V4's DSpark block-parallel drafter. It is NOT Eagle3
+                # and NOT upstream's one-extra-layer MTP, but it rides the
+                # Eagle3 aux-hidden-state transport, so ``is_eagle3_spec`` is
+                # set: every one of that flag's consumers -- the aux-layer
+                # handshake, the aux-hidden return handling, the async-schedule
+                # gate and the two drafting paths -- is behavior DSpark needs.
+                # ``DSparkProposer`` subclasses ``EagleProposer`` precisely so
+                # the three ``isinstance`` guards downstream keep holding
+                # unwidened.
+                from vllm_neuron.vllm.spec_decode.dspark import DSparkProposer
+
+                self.is_eagle3_spec = True
+                self.drafter = DSparkProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.rejection_sampler = RejectionSampler()
             else:
                 raise ValueError(
                     f"Unsupported speculative decoding method: {self.speculative_config.method}"
