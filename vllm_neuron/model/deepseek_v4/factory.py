@@ -297,14 +297,32 @@ class DeepSeekV4MTP(nn.Module):
         start_layer_idx: int,
         neuron_config: NeuronConfig | None = None,
     ) -> nn.Module:
+        # <-- RECORDED PLAN DEFECT: no drafter exists in this port.
+        #
+        # The port plan's speculative-decoding row is transcribed from
+        # upstream vLLM 0.21.0's DeepSeekV4MultiTokenPredictorLayer
+        # (``enorm``/``hnorm`` + ``e_proj``/``h_proj`` + ``shared_head``).
+        # NONE of those parameters exists in the pinned checkpoint: its
+        # ``mtp.*`` namespace holds a different drafter ("DSpark", see the
+        # reference implementation's ``DSparkBlock``) with
+        # ``main_norm``/``main_proj`` on stage 0 and ``markov_head`` /
+        # ``confidence_head`` on stage 2. Building the planned design
+        # would load nothing.
+        #
+        # Raising here is deliberate and is the honest state: this class
+        # is deliberately NOT in ``registry.py``, so nothing reaches it in
+        # a normal serve. The full diagnosis, with the checkpoint key
+        # census that proves it, is in
+        # ``artifacts/repairs/author_model_family-iter1/``.
+        del start_layer_idx
         cls._validate_config(config, neuron_config)
-
-        from .mtp_model import DeepSeekV4MTP as Model
-
-        return Model.from_configs(
-            config=config,
-            start_layer_idx=start_layer_idx,
-            neuron_config=neuron_config,
+        raise NotImplementedError(
+            "DeepSeek-V4 speculative decoding is not implemented in this "
+            "port. The checkpoint's draft weights ('DSpark': main_proj, "
+            "main_norm, markov_head, confidence_head) do not match the "
+            "drafter the port plan records, so the planned design would "
+            "load no weights. This is a recorded plan defect awaiting a "
+            "replan; serve without speculative decoding until it lands."
         )
 
     @classmethod
@@ -319,6 +337,15 @@ class DeepSeekV4MTP(nn.Module):
         from .config import DeepseekV4Config
 
         parsed = DeepseekV4Config.from_configs(config, neuron_config)
+        # <-- KNOWN-WRONG FIELD, kept only so the replan sees it.
+        # The HF config declares ``num_nextn_predict_layers = 1``, but the
+        # checkpoint ships THREE draft stages (``mtp.0``, ``mtp.1``,
+        # ``mtp.2``) and the reference config declares
+        # ``n_mtp_layers = 3``. So this rule validates a field that
+        # contradicts the weights. Which field is authoritative is a
+        # replan question, recorded in
+        # ``artifacts/repairs/author_model_family-iter1/``. Do not "fix"
+        # this by relaxing the rule — the drafter itself is the defect.
         if parsed.num_nextn_predict_layers != 1:
             raise ValueError(
                 "The DeepSeek-V4 MTP proposer supports exactly one nextn "

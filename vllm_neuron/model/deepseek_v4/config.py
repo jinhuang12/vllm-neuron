@@ -26,17 +26,33 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 
 from .quantization import QuantizationSpec
 
-#: Config fields present in the checkpoint that this port deliberately
-#: ignores, with the reason. ``dspark_*`` is consumed nowhere in upstream
-#: vLLM 0.21.0 (``git grep dspark v0.21.0 -- vllm/`` is empty at
-#: ``ad7125a431e176d4161099480a66f0169609a690``), so the GPU incumbent
-#: ignores these fields and the port ignores them identically — a
-#: like-for-like decision, not an omission.
+#: Config fields present in the checkpoint that this port does not consume,
+#: with the reason.
+#:
+#: The ``dspark_*`` fields drive the checkpoint's own draft model. The
+#: checkpoint repo ships DeepSeek's reference implementation, and its
+#: ``DSparkBlock`` reads every one of them: ``dspark_target_layer_ids``
+#: selects the three target layers whose hc-mean hidden states are
+#: concatenated into ``main_proj`` (hence the checkpoint's
+#: ``mtp.0.main_proj.weight`` of shape ``[4096, 3 * 4096]``),
+#: ``dspark_block_size`` is the number of tokens drafted per step, and
+#: ``dspark_noise_token_id`` / ``dspark_markov_rank`` parameterize the
+#: draft input and the Markov head.
+#:
+#: They are unread HERE because this port carries no drafter: the port
+#: plan's speculative-decoding row describes upstream vLLM 0.21.0's
+#: ``DeepSeekV4MultiTokenPredictorLayer`` (``enorm``/``hnorm`` +
+#: ``e_proj``/``h_proj``), whose parameters do not exist in this
+#: checkpoint, so it would load nothing. That is a recorded plan defect
+#: awaiting a replan, NOT a like-for-like omission — do not re-label it
+#: as one.
 IGNORED_CHECKPOINT_FIELDS: dict[str, str] = {
-    "dspark_block_size": "unused by upstream vLLM 0.21.0",
-    "dspark_noise_token_id": "unused by upstream vLLM 0.21.0",
-    "dspark_target_layer_ids": "unused by upstream vLLM 0.21.0",
-    "dspark_markov_rank": "unused by upstream vLLM 0.21.0",
+    "dspark_block_size": "draft-model field; no drafter in this port (plan defect)",
+    "dspark_noise_token_id": "draft-model field; no drafter in this port (plan defect)",
+    "dspark_target_layer_ids": (
+        "draft-model field; no drafter in this port (plan defect)"
+    ),
+    "dspark_markov_rank": "draft-model field; no drafter in this port (plan defect)",
 }
 
 #: Per-layer KV-compression classes.
@@ -176,6 +192,54 @@ class DeepseekV4Config:
     def is_hash_moe_layer(self, layer_idx: int) -> bool:
         """Whether ``layer_idx`` routes MoE through the ``tid2eid`` table."""
         return layer_idx < self.num_hash_layers
+
+    # ------------------------------------------------------------------
+    # YaRN RoPE scaling
+    # ------------------------------------------------------------------
+    # <-- MODEL-SPECIFIC: this checkpoint DOES enable YaRN. The pinned
+    # config.json carries ``rope_scaling = {"type": "yarn", "factor": 16,
+    # "original_max_position_embeddings": 65536, "beta_fast": 32,
+    # "beta_slow": 1}``, and 16 * 65536 == 1048576 ==
+    # max_position_embeddings. The reference implementation applies the
+    # frequency interpolation whenever ``original_seq_len > 0``
+    # (inference/model.py:206-235), so a port that skipped it would place
+    # every position past 65536 on the wrong frequencies. These
+    # properties exist so the RoPE table builder reads one source.
+    @property
+    def rope_is_yarn(self) -> bool:
+        """Whether YaRN frequency interpolation applies."""
+        scaling = self.rope_scaling
+        if not scaling:
+            return False
+        return str(scaling.get("type", scaling.get("rope_type", ""))).lower() == "yarn"
+
+    @property
+    def rope_original_seq_len(self) -> int:
+        """Pre-scaling context length YaRN interpolates from (0 disables)."""
+        if not self.rope_is_yarn:
+            return 0
+        return int(self.rope_scaling.get("original_max_position_embeddings", 0))
+
+    @property
+    def rope_factor(self) -> float:
+        """YaRN extension factor."""
+        if not self.rope_is_yarn:
+            return 1.0
+        return float(self.rope_scaling.get("factor", 1.0))
+
+    @property
+    def rope_beta_fast(self) -> int:
+        """YaRN high-frequency correction bound."""
+        if not self.rope_is_yarn:
+            return 32
+        return int(self.rope_scaling.get("beta_fast", 32))
+
+    @property
+    def rope_beta_slow(self) -> int:
+        """YaRN low-frequency correction bound."""
+        if not self.rope_is_yarn:
+            return 1
+        return int(self.rope_scaling.get("beta_slow", 1))
 
     def rope_theta_for_layer(self, layer_idx: int) -> float:
         """Dual-theta RoPE base for ``layer_idx``.

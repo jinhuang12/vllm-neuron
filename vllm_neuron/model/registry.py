@@ -5,6 +5,7 @@ from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
+from .deepseek_v4 import DeepseekV4ForCausalLM
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -21,6 +22,11 @@ def get_models() -> list[tuple[str, type]]:
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
+        # The architecture string must equal the HF config.json
+        # "architectures" entry exactly; the pinned
+        # deepseek-ai/DeepSeek-V4-Flash-0731 config declares
+        # ["DeepseekV4ForCausalLM"] (lower-case "seek", capital V4).
+        ("DeepseekV4ForCausalLM", DeepseekV4ForCausalLM),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

@@ -12,6 +12,17 @@ from .attention.attention_segmented_cte import (
     segmented_attention,
     segmented_attention_cp,
 )
+# <-- deepseek_v4: MLA / sliding-window / DSA-indexer ops. Each is a torch
+# composition, not an nkilib wrapper: every kernel the port plan's ladder
+# cited for these rows is absent from the installed neuron wheel, so each
+# row takes its recorded same-row torch-composition rung. Without these
+# re-exports `NF.<op>` does not resolve at call time.
+from .attention.mla_qkv import mla_qkv
+from .attention.mla_oproj import mla_grouped_oproj
+from .attention.mla_sparse_attention import mla_sparse_attention
+from .attention.mla_decode import mla_decode_attention
+from .attention.swa_attention import swa_attention
+from .attention.sparse_indexer import sparse_indexer_topk
 from .collectives.all_to_all import all_to_all
 from .collectives.all_to_all_v import all_to_all_v
 from .embedding import embedding
@@ -56,6 +67,10 @@ __all__ = [
     "get_group_slice_indices",
     "get_local_expert_affinities",
     "merge_prompt_embeds",
+    "mla_decode_attention",
+    "mla_grouped_oproj",
+    "mla_qkv",
+    "mla_sparse_attention",
     "mlp",
     "moe_block_tkg",
     "moe_cte",
@@ -69,6 +84,8 @@ __all__ = [
     "sample",
     "segmented_attention",
     "segmented_attention_cp",
+    "sparse_indexer_topk",
+    "swa_attention",
     "topk_reduce",
     "validate_expert_parallelism_config",
 ]
