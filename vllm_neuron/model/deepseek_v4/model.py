@@ -36,12 +36,21 @@ call site. Where the reference and upstream vLLM 0.21.0 disagree, the
 reference wins: it is the implementation the checkpoint was published
 with.
 
-NOT IMPLEMENTED HERE, DELIBERATELY: the draft model. The checkpoint's
-``mtp.*`` namespace holds a "DSpark" block-parallel drafter
-(``inference/model.py:818-874``) whose parameters do not match the
-speculative-decoding design the port plan records. That is a recorded
-plan defect awaiting a replan; this module carries no drafter and no
-Eagle3 aux-hidden-state collection.
+THE DRAFT MODEL LIVES IN :mod:`.dspark_model`, NOT HERE. The checkpoint's
+``mtp.*`` namespace holds DeepSeek's own "DSpark" block-parallel drafter
+(``inference/model.py:818-874``) -- three full decoder stages that draft five
+tokens per pass, not the one-extra-layer MTP the port plan first assumed. That
+mismatch was a recorded plan defect and has been replanned (ladder rows
+LD-18/19/20). What THIS module owes the drafter is exactly two things, both
+below:
+
+1. ``SupportsEagle3`` plus the hc-bundle-mean collection at
+   ``config.dspark_target_layer_ids``, concatenated on-device into the
+   ``[T, 3 * hidden_size]`` tensor DSpark's stage-0 ``main_proj`` consumes.
+2. The DECLARATION of the drafter's three sliding-window KV legs
+   (:meth:`DeepseekV4ForCausalLM._drafter_kv_layer_specs`) -- declared here so
+   they get ``SlidingWindowSpec``, because the runner would wrap anything the
+   drafter itself declared in ``FullAttentionSpec`` at ``max_model_len``.
 
 Supported parallelism: TP, EP, plus a shared-expert TP subgroup and an
 o-projection group. Sequence parallelism is NOT enabled in this port
@@ -57,10 +66,11 @@ import torch.distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
-from vllm_neuron.model.kv_cache import KVSpec
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
@@ -71,7 +81,11 @@ from vllm_neuron.utils.weight_loader import (
     with_rank_override,
 )
 
-from .attention import DeepseekV4Attention
+from .attention import (
+    _FP8_DTYPE,
+    _SWA_PAIR_HEAD_SIZE,
+    DeepseekV4Attention,
+)
 from .config import DeepseekV4Config
 from .moe import DeepseekV4MoE
 from .weight_loaders import (
@@ -608,6 +622,13 @@ class DeepseekV4Model(nn.Module):
 
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
 
+        # EAGLE3 TRANSPORT: which layers hand their hc-bundle mean to the DSpark
+        # drafter. Empty until the runner calls
+        # ``DeepseekV4ForCausalLM.set_aux_hidden_state_layers``, which it does
+        # only on a speculative serve; ``forward`` then reads it. This is
+        # compile-time graph shape, same class of flag as ``_gather_logits``.
+        self.aux_hidden_state_layers: list[int] = []
+
         # <-- MODEL-SPECIFIC: 43 layers, per-layer KV compression class.
         self.layers = nn.ModuleList(
             [
@@ -686,8 +707,15 @@ class DeepseekV4Model(nn.Module):
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         is_token_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return the collapsed, normalized hidden states, ``[T, H]``."""
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return the collapsed, normalized hidden states and the aux states.
+
+        Returns:
+            ``(hidden_states [T, H], aux_hidden_states)``. The aux list is
+            EMPTY unless :attr:`aux_hidden_state_layers` was set, which only
+            happens when a DSpark drafter is configured; the second element then
+            holds one ``[T, H]`` tensor per configured layer, in layer order.
+        """
         # <-- MODEL-SPECIFIC: read the dispatch off ``.swa``, NOT off the bare
         # ``layers.0.self_attn``. Layer 0 is SWA-only in this model (the
         # checkpoint carries compressor keys on layers 2..42 only), so
@@ -715,6 +743,16 @@ class DeepseekV4Model(nn.Module):
         cos_c, sin_c = self.rotary_emb(positions, compressed=True)
         cos_w, sin_w = self.rotary_emb(positions, compressed=False)
 
+        # <-- MODEL-SPECIFIC / EAGLE3 TRANSPORT: what DSpark's stage-0
+        # ``main_proj`` consumes is the hc-bundle MEAN over the hc_mult streams,
+        # taken AFTER the layer that produced it and BEFORE the next one -- the
+        # reference's ``h.mean(dim=2)`` at each configured layer
+        # (``dsv4_ref/model.py:920-925``). It is deliberately NOT the collapsed
+        # ``hc_head`` output and NOT one arbitrary stream: the mean is what the
+        # drafter was trained against. The list is empty on a non-speculative
+        # serve, so the bundle mean is never computed there and the graph shape
+        # is unchanged.
+        aux_hidden_states: list[torch.Tensor] = []
         for layer_idx, layer in enumerate(self.layers):
             compressed = self.config.has_compressed_cache(layer_idx)
             bundle = layer(
@@ -726,6 +764,8 @@ class DeepseekV4Model(nn.Module):
                 rope_cos=cos_c if compressed else cos_w,
                 rope_sin=sin_c if compressed else sin_w,
             )
+            if layer_idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(bundle.mean(dim=1))
 
         hidden_states = DeepseekV4HashContext.head(
             bundle,
@@ -735,7 +775,7 @@ class DeepseekV4Model(nn.Module):
             self.config.rms_norm_eps,
             self.config.hc_eps,
         )
-        return self.norm(hidden_states)
+        return self.norm(hidden_states), aux_hidden_states
 
 
 # =============================================================================
@@ -743,12 +783,22 @@ class DeepseekV4Model(nn.Module):
 # =============================================================================
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+class DeepseekV4ForCausalLM(nn.Module, SupportsEagle3):
     """DeepSeek-V4 with its LM head, implementing the runner contract.
 
     The five members the Neuron model runner requires are :meth:`forward`,
     :meth:`get_kv_spec`, :meth:`bind_kv_cache`, :meth:`load_weights` and
     :meth:`from_configs`.
+
+    It also implements ``SupportsEagle3``, which is how the DSpark drafter gets
+    the target hidden states it rides on. DSpark is not Eagle3 -- it is
+    DeepSeek's own block-parallel drafter (see :mod:`.dspark_model`) -- but the
+    transport it needs is precisely Eagle3's: a set of mid-stack hidden states,
+    concatenated on-device into one tensor of width
+    ``hidden_size * len(aux_layers)``. Reusing that interface means the runner
+    handshake (``supports_eagle3`` -> ``get_eagle3_aux_hidden_state_layers`` ->
+    ``set_aux_hidden_state_layers``, ``neuron_model_runner.py:1235-1247``)
+    needs no new framework path.
 
     >>> PARALLELISM: column-parallel LM head <<<
     <-- MODEL-SPECIFIC: embeddings are NOT tied
@@ -848,7 +898,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         positions = positions.to(torch.int32)
 
-        hidden_states = self.model(
+        hidden_states, aux_hidden_states = self.model(
             input_ids,
             positions,
             attn_metadata=attn_metadata,
@@ -887,22 +937,98 @@ class DeepseekV4ForCausalLM(nn.Module):
                     dp_rank * local_batch : (dp_rank + 1) * local_batch
                 ]
 
+        # EAGLE3 TRANSPORT: the drafter's stage-0 ``main_proj`` reads ONE
+        # concatenated tensor of width ``hidden_size * len(aux_layers)``
+        # (12288 for the three configured layers), which is exactly the width
+        # the proposer's synthetic-input builder assumes
+        # (``spec_decode/eagle.py:155-157`` builds ``hidden_size * 3``). The
+        # concat -- not the list -- is the interface, and its dim is the feature
+        # dim, matching ``dsv4_ref/model.py:851-853``. The extra return element
+        # appears ONLY when aux layers were configured, because the runner
+        # unpacks the tuple by arity.
+        aux_concat = (
+            torch.cat(aux_hidden_states, dim=-1) if aux_hidden_states else None
+        )
+
         if self.on_device_sampling_config is None:
+            if aux_concat is not None:
+                return logits, aux_concat
             return logits
 
         sampled_tokens = self.sampler(
             logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
         )
 
-        # Speculative decoding is not wired in this port (no drafter — see
-        # the module docstring). The hook is kept so a future drafter
-        # needs no change here.
         if spec_decode_metadata is not None:
             from vllm_neuron.nn.rejection_sampler import rejection_sampler
 
-            return rejection_sampler(spec_decode_metadata, sampled_tokens)
+            accepted = rejection_sampler(spec_decode_metadata, sampled_tokens)
+            if aux_concat is not None:
+                return accepted, aux_concat, gathered_logits
+            return accepted
 
+        if aux_concat is not None:
+            return sampled_tokens, aux_concat, gathered_logits
         return sampled_tokens, gathered_logits
+
+    # ── Eagle3 transport (the DSpark drafter's hidden-state feed) ────────
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if layers is not None:
+            self.model.aux_hidden_state_layers = list(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """The layers whose hc-bundle means feed the DSpark drafter.
+
+        <-- MODEL-SPECIFIC: NOT the generic ``(2, n//2, n-3)`` heuristic the
+        other families return. DSpark was trained against specific target
+        layers, recorded in config as ``dspark_target_layer_ids``
+        ([40, 41, 42] -- the last three of 43), and the reference reads them
+        from its own config rather than deriving them
+        (``dsv4_ref/model.py:920-925``). A heuristic here would silently feed
+        the drafter states it was never trained on: the shapes would match, the
+        compile would succeed, and only the acceptance rate would collapse.
+        """
+        if self.model.aux_hidden_state_layers:
+            return tuple(self.model.aux_hidden_state_layers)
+        return tuple(self.config.dspark_target_layer_ids)
+
+    def _drafter_kv_layer_specs(self) -> list[LayerSpec]:
+        """The DSpark stages' sliding-window legs, declared BY THE TARGET.
+
+        Deliberately declared here rather than by
+        :meth:`~.dspark_model.DeepseekV4DSparkDrafter.get_kv_spec`, which
+        returns nothing. The runner wraps every layer a DRAFTER declares in
+        ``FullAttentionSpec`` unconditionally
+        (``neuron_model_runner.py:7853-7866``), and
+        ``FullAttentionSpec.max_memory_usage_bytes`` ignores ``sliding_window``
+        -- so a window-128 leg declared there would be sized at
+        ``max_model_len``. At the planned 65536 / 32-seq / fp8 configuration
+        that turns 12 MiB/core of drafter KV into roughly 6.0 GiB/core and
+        breaks the 21.6 GiB/core budget. Declared here they go through the
+        target's branch, become ``SlidingWindowSpec``, and are spec-identical to
+        the 43 target SWA legs, so they merge into the same KV cache group --
+        which is also what makes the proposer's
+        ``validate_same_kv_cache_group`` check meaningful rather than vacuous.
+
+        Gated on ``aux_hidden_state_layers`` being set, which is the Eagle3
+        handshake's own signal and happens in ``load_model``
+        (``neuron_model_runner.py:1247``) -- strictly before
+        ``initialize_kv_cache`` calls ``get_kv_spec``. On a non-speculative
+        serve the list is empty and no drafter leg is allocated.
+        """
+        if not self.model.aux_hidden_state_layers:
+            return []
+        return [
+            LayerSpec(
+                name=f"mtp.{stage}.self_attn.swa",
+                num_kv_heads=1,
+                head_size=_SWA_PAIR_HEAD_SIZE,
+                dtype=_FP8_DTYPE,
+                sliding_window_size=self.config.sliding_window,
+                chunk_size=None,
+            )
+            for stage in range(self.config.num_dspark_stages)
+        ]
 
     # ── Runner contract: KV cache ────────────────────────────────────────
     def get_kv_spec(self) -> KVSpec:
@@ -910,16 +1036,28 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         Each :class:`~.attention.DeepseekV4Attention` owns the names and
         widths of the cache pairs it reads and writes, so the spec cannot
-        drift from the code that uses it.
+        drift from the code that uses it. The DSpark stages' legs are appended
+        by :meth:`_drafter_kv_layer_specs`; see there for why the target owns
+        that declaration.
         """
         layers = []
         for layer_idx, layer in enumerate(self.model.layers):
             layers.extend(layer.self_attn.kv_layer_specs(layer_idx))
+        layers.extend(self._drafter_kv_layer_specs())
         return KVSpec(layers=layers)
 
     def bind_kv_cache(
         self, kv_caches: dict[str, list[torch.Tensor]]
     ) -> None:
+        """Bind the target's own legs only.
+
+        The three ``mtp.*`` legs this class DECLARES are bound by the drafter
+        module, which the runner hands the same whole cache dict
+        (``neuron_model_runner.py:7784-7791``). Declaring and binding are
+        deliberately split: the declaration has to be on this side to get the
+        right spec type, the binding has to be on the drafter's side because
+        that is the module whose forward reads the tensors.
+        """
         for layer in self.model.layers:
             layer.self_attn.bind_kv_cache(kv_caches)
 
@@ -942,6 +1080,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             names.append(f"{base}.swa")
             if config.has_indexer(layer_idx):
                 names.append(f"{base}.indexer")
+        # The DSpark stages' legs, derived from the stage count in config --
+        # independently of :meth:`_drafter_kv_layer_specs`, which derives them
+        # from the same count but through the drafter's naming. The gate is the
+        # same Eagle3 signal, read here too so the two sides agree on WHETHER
+        # the legs exist as well as on their names.
+        if self.model.aux_hidden_state_layers:
+            for stage in range(config.num_dspark_stages):
+                names.append(f"mtp.{stage}.self_attn.swa")
         return names
 
     # ── Runner contract: weight loading ──────────────────────────────────

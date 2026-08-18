@@ -250,13 +250,16 @@ class DeepseekV4ForCausalLM(nn.Module):
 
 
 class DeepSeekV4MTP(nn.Module):
-    """Factory for the DeepSeek-V4 multi-token-prediction draft module.
+    """Factory for the DeepSeek-V4 DSpark draft module.
 
-    Registered under the architecture string upstream uses for this
-    checkpoint's draft module (``"DeepSeekV4MTPModel"`` in vLLM 0.21.0's
-    registry). The proposer in
-    ``vllm_neuron/vllm/spec_decode/mtp.py`` resolves it and drives one
-    draft step per target step.
+    Named ``MTP`` because that is the architecture string upstream vLLM 0.21.0
+    registers for this checkpoint's draft module
+    (``"DeepSeekV4MTPModel"``) and the name the speculative config carries; what
+    it actually builds is DeepSeek's DSpark block-parallel drafter
+    (:class:`~.dspark_model.DeepseekV4DSparkDrafter`), which is a different
+    design from upstream's one-extra-layer MTP. ``DSparkProposer``
+    (``vllm_neuron/vllm/spec_decode/dspark.py``) resolves this class and drives
+    one BLOCK of ``dspark_block_size`` drafted tokens per target step.
     """
 
     def __init__(
@@ -297,32 +300,21 @@ class DeepSeekV4MTP(nn.Module):
         start_layer_idx: int,
         neuron_config: NeuronConfig | None = None,
     ) -> nn.Module:
-        # <-- RECORDED PLAN DEFECT: no drafter exists in this port.
-        #
-        # The port plan's speculative-decoding row is transcribed from
-        # upstream vLLM 0.21.0's DeepSeekV4MultiTokenPredictorLayer
-        # (``enorm``/``hnorm`` + ``e_proj``/``h_proj`` + ``shared_head``).
-        # NONE of those parameters exists in the pinned checkpoint: its
-        # ``mtp.*`` namespace holds a different drafter ("DSpark", see the
-        # reference implementation's ``DSparkBlock``) with
-        # ``main_norm``/``main_proj`` on stage 0 and ``markov_head`` /
-        # ``confidence_head`` on stage 2. Building the planned design
-        # would load nothing.
-        #
-        # Raising here is deliberate and is the honest state: this class
-        # is deliberately NOT in ``registry.py``, so nothing reaches it in
-        # a normal serve. The full diagnosis, with the checkpoint key
-        # census that proves it, is in
+        # The replan (ladder rows LD-18/19/20) settled what this builds. The
+        # earlier version of this method raised NotImplementedError, because the
+        # port plan's speculative row was transcribed from upstream's
+        # DeepSeekV4MultiTokenPredictorLayer (``enorm``/``hnorm`` +
+        # ``e_proj``/``h_proj`` + ``shared_head``) and NONE of those parameters
+        # exists in the pinned checkpoint. Its ``mtp.*`` namespace holds DSpark:
+        # three full decoder stages with ``main_proj``/``main_norm`` on stage 0
+        # and ``markov_head``/``confidence_head`` on stage 2. The diagnosis and
+        # the key census that settled it are in
         # ``artifacts/repairs/author_model_family-iter1/``.
-        del start_layer_idx
+        from .dspark_model import DeepseekV4DSparkDrafter
+
         cls._validate_config(config, neuron_config)
-        raise NotImplementedError(
-            "DeepSeek-V4 speculative decoding is not implemented in this "
-            "port. The checkpoint's draft weights ('DSpark': main_proj, "
-            "main_norm, markov_head, confidence_head) do not match the "
-            "drafter the port plan records, so the planned design would "
-            "load no weights. This is a recorded plan defect awaiting a "
-            "replan; serve without speculative decoding until it lands."
+        return DeepseekV4DSparkDrafter.from_configs(
+            config, start_layer_idx, neuron_config
         )
 
     @classmethod
@@ -331,25 +323,86 @@ class DeepSeekV4MTP(nn.Module):
     ) -> None:
         """Validate the draft configuration.
 
-        The draft shares the target's dimensions, so it inherits the
-        target's rules; only the draft-specific depth is checked here.
+        The draft shares the target's dimensions and therefore inherits every
+        target rule; what is checked here is only what is draft-specific.
+
+        ``num_nextn_predict_layers`` is deliberately NOT checked. The HF config
+        declares it 1 while the checkpoint ships THREE draft stages
+        (``mtp.{0,1,2}``) and the reference config declares ``n_mtp_layers = 3``;
+        the field is recorded as contradicted by the weights
+        (:data:`~.config.CONTRADICTED_CHECKPOINT_FIELDS`) and
+        ``config.num_dspark_stages`` is the authority. An earlier version of this
+        method enforced the field, which would have rejected the real
+        checkpoint.
         """
         from .config import DeepseekV4Config
 
         parsed = DeepseekV4Config.from_configs(config, neuron_config)
-        # <-- KNOWN-WRONG FIELD, kept only so the replan sees it.
-        # The HF config declares ``num_nextn_predict_layers = 1``, but the
-        # checkpoint ships THREE draft stages (``mtp.0``, ``mtp.1``,
-        # ``mtp.2``) and the reference config declares
-        # ``n_mtp_layers = 3``. So this rule validates a field that
-        # contradicts the weights. Which field is authoritative is a
-        # replan question, recorded in
-        # ``artifacts/repairs/author_model_family-iter1/``. Do not "fix"
-        # this by relaxing the rule — the drafter itself is the defect.
-        if parsed.num_nextn_predict_layers != 1:
+
+        if parsed.num_dspark_stages < 1:
             raise ValueError(
-                "The DeepSeek-V4 MTP proposer supports exactly one nextn "
-                f"layer; config declares num_nextn_predict_layers="
-                f"{parsed.num_nextn_predict_layers}."
+                "DSpark needs at least one draft stage; config.num_dspark_stages "
+                f"= {parsed.num_dspark_stages}."
             )
+        if parsed.dspark_block_size < 1:
+            raise ValueError(
+                "DSpark drafts a block of at least one token; "
+                f"config.dspark_block_size = {parsed.dspark_block_size}."
+            )
+        if not 0 <= parsed.dspark_noise_token_id < parsed.vocab_size:
+            raise ValueError(
+                f"dspark_noise_token_id={parsed.dspark_noise_token_id} is outside "
+                f"the vocabulary [0, {parsed.vocab_size})."
+            )
+        bad_layers = [
+            layer
+            for layer in parsed.dspark_target_layer_ids
+            if not 0 <= layer < parsed.num_hidden_layers
+        ]
+        if bad_layers:
+            raise ValueError(
+                f"dspark_target_layer_ids {bad_layers} are outside the target's "
+                f"{parsed.num_hidden_layers} layers; the Eagle3 aux-hidden "
+                "collection would never fire for them."
+            )
+        # Every stage must be MoE-and-SWA-shaped by its OWN layer index. This is
+        # the load-bearing consequence of numbering the stages
+        # ``num_hidden_layers + s``: it is what makes them take the gate.bias
+        # branch (no ``tid2eid``) and declare no compressor or indexer, matching
+        # the ``mtp.*`` key census. Checked here because getting it wrong is a
+        # missing-key failure thousands of seconds into a load, not a crash.
+        for stage in range(parsed.num_dspark_stages):
+            layer_idx = parsed.num_hidden_layers + stage
+            if parsed.is_hash_moe_layer(layer_idx):
+                raise ValueError(
+                    f"DSpark stage {stage} maps to layer_idx {layer_idx}, which "
+                    "config classifies as a hash-MoE layer; the stages must take "
+                    "the gate.bias branch, and no mtp.* key carries a tid2eid."
+                )
+            if parsed.has_compressed_cache(layer_idx):
+                raise ValueError(
+                    f"DSpark stage {stage} maps to layer_idx {layer_idx}, whose "
+                    f"compress_ratio is {parsed.compress_ratio(layer_idx)}; the "
+                    "stages are SWA-only (compress_ratios[43:46] == [0, 0, 0]) "
+                    "and no mtp.* key carries a compressor."
+                )
+
+        # The same K_local % 128 == 0 obligation the target's Rule 4 carries,
+        # over the DSpark stage's own linear inventory. tp_size comes from the
+        # SAME resolver the target uses, and the check is skipped when it is
+        # unavailable -- exactly as Rule 3 does -- because an absent vLLM config
+        # is a CPU-side import, not a misconfiguration.
+        tp_size = DeepseekV4ForCausalLM._resolve_tp_size()
+        if tp_size is not None:
+            for name, k_full, sharding, k_local in parsed.dspark_block_fp8_linear_plan(
+                tp_size
+            ):
+                if k_local % _ACTIVATION_GROUP != 0:
+                    raise ValueError(
+                        f"DSpark block-FP8 linear {name!r} would have "
+                        f"K_local={k_local} at tensor_parallel_size={tp_size} "
+                        f"(K_full={k_full}, {sharding}-sharded); block-128x128 "
+                        f"FP8 requires K_local % {_ACTIVATION_GROUP} == 0."
+                    )
+
         DeepseekV4ForCausalLM._validate_config(config, neuron_config)
