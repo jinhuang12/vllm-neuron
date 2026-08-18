@@ -95,6 +95,7 @@ def mla_decode_attention(
     swa_scale_cache: Optional[Tensor] = None,
     swa_widths: Optional[Sequence[int]] = None,
     swa_block_table: Optional[Tensor] = None,
+    swa_pos_offset: Optional[Tensor] = None,
     swa_ring: bool = False,
     nope_dim: int = LATENT_NOPE_DIM,
     rope_dim: int = LATENT_ROPE_DIM,
@@ -155,6 +156,24 @@ def mla_decode_attention(
         max_compressed_slots: static pool span for the no-``topk_indices`` case.
         latent_*/swa_*: the other physical cache pieces, their column widths,
             their fp32 group-64 dequant scales, and their block tables.
+        swa_pos_offset: ``[B]`` int per-sequence window-start offset for a
+            SWA block table the runner TRIMMED to the window-relevant blocks.
+            Subtracted from ``positions`` for the sliding-window leg ONLY, so
+            that leg addresses its trimmed table in the trimmed frame while
+            the compressed leg keeps the absolute positions its causal cap
+            needs. This is NOT optional bookkeeping on a real serve: at decode
+            the runner replaces a ``SlidingWindowSpec`` group's
+            ``block_table_tensor`` with ``_compute_swa_decode_tensors``'
+            window-trimmed gather and publishes the matching
+            ``swa_kv_pos_offset`` (``neuron_model_runner.py:3966-3985``,
+            ``:3786-3815``), so a caller that keeps feeding absolute positions
+            reads the wrong blocks (or out of range) for every sequence whose
+            context has grown past the trimmed span. ``gpt_oss`` applies the
+            same shift (``model_bf16.py:1533-1552``). Negative results are
+            clamped to 0 — a padded/freed row carries position 0 against a
+            positive offset, and the clamp collapses its window instead of
+            marking a stale row valid, which is exactly the guard
+            ``model_bf16.py:1539-1552`` records.
         nope_dim / rope_dim: latent split, 448 + 64.
         quant_group_size: fp8 group size of the scale caches, 64.
         softmax_dtype: fp32 accumulation dtype for the softmax statistics.
@@ -202,7 +221,13 @@ def mla_decode_attention(
         )
         win_valid = torch.ones_like(win_idx, dtype=torch.bool)
     else:
-        win_idx, win_valid = _window_local_indices(pos, window, ring=swa_ring)
+        # Shift into the trimmed block table's frame when the runner trimmed
+        # it; see ``swa_pos_offset`` in the docstring. The band's geometry is
+        # translation-invariant, so this is exact rather than approximate.
+        swa_pos = pos
+        if swa_pos_offset is not None:
+            swa_pos = (pos - swa_pos_offset.reshape(-1).to(torch.int64)).clamp_min(0)
+        win_idx, win_valid = _window_local_indices(swa_pos, window, ring=swa_ring)
 
     swa_caches: List[Tensor] = [swa_cache]
     if swa_v_cache is not None:

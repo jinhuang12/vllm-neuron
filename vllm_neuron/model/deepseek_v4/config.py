@@ -29,31 +29,42 @@ from .quantization import QuantizationSpec
 #: Config fields present in the checkpoint that this port does not consume,
 #: with the reason.
 #:
-#: The ``dspark_*`` fields drive the checkpoint's own draft model. The
-#: checkpoint repo ships DeepSeek's reference implementation, and its
-#: ``DSparkBlock`` reads every one of them: ``dspark_target_layer_ids``
-#: selects the three target layers whose hc-mean hidden states are
-#: concatenated into ``main_proj`` (hence the checkpoint's
-#: ``mtp.0.main_proj.weight`` of shape ``[4096, 3 * 4096]``),
-#: ``dspark_block_size`` is the number of tokens drafted per step, and
-#: ``dspark_noise_token_id`` / ``dspark_markov_rank`` parameterize the
-#: draft input and the Markov head.
+#: The ``dspark_*`` fields USED to sit here, because iteration 1 of this port
+#: carried no drafter. They are parsed drafter inputs now (see
+#: :mod:`.dspark_model`), so they left this list at the DSpark re-entry.
+IGNORED_CHECKPOINT_FIELDS: dict[str, str] = {}
+
+#: Checkpoint config fields whose declared value is CONTRADICTED by the
+#: weights, with the resolution and its evidence. A field here is parsed and
+#: kept (something outside this family may read it) but is never the
+#: authority for a shape or a count inside the family.
 #:
-#: They are unread HERE because this port carries no drafter: the port
-#: plan's speculative-decoding row describes upstream vLLM 0.21.0's
-#: ``DeepSeekV4MultiTokenPredictorLayer`` (``enorm``/``hnorm`` +
-#: ``e_proj``/``h_proj``), whose parameters do not exist in this
-#: checkpoint, so it would load nothing. That is a recorded plan defect
-#: awaiting a replan, NOT a like-for-like omission — do not re-label it
-#: as one.
-IGNORED_CHECKPOINT_FIELDS: dict[str, str] = {
-    "dspark_block_size": "draft-model field; no drafter in this port (plan defect)",
-    "dspark_noise_token_id": "draft-model field; no drafter in this port (plan defect)",
-    "dspark_target_layer_ids": (
-        "draft-model field; no drafter in this port (plan defect)"
+#: ``num_nextn_predict_layers = 1`` is the whole list. The checkpoint ships
+#: THREE DSpark stages (``mtp.0``, ``mtp.1``, ``mtp.2``, and no ``mtp.3`` —
+#: key census ``checkpoint-key-analysis.txt`` §A over all 72317 index keys)
+#: and DeepSeek's own reference config declares ``n_mtp_layers = 3``
+#: (``dsv4_ref/config.json``). **The weights are authoritative: 3 stages.**
+#: The field stays parsed for exactly one reason: upstream
+#: ``SpeculativeConfig`` reads it as ``n_predict`` and validates
+#: ``num_speculative_tokens % n_predict == 0``
+#: (``vllm/config/speculative.py:722-736`` @ ``ad7125a431``), which the
+#: planned ``num_speculative_tokens = 5`` passes because 5 % 1 == 0. The
+#: drafter's real block size is :attr:`DeepseekV4Config.dspark_block_size`.
+CONTRADICTED_CHECKPOINT_FIELDS: dict[str, str] = {
+    "num_nextn_predict_layers": (
+        "declares 1; the checkpoint ships 3 mtp.* stages and dsv4_ref's "
+        "config.json declares n_mtp_layers=3. Resolution: 3 stages, by the "
+        "weights (see NUM_DSPARK_STAGES). Kept parsed only because upstream "
+        "SpeculativeConfig reads it as n_predict."
     ),
-    "dspark_markov_rank": "draft-model field; no drafter in this port (plan defect)",
 }
+
+#: Plan constant: the number of DSpark draft stages, ruled by the weights
+#: (port-assessment.md iteration 3 §2, "stage-count authority ruling") and
+#: corroborated at load time by the ``mtp.{0,1,2}`` key census. It is NOT
+#: read from ``num_nextn_predict_layers``; see
+#: :data:`CONTRADICTED_CHECKPOINT_FIELDS`.
+NUM_DSPARK_STAGES: int = 3
 
 #: Per-layer KV-compression classes.
 LAYER_CLASS_SWA_ONLY = "swa_only"
@@ -84,8 +95,17 @@ class DeepseekV4Config:
     torch_dtype: torch.dtype = torch.bfloat16
     hidden_act: str = "silu"
 
-    # <-- MODEL-SPECIFIC: KV compression schedule. 46 entries; entries
-    # beyond num_hidden_layers are unused padding in the checkpoint.
+    # <-- MODEL-SPECIFIC: KV compression schedule. 46 entries for 43 target
+    # layers, and the three extra entries are NOT padding: the reference
+    # indexes this same list by ``n_layers + stage`` for the DSpark stages
+    # (``dsv4_ref/model.py:459`` inside ``Attention.__init__``, reached from
+    # ``DSparkBlock(args.n_layers + layer_id, args)`` at ``:902``). The pinned
+    # config's tail is ``[..., 4, 0, 0, 0]`` — index 42 is the last target
+    # layer and indices 43/44/45 are ratio 0, which is why every DSpark stage
+    # is SWA-only (``DSparkAttention.forward`` asserts ``compress_ratio == 0``,
+    # ``:753``). 46 == 43 + 3 is therefore a THIRD independent corroboration
+    # of the three-stage ruling, alongside the ``mtp.{0,1,2}`` key census and
+    # the reference config's ``n_mtp_layers = 3``.
     compress_ratios: list[int] = field(default_factory=list)
     compress_rope_theta: float = 160000.0
     rope_theta: float = 10000.0
@@ -114,7 +134,24 @@ class DeepseekV4Config:
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
-    # <-- MODEL-SPECIFIC: multi-token prediction draft
+    # <-- MODEL-SPECIFIC: the DSpark block-parallel draft model.
+    # Every field below is read by :mod:`.dspark_model`; all four are present
+    # in the pinned HF ``config.json`` and byte-identical in DeepSeek's own
+    # reference config (``dsv4_ref/hf_config.json``, verified at iteration 3).
+    #: Tokens drafted per block-parallel step (``dsv4_ref/model.py:854-855``).
+    dspark_block_size: int = 5
+    #: Filler token id for draft positions 1.. (``dsv4_ref/model.py:855``).
+    dspark_noise_token_id: int = 128799
+    #: Target layers whose hc-bundle means are concatenated into the drafter's
+    #: ``main_proj`` input (``dsv4_ref/model.py:920-925``, :851-853).
+    dspark_target_layer_ids: list[int] = field(
+        default_factory=lambda: [40, 41, 42]
+    )
+    #: Rank of the stage-2 Markov head (``dsv4_ref/model.py:795-804``).
+    dspark_markov_rank: int = 256
+
+    # <-- CONTRADICTED BY THE WEIGHTS: parsed, never authoritative. See
+    # CONTRADICTED_CHECKPOINT_FIELDS and NUM_DSPARK_STAGES above.
     num_nextn_predict_layers: int = 1
 
     # Framework config
@@ -303,6 +340,85 @@ class DeepseekV4Config:
             # replicated (upstream ReplicatedLinear,
             # deepseek_v4_attention.py:1120-1126).
             ("self_attn.indexer.wq_b", self.q_lora_rank, "replicated", self.q_lora_rank),
+        ]
+
+    # ------------------------------------------------------------------
+    # DSpark drafter — derived structure
+    # ------------------------------------------------------------------
+    @property
+    def num_dspark_stages(self) -> int:
+        """Number of DSpark draft stages, by the weights (3).
+
+        Deliberately a plan constant rather than
+        ``num_nextn_predict_layers``: see
+        :data:`CONTRADICTED_CHECKPOINT_FIELDS`.
+        """
+        return NUM_DSPARK_STAGES
+
+    @property
+    def dspark_main_hidden_size(self) -> int:
+        """Width of the drafter's ``main_proj`` input.
+
+        The target contributes one hc-bundle MEAN per configured target layer
+        and the drafter concatenates them (``dsv4_ref/model.py:851-853``,
+        ``:920-925``), so the width is ``hidden_size * len(target_layers)`` =
+        12288 for the pinned config — which is exactly the checkpoint's
+        ``mtp.0.main_proj.weight`` ``[4096, 12288]``.
+        """
+        return self.hidden_size * len(self.dspark_target_layer_ids)
+
+    def dspark_block_fp8_linear_plan(
+        self, tp_size: int
+    ) -> list[tuple[str, int, str, int]]:
+        """Block-FP8 linear inventory for ONE DSpark stage.
+
+        Same tuple shape and same ``k_local % 128 == 0`` obligation as
+        :meth:`block_fp8_linear_plan`; the factory enforces both lists.
+
+        Two shape facts that differ from the main stack and matter:
+
+        * ``wq_a`` and ``wkv`` are NOT fused here. The main stack fuses them
+          because both consume the same normed hidden state; the drafter's
+          ``wkv`` runs on ``main_x`` (the projected target hidden) at one
+          cadence and on the draft block at another
+          (``dsv4_ref/model.py:766-780``), so a fused stack would have to be
+          evaluated twice on different inputs. The checkpoint agrees: it
+          ships ``mtp.{s}.attn.wq_a`` and ``mtp.{s}.attn.wkv`` as separate
+          tensors with separate scales (key census §A).
+        * stage 0 adds ``main_proj`` ``[hidden_size, 12288]``, replicated in
+          K. 12288 % 128 == 0, so the block-alignment invariant holds and the
+          column-parallel ``N_local = 64`` shard is admissible under the
+          LD-11 envelope (assessment §3).
+        """
+        return [
+            ("attn.wq_a", self.hidden_size, "replicated", self.hidden_size),
+            ("attn.wkv", self.hidden_size, "replicated", self.hidden_size),
+            ("attn.wq_b", self.q_lora_rank, "column", self.q_lora_rank),
+            ("attn.wo_a", self.kv_lora_rank, "column", self.kv_lora_rank),
+            (
+                "attn.wo_b",
+                self.o_groups * self.o_lora_rank,
+                "row",
+                (self.o_groups * self.o_lora_rank) // tp_size,
+            ),
+            (
+                "ffn.shared_experts.gate_up_proj",
+                self.hidden_size,
+                "column",
+                self.hidden_size,
+            ),
+            (
+                "ffn.shared_experts.down_proj",
+                self.moe_intermediate_size,
+                "row",
+                self.moe_intermediate_size // self.shared_expert_tp,
+            ),
+            (
+                "main_proj",
+                self.dspark_main_hidden_size,
+                "replicated",
+                self.dspark_main_hidden_size,
+            ),
         ]
 
     # ------------------------------------------------------------------

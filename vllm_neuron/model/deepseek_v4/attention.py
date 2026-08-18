@@ -1565,6 +1565,19 @@ class DeepseekV4Attention(nn.Module):
         q = query.reshape(batch, self.num_local_heads, self.head_dim)
         pos = positions.reshape(batch)
 
+        # <-- The SWA leg's block table is TRIMMED at decode. The runner
+        # replaces a SlidingWindowSpec group's ``block_table_tensor`` with a
+        # window-relevant gather and publishes ``swa_kv_pos_offset`` =
+        # start_block * block_size (``neuron_model_runner.py:3966-3985``);
+        # feeding absolute positions against that trimmed table reads the
+        # wrong blocks for every sequence past the trimmed span. The offset
+        # applies to the SWA leg ONLY — the compressed leg's table is a
+        # FullAttentionSpec one and its causal cap needs absolute positions —
+        # which is why it is a separate op argument rather than a shift of
+        # ``positions``. Absent (prefill, or a short-sequence decode) it is
+        # None and nothing shifts.
+        swa_pos_offset = swa_md.get("swa_kv_pos_offset")
+
         if self.has_compressed_cache:
             latent_md = attn_metadata[prefix]
             return NF.mla_decode_attention(
@@ -1592,6 +1605,7 @@ class DeepseekV4Attention(nn.Module):
                 swa_scale_cache=self.swa_v_cache,
                 swa_widths=(self.head_dim,),
                 swa_block_table=swa_md["block_table_tensor"],
+                swa_pos_offset=swa_pos_offset,
                 nope_dim=self.nope_head_dim,
                 rope_dim=self.rope_head_dim,
                 quant_group_size=_KV_QUANT_GROUP,
@@ -1617,6 +1631,7 @@ class DeepseekV4Attention(nn.Module):
             swa_scale_cache=self.swa_v_cache,
             swa_widths=(self.head_dim,),
             swa_block_table=swa_md["block_table_tensor"],
+            swa_pos_offset=swa_pos_offset,
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
             quant_group_size=_KV_QUANT_GROUP,
