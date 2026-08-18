@@ -1564,8 +1564,8 @@ class DeepseekV4Attention(nn.Module):
         | ``layers.{i}.self_attn.rope``               | 1     | 128       | None   | compressed |
         | ``layers.{i}.self_attn.swa``                | 1     | 512       | 128    | every layer|
         | ``layers.{i}.self_attn.indexer``            | 1     | 128       | None   | C4 layer   |
-        | ``layers.{i}.self_attn.compressor``         | 1     | 2048/1024 | 8/128  | compressed |
-        | ``layers.{i}.self_attn.indexer_compressor`` | 1     | 512       | 8      | C4 layer   |
+        | ``layers.{i}.self_attn.compressor``         | 1     | 2080/1040 | 8/128  | compressed |
+        | ``layers.{i}.self_attn.indexer_compressor`` | 1     | 520       | 8      | C4 layer   |
 
         Column layout, written by this module and read by the ``NF`` ops
         through their ``*_widths`` / ``*_scale_cache`` arguments:
@@ -1581,10 +1581,16 @@ class DeepseekV4Attention(nn.Module):
           ``v_cache[0:4]`` = its 4 group-32 scales.
         * ``self_attn.compressor`` / ``self_attn.indexer_compressor``: the two
           compressors' RAW per-token rows, the cross-step state R-12 candidate
-          A introduces. ``k_cache`` = ``[kv codes | gate codes]``, each
-          ``proj_width`` wide (``coff * head_dim``: 1024 at ratio 4, 512 at
-          ratio 128, 256 for the indexer's nested copy); ``v_cache`` = their
-          group-64 UE8M0 scales in the same column order. Both are
+          A introduces. Both tensors of the pair carry a TWO-LIMB FP8
+          encoding (``value = (limb1 + limb2 / 16) * scale``, see
+          ``_STATE_LIMB_SHIFT``), so
+          ``k_cache = [kv limb1 | gate limb1 | kv scales | gate scales]`` and
+          ``v_cache = [kv limb2 | gate limb2]`` — the pair's second tensor is
+          where the residual limb lives, exactly as the ``.swa`` leg puts its
+          scales there. Width is therefore
+          ``2*proj_width + 2*(proj_width/64)`` = **2080** at ratio 4,
+          **1040** at ratio 128 and **520** for the indexer's nested copy
+          (``proj_width = coff * head_dim`` = 1024 / 512 / 256). Both legs are
           ``SlidingWindowSpec`` at ``window`` raw slots, so they are
           window-bounded, not context-bounded. Read
           :class:`CompressorState` for the FP8-storage and validity
@@ -1601,6 +1607,15 @@ class DeepseekV4Attention(nn.Module):
         ``window``-bounded (128 slots per sequence per layer = 128 KiB)
         rather than context-bounded, while the compressed pool at ratio 4 is
         ``max_seq_len / 4`` slots — the leg that actually sets capacity.
+
+        The two state legs cost ``2 * width`` B per slot — 4160 B at ratio 4,
+        2080 B at ratio 128, 1040 B for the indexer's — over ``window`` raw
+        slots. **Block granularity rounds the C4 window up**: a ratio-4 leg
+        needs only ``window = 8`` slots, but the runner allocates whole
+        blocks, so at the usual ``block_size = 32`` each sequence pays 32
+        slots, i.e. 4x the declared window. That rounding is what the
+        capacity table in the authored inventory prices; it is a footprint
+        fact, not a correctness one.
 
         Args:
             layer_idx: The layer to declare for. Passed explicitly rather
