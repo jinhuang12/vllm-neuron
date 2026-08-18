@@ -190,7 +190,10 @@ def moe_tkg(
         )
     else:
         raise NotImplementedError(
-            f"moe_tkg currently only supports MXFP4 weights on Trn3, but got {expert_gate_up_weights.dtype=}"
+            "moe_tkg supports MXFP4 (uint16), MXFP8 (uint32) and BF16 weights on "
+            f"a Neuron device or CPU with the NKI simulator, but got "
+            f"{expert_gate_up_weights.dtype=} on {hidden_input.device}. There is "
+            "no torch fallback for this op."
         )
 
 
@@ -206,14 +209,28 @@ def _can_use_kernel(
 
     Kernel constraints checked:
         - Must be running on Neuron device or CPU with NKI simulator
-        - Must use MXFP4 or BF16 weights
+        - Must use MXFP4, MXFP8 or BF16 weights
     """
     if not can_run_kernel(hidden_input):
         return False
 
-    # TODO: validate MXFP8 with MoE kernel, then auto-enable
     if expert_down_weights.dtype == torch.uint16:
         return True  # MXFP4 always uses kernel
+
+    if expert_down_weights.dtype == torch.uint32:
+        # MXFP8. ADDITIVE: this admits a dtype the gate previously refused and
+        # changes nothing for the uint16 / bfloat16 paths above, so no existing
+        # family's behaviour moves.
+        #
+        # The wrapper this gate dispatches into already reinterprets uint32 as
+        # ``float8_e4m3fn_x4`` (``moe_tkg_wrapper.py:62-70``), i.e. the kernel
+        # side has always supported MXFP8; only the gate did not admit it,
+        # under a "TODO: validate MXFP8 with MoE kernel, then auto-enable"
+        # comment. Refusing it was not a fallback: this function's caller
+        # RAISES ``NotImplementedError`` when the gate says no
+        # (``moe_tkg.py:191-194``), so an MXFP8 checkpoint could not take the
+        # decode MoE path at all.
+        return True
 
     if expert_down_weights.dtype == torch.bfloat16:
         return True
