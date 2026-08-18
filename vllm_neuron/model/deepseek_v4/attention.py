@@ -85,6 +85,20 @@ _FP8_MAX: float = 448.0
 #: FP4 E2M1 absolute maximum (``dsv4_ref/kernel.py:134``).
 _FP4_MAX: float = 6.0
 
+#: Smallest power of two ``float8_e4m3fn`` represents (its min SUBNORMAL).
+#: A UE8M0 dequant scale below this reads back as zero out of an FP8 cache,
+#: which wipes its whole group rather than degrading it, so the compressor's
+#: state encoding floors every stored scale here.
+_FP8_MIN_SCALE: float = 2.0**-9
+
+#: Weight of the second FP8 limb in the compressor's cross-step state:
+#: ``value = (limb1 + limb2 / shift) * scale``. Chosen as the largest power of
+#: two for which a limb-1 residual still fits ``[-448, 448]`` in limb 2 --
+#: limb 1's worst-case residual is ``448 / 8 / 2 = 28`` code units and
+#: ``28 * 16 = 448``. See
+#: :attr:`DeepseekV4KVCompressor.state_pair_width`.
+_STATE_LIMB_SHIFT: float = 16.0
+
 #: The latent NoPE dims are quantized in groups of 64
 #: (``dsv4_ref/model.py:512``, ``:378``: ``act_quant(kv[..., :-rd], 64,
 #: ...)``), giving ``448 / 64 = 7`` scales per slot.
@@ -704,15 +718,29 @@ class DeepseekV4KVCompressor(nn.Module):
     def state_pair_width(self) -> int:
         """``head_size`` of this compressor's :class:`CompressorState` leg.
 
-        Both raw rows are ``proj_width`` wide and both are needed, so one KV
-        pair carries them side by side: ``kv`` in the lower half of
-        ``k_cache``, the gate row in the upper half, and the matching group-64
-        scales in the same column order in ``v_cache``. Concatenating the
-        scales in that order is what makes
-        :func:`_gather_scale_columns`'s in-order group expansion line up with
-        the concatenated codes, which is why the halves are not interleaved.
+        Layout, per slot, with ``pw = proj_width`` and
+        ``ng = pw // 64`` scale groups::
+
+            k_cache: [ kv limb1 (pw) | gate limb1 (pw) | kv s (ng) | gate s (ng) ]
+            v_cache: [ kv limb2 (pw) | gate limb2 (pw) | unused             ]
+
+        so ``head_size = 2 * pw + 2 * ng``.
+
+        WHY TWO LIMBS. A single FP8 code per value costs 3 mantissa bits, i.e.
+        about 6% relative. On the VALUE rows that is the family's ordinary KV
+        precision, but the gate rows are softmax LOGITS: a 6% error on a logit
+        of 5 moves its pooling weight by ~30%, and the CPU check measured
+        ~1.2e-1 relative error on the pooled latent from exactly that. The
+        second limb is the residual ``x/s - limb1`` scaled by
+        :data:`_STATE_LIMB_SHIFT`, so it needs no scale of its own and
+        reconstruction is ``(limb1 + limb2 / shift) * s``. It buys roughly four
+        more mantissa bits for ``2 * ng`` extra columns — 1.6% of the leg.
+
+        The single-limb form remains the recorded footprint/simplicity lever
+        (drop limb2, ``head_size = 2 * pw + 2 * ng`` becomes ``2 * pw``) if the
+        measured accuracy ever says the second limb is not paying for itself.
         """
-        return 2 * self.proj_width
+        return 2 * self.proj_width + 2 * (self.proj_width // _KV_QUANT_GROUP)
 
     @property
     def state_window(self) -> int:
@@ -902,6 +930,32 @@ class DeepseekV4KVCompressor(nn.Module):
     # ------------------------------------------------------------------
     # Cross-step raw-row state (R-12, candidate A)
     # ------------------------------------------------------------------
+    def _encode_state_row(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Two-limb FP8 encoding of ``[T, proj_width]``: ``(limb1, limb2, scale)``.
+
+        ``x ~= (limb1 + limb2 / _STATE_LIMB_SHIFT) * scale``, the scale being
+        one group-64 UE8M0 power of two exactly as
+        :func:`_quant_fp8_ue8m0` produces. See
+        :attr:`state_pair_width` for why the second limb exists.
+
+        The scale is floored at :data:`_FP8_MIN_SCALE`. It has to be, because
+        the scale itself is stored in an FP8 cache: a group whose absmax is
+        below ~0.9 would otherwise want a scale under ``2**-9``, which is not
+        representable in ``e4m3`` and reads back as ZERO, wiping the whole
+        group's value rather than degrading it. Flooring costs a little
+        relative precision in exactly the groups that contribute least.
+        """
+        limb1, scale = _quant_fp8_ue8m0(x)
+        scale = scale.clamp_min(_FP8_MIN_SCALE)
+        expanded = _dequant_fp8(
+            torch.ones_like(limb1, dtype=torch.float32), scale, _KV_QUANT_GROUP
+        )
+        residual = (x / expanded - limb1.to(torch.float32)) * _STATE_LIMB_SHIFT
+        limb2 = torch.clamp(residual, -_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+        return limb1, limb2, scale
+
     def _write_state(
         self,
         state: CompressorState,
@@ -910,31 +964,36 @@ class DeepseekV4KVCompressor(nn.Module):
     ) -> None:
         """Store this forward's raw ``(kv, gate)`` rows for later steps.
 
-        Both rows go into ONE pair: codes side by side in ``k_cache``, their
-        group-64 UE8M0 scales in the same column order in ``v_cache``. The
-        codes are cast to fp32 before the concat because ``torch.cat`` on FP8
-        is avoided port-wide (the SWA write does the same); the cast is exact,
-        every FP8 value being representable in fp32, and
-        :func:`_masked_scatter_rows` casts back.
+        Column layout is the one :attr:`state_pair_width` documents. Codes are
+        cast to fp32 before the concat because ``torch.cat`` on FP8 is avoided
+        port-wide (the SWA write does the same); the cast is exact, every FP8
+        value being representable in fp32, and :func:`_masked_scatter_rows`
+        casts back.
 
         The mapping is the RAW per-token one, not
         :meth:`DeepseekV4Attention._coarse_slots`: every token's rows are
         state, while only a window-CLOSING token's pooled value is a
         compressed-cache entry.
         """
-        kv_codes, kv_scales = _quant_fp8_ue8m0(kv_rows)
-        score_codes, score_scales = _quant_fp8_ue8m0(score_rows)
+        kv1, kv2, kv_scale = self._encode_state_row(kv_rows)
+        gate1, gate2, gate_scale = self._encode_state_row(score_rows)
         _masked_scatter_rows(
             state.k_cache,
             state.slot_mapping,
             torch.cat(
-                (kv_codes.to(torch.float32), score_codes.to(torch.float32)), dim=-1
+                (
+                    kv1.to(torch.float32),
+                    gate1.to(torch.float32),
+                    kv_scale,
+                    gate_scale,
+                ),
+                dim=-1,
             ),
         )
         _masked_scatter_rows(
             state.v_cache,
             state.slot_mapping,
-            torch.cat((kv_scales, score_scales), dim=-1),
+            torch.cat((kv2.to(torch.float32), gate2.to(torch.float32)), dim=-1),
         )
 
     def _merge_state(
@@ -1002,12 +1061,22 @@ class DeepseekV4KVCompressor(nn.Module):
         slots = blocks * block_size + torch.remainder(local, block_size)
 
         width = self.state_pair_width
-        rows = _gather_cache_rows(state.k_cache, slots, width) * _gather_scale_columns(
-            state.v_cache, slots, width // _KV_QUANT_GROUP, _KV_QUANT_GROUP
-        )
+        pw = self.proj_width
+        ng = pw // _KV_QUANT_GROUP
+        limb1 = _gather_cache_rows(state.k_cache, slots, width)
+        limb2 = _gather_cache_rows(state.v_cache, slots, width)
+
+        def decode(offset: int, scale_offset: int) -> torch.Tensor:
+            scale = limb1[..., 2 * pw + scale_offset : 2 * pw + scale_offset + ng]
+            expanded = scale.unsqueeze(-1).expand(*scale.shape, _KV_QUANT_GROUP)
+            return (
+                limb1[..., offset : offset + pw]
+                + limb2[..., offset : offset + pw] / _STATE_LIMB_SHIFT
+            ) * expanded.reshape(*scale.shape[:-1], pw)
+
         pick = from_state[:lead].unsqueeze(-1)
-        head_kv = torch.where(pick, rows[..., : self.proj_width], kv_win[:lead])
-        head_score = torch.where(pick, rows[..., self.proj_width :], score_win[:lead])
+        head_kv = torch.where(pick, decode(0, 0), kv_win[:lead])
+        head_score = torch.where(pick, decode(pw, ng), score_win[:lead])
         if lead == tokens:
             return head_kv, head_score
         return (
