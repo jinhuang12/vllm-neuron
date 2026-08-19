@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from .argsort_unstable import argsort_unstable
+# <-- deepseek_v4 (LD-11): the checkpoint's 128x128 block-FP8 linear. The one
+# NEW kernel triad this port authors; every other deepseek_v4 row took a
+# torch-composition or existing-op rung. Seven call sites reach it through
+# `NF.block_fp8_linear`, so without this re-export the name does not resolve
+# at call time.
+from .block_fp8_linear import block_fp8_linear
 from .spec_decode_correction import (
     correct_spec_decode_positions_and_slot_mapping as correct_spec_decode_positions_and_slot_mapping,
 )  # noqa: F401
@@ -55,6 +61,7 @@ __all__ = [
     "all_to_all",
     "all_to_all_v",
     "attention_decode",
+    "block_fp8_linear",
     "build_all2all_combine_metadata",
     "build_all2all_dispatch_metadata",
     "build_blockwise_mapping",
