@@ -146,10 +146,16 @@ def _block_fp8_linear_nki(
     * ``nisa.nc_matmul`` contracts along the PARTITION axis of both operands
       (``dst = stationary.T @ moving``), so both operands need K on partitions.
       ``x`` is ``[M, K]`` and ``weight_fp8`` is ``[N, K]`` -- both K-minor --
-      so exactly one transpose per operand is unavoidable. Both are done with
-      ``nisa.dma_transpose``, measured exact on 1-byte data in this venue's CPU
-      simulator; the TensorE transpose path is NOT used because on
-      NeuronCore-v3 its FP8 mode writes 16-bit PSUM elements.
+      so exactly one transpose per operand is unavoidable. Both go through
+      ``nisa.dma_transpose`` in a BF16 STAGING TILE, never on the 1-byte data
+      directly -- see the two transpose sites below for the measured reason and
+      for why the bf16 round trip is exact. (SUPERSEDED IN PLACE, iteration 3:
+      this bullet used to say both transposes were done on the fp8 data
+      directly, "measured exact on 1-byte data in this venue's CPU simulator",
+      with TensorE avoided because "on NeuronCore-v3 its FP8 mode writes 16-bit
+      PSUM elements". The simulator measurement was real and the conclusion was
+      still wrong: the simulator does not run the MLIR verifier, which rejects a
+      1-byte ``dma_transpose`` destination outright.)
     * The moving free dimension may be up to 512 on this generation, but the
       N tile is deliberately ONE 128-wide weight block, because then the whole
       per-partial scale ``a_scale[m, kb] * w_scale[nb, kb]`` is a single
@@ -185,15 +191,57 @@ def _block_fp8_linear_nki(
     # -- weights: one transposed [K_block, N_block] fp8 tile per block, once --
     # Free-axis layout is k-block major: tile (kb, nb) occupies
     # ``wT[:, kb * N + n0 : kb * N + n0 + n_sz]``.
+    #
+    # THE TRANSPOSE GOES THROUGH A BF16 STAGING TILE, and the measurement is
+    # why. ``nisa.dma_transpose`` straight into the fp8 tile -- what this loop
+    # used to do -- is rejected by the installed wheel's MLIR verifier:
+    #
+    #     nki/isa/_transpose.py:640:9: error: 'nisa.dma_transpose' op 'dst' must
+    #     be not a 1-byte or packed MX type (int8, uint8, float8, and packed MX
+    #     x4 are excluded), got 'f8E4M3'
+    #
+    # The NKI CPU simulator does not run that verifier, which is why simulator
+    # validation passed the 1-byte form for two iterations. The SAME call with a
+    # 2-byte destination compiles, so the rejection is the byte width and not the
+    # call, the shapes, or the tiling.
+    #
+    # Widening to bf16 and narrowing back is EXACT, not approximately exact:
+    # every finite ``float8_e4m3`` value is exactly representable in bfloat16 (4
+    # exponent bits inside 8, 3 mantissa bits inside 7), so both copies are the
+    # identity on the fp8 grid and ``dma_transpose`` only moves bytes. The matmul
+    # operands stay fp8, so the matmul dtype, the ue8m0 scaling and the LD-24
+    # legacy-grid encoding settlement are all untouched.
+    #
+    # ``nisa.nc_transpose`` on TensorE with an fp8 PSUM destination ALSO compiles
+    # and is cheaper (one instruction plus the PSUM eviction). It is deliberately
+    # not used: its exactness rests on the wheel's claim that Tensor Engine
+    # transpose is bit-accurate from NeuronCore-v3 on, which is credible but is a
+    # vendor claim rather than something a device-free venue can observe --
+    # the same rule that picked the exact reciprocal below over
+    # ``nisa.reciprocal``. Recorded for a later perf rung with device evidence.
+    # Also measured and rejected: ``nl.load_transpose2d`` (a thin wrapper over
+    # the same forbidden op, identical diagnostic), ``nc_transpose`` with an SBUF
+    # dst (forces VectorE, capped at [32, 32]), ``nl.transpose`` (yields a PSUM
+    # tile, and ``moving`` must be in SBUF), and one ``dma_copy`` per output
+    # column (compiles, but 128 descriptors per tile).
+    #
+    # Cost: two extra ``tensor_copy`` instructions and one transient bf16 tile
+    # per transposed block. A perf trade for the perf report, like the
+    # one-128-wide-N-tile choice and the unsharded LNC-2 launch (R-8).
     wT = nl.ndarray((P, KB * N), dtype=weight_fp8.dtype, buffer=nl.sbuf)
     for nb in range(NB):
         n0 = nb * P
         n_sz = min(P, N - n0)
         for kb in range(KB):
             k0 = kb * P
-            nisa.dma_transpose(
-                dst=wT[:, kb * N + n0 : kb * N + n0 + n_sz],
-                src=weight_fp8[n0 : n0 + n_sz, k0 : k0 + P],
+            w_sb = nl.ndarray((n_sz, P), dtype=weight_fp8.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(w_sb, weight_fp8[n0 : n0 + n_sz, k0 : k0 + P])
+            w_wide = nl.ndarray((n_sz, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=w_wide, src=w_sb)
+            wT_wide = nl.ndarray((P, n_sz), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_transpose(dst=wT_wide, src=w_wide)
+            nisa.tensor_copy(
+                dst=wT[:, kb * N + n0 : kb * N + n0 + n_sz], src=wT_wide
             )
 
     ones = nl.full((1, P), 1.0, dtype=nl.float32, buffer=nl.sbuf)
@@ -325,9 +373,21 @@ def _block_fp8_linear_nki(
                 op1=nl.minimum,
                 operand1=fp8_max,
             )
+            # QUANTIZE FIRST, THEN WIDEN. The rounding to the fp8 grid happens
+            # exactly once, here; the bf16 staging round trip that follows is the
+            # identity on the values it then transposes (see the weight loop for
+            # the verifier diagnostic that forces the staging tile). Going
+            # fp32 -> bf16 -> fp8 instead would round TWICE and would not be the
+            # same number, so the order of these three copies is load-bearing.
             codes = nl.ndarray((m_sz, P), dtype=weight_fp8.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(dst=codes, src=clamped)
-            nisa.dma_transpose(dst=xqT[:, kb * m_sz : (kb + 1) * m_sz], src=codes)
+            codes_wide = nl.ndarray((m_sz, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=codes_wide, src=codes)
+            xqT_wide = nl.ndarray((P, m_sz), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_transpose(dst=xqT_wide, src=codes_wide)
+            nisa.tensor_copy(
+                dst=xqT[:, kb * m_sz : (kb + 1) * m_sz], src=xqT_wide
+            )
 
         for nb in range(NB):
             n0 = nb * P
