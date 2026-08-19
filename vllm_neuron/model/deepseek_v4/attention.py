@@ -2408,7 +2408,7 @@ class DeepseekV4Attention(nn.Module):
         token-granular *physical* slot, already block-table-translated by the
         runner (``neuron_model_runner.py:4036-4041``), so that expression
         divided AFTER translation. Every reader of these three legs divides
-        BEFORE translation: ``mla_sparse_attention._translate_rows``
+        BEFORE translation: ``mla_sparse_attention._slot_ids``
         (``:120-131``) takes a sequence-local index, computes
         ``block_of = local_idx // block_size``, gathers the block out of the
         table and only then forms ``blocks * block_size + local_idx %
@@ -2427,7 +2427,7 @@ class DeepseekV4Attention(nn.Module):
         sequence-local frontier ``(positions + 1) // ratio``
         (``sparse_indexer.py:611-649``) and the C128 dense candidate list is a
         sequence-local ``arange``. The three arithmetic steps below are
-        deliberately the same ones ``_translate_rows`` performs, including the
+        deliberately the same ones ``_slot_ids`` performs, including the
         negative-block ``where`` — the null-block sentinel this tree writes
         with ``_remap_null_block_to_sentinel``
         (``neuron_model_runner.py:94``, applied at ``:2190`` and ``:2197``)
