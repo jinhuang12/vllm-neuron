@@ -9,8 +9,10 @@ Three modules, in the order the data flows through them:
   ``gate_bias`` and, on the three hash layers only, the ``tid2eid`` table.
   It produces the per-token expert selection and weights, drives the routed
   experts and the shared expert, and sums the two contributions.
-* :class:`DeepseekV4RoutedExperts` — the 256 routed experts, MXFP8 group-32,
-  four of them resident per core at ``ep_degree=64``.
+* :class:`DeepseekV4RoutedExperts` — the 256 routed experts, 1-byte FP8 with
+  one power-of-two scale per output channel (NOT MX: the MX expert kernels are
+  NeuronCore-v4 and this venue is v3), four of them resident per core at
+  ``ep_degree=64``.
 * :class:`DeepseekV4SharedExpert` — the single always-on expert, block-128x128
   FP8, sharded 16 ways and replicated four times across the TP group.
 
@@ -55,29 +57,29 @@ from .config import DeepseekV4Config
 logger = logging.getLogger(__name__)
 
 
-# <-- MODEL-SPECIFIC: MX scale group extent for the routed experts. The
-# checkpoint stores one E8M0 byte per 32 elements along K
-# (``dsv4_ref/model.py:143-145``: FP4 scale is ``[out, in // fp4_block_size]``
-# with ``fp4_block_size == 32``). The MXFP8 upcast the loader performs keeps
-# the group extent; only the element width changes.
-_MX_GROUP_SIZE = 32
-
-# Number of MX elements packed into one machine word on the expert path. The
-# MoE kernels take their weights bit-cast to a wide integer dtype and
-# reinterpret it (``functional/moe/moe_tkg_wrapper.py``: ``uint32 ->
-# float8_e4m3fn_x4``), so four FP8 elements travel as one ``uint32``.
-_MX_ELEMS_PER_WORD = 4
-
-# MX tile extents the MoE kernels document. ``gate_up`` is tiled
-# ``[E, 128, 2, ceil(H/512), I]``; ``down`` is tiled ``[E, I_p, ceil(I/512), H]``
-# with ``I_p = 128`` once ``I > 512`` (``functional/moe/moe_tkg.py:62,70-72``).
-_MX_TILE_ROWS = 128
-_MX_TILE_K = 512
+# RETIRED (LD-21): ``_MX_GROUP_SIZE``, ``_MX_ELEMS_PER_WORD``,
+# ``_MX_TILE_ROWS`` and ``_MX_TILE_K`` parameterized the MX tiled layouts.
+# The checkpoint's group-32 E8M0 grid still exists on disk — the loader reads
+# it (``weight_loaders.py`` ``_MX_GROUP``) — but this module never sees it: the
+# groups are folded into one per-output-channel scale at load time (LD-23), so
+# no group extent reaches the forward. The MX expert kernels are
+# NeuronCore-v4 and cannot execute on this campaign's trn2 (= v3) venue at all
+# (R-13), so the routed experts now take the gen3-legal PLAIN layouts and there
+# is no tiling left to parameterize. Kept as a comment, not as dead constants
+# that read like a live contract.
 
 # >>> PARALLELISM: block extent for the prefill blockwise mapping. Must be a
 # multiple of 128 (``functional/moe/moe_cte.py:198``). 256 is what gpt_oss
 # uses at the same hidden size, so the block-count arithmetic is already
 # exercised at this shape. <<<
+#
+# LD-21: 256 is now also MANDATORY, not merely convenient. The gen3-legal
+# quantized prefill implementation is ``shard_on_i``, whose own compatibility
+# check asserts ``block_size % 256 == 0``
+# (``nkilib/core/moe/moe_cte/bwmm_shard_on_I.py:660``, reproduced verbatim in
+# ``artifacts/repairs/author_model_family-iter3/iter3-moe-gen3-probe.txt``
+# finding B). Lowering this to 128 does not degrade — it fails kernel
+# validation.
 _MOE_CTE_BLOCK_SIZE = 256
 
 # The block-FP8 contract for the shared expert, frozen by the family
@@ -109,6 +111,37 @@ def _moe_kernel_enums() -> tuple:
         _cte_mod.ExpertAffinityScaleMode,
         _tkg_mod.MoEAllToAllVStrategy,
     )
+
+
+def _nki_output_dtype(torch_dtype: torch.dtype):
+    """Map a torch dtype to the NKI dtype ``nkilib``'s ``moe_tkg`` requires.
+
+    ``moe_tkg`` sizes its output allocation with
+    ``sizeinbytes(output_dtype)`` (``nkilib/core/moe/moe_tkg/moe_tkg.py:264``),
+    which ``kernel_assert``s "dtype size unknown!" on a torch dtype
+    (``nkilib/core/utils/allocator.py:54``). Deferred import for the same
+    reason as :func:`_moe_kernel_enums`: this module must import on a host with
+    no Neuron toolchain.
+
+    Only the dtypes this family's activations can actually be are mapped. An
+    unmapped dtype raises here rather than reaching the kernel's assert, so the
+    error names the model's dtype instead of the allocator's internals.
+    """
+    import nki.language as nl
+
+    mapping = {
+        torch.bfloat16: nl.bfloat16,
+        torch.float32: nl.float32,
+        torch.float16: nl.float16,
+    }
+    try:
+        return mapping[torch_dtype]
+    except KeyError:
+        raise ValueError(
+            f"DeepseekV4 MoE decode cannot map activation dtype {torch_dtype} "
+            "to an NKI output dtype for moe_tkg. Expected bfloat16 (the served "
+            "dtype), float32 or float16."
+        ) from None
 
 
 def _resolve_ep(config: DeepseekV4Config) -> tuple[int, int, object]:
@@ -154,18 +187,34 @@ class DeepseekV4RoutedExperts(nn.Module):
     <-- MODEL-SPECIFIC: 256 experts, top-6, SwiGLU with the asymmetric
     ``swiglu_limit`` clamp, ``w1`` = gate / ``w3`` = up / ``w2`` = down.
 
-    <-- MXFP8: the checkpoint stores these experts as MXFP4
-    (``float4_e2m1fn_x2`` elements, ``[out, in // 32]`` E8M0 scales —
-    ``dsv4_ref/model.py:140-145``). Trainium2 has no FP4 datapath, so the
-    loader upcasts the elements to ``float8_e4m3fn`` and preserves the
-    group-32 scale grid. This class consumes ONLY that upcast form.
+    <-- FP8 PER-CHANNEL (LD-21/LD-23): the checkpoint stores these experts as
+    MXFP4 (``float4_e2m1fn_x2`` elements, ``[out, in // 32]`` E8M0 scales —
+    ``dsv4_ref/model.py:140-145``). Trainium2 has no FP4 datapath AND no MX
+    datapath: ``nisa.nc_matmul_mx`` / ``nisa.quantize_mx`` are NeuronCore-v4
+    instructions, and this venue is v3 (R-13). So the loader requantizes to
+    1-byte legacy-E4M3 elements plus ONE fp32 power-of-two scale per output
+    channel, which is the form the gen3-legal MoE entry points take:
+    ``NF.moe_cte`` non-MX ``shard_on_i`` (PER_CHANNEL) at prefill and
+    ``NF.moe_tkg`` ``QuantizationType.ROW`` at decode. Both were proven on the
+    installed wheel before this class was written —
+    ``artifacts/repairs/author_model_family-iter3/iter3-moe-gen3-probe.txt``.
 
-    Parameter shapes are the family contract's, i.e. the *logical*
-    ``[E_local, out, in]`` orientation. The MoE kernels want the same bytes
-    in their tiled MX layout, and the two are byte-for-byte the same size at
-    this model's dimensions (see :meth:`_gate_up_weight`), so the loader
-    writes tiled bytes into these buffers and this class reinterprets them
-    with pure ``view`` calls — no runtime repacking.
+    THE 1-BYTE DTYPE IS A CARRIER, NOT AN ENCODING CLAIM. The parameters are
+    declared ``torch.float8_e4m3fn`` because that is the only 1-byte float
+    torch has, but the BYTES inside them are legacy ``nl.float8_e4m3`` (bias 7,
+    amax 240), written by the loader from a byte table and exponent-field
+    arithmetic. That is correct rather than merely tolerated: on trn2 the
+    plugin maps ``torch.float8_e4m3fn`` to ``nl.float8_e4m3`` in both
+    directions (``nki/nki_dtype.py:43,51-53``), so the kernel decodes exactly
+    the encoding the loader wrote. Never convert these tensors through torch's
+    own fp8 cast — that is the OCP ``e4m3fn`` encoding (amax 448) and would
+    reinterpret every exponent.
+
+    Parameter shapes are the *contraction-first* ``[E_local, in, out]``
+    orientation, which is what the kernels take (``gate_up`` ``[E, H, 2, I]``,
+    ``down`` ``[E, I, H]``). The loader writes them already transposed, because
+    this class reinterprets with pure ``view`` calls — no runtime repacking —
+    and a ``view`` cannot transpose.
     """
 
     def __init__(
@@ -213,139 +262,104 @@ class DeepseekV4RoutedExperts(nn.Module):
         # (``dsv4_ref/model.py:625-626``). <<<
         self.local_expert_start = self.ep_rank * self.num_local_experts
 
-        num_mx_groups_h = self.hidden_size // _MX_GROUP_SIZE
-        num_mx_groups_i = self.intermediate_size // _MX_GROUP_SIZE
-
-        # <-- MXFP8: w1 = gate projection, w3 = up projection
+        # <-- FP8 PER-CHANNEL: w1 = gate projection, w3 = up projection
         # (``dsv4_ref/model.py:602-603``: ``gate = self.w1(x)``,
-        # ``up = self.w3(x)``). Both are ``[out=I, in=H]``, i.e. the
-        # ``[out, in]`` orientation the checkpoint already uses — do NOT
-        # transpose.
-        expert_shape = (self.num_local_experts, self.intermediate_size, self.hidden_size)
-        scale_shape = (self.num_local_experts, self.intermediate_size, num_mx_groups_h)
+        # ``up = self.w3(x)``). Logically ``[out=I, in=H]``; stored
+        # CONTRACTION-FIRST as ``[in=H, out=I]`` because the kernels take
+        # ``gate_up`` as ``[E, H, 2, I]`` and this class only ``view``s.
+        # The loader writes the transpose (LD-23).
+        expert_shape = (self.num_local_experts, self.hidden_size, self.intermediate_size)
+        # ONE fp32 power-of-two multiplier per OUTPUT channel. Not a group
+        # grid: the gen3-legal kernels take PER_CHANNEL / ROW scales only, and
+        # the group-32 exponents were folded into these at load time.
+        scale_shape = (self.num_local_experts, self.intermediate_size)
         self.w1_weight = nn.Parameter(
             torch.empty(*expert_shape, dtype=torch.float8_e4m3fn), requires_grad=False
         )
         self.w1_scale = nn.Parameter(
-            torch.empty(*scale_shape, dtype=torch.uint8), requires_grad=False
+            torch.empty(*scale_shape, dtype=torch.float32), requires_grad=False
         )
         self.w3_weight = nn.Parameter(
             torch.empty(*expert_shape, dtype=torch.float8_e4m3fn), requires_grad=False
         )
         self.w3_scale = nn.Parameter(
-            torch.empty(*scale_shape, dtype=torch.uint8), requires_grad=False
+            torch.empty(*scale_shape, dtype=torch.float32), requires_grad=False
         )
 
-        # <-- MXFP8: w2 = down projection, ``[out=H, in=I]``.
+        # <-- FP8 PER-CHANNEL: w2 = down projection, logically ``[out=H, in=I]``,
+        # stored contraction-first as ``[in=I, out=H]`` — which is exactly the
+        # ``down`` layout the kernels document, so no fuse and no view here.
         self.w2_weight = nn.Parameter(
             torch.empty(
                 self.num_local_experts,
-                self.hidden_size,
                 self.intermediate_size,
+                self.hidden_size,
                 dtype=torch.float8_e4m3fn,
             ),
             requires_grad=False,
         )
         self.w2_scale = nn.Parameter(
             torch.empty(
-                self.num_local_experts,
-                self.hidden_size,
-                num_mx_groups_i,
-                dtype=torch.uint8,
+                self.num_local_experts, self.hidden_size, dtype=torch.float32
             ),
             requires_grad=False,
         )
 
-        # MX tile extents, derived once so forward stays free of arithmetic.
-        self._h_tiles = math.ceil(self.hidden_size / _MX_TILE_K)
-        self._i_tiles = math.ceil(self.intermediate_size / _MX_TILE_K)
-        self._i_p = (
-            _MX_TILE_ROWS
-            if self.intermediate_size > _MX_TILE_K
-            else self.intermediate_size // _MX_ELEMS_PER_WORD
-        )
-        # One E8M0 byte per 32 elements, four elements per packed word, so a
-        # tile row of packed words covers eight scale groups.
-        self._scale_rows_per_tile = _MX_GROUP_SIZE // _MX_ELEMS_PER_WORD
-
     # ------------------------------------------------------------------
-    # MX layout reinterpretation (pure views; no repacking at runtime)
+    # Kernel layout reinterpretation (views + one fuse; no repacking)
     # ------------------------------------------------------------------
-    def _packed(self, weight: Tensor) -> Tensor:
-        """Bit-cast an FP8 expert weight to the ``uint32`` word view.
-
-        The two-step ``view(uint8).view(uint32)`` is the idiom every existing
-        loader in the repo uses for this (``weight_loaders_mx_fp8.py:315``);
-        it is a reinterpretation, never a numeric conversion, so the E4M3
-        bytes survive intact. ``view`` (not ``reshape``) is deliberate: it
-        raises rather than silently copying if the parameter is ever handed
-        over non-contiguous.
-        """
-        return weight.view(torch.uint8).view(torch.uint32)
-
     def _gate_up_weight(self) -> Tensor:
-        """Fuse ``w1``/``w3`` into the ``[E_L, 128, 2, H/512, I]`` MX buffer.
+        """Fuse ``w1``/``w3`` into the ``[E_L, H, 2, I]`` kernel buffer.
 
-        Both MoE entry points take gate and up as one tensor with the
-        gate/up axis at dim 2 (``functional/moe/moe_tkg.py:70``,
-        ``functional/moe/moe_cte.py:119``). At this model's dimensions the
-        byte counts line up exactly — ``w1`` alone is
-        ``4 x 2048 x 4096`` FP8 bytes = ``4 x 128 x 1 x 8 x 2048`` uint32
-        words — so each parameter reinterprets to one half of the fused
-        buffer and the fuse is a single concatenation.
+        Both MoE entry points take gate and up as one tensor with the gate/up
+        axis at dim 2 (``functional/moe/moe_tkg.py:70``,
+        ``functional/moe/moe_cte.py:119``). Each parameter is already
+        ``[E, H, I]``, so the fuse is one ``view`` to insert the axis plus one
+        concatenation.
 
         RECORDED COST: that concatenation is a real copy on every forward
-        (~64 MiB per layer). It exists only because the interface contract
-        fixes ``w1_weight`` and ``w3_weight`` as separate parameters; a fused
-        ``gate_up`` parameter emitted by ``attach_moe_loaders`` would remove
-        it entirely. Flagged rather than silently absorbed.
+        (~32 MiB per layer at 1 byte per element). It exists only because the
+        interface contract fixes ``w1_weight`` and ``w3_weight`` as separate
+        parameters; a fused ``gate_up`` parameter emitted by
+        ``attach_moe_loaders`` would remove it entirely. Flagged rather than
+        silently absorbed.
         """
-        gate = self._packed(self.w1_weight).view(
-            self.num_local_experts,
-            _MX_TILE_ROWS,
-            1,
-            self._h_tiles,
-            self.intermediate_size,
-        )
-        up = self._packed(self.w3_weight).view(
-            self.num_local_experts,
-            _MX_TILE_ROWS,
-            1,
-            self._h_tiles,
-            self.intermediate_size,
-        )
-        return torch.cat([gate, up], dim=2)
-
-    def _gate_up_scale(self) -> Tensor:
-        """Fuse the group-32 scales into ``[E_L, 16, 2, H/512, I]``.
-
-        Same axis convention as :meth:`_gate_up_weight`; the leading tile
-        extent is ``128 / 8 = 16`` because one packed word carries four
-        elements and one scale covers 32 (``functional/moe/moe_tkg.py:86-88``).
-        """
-        rows = _MX_TILE_ROWS // self._scale_rows_per_tile
-        gate = self.w1_scale.view(
-            self.num_local_experts, rows, 1, self._h_tiles, self.intermediate_size
-        )
-        up = self.w3_scale.view(
-            self.num_local_experts, rows, 1, self._h_tiles, self.intermediate_size
-        )
+        e, h, i = self.num_local_experts, self.hidden_size, self.intermediate_size
+        gate = self.w1_weight.view(e, h, 1, i)
+        up = self.w3_weight.view(e, h, 1, i)
         return torch.cat([gate, up], dim=2)
 
     def _down_weight(self) -> Tensor:
-        """Reinterpret ``w2`` as ``[E_L, I_p, ceil(I/512), H]`` (no copy)."""
-        return self._packed(self.w2_weight).view(
-            self.num_local_experts, self._i_p, self._i_tiles, self.hidden_size
-        )
+        """``w2`` already IS the ``[E_L, I, H]`` ``down`` layout — no view."""
+        return self.w2_weight
 
-    def _down_scale(self) -> Tensor:
-        """Reinterpret the ``w2`` scales as ``[E_L, I_p/8, ceil(I/512), H]``."""
-        return self.w2_scale.view(
-            self.num_local_experts,
-            self._i_p // self._scale_rows_per_tile,
-            self._i_tiles,
-            self.hidden_size,
-        )
+    def _gate_up_scale_row(self) -> Tensor:
+        """``moe_tkg`` ROW gate/up scale: ``[E_L, 2, I]``.
+
+        ``QuantizationType.ROW`` is selected by the mere PRESENCE of a weight
+        scale (``functional/moe/moe_tkg.py:390-410``), and its gate/up scale
+        carries the gate/up axis at dim 1 — the same axis convention as the
+        weight, one dimension shorter.
+        """
+        return torch.stack([self.w1_scale, self.w3_scale], dim=1)
+
+    def _down_scale_row(self) -> Tensor:
+        """``moe_tkg`` ROW down scale: ``[E_L, H]`` — the parameter as stored."""
+        return self.w2_scale
+
+    def _gate_up_scale_per_channel(self) -> Tensor:
+        """``moe_cte`` PER_CHANNEL gate/up scale: ``[E_L, 1, 2*I]``.
+
+        The kernel flattens the fused weight's last two axes, so the fused
+        output-channel axis runs ``[gate_0..gate_{I-1}, up_0..up_{I-1}]`` and
+        the scale must concatenate in exactly that order — a ``stack`` would
+        interleave and silently mis-scale every channel.
+        """
+        return torch.cat([self.w1_scale, self.w3_scale], dim=1).unsqueeze(1)
+
+    def _down_scale_per_channel(self) -> Tensor:
+        """``moe_cte`` PER_CHANNEL down scale: ``[E_L, 1, H]``."""
+        return self.w2_scale.unsqueeze(1)
 
     # ------------------------------------------------------------------
     # Activation clamp
@@ -478,14 +492,50 @@ class DeepseekV4RoutedExperts(nn.Module):
             ]
         )
 
+        # R-17 GUARD. ``_can_use_moe_cte_kernel``'s non-MX branch checks
+        # neither dtype nor scales (``functional/moe/moe_cte.py:584-615``): it
+        # returns ``can_run_kernel(hidden_states)``, which is also False under
+        # ``VLLM_NEURON_DISABLE_NKI_KERNELS``. When it is False the call falls
+        # through to ``_torch_moe_impl`` (``moe_cte.py:448-461``), which takes
+        # NO scale arguments at all — so fp8 experts would be multiplied as raw
+        # E4M3 mantissas with every per-channel multiplier dropped. That is
+        # SILENTLY WRONG output, not an error, and the port plan records the
+        # rule as hard: never route fp8 weights to ``_torch_moe_impl``.
+        # Convert the silence into a refusal here, at the only call site that
+        # can.
+        from vllm_neuron.functional.moe import moe_cte as _cte_mod
+
+        if not _cte_mod.can_run_kernel(hidden_states):
+            raise RuntimeError(
+                "DeepseekV4RoutedExperts prefill cannot run the NKI moe_cte "
+                "kernel on this venue, and its torch fallback "
+                "(_torch_moe_impl) accepts no weight scales. These experts are "
+                "fp8 with per-output-channel scales, so falling back would "
+                "silently drop every multiplier and produce wrong output with "
+                "no error (R-17). Refusing. Run the prefill path on a Neuron "
+                "device with the NKI kernels enabled, or exercise this module "
+                "under the NKI CPU simulator (VLLM_NEURON_CPU_MODE=1 with "
+                "NKI_SIMULATOR=1)."
+            )
+
         return NF.moe_cte(
-            implementation=impl.shard_on_block_mx,
+            # LD-21: ``shard_on_i``, NOT ``shard_on_block``. Both accept fp8
+            # weights with per-channel scales, but ``shard_on_block`` pins
+            # ``gup_scale = down_scale = None`` under a "# Placeholder for FP8"
+            # comment (``nkilib/core/moe/moe_cte/bwmm_shard_on_block.py:245-246``)
+            # while still setting ``is_quant`` from scale presence (:216) — it
+            # accepts the scales and never applies them. Measured on the
+            # installed wheel: rel_err 2.1e+09 vs 5.2e-03 for ``shard_on_i`` at
+            # the same shapes and inputs, with NO kernel error either way
+            # (probe findings A and B). ``shard_on_i`` has the complete
+            # plumbing (``bwmm_shard_on_I.py:304-305,999-1008,1137,1973-2040``).
+            implementation=impl.shard_on_i,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
             gate_up_proj_weight=self._gate_up_weight(),
             down_proj_weight=self._down_weight(),
-            gate_up_proj_scale=self._gate_up_scale(),
-            down_proj_scale=self._down_scale(),
+            gate_up_proj_scale=self._gate_up_scale_per_channel(),
+            down_proj_scale=self._down_scale_per_channel(),
             token_position_to_id=token_position_to_id.to(dtype=torch.int32),
             block_to_expert=block_to_expert.to(dtype=torch.int32),
             block_size=_MOE_CTE_BLOCK_SIZE,
@@ -505,7 +555,14 @@ class DeepseekV4RoutedExperts(nn.Module):
             up_clamp_upper_limit=up_hi,
             up_clamp_lower_limit=up_lo,
             skip_token=True,
-            is_tensor_update_accumulating=True,
+            # LD-21: FALSE for ``shard_on_i``, which returns a plain ``[T, H]``
+            # tensor. The plugin's own trim branch under this flag
+            # (``functional/moe/moe_cte.py:395-402``) indexes ``output[:, 0, :H]``,
+            # which is ``shard_on_block``'s ``[T, 2, H+E]`` allocation and
+            # raises ``IndexError: too many indices for tensor of dimension 2``
+            # on this implementation (probe finding B, leg P2d). Setting this
+            # True here would be a crash, not a slowdown.
+            is_tensor_update_accumulating=False,
         )
 
     def _forward_decode(
@@ -545,8 +602,13 @@ class DeepseekV4RoutedExperts(nn.Module):
             hidden_input=hidden_states,
             expert_gate_up_weights=self._gate_up_weight(),
             expert_down_weights=self._down_weight(),
-            expert_gate_up_weights_scale=self._gate_up_scale(),
-            expert_down_weights_scale=self._down_scale(),
+            # LD-21: presenting these two selects ``QuantizationType.ROW``
+            # (``functional/moe/moe_tkg.py:390-410``), which the installed wheel
+            # dequantizes correctly on a 1-byte fp8 carrier — rel_err 5.068e-03
+            # against the dequantized reference, versus 4.470e-03 for the bf16
+            # control at the same shapes (probe finding C, leg P3c).
+            expert_gate_up_weights_scale=self._gate_up_scale_row(),
+            expert_down_weights_scale=self._down_scale_row(),
             expert_affinities=expert_affinities,
             expert_index=expert_index,
             is_all_expert=True,
@@ -564,7 +626,15 @@ class DeepseekV4RoutedExperts(nn.Module):
             # this module to the runner's bucket shapes.
             is_all_expert_dynamic=False,
             all_to_all_v_strategy=a2a.DISABLED,
-            output_dtype=hidden_states.dtype,
+            # This must be an NKI dtype, NOT a torch dtype. ``nkilib``'s
+            # ``moe_tkg`` calls ``sizeinbytes(output_dtype)``
+            # (``nkilib/core/moe/moe_tkg/moe_tkg.py:264``) and a torch dtype
+            # trips ``kernel_assert`` there with "dtype size unknown!
+            # torch.bfloat16" (``nkilib/core/utils/allocator.py:54``). Line 264
+            # precedes every other validation in that kernel, so this is the
+            # FIRST thing it would fail on. Found by the LD-21 probe; recorded
+            # in iter3-moe-gen3-probe.txt section 2.5.
+            output_dtype=_nki_output_dtype(hidden_states.dtype),
         )
 
     def _ep_tp_group(self):

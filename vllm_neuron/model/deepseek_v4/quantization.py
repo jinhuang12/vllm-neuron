@@ -20,8 +20,14 @@ Two distinct weight formats therefore coexist in one model:
   ``[ceil(N/128), ceil(K/128)]`` UE8M0 scale grid) for the attention
   projections, the shared-expert MLP and the DSA indexer ``wq_b``. Served
   through :func:`vllm_neuron.functional.block_fp8_linear`.
-* **MXFP8 group-32** for the 256 routed experts, upcast from the
-  checkpoint's MXFP4 at load time (Trainium2 has no FP4 datapath).
+* **1-byte FP8 with one power-of-two scale per output channel** for the 256
+  routed experts, requantized from the checkpoint's MXFP4 + group-32 E8M0 at
+  load time (LD-23). Trainium2 has neither an FP4 datapath nor an MX datapath
+  — ``nisa.nc_matmul_mx`` is a NeuronCore-v4 instruction and this venue is v3
+  (R-13) — so the group scales are folded into one per channel, which is what
+  the gen3-legal MoE entry points take (``moe_cte`` PER_CHANNEL, ``moe_tkg``
+  ROW). The fold is bit-exact or it raises at load; see the LD-23 section of
+  ``weight_loaders.py``.
 
 Everything else — the KV compressor, the indexer ``weights_proj``, norms,
 the router gate, embedding and LM head — stays unquantized. That split is
@@ -63,9 +69,27 @@ class QuantScheme(str, Enum):
     #: per-128-element-K-group FP8 activation quantization.
     FP8_BLOCK_128X128 = "fp8_block_128x128"
 
-    #: MXFP8: ``float8_e4m3fn`` weights with group-32 E8M0 scales. The
-    #: checkpoint stores the routed experts as MXFP4; the loader upcasts
-    #: the elements to FP8 and preserves the E8M0 group scales.
+    #: 1-byte FP8 weights with ONE power-of-two dequant scale per OUTPUT
+    #: CHANNEL. The scheme the routed experts are actually served under: the
+    #: loader requantizes the checkpoint's MXFP4 + group-32 E8M0 to this form
+    #: (LD-23), and the gen3-legal MoE entry points consume it as
+    #: ``moe_cte`` PER_CHANNEL / ``moe_tkg`` ROW.
+    #:
+    #: The bytes are LEGACY ``nl.float8_e4m3`` (bias 7, amax 240), not OCP
+    #: ``float8_e4m3fn`` (amax 448). The torch dtype is a 1-byte carrier only;
+    #: on trn2 the plugin maps between the two names
+    #: (``nki/nki_dtype.py:43,51-53``).
+    FP8_E4M3_PER_CHANNEL = "fp8_e4m3_per_channel"
+
+    #: MXFP8: ``float8_e4m3fn`` weights with group-32 E8M0 scales.
+    #:
+    #: UNREFERENCED ON PURPOSE — kept in the enum, assigned to nothing. The MX
+    #: expert kernels lower to ``nisa.nc_matmul_mx`` / ``nisa.quantize_mx``,
+    #: which are NeuronCore-v4 instructions, so no MX weight path is
+    #: executable on this campaign's trn2 (= NeuronCore-v3) venue at any shape
+    #: (R-13). It stays declared because it is the correct scheme name for a
+    #: Trn3 venue, where it becomes assignable again with no other change to
+    #: this module; deleting it would erase that fact from the type.
     MXFP8_GROUP32 = "mxfp8_group32"
 
 
@@ -277,13 +301,15 @@ class QuantizationSpec:
         if expert_dtype_norm not in _SUPPORTED_EXPERT_DTYPES:
             raise ValueError(
                 f"Unsupported expert_dtype={expert_dtype_norm!r}. DeepseekV4 on "
-                f"Neuron supports: {list(_SUPPORTED_EXPERT_DTYPES)} (upcast to "
-                "MXFP8 group-32 at load; Trainium2 has no FP4 datapath)."
+                f"Neuron supports: {list(_SUPPORTED_EXPERT_DTYPES)} "
+                "(requantized at load to 1-byte legacy-E4M3 with one "
+                "power-of-two scale per output channel: Trainium2 has neither "
+                "an FP4 datapath nor an MX datapath)."
             )
 
         return cls(
             linear_scheme=QuantScheme.FP8_BLOCK_128X128,
-            expert_scheme=QuantScheme.MXFP8_GROUP32,
+            expert_scheme=QuantScheme.FP8_E4M3_PER_CHANNEL,
             weight_block_size=block_size,
             scale_fmt=scale_fmt,
             activation_scheme=activation_scheme,

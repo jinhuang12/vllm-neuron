@@ -190,8 +190,9 @@ def moe_tkg(
         )
     else:
         raise NotImplementedError(
-            "moe_tkg supports MXFP4 (uint16), MXFP8 (uint32) and BF16 weights on "
-            f"a Neuron device or CPU with the NKI simulator, but got "
+            "moe_tkg supports MXFP4 (uint16), MXFP8 (uint32), 1-byte FP8 "
+            "(float8_e4m3fn, with PER-CHANNEL / ROW scales) and BF16 weights "
+            "on a Neuron device or CPU with the NKI simulator, but got "
             f"{expert_gate_up_weights.dtype=} on {hidden_input.device}. There is "
             "no torch fallback for this op."
         )
@@ -209,7 +210,7 @@ def _can_use_kernel(
 
     Kernel constraints checked:
         - Must be running on Neuron device or CPU with NKI simulator
-        - Must use MXFP4, MXFP8 or BF16 weights
+        - Must use MXFP4, MXFP8, 1-byte FP8 or BF16 weights
     """
     if not can_run_kernel(hidden_input):
         return False
@@ -230,6 +231,34 @@ def _can_use_kernel(
         # RAISES ``NotImplementedError`` when the gate says no
         # (``moe_tkg.py:191-194``), so an MXFP8 checkpoint could not take the
         # decode MoE path at all.
+        return True
+
+    if expert_down_weights.dtype == torch.float8_e4m3fn:
+        # 1-byte FP8 with PER-CHANNEL / ROW dequant scales. ADDITIVE: admits a
+        # dtype the gate previously refused and touches no branch above, so no
+        # existing family's behaviour moves.
+        #
+        # Refusing it was never a fallback either: the caller RAISES
+        # ``NotImplementedError`` when this gate says no
+        # (``moe_tkg.py:191-194``), so a 1-byte-FP8 checkpoint could not take
+        # the decode MoE path at all.
+        #
+        # WHY NO CARRIER REINTERPRET IS NEEDED, unlike the uint16/uint32 cases
+        # in ``moe_tkg_wrapper.py:52-70``: those carriers pack SEVERAL
+        # quantized values per machine word, so the wrapper must re-view them
+        # as ``*_x2`` / ``*_x4`` element types. A 1-byte FP8 tensor already IS
+        # one element per element, and on trn2 the plugin maps
+        # ``torch.float8_e4m3fn`` to ``nl.float8_e4m3`` in both directions
+        # (``nki/nki_dtype.py:43,51-53``), with the CPU simulator re-viewing the
+        # numpy buffer identically (``nki/nki_cpu_sim.py:156-159``).
+        #
+        # PROVEN, not assumed: the wrapper was called unmodified with these
+        # weights and ROW scales under the NKI CPU simulator and reproduced the
+        # dequantized reference to rel_err 5.068e-03, against 4.470e-03 for the
+        # bf16 control at the same shapes. Evidence:
+        # ``artifacts/repairs/author_model_family-iter3/iter3-moe-gen3-probe.txt``
+        # legs P3b (this gate's refusal) and P3c (the pass), stamp_commit
+        # 42ff1393.
         return True
 
     if expert_down_weights.dtype == torch.bfloat16:
