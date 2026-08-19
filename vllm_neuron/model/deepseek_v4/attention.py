@@ -1302,6 +1302,30 @@ class DeepseekV4Indexer(nn.Module):
             key_scale = _gather_scale_columns(
                 index_v_cache, key_slot_ids, _INDEX_NUM_SCALES, _FP4_QUANT_GROUP
             )
+            if key_slot_ids.shape[0] == 1 and hidden_states.shape[0] != 1:
+                # <-- SEGMENTED PREFILL (LD-26 rung (B), Gap 1): a prefill
+                # forward carries T tokens of ONE sequence, so B == 1 while
+                # T == 8192. The op reads ``keys.dim() == 3`` as "one pool PER
+                # TOKEN" (sparse_indexer.py:560-600) and bmm's the [1, S, D]
+                # pool against a [T, ...] query, which fails outright — probe
+                # p2a0: "Expected size for first two dimensions of batch2
+                # tensor to be: [8192, 128] but got: [1, 128]". Squeezing the
+                # batch axis away gives the [S, D] SHARED-POOL form, which is
+                # both what a single-sequence prefill means and the cheaper
+                # matmul rather than a bmm.
+                #
+                # The B == 1 assumption is not new here: the in-forward pool
+                # this branch replaces was ``fresh[ratio-1::ratio]``, a single
+                # shared pool over all T tokens, so the shipped prefill path
+                # already assumed one sequence per prefill forward. Asserted
+                # rather than left implicit.
+                assert block_table.shape[0] == 1, (
+                    "a prefill forward must carry exactly one sequence; got "
+                    f"block_table batch {block_table.shape[0]} with "
+                    f"{hidden_states.shape[0]} tokens"
+                )
+                key_slot_ids = key_slot_ids.reshape(pool_span)
+                key_scale = key_scale.reshape(pool_span, -1)
         else:
             # In-forward pool: the closing token of group j is token
             # ``j * ratio + ratio - 1``, so a strided slice IS the pool in
@@ -1922,11 +1946,42 @@ class DeepseekV4Attention(nn.Module):
         topk_indices = None
         if self.indexer is not None:
             index_md = attn_metadata[f"{prefix}.indexer"]
-            span = (
-                index_md["max_blocks_per_seq"] * index_md["block_size"]
-                if is_decode
-                else 0
-            )
+            # <-- SEGMENTED PREFILL (LD-26 rung (B), Gap 1): the candidate pool
+            # is the PAGED one on every path, prefill included. It used to be
+            # ``0 if not is_decode``, i.e. the in-forward pool
+            # ``fresh[ratio-1::ratio]``, which holds ONLY the slots this forward
+            # just produced. On a segmented prefill that is wrong twice over,
+            # and both halves were EXECUTED, not inferred (probe p2b2, segment 2
+            # of a 65536-token prompt at kv_segment_size 8192, positions
+            # 8192..16383):
+            #   1. FUTURE LEAKAGE. The op's causal cap compares a pool-LOCAL
+            #      column index against a sequence-LOCAL frontier
+            #      ``(positions+1)//ratio`` (sparse_indexer.py:611-649). On
+            #      segment 2 the frontier is 2048 while the in-forward pool is
+            #      only 2048 wide, so the cap cannot fire on any column and all
+            #      512 selected slots name groups that close AFTER the query.
+            #   2. WRONG SLOTS DOWNSTREAM. The chunk-local indices 9..2047 are
+            #      then consumed by NF.mla_sparse_attention as sequence-local,
+            #      so they address the sequence's FIRST 2048 groups.
+            # The paged pool makes pool-local == sequence-local, which is the
+            # coordinate system BOTH the cap and mla_sparse_attention already
+            # assume, and the cap then does the whole job: probe p2a2 measures
+            # 512 valid slots with max 2047 at the segment boundary (query
+            # position 8192, frontier 2048 — exact) and max 4095 / min 4 at
+            # query position 16383, with 253 prior-segment and 259 own-chunk
+            # slots, i.e. genuine cross-segment reach.
+            #
+            # DEVIATION FROM THE PLAN, reported not silently taken: plan §1(b)
+            # says "set the two offsets from the prior length". Measurement
+            # refutes that clause and both offsets must stay 0.
+            # ``index_offset`` is ADDED to already-sequence-local paged indices
+            # AFTER selection (sparse_indexer.py:708-711) and never enters the
+            # cap, so it cannot fix a cap that reads chunk-local columns and it
+            # would corrupt indices that are already correct;
+            # ``topk_index_offset`` is SUBTRACTED (mla_sparse_attention.py:412)
+            # from indices whose contract is sequence-local. Any non-zero value
+            # for either breaks p2a2's measured result.
+            span = index_md["max_blocks_per_seq"] * index_md["block_size"]
             # ``qr``: the indexer consumes the SAME normed q latent the MLA
             # path does (dsv4_ref/model.py:502, :517). NF.mla_qkv's fixed
             # return is (q_nope, q_rope, latent_kv) with no slot for it, so
@@ -1964,7 +2019,16 @@ class DeepseekV4Attention(nn.Module):
             # no separate V: the same latent row is K and V, and the value
             # fed in is the QAT round-tripped one (``:512`` runs before
             # ``:533``).
-            keys = latent_kv.unsqueeze(1)
+            # <-- SEGMENTED PREFILL (LD-26 rung (B), Gap 2): the key set is this
+            # chunk's latents PLUS the ``window - 1`` rows that precede the
+            # chunk, read back out of the paged SWA cache. ``latent_kv`` alone
+            # holds only this forward's T rows, so on every segment after the
+            # first the leading 127 queries silently lost the part of their
+            # window that fell in the previous segment — a wrong answer, not an
+            # error. See ``_swa_prefill_keys`` for why this needs no new kernel.
+            keys, kv_positions, kv_valid = self._swa_prefill_keys(
+                latent_kv, positions_l, swa_md
+            )
             attn_out = NF.swa_attention(
                 query,
                 keys,
@@ -1973,7 +2037,8 @@ class DeepseekV4Attention(nn.Module):
                 self.attn_sink,
                 self.scale,
                 positions=positions_l,
-                kv_positions=positions_l,
+                kv_positions=kv_positions,
+                kv_valid=kv_valid,
                 causal=True,
             )
         else:
@@ -2061,6 +2126,101 @@ class DeepseekV4Attention(nn.Module):
     # ------------------------------------------------------------------
     # Forward helpers
     # ------------------------------------------------------------------
+    def _swa_prefill_keys(
+        self,
+        latent_kv: torch.Tensor,
+        positions_l: torch.Tensor,
+        swa_md: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """SWA-only prefill keys: the pre-chunk window plus this chunk's rows.
+
+        <-- SEGMENTED PREFILL (LD-26 rung (B), Gap 2). A SWA-only layer (0 and
+        1, ``compress_ratio`` ratio 0) attends over a band of ``window`` = 128
+        absolute positions. When a prefill is segmented, this forward's queries
+        sit at absolute ``[P, P + T - 1]``, so their band reaches back to
+        ``P - window + 1``; those ``window - 1`` = 127 rows were written to the
+        paged SWA cache by an EARLIER forward and are not in ``latent_kv``.
+
+        This needs NO new NKI kernel, which is why the plan's deliberately
+        unsettled Gap 2 settles as authoring rather than a ``kernels_pending``
+        hand-off. ``NF.swa_attention``'s band is decided ENTIRELY by position
+        VALUES — ``delta = q_pos - k_pos; allowed = (delta >= 0) & (delta <
+        window)`` (``swa_attention.py:95-100``) — with no index-based triangular
+        mask anywhere, so a key set that is longer than the query set and starts
+        earlier is already admissible; it only has to be described truthfully
+        through ``kv_positions`` and ``kv_valid``, both of which are existing
+        keyword-only parameters (``swa_attention.py:174-179``). The DSpark
+        drafter already does exactly this against the same cache
+        (``dspark_model.py:513-568``), so this is the family's own established
+        idiom rather than a new one.
+
+        Shapes are static: ``127 + T`` keys on every segment, including the
+        first, where the 127 prior positions are negative and ``kv_valid``
+        masks them. That invariance is what keeps one traced graph valid for
+        all 8 segments of a 65536-token prompt at ``kv_segment_size`` 8192.
+
+        Returns ``(keys [127 + T, 1, 512], kv_positions [127 + T] int64,
+        kv_valid [127 + T] bool)``.
+        """
+        prefix_len = self.sliding_window - 1
+        device = latent_kv.device
+
+        # This chunk's first absolute position. A runtime read of a fixed slice
+        # -- static shape, no ``.item()``.
+        first = positions_l.reshape(-1)[:1]
+        prior_abs = (
+            first
+            - prefix_len
+            + torch.arange(prefix_len, device=device, dtype=torch.int64)
+        )
+        prior_valid = prior_abs >= 0
+
+        # Addressing frame. Positions stay ABSOLUTE for the mask; the offset
+        # correction applies to the block-table lookup only, the same split
+        # ``_decode_attention`` and ``dspark_model.py:521-531`` make.
+        local = prior_abs.clamp_min(0)
+        pos_offset = swa_md.get("swa_kv_pos_offset")
+        if pos_offset is not None:
+            local = (local - pos_offset.reshape(-1)[:1]).clamp_min(0)
+
+        block_table = swa_md["block_table_tensor"].to(torch.int64)
+        block_size = swa_md["block_size"]
+        slot_ids = (
+            torch.index_select(block_table[:1], 1, local // block_size) * block_size
+            + (local % block_size)
+        )  # [1, prefix_len]
+
+        # Rebuild the latent row: 448 NoPE columns are fp8 codes needing their
+        # group-64 scales, the 64 RoPE columns are stored as values. Same
+        # reconstruction as ``dspark_model.py:533-539``.
+        row = _gather_cache_rows(self.swa_k_cache, slot_ids, self.head_dim)
+        factors = _gather_scale_columns(
+            self.swa_v_cache, slot_ids, _KV_NUM_SCALES, _KV_QUANT_GROUP
+        )
+        nope = self.nope_head_dim
+        prior = torch.cat(
+            (row[..., :nope] * factors[..., :nope], row[..., nope:]), dim=-1
+        )
+
+        keys = torch.cat(
+            (
+                prior.reshape(prefix_len, 1, self.head_dim).to(latent_kv.dtype),
+                latent_kv.unsqueeze(1),
+            ),
+            dim=0,
+        )
+        kv_positions = torch.cat((prior_abs, positions_l.reshape(-1)), dim=0)
+        kv_valid = torch.cat(
+            (
+                prior_valid,
+                torch.ones(
+                    positions_l.reshape(-1).shape[0], dtype=torch.bool, device=device
+                ),
+            ),
+            dim=0,
+        )
+        return keys, kv_positions, kv_valid
+
     def _decode_attention(
         self,
         query: torch.Tensor,
