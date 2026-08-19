@@ -1936,9 +1936,12 @@ class DeepseekV4Attention(nn.Module):
                         is_decode,
                     ),
                 ),
-                self._coarse_slots(attn_metadata[prefix]["slot_mapping"], positions_l),
+                # F-13: each leg's OWN metadata entry, whole — the write frame
+                # must translate through the same block table the reader is
+                # handed for that leg. See ``_coarse_slots``.
+                self._coarse_slots(attn_metadata[prefix], positions_l, is_decode),
                 self._coarse_slots(
-                    attn_metadata[f"{prefix}.rope"]["slot_mapping"], positions_l
+                    attn_metadata[f"{prefix}.rope"], positions_l, is_decode
                 ),
             )
 
@@ -1993,7 +1996,7 @@ class DeepseekV4Attention(nn.Module):
                 positions_l,
                 self.index_k_cache,
                 self.index_v_cache,
-                self._coarse_slots(index_md["slot_mapping"], positions_l),
+                self._coarse_slots(index_md, positions_l, is_decode),
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
                 pool_span=span,
@@ -2382,7 +2385,10 @@ class DeepseekV4Attention(nn.Module):
         )
 
     def _coarse_slots(
-        self, slot_mapping: torch.Tensor, positions: torch.Tensor
+        self,
+        metadata: dict,
+        positions: torch.Tensor,
+        is_decode: bool,
     ) -> torch.Tensor:
         """Map raw per-token slots to compressed-slot destinations.
 
@@ -2392,19 +2398,97 @@ class DeepseekV4Attention(nn.Module):
         1. Only the token that CLOSES a group writes
            (``dsv4_ref/model.py:350``); every other token is forced to
            ``PAD_SLOT_ID`` and skipped by the masked scatter.
-        2. The destination is the raw slot divided by ``compress_ratio``,
-           i.e. the page geometry re-read at the compressed cadence.
+        2. The destination is the sequence-local compressed GROUP index
+           translated through this leg's block table — NOT the raw physical
+           slot divided by ``compress_ratio``.
+
+        **F-13 (plan §3.7): point 2 is a REPAIR of a silent correctness
+        defect, and the distinction is the whole finding.** The body used to
+        be ``coarse = slot_mapping // ratio``. ``slot_mapping`` is the
+        token-granular *physical* slot, already block-table-translated by the
+        runner (``neuron_model_runner.py:4036-4041``), so that expression
+        divided AFTER translation. Every reader of these three legs divides
+        BEFORE translation: ``mla_sparse_attention._translate_rows``
+        (``:120-131``) takes a sequence-local index, computes
+        ``block_of = local_idx // block_size``, gathers the block out of the
+        table and only then forms ``blocks * block_size + local_idx %
+        block_size``. Divide-then-translate and translate-then-divide commute
+        only when ``block_table[k] == k`` for every ``k``, which forces
+        ``block_table[0] == 0``; block 0 is the reserved null block
+        (``NULL_BLOCK_ID = 0``, ``neuron_model_runner.py:89``) and no real
+        sequence can own it, so **the two frames never agreed in production**.
+        Nothing raised: the reader clamps a negative block to zero
+        (``mla_sparse_attention.py:130``) and :func:`_masked_scatter_rows`
+        clamps ``min=0`` (``:504``), so the symptom was wrong output and, for
+        a scattered block table, cross-request cache corruption.
+
+        The repair moves the WRITE frame to the READ frame, because the read
+        frame is the design intent: the causal cap compares against a
+        sequence-local frontier ``(positions + 1) // ratio``
+        (``sparse_indexer.py:611-649``) and the C128 dense candidate list is a
+        sequence-local ``arange``. The three arithmetic steps below are
+        deliberately the same ones ``_translate_rows`` performs, including the
+        negative-block ``where`` — the null-block sentinel this tree writes
+        with ``_remap_null_block_to_sentinel``
+        (``neuron_model_runner.py:94``, applied at ``:2190`` and ``:2197``)
+        must be absorbed identically on both sides or the frames disagree
+        again by one block.
+
+        ``.swa``, ``.compressor`` and ``.indexer_compressor`` are NOT affected
+        and are NOT touched: both of their sides already live in one raw-token
+        frame (see :meth:`DeepseekV4KVCompressor._merge_state` at ``:1100-1117``,
+        which already gathers the block before forming the slot).
 
         NOT SETTLED BY THE REFERENCE: it indexes its compressed region
         directly by ``start_pos // ratio`` (``:380-382``) because it has no
         paging at all. In the port the runner owns the block table and has no
         notion of ``compress_ratio``, so it cannot emit a coarse mapping
-        itself. This division is the localized assumption — change it here
+        itself. This translation is the localized assumption — change it here
         and every compressed write follows.
+
+        Args:
+            metadata: this leg's own ``attn_metadata`` entry. Taken whole
+                rather than as three scalars because ``block_table_tensor``
+                and ``block_size`` must come from the SAME group entry the
+                reader is handed (``_decode_attention`` passes
+                ``latent_md["block_table_tensor"]`` straight into
+                ``latent_block_table``); pulling them from different entries
+                is how a frame split re-opens.
+            positions: ``[T]`` sequence-local absolute token positions, the
+                same tensor the causal cap is computed from.
+            is_decode: selects the ``seq_ids`` convention, which is DERIVED
+                and not read — exactly as :meth:`_compressor_state` derives
+                it and for the same recorded reason: at decode the runner
+                lays out one token per sequence in block-table row order, so
+                ``arange`` IS the mapping; at prefill one forward carries one
+                sequence.
         """
         ratio = self.compress_ratio
+        slot_mapping = metadata["slot_mapping"]
+        block_table = metadata["block_table_tensor"]
+        block_size = metadata["block_size"]
+
+        # The sequence-local compressed GROUP index — the reader's coordinate.
+        group = torch.div(positions, ratio, rounding_mode="floor")
+
+        tokens = positions.shape[0]
+        seq_ids = (
+            torch.arange(tokens, dtype=torch.long, device=positions.device)
+            if is_decode
+            else torch.zeros(tokens, dtype=torch.long, device=positions.device)
+        )
+        table = torch.index_select(block_table.to(torch.int64), 0, seq_ids)
+        max_blocks = table.shape[1]
+        block_of = torch.clamp(
+            torch.div(group, block_size, rounding_mode="floor"), 0, max_blocks - 1
+        )
+        blocks = torch.gather(table, 1, block_of.unsqueeze(-1)).squeeze(-1)
+        blocks = torch.where(blocks < 0, torch.zeros_like(blocks), blocks)
+        coarse = blocks * block_size + torch.remainder(group, block_size)
+
+        # Validity is still the runner's: a token whose raw slot is padded has
+        # no compressed destination either, whatever its group index says.
         fires = torch.remainder(positions + 1, ratio) == 0
-        coarse = slot_mapping // ratio
         return torch.where(
             fires & (slot_mapping > _PAD_SLOT_ID),
             coarse,
