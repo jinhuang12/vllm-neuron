@@ -376,16 +376,40 @@ def _torch_block_fp8_linear(
     one may NOT refuse quantization: six of the seven call sites reach this op
     precisely because ``weight_scale is not None``.
 
-    Written in the DEQUANTIZE-THEN-MATMUL form. The declared plain-torch
-    reference is written in the equivalent SCALED-PARTIAL form, so the c13
-    leg-1 comparison grades two independent spellings of the contract instead
-    of one spelling against a paraphrase of itself. They agree exactly in real
-    arithmetic and differ only in fp32 rounding -- of the summation always, and
-    of the scale multiply only when a scale is not a power of two. On the
-    production load path it always is (ue8m0, doubled by LD-24), so that second
-    term is exactly zero there; the harness's synthetic ``randint`` scales
-    include non-powers of two, which is what the declared 2e-05 fp32 clause
-    bounds.
+    Written in the SCALED-PARTIAL form -- fp8 codes multiplied on their integer
+    grid, the fp32 partial then scaled by ``a_scale * w_scale`` -- because that
+    is the arithmetic the contract literally declares, and because it is the
+    arithmetic the NKI kernel performs (fp8 operands into an fp32 PSUM partial,
+    evicted, scaled, accumulated). The triad contract's word for the fallback
+    is NUMERICALLY MATCHED, so the two paths must not disagree merely because
+    the gate flipped.
+
+    THIS REPLACED A DEQUANTIZE-THEN-MATMUL SPELLING, AND THE MEASUREMENT IS WHY.
+    The first version of this fallback deliberately used the other spelling, so
+    that the c13 leg-1 comparison would grade two independent derivations rather
+    than one derivation against a paraphrase of itself. Measured at the declared
+    CTE shape (4096x4096x1536), that spelling disagreed with the plain-torch
+    reference at 57 of 6291456 output positions: one bf16 ULP at ordinary
+    magnitudes (-288 vs -286), but ~64 ULPs at a position where accumulation
+    cancels seven orders of magnitude down from the tensor's maximum
+    (-9.5367432e-05 against a max |out| of 1672). The NKI kernel matched the
+    reference BIT-EXACTLY on the same case, 0 of 6291456 positions differing.
+    So the outlier was this fallback's re-association, and pre-multiplying the
+    operands is simply the less accurate order: it rounds every term before
+    summing, where scaling the completed partial rounds once.
+
+    Independence of derivation survives: the reference is a separately authored
+    module written to the plan text, importing nothing from the port. Only the
+    ASSOCIATION ORDER is now aligned, and that order is part of the declared
+    contract, so aligning to it is conformance rather than collusion. The
+    reference module's own docstring still describes the earlier arrangement; it
+    is a pre-registered grading instrument and is deliberately left untouched,
+    with the correction recorded here and in the triad record.
+
+    The price is graph nodes -- ``n_blocks * k_blocks`` small matmuls instead of
+    ``k_blocks`` large ones (384 instead of 32 at the CTE shape). Paid
+    knowingly: this path traces only when the gate is false, and correctness of
+    the traced numbers outranks node count on a path that exists to be correct.
     """
     block_n, block_k = int(block_size[0]), int(block_size[1])
     group = int(act_group_size)
@@ -394,36 +418,39 @@ def _torch_block_fp8_linear(
     n_blocks = (n + block_n - 1) // block_n
     k_blocks = k // block_k
 
-    # -- activations: dynamic per-row, per-group fp8 quant/dequant -----------
+    # -- activations: dynamic per-row, per-group fp8 quantization. The codes
+    # -- stay on the integer fp8 grid; the scale is applied to the partial.
     grouped = x.to(torch.float32).reshape(m, k // group, group)
     amax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=_AMAX_FLOOR)
     a_scale = _pow2_ceil_scale(amax, FP8_CLAMP_MAX)
-    a_dequant = (
+    a_codes = (
         (grouped / a_scale)
         .clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX)
         .to(torch.float8_e4m3fn)
         .to(torch.float32)
-        * a_scale
-    ).reshape(m, k)
-
-    # -- weights: block scale expanded to elements. Exact: every scale is a
-    # -- power of two, so this multiply introduces no rounding.
-    w_scale = (
-        weight_scale.to(torch.float32)
-        .repeat_interleave(block_n, dim=0)
-        .repeat_interleave(block_k, dim=1)[:n, :k]
+        .reshape(m, k)
     )
-    w_dequant = weight_fp8.to(torch.float32) * w_scale
+    a_scale = a_scale.reshape(m, k // group)
+    w_codes = weight_fp8.to(torch.float32)
+    w_scale = weight_scale.to(torch.float32)
 
-    # -- fp32 accumulation, one 128-contraction partial at a time, mirroring
-    # -- the kernel's blocking. Static loop count.
-    out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
-    for kb in range(k_blocks):
-        k0 = kb * block_k
-        k1 = k0 + block_k
-        out = out + a_dequant[:, k0:k1] @ w_dequant[:, k0:k1].t()
+    # -- one 128x128 output-block partial at a time, scaled then accumulated in
+    # -- fp32. Static loop counts; the per-block column accumulators are
+    # -- concatenated instead of written into a slice, so no in-place mutation
+    # -- of a traced tensor is needed.
+    columns = []
+    for nb in range(n_blocks):
+        n0 = nb * block_n
+        n1 = min(n0 + block_n, n)
+        acc = torch.zeros((m, n1 - n0), dtype=torch.float32, device=x.device)
+        for kb in range(k_blocks):
+            k0 = kb * block_k
+            k1 = k0 + block_k
+            partial = a_codes[:, k0:k1] @ w_codes[n0:n1, k0:k1].t()
+            acc = acc + partial * a_scale[:, kb : kb + 1] * w_scale[nb, kb]
+        columns.append(acc)
+    out = columns[0] if len(columns) == 1 else torch.cat(columns, dim=1)
 
-    del n_blocks  # shape check only; the loop is over K blocks
     out = out.to(accum_dtype)
     if bias is not None:
         out = out + bias.to(accum_dtype)
