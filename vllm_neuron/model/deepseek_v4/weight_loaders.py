@@ -247,10 +247,27 @@ def _build_fp4_to_fp8_bytes() -> torch.Tensor:
     nibble in a hand-written table is invisible in review and shows up only as
     degraded output quality after a multi-thousand-second compile.
     """
+    # `device="cpu"` is REQUIRED, not decorative. This module body runs at import
+    # time, and the runner imports the family INSIDE `torch.device("meta")`
+    # (vllm/worker/neuron_model_runner.py:1194 -> factory.py:70's lazy
+    # `from .model import ...` -> attention.py:65 / model.py:91). Under that
+    # ambient context `torch.utils._device.DeviceContext.__torch_function__`
+    # rewrites every device constructor that did not name a device -- but only
+    # `if kwargs.get("device") is None`. Naming the device is therefore the one
+    # thing the ambient context cannot override. Without it both this table and
+    # the LD-24 table below become META tensors for the process lifetime: the
+    # `torch.equal` cross-check on the next line has no meta kernel and raises
+    # `NotImplementedError: aten::equal`, and the LD-24 builder does not even
+    # raise -- it silently returns a meta table that poisons every dense and
+    # attention fp8 weight and fails much later, in a shared utility, at
+    # `tensor.to(device)`. These are constant lookup tables, never traced
+    # operands, so pinning them to CPU is correct at every call site.
     table = (
-        torch.tensor(_FP4_TABLE, dtype=torch.float32).to(_FP8_DTYPE).view(torch.uint8)
+        torch.tensor(_FP4_TABLE, dtype=torch.float32, device="cpu")
+        .to(_FP8_DTYPE)
+        .view(torch.uint8)
     )
-    expected = torch.tensor(_EXPECTED_FP4_FP8_BYTES, dtype=torch.uint8)
+    expected = torch.tensor(_EXPECTED_FP4_FP8_BYTES, dtype=torch.uint8, device="cpu")
     if not torch.equal(table, expected):
         raise RuntimeError(
             "FP4->FP8 byte table mismatch: torch produced "
@@ -484,7 +501,11 @@ def _build_ocp_to_legacy_halved_bytes() -> torch.Tensor:
                 "not load dense/attention FP8 weights until it is resolved."
             )
 
-    return torch.tensor(table, dtype=torch.uint8)
+    # `device="cpu"` for the same reason as in `_build_fp4_to_fp8_bytes`, and it
+    # matters MORE here: every check above runs on pure Python ints, so under an
+    # ambient `torch.device("meta")` this builder raises nothing at all and just
+    # returns a meta table -- a silent defect, not a loud one.
+    return torch.tensor(table, dtype=torch.uint8, device="cpu")
 
 
 _OCP_TO_LEGACY_HALVED_BYTES = _build_ocp_to_legacy_halved_bytes()
