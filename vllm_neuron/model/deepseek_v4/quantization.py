@@ -83,13 +83,23 @@ class QuantScheme(str, Enum):
 
     #: MXFP8: ``float8_e4m3fn`` weights with group-32 E8M0 scales.
     #:
-    #: UNREFERENCED ON PURPOSE — kept in the enum, assigned to nothing. The MX
-    #: expert kernels lower to ``nisa.nc_matmul_mx`` / ``nisa.quantize_mx``,
-    #: which are NeuronCore-v4 instructions, so no MX weight path is
-    #: executable on this campaign's trn2 (= NeuronCore-v3) venue at any shape
-    #: (R-13). It stays declared because it is the correct scheme name for a
-    #: Trn3 venue, where it becomes assignable again with no other change to
-    #: this module; deleting it would erase that fact from the type.
+    #: UNREFERENCED ON PURPOSE — kept in the enum, assigned to nothing. No MX
+    #: weight path is reachable for THIS family on this campaign's trn2
+    #: (= NeuronCore-v3) venue, for two separately measured reasons (R-13; probe
+    #: artifact ``author_model_family-iter3/iter3-moe-gen3-probe.txt`` §3.3):
+    #:
+    #: - DECODE is refused outright: ``functional/moe/moe_tkg.py:455`` asserts
+    #:   NeuronCore-v4 for MX, at every shape.
+    #: - PREFILL is refused by SHAPE, not by generation. The MX prefill kernel
+    #:   ``bwmm_shard_on_block_mx`` DOES lower on gen3 (measured PASS at
+    #:   H=512), but gen3 caps a matmul moving free dimension at 512 and this
+    #:   family's hidden size is 4096, so every family-shaped MX prefill matmul
+    #:   violates the cap. Do not restate this as "MX cannot lower on gen3" —
+    #:   that overclaim is contradicted by the probe.
+    #:
+    #: It stays declared because it is the correct scheme name for a Trn3 venue,
+    #: where it becomes assignable again with no other change to this module;
+    #: deleting it would erase that fact from the type.
     MXFP8_GROUP32 = "mxfp8_group32"
 
 
