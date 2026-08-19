@@ -67,6 +67,19 @@ class QuantScheme(str, Enum):
     #: Block-128x128 FP8 (``float8_e4m3fn``) weights with a UE8M0
     #: (power-of-two) per-block dequant scale grid and dynamic per-token,
     #: per-128-element-K-group FP8 activation quantization.
+    #:
+    #: The bytes are LEGACY ``nl.float8_e4m3`` (bias 7, amax 240), not OCP
+    #: ``float8_e4m3fn`` (amax 448). The torch dtype is a 1-byte carrier only;
+    #: on trn2 the plugin maps between the two names
+    #: (``nki/nki_dtype.py:43,51-53``). The checkpoint stores OCP-448 bytes by
+    #: design, so the loader re-encodes every element into the legacy grid by
+    #: HALVING it and DOUBLES the paired block scale to absorb that -- LD-24,
+    #: ``weight_loaders.py`` ``_OCP_TO_LEGACY_HALVED_BYTES``. The doubled scale
+    #: is still an exact power of two, so it is still exactly UE8M0.
+    #:
+    #: The dense/attention slice is NOT exempt from the carrier doctrine that
+    #: :attr:`FP8_E4M3_PER_CHANNEL` records below. Believing it was is what
+    #: produced this campaign's third replan.
     FP8_BLOCK_128X128 = "fp8_block_128x128"
 
     #: 1-byte FP8 weights with ONE power-of-two dequant scale per OUTPUT

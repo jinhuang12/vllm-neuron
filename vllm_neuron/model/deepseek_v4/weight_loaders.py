@@ -23,7 +23,7 @@ Primary evidence used (this outranks any derived spec):
   nibble order) and ``model.py`` (every parameter's declared shape) and
   ``kernel.py`` (how the block scale is applied, hence its orientation).
 
-Five facts that a "port it like llama3" reflex gets wrong, each enforced
+Six facts that a "port it like llama3" reflex gets wrong, each enforced
 below:
 
 1. **Keys are NOT HF-standard.** There is no ``model.`` prefix and no
@@ -53,6 +53,14 @@ below:
    the checkpoint carries three MTP blocks while the config declares one.
    Neither absence is an error, so nothing here asks the checkpoint for a key
    the index says is missing.
+6. **The stored FP8 bytes are OCP-448 and this venue's are legacy-240**, and the
+   two disagree ONLY at exponent field 15, which is finite in the checkpoint's
+   grid and inf/NaN in trn2's. BOTH quantized slices re-encode, neither is
+   exempt: the routed experts by bitwise exponent folding (LD-23), the
+   dense/attention slice by halving through
+   :data:`_OCP_TO_LEGACY_HALVED_BYTES` with its block scale doubled (LD-24).
+   See "THE 1-BYTE CARRIER DOCTRINE" below. Believing the dense slice was
+   exempt is what produced this campaign's third replan.
 
 Public entry points (fixed by the family interface contract; everything else
 in this module is private):
@@ -111,6 +119,59 @@ _BLOCK = 128
 _MX_GROUP = 32
 
 _FP8_DTYPE = torch.float8_e4m3fn
+
+
+# ---------------------------------------------------------------------------
+# THE 1-BYTE CARRIER DOCTRINE — SHARED BY BOTH QUANTIZED SLICES (LD-24)
+#
+# Promoted to module level at iteration 5. It used to live only on the LD-23
+# expert path, and that placement is exactly how this campaign shipped a defect:
+# a reader (and a planner) concluded the dense/attention slice was deliberately
+# exempt. IT IS NOT. Both slices obey every clause below.
+#
+# THE DTYPE IS A CARRIER, NOT AN ENCODING CLAIM. Every 1-byte parameter in this
+# family is declared ``torch.float8_e4m3fn`` because that is the only 1-byte
+# float torch has, and because it is the KEY that makes
+# ``torch_to_nki_dtype`` yield ``nl.float8_e4m3`` on trn2
+# (``nki/nki_dtype.py:43,51-53``). The BYTES inside it are LEGACY
+# ``nl.float8_e4m3``: bias 7, exponent field 1..14 for normals, field 15
+# RESERVED for inf/NaN, amax ``1.875 * 2**7 = 240``. OCP ``float8_e4m3fn``
+# instead makes field 15 FINITE (256..448, NaN only at mantissa 7), amax 448.
+# The two grids are bit-for-bit IDENTICAL for field 0..14 and disagree ONLY at
+# field 15 (port-assessment.md section 2.1, measured leg A).
+#
+# THEREFORE: never route a weight value through torch's own fp8 cast unless it
+# is already known to sit at field <= 14. torch's cast is the OCP encoding and
+# would place a large value at field 15, which decodes as inf/NaN on this venue.
+# Move exponent fields inside bytes instead.
+#
+# AND: "it stays torch-side, so the NKI dtype mapper never reaches it" is NOT a
+# safety argument on trn2. ``compile/backend.py:690-714`` injects
+# ``--experimental-unsafe-fp8e4m3fn-as-fp8e4m3`` into the compiler
+# unconditionally on this target, so a plain torch fp8 convert INSIDE the
+# compiled graph is legacy-reinterpreted as well (port-assessment.md section
+# 2.8). Field 15 is fatal on both paths.
+#
+# WHAT EACH SLICE DOES ABOUT IT:
+#   * routed experts (LD-23) -- never touch torch's fp8 cast at all; the bytes
+#     are assembled from :data:`_FP4_TO_FP8_BYTES` and their exponent fields are
+#     shifted bitwise into ``[_E4M3_FIELD_MIN, _E4M3_FIELD_MAX]``.
+#   * dense / attention (LD-24) -- the checkpoint stores OCP-448 bytes by
+#     design (its own quantizer clamps at 448, ``dsv4_ref/kernel.py:47-48``;
+#     82.6% of 128x128 blocks hold at least one field-15 byte, measured leg B),
+#     so every byte is re-encoded AT LOAD into the legacy grid by
+#     :data:`_OCP_TO_LEGACY_HALVED_BYTES`, with the paired block scale doubled
+#     to absorb the halving.
+# ---------------------------------------------------------------------------
+
+#: Legacy ``nl.float8_e4m3`` biased-exponent field window for NORMAL values.
+#: Field 0 is zero/subnormal and field 15 is inf/NaN, so a normal occupies
+#: ``1..14``. Shared by both quantized slices; see the carrier doctrine above.
+_E4M3_FIELD_MIN = 1
+_E4M3_FIELD_MAX = 14
+
+#: The reserved field, named once so no site re-derives ``15``.
+_E4M3_FIELD_NAN = 15
 
 # RETIRED (LD-23): the MX tile geometry constants (``_MX_PMAX``,
 # ``_MX_Q_WIDTH``, ``_MX_Q_HEIGHT``, ``_MX_TILE_K``, ``_MX_BYTES_PER_WORD``)
@@ -201,6 +262,310 @@ def _build_fp4_to_fp8_bytes() -> torch.Tensor:
 
 
 _FP4_TO_FP8_BYTES = _build_fp4_to_fp8_bytes()
+
+
+# ---------------------------------------------------------------------------
+# LD-24: OCP-448 checkpoint bytes -> legacy nl.float8_e4m3 bytes, halved
+#
+# WHY (port-assessment.md sections 2.1-2.4). The checkpoint's dense/attention
+# block-FP8 bytes are OCP ``float8_e4m3fn``, amax 448, and it emits exponent
+# field 15 BY DESIGN -- its own quantizer clamps at +-448
+# (``dsv4_ref/kernel.py:47-48``) and 423 of 512 sampled 128x128 blocks (82.6%)
+# hold at least one field-15 byte (measured leg B). On trn2 field 15 is
+# inf/NaN, so those bytes decode to NaN in compiled code and one NaN weight
+# element poisons its whole output column (32 of 1024 outputs non-finite,
+# measured leg E1).
+#
+# THE REMEDY IS AT LOAD, NOT IN THE KERNEL, AND IT IS UNCONDITIONAL. Halve every
+# element of every block into the legacy grid and DOUBLE that block's scale to
+# absorb it. It cannot be conditional: the weight transform and the scale
+# transform are two separate ``SafetensorsWeightLoader`` objects with no shared
+# state, and "does this block hold a field-15 byte?" is derivable only from the
+# weight bytes, which the scale loader never sees. A disagreement between them
+# is silent -- no raise, plausible logits, and only a parity miss to show it.
+# Unconditionality also buys commutation: a uniform per-element transform
+# commutes with every downstream slice, ``cat`` and shard, so ``attention.py``'s
+# fused slice, ``dspark_model.py``'s complementary slice, the fused N-concat and
+# ``_grid_shard``'s shared sub-block row all stay untouched.
+#
+# WHY THE FACTOR IS 2 AND NOT ``240/448``. ``llama3/weight_loaders_static_fp8.py
+# :47-70`` solves the same problem for per-TENSOR fp32 scales and uses
+# ``240/448``. That factor is wrong here: ``240/448 = 0.5357`` is not a power of
+# two, so the compensated block scale would stop being exactly representable as
+# ue8m0 and ``NF.block_fp8_linear``'s "weight dequantization introduces no
+# rounding" clause would fail. Halving is the only in-range factor that keeps
+# the scale ue8m0-exact, and it always fits because ``|ocp| / 2 <= 224 < 240``.
+#
+# DO NOT IMPLEMENT THIS AS ARITHMETIC ON THE BYTE. ``byte - 8`` is the obvious
+# form -- decrement the exponent field -- and it is MEASURED WRONG (leg E2a,
+# ``artifacts/repairs/author_kernel_triads-iter1/triads1-ld11-remedy.txt``):
+# still 16 of 1024 non-finite outputs, because a field-0 byte underflows the
+# exponent field into the SIGN BIT and manufactures a fresh field-15 (NaN)
+# pattern. It turned 2 previously-good bytes into NaN while fixing 4. In the
+# sampled block 6 of 16384 live bytes sat at field <= 1, so the trap is
+# reachable, not exotic. The table below is GENERATED from a float64 reference
+# and then asserted exhaustively; the "sign bit preserved for all 256 inputs"
+# clause is what kills that shortcut mechanically (R-20).
+#
+# NOT BIT-EXACT, AND EXACTLY HOW INEXACT. A one-binade shift is exact for every
+# byte at field >= 2. Loss occurs only at field <= 1 (``|w| < 2**-5`` in grid
+# units) and is at most half a subnormal step, ``2**-10`` in grid units, i.e.
+# <= 8.1e-06 of a block whose largest element may be ``240 * scale``. Measured
+# on a real block: 16381 of 16384 elements halve EXACTLY (99.9817%), the 3
+# inexact ones being the smallest in the block, ``max_rel`` 1.32114e-06 and 0 of
+# 1024 non-finite outputs (leg E2b). Recorded as production-config dimension 4
+# deviation D-2, planner authority (port-assessment.md section 4).
+# ---------------------------------------------------------------------------
+
+#: The two bytes that are NaN in OCP ``float8_e4m3fn`` (exponent field 15,
+#: mantissa 7). Legacy ``nl.float8_e4m3`` spells NaN with the same two patterns,
+#: so under BOTH grids these mean NaN and there is no value to halve. They are
+#: REFUSED at load rather than mapped to anything finite: a NaN weight that
+#: loads silently poisons every activation that touches its block and has no
+#: other symptom -- the same reason ``_e8m0_to_fp32`` refuses E8M0 code 255.
+_OCP_NAN_BYTES: tuple[int, ...] = (0x7F, 0xFF)
+
+
+def _legacy_e4m3_magnitudes() -> tuple[float, ...]:
+    """Every non-negative legacy ``nl.float8_e4m3`` value, indexed by its byte.
+
+    Bytes ``0x00..0x77``, which is ascending VALUE order too: the exponent field
+    sits above the mantissa, so the byte is a monotone encoding of the
+    magnitude. Field 0 is zero/subnormal (``m/8 * 2**-6``); fields
+    ``_E4M3_FIELD_MIN.._E4M3_FIELD_MAX`` are normals
+    (``(1 + m/8) * 2**(f-7)``). Field 15 is deliberately ABSENT -- in this grid
+    it is inf/NaN, not a value, which is the whole point of LD-24.
+
+    Every entry is a dyadic rational with a small exponent, so float64 holds all
+    of them exactly and the rounding search below has no floating-point error to
+    account for.
+    """
+    values = []
+    for f in range(_E4M3_FIELD_NAN):  # 0 .. 14
+        for m in range(8):
+            if f == 0:
+                values.append(m / 8.0 * 2.0**-6)
+            else:
+                values.append((1.0 + m / 8.0) * 2.0 ** (f - 7))
+    return tuple(values)
+
+
+def _ocp_e4m3fn_magnitude(f: int, m: int) -> float:
+    """The OCP ``float8_e4m3fn`` magnitude of exponent field ``f``, mantissa ``m``.
+
+    Identical to :func:`_legacy_e4m3_magnitudes` for ``f`` in ``0..14`` -- the
+    two grids agree bit-for-bit there -- and defined for ``f == 15`` as well,
+    where OCP is FINITE (``256..448``) and legacy is not. ``(15, 7)`` is OCP's
+    NaN and has no magnitude; callers must exclude it first.
+    """
+    if f == _E4M3_FIELD_NAN and m == 7:
+        raise ValueError("OCP field 15 mantissa 7 is NaN, not a magnitude")
+    if f == 0:
+        return m / 8.0 * 2.0**-6
+    return (1.0 + m / 8.0) * 2.0 ** (f - 7)
+
+
+def _encode_legacy_rne(value: float, magnitudes: Sequence[float]) -> int:
+    """Round a non-negative ``value`` to its nearest legacy byte, ties to even.
+
+    A linear search over 120 candidates, run 256 times at import: microseconds,
+    and it needs no bit reasoning at all, which is the point. ``magnitudes`` is
+    ascending, so "ties to even" is exactly "prefer the even byte", the standard
+    round-to-nearest-even rule stated on the encoding rather than on the value.
+    """
+    best, best_err = 0, abs(magnitudes[0] - value)
+    for byte in range(1, len(magnitudes)):
+        err = abs(magnitudes[byte] - value)
+        if err < best_err or (err == best_err and byte % 2 == 0):
+            best, best_err = byte, err
+    return best
+
+
+def _rne_half(n: int) -> int:
+    """``n / 2`` rounded to the nearest integer, ties to even. Integers only."""
+    half, odd = divmod(n, 2)
+    return half + 1 if odd and half % 2 == 1 else half
+
+
+def _build_ocp_to_legacy_halved_bytes() -> torch.Tensor:
+    """Derive the 256-entry OCP-byte -> halved-legacy-byte table, and assert it.
+
+    Same idiom as :func:`_build_fp4_to_fp8_bytes`: derive, then cross-check
+    against an independent derivation. Here the primary derivation is the
+    float64 reference -- "the legacy encoding of ``ocp_decode(b) / 2``" -- and
+    the cross-check is the closed bitwise form:
+
+    ==========================  ==================================  ==========
+    case                        output                              exact?
+    ==========================  ==================================  ==========
+    ``f == 15 and m == 7``      REFUSED at load, slot kept as NaN   --
+    ``f >= 2``                  ``s | ((f-1) << 3) | m``            exact
+    ``f == 1``                  ``s | rne_half(8 + m)``             m even
+    ``f == 0``                  ``s | rne_half(m)``                 m even
+    ==========================  ==================================  ==========
+
+    Two derivations of the same 256 bytes is cheap insurance for the same
+    reason it is on the FP4 table, and here it is load-bearing rather than
+    decorative: the obvious hand-derived form (``byte - 8``) is measured wrong
+    (see the section header, leg E2a).
+
+    Asserted exhaustively over all 256 bytes:
+
+    1. the bitwise form equals the float64 form (the 254 loadable bytes);
+    2. an output carries exponent field 15 **if and only if** its input is an
+       OCP NaN byte -- stated as a biconditional, which is strictly stronger
+       than "no output at field 15" and also pins the two NaN slots;
+    3. the SIGN BIT is preserved for all 256 inputs (R-20: this is the clause
+       ``byte - 8`` fails by construction);
+    4. the two OCP NaN bytes keep their NaN patterns, so a slot that somehow
+       escaped :func:`_reencode_ocp_to_legacy_halved`'s guard stays NaN instead
+       of silently becoming a finite weight.
+    """
+    magnitudes = _legacy_e4m3_magnitudes()
+    table: list[int] = [0] * 256
+    for b in range(256):
+        sign = b & 0x80
+        field = (b >> 3) & 0x0F
+        mant = b & 0x07
+        if field == _E4M3_FIELD_NAN and mant == 7:
+            # Kept as its own NaN pattern; refused before any gather.
+            table[b] = b
+            continue
+        table[b] = sign | _encode_legacy_rne(
+            _ocp_e4m3fn_magnitude(field, mant) / 2.0, magnitudes
+        )
+
+    for b in range(256):
+        sign = b & 0x80
+        field = (b >> 3) & 0x0F
+        mant = b & 0x07
+        out = table[b]
+
+        # (3) sign bit preserved -- checked for every byte, NaN slots included.
+        if (out & 0x80) != sign:
+            raise RuntimeError(
+                f"OCP->legacy halving table flipped the sign bit on input "
+                f"{b:#04x} -> {out:#04x}. This is the exact failure mode of the "
+                "rejected 'byte - 8' shortcut (underflow of exponent field 0 "
+                "into the sign bit); refusing to load weights with it."
+            )
+
+        # (2) field 15 out IFF NaN in, and (4) the NaN slots keep their pattern.
+        out_is_nan_field = ((out >> 3) & 0x0F) == _E4M3_FIELD_NAN
+        in_is_ocp_nan = b in _OCP_NAN_BYTES
+        if out_is_nan_field != in_is_ocp_nan:
+            raise RuntimeError(
+                f"OCP->legacy halving table put input {b:#04x} at output "
+                f"{out:#04x} (exponent field "
+                f"{(out >> 3) & 0x0F}); field {_E4M3_FIELD_NAN} is inf/NaN in "
+                "the legacy grid and must appear for the OCP NaN bytes "
+                f"{[hex(x) for x in _OCP_NAN_BYTES]} and for nothing else."
+            )
+        if in_is_ocp_nan:
+            if out != b:
+                raise RuntimeError(
+                    f"OCP NaN byte {b:#04x} must stay {b:#04x} in the table, "
+                    f"got {out:#04x}."
+                )
+            continue
+
+        # (1) the closed bitwise form, independently.
+        if field >= 2:
+            expected = sign | ((field - 1) << 3) | mant
+        elif field == 1:
+            expected = sign | _rne_half(8 + mant)
+        else:
+            expected = sign | _rne_half(mant)
+        if out != expected:
+            raise RuntimeError(
+                f"OCP->legacy halving table disagrees with its own bitwise "
+                f"form on input {b:#04x}: float64 reference says {out:#04x}, "
+                f"closed form says {expected:#04x}. One of the two is wrong; do "
+                "not load dense/attention FP8 weights until it is resolved."
+            )
+
+    return torch.tensor(table, dtype=torch.uint8)
+
+
+_OCP_TO_LEGACY_HALVED_BYTES = _build_ocp_to_legacy_halved_bytes()
+
+
+def _reencode_ocp_to_legacy_halved(
+    tensor: torch.Tensor, param_name: str, ckpt_key: str
+) -> torch.Tensor:
+    """LD-24: re-encode a 1-byte OCP tensor into halved legacy bytes.
+
+    Applied UNCONDITIONALLY to every element the dense/attention block-FP8
+    weight loaders emit. Returns the same shape and the same
+    :data:`_FP8_DTYPE` carrier dtype -- only the byte VALUES change, so no
+    downstream shape, dtype, signature or call site moves.
+
+    The paired block scale MUST be doubled by
+    :func:`_e8m0_to_fp32_doubled`. A weight halved without its scale doubled is
+    a silent factor of two: no raise, plausible logits, and only a parity miss
+    to show it (R-21).
+
+    The index runs through ``index_select`` on an ``int32`` index rather than
+    ``table[raw.long()]`` so a large parameter does not pay an int64 index
+    tensor; the two are equivalent and ``index_select`` accepts ``int32``.
+    """
+    raw = _as_bytes(tensor, param_name, ckpt_key)
+    # Both OCP NaN bytes at once: 0x7F and 0xFF differ only in the sign bit.
+    if bool(((raw & 0x7F) == 0x7F).any()):
+        count = int(((raw & 0x7F) == 0x7F).sum())
+        raise ValueError(
+            f"Block-FP8 weight {param_name!r} (key {ckpt_key!r}) contains "
+            f"{count} OCP float8_e4m3fn NaN byte(s) "
+            f"({[hex(x) for x in _OCP_NAN_BYTES]}). Refusing to load: a NaN "
+            "weight produces NaN activations with no other symptom, and it is "
+            "not something a re-encoding may quietly turn into a finite value."
+        )
+    flat = torch.index_select(
+        _OCP_TO_LEGACY_HALVED_BYTES, 0, raw.reshape(-1).to(torch.int32)
+    )
+    return flat.reshape(raw.shape).view(_FP8_DTYPE)
+
+
+def _e8m0_to_fp32_doubled(
+    scale: torch.Tensor, param_name: str, ckpt_key: str
+) -> torch.Tensor:
+    """LD-24's scale leg: ``2 * _e8m0_to_fp32(scale)``, exactly.
+
+    The paired half of :func:`_reencode_ocp_to_legacy_halved`. Every weight
+    element was halved, so every block scale doubles and the product is
+    unchanged to within the halving's own rounding.
+
+    THE DOUBLING HAPPENS IN THE FP32 DOMAIN, after :func:`_e8m0_to_fp32`, not
+    in the E8M0 code domain. Multiplying an fp32 power of two by ``2.0`` is
+    exact, and it preserves ``_e8m0_to_fp32``'s deliberately recorded code-0
+    semantics (code 0 -> ``0.0``, matching the reference's own ``fast_pow2``).
+    A code-domain ``+1`` would turn ``0.0`` into ``2**-126`` and silently
+    diverge from a documented decision. An all-zero block (code 0) is
+    consistent either way: its weight bytes are all zero, so both ``0.0`` and
+    ``2 * 0.0`` give a zero product.
+
+    The doubled scale is STILL AN EXACT POWER OF TWO, so it is still exactly
+    representable as ue8m0 and ``NF.block_fp8_linear``'s "weight dequantization
+    introduces no rounding" clause survives -- the reason the factor is 2 and
+    not ``240/448`` (see the LD-24 section header).
+
+    Code 254 is REJECTED here. ``_e8m0_to_fp32`` already refuses code 255
+    (E8M0 NaN); code 254 is ``2**127``, whose double overflows fp32 to ``+inf``,
+    and an ``inf`` scale poisons its block exactly as a NaN one would.
+    """
+    raw = _as_bytes(scale, param_name, ckpt_key)
+    if bool((raw >= 254).any()):
+        worst = int(raw[raw >= 254][0])
+        raise ValueError(
+            f"Block scale for {param_name!r} (key {ckpt_key!r}) contains E8M0 "
+            f"code {worst}. LD-24 doubles every dense/attention block scale to "
+            "absorb the weight halving, and code 254 is 2**127 whose double "
+            "overflows fp32 to +inf (code 255 is already NaN). Refusing to "
+            "load: an inf or NaN weight scale produces non-finite activations "
+            "with no other symptom."
+        )
+    return _e8m0_to_fp32(scale, param_name, ckpt_key) * 2.0
+
 
 #: Attribute name under which each attach function records
 #: ``(attribute, checkpoint_keys, loader)`` triples on the module it decorates,
@@ -503,13 +868,20 @@ def _block_fp8_weight_loader(
     No transpose: the storage orientation already matches
     ``NF.block_fp8_linear(x, weight_fp8[N_local, K_local], ...)``. See the
     module docstring, point 3.
+
+    LD-24: every byte is re-encoded from the checkpoint's OCP-448 grid into the
+    venue's legacy ``nl.float8_e4m3`` grid, halved, and this parameter's block
+    scale is doubled to match by :func:`_block_fp8_scale_loader`. Both, or the
+    port is silently wrong on this tensor (R-21).
     """
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         del rank  # shard resolved at attach time; see _Shard's docstring
         _require_slice_count(param_name, slices, 1)
         _require_shape(param_name, ckpt_key, slices[0], full_shape)
-        return slices[0][shard.key()]
+        return _reencode_ocp_to_legacy_halved(
+            slices[0][shard.key()], param_name, ckpt_key
+        )
 
     return SafetensorsWeightLoader(transform=transform)
 
@@ -524,6 +896,11 @@ def _block_fp8_scale_loader(
 
     Emits fp32 (not the stored ``float8_e8m0fnu``) because that is exactly what
     ``NF.block_fp8_linear``'s ``weight_scale`` argument takes.
+
+    LD-24: the grid is DOUBLED, absorbing the halving
+    :func:`_block_fp8_weight_loader` applied to this parameter's bytes. Still an
+    exact power of two, so it is still exactly ue8m0. Both, or the port is
+    silently wrong on this tensor (R-21).
     """
     grid_shape = (_grid_extent(full_shape[0]), _grid_extent(full_shape[1]))
     grid_key = _grid_shard(shard, param_name, ckpt_key)
@@ -543,7 +920,7 @@ def _block_fp8_scale_loader(
         del rank
         _require_slice_count(param_name, slices, 1)
         _require_shape(param_name, ckpt_key, slices[0], grid_shape)
-        grid = _e8m0_to_fp32(slices[0][grid_key], param_name, ckpt_key)
+        grid = _e8m0_to_fp32_doubled(slices[0][grid_key], param_name, ckpt_key)
         if tuple(grid.shape) != local_grid:
             raise ValueError(
                 f"Local block-scale grid for {param_name!r} (key {ckpt_key!r}) "
@@ -569,6 +946,13 @@ def _fused_block_fp8_weight_loader(
     (``dsv4_ref/model.py:463-466`` declares them as two separate ``Linear``s),
     and this port fuses them into one ``[1536, 4096]`` parameter so the q and
     kv down-projections share a single GEMM.
+
+    LD-24: every byte of every part is re-encoded and halved, and the fused
+    scale grid is doubled by :func:`_fused_block_fp8_scale_loader`. Because the
+    transform is uniform it commutes with the N-concat, so re-encoding before
+    the ``cat`` and re-encoding after it are the same bytes -- which is also why
+    ``attention.py``'s ``[:rows]`` slice and ``dspark_model.py``'s complementary
+    slice of this parameter need no edit.
     """
 
     def transform(slices: list, rank: int) -> torch.Tensor:
@@ -579,7 +963,11 @@ def _fused_block_fp8_weight_loader(
             slices, ckpt_keys, full_shapes, shards
         ):
             _require_shape(param_name, key, slice_obj, shape)
-            parts.append(slice_obj[shard.key()])
+            parts.append(
+                _reencode_ocp_to_legacy_halved(
+                    slice_obj[shard.key()], param_name, key
+                )
+            )
         return torch.cat(parts, dim=0)
 
     return SafetensorsWeightLoader(transform=transform)
@@ -596,6 +984,10 @@ def _fused_block_fp8_scale_loader(
     The grids concatenate exactly like the weights, because the fusion is along
     the N axis and each source's N is a whole number of 128-blocks:
     ``[8, 32]`` and ``[4, 32]`` become ``[12, 32]``.
+
+    LD-24: every part's grid is DOUBLED, absorbing the halving
+    :func:`_fused_block_fp8_weight_loader` applied to the fused bytes. Both, or
+    the port is silently wrong on this tensor (R-21).
     """
     grid_shapes = [(_grid_extent(n), _grid_extent(k)) for n, k in full_shapes]
     grid_keys = [
@@ -610,7 +1002,9 @@ def _fused_block_fp8_scale_loader(
             slices, ckpt_keys, grid_shapes, grid_keys
         ):
             _require_shape(param_name, key, slice_obj, grid_shape)
-            parts.append(_e8m0_to_fp32(slice_obj[grid_key], param_name, key))
+            parts.append(
+                _e8m0_to_fp32_doubled(slice_obj[grid_key], param_name, key)
+            )
         return torch.cat(parts, dim=0)
 
     return SafetensorsWeightLoader(transform=transform)
@@ -705,18 +1099,14 @@ def _unpack_mxfp4_to_fp8_bytes(
 # the real family shape ``[2048, 4096]``.
 # ---------------------------------------------------------------------------
 
-#: Legacy ``nl.float8_e4m3`` biased-exponent field window for NORMAL values.
-#: Field 0 is zero/subnormal and field 15 is inf/NaN, so a normal occupies
-#: ``1..14``. This is the legacy encoding (amax ``1.875 * 2**7 = 240``), NOT
-#: OCP ``float8_e4m3fn`` (amax 448) -- on trn2 the plugin maps
-#: ``torch.float8_e4m3fn`` to ``nl.float8_e4m3`` in both directions
-#: (``nki/nki_dtype.py:43,51-53``), so the 1-byte parameter is only a CARRIER
-#: and the bytes inside it must be legacy-encoded. They are here, by
-#: construction: this loader never routes a value through torch's fp8
-#: conversion, it moves exponent fields inside bytes taken from
-#: :data:`_FP4_TO_FP8_BYTES`.
-_E4M3_FIELD_MIN = 1
-_E4M3_FIELD_MAX = 14
+# The exponent-field window this fold targets, :data:`_E4M3_FIELD_MIN` ..
+# :data:`_E4M3_FIELD_MAX`, is now MODULE-LEVEL doctrine shared with the
+# dense/attention slice -- see "THE 1-BYTE CARRIER DOCTRINE" in the Constants
+# section. It is not an expert-path-only rule and never was; the promotion
+# happened at LD-24, when the dense slice turned out to need the same
+# discipline. This path satisfies it by construction: it never routes a value
+# through torch's fp8 conversion, it moves exponent fields inside bytes taken
+# from :data:`_FP4_TO_FP8_BYTES`.
 
 #: Where the per-channel maximum is placed. Top of the window, so the fold
 #: never overflows to inf and the mantissa keeps every bit it had.
