@@ -129,6 +129,17 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        # Upstream rewrites this checkpoint's quant_method "fp8" ->
+        # "deepseek_v4_fp8" keyed on model_type == "deepseek_v4"
+        # (site-packages/vllm/model_executor/models/config.py:110-131 @ vLLM
+        # 0.21.0), then ModelConfig._verify_quantization passes the rewritten
+        # name to current_platform.verify_quantization (vllm/config/model.py:
+        # 703-704, 1023-1026). No serve flag reaches it. Admitting the name is
+        # what lets a block-fp8 DeepSeek-V4 checkpoint reach engine config on
+        # Neuron; quantization itself stays owned by the plugin, parsed from the
+        # checkpoint's quantization_config in
+        # model/deepseek_v4/quantization.py.
+        "deepseek_v4_fp8",
     ]
     device_control_env_var: str = "NEURON_VISIBLE_DEVICES"
     _device_count: int = -1

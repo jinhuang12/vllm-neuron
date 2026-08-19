@@ -145,7 +145,13 @@ UNQUANTIZED_MODULES: frozenset[str] = frozenset(
 #: Leaf module names whose weights are the routed experts.
 _ROUTED_EXPERT_MODULES: frozenset[str] = frozenset({"experts", "routed_experts"})
 
-_SUPPORTED_QUANT_METHODS = ("fp8",)
+# "deepseek_v4_fp8" is upstream's in-place rewrite of this checkpoint's "fp8"
+# (vllm/model_executor/models/config.py:110-131 @ vLLM 0.21.0). It mutates the
+# same live hf_config this module later reads through
+# DeepseekV4Config.from_configs (config.py:452, 472-474), so the bare "fp8"
+# literal alone raises at model construction. Both names denote the same
+# checkpoint format and yield an identical parsed QuantizationSpec.
+_SUPPORTED_QUANT_METHODS = ("fp8", "deepseek_v4_fp8")
 _SUPPORTED_EXPERT_DTYPES = ("fp4",)
 
 
