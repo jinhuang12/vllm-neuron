@@ -213,8 +213,25 @@ class DeepseekV4RotaryEmbedding(nn.Module):
                 (``dsv4_ref/model.py:484-485``).
         """
         dim = config.qk_rope_head_dim
+        # <-- ``device="cpu"`` IS LOAD-BEARING. The shipped runner builds this
+        # family inside ``with torch.device("meta")``
+        # (``vllm/worker/neuron_model_runner.py:1194``), and
+        # ``torch.utils._device.DeviceContext.__torch_function__`` substitutes
+        # ``device=meta`` into every factory call whose kwargs
+        # ``.get("device") is None``. A named device is never overridden; an
+        # absent one always is. Both tables become non-persistent buffers that
+        # NO checkpoint key populates, so the weight load cannot replace them
+        # the way ``load_state_dict(assign=True)`` replaces a parameter. They
+        # would still be meta at ``neuron_model_runner.py:1230``
+        # ``self.model.to(self.device)``, whose buffer branch then raises
+        # "Cannot copy out of meta tensor".
+        # CPU, and not a lazy accessor, because :meth:`forward` reads these
+        # buffers: they must be module state that the runner's own
+        # ``.to(device)`` carries to the NeuronCore, exactly as a weight is.
+        # Same convention as ``gpt_oss/model_mxfp4.py:159-166`` and
+        # ``qwen3_vl/model_bf16.py:138`` for this same tensor.
         freqs = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+            base ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim)
         )
         original_seq_len = config.rope_original_seq_len
         if not yarn or original_seq_len <= 0:
@@ -234,7 +251,13 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         if low == high:
             high = high + 0.001
         ramp = torch.clamp(
-            (torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low), 0, 1
+            # device="cpu" for the same reason as ``freqs`` above: ``ramp``
+            # feeds the returned table, so a meta ``ramp`` would put the
+            # buffer back on the meta device.
+            (torch.arange(dim // 2, dtype=torch.float32, device="cpu") - low)
+            / (high - low),
+            0,
+            1,
         )
         smooth = 1 - ramp
         return freqs / factor * (1 - smooth) + freqs * smooth
