@@ -54,6 +54,7 @@ from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
 from vllm_neuron.model.kv_cache import LayerSpec
+from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 
 from .config import (
     LAYER_CLASS_DENSE_C128,
@@ -79,8 +80,41 @@ __all__ = [
 #: also what the write side casts to.
 _FP8_DTYPE: torch.dtype = torch.float8_e4m3fn
 
-#: FP8 E4M3 absolute maximum (``dsv4_ref/kernel.py:47-48``).
-_FP8_MAX: float = 448.0
+#: FP8 E4M3 absolute maximum, PLATFORM-RESOLVED: 240.0 on trn2, 448.0 on trn3
+#: (``utils/dtype_utils.py:16-41``).
+#:
+#: WHY THIS IS NOT THE REFERENCE'S 448 (finding F-7, port-assessment.md section
+#: 2.8; lead-granted route (i)). The reference implementation clamps at 448
+#: (``dsv4_ref/kernel.py:47-48``) because it runs on OCP ``float8_e4m3fn``,
+#: whose exponent field 15 is FINITE (256..448). On trn2 the only 1-byte e4m3
+#: grid the venue admits is LEGACY ``nl.float8_e4m3``, whose field 15 is
+#: reserved for inf/NaN and whose amax is 240 (``nki/nki_dtype.py:50-52``;
+#: ``weight_loaders.py`` "THE 1-BYTE CARRIER DOCTRINE").
+#:
+#: Quantizing against 448 with a ue8m0 (power-of-two) scale puts the group's
+#: largest code in ``(224, 448]``, so a field-15 byte appears as soon as that
+#: maximum reaches 256 -- ON THE ORDER OF 80% OF KV QUANT GROUPS, by
+#: construction, not as a tail case. Against 240 the largest code lands in
+#: ``[120, 240]`` and NO byte can carry field 15. Encoding-safe by construction,
+#: the same discipline ``functional/rmsnorm_quant.py:32`` already applies.
+#:
+#: "It stays torch-side, so the NKI dtype mapper never sees it" is NOT a safety
+#: argument here: ``compile/backend.py:690-714`` injects
+#: ``--experimental-unsafe-fp8e4m3fn-as-fp8e4m3`` unconditionally on trn2, so a
+#: plain torch fp8 convert inside the COMPILED graph is legacy-reinterpreted
+#: too. A 448-clamped port has its own encoder and decoder disagreeing by ~208
+#: on byte ``0x7E``.
+#:
+#: ACCURACY COST IS NIL TO FIRST ORDER. Since ``448/240 = 1.867 < 2``, the
+#: power-of-two scale either stays put or exactly doubles; when it doubles every
+#: grid value halves and lands one binade lower, where the absolute grid step
+#: also halves, so the absolute quantization error ``grid_step * scale`` is
+#: UNCHANGED. Second-order only: a group with more than ~13 binades of internal
+#: dynamic range spends one more binade of underflow headroom.
+#:
+#: The name stays ``_FP8_MAX`` so every use site reads the ONE resolved ceiling;
+#: do not reintroduce a literal at any of them.
+_FP8_MAX: float = FP8_CLAMP_MAX
 
 #: FP4 E2M1 absolute maximum (``dsv4_ref/kernel.py:134``).
 _FP4_MAX: float = 6.0
@@ -93,10 +127,25 @@ _FP8_MIN_SCALE: float = 2.0**-9
 
 #: Weight of the second FP8 limb in the compressor's cross-step state:
 #: ``value = (limb1 + limb2 / shift) * scale``. Chosen as the largest power of
-#: two for which a limb-1 residual still fits ``[-448, 448]`` in limb 2 --
-#: limb 1's worst-case residual is ``448 / 8 / 2 = 28`` code units and
-#: ``28 * 16 = 448``. See
-#: :attr:`DeepseekV4KVCompressor.state_pair_width`.
+#: two for which a limb-1 residual still fits ``[-M, M]`` in limb 2, for the
+#: ceiling ``M`` in force.
+#:
+#: THE CONSTANT IS CEILING-AGNOSTIC, so the F-7 swap of :data:`_FP8_MAX` from
+#: the reference's 448 to the platform-resolved value leaves it alone
+#: (port-assessment.md section 2.8). Its derivation, restated without a
+#: literal: limb 1 rounds to the e4m3 grid, so ``|residual| <= half a grid step
+#: at the value's own binade``. The coarsest step over the representable range
+#: is at the top binade, giving the loose bound ``|residual| <= M / 16`` and
+#: therefore ``|residual * 16| <= M`` -- the clamp at
+#: ``[-_FP8_MAX, _FP8_MAX]`` in :meth:`_encode_state_row` is exactly the bound,
+#: at every ceiling. Tightly: the top binade of legacy e4m3 (amax 240) is
+#: ``[128, 256)`` with step 16, so ``|residual| <= 8`` and ``8 * 16 = 128``,
+#: comfortably inside 240; for OCP (amax 448) the top binade is ``[256, 512)``
+#: with step 32, so ``|residual| <= 16`` and ``16 * 16 = 256``, inside 448. The
+#: earlier form of this note computed ``448 / 8 / 2 = 28`` -- a looser bound on
+#: the same quantity, and one that read as if 448 were load-bearing. It is not.
+#:
+#: See :attr:`DeepseekV4KVCompressor.state_pair_width`.
 _STATE_LIMB_SHIFT: float = 16.0
 
 #: The latent NoPE dims are quantized in groups of 64
@@ -322,8 +371,15 @@ def _quant_fp8_ue8m0(
     """UE8M0 block-FP8 quantization of ``[T, D]`` in groups of ``group``.
 
     ``dsv4_ref/kernel.py:77-98`` with ``scale_fmt="ue8m0"``: per-group absmax
-    clamped at ``1e-4``, scale ``absmax / 448`` rounded UP to a power of two,
-    values divided by the scale and clamped to ``[-448, 448]``.
+    clamped at ``1e-4``, scale ``absmax / _FP8_MAX`` rounded UP to a power of
+    two, values divided by the scale and clamped to
+    ``[-_FP8_MAX, _FP8_MAX]``.
+
+    THE CEILING IS :data:`_FP8_MAX`, THE PLATFORM-RESOLVED ONE (240 on trn2),
+    NOT the reference's literal 448 -- see :data:`_FP8_MAX` for why, and note
+    that the scale divisor and the clamp must be the SAME ceiling or the group's
+    top values saturate. Both read ``_FP8_MAX`` here. Do not reintroduce a
+    literal at either.
 
     Returns:
         ``(codes [T, D] fp8, dequant_scales [T, D // group] fp32)`` with

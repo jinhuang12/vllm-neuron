@@ -66,6 +66,8 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX
+
 
 def _rms_norm(
     x: Tensor,
@@ -206,11 +208,18 @@ def _gather_rope_tables(
     return cos, sin
 
 
-def _round_scale_pow2(amax: Tensor) -> Tensor:
-    """``s = 2 ** ceil(log2(amax / 448))`` via the reference's IEEE-754 bit trick.
+def _round_scale_pow2(amax: Tensor, fp8_max: float = FP8_CLAMP_MAX) -> Tensor:
+    """``s = 2 ** ceil(log2(amax / fp8_max))`` via the reference's IEEE-754 bit trick.
+
+    ``fp8_max`` DEFAULTS TO THE PLATFORM-RESOLVED CEILING (240.0 on trn2, 448.0
+    on trn3), not the reference's literal 448 -- finding F-7, lead-granted route
+    (i); see :func:`_fp8_group_quant_dequant` for the whole argument. The divisor
+    here and the clamp in the caller MUST be the same ceiling: a scale computed
+    against 448 with a clamp at 240 would saturate roughly half of every group's
+    top values, which is a real accuracy loss rather than a re-encoding.
 
     ``dsv4_ref/kernel.py:36-37`` computes the ue8m0 (power-of-two) act-quant
-    scale as ``fast_pow2(fast_log2_ceil(amax * (1/448)))``, and
+    scale as ``fast_pow2(fast_log2_ceil(amax * (1/fp8_max)))``, and
     ``kernel.py:22-33`` implements those two with bit arithmetic::
 
         exp = (bits >> 23) & 0xFF; man = bits & ((1 << 23) - 1)
@@ -226,7 +235,7 @@ def _round_scale_pow2(amax: Tensor) -> Tensor:
     ``(man != 0)`` is used as ARITHMETIC (``.to(int32)``), never as an index, so
     the graph stays static-shape.
     """
-    v = (amax.to(torch.float32) * (1.0 / 448.0)).contiguous()
+    v = (amax.to(torch.float32) * (1.0 / fp8_max)).contiguous()
     bits = v.view(torch.int32)
     exponent = (bits >> 23) & 0xFF
     mantissa = bits & 0x7FFFFF
@@ -238,7 +247,7 @@ def _fp8_group_quant_dequant(
     x: Tensor,
     group_size: int,
     fp8_dtype: torch.dtype,
-    fp8_max: float = 448.0,
+    fp8_max: float = FP8_CLAMP_MAX,
     amax_floor: float = 1e-4,
 ) -> Tensor:
     """Group-wise fp8 quant/dequant round trip along the last dim.
@@ -250,12 +259,37 @@ def _fp8_group_quant_dequant(
     ``kernel.py:105-125`` for the wrapper). Per group::
 
         amax = max(|x|.amax(-1), 1e-4)
-        s    = 2 ** ceil(log2(amax / 448))      # scale_fmt="ue8m0"
-        y    = f32(fp8(clamp(x / s, -448, 448))) * s
+        s    = 2 ** ceil(log2(amax / fp8_max))            # scale_fmt="ue8m0"
+        y    = f32(fp8(clamp(x / s, -fp8_max, fp8_max))) * s
 
-    ``fp8_max = 448`` and the ``1e-4`` amax floor are the reference's literals
+    The ``1e-4`` amax floor is the reference's literal
     (``kernel.py:47-49, 79``). Skipping this step does not make the result
     "cleaner" — it makes it differ from the trained numerics.
+
+    ``fp8_max`` IS **NOT** THE REFERENCE'S 448 ON THIS VENUE (finding F-7,
+    port-assessment.md §2.8; lead-granted route (i)). It defaults to the fork's
+    platform-resolved ``FP8_CLAMP_MAX`` — 240.0 on trn2, 448.0 on trn3.
+
+    Why the reference's number is wrong here. The reference runs on OCP
+    ``float8_e4m3fn``, whose exponent field 15 is FINITE (256..448). trn2 admits
+    only LEGACY ``nl.float8_e4m3``, whose field 15 is reserved for inf/NaN and
+    whose amax is 240 (``nki/nki_dtype.py:50-52``). With a ue8m0 (power-of-two)
+    scale against 448 the group's largest code lands in ``(224, 448]``, so a
+    field-15 byte appears as soon as that maximum reaches 256 — the COMMON case,
+    not a tail case. Against 240 the largest code lands in ``[120, 240]`` and no
+    byte can carry field 15.
+
+    This is a real hazard even though the round trip is transient and stays in
+    torch: ``compile/backend.py:690-714`` injects
+    ``--experimental-unsafe-fp8e4m3fn-as-fp8e4m3`` unconditionally on trn2, so
+    the fp8 convert inside the COMPILED graph is legacy-reinterpreted too, and
+    the non-finite code is multiplied straight back into the DEQUANTIZED bf16
+    activation below — the poison escapes the round trip.
+
+    Accuracy cost is nil to first order: ``448/240 = 1.867 < 2``, so the
+    power-of-two scale either stays put or exactly doubles, and when it doubles
+    every grid value halves into a binade whose absolute step also halves, so
+    ``grid_step * s`` is unchanged.
     """
     orig_dtype = x.dtype
     shape = x.shape
@@ -267,7 +301,7 @@ def _fp8_group_quant_dequant(
         *shape[:-1], shape[-1] // group_size, group_size
     )
     amax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=amax_floor)
-    scale = _round_scale_pow2(amax)
+    scale = _round_scale_pow2(amax, fp8_max)
     quantized = (grouped / scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
     dequantized = quantized.to(torch.float32) * scale
     return dequantized.reshape(shape).to(orig_dtype)
