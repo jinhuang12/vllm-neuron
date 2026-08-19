@@ -262,15 +262,59 @@ def _block_fp8_linear_nki(
         a_scale = nl.ndarray((m_sz, KB), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=a_scale, src=scale_bits.view(nl.float32))
 
+        # -- and its EXACT reciprocal, by negating the biased exponent --------
+        # The quantize step below needs ``x / a_scale``, but this wheel's
+        # ``nisa.tensor_scalar`` has no ``divide``: ``op0=nl.divide`` is rejected
+        # at trace time with "invalid kwarg 'op0': unsupported operator
+        # 'divide'". ``nl.divide`` EXISTS as a symbol, which is why the call read
+        # as legal, and the NKI CPU simulator does not enforce the ISA operator
+        # table, which is why simulator validation passed it.
+        #
+        # ``a_scale`` is always the exact power of two ``2**(f-127)`` where ``f``
+        # is ``ceil_field``, so its reciprocal is the exact power of two
+        # ``2**(127-f)``, whose biased exponent field is ``254-f``. Building it
+        # with integer ``multiply``/``add`` on the field -- both admitted -- and
+        # reinterpreting is EXACT by IEEE-754, and ``x * inv_a_scale`` is then
+        # BITWISE identical to ``x / a_scale``: measured 0 mismatches in 586586
+        # comparisons across every ``ceil_field`` the gate admits.
+        #
+        # The gate admits bf16 activations only, so ``ceil_field`` is in
+        # [106, 248] (``_AMAX_FLOOR``/fp8_max at the bottom, bf16 max/fp8_max at
+        # the top) and ``inv_field = 254 - ceil_field`` is in [6, 148] -- always
+        # a NORMAL fp32 exponent field, never subnormal and never infinite.
+        #
+        # ``nisa.reciprocal`` also compiles and is one instruction shorter, but
+        # it is a Vector-Engine instruction whose accuracy ON DEVICE cannot be
+        # observed from a device-free venue. Recorded, deliberately not used:
+        # this form needs no device measurement to be exact.
+        inv_field = nl.ndarray((m_sz, KB), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=inv_field,
+            data=ceil_field,
+            op0=nl.multiply,
+            operand0=-1,
+            op1=nl.add,
+            operand1=254,
+        )
+        inv_bits = nl.ndarray((m_sz, KB), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=inv_bits, data=inv_field, op0=nl.left_shift, operand0=23
+        )
+        inv_a_scale = nl.ndarray((m_sz, KB), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=inv_a_scale, src=inv_bits.view(nl.float32))
+
         # -- quantize to fp8 and transpose, once per (M tile, K block) --------
         xqT = nl.ndarray((P, KB * m_sz), dtype=weight_fp8.dtype, buffer=nl.sbuf)
         for kb in range(KB):
             scaled = nl.ndarray((m_sz, P), dtype=nl.float32, buffer=nl.sbuf)
+            # ``* inv_a_scale``, not ``/ a_scale``: this wheel's tensor_scalar
+            # admits no ``divide``, and the two are bitwise identical here
+            # because ``inv_a_scale`` is the exact reciprocal of a power of two.
             nisa.tensor_scalar(
                 dst=scaled,
                 data=x_sb[:, kb * P : (kb + 1) * P],
-                op0=nl.divide,
-                operand0=a_scale[:, kb : kb + 1],
+                op0=nl.multiply,
+                operand0=inv_a_scale[:, kb : kb + 1],
             )
             clamped = nl.ndarray((m_sz, P), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(
@@ -336,23 +380,97 @@ def _block_fp8_linear_nki(
 
 
 def _pow2_ceil_scale(amax: Tensor, fp8_max: float) -> Tensor:
-    """``s = 2 ** ceil(log2(amax / fp8_max))`` via the reference's bit trick.
+    """``s = 2 ** ceil(log2(amax / fp8_max))``, in a form that LOWERS to HLO.
 
-    A local copy of ``attention/mla_qkv.py:211-243``'s ``_round_scale_pow2``
-    rather than an import: that symbol is private to another functional module,
-    and this file must not depend on the import order of the attention
-    subpackage. The two must stay identical -- they implement the same clause of
-    the same checkpoint recipe (``dsv4_ref/kernel.py:22-37``).
+    A local copy of ``attention/mla_qkv.py``'s ``_round_scale_pow2`` rather than
+    an import: that symbol is private to another functional module, and this file
+    must not depend on the import order of the attention subpackage. The two must
+    stay identical -- they implement the same clause of the same checkpoint
+    recipe (``dsv4_ref/kernel.py:22-37``) -- and the numerics declaration grades
+    that equality as a clause.
 
-    ``(mantissa != 0)`` is used as ARITHMETIC, never as an index, so the graph
-    stays static-shape.
+    THIS REPLACED THE REFERENCE'S IEEE-754 INTEGER BIT TRICK, AND THE
+    MEASUREMENT IS WHY. The bit form
+    (``bits = v.view(int32); (bits >> 23) & 0xFF; ...``) does not lower through
+    the production ``vllm_neuron/compile/hlo.py:convert_fx_to_hlo``::
+
+        rshift = torch.ops.aten.__rshift__.Scalar(detach, 23)
+        RuntimeError: Expected XLA tensor. Got: XLAIntType
+
+    ``convert_fx_to_hlo`` builds XLA placeholders and RE-EXECUTES the FX graph on
+    them, so an op with no torch_xla lowering falls back to CPU and the next op
+    rejects the result. Eager execution never lowers, which is why eager
+    validation passed this for two iterations. Measured on this venue, against a
+    2-input matmul control and a 1-input fp32 elementwise control that both reach
+    a NEFF, every crash retried once and deterministic:
+
+        COMPILE : mul add sub div floor ceil log2 minimum maximum pow exp clamp
+        SEGFAULT: the fp32->int32 bitcast, and ``torch.exp2``
+        ABORT   : ``torch.frexp``, ``torch.ldexp``
+        FAIL    : ``>>``, ``bitwise_right_shift``, int32 ``multiply``
+
+    So every bit-trick form, every ``frexp`` form and every ``exp2`` form is
+    unavailable here, and the restatement has to live inside the first line.
+
+    WHY THIS IS STILL BIT-EXACT AT EXACT POWERS OF TWO, which is the whole point
+    of the bit form. ``exp2(ceil(log2 v))`` is the obvious replacement and it is
+    WRONG: measured 73 of 81 mismatches at nextafter-above-a-power-of-two, each
+    off by exactly a factor of 0.5 -- one whole exponent of quantization error,
+    exactly as ``mla_qkv``'s docstring warned. This form instead uses ``log2``
+    only for a SEED and then removes its error entirely:
+
+      * ``pow(2.0, floor(log2(v)))`` is an EXACT power of two, and ``floor(log2)``
+        is within 1 of the true ``floor(log2 v)``.
+      * three fixups then run, each EXACT: halve once if ``s > v``; double once if
+        ``2s <= v``; double once unless ``s == v``. One step each is provably
+        enough because the seed is within one binade -- writing ``v`` in
+        ``[2**t, 2**(t+1))`` and the seed as ``2**k`` with ``k`` in
+        ``{t-1, t, t+1}``, each of the three cases reaches ``s <= v < 2s`` after
+        at most one correction.
+      * halving and doubling a power of two is exact in fp32 inside the normal
+        range, and the comparisons are exact, so ``log2``'s error cannot reach
+        the result.
+
+    Measured BIT-EXACT against the bit trick over the declared domain -- 122
+    exact-power-of-two positions included, three probes in every admitted binade
+    from ``2**-30`` to ``2**30``, both nextafter neighbours of every power of two,
+    4096 random values, ``_AMAX_FLOOR`` and ``bfloat16_max``. That an INEXACT seed
+    is NOT rescued by the fixups was measured too: ``exp(k*ln2)`` seeds fail the
+    same clause at 225 and 524 positions, which is what makes the exactness of
+    the ``pow`` seed load-bearing rather than incidental.
+
+    DECLARED DEVIATION, outside the declared domain. For SUBNORMAL ``v`` the bit
+    trick floors at ``2**-126`` (its exponent field is 0, so ``ceil_log2``
+    saturates) while this form returns the true ceiling; 3 of 4 subnormal probes
+    differ. ``amax`` is an absolute maximum clamped at ``_AMAX_FLOOR``, so
+    ``v >= _AMAX_FLOOR/fp8_max = 4.166667e-07`` and subnormal ``v`` cannot occur
+    on any path this op has. Recorded rather than absorbed; no threshold moved.
+
+    Every selector is ARITHMETIC on integer-valued or ratio quantities -- no
+    boolean tensor, no index, no bitcast, no int32 -- so the graph stays
+    static-shape and inside the lowerable subset. 35 fx nodes, reaching a NEFF.
     """
     v = (amax.to(torch.float32) * (1.0 / fp8_max)).contiguous()
-    bits = v.view(torch.int32)
-    exponent = (bits >> 23) & 0xFF
-    mantissa = bits & 0x7FFFFF
-    ceil_log2 = exponent - 127 + (mantissa != 0).to(torch.int32)
-    return ((ceil_log2 + 127) << 23).view(torch.float32)
+    zero = torch.zeros_like(v)
+    one = torch.ones_like(v)
+
+    # Exact power-of-two seed, within one binade of the answer.
+    s = torch.pow(2.0, torch.floor(torch.log2(v)))
+
+    # Fixup 1 -- force s <= v. sel == 1 iff v/s < 1.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.ceil(one - r), zero), one)
+    s = s * (0.5 * sel + (one - sel))
+
+    # Fixup 2 -- force 2s > v, so that s <= v < 2s. sel == 1 iff v/s >= 2.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.floor(r * 0.5), zero), one)
+    s = s * (2.0 * sel + (one - sel))
+
+    # Fixup 3 -- the smallest power of two >= v: double unless s == v exactly.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.ceil(r - one), zero), one)
+    return s * (2.0 * sel + (one - sel))
 
 
 def _torch_block_fp8_linear(

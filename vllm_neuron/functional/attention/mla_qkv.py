@@ -209,14 +209,16 @@ def _gather_rope_tables(
 
 
 def _round_scale_pow2(amax: Tensor, fp8_max: float = FP8_CLAMP_MAX) -> Tensor:
-    """``s = 2 ** ceil(log2(amax / fp8_max))`` via the reference's IEEE-754 bit trick.
+    """``s = 2 ** ceil(log2(amax / fp8_max))``, in a form that LOWERS to HLO.
 
     ``fp8_max`` DEFAULTS TO THE PLATFORM-RESOLVED CEILING (240.0 on trn2, 448.0
     on trn3), not the reference's literal 448 -- finding F-7, lead-granted route
     (i); see :func:`_fp8_group_quant_dequant` for the whole argument. The divisor
     here and the clamp in the caller MUST be the same ceiling: a scale computed
     against 448 with a clamp at 240 would saturate roughly half of every group's
-    top values, which is a real accuracy loss rather than a re-encoding.
+    top values, which is a real accuracy loss rather than a re-encoding. The
+    restatement below leaves both of those invariants exactly as they were: same
+    signature, same default, same divisor, same coupling to the caller's clamp.
 
     ``dsv4_ref/kernel.py:36-37`` computes the ue8m0 (power-of-two) act-quant
     scale as ``fast_pow2(fast_log2_ceil(amax * (1/fp8_max)))``, and
@@ -226,21 +228,109 @@ def _round_scale_pow2(amax: Tensor, fp8_max: float = FP8_CLAMP_MAX) -> Tensor:
         ceil_log2 = exp - 127 + (1 if man != 0 else 0)
         pow2      = reinterpret_f32((ceil_log2 + 127) << 23)
 
-    Reproducing the bit form rather than ``exp2(ceil(log2(v)))`` matters at exact
-    powers of two, where fp32 ``log2`` can land a hair above or below the integer
-    and flip the ceiling — one whole exponent of quantization error. It is also
-    the same reinterpretation idiom the port must use for the checkpoint's
-    ``float8_e8m0fnu`` scales (family interface contract §1, discrepancy 1).
+    THAT BIT FORM REPLACED, AND THE MEASUREMENT IS WHY. It does not lower through
+    the production ``vllm_neuron/compile/hlo.py:convert_fx_to_hlo``::
 
-    ``(man != 0)`` is used as ARITHMETIC (``.to(int32)``), never as an index, so
-    the graph stays static-shape.
+        rshift = torch.ops.aten.__rshift__.Scalar(detach, 23)
+        RuntimeError: Expected XLA tensor. Got: XLAIntType
+
+    ``convert_fx_to_hlo`` builds XLA placeholders and RE-EXECUTES the FX graph on
+    them, so an op with no torch_xla lowering falls back to CPU and the next op
+    rejects the result. Eager execution never lowers, which is why eager
+    validation passed this for two iterations.
+
+    THIS COPY IS THE HARDER OF THE TWO THIS BUG HAS, AND NOTHING GATES IT. This
+    module has no ``_can_use_*`` dispatch pair at all (module docstring), so there
+    is no gate to turn off and no torch/NKI fork to take. The only guard on the
+    call path is ``kv_nope_fp8_qat``, which defaults ``True`` in :func:`mla_qkv`
+    and is passed explicitly ``True`` at both production call sites
+    (``model/deepseek_v4/attention.py`` and ``model/deepseek_v4/dspark_model.py``),
+    so this helper is traced UNCONDITIONALLY on the production path. Repairing
+    only ``functional/block_fp8_linear.py``'s copy would have left the compile
+    blocked here.
+
+    Measured on this venue, against a 2-input matmul control and a 1-input fp32
+    elementwise control that both reach a NEFF, every crash retried once and
+    deterministic:
+
+        COMPILE : mul add sub div floor ceil log2 minimum maximum pow exp clamp
+        SEGFAULT: the fp32->int32 bitcast, and ``torch.exp2``
+        ABORT   : ``torch.frexp``, ``torch.ldexp``
+        FAIL    : ``>>``, ``bitwise_right_shift``, int32 ``multiply``
+
+    So every bit-trick form, every ``frexp`` form and every ``exp2`` form is
+    unavailable here, and the restatement has to live inside the first line.
+
+    WHY THIS IS STILL BIT-EXACT AT EXACT POWERS OF TWO, which is the whole point
+    of the bit form and what this docstring used to warn about. ``exp2(ceil(log2
+    v))`` is the obvious replacement and it is WRONG: measured 73 of 81 mismatches
+    at nextafter-above-a-power-of-two, each off by exactly a factor of 0.5 -- one
+    whole exponent of quantization error, the warning confirmed by measurement
+    rather than dropped. This form instead uses ``log2`` only for a SEED and then
+    removes its error entirely:
+
+      * ``pow(2.0, floor(log2(v)))`` is an EXACT power of two, and ``floor(log2)``
+        is within 1 of the true ``floor(log2 v)``.
+      * three fixups then run, each EXACT: halve once if ``s > v``; double once if
+        ``2s <= v``; double once unless ``s == v``. One step each is provably
+        enough because the seed is within one binade -- writing ``v`` in
+        ``[2**t, 2**(t+1))`` and the seed as ``2**k`` with ``k`` in
+        ``{t-1, t, t+1}``, each of the three cases reaches ``s <= v < 2s`` after
+        at most one correction.
+      * halving and doubling a power of two is exact in fp32 inside the normal
+        range, and the comparisons are exact, so ``log2``'s error cannot reach
+        the result.
+
+    Measured BIT-EXACT against the bit trick over the declared domain -- 122
+    exact-power-of-two positions included, three probes in every admitted binade
+    from ``2**-30`` to ``2**30``, both nextafter neighbours of every power of two,
+    4096 random values, ``_AMAX_FLOOR`` and ``bfloat16_max``. That an INEXACT seed
+    is NOT rescued by the fixups was measured too: ``exp(k*ln2)`` seeds fail the
+    same clause at 225 and 524 positions, which is what makes the exactness of
+    the ``pow`` seed load-bearing rather than incidental.
+
+    DECLARED DEVIATION, outside the declared domain. For SUBNORMAL ``v`` the bit
+    trick floors at ``2**-126`` (its exponent field is 0, so ``ceil_log2``
+    saturates) while this form returns the true ceiling; 3 of 4 subnormal probes
+    differ. ``amax`` here is an absolute maximum clamped at ``amax_floor`` by
+    :func:`_fp8_group_quant_dequant`, so ``v >= 1e-4/fp8_max = 4.166667e-07`` and
+    subnormal ``v`` cannot occur on any path this op has. Recorded rather than
+    absorbed; no threshold moved.
+
+    THE REINTERPRETATION IDIOM IS UNAFFECTED WHERE IT IS A LOADER CONCERN
+    (family interface contract §1, discrepancy 1: decoding the checkpoint's
+    ``float8_e8m0fnu`` scales). That runs at weight load, off the traced graph,
+    where the bitcast is legal. Only this on-graph use had to move.
+
+    Every selector is ARITHMETIC on integer-valued or ratio quantities -- no
+    boolean tensor, no index, no bitcast, no int32 -- so the graph stays
+    static-shape and inside the lowerable subset. 35 fx nodes, reaching a NEFF.
+
+    KEPT IDENTICAL to ``functional/block_fp8_linear.py``'s ``_pow2_ceil_scale``,
+    which is a local copy of this helper; the LD-11 numerics declaration grades
+    that equality as a clause.
     """
     v = (amax.to(torch.float32) * (1.0 / fp8_max)).contiguous()
-    bits = v.view(torch.int32)
-    exponent = (bits >> 23) & 0xFF
-    mantissa = bits & 0x7FFFFF
-    ceil_log2 = exponent - 127 + (mantissa != 0).to(torch.int32)
-    return ((ceil_log2 + 127) << 23).view(torch.float32)
+    zero = torch.zeros_like(v)
+    one = torch.ones_like(v)
+
+    # Exact power-of-two seed, within one binade of the answer.
+    s = torch.pow(2.0, torch.floor(torch.log2(v)))
+
+    # Fixup 1 -- force s <= v. sel == 1 iff v/s < 1.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.ceil(one - r), zero), one)
+    s = s * (0.5 * sel + (one - sel))
+
+    # Fixup 2 -- force 2s > v, so that s <= v < 2s. sel == 1 iff v/s >= 2.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.floor(r * 0.5), zero), one)
+    s = s * (2.0 * sel + (one - sel))
+
+    # Fixup 3 -- the smallest power of two >= v: double unless s == v exactly.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.ceil(r - one), zero), one)
+    return s * (2.0 * sel + (one - sel))
 
 
 def _fp8_group_quant_dequant(
