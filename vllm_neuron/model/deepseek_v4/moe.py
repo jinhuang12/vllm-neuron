@@ -172,7 +172,7 @@ def _resolve_ep(config: DeepseekV4Config) -> tuple[int, int, object]:
 
 
 # =============================================================================
-# Section 1: Routed experts (MXFP8 group-32, expert-parallel)
+# Section 1: Routed experts (FP8 per-output-channel, expert-parallel)
 # =============================================================================
 
 
@@ -442,6 +442,40 @@ class DeepseekV4RoutedExperts(nn.Module):
         (``functional/moe/moe_block_tkg.py:435-437``) or pay all-expert cost
         per token.
         """
+        # R-17 GUARD. ``_can_use_moe_cte_kernel``'s non-MX branch checks
+        # neither dtype nor scales (``functional/moe/moe_cte.py:584-615``): it
+        # returns ``can_run_kernel(hidden_states)``, which is also False under
+        # ``VLLM_NEURON_DISABLE_NKI_KERNELS``. When it is False the call falls
+        # through to ``_torch_moe_impl`` (``moe_cte.py:448-461``), which takes
+        # NO scale arguments at all — so fp8 experts would be multiplied as raw
+        # E4M3 mantissas with every per-channel multiplier dropped. That is
+        # SILENTLY WRONG output, not an error, and the port plan records the
+        # rule as hard: never route fp8 weights to ``_torch_moe_impl``.
+        # Convert the silence into a refusal here, at the only call site that
+        # can.
+        # The guard is conditioned on the WEIGHTS being quantized rather than
+        # on the venue alone, because the harm is specific to dropped scales: a
+        # bf16 expert set has no scales to drop and reaching the torch fallback
+        # with one is correct, which is what makes the bf16 dataflow A/B
+        # (port-plan.md section 2 check 2) possible on CPU at all.
+        from vllm_neuron.functional.moe import moe_cte as _cte_mod
+
+        gate_up_weight = self._gate_up_weight()
+        gate_up_scale = self._gate_up_scale_per_channel()
+        if gate_up_scale is not None and not _cte_mod.can_run_kernel(hidden_states):
+            raise RuntimeError(
+                "DeepseekV4RoutedExperts prefill cannot run the NKI moe_cte "
+                "kernel on this venue, and its torch fallback "
+                "(_torch_moe_impl) accepts no weight scales. These experts are "
+                f"{gate_up_weight.dtype} with per-output-channel scales "
+                f"{tuple(gate_up_scale.shape)}, so falling back would silently "
+                "drop every multiplier and produce wrong output with no error "
+                "(R-17). Refusing. Run the prefill path on a Neuron device "
+                "with the NKI kernels enabled, or exercise this module under "
+                "the NKI CPU simulator (VLLM_NEURON_CPU_MODE=1 with "
+                "NKI_SIMULATOR=1)."
+            )
+
         impl, act_fn, scale_mode, _ = _moe_kernel_enums()
         gate_hi, gate_lo, up_hi, up_lo = self._clamps()
 
@@ -492,32 +526,6 @@ class DeepseekV4RoutedExperts(nn.Module):
             ]
         )
 
-        # R-17 GUARD. ``_can_use_moe_cte_kernel``'s non-MX branch checks
-        # neither dtype nor scales (``functional/moe/moe_cte.py:584-615``): it
-        # returns ``can_run_kernel(hidden_states)``, which is also False under
-        # ``VLLM_NEURON_DISABLE_NKI_KERNELS``. When it is False the call falls
-        # through to ``_torch_moe_impl`` (``moe_cte.py:448-461``), which takes
-        # NO scale arguments at all — so fp8 experts would be multiplied as raw
-        # E4M3 mantissas with every per-channel multiplier dropped. That is
-        # SILENTLY WRONG output, not an error, and the port plan records the
-        # rule as hard: never route fp8 weights to ``_torch_moe_impl``.
-        # Convert the silence into a refusal here, at the only call site that
-        # can.
-        from vllm_neuron.functional.moe import moe_cte as _cte_mod
-
-        if not _cte_mod.can_run_kernel(hidden_states):
-            raise RuntimeError(
-                "DeepseekV4RoutedExperts prefill cannot run the NKI moe_cte "
-                "kernel on this venue, and its torch fallback "
-                "(_torch_moe_impl) accepts no weight scales. These experts are "
-                "fp8 with per-output-channel scales, so falling back would "
-                "silently drop every multiplier and produce wrong output with "
-                "no error (R-17). Refusing. Run the prefill path on a Neuron "
-                "device with the NKI kernels enabled, or exercise this module "
-                "under the NKI CPU simulator (VLLM_NEURON_CPU_MODE=1 with "
-                "NKI_SIMULATOR=1)."
-            )
-
         return NF.moe_cte(
             # LD-21: ``shard_on_i``, NOT ``shard_on_block``. Both accept fp8
             # weights with per-channel scales, but ``shard_on_block`` pins
@@ -532,9 +540,9 @@ class DeepseekV4RoutedExperts(nn.Module):
             implementation=impl.shard_on_i,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
-            gate_up_proj_weight=self._gate_up_weight(),
+            gate_up_proj_weight=gate_up_weight,
             down_proj_weight=self._down_weight(),
-            gate_up_proj_scale=self._gate_up_scale_per_channel(),
+            gate_up_proj_scale=gate_up_scale,
             down_proj_scale=self._down_scale_per_channel(),
             token_position_to_id=token_position_to_id.to(dtype=torch.int32),
             block_to_expert=block_to_expert.to(dtype=torch.int32),
