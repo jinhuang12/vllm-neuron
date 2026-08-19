@@ -1,0 +1,124 @@
+{
+  "_declaration": "LD-11 block_fp8_linear numerics declaration (restated at port-plan iteration 5). COMMITTED BEFORE ANY MEASUREMENT: this file is committed first and the graded legs run over a scratch checkout at a later-or-equal commit, so scripts/triad_numerics.py leg 0 can prove mechanically that the thresholds predate the numbers they grade. Thresholds, shapes, cases and the timeout are transcribed from port-plan.md section 1(c) and port-assessment.md section 3.2; nothing here was chosen after seeing a result, and nothing here may be widened afterwards (plan section 6 records the alternative for a missed envelope: ladder row LD-25, plan-level, never a widened threshold).",
+  "_venue": "trn2-2, pinned venv /opt/aws_neuronx_venv_pytorch_inference_vllm_0_21_0_1_0_0, device-free. Every graded leg exports NEURON_PLATFORM_TARGET_OVERRIDE=trn2 BEFORE the first import (R-24): FP8_CLAMP_MAX is frozen at import time and falls back to 448.0 in bare CPU mode, so a leg that imports first would grade against the wrong fp8 ceiling and pass for the wrong reason.",
+  "_two_instruments": "The plan declares EIGHT cases. Five are expressible in this harness's input vocabulary (shape/dtype/kind/seed) and are graded here. THREE are the encoding cases added at iteration 5; they require weight bytes that were exponent-field 15 in the checkpoint's OCP grid and their paired doubled block scale, i.e. the actual output of the LD-24 loader transforms. The harness can generate only randn/rand/ones/zeros/arange/randint inputs, so it cannot construct them: they are declared under 'supplementary_cases' below and graded by the committed probe artifacts/repairs/author_kernel_triads-iter2/probe_ld11_triad.py, which runs the SAME two legs with the SAME env discipline (fallback: VLLM_NEURON_CPU_MODE=1 + VLLM_NEURON_DISABLE_NKI_KERNELS=1; simulator: VLLM_NEURON_CPU_MODE=1 + NKI_SIMULATOR=1) against the SAME plain-torch reference and reads its thresholds from THIS file. Neither instrument invents a threshold; the split is a limit of the harness's input vocabulary, recorded rather than absorbed.",
+
+  "op": "block_fp8_linear",
+  "timeout_seconds": 1200,
+
+  "reference": {
+    "callable": "numerics.block_fp8_linear_reference:block_fp8_linear_reference",
+    "_why": "Plain torch, outside the port package (the harness refuses a reference resolving inside vllm_neuron). Written in the scaled-partial form while the triad's fallback is written in the dequantize-then-matmul form, so leg 1 compares two independent spellings of the declared math."
+  },
+
+  "_tolerance_derivation": {
+    "compared_quantity": "the op's returned tensor at the contract's default out_dtype=torch.bfloat16 (the harness upcasts both sides to fp32 before comparing, so equal bf16 values compare equal).",
+    "rtol": "2**-7 = 0.0078125. bf16 carries 7 stored mantissa bits, so for a value v in [2**e, 2**(e+1)) one ULP is 2**(e-7) and one ULP RELATIVE lies in (2**-8, 2**-7]. rtol = 2**-7 is therefore the smallest relative tolerance that admits ANY single-ULP difference wherever it falls in a binade, which is exactly the declared clause 'bf16 output exact except positions differing by exactly one bf16 ULP'. It is four orders of magnitude below every defect class this gate exists to catch (a transposed weight, a swapped scale index, a wrong group boundary, a mis-sharded scale grid each move the output by >= 100%).",
+    "atol": "0.0. An absolute floor would let a near-zero output disagree by many ULPs unnoticed; the relative clause is the declared one.",
+    "not_a_substitute": "allclose(rtol=2**-7) admits a one-ULP difference at EVERY position. The declared clause also CAPS the number of such positions at 0.1%, and caps non-finite outputs at 0, and bounds the pre-cast fp32 accumulator at 2e-05 max_rel. Those three counted/measured clauses are below under 'clauses' and are graded by the committed probe, which reads them from here. A pass on this harness alone does not settle them."
+  },
+
+  "clauses": {
+    "non_finite_outputs_max": 0,
+    "fp32_accumulator_max_rel": 2e-05,
+    "bf16_one_ulp_position_fraction_max": 0.001,
+    "bf16_max_ulp_distance": 1,
+    "_basis": "port-plan.md section 1(c) / port-assessment.md section 3.2, verbatim. non-finite cap 0 is the defect this replan exists to kill (32/1024 -> 0/1024, legs E1 vs E2b of artifacts/repairs/author_kernel_triads-iter1/). 2e-05 sits ~15x above the measured 1.32114e-06 for the LD-24 halving at one 128-contraction block and four orders below any real defect class.",
+    "_measured_on": "fp32_accumulator_max_rel is measured with the op called at out_dtype=torch.float32 (the pre-cast accumulator the clause names); the bf16 clauses are measured at the contract default out_dtype=torch.bfloat16."
+  },
+
+  "cases": [
+    {
+      "name": "cte_m4096_k4096_n1536",
+      "_role": "plan case 1 of 5: the CTE prefill shape, fused_wqa_wkv at TP=64.",
+      "_simulator_note": "Declared true deliberately. 32 x 12 x 32 tiled matmuls through the numpy simulator may exceed the declared 1200s timeout, in which case the harness records UNCOVERED - loudly, never as a pass - and hardware proof for this shape stays with compile_and_serve. Declaring it false would have hidden the question.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [4096, 4096], "dtype": "bfloat16", "kind": "randn", "seed": 11001},
+        {"shape": [1536, 4096], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 11002},
+        {"shape": [12, 32], "dtype": "float32", "kind": "randint", "low": 1, "high": 9, "seed": 11003}
+      ],
+      "kwargs": {"block_size": [128, 128], "act_group_size": 128, "bias": null},
+      "tolerances": {"rtol": 0.0078125, "atol": 0.0}
+    },
+    {
+      "name": "tkg_m64_k1024_n512",
+      "_role": "plan case 2 of 5: the TKG decode shape (R-8's least favourable shape for a PE-array fp8 matmul).",
+      "simulator": true,
+      "inputs": [
+        {"shape": [64, 1024], "dtype": "bfloat16", "kind": "randn", "seed": 12001},
+        {"shape": [512, 1024], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 12002},
+        {"shape": [4, 8], "dtype": "float32", "kind": "randint", "low": 1, "high": 9, "seed": 12003}
+      ],
+      "kwargs": {"block_size": [128, 128], "act_group_size": 128, "bias": null},
+      "tolerances": {"rtol": 0.0078125, "atol": 0.0}
+    },
+    {
+      "name": "sub_block_n_shard_n64",
+      "_role": "plan case 3 of 5: a sub-block-N shard. N=64 < block_n=128, one grid row shared by the cores that split it (weight_loaders._grid_shard). The kernel must not assume N is a whole number of 128-blocks.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [64, 4096], "dtype": "bfloat16", "kind": "randn", "seed": 13001},
+        {"shape": [64, 4096], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 13002},
+        {"shape": [1, 32], "dtype": "float32", "kind": "randint", "low": 1, "high": 9, "seed": 13003}
+      ],
+      "kwargs": {"block_size": [128, 128], "act_group_size": 128, "bias": null},
+      "tolerances": {"rtol": 0.0078125, "atol": 0.0}
+    },
+    {
+      "name": "exactly_one_k_block_k128",
+      "_role": "plan case 4 of 5: K_local = 128 exactly - one contraction block, one activation group, a [N/128, 1] scale grid. The degenerate loop bound.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [64, 128], "dtype": "bfloat16", "kind": "randn", "seed": 14001},
+        {"shape": [256, 128], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 14002},
+        {"shape": [2, 1], "dtype": "float32", "kind": "randint", "low": 1, "high": 9, "seed": 14003}
+      ],
+      "kwargs": {"block_size": [128, 128], "act_group_size": 128, "bias": null},
+      "tolerances": {"rtol": 0.0078125, "atol": 0.0}
+    },
+    {
+      "name": "out_of_envelope_fp32_activations",
+      "_role": "plan case 5 of 5: the out-of-envelope case that MUST take the fallback. x is fp32; the kernel envelope admits bf16 activations only, so _can_use_block_fp8_linear returns False and the same call site runs the torch fallback on both legs. What it proves is that the gate REJECTS: the simulator leg's agreement is trivial by construction, and the probe additionally records the gate's boolean verdict per case so the rejection is evidence rather than an inference.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [64, 1024], "dtype": "float32", "kind": "randn", "seed": 15001},
+        {"shape": [128, 1024], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 15002},
+        {"shape": [1, 8], "dtype": "float32", "kind": "randint", "low": 1, "high": 9, "seed": 15003}
+      ],
+      "kwargs": {"block_size": [128, 128], "act_group_size": 128, "bias": null},
+      "tolerances": {"rtol": 0.0078125, "atol": 0.0}
+    }
+  ],
+
+  "supplementary_cases": [
+    {
+      "name": "encoding_field15_preimage_block",
+      "_role": "plan encoding case 1 of 3: a weight block holding at least one byte that carried exponent field 15 in the checkpoint's OCP grid - the case that produced 32/1024 non-finite outputs unremedied (leg E1). Built by drawing a block under the checkpoint's own recipe (ue8m0 power-of-two block scale against OCP 448, clamp +-448) until a field-15 byte appears, then passing the bytes through the LD-24 loader's OWN transform _reencode_ocp_to_legacy_halved and the paired scale through _e8m0_to_fp32_doubled. The op therefore consumes the loader's actual output, not a re-derivation of it.",
+      "shape": {"m": 128, "k": 128, "n": 128},
+      "simulator": true,
+      "seed": 21001
+    },
+    {
+      "name": "encoding_field01_odd_mantissa_block",
+      "_role": "plan encoding case 2 of 3: a weight block holding bytes at exponent field 0 AND field 1 with ODD mantissas - the halving's entire inexact zone (round-to-nearest-even into the subnormals), so the 2e-05 fp32 clause is actually exercised rather than trivially passed. Constructed by placing the required byte patterns explicitly, then through the same two LD-24 loader transforms.",
+      "shape": {"m": 128, "k": 128, "n": 128},
+      "simulator": true,
+      "seed": 22001
+    },
+    {
+      "name": "activation_group_240_448_and_wide_dynamic_range",
+      "_role": "plan encoding case 3 of 3: an activation group whose amax/s would have landed in (240, 448] under the old 448 ceiling - the COMMON case, not a tail case (~90% of ue8m0 groups under a 448 ceiling, assessment section 2.7) - plus a second group carrying more than 13 binades of internal dynamic range. Asserts additionally that no activation byte the op emits carries exponent field 15 on this venue.",
+      "shape": {"m": 128, "k": 256, "n": 128},
+      "simulator": true,
+      "seed": 23001
+    }
+  ],
+
+  "supplementary_legs": {
+    "fallback_vs_plain_torch": "same reference callable as above, same clauses",
+    "simulator_kernel_vs_fallback": "same clauses, under the same declared timeout_seconds",
+    "gate_verdicts": "_can_use_block_fp8_linear evaluated on every declared case (harness cases included) and its boolean recorded, so 'the out-of-envelope case took the fallback' is measured rather than assumed",
+    "emitted_activation_field15_count": {"max": 0, "_basis": "plan section 2 step 0 / R-22: no activation byte this op emits may carry exponent field 15 on trn2, where field 15 is inf/NaN."}
+  }
+}
