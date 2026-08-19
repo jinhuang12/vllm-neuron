@@ -112,24 +112,15 @@ _MX_GROUP = 32
 
 _FP8_DTYPE = torch.float8_e4m3fn
 
-#: MX tile geometry for the Neuron MoE kernels. These four numbers are not
-#: derivable from the model config -- they are the kernel's own tiling
-#: constants, read off ``gpt_oss/weight_loaders_mxfp4.py:27-29``
-#: (``PMAX = 128``, ``Q_WIDTH = 4``, ``Q_HEIGHT = 8``) and the 512-element K
-#: tile the MoE entry points document (``functional/moe/moe_tkg.py:62,70-72``,
-#: ``functional/moe/moe_cte.py:117-171``: ``gate_up`` is
-#: ``[E, 128, 2, ceil(H/512), I]`` and ``down`` is
-#: ``[E, I_p, ceil(I/512), H]``).
-_MX_PMAX = 128
-_MX_Q_WIDTH = 4
-_MX_Q_HEIGHT = 8
-_MX_TILE_K = 512
-
-#: FP8 elements per machine word on the expert path: the MoE wrappers hand the
-#: kernel a ``uint32`` view and reinterpret it as ``float8_e4m3fn_x4``
-#: (``functional/moe/moe_tkg_wrapper.py``). The tiling therefore has to treat
-#: four consecutive contraction-axis bytes as one atomic element.
-_MX_BYTES_PER_WORD = 4
+# RETIRED (LD-23): the MX tile geometry constants (``_MX_PMAX``,
+# ``_MX_Q_WIDTH``, ``_MX_Q_HEIGHT``, ``_MX_TILE_K``, ``_MX_BYTES_PER_WORD``)
+# lived here to drive the four ``_tile_mx_*`` transforms. Those transforms
+# existed only to feed the MX expert kernels, which lower to NeuronCore-v4
+# instructions and cannot execute on this campaign's trn2 (= NeuronCore-v3)
+# venue at all -- see the LD-23 section header and R-13. The gen3-legal path
+# takes PLAIN layouts, so there is no tiling left to parameterize and the
+# constants are removed rather than left as dead code that reads like a live
+# contract.
 
 #: FP4 (E2M1) code -> value table, verbatim from DeepSeek's own
 #: ``convert.py:11-14``. Note index 8 (the "negative zero" code) maps to
@@ -666,299 +657,340 @@ def _unpack_mxfp4_to_fp8_bytes(
 
 
 # ---------------------------------------------------------------------------
-# MX tiling for the routed experts
+# LD-23: MXFP4 + E8M0-group-32  ->  legacy-E4M3 + per-output-channel power-of-two
 #
-# WHY THIS EXISTS AT ALL: ``DeepseekV4RoutedExperts`` reinterprets these
-# parameters for the MoE kernels with *pure* ``view()`` calls -- no runtime
-# repacking (``moe.py:274-348``). A ``view`` cannot reorder elements, so the
-# loader must write the bytes ALREADY TILED. Get this wrong and nothing
-# raises: the views still succeed and the kernel silently reads garbage.
+# WHY THIS REPLACED THE MX TILING PATH (R-13, recorded in
+# ``artifacts/repairs/author_model_family-iter2/r13-moe-mxfp8-gen4-blocker.txt``):
+# the MX expert kernels lower to ``nisa.nc_matmul_mx`` / ``nisa.quantize_mx``,
+# which are NeuronCore-v4 instructions. This campaign's venue is trn2 =
+# NeuronCore-v3, so EVERY MX weight path is unexecutable here, tiled correctly
+# or not. The whole MX tiling apparatus (the four ``_tile_mx_*`` transforms and
+# their ``_MX_TILERS`` table) is therefore retired, not fixed.
 #
-# WHERE THE TRANSFORM COMES FROM: it is gpt_oss's, element for element --
-# ``gpt_oss/weight_loaders_mxfp4.py`` ``_tile_gate_up_blocks`` (590-656),
-# ``_tile_gate_up_scale`` (659-711), ``_tile_down_blocks`` (751-782) and
-# ``_tile_down_scale`` (785-811), with the tile extents from
-# ``_get_h_tiling_shard_i`` (814-832) and ``_get_i_tiling_shard_i`` (834-...).
-# Two differences, both mechanical:
+# WHAT REPLACES IT: the gen3-legal quantized expert path is 1-byte FP8 with
+# *plain* layouts and per-output-channel dequant scales -- ``NF.moe_cte``
+# non-MX ``shard_on_i`` at prefill and ``NF.moe_tkg`` ``QuantizationType.ROW``
+# at decode, both proven on the installed wheel by
+# ``artifacts/repairs/author_model_family-iter3/iter3-moe-gen3-probe.txt``.
+# Those kernels take ONE fp32 multiplier per output channel, so the
+# checkpoint's per-group-of-32 E8M0 exponents have to be folded into a single
+# per-channel exponent here, at load time.
 #
-#   1. gpt_oss stores its expert weights ``[in, out]`` (its tiler's input is
-#      ``[E, H/4, 2I]``) while this family stores ``[out, in]`` per contract
-#      §1, so each transform starts by transposing to the reference's
-#      orientation.
-#   2. gpt_oss's element is a *word* that already packs 4 quantized values
-#      along the contraction axis. Here the stored element is one FP8 byte, so
-#      the 4-byte word is materialized as an explicit innermost axis that the
-#      permutation carries along untouched. That keeps the packing implicit and
-#      avoids a ``uint32`` view of a non-contiguous tensor.
+# WHY THAT FOLD IS EXACT, AND WHY IT MUST BE ASSERTED RATHER THAN ASSUMED
+# (port-assessment.md section 2.5). Every source element is
+# ``value = m * 2**e_ck`` where ``m`` is one of the 16 FP4 magnitudes and
+# ``e_ck = code - 127`` is its group's E8M0 exponent. Writing the FP8 byte's
+# biased exponent field as ``f`` (legacy ``nl.float8_e4m3``: bias 7, ``f`` in
+# ``1..14`` for normals, ``15`` reserved for inf/NaN), the element's exponent
+# budget is ``q = f_base + e_ck``, where ``f_base`` is the field the FP4
+# magnitude alone occupies. Choosing ONE per-channel shift ``p`` and writing
+# ``f_tgt = q - p`` reproduces the value EXACTLY -- no rounding whatsoever,
+# because only the exponent field moves and the 3 mantissa bits are copied
+# untouched -- provided every live element lands in ``1 <= f_tgt <= 14``.
+# Placing the channel's maximum at the top of the window (``p = q_max - 14``)
+# makes the fold exact iff the channel's ``q`` span is at most 13 binades.
 #
-# Verified at this family's dimensions: a gate/up parameter tiles to bytes
-# that ``view`` as ``[E, 128, 1, H/512, I]`` uint32 (``[4, 128, 1, 8, 2048]``,
-# concatenated to ``[4, 128, 2, 8, 2048]`` by ``moe.py``), its scale to
-# ``[4, 16, 1, 8, 2048]`` uint8, and ``w2`` to ``[4, 128, 4, 4096]`` uint32
-# with scale ``[4, 16, 4, 4096]`` uint8.
+# 13 binades is a real, checkpoint-dependent limit, not a formality. When a
+# channel exceeds it there is no exact representation, and the two silent
+# alternatives are both wrong: rounding loses bits the parity standard is
+# measuring, and falling back to another format on this loader's own authority
+# would substitute a path nobody planned. So this loader RAISES, naming the
+# offending tensor, the output channel, and the measured span. That raise is
+# operator finding F-4 part 2 (port-assessment.md section 4): it is the
+# planner's decision to make, not this node's.
+#
+# The arithmetic below was proven bit-exact before it was authored --
+# ``scratch/iter3/requant_math.py``, 7 cases including the 13-binade boundary,
+# a 14-binade over-window raise, E8M0 code-0 groups, an all-zero channel and
+# the real family shape ``[2048, 4096]``.
 # ---------------------------------------------------------------------------
 
+#: Legacy ``nl.float8_e4m3`` biased-exponent field window for NORMAL values.
+#: Field 0 is zero/subnormal and field 15 is inf/NaN, so a normal occupies
+#: ``1..14``. This is the legacy encoding (amax ``1.875 * 2**7 = 240``), NOT
+#: OCP ``float8_e4m3fn`` (amax 448) -- on trn2 the plugin maps
+#: ``torch.float8_e4m3fn`` to ``nl.float8_e4m3`` in both directions
+#: (``nki/nki_dtype.py:43,51-53``), so the 1-byte parameter is only a CARRIER
+#: and the bytes inside it must be legacy-encoded. They are here, by
+#: construction: this loader never routes a value through torch's fp8
+#: conversion, it moves exponent fields inside bytes taken from
+#: :data:`_FP4_TO_FP8_BYTES`.
+_E4M3_FIELD_MIN = 1
+_E4M3_FIELD_MAX = 14
 
-def _mx_h_tiling(h_size: int) -> tuple[int, int]:
-    """``(num_H_tiles, q_blocks_per_H_tile)`` for a contraction axis of ``h_size``.
+#: Where the per-channel maximum is placed. Top of the window, so the fold
+#: never overflows to inf and the mantissa keeps every bit it had.
+_E4M3_FIELD_TOP = _E4M3_FIELD_MAX
 
-    Verbatim from ``gpt_oss/weight_loaders_mxfp4.py:829-830``.
+#: The exactly-representable ``q`` span, in binades.
+_E4M3_EXACT_SPAN = _E4M3_FIELD_MAX - _E4M3_FIELD_MIN
+
+
+def _requantize_expert_to_pow2_per_channel(
+    packed: torch.Tensor,
+    scale_codes: torch.Tensor,
+    param_name: str,
+    ckpt_key: str,
+    logical_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[N, K/2]`` MXFP4 + ``[N, K/32]`` E8M0  ->  ``[N, K]`` legacy-E4M3 bytes
+    and ``[N]`` fp32 power-of-two per-output-channel scales.
+
+    Rows are OUTPUT channels: the checkpoint stores every expert leaf as
+    ``[out, in]`` (family interface contract section 1) and the E8M0 groups run
+    along ``in``, so one scale per row is exactly "per output channel".
+
+    Returns ``(bytes, scale)`` such that
+    ``legacy_e4m3_decode(bytes) * scale[:, None]`` equals the checkpoint's own
+    value ``fp4_value * 2**(code - 127)`` BIT-EXACTLY for every element, or
+    raises. There is no tolerance parameter and no rounding: see the section
+    header for why exactness is checked rather than hoped for.
     """
-    return (
-        h_size // (_MX_PMAX * _MX_Q_WIDTH),
-        _MX_TILE_K // (_MX_Q_WIDTH * _MX_Q_HEIGHT),
-    )
-
-
-def _mx_i_tiling(i_size: int) -> tuple[int, int]:
-    """``(num_I_tiles, q_blocks_per_I_tile)`` for a free axis of ``i_size``.
-
-    Verbatim from ``gpt_oss/weight_loaders_mxfp4.py:834-880``: once the free
-    axis exceeds one 512-element tile the tile count grows and each tile holds
-    ``512/32`` quantization blocks; below that there is a single tile.
-    """
-    if i_size > _MX_TILE_K:
-        return (i_size + _MX_TILE_K - 1) // _MX_TILE_K, _MX_TILE_K // _MX_GROUP
-    return 1, i_size // _MX_GROUP
-
-
-def _require_mx_divisible(
-    param_name: str, ckpt_key: str, axis: str, size: int, factor: int
-) -> None:
-    """Fail loudly when an axis does not tile exactly.
-
-    gpt_oss pads to the tile geometry; this family's dimensions
-    (``H = 4096``, ``I = 2048``) divide it exactly, so padding is deliberately
-    not implemented -- and an unpadded remainder would produce a
-    silently-misaligned buffer rather than an error, which is exactly the
-    failure mode this port cannot afford.
-    """
-    if size % factor != 0:
+    if packed.shape[1] * 2 != logical_k:
         raise ValueError(
-            f"MX tiling for {param_name!r} (key {ckpt_key!r}): {axis} extent "
-            f"{size} is not a multiple of {factor}. The tile geometry "
-            f"(PMAX={_MX_PMAX}, Q_WIDTH={_MX_Q_WIDTH}, "
-            f"Q_HEIGHT={_MX_Q_HEIGHT}, K tile={_MX_TILE_K}) requires exact "
-            "division; padding is not implemented for this family."
+            f"MXFP4 requantization for {param_name!r} (key {ckpt_key!r}): "
+            f"stored {tuple(packed.shape)} implies logical K="
+            f"{packed.shape[1] * 2}, expected {logical_k}."
+        )
+    n_groups = scale_codes.shape[1]
+    if n_groups * _MX_GROUP != logical_k:
+        raise ValueError(
+            f"MXFP4 requantization for {param_name!r} (key {ckpt_key!r}): "
+            f"{n_groups} E8M0 groups x {_MX_GROUP} = {n_groups * _MX_GROUP} "
+            f"elements, but the weight has K={logical_k}."
+        )
+    if packed.shape[0] != scale_codes.shape[0]:
+        raise ValueError(
+            f"MXFP4 requantization for {param_name!r} (key {ckpt_key!r}): "
+            f"weight has {packed.shape[0]} output channels but its scale grid "
+            f"has {scale_codes.shape[0]}."
         )
 
+    codes = _as_bytes(scale_codes, param_name, ckpt_key)
+    # Code 255 is E8M0's NaN. Rejected for the same reason
+    # ``_e8m0_to_fp32`` rejects it: a NaN scale poisons every activation that
+    # touches the block and has no other symptom.
+    if bool((codes == 255).any()):
+        raise ValueError(
+            f"Expert scale for {param_name!r} (key {ckpt_key!r}) contains the "
+            "E8M0 code 255, which is NaN. Refusing to load."
+        )
 
-def _tile_mx_gate_up_weight(
-    byte_w: torch.Tensor, param_name: str, ckpt_key: str
-) -> torch.Tensor:
-    """Tile stacked gate/up expert bytes ``[E, I, H]`` in place of a ``view``.
+    # --- the FP4 -> FP8 byte upcast, unchanged (bit-identical to the
+    # reference's own "lossless" direction, dsv4_ref/convert.py:17-19) --------
+    base = _unpack_mxfp4_to_fp8_bytes(packed, param_name, ckpt_key, logical_k)
 
-    ``H`` is the contraction axis and is the packed one (4 bytes per word).
+    sign = (base & 0x80).to(torch.int32)
+    mant = (base & 0x07).to(torch.int32)
+    f_base = ((base >> 3) & 0x0F).to(torch.int32)
+
+    # An element contributes NOTHING to the channel's exponent budget when it
+    # is a zero. Two independent ways to be zero, both of which must be
+    # excluded or a single zero would drag ``q_min`` to nonsense:
+    #   * the FP4 code is +-0, i.e. byte 0x00 or 0x80 (note _FP4_TABLE maps
+    #     code 8 to +0.0, so in practice only 0x00 occurs);
+    #   * the whole group carries E8M0 code 0, whose multiplier is 0.0 -- the
+    #     reference's own ``fast_pow2`` semantics, see ``_e8m0_to_fp32``.
+    zero_code = (base & 0x7F) == 0
+    group_zero = torch.repeat_interleave(codes == 0, _MX_GROUP, dim=1)
+    is_zero = zero_code | group_zero
+
+    e_ck = torch.repeat_interleave(codes.to(torch.int32), _MX_GROUP, dim=1) - 127
+    q = f_base + e_ck
+
+    # Per-channel shift from the max live ``q``. ``masked_fill`` with a value
+    # below any reachable ``q`` (``f_base >= 0``, ``e_ck >= -127``) keeps the
+    # max over live elements only.
+    live = ~is_zero
+    has_live = live.any(dim=1)
+    q_live_max = q.masked_fill(is_zero, -(2**20)).amax(dim=1)
+    p = torch.where(has_live, q_live_max - _E4M3_FIELD_TOP, torch.zeros_like(q_live_max))
+
+    f_tgt = q - p[:, None]
+
+    # --- the HARD exactness assertion (operator finding F-4 part 2) ---------
+    bad = live & ((f_tgt < _E4M3_FIELD_MIN) | (f_tgt > _E4M3_FIELD_MAX))
+    if bool(bad.any()):
+        rows = torch.nonzero(bad.any(dim=1), as_tuple=False).flatten()
+        row = int(rows[0])
+        q_row = q[row][live[row]]
+        span = int(q_row.max() - q_row.min())
+        raise ValueError(
+            f"Cannot requantize {param_name!r} (key {ckpt_key!r}) to one "
+            f"power-of-two scale per output channel without losing bits: "
+            f"{int(bad.sum())} element(s) in {int(rows.numel())} of "
+            f"{packed.shape[0]} output channel(s) fall outside legacy "
+            f"nl.float8_e4m3's normal exponent window "
+            f"[{_E4M3_FIELD_MIN}, {_E4M3_FIELD_MAX}]. First offending output "
+            f"channel is {row}: its live elements span "
+            f"{int(q_row.min())}..{int(q_row.max())} = {span} binades, and only "
+            f"{_E4M3_EXACT_SPAN} are exactly representable. "
+            "This loader will NOT round and will NOT substitute another format "
+            "on its own authority -- both would silently change the numerics "
+            "the parity standard measures. This is operator finding F-4 part 2 "
+            "(port-assessment.md section 4): the ladder rung is the planner's "
+            "decision."
+        )
+
+    # Zeros keep their sign bit and nothing else; live elements keep sign and
+    # mantissa and take the shifted exponent field. Purely bitwise -- no
+    # floating-point operation touches a weight value anywhere in this
+    # function, which is what makes "bit-exact" a fact and not a hope.
+    out = torch.where(
+        is_zero,
+        sign,
+        sign | (f_tgt << 3) | mant,
+    ).to(torch.uint8)
+
+    # ``2**p`` built by moving ``p`` into the fp32 exponent field, the same
+    # bit trick ``_e8m0_to_fp32`` documents (and, transitively, the
+    # reference's ``fast_pow2``). ``ldexp`` would also work; this keeps the
+    # module's single idiom for "exact power of two" and needs no fp math.
+    #
+    # Range note: p = q_max - 14 with f_base <= 9 and code <= 254 gives
+    # p <= 118, and the smallest live q is >= 1 - 127 = -126 so p >= -140 is
+    # possible in principle. An fp32 exponent field only holds 1..254
+    # (unbiased -126..127), so a p outside that is not representable; it is
+    # rejected here rather than wrapping into a wrong multiplier.
+    p_biased = p + 127
+    if bool(((p_biased < 1) | (p_biased > 254)).any()):
+        worst = int(p[(p_biased < 1) | (p_biased > 254)][0])
+        raise ValueError(
+            f"Requantized scale for {param_name!r} (key {ckpt_key!r}) needs "
+            f"2**{worst}, which is outside fp32's normal exponent range "
+            "[-126, 127]. Refusing to load a scale that cannot be represented."
+        )
+    scale = (p_biased.to(torch.int32) << 23).view(torch.float32)
+
+    return out.reshape(packed.shape[0], logical_k), scale
+
+
+def _split_weight_and_scale_slices(
+    param_name: str, slices: Sequence[Any], n_local: int
+) -> tuple[list, list]:
+    """Split ``[w_e0..w_e{L-1}, s_e0..s_e{L-1}]`` into its two groups.
+
+    ``expert_parallel_grouped_loader`` is documented to hand a flat list
+    grouped BY ITEM across experts (``utils/weight_loader.py:697-704``), and
+    both LD-23 loaders bind the weight keys followed by the scale keys, so the
+    list is exactly two equal groups. Asserted rather than assumed: getting
+    this wrong would silently requantize scale bytes as weights.
     """
-    e_size, i_size, h_size = byte_w.shape
-    _require_mx_divisible(param_name, ckpt_key, "H", h_size, _MX_PMAX * _MX_Q_WIDTH)
-    _require_mx_divisible(param_name, ckpt_key, "I", i_size, _MX_TILE_K)
-    num_h_tiles, qb_h = _mx_h_tiling(h_size)
-    num_i_tiles, qb_i = _mx_i_tiling(i_size)
-
-    # -> gpt_oss's orientation, with the 4-byte word as an innermost axis:
-    # [E, H/4, I, 4].
-    words = (
-        byte_w.permute(0, 2, 1)
-        .reshape(e_size, h_size // _MX_BYTES_PER_WORD, _MX_BYTES_PER_WORD, i_size)
-        .permute(0, 1, 3, 2)
-    )
-    # [E, nHt, qbH, QH_h, gate_up=1, nIt, qbI, QH_i, QW_i, bytes]
-    words = words.reshape(
-        e_size,
-        num_h_tiles,
-        qb_h,
-        _MX_Q_HEIGHT,
-        1,
-        num_i_tiles,
-        qb_i,
-        _MX_Q_HEIGHT,
-        _MX_Q_WIDTH,
-        _MX_BYTES_PER_WORD,
-    )
-    # gpt_oss's permutation (639-650), plus the trailing byte axis. The gate/up
-    # axis is 1 wide here because the contract keeps w1 and w3 as separate
-    # parameters; ``moe.py`` concatenates them on that axis.
-    words = words.permute(0, 2, 3, 4, 1, 5, 8, 6, 7, 9)
-    return words.reshape(e_size, i_size, h_size)
+    if len(slices) != 2 * n_local:
+        raise ValueError(
+            f"Loader for {param_name!r} expected {2 * n_local} slices "
+            f"({n_local} weights then {n_local} scale grids), got "
+            f"{len(slices)}."
+        )
+    return list(slices[:n_local]), list(slices[n_local:])
 
 
-def _tile_mx_gate_up_scale(
-    byte_s: torch.Tensor, param_name: str, ckpt_key: str
-) -> torch.Tensor:
-    """Tile stacked gate/up expert scale bytes ``[E, I, H/32]``."""
-    e_size, i_size, groups = byte_s.shape
-    h_size = groups * _MX_GROUP
-    _require_mx_divisible(param_name, ckpt_key, "H", h_size, _MX_PMAX * _MX_Q_WIDTH)
-    _require_mx_divisible(param_name, ckpt_key, "I", i_size, _MX_TILE_K)
-    num_h_tiles, qb_h = _mx_h_tiling(h_size)
-    num_i_tiles, qb_i = _mx_i_tiling(i_size)
-
-    # -> [E, H/32, I], then gpt_oss's reshape/permute (673-710). No byte axis:
-    # a scale IS one byte per 32 contraction elements.
-    scale = byte_s.permute(0, 2, 1).reshape(
-        e_size,
-        num_h_tiles,
-        qb_h,
-        1,
-        num_i_tiles,
-        qb_i,
-        _MX_Q_HEIGHT,
-        _MX_Q_WIDTH,
-    )
-    scale = scale.permute(0, 2, 3, 1, 4, 7, 5, 6)
-    return scale.reshape(e_size, i_size, groups)
-
-
-def _tile_mx_down_weight(
-    byte_w: torch.Tensor, param_name: str, ckpt_key: str
-) -> torch.Tensor:
-    """Tile stacked down-projection expert bytes ``[E, H, I]``.
-
-    Here ``I`` is the contraction (and packed) axis and ``H`` the free axis,
-    which the kernel additionally shuffles in blocks of 4
-    (``_tile_down_blocks``, gpt_oss:764-780).
-    """
-    e_size, h_size, i_size = byte_w.shape
-    _require_mx_divisible(param_name, ckpt_key, "I", i_size, _MX_TILE_K)
-    _require_mx_divisible(param_name, ckpt_key, "H", h_size, _MX_BYTES_PER_WORD)
-    num_i_tiles, qb_i = _mx_i_tiling(i_size)
-
-    # -> [E, I/4, H, 4]
-    words = (
-        byte_w.permute(0, 2, 1)
-        .reshape(e_size, i_size // _MX_BYTES_PER_WORD, _MX_BYTES_PER_WORD, h_size)
-        .permute(0, 1, 3, 2)
-    )
-    words = words.reshape(
-        e_size,
-        num_i_tiles,
-        qb_i,
-        _MX_Q_HEIGHT,
-        h_size // _MX_BYTES_PER_WORD,
-        _MX_BYTES_PER_WORD,
-        _MX_BYTES_PER_WORD,
-    )
-    # gpt_oss:777 permute(0, 2, 3, 1, 5, 4, 6), with our byte axis in the slot
-    # its ``q_packed`` (size 1) occupied.
-    words = words.permute(0, 2, 3, 1, 5, 4, 6)
-    return words.reshape(e_size, h_size, i_size)
-
-
-def _tile_mx_down_scale(
-    byte_s: torch.Tensor, param_name: str, ckpt_key: str
-) -> torch.Tensor:
-    """Tile stacked down-projection scale bytes ``[E, H, I/32]``."""
-    e_size, h_size, groups = byte_s.shape
-    i_size = groups * _MX_GROUP
-    _require_mx_divisible(param_name, ckpt_key, "I", i_size, _MX_TILE_K)
-    _require_mx_divisible(param_name, ckpt_key, "H", h_size, _MX_BYTES_PER_WORD)
-    num_i_tiles, qb_i = _mx_i_tiling(i_size)
-
-    # -> [E, I/32, H], then gpt_oss:797-809.
-    scale = byte_s.permute(0, 2, 1).reshape(
-        e_size,
-        num_i_tiles,
-        qb_i,
-        h_size // _MX_BYTES_PER_WORD,
-        _MX_BYTES_PER_WORD,
-    )
-    scale = scale.permute(0, 2, 1, 4, 3)
-    return scale.reshape(e_size, h_size, groups)
-
-
-#: Which tiling pair a routed-expert leaf uses. ``w1``/``w3`` contract over
-#: ``H``; ``w2`` contracts over ``I``.
-_MX_TILERS = {
-    "gate_up": (_tile_mx_gate_up_weight, _tile_mx_gate_up_scale),
-    "down": (_tile_mx_down_weight, _tile_mx_down_scale),
-}
-
-
-def _mxfp4_expert_weight_loader(
+def _fp8_pow2_expert_weight_loader(
     param_name: str,
-    local_keys: Sequence[str],
+    local_weight_keys: Sequence[str],
+    local_scale_keys: Sequence[str],
     out_dim: int,
     logical_k: int,
-    kind: str,
 ) -> SafetensorsWeightLoader:
-    """Upcast this core's local experts from MXFP4 to MXFP8 ``[E_local, N, K]``.
+    """Requantize this core's local experts to ``[E_local, K, N]`` FP8 bytes.
 
-    Why upcast at load instead of at runtime: Trainium2 has no FP4 datapath, so
-    the expert GEMM must see ``float8_e4m3fn`` elements. Every FP4 magnitude is
-    exactly representable in E4M3, so this costs accuracy nothing (the
-    reference calls the same direction "lossless",
-    ``dsv4_ref/convert.py:17-19``) and it costs 2x expert bytes, which the port
-    plan already accounts for.
+    TWO things happen here that the retired MX loader did not do.
 
-    The group-32 E8M0 scales are NOT folded in here -- they are carried through
-    unchanged by :func:`_mx_expert_scale_loader`, so the served format stays
-    MXFP8 group-32 (what the Neuron MX expert kernels take). This is where this
-    port deliberately differs from the reference's own
-    ``--expert-dtype fp8`` conversion, which instead re-blocks the scales into
-    a 128x128 grid for its own fp8 GEMM (``dsv4_ref/convert.py:35-52``).
+    1. THE SCALES ARE FOLDED IN, so this loader needs BOTH checkpoint tensors
+       per expert -- the FP4 weight and its E8M0 grid. It gets them because
+       :func:`attach_moe_loaders` binds the weight keys followed by the scale
+       keys and ``expert_parallel_grouped_loader`` trims each group to the
+       local expert range independently.
 
-    Only the ``ep_degree``-local experts are ever materialized: the EP wrapper
-    restricts ``slices`` to this core's contiguous expert range before this
-    transform runs (4 of 256 at EP=64).
+    2. THE RESULT IS TRANSPOSED to ``[in, out]``. The gen3-legal MoE kernels
+       take ``gate_up`` as ``[E, H, 2, I]`` and ``down`` as ``[E, I, H]``
+       (contraction axis first, output channel last), while the checkpoint
+       stores ``[out, in]``. ``DeepseekV4RoutedExperts`` reinterprets these
+       parameters with pure ``view()`` calls, and a ``view`` cannot transpose,
+       so the transpose has to happen at load time -- exactly the constraint
+       that forced the retired path to pre-tile.
 
-    The result is written ALREADY TILED for the MX MoE kernels -- see the
-    tiling section above for why a ``view``-only consumer forces that.
+    Every byte is emitted as ``uint8`` and reinterpreted once at the end:
+    several torch CPU builds lack float8 ``stack``/``index_select`` kernels,
+    and the byte route is bit-equivalent (same reasoning as
+    ``llama3/weight_pack_mx_fp8.py:121-124``).
     """
-    expected = (out_dim, logical_k // 2)
-    tile_weight, _ = _MX_TILERS[kind]
+    n_local = len(local_weight_keys)
+    weight_shape = (out_dim, logical_k // 2)
+    scale_shape = (out_dim, logical_k // _MX_GROUP)
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         del rank  # experts are selected by EP rank, baked in at attach time
-        _require_slice_count(param_name, slices, len(local_keys))
+        w_slices, s_slices = _split_weight_and_scale_slices(
+            param_name, slices, n_local
+        )
         per_expert = []
-        for slice_obj, key in zip(slices, local_keys):
-            _require_shape(param_name, key, slice_obj, expected)
-            per_expert.append(
-                _unpack_mxfp4_to_fp8_bytes(slice_obj[:], param_name, key, logical_k)
+        for w_slice, s_slice, w_key, s_key in zip(
+            w_slices, s_slices, local_weight_keys, local_scale_keys
+        ):
+            _require_shape(param_name, w_key, w_slice, weight_shape)
+            _require_shape(param_name, s_key, s_slice, scale_shape)
+            byts, _ = _requantize_expert_to_pow2_per_channel(
+                _as_bytes(w_slice[:], param_name, w_key),
+                s_slice[:],
+                param_name,
+                w_key,
+                logical_k,
             )
-        # Stack as bytes, tile, then reinterpret once: torch CPU builds without
-        # float8 kernels can still run this whole path.
+            # [out, in] -> [in, out]; ``contiguous`` because the parameter is
+            # consumed by ``view``, which refuses a non-contiguous source.
+            per_expert.append(byts.t().contiguous())
         stacked = torch.stack(per_expert, dim=0)
-        tiled = tile_weight(stacked, param_name, local_keys[0])
-        return tiled.contiguous().view(_FP8_DTYPE)
+        return stacked.contiguous().view(_FP8_DTYPE)
 
     return SafetensorsWeightLoader(transform=transform)
 
 
-def _mx_expert_scale_loader(
+def _fp8_pow2_expert_scale_loader(
     param_name: str,
-    local_keys: Sequence[str],
+    local_weight_keys: Sequence[str],
+    local_scale_keys: Sequence[str],
     out_dim: int,
     logical_k: int,
-    kind: str,
 ) -> SafetensorsWeightLoader:
-    """Stack this core's local experts' group-32 E8M0 scales, values unchanged.
+    """Emit this core's local experts' ``[E_local, N]`` fp32 per-channel scales.
 
-    Shape per expert is ``[N, K/32]`` (``dsv4_ref/model.py:139-143``: "Scale is
-    [out, in//32] in float8_e8m0fnu (1 scale per 32 fp4 elements along K)").
-    They stay raw ``uint8`` exponent bytes -- the MX kernels consume E8M0
-    directly, and converting them to an fp32 multiplier here (which is what the
-    *block*-FP8 path does) would both quadruple their size and destroy the
-    format the kernel expects. ``moe.py`` declares ``experts.*_scale`` as
-    ``uint8`` and ``shared_expert.*_scale`` as fp32 for exactly this reason.
+    Computed by the SAME function as the weights
+    (:func:`_requantize_expert_to_pow2_per_channel`), from the same two
+    checkpoint tensors, so the scale can never disagree with the bytes it
+    scales. Duplicating the derivation instead of caching it costs one extra
+    pass over the FP4 bytes at load and buys the guarantee that a future edit
+    cannot desynchronize the pair -- the failure mode here is silent numeric
+    corruption, not a crash.
 
-    Only the element ORDER changes: the scales are tiled with the same
-    permutation as the weights they scale, so every scale stays paired with its
-    32 elements.
+    No transpose: the scale is already one value per output channel, and the
+    kernels take it as ``[E, N]`` (``moe_tkg`` ROW) or ``[E, 1, N]``
+    (``moe_cte`` PER_CHANNEL, produced by an ``unsqueeze`` in ``moe.py``).
     """
-    expected = (out_dim, logical_k // _MX_GROUP)
-    _, tile_scale = _MX_TILERS[kind]
+    n_local = len(local_weight_keys)
+    weight_shape = (out_dim, logical_k // 2)
+    scale_shape = (out_dim, logical_k // _MX_GROUP)
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         del rank
-        _require_slice_count(param_name, slices, len(local_keys))
+        w_slices, s_slices = _split_weight_and_scale_slices(
+            param_name, slices, n_local
+        )
         per_expert = []
-        for slice_obj, key in zip(slices, local_keys):
-            _require_shape(param_name, key, slice_obj, expected)
-            per_expert.append(_as_bytes(slice_obj[:], param_name, key))
-        stacked = torch.stack(per_expert, dim=0)
-        return tile_scale(stacked, param_name, local_keys[0]).contiguous()
+        for w_slice, s_slice, w_key, s_key in zip(
+            w_slices, s_slices, local_weight_keys, local_scale_keys
+        ):
+            _require_shape(param_name, w_key, w_slice, weight_shape)
+            _require_shape(param_name, s_key, s_slice, scale_shape)
+            _, scale = _requantize_expert_to_pow2_per_channel(
+                _as_bytes(w_slice[:], param_name, w_key),
+                s_slice[:],
+                param_name,
+                w_key,
+                logical_k,
+            )
+            per_expert.append(scale)
+        return torch.stack(per_expert, dim=0).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)
 
@@ -1473,8 +1505,12 @@ def attach_moe_loaders(
     * **Router** (``gate_weight``, ``gate_bias``, ``tid2eid``): replicated.
       Every core must score every expert before dispatch.
     * **Routed experts**: expert-parallel, ``n_routed_experts // ep_degree``
-      local experts (4 of 256 at EP=64). Weights are upcast MXFP4 -> MXFP8; the
-      group-32 E8M0 scales pass through unchanged.
+      local experts (4 of 256 at EP=64). LD-23: the checkpoint's MXFP4 weights
+      and group-32 E8M0 scales are REQUANTIZED here to legacy-E4M3 bytes plus
+      one fp32 power-of-two scale per output channel, and the bytes are written
+      transposed to ``[in, out]``. Both parameters read both checkpoint
+      tensors; see the LD-23 section header for why the fold is bit-exact and
+      why it raises instead of rounding.
     * **Shared expert**: sharded over a ``shared_tp_size``-way subgroup and
       replicated across the remaining subgroups (16-way with 4-fold replication
       at TP=64). A 64-way split would give ``K_local = 32`` on ``w2``, which
@@ -1578,13 +1614,21 @@ def attach_moe_loaders(
 
     # ``w1``/``w3`` are the gate/up projections (hidden -> intermediate) and
     # ``w2`` the down projection (intermediate -> hidden), matching the
-    # reference Expert (dsv4_ref/model.py:596-598).
-    # ``kind`` selects the MX tiling: ``w1``/``w3`` contract over ``H`` and tile
-    # as gate/up, ``w2`` contracts over ``I`` and tiles as down.
-    for leaf, out_dim, logical_k, kind in (
-        ("w1", inter, hidden, "gate_up"),
-        ("w3", inter, hidden, "gate_up"),
-        ("w2", hidden, inter, "down"),
+    # reference Expert (dsv4_ref/model.py:596-598). ``w1``/``w3`` contract over
+    # ``H``, ``w2`` over ``I``; that is the only per-leaf difference now that
+    # the MX tiling is retired (see the LD-23 section header).
+    #
+    # BOTH loaders take BOTH checkpoint tensors. The requantization folds the
+    # E8M0 group scales into one power-of-two per output channel, so neither
+    # the bytes nor the scale can be computed from its own tensor alone. The
+    # key list is therefore ``weights then scales``: two groups of
+    # ``n_experts``, which is exactly the layout
+    # ``expert_parallel_grouped_loader`` documents and trims group-wise
+    # (``utils/weight_loader.py:697-714``).
+    for leaf, out_dim, logical_k in (
+        ("w1", inter, hidden),
+        ("w3", inter, hidden),
+        ("w2", hidden, inter),
     ):
         all_weight_keys = [
             f"{prefix}.ffn.experts.{e}.{leaf}.weight" for e in range(n_experts)
@@ -1594,23 +1638,24 @@ def attach_moe_loaders(
         ]
         local_weight_keys = [all_weight_keys[e] for e in local_indices]
         local_scale_keys = [all_scale_keys[e] for e in local_indices]
+        paired_keys = [*all_weight_keys, *all_scale_keys]
 
         # The mapping enumerates all 256 per-expert keys (build_checkpoint_mappings
         # is a pure function of the config and cannot know this core's EP rank),
         # so the EP wrapper trims ``slices`` to the local contiguous range before
-        # the upcast runs -- non-local experts are never read from disk.
+        # the requantization runs -- non-local experts are never read from disk.
         _bind(
             experts,
             f"{leaf}_weight",
-            all_weight_keys,
+            paired_keys,
             expert_parallel_grouped_loader(
                 local_indices,
-                _mxfp4_expert_weight_loader(
+                _fp8_pow2_expert_weight_loader(
                     f"experts.{leaf}_weight",
                     local_weight_keys,
+                    local_scale_keys,
                     out_dim,
                     logical_k,
-                    kind,
                 ),
                 n_experts,
             ),
@@ -1618,15 +1663,15 @@ def attach_moe_loaders(
         _bind(
             experts,
             f"{leaf}_scale",
-            all_scale_keys,
+            paired_keys,
             expert_parallel_grouped_loader(
                 local_indices,
-                _mx_expert_scale_loader(
+                _fp8_pow2_expert_scale_loader(
                     f"experts.{leaf}_scale",
+                    local_weight_keys,
                     local_scale_keys,
                     out_dim,
                     logical_k,
-                    kind,
                 ),
                 n_experts,
             ),
@@ -2089,20 +2134,26 @@ def build_checkpoint_mappings(
             put(f"{moe}.gate_bias", f"{key_prefix}.ffn.gate.bias")
 
         for leaf in ("w1", "w3", "w2"):
-            put(
-                f"{moe}.experts.{leaf}_weight",
-                [
-                    f"{key_prefix}.ffn.experts.{e}.{leaf}.weight"
-                    for e in range(n_experts)
-                ],
-            )
-            put(
-                f"{moe}.experts.{leaf}_scale",
-                [
-                    f"{key_prefix}.ffn.experts.{e}.{leaf}.scale"
-                    for e in range(n_experts)
-                ],
-            )
+            # LD-23: BOTH routed-expert parameters read BOTH checkpoint
+            # tensors, because the requantization folds the E8M0 group scales
+            # into one power-of-two per output channel and neither result is
+            # computable from its own tensor alone. The order is
+            # ``all weights then all scales`` -- the two-group layout
+            # ``expert_parallel_grouped_loader`` trims group-wise
+            # (``utils/weight_loader.py:697-714``) and the layout
+            # ``_split_weight_and_scale_slices`` asserts. It must stay in step
+            # with the ``paired_keys`` list in ``attach_moe_loaders``.
+            expert_weight_keys = [
+                f"{key_prefix}.ffn.experts.{e}.{leaf}.weight"
+                for e in range(n_experts)
+            ]
+            expert_scale_keys = [
+                f"{key_prefix}.ffn.experts.{e}.{leaf}.scale"
+                for e in range(n_experts)
+            ]
+            paired = [*expert_weight_keys, *expert_scale_keys]
+            put(f"{moe}.experts.{leaf}_weight", paired)
+            put(f"{moe}.experts.{leaf}_scale", paired)
             put(
                 f"{moe}.shared_expert.{leaf}_weight",
                 f"{key_prefix}.ffn.shared_experts.{leaf}.weight",
