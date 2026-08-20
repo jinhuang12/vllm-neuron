@@ -37,6 +37,11 @@ if TYPE_CHECKING:
     # underlying CPU, number of ranks, and buckets being compiled.
     VLLM_NEURON_PARALLEL_TRACE_WORKERS: int = 8
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
+    # Host-RAM admission gate for the parallel-trace fork pool. Both keys
+    # default to 0, which means OFF: at 0 the pool behaves exactly as it does
+    # with the keys absent — no lock path is touched and no log line is added.
+    VLLM_NEURON_MAX_CONCURRENT_TRACERS: int = 0
+    VLLM_NEURON_TRACER_ADMIT_TIMEOUT: int = 0
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
@@ -166,6 +171,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph extraction sequentially in the parent process.
     "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE")) or False
+    ),
+    # Cap on the number of parallel-trace fork children alive at once,
+    # counted across EVERY rank on the host rather than per rank. Each rank
+    # calls parallel_trace independently, so `VLLM_NEURON_PARALLEL_TRACE_WORKERS`
+    # alone bounds only one rank's fan-out; host RAM is consumed by the sum.
+    # 0 = OFF and is the default: the admission gate is not constructed, no
+    # lock path is created or touched, and no log line is emitted, so the pool
+    # is behaviourally identical to having no gate in the code at all.
+    # The `_v if (_v := ...) is not None else 0` form is deliberate: the
+    # `or N` idiom used by the older keys above cannot distinguish an explicit
+    # 0 from an unset key, and here 0 is a meaningful value ("disabled").
+    "VLLM_NEURON_MAX_CONCURRENT_TRACERS": lambda: (
+        _v
+        if (_v := maybe_convert_int(os.getenv("VLLM_NEURON_MAX_CONCURRENT_TRACERS")))
+        is not None
+        else 0
+    ),
+    # Seconds a rank waits for an admission slot before aborting the leg.
+    # 0 = OFF. This key MUST be set to a positive value whenever
+    # VLLM_NEURON_MAX_CONCURRENT_TRACERS is set; the gate refuses to run
+    # unbounded, because an unbounded staging wait converts a loud host-RAM
+    # OOM into a silent hang that neither VLLM_NEURON_BARRIER_TIMEOUT (which
+    # only bounds the POST-trace rendezvous) nor a MemAvailable watchdog
+    # (memory looks healthy while every rank waits) can detect.
+    "VLLM_NEURON_TRACER_ADMIT_TIMEOUT": lambda: (
+        _v
+        if (_v := maybe_convert_int(os.getenv("VLLM_NEURON_TRACER_ADMIT_TIMEOUT")))
+        is not None
+        else 0
     ),
     # Minimum KV budget (GiB) guardrail
     "VLLM_NEURON_MIN_KV_BUDGET_GIB": lambda: (
