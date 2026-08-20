@@ -10,11 +10,45 @@ GLM-5.2 checkpoint.
 - Expert parallel size: 64
 - Main decoder layers: 78
 - MTP layers: excluded from main execution
-- Checkpoint format: block FP8 weights with BF16 activations
+- Checkpoint format: block FP8 weights converted to row-scaled FP8 for routed
+  experts, with BF16 activations
 - On-device sampling: greedy only
 
 `GlmMoeDsaConfig` validates the complete pinned architecture and quantization
 contract. It rejects unsupported checkpoint variants.
+
+## Validated runtime envelope
+
+Revision `ae56198` was validated on one Trainium2 `trn2.48xlarge` instance on
+2026-08-20.
+
+- Fresh TP64 compile: 384 HLO graphs, 384 NEFF files, and 384 completion
+  markers, with no compiler errors.
+- Cached activation: prefill buckets 16, 128, and 512 and decode buckets 1, 8,
+  and 32, with no cache misses or compiler processes.
+- Offline concurrency 32: 288 of 288 requests passed for prompt lengths 16,
+  128, and 480 and output lengths 1, 16, and 32.
+- OpenAI-compatible concurrency 32: 576 of 576 chat-completion and completion
+  requests passed for the same prompt and output matrix.
+- Length boundary: one offline request with 2,016 prompt tokens and 32 output
+  tokens completed at the 2,048-token limit.
+
+The CUDA reference run on eight H200 GPUs captured 384 requests with the same
+model, tokenizer, and greedy sampling. Its exact prompts and outputs were used
+for a 320-request Neuron diagnostic. Token sequences diverged across backends,
+while representative longer responses retained the same meaning. FP8 execution
+and backend reduction order are not bit-exact. This is a semantic smoke result,
+not a promise of token-for-token equality.
+
+## Current limits
+
+- Concurrency 32 is validated through 512 total prompt and output tokens.
+- The 2,048-token result is a single offline boundary request. It does not
+  establish concurrency-32 or HTTP service at that length.
+- Context lengths above 2,048 tokens are not validated.
+- The selective block-FP8 MoE and selected-latent MLA paths remain
+  experimental and disabled by default.
+- This validation does not include performance targets.
 
 ## Package structure
 
