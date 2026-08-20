@@ -479,6 +479,114 @@ def _gptj_rope(
     )
 
 
+def _pow2_ceil_scale(amax: torch.Tensor, fp8_max: float) -> torch.Tensor:
+    """``s = 2 ** ceil(log2(amax / fp8_max))``, in a form that LOWERS to HLO.
+
+    FINDING F-3, episode ``ep8-exp2-customcall``. ``torch.exp2`` HAS NO
+    ``torch_xla`` LOWERING. ``vllm_neuron/compile/hlo.py:176``
+    (``convert_fx_to_hlo``) builds XLA placeholders and RE-EXECUTES the traced FX
+    graph on them, so at an ``exp2`` node the op leaves the XLA path: measured,
+    it produces an ``aten::exp2`` FALLBACK counter plus ``xla::_to_cpu`` /
+    ``xla::_copy_from`` and leaves NO ``exp2`` IR node at all, i.e. it
+    materializes its input on the host. That forces the pending graph to be
+    compiled and executed by the XLA CPU backend, and the graph does not survive
+    it. The termination mode is selected by what else the graph holds:
+
+        with an NKI custom call pending -> the CPU backend's IR emitter meets a
+          deliberately api_version-0 CustomCall (``nki_hop.py:301-309`` passes no
+          api_version, which the NEURON compiler wants) and raises
+          ``Unknown custom-call API version enum value: 0
+          (API_VERSION_UNSPECIFIED)``
+        with no custom call pending  -> SIGSEGV, because the placeholders have no
+          backing data
+
+    Measured as a 2x2 factorial through the production converter (episode legs
+    C2z/C2a/C2b/C2c/C3): ``exp2`` is NECESSARY AND SUFFICIENT for the failure, and
+    an api_version-0 NKI custom call passes this path cleanly on its own. So the
+    custom-call message is a SYMPTOM of ``exp2``, not a registration defect.
+    Eager execution never lowers, which is why eager validation passed this.
+
+    THIS IS THE THIRD LOCAL COPY OF ONE HELPER, BY THE REPO'S OWN CONVENTION, AND
+    THE EQUALITY OF THE THREE IS GRADED. The body below is VERBATIM
+    ``functional/attention/mla_qkv.py::_round_scale_pow2`` (body lines 313-333);
+    ``functional/block_fp8_linear.py::_pow2_ceil_scale`` is the second copy and
+    its docstring states the copy-not-import rationale -- a private symbol of
+    another functional module, and no dependence on the attention subpackage's
+    import order. The LD-11 numerics declaration grades that equality as a
+    clause, and this copy is graded into it. **Change one, change all three.**
+
+    THE PRIOR F-3 REPAIR NEVER REACHED THIS FILE. It was applied only inside
+    ``mla_qkv.py`` and ``block_fp8_linear.py``; the sweep report said so at the
+    time, and the two ``exp2`` primitives stayed live here until this episode.
+
+    WHY THIS IS ALSO A NUMERICS REPAIR, NOT ONLY A LOWERING ONE.
+    ``exp2(ceil(log2 v))`` is the obvious form and it is WRONG: graded against an
+    exact float64 smallest-power-of-two-``>=`` reference computed on its OWN input
+    form, it is wrong at **53 of 244** power-of-two-edge points, each by exactly a
+    factor of 2 -- one whole exponent of quantization error -- while this form is
+    wrong at **0**. Identical at both ceilings used here (240.0 and 6.0). The repo
+    had already recorded the same defect from a different domain with a different
+    instrument ("73 of 81", ``block_fp8_linear.py:476-479``). So the shipped code
+    would have produced scales off by a full binade at binade edges EVEN IF IT HAD
+    LOWERED. No tolerance was moved to reach that statement.
+
+    This form uses ``log2`` only for a SEED and then removes its error entirely:
+
+      * ``pow(2.0, floor(log2(v)))`` is an EXACT power of two, and ``floor(log2)``
+        is within 1 of the true ``floor(log2 v)``.
+      * three fixups then run, each EXACT: halve once if ``s > v``; double once if
+        ``2s <= v``; double once unless ``s == v``. One step each is provably
+        enough because the seed is within one binade -- writing ``v`` in
+        ``[2**t, 2**(t+1))`` and the seed as ``2**k`` with ``k`` in
+        ``{t-1, t, t+1}``, each of the three cases reaches ``s <= v < 2s`` after
+        at most one correction.
+      * halving and doubling a power of two is exact in fp32 inside the normal
+        range, and the comparisons are exact, so ``log2``'s error cannot reach
+        the result.
+
+    DECLARED DEVIATION, CARRIED FORWARD, AND UNREACHABLE AT BOTH SITES HERE. For
+    SUBNORMAL ``v`` the reference's IEEE-754 bit trick floors at ``2**-126`` (its
+    exponent field is 0, so ``ceil_log2`` saturates) while this form returns the
+    true ceiling; 3 of 4 subnormal probes differ. Both callers in this module
+    clamp ``absmax`` first, so subnormal ``v`` cannot occur on either path:
+    :func:`_quant_fp8_ue8m0` clamps at ``1e-4``, giving
+    ``v >= 1e-4/240 = 4.17e-07``, and :func:`_quant_fp4_simulate` clamps at
+    ``1e-8``, giving ``v >= 1e-8/6.0 = 1.67e-09``. fp32's smallest NORMAL is
+    ``1.18e-38``, so both floors clear it by 31 and 29 orders of magnitude.
+    Recorded rather than absorbed; no threshold moved.
+
+    THE CALLER'S CEILING AND THIS DIVISOR MUST BE THE SAME. A scale computed
+    against 448 with a clamp at 240 would saturate roughly half of every group's
+    top values, which is a real accuracy loss rather than a re-encoding. Both
+    callers pass the platform-resolved ceiling they also clamp with.
+
+    Every selector is ARITHMETIC on integer-valued or ratio quantities -- no
+    boolean tensor, no index, no bitcast, no int32, no ``exp2``, no ``frexp``, no
+    ``ldexp`` -- so the graph stays static-shape and inside the lowerable subset.
+    """
+    v = (amax.to(torch.float32) * (1.0 / fp8_max)).contiguous()
+    zero = torch.zeros_like(v)
+    one = torch.ones_like(v)
+
+    # Exact power-of-two seed, within one binade of the answer.
+    s = torch.pow(2.0, torch.floor(torch.log2(v)))
+
+    # Fixup 1 -- force s <= v. sel == 1 iff v/s < 1.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.ceil(one - r), zero), one)
+    s = s * (0.5 * sel + (one - sel))
+
+    # Fixup 2 -- force 2s > v, so that s <= v < 2s. sel == 1 iff v/s >= 2.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.floor(r * 0.5), zero), one)
+    s = s * (2.0 * sel + (one - sel))
+
+    # Fixup 3 -- the smallest power of two >= v: double unless s == v exactly.
+    r = v / s
+    sel = torch.minimum(torch.maximum(torch.ceil(r - one), zero), one)
+    return s * (2.0 * sel + (one - sel))
+
+
 def _quant_fp8_ue8m0(
     x: torch.Tensor, group: int = _KV_QUANT_GROUP
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -504,11 +612,17 @@ def _quant_fp8_ue8m0(
     groups = width // group
     xb = x.to(torch.float32).view(tokens, groups, group)
     absmax = xb.abs().amax(dim=-1).clamp_min(1e-4)
-    exponents = torch.ceil(torch.log2(absmax / _FP8_MAX))
+    # F-3 (ep8): `torch.exp2` has no torch_xla lowering and kills
+    # convert_fx_to_hlo -- see :func:`_pow2_ceil_scale`. `scales` IS the same
+    # quantity the old `torch.exp2(exponents)` returned, so `_dequant_fp8` and the
+    # `mla_sparse_attention.dequant_group_scales` convention are unchanged; and
+    # `xb / scales` equals the old `xb * exp2(-exponents)` exactly, because a
+    # power-of-two reciprocal is exact in fp32 inside the normal range.
+    scales = _pow2_ceil_scale(absmax, _FP8_MAX)
     codes = torch.clamp(
-        xb * torch.exp2(-exponents).unsqueeze(-1), -_FP8_MAX, _FP8_MAX
+        xb / scales.unsqueeze(-1), -_FP8_MAX, _FP8_MAX
     ).to(_FP8_DTYPE)
-    return codes.view(tokens, width), torch.exp2(exponents)
+    return codes.view(tokens, width), scales
 
 
 def _dequant_fp8(codes: torch.Tensor, scales: torch.Tensor, group: int) -> torch.Tensor:
@@ -557,7 +671,10 @@ def _quant_fp4_simulate(x: torch.Tensor, group: int = _FP4_QUANT_GROUP) -> torch
     groups = width // group
     xb = x.to(torch.float32).view(tokens, groups, group)
     absmax = xb.abs().amax(dim=-1).clamp_min(1e-8)
-    scales = torch.exp2(torch.ceil(torch.log2(absmax / _FP4_MAX))).unsqueeze(-1)
+    # F-3 (ep8): `torch.exp2` has no torch_xla lowering and kills
+    # convert_fx_to_hlo -- see :func:`_pow2_ceil_scale`, which returns the same
+    # power-of-two scale without it (and without its binade-edge error).
+    scales = _pow2_ceil_scale(absmax, _FP4_MAX).unsqueeze(-1)
 
     scaled = torch.clamp(xb / scales, -_FP4_MAX, _FP4_MAX)
     # DC-1 (ep7): `torch.tensor(<python sequence>, device=x.device)` on the meta
