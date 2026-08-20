@@ -82,8 +82,8 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .attention import (
+    _DRAFT_SWA_PAIR_HEAD_SIZE,
     _FP8_DTYPE,
-    _SWA_PAIR_HEAD_SIZE,
     DeepseekV4Attention,
 )
 from .config import DeepseekV4Config
@@ -1028,10 +1028,28 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsEagle3):
         ``max_model_len``. At the planned 65536 / 32-seq / fp8 configuration
         that turns 12 MiB/core of drafter KV into roughly 6.0 GiB/core and
         breaks the 21.6 GiB/core budget. Declared here they go through the
-        target's branch, become ``SlidingWindowSpec``, and are spec-identical to
-        the 43 target SWA legs, so they merge into the same KV cache group --
-        which is also what makes the proposer's
-        ``validate_same_kv_cache_group`` check meaningful rather than vacuous.
+        target's branch and become ``SlidingWindowSpec``, which is the reason
+        this declaration lives in the target.
+
+        They are NOT spec-identical to the 43 target SWA legs, and that is
+        deliberate as of `KV-ROW-DESIGN-v2` (port plan §3.6.2, LD-29 / R-34).
+        Their declared head is :data:`~.attention._DRAFT_SWA_PAIR_HEAD_SIZE`
+        (896) against the target's 672, even though the CONTENT both write is
+        the same 512 / 7 split. Keeping these THREE legs a spec type of their
+        own pins ``group_size = min_num_layers = 3``
+        (``kv_cache_utils.py:1136-1147``), and 3 divides the target's 21 and 42
+        exactly, so the two ``group_size`` factors in
+        ``_max_memory_usage_bytes_from_groups`` (``:1767-1778``) cancel. Letting
+        them merge instead pushes ``group_size`` to 20, which divides 21 and 43
+        badly and costs 2022.40 -> 2979.38 MiB/request in pure rounding. So the
+        design's price is coupled to DSpark being enabled.
+
+        ``EagleProposer.validate_same_kv_cache_group``
+        (``vllm/spec_decode/eagle.py:278-291``) still passes and is still
+        meaningful: it asserts that the DRAFTER's own layers -- here
+        ``DSparkProposer.attn_layer_names``, i.e. these three names -- share ONE
+        group, not that they share the target's. Three legs of one spec type at
+        ``group_size = 3`` is exactly one group.
 
         Gated on ``aux_hidden_state_layers`` being set, which is the Eagle3
         handshake's own signal and happens in ``load_model``
@@ -1045,7 +1063,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsEagle3):
             LayerSpec(
                 name=f"mtp.{stage}.self_attn.swa",
                 num_kv_heads=1,
-                head_size=_SWA_PAIR_HEAD_SIZE,
+                head_size=_DRAFT_SWA_PAIR_HEAD_SIZE,
                 dtype=_FP8_DTYPE,
                 sliding_window_size=self.config.sliding_window,
                 chunk_size=None,

@@ -1059,7 +1059,35 @@ class DeepseekV4MoE(nn.Module):
             flat_ids = input_ids.reshape(-1).to(torch.int64)
             expert_index = self.tid2eid.index_select(0, flat_ids)
         else:
-            expert_index = torch.topk(scores, self.num_experts_per_tok, dim=-1)[1]
+            # LD-09 / port plan §3.9. Routed through ``NF.topk`` rather than
+            # ``torch.topk`` so the rotational NKI top-k kernel can take this
+            # call: sweep finding F-2 predicts a bare ``torch.topk`` lowers to
+            # an HLO ``sort`` that ``neuronx-cc`` rejects (``NCC_EVRF029``,
+            # exit 70). This is the family's ONLY ``topk``/``sort`` call site
+            # and it is live on both prefill and decode.
+            #
+            # ``process_group=None`` is deliberate and semantics-preserving:
+            # the router matmul above is replicated, not expert-sharded, so
+            # ``scores`` is already the global ``[T, n_routed_experts]``. With
+            # no group the op takes its ``tp_degree == 1`` fast path, which is
+            # exactly the local selection ``torch.topk`` was doing. On that
+            # path ``gather_dim`` is unread; it is passed as ``-1`` to match
+            # ``dim`` rather than left to a default, because the op has none.
+            #
+            # NOT a guarantee on its own: when ``_can_use_nki_topk`` declines
+            # the shape, the op falls back to ``torch.topk`` and F-2's rejected
+            # lowering returns. ``_rotational_topk_config_compiles`` is the
+            # authoritative device-free gate and it is graded per compiled
+            # bucket, off hardware.
+            #
+            # R-39, parity-relevant: the NKI path and ``torch.topk`` may break
+            # ties differently. This is EXPERT selection, so a different
+            # tie-break selects a different expert and can change the output
+            # token relative to a GPU baseline that used ``torch.topk``
+            # semantics -- a divergence that is not a port bug.
+            expert_index = NF.topk(
+                scores, self.num_experts_per_tok, dim=-1, gather_dim=-1
+            )[1]
         expert_index = expert_index.to(torch.int64)
 
         # Step 6 (:585) — weights come from the UNCORRECTED scores.

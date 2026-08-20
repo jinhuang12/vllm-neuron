@@ -49,6 +49,17 @@ from .moe.rmsnorm_router_topk_tkg import rmsnorm_router_topk_tkg
 from .moe.router import router
 from .moe.topk_reduce import topk_reduce
 from .rmsnorm_quant import rmsnorm_quant
+# <-- deepseek_v4 (LD-09): the plain top-k op. SHIPPED and unmodified; this port
+# only re-exports it. Without this line `NF.topk` resolves to the MODULE, not
+# the function, and `NF.topk(...)` raises `TypeError: 'module' object is not
+# callable`. The one call site is the MoE router (`model/deepseek_v4/moe.py`),
+# which called `torch.topk` directly before: sweep finding F-2 predicts that
+# lowers to an HLO `sort` which `neuronx-cc` rejects (`NCC_EVRF029`, exit 70).
+# Routing through this op is what lets the rotational NKI top-k kernel take the
+# call when its own gate admits the shape; when the gate declines, the op's
+# fallback IS `torch.topk`, so the rewire alone is not a guarantee -- see
+# `topk._rotational_topk_config_compiles`, the authoritative device-free gate.
+from .topk import topk
 from .sampling import sample
 from .cumsum import cumsum
 from .prompt_embeds import merge_prompt_embeds
@@ -93,6 +104,7 @@ __all__ = [
     "segmented_attention_cp",
     "sparse_indexer_topk",
     "swa_attention",
+    "topk",
     "topk_reduce",
     "validate_expert_parallelism_config",
 ]

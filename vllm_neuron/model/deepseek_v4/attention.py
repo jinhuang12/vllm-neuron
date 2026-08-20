@@ -177,11 +177,37 @@ _PAD_INDEX: int = -1
 #: ``k_cache``/``v_cache``, which the runner allocates with identical shape.
 _LATENT_PAIR_HEAD_SIZE: int = 224
 
-#: ``self_attn.rope`` pair width: ``k_cache`` columns ``[0:64]`` are the 64
-#: RoPE columns, ``v_cache`` columns ``[0:7]`` are the group-64 dequant
-#: scales. 128 (rather than 64) is kept from contract §4 so the recorded
-#: 704 B compressed slot does not move.
-_ROPE_PAIR_HEAD_SIZE: int = 128
+#: ``self_attn.rope`` DECLARED pair width: ``k_cache`` columns ``[0:64]`` are
+#: the 64 RoPE columns, ``v_cache`` columns ``[0:7]`` are the group-64 dequant
+#: scales.
+#:
+#: DECLARATION-ONLY. This constant reaches exactly one site,
+#: :meth:`DeepseekV4Attention.kv_layer_specs`. It is NOT a content width. The
+#: writer is :meth:`DeepseekV4Attention._write_compressed_cache`, whose two
+#: ``.rope`` rows are ``compressed[..., nope:]`` — i.e.
+#: ``self.head_dim - self.nope_head_dim`` = 64 columns into ``k_cache`` — and
+#: ``scales`` from :func:`_quant_fp8_ue8m0`, i.e. :data:`_KV_NUM_SCALES` = 7
+#: columns into ``v_cache``. Both are separate names, and every reader takes
+#: its own ``compressed_widths`` argument rather than this value.
+#:
+#: 64, NOT 128 (`KV-ROW-DESIGN-v2`, port plan §3.6.4/§3.6.5). Iteration 6's
+#: declared set — heads ``{128, 224, 512, 520, 1040, 2080}`` — made upstream's
+#: ``unify_kv_cache_spec_page_size`` (``vllm/v1/core/kv_cache_utils.py:1007``)
+#: raise ``NotImplementedError``, because page size is ``64 * head`` here and
+#: 8192/14336/32768 do not divide the 133120 maximum. Every declared head in
+#: this module now divides ``H_max = 2688``, which makes page divisibility
+#: equivalent to head divisibility. 128 was ALSO admissible on that rule
+#: (2688/128 = 21); 64 is chosen because it is this leg's own per-tensor floor
+#: ``max(k_content, v_content) = max(64, 7)`` and the earlier 128 bought
+#: nothing but 41 layers of dead columns.
+#:
+#: The FLOOR is the binding constraint and it is per-TENSOR, not per-pair: the
+#: runner allocates each declared leg as TWO tensors of ``head_size`` columns
+#: (``neuron_model_runner.py:7747``, ``:7782``), and :func:`_pad_columns`
+#: raises ``ValueError: N columns do not fit width W`` on any shrink. Content
+#: is NOT redistributable across a pair's halves without changing every writer
+#: and every reader.
+_ROPE_PAIR_HEAD_SIZE: int = 64
 
 #: ``self_attn.swa`` pair width — RESOLVED at 512, correcting contract §4's
 #: provisional 320.
@@ -202,12 +228,100 @@ _ROPE_PAIR_HEAD_SIZE: int = 128
 #: exactly one layer name, i.e. exactly two tensors, so the only split that
 #: keeps the faithful group-64 numerics is: ``k_cache`` = the whole 512-wide
 #: latent (one piece, ``swa_widths=(512,)``), ``v_cache`` = the scale
-#: companion (7 of 512 columns used). Hence 512.
-_SWA_PAIR_HEAD_SIZE: int = 512
+#: companion (7 of 512 columns used). Hence a CONTENT width of 512.
+#:
+#: DECLARED at 672, not 512 (`KV-ROW-DESIGN-v2`, port plan §3.6.4/§3.6.5).
+#: This constant is DECLARATION-ONLY and reaches exactly one site,
+#: :meth:`DeepseekV4Attention.kv_layer_specs`. The CONTENT width stays 512 and
+#: travels under a different name: ``self.head_dim``, passed to the readers as
+#: ``swa_widths=(512,)``. The 160 extra columns are zero pad written by
+#: :func:`_pad_columns` inside :func:`_masked_scatter_rows`, and the reader
+#: side takes ``part[..., :width]``, so the pad is never read.
+#:
+#: WHY 672: every declared head in this module must divide ``H_max = 2688`` or
+#: upstream's ``unify_kv_cache_spec_page_size``
+#: (``vllm/v1/core/kv_cache_utils.py:1007``) raises ``NotImplementedError`` —
+#: page size is ``64 * head`` here, so page divisibility is head
+#: divisibility. 672 is the smallest divisor of 2688 at or above this leg's
+#: per-tensor floor ``max(k_content, v_content) = max(512, 7) = 512``.
+#:
+#: The floor is per-TENSOR, not per-pair: the runner allocates each declared
+#: leg as TWO tensors of ``head_size`` columns
+#: (``neuron_model_runner.py:7747``, ``:7782``), and :func:`_pad_columns`
+#: raises ``ValueError: N columns do not fit width W`` on any shrink.
+_SWA_PAIR_HEAD_SIZE: int = 672
+
+#: ``mtp.{stage}.self_attn.swa`` DECLARED pair width — the DSpark drafter's
+#: three window legs, declared by the TARGET at
+#: ``model.py``'s ``_drafter_kv_layer_specs`` (see there for why the target
+#: owns that declaration). DECLARATION-ONLY, one use.
+#:
+#: Its CONTENT is identical to the target ``.swa`` leg's — 512 k columns
+#: (``cat(codes, latent[..., nope:])``) and ``_SWA_NUM_SCALES`` = 7 v columns,
+#: both written by ``dspark_model.py``'s ``write_main_kv`` — so it could reuse
+#: :data:`_SWA_PAIR_HEAD_SIZE`. It deliberately does NOT, and the reason is
+#: pricing, not content (port plan §3.6.2, LD-29 / R-34):
+#:
+#: ``_max_memory_usage_bytes_from_groups`` (``kv_cache_utils.py:1767-1778``)
+#: charges ``max(len(group)) * page_size * Σ_g cdiv(m_g, page_size)``, whose
+#: two ``group_size`` factors cancel only when every spec type divides
+#: ``group_size`` evenly. ``group_size = min_num_layers``
+#: (``kv_cache_utils.py:1136-1147``), and these THREE legs are the smallest
+#: spec type in the model — so a declared head DISTINCT from the target
+#: ``.swa`` legs keeps them a 3-leg type and pins ``group_size = 3``, which
+#: divides 21 and 42 exactly. Letting them collide with ``.swa`` merges them
+#: into a 46-leg type, pushes ``group_size`` to 20, and 20 divides 21 and 43
+#: badly: 2022.40 -> 2979.38 MiB/request of pure rounding, measured. The
+#: design's price is therefore COUPLED to DSpark being enabled.
+#:
+#: 896 = 2688 / 3, the smallest divisor of ``H_max`` that is both at or above
+#: this leg's per-tensor floor (512) and distinct from
+#: :data:`_SWA_PAIR_HEAD_SIZE` (672).
+#:
+#: This does NOT weaken ``EagleProposer.validate_same_kv_cache_group``
+#: (``vllm/spec_decode/eagle.py:278-291``): that assertion requires the
+#: DRAFTER's own layers to share ONE group, not to share the target's. At 3
+#: legs of a distinct spec type with ``group_size = 3`` they form exactly one
+#: group, so the check still passes and is still meaningful.
+_DRAFT_SWA_PAIR_HEAD_SIZE: int = 896
 
 #: ``self_attn.indexer`` pair width: ``k_cache`` holds the 128 index-K
 #: columns, ``v_cache`` columns ``[0:4]`` hold that slot's group-32 scales.
+#:
+#: MUST STAY 128, and it must stay EQUAL to ``config.index_head_dim`` — this is
+#: CONTENT-COUPLED, not declaration-only, and the coupling is silent (port plan
+#: §3.6.6, LD-30). ``functional/attention/sparse_indexer.py:482`` does
+#: ``flat_cache = index_k_cache.reshape(-1, index_head_dim)`` where
+#: ``index_head_dim`` arrives from :meth:`DeepseekV4Indexer.forward` as
+#: ``config.index_head_dim``, i.e. FROM CONFIG, not from ``cache.shape[-1]``,
+#: and with NO upper clamp — unlike ``mla_sparse_attention.py`` and
+#: :func:`_gather_cache_rows`, which both clamp. So:
+#:
+#: * declared > 128 — the reshape yields more rows than there are slots, every
+#:   slot id stays in range, and every gather reads the wrong offset of the
+#:   wrong slot. SILENTLY, with no error.
+#: * declared < 128 — fewer rows than slots, so ``index_select`` gets
+#:   out-of-range indices and raises.
+#:
+#: The branch is live, not dead: ``index_k`` is ``None`` whenever
+#: ``pool_span > 0``, i.e. on decode and on every segmented prefill.
+#: `KV-ROW-DESIGN-v2` chose ``H_max = 2688`` partly BECAUSE 128 divides it, so
+#: this leg never has to move (2080 would force 130, 2240 would force 140).
+#: :meth:`DeepseekV4Attention.kv_layer_specs` asserts the equality so a future
+#: config change cannot break it silently. Moving this constant requires moving
+#: that stride with it, and that is a PLANNED change, never a local one.
 _INDEXER_PAIR_HEAD_SIZE: int = 128
+
+#: DECLARED ``head_size`` per configured ``proj_width`` for the two
+#: :class:`CompressorState` leg kinds, i.e. the declaration-only counterpart of
+#: :attr:`DeepseekV4KVCompressor.state_pair_width`. See
+#: :attr:`DeepseekV4KVCompressor.state_declared_head` for the two constraints each entry
+#: satisfies (at or above the content width; divides ``H_max = 2688``) and for
+#: why the content width itself must not move.
+#:
+#: ``proj_width = coff * head_dim`` -> 1024 (ratio 4) / 512 (ratio 128) / 256
+#: (the indexer's nested copy). Content widths 2080 / 1040 / 520.
+_STATE_DECLARED_HEAD_SIZES: dict[int, int] = {256: 672, 512: 1344, 1024: 2688}
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +886,15 @@ class DeepseekV4KVCompressor(nn.Module):
 
     @property
     def state_pair_width(self) -> int:
-        """``head_size`` of this compressor's :class:`CompressorState` leg.
+        """CONTENT width of this compressor's :class:`CompressorState` leg.
+
+        DUAL-ROLE, and that is why it does NOT move (port plan §3.6.5). It is
+        the width the WRITER puts into ``k_cache`` (:meth:`_write_state`) and
+        it is ALSO the width the READER gathers back
+        (:meth:`_merge_state`'s ``_gather_cache_rows(..., width)``). The
+        DECLARED ``head_size`` of the leg is :attr:`state_declared_head`, a
+        separate, declaration-only number; moving this one would move a writer
+        and a reader together, which is the defect class §3.6.5 audits for.
 
         Layout, per slot, with ``pw = proj_width`` and
         ``ng = pw // 64`` scale groups::
@@ -797,6 +919,51 @@ class DeepseekV4KVCompressor(nn.Module):
         measured accuracy ever says the second limb is not paying for itself.
         """
         return 2 * self.proj_width + 2 * (self.proj_width // _KV_QUANT_GROUP)
+
+    @property
+    def state_declared_head(self) -> int:
+        """DECLARED ``head_size`` of this compressor's state leg.
+
+        DECLARATION-ONLY. This property reaches exactly one site,
+        :meth:`DeepseekV4Attention.kv_layer_specs`, and no writer or reader
+        consults it. That separation is the whole point: the CONTENT width is
+        :attr:`state_pair_width`, which is dual-role (writer AND reader), so it
+        must not move. Here the two roles are split (port plan §3.6.5).
+
+        The declared head must (a) be at least :attr:`state_pair_width`,
+        because the runner gives BOTH tensors of the pair exactly ``head_size``
+        columns (``neuron_model_runner.py:7747``, ``:7782``) and
+        :func:`_pad_columns` raises ``ValueError`` rather than shrink, and
+        (b) divide ``H_max = 2688``, because page size is ``64 * head`` here so
+        upstream's ``unify_kv_cache_spec_page_size``
+        (``vllm/v1/core/kv_cache_utils.py:1007``) raises
+        ``NotImplementedError`` on any head that does not
+        (`KV-ROW-DESIGN-v2`, port plan §3.6.4).
+
+        The table is the smallest such divisor per configured ``proj_width``::
+
+            proj_width   content (state_pair_width)   declared   H_max / declared
+                   256                          520        672                  4
+                   512                         1040       1344                  2
+                  1024                         2080       2688                  1
+
+        The extra columns are zero pad written by :func:`_pad_columns` inside
+        :func:`_masked_scatter_rows`; the reader takes ``gathered[:, :width]``
+        at :attr:`state_pair_width`, so the pad is never read.
+
+        Raises:
+            KeyError: on a ``proj_width`` this design did not price. That is
+                deliberate and loud: an unpriced width would otherwise fall
+                back to some default and silently re-break page divisibility,
+                which is the exact failure `KV-ROW-DESIGN-v2` was cut to fix.
+        """
+        declared = _STATE_DECLARED_HEAD_SIZES[self.proj_width]
+        assert declared >= self.state_pair_width, (
+            f"state leg declared head {declared} is below its own content "
+            f"width {self.state_pair_width} at proj_width {self.proj_width}: "
+            f"_pad_columns (attention.py) cannot shrink and would raise"
+        )
+        return declared
 
     @property
     def state_window(self) -> int:
@@ -1638,14 +1805,31 @@ class DeepseekV4Attention(nn.Module):
         the reference's single 512-wide row has to be re-expressed as
         same-shape pairs here.
 
-        | name                                        | heads | head_size | window | when       |
-        |---------------------------------------------|-------|-----------|--------|------------|
-        | ``layers.{i}.self_attn``                    | 1     | 224       | None   | compressed |
-        | ``layers.{i}.self_attn.rope``               | 1     | 128       | None   | compressed |
-        | ``layers.{i}.self_attn.swa``                | 1     | 512       | 128    | every layer|
-        | ``layers.{i}.self_attn.indexer``            | 1     | 128       | None   | C4 layer   |
-        | ``layers.{i}.self_attn.compressor``         | 1     | 2080/1040 | 8/128  | compressed |
-        | ``layers.{i}.self_attn.indexer_compressor`` | 1     | 520       | 8      | C4 layer   |
+        DECLARED head_size vs the CONTENT each writer puts in the wider of the
+        pair's two tensors. They are different numbers on four legs, and that
+        separation is `KV-ROW-DESIGN-v2` (port plan §3.6.4): every DECLARED
+        head divides ``H_max = 2688`` so upstream's
+        ``unify_kv_cache_spec_page_size`` stops raising, while no CONTENT width
+        moves at all, so no writer, reader or op signature changes.
+
+        | name                                        | heads | DECLARED  | content   | window | when       |
+        |---------------------------------------------|-------|-----------|-----------|--------|------------|
+        | ``layers.{i}.self_attn``                    | 1     | 224       | 224 / 224 | None   | compressed |
+        | ``layers.{i}.self_attn.rope``               | 1     | 64        | 64 / 7    | None   | compressed |
+        | ``layers.{i}.self_attn.swa``                | 1     | 672       | 512 / 7   | 128    | every layer|
+        | ``layers.{i}.self_attn.indexer``            | 1     | 128       | 128 / 4   | None   | C4 layer   |
+        | ``layers.{i}.self_attn.compressor``         | 1     | 2688/1344 | 2080/1040 | 8/128  | compressed |
+        | ``layers.{i}.self_attn.indexer_compressor`` | 1     | 672       | 520       | 8      | C4 layer   |
+        | ``mtp.{s}.self_attn.swa`` (declared in      | 1     | 896       | 512 / 7   | 128    | DSpark on  |
+        | ``model.py``, not here)                     |       |           |           |        |            |
+
+        The DECLARED figure is what the runner allocates for BOTH tensors of
+        the pair; the surplus is zero pad written by :func:`_pad_columns` and
+        never read back, because every reader takes its own explicit width.
+        The per-leg constraint is therefore per-TENSOR —
+        ``declared >= max(k_content, v_content)`` — and :func:`_pad_columns`
+        raises rather than shrink, so a declaration below the floor fails loudly
+        at the first write.
 
         Column layout, written by this module and read by the ``NF`` ops
         through their ``*_widths`` / ``*_scale_cache`` arguments:
@@ -1670,26 +1854,31 @@ class DeepseekV4Attention(nn.Module):
           scales there. Width is therefore
           ``2*proj_width + 2*(proj_width/64)`` = **2080** at ratio 4,
           **1040** at ratio 128 and **520** for the indexer's nested copy
-          (``proj_width = coff * head_dim`` = 1024 / 512 / 256). Both legs are
-          ``SlidingWindowSpec`` at ``window`` raw slots, so they are
-          window-bounded, not context-bounded. Read
+          (``proj_width = coff * head_dim`` = 1024 / 512 / 256) — that is the
+          CONTENT width, :attr:`DeepseekV4KVCompressor.state_pair_width`, which
+          is what both the writer and the reader use. The DECLARED head is
+          :attr:`DeepseekV4KVCompressor.state_declared_head` (2688 / 1344 /
+          672). Both legs are ``SlidingWindowSpec`` at ``window`` raw slots, so
+          they are window-bounded, not context-bounded. Read
           :class:`CompressorState` for the FP8-storage and validity
           consequences and for why an ``nn.Module`` buffer was not used
           instead.
 
-        Per-slot bytes at ``fp8`` (1 B per column): compressed leg
-        ``2*224 + 2*128 = 704`` B with 519 used; SWA leg ``2*512 = 1024`` B
-        with 519 used. The compressed number is unchanged from
-        ``pricing-and-design.md`` §3; the SWA number is the delta, and it is
-        the price of holding the reference's full 512-wide window row plus
-        its group-64 scales inside ONE layer name (i.e. two same-shape
-        tensors). The SWA leg is a ``SlidingWindowSpec``, so it is
-        ``window``-bounded (128 slots per sequence per layer = 128 KiB)
-        rather than context-bounded, while the compressed pool at ratio 4 is
-        ``max_seq_len / 4`` slots — the leg that actually sets capacity.
+        Per-slot bytes at ``fp8`` (1 B per DECLARED column, since the runner
+        allocates the declared width for both halves): compressed leg
+        ``2*224 + 2*64 = 576`` B with 519 used; SWA leg ``2*672 = 1344`` B with
+        519 used. The SWA leg is a ``SlidingWindowSpec``, so it is
+        ``window``-bounded rather than context-bounded, while the compressed
+        pool at ratio 4 is ``max_seq_len / 4`` slots — the leg that actually
+        sets capacity. Both figures moved at `KV-ROW-DESIGN-v2`: the compressed
+        leg shrank 704 -> 576 B because ``.rope`` dropped 128 -> 64, and the SWA
+        leg grew 1024 -> 1344 B because ``.swa`` rose 512 -> 672. The whole set
+        prices at **2022.40 MiB/request** enforced
+        (``_max_memory_usage_bytes_from_groups``); port plan §3.6.4 is the table
+        and §3.6.8 the one-request gate.
 
-        The two state legs cost ``2 * width`` B per slot — 4160 B at ratio 4,
-        2080 B at ratio 128, 1040 B for the indexer's — over ``window`` raw
+        The two state legs cost ``2 * declared`` B per slot — 5376 B at ratio 4,
+        2688 B at ratio 128, 1344 B for the indexer's — over ``window`` raw
         slots. **Block granularity rounds the C4 window up**: a ratio-4 leg
         needs only ``window = 8`` slots, but the runner allocates whole
         blocks, so at the usual ``block_size = 32`` each sequence pays 32
@@ -1704,6 +1893,25 @@ class DeepseekV4Attention(nn.Module):
         """
         prefix = f"layers.{layer_idx}.self_attn"
         specs: list[LayerSpec] = []
+
+        # LD-30 / port plan §3.6.6. The ``.indexer`` leg's DECLARED head is
+        # content-coupled to a reader that strides by the CONFIG value rather
+        # than by ``cache.shape[-1]``, with no clamp:
+        #   ``functional/attention/sparse_indexer.py:482``
+        #   ``flat_cache = index_k_cache.reshape(-1, index_head_dim)``
+        # fed from ``DeepseekV4Indexer.forward`` (:1522) as ``self.head_dim`` =
+        # ``config.index_head_dim`` (:1358). Declared ABOVE 128 reads the wrong
+        # offset of the wrong slot SILENTLY; below 128 ``index_select`` raises.
+        # `KV-ROW-DESIGN-v2` chose ``H_max = 2688`` so this leg never moves, but
+        # the coupling itself is invisible at both sites — so it is asserted
+        # here, at the one place declared widths are written, rather than left
+        # to hold by luck.
+        assert _INDEXER_PAIR_HEAD_SIZE == self.config.index_head_dim, (
+            f"indexer declared head {_INDEXER_PAIR_HEAD_SIZE} must equal "
+            f"config.index_head_dim {self.config.index_head_dim}: "
+            f"sparse_indexer.py:482 strides the paged index-K cache by the "
+            f"config value, not by cache.shape[-1], and does not clamp"
+        )
 
         if self.config.has_compressed_cache(layer_idx):
             specs.append(
@@ -1760,7 +1968,7 @@ class DeepseekV4Attention(nn.Module):
                 LayerSpec(
                     name=f"{prefix}.indexer_compressor",
                     num_kv_heads=1,
-                    head_size=self.indexer.compressor.state_pair_width,
+                    head_size=self.indexer.compressor.state_declared_head,
                     dtype=_FP8_DTYPE,
                     sliding_window_size=self.indexer.compressor.state_window,
                     chunk_size=None,
@@ -1775,7 +1983,7 @@ class DeepseekV4Attention(nn.Module):
                 LayerSpec(
                     name=f"{prefix}.compressor",
                     num_kv_heads=1,
-                    head_size=self.compressor.state_pair_width,
+                    head_size=self.compressor.state_declared_head,
                     dtype=_FP8_DTYPE,
                     sliding_window_size=self.compressor.state_window,
                     chunk_size=None,
