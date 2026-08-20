@@ -253,7 +253,14 @@ def _top_k_filter(
 
     # Mask tokens below threshold (only where k > 0)
     mask = (sorted_logits < thresholds) & (k > 0)
-    sorted_logits = sorted_logits.masked_fill_(mask, -3000.0)
+    # Fill value is a 0-dim tensor, never a Python float: torch_xla materialises
+    # the bare float as an F64 constant and neuronx-cc rejects f64
+    # ([NCC_ESPP004], StableHLOToPythonPrinter.cc:824). ``masked_fill`` lowers to
+    # ``select``, which converts the scalar to F32 first, so the constant alone is
+    # F64 (1 instruction, not the 3 a ``compare`` produces). ep11 iteration 11
+    # measured this site as 1 of the 71 F64 instructions in the traced graph.
+    _neg = torch.full((), -3000.0, dtype=sorted_logits.dtype, device=sorted_logits.device)
+    sorted_logits = sorted_logits.masked_fill_(mask, _neg)
 
     return sorted_logits, sorted_indices
 
@@ -273,7 +280,12 @@ def _top_p_filter(probs: Tensor, p: Tensor) -> Tensor:
     # Mask where cumsum exceeds per-row p threshold
     sorted_mask = cumsum_sorted > p
     sorted_mask[..., 0] = False  # Always keep at least one token
-    sorted_probs = sorted_probs.masked_fill(sorted_mask, 0.0)
+    # 0-dim tensor fill value, not a bare Python float — see _top_k_filter above.
+    # ep11 iteration 11 measured this site as 1 of the 71 F64 instructions in the
+    # traced graph (literal 0.0, followed by the reduce+divide of this
+    # renormalisation).
+    _zero = torch.full((), 0.0, dtype=sorted_probs.dtype, device=sorted_probs.device)
+    sorted_probs = sorted_probs.masked_fill(sorted_mask, _zero)
 
     # Renormalize and return sorted probs
     return sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)

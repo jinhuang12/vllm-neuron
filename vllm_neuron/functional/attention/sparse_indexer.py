@@ -699,7 +699,19 @@ def _select_topk(
     values, indices = _gated_topk(scores, k_eff, dim=-1, gather_dim=-1)
 
     # Slots that only won because everything else was masked out.
-    valid = values > _MASKED_SCORE_THRESHOLD
+    # 0-dim tensor threshold, not a bare Python float: the ``Tensor > float``
+    # form lowers the scalar at F64 and upcasts, which neuronx-cc rejects
+    # ([NCC_ESPP004], StableHLOToPythonPrinter.cc:824). Same construct class and
+    # the same literal (-5e+29) as swa_attention.py:289. ep11 iteration 11 proved
+    # by a backward HLO walk (P6) that this site contributed ZERO F64
+    # instructions to the failing graph — 23 of 23 clusters were additive-mask-
+    # like with no sort/custom-call ancestor. It is corrected as measured-class
+    # prophylaxis, since the site is on the production path
+    # (model/deepseek_v4/attention.py:1657) and the serve graph is unmeasured.
+    _vthr = torch.full(
+        (), _MASKED_SCORE_THRESHOLD, dtype=values.dtype, device=values.device
+    )
+    valid = values > _vthr
     if positions is not None and compress_ratio > 0:
         limit = torch.div(
             positions.reshape(-1, 1) + 1, compress_ratio, rounding_mode="floor"

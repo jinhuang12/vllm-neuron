@@ -286,7 +286,17 @@ def swa_attention(
     # drive an output. The reference kernel has no such guard (its every query
     # sees at least its own window slot); this guard only ever fires on padded
     # query rows, which the reference never produces.
-    keep = (mask > MASK_NEG / 2).any(dim=-1, keepdim=True)  # [T, 1] bool
+    # Compare against a 0-dim f32 TENSOR, never a Python float. torch_xla
+    # lowers ``Tensor(f32) > python-float`` by materialising the scalar at F64
+    # and UPCASTING the f32 operand, and neuronx-cc rejects f64:
+    # ``[NCC_ESPP004] f64 dtype is not supported`` at
+    # StableHLOToPythonPrinter.cc:824, exit 70. Sweep leg H11 recorded
+    # ``x > 0.5`` FAILING and ``x > torch.full((), v, f32)`` LOWERING; the same
+    # 0-dim-tensor form is already used at :73 above. ep11 iteration 11
+    # measured this single site as 69 of the 71 F64 instructions in the traced
+    # graph (23 x constant+broadcast+convert, literal -5e+29).
+    _keep_thr = torch.full((), MASK_NEG / 2, dtype=mask.dtype, device=mask.device)
+    keep = (mask > _keep_thr).any(dim=-1, keepdim=True)  # [T, 1] bool
     keep_f = keep.to(softmax_dtype).unsqueeze(0)  # [1, T, 1]
 
     out = _sink_softmax_attend(scores, v_g, sink_g, keep_f)  # [H, T, Dv] fp32
