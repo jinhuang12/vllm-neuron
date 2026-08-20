@@ -172,10 +172,13 @@ def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
         return
 
     lanes = _partition_round_robin(jobs, num_workers)
-    workdir = tempfile.mkdtemp(prefix=f"trace_pool_rank{parent_rank}_")
     # None unless VLLM_NEURON_MAX_CONCURRENT_TRACERS is positive. At the
     # default this constructs nothing, touches no path and logs nothing.
+    # Built BEFORE the workdir so a refused configuration fails without
+    # leaving a temp directory behind: nothing between mkdtemp and the try
+    # below may raise.
     gate = _TracerAdmissionGate.from_env(parent_rank)
+    workdir = tempfile.mkdtemp(prefix=f"trace_pool_rank{parent_rank}_")
     try:
         child_pids: dict[int, int] = {}
         result_paths: dict[int, str] = {}
@@ -463,6 +466,7 @@ class _TracerAdmissionGate:
         os.makedirs(self._dir, exist_ok=True)
         self._held: dict[int, int] = {}  # fd -> slot index
         self._child_slots: dict[int, int] = {}  # lane_idx -> slot index
+        self._open_failed: set[int] = set()  # slots already warned about
 
     @classmethod
     def from_env(cls, parent_rank: int) -> "_TracerAdmissionGate | None":
@@ -559,9 +563,21 @@ class _TracerAdmissionGate:
         try:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as e:
-            logger.warning(
-                "Tracer admission could not open slot file %s: %s", path, e
-            )
+            # Warn once per slot, not once per sweep: the wait loop re-scans
+            # every _ADMIT_POLL_INTERVAL_S, so an unopenable slot would
+            # otherwise emit hundreds of identical lines per second and bury
+            # the heartbeat that makes waiting legible. The timeout's census
+            # reports the condition again, once, as `open-failed`.
+            if slot not in self._open_failed:
+                self._open_failed.add(slot)
+                logger.warning(
+                    "Tracer admission cannot open slot file %s: %s. This slot "
+                    "is unusable, so the effective cap is below the configured "
+                    "%d.",
+                    path,
+                    e,
+                    self._cap,
+                )
             return None
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -576,11 +592,21 @@ class _TracerAdmissionGate:
         return fd
 
     def _stamp(self, fd: int, lane_idx: int, pid: int, slot: int, what: str) -> None:
+        """Overwrite the slot file's diagnostic breadcrumb.
+
+        Truncates first: the post-fork record is shorter than the pre-fork one,
+        and ``pwrite`` alone would leave the tail of the longer record behind,
+        so the census would report a spliced line. ``pwrite`` rather than
+        ``write`` because the forked child shares this descriptor's file
+        offset. A census that samples between the truncate and the write sees a
+        short record, which is why the census is documented as best-effort.
+        """
         rec = (
             f"slot={slot} rank={self._parent_rank} lane={lane_idx} "
-            f"{what}_pid={pid} t={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
+            f"{what}_pid={pid} t={time.strftime('%Y-%m-%dT%H:%M:%S')}"
         )
         try:
+            os.ftruncate(fd, 0)
             os.pwrite(fd, rec.encode(), 0)
         except OSError:
             pass
