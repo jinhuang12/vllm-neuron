@@ -27,6 +27,7 @@ from .attention import GlmMoeDsaAttention, GlmMoeDsaRMSNorm
 from .block_fp8 import (
     FP8_INVERSE_SCALE_ADJUSTMENT,
     FP8_STORAGE_SCALE,
+    quantize_block_fp8_to_row,
 )
 from .cache import (
     MAIN_INDEXER_LAYER_INDICES,
@@ -589,7 +590,21 @@ class GlmMoeDsaForCausalLM(nn.Module):
                 Disposition.FP8_SCALE,
             ):
                 raise ValueError(f"Parameter maps to non-load target {checkpoint_key}")
-            mappings[name] = checkpoint_key
+            if re.match(
+                r"^model\.layers\.\d+\.mlp\.experts\.experts\.\d+\."
+                r"(?:gate_proj|up_proj|down_proj)\.(?:weight|weight_scale_inv)$",
+                name,
+            ):
+                weight_key = checkpoint_key.removesuffix("_scale_inv")
+                scale_key = weight_key + "_scale_inv"
+                if weight_key not in by_key or scale_key not in by_key:
+                    raise ValueError(
+                        f"Routed FP8 parameter {name!r} requires checkpoint pair "
+                        f"{weight_key!r}, {scale_key!r}"
+                    )
+                mappings[name] = [weight_key, scale_key]
+            else:
+                mappings[name] = checkpoint_key
         return mappings
 
     def _shard_dim(self, checkpoint_key: str, shape: tuple[int, ...]) -> int | None:
@@ -648,10 +663,58 @@ class GlmMoeDsaForCausalLM(nn.Module):
 
         return SafetensorsWeightLoader(transform=transform)
 
+    def _row_fp8_pair_loader(
+        self,
+        weight_key: str,
+        scale_key: str,
+        global_shape: tuple[int, int],
+        *,
+        return_scale: bool,
+    ) -> SafetensorsWeightLoader:
+        """Load one block-FP8 checkpoint pair as row-scaled FP8 on CPU."""
+
+        weight_loader = self._fp8_weight_loader(weight_key, global_shape, None)
+        scale_loader = self._fp8_scale_loader(scale_key, global_shape, None)
+
+        def transform(sources, rank: int) -> torch.Tensor:
+            if len(sources) != 2:
+                raise ValueError(
+                    f"Row-FP8 tensor {weight_key} requires weight and scale sources"
+                )
+            block_weight = weight_loader.load([sources[0]], rank)
+            block_scale = scale_loader.load([sources[1]], rank)
+            row_weight, row_scale = quantize_block_fp8_to_row(block_weight, block_scale)
+            return row_scale if return_scale else row_weight
+
+        return SafetensorsWeightLoader(transform=transform)
+
     def _install_weight_loaders(self, manifest, mappings) -> None:
         by_key = manifest.by_key
         for name, parameter in self.named_parameters():
             checkpoint_key = mappings[name]
+            if isinstance(checkpoint_key, list):
+                if len(checkpoint_key) != 2:
+                    raise ValueError(f"Invalid routed FP8 mapping for {name!r}")
+                weight_key, scale_key = checkpoint_key
+                weight_entry = by_key[weight_key]
+                if weight_entry.header.dtype != "F8_E4M3":
+                    raise ValueError(
+                        f"Routed FP8 weight {weight_key!r} has dtype "
+                        f"{weight_entry.header.dtype}"
+                    )
+                shape = weight_entry.header.shape
+                if self._shard_dim(weight_key, shape) is not None:
+                    raise ValueError(f"Routed expert weight {weight_key!r} was sharded")
+                set_weight_loader(
+                    parameter,
+                    self._row_fp8_pair_loader(
+                        weight_key,
+                        scale_key,
+                        shape,
+                        return_scale=name.endswith(".weight_scale_inv"),
+                    ),
+                )
+                continue
             entry = by_key[checkpoint_key]
             shape = entry.header.shape
             if entry.info.disposition is Disposition.FP8_SCALE:
@@ -719,11 +782,12 @@ class GlmMoeDsaForCausalLM(nn.Module):
         )
 
     def _materialize_router_selection_identities(self, device: torch.device) -> None:
-        """Create generated router state omitted from the checkpoint.
+        """Create generated MoE state omitted from the checkpoint.
 
         vLLM constructs the model under a meta-device context. The selection
-        identities are nonpersistent buffers, so checkpoint loading cannot
-        replace those meta tensors before the runner calls ``model.to(device)``.
+        identities and expert-parallel rank inputs are nonpersistent buffers,
+        so checkpoint loading cannot replace those meta tensors before the
+        runner calls ``model.to(device)``.
         """
         for layer in self.model.layers:
             if not layer.is_moe:
@@ -732,6 +796,12 @@ class GlmMoeDsaForCausalLM(nn.Module):
             router.selection_identity = torch.eye(
                 router.num_experts,
                 dtype=torch.float32,
+                device=device,
+            )
+            experts = layer.mlp.experts
+            experts.expert_parallel_rank_tensor = torch.tensor(
+                [[experts.expert_parallel_rank]],
+                dtype=torch.int32,
                 device=device,
             )
 

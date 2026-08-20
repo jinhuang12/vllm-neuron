@@ -45,7 +45,7 @@ def moe_tkg(
 ) -> Tensor:
     """MoE expert MLP token generation kernel API.
 
-    Currently only supports MXFP4 on Trn3; support will be extended in the future to BF16/FP8 on Trn2 and MXFP8 on Trn3.
+    Supports BF16 and row/static FP8 weights on Trn2, and MXFP4 on Trn3.
 
     This functional API should be used instead of the moe_block_tkg functional API when different
     sharding schemes are used in the norm/router region of the MoE block and in the expert MLPs region.
@@ -150,7 +150,10 @@ def moe_tkg(
     """
     can_use = _can_use_kernel(
         hidden_input=hidden_input,
+        expert_gate_up_weights=expert_gate_up_weights,
         expert_down_weights=expert_down_weights,
+        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
+        expert_down_weights_scale=expert_down_weights_scale,
     )
 
     if can_use:
@@ -190,13 +193,21 @@ def moe_tkg(
         )
     else:
         raise NotImplementedError(
-            f"moe_tkg currently only supports MXFP4 weights on Trn3, but got {expert_gate_up_weights.dtype=}"
+            "moe_tkg requires BF16 weights, MXFP4 weights, or FP8 E4M3 "
+            "weights with both weight-scale tensors; got "
+            f"gate_up={expert_gate_up_weights.dtype}, "
+            f"down={expert_down_weights.dtype}, "
+            f"gate_up_scale={expert_gate_up_weights_scale is not None}, "
+            f"down_scale={expert_down_weights_scale is not None}"
         )
 
 
 def _can_use_kernel(
     hidden_input: Tensor,
+    expert_gate_up_weights: Tensor,
     expert_down_weights: Tensor,
+    expert_gate_up_weights_scale: Optional[Tensor],
+    expert_down_weights_scale: Optional[Tensor],
 ) -> bool:
     """
     Check if the moe_tkg NKI kernel can be used.
@@ -206,16 +217,32 @@ def _can_use_kernel(
 
     Kernel constraints checked:
         - Must be running on Neuron device or CPU with NKI simulator
-        - Must use MXFP4 or BF16 weights
+        - Must use MXFP4, BF16, or row/static FP8 E4M3 weights
+        - FP8 weights require both weight-scale tensors
     """
     if not can_run_kernel(hidden_input):
         return False
 
     # TODO: validate MXFP8 with MoE kernel, then auto-enable
-    if expert_down_weights.dtype == torch.uint16:
+    if (
+        expert_gate_up_weights.dtype == torch.uint16
+        and expert_down_weights.dtype == torch.uint16
+    ):
         return True  # MXFP4 always uses kernel
 
-    if expert_down_weights.dtype == torch.bfloat16:
+    if (
+        expert_gate_up_weights.dtype == torch.bfloat16
+        and expert_down_weights.dtype == torch.bfloat16
+    ):
         return True
+
+    if (
+        expert_gate_up_weights.dtype == torch.float8_e4m3fn
+        and expert_down_weights.dtype == torch.float8_e4m3fn
+    ):
+        return (
+            expert_gate_up_weights_scale is not None
+            and expert_down_weights_scale is not None
+        )
 
     return False

@@ -177,6 +177,13 @@ def test_meta_router_identities_materialize_before_device_transfer() -> None:
     }
     assert len(before) == 75
     assert all(buffer.is_meta for buffer in before.values())
+    before_rank_inputs = {
+        name: buffer
+        for name, buffer in model.named_buffers()
+        if name.endswith("experts.expert_parallel_rank_tensor")
+    }
+    assert len(before_rank_inputs) == 75
+    assert all(buffer.is_meta for buffer in before_rank_inputs.values())
 
     model._materialize_router_selection_identities(torch.device("cpu"))
 
@@ -193,6 +200,18 @@ def test_meta_router_identities_materialize_before_device_transfer() -> None:
     expected = torch.eye(256, dtype=torch.float32)
     assert all(torch.equal(buffer, expected) for buffer in after.values())
     assert all(name not in model.state_dict() for name in after)
+
+    rank_inputs = {
+        name: buffer
+        for name, buffer in model.named_buffers()
+        if name.endswith("experts.expert_parallel_rank_tensor")
+    }
+    assert len(rank_inputs) == 75
+    assert all(not buffer.is_meta for buffer in rank_inputs.values())
+    assert all(buffer.device.type == "cpu" for buffer in rank_inputs.values())
+    assert all(buffer.dtype is torch.int32 for buffer in rank_inputs.values())
+    assert all(buffer.tolist() == [[17]] for buffer in rank_inputs.values())
+    assert all(name not in model.state_dict() for name in rank_inputs)
 
 
 def test_load_lifecycle_materializes_identity_and_preserves_cpu_router_selection() -> (
@@ -267,9 +286,21 @@ def test_rank17_manifest_binds_every_fp8_grid_and_has_hbm_headroom() -> None:
     assert sum(name.endswith(".weight_scale_inv") for name in parameters) == 1_566
 
     for parameter_name, checkpoint_key in mappings.items():
-        assert isinstance(checkpoint_key, str)
-        entry = manifest.by_key[checkpoint_key]
         parameter = parameters[parameter_name]
+        if isinstance(checkpoint_key, list):
+            assert len(checkpoint_key) == 2
+            weight_key, scale_key = checkpoint_key
+            assert parameter_name.startswith("model.layers.")
+            assert ".mlp.experts.experts." in parameter_name
+            assert scale_key == weight_key + "_scale_inv"
+            if parameter_name.endswith(".weight_scale_inv"):
+                assert parameter.dtype is torch.float32
+                assert parameter.ndim == 1
+            else:
+                assert parameter.dtype is torch.float8_e4m3fn
+                assert parameter.ndim == 2
+            continue
+        entry = manifest.by_key[checkpoint_key]
         if entry.info.disposition is Disposition.FP8_SCALE:
             assert parameter.dtype is torch.float32
             assert parameter_name.endswith(".weight_scale_inv")
@@ -314,3 +345,35 @@ def test_weight_and_scale_loaders_preserve_storage_and_value_contract() -> None:
         local_scale,
         scale[0:1] * FP8_INVERSE_SCALE_ADJUSTMENT,
     )
+
+
+def test_routed_expert_pair_loaders_emit_row_fp8_without_bf16_state() -> None:
+    model = _rank17_meta_model()
+    values = torch.arange(256 * 384, dtype=torch.float32).reshape(256, 384)
+    weight = ((values % 29) - 14).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25, 0.5, 1.0], [0.75, 1.25, 1.5]], dtype=torch.float32)
+    weight_key = "model.layers.3.mlp.experts.68.gate_proj.weight"
+    scale_key = weight_key + "_scale_inv"
+
+    row_weight = model._row_fp8_pair_loader(
+        weight_key, scale_key, (256, 384), return_scale=False
+    ).load([weight, scale], rank=17)
+    row_scale = model._row_fp8_pair_loader(
+        weight_key, scale_key, (256, 384), return_scale=True
+    ).load([weight, scale], rank=17)
+
+    assert row_weight.dtype is torch.float8_e4m3fn
+    assert row_weight.shape == weight.shape
+    assert row_scale.dtype is torch.float32
+    assert row_scale.shape == (256,)
+    reconstructed = row_weight.float() * row_scale[:, None]
+    stored = (weight.float() * FP8_STORAGE_SCALE).to(torch.float8_e4m3fn)
+    adjusted_scale = scale * FP8_INVERSE_SCALE_ADJUSTMENT
+    expected = (
+        stored.float()
+        * adjusted_scale[
+            (torch.arange(256) // 128)[:, None],
+            (torch.arange(384) // 128)[None, :],
+        ]
+    )
+    torch.testing.assert_close(reconstructed, expected, rtol=0.13, atol=0.1)

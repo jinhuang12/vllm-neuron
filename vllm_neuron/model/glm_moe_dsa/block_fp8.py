@@ -245,6 +245,50 @@ def dequantize_block_fp8(
     return weight.float() * expanded
 
 
+def quantize_block_fp8_to_row(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    *,
+    row_offset: int = 0,
+    col_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert checkpoint block-FP8 storage to Trn2 row-scaled FP8.
+
+    The supported Trn2 MoE kernels consume one inverse scale per output row.
+    Conversion happens in the CPU checkpoint loader, before device transfer,
+    so the compiled graph retains FP8 weights and contains no full-weight
+    dequantization operations.
+    """
+
+    dequantized = dequantize_block_fp8(
+        weight,
+        weight_scale_inv,
+        row_offset=row_offset,
+        col_offset=col_offset,
+    )
+    row_max = dequantized.abs().amax(dim=1)
+    row_scale = row_max / TRN2_FP8_MAX
+    row_scale = torch.where(row_max == 0, torch.ones_like(row_scale), row_scale)
+    quantized = (dequantized / row_scale[:, None]).clamp(-TRN2_FP8_MAX, TRN2_FP8_MAX)
+    return quantized.to(torch.float8_e4m3fn), row_scale.to(torch.float32)
+
+
+def dequantize_row_fp8(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+) -> torch.Tensor:
+    """Reference dequantization for row-scaled FP8 MoE weights."""
+
+    if weight.ndim != 2:
+        raise ValueError("row-FP8 weight must be rank 2")
+    if tuple(weight_scale_inv.shape) != (weight.shape[0],):
+        raise ValueError(
+            f"row scale shape {tuple(weight_scale_inv.shape)} does not match "
+            f"weight output rows {weight.shape[0]}"
+        )
+    return weight.float() * weight_scale_inv[:, None]
+
+
 def block_fp8_linear(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -338,6 +382,46 @@ class BlockFP8Linear(_BlockFP8Mixin, nn.Module):
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self._block_linear(hidden)
+
+
+class RowFP8Linear(BlockFP8Linear):
+    """FP8 linear storage formatted for the supported Trn2 MoE kernels."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.row_offset = 0
+        self.col_offset = 0
+        self.register_parameter("bias", None)
+        self.weight = nn.Parameter(
+            torch.empty(
+                (out_features, in_features),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+            requires_grad=False,
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.empty((out_features,), dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if can_run_kernel(hidden):
+            raise RuntimeError(
+                "RowFP8Linear must be dispatched through the fused MoE kernel"
+            )
+        return F.linear(
+            hidden,
+            dequantize_row_fp8(self.weight, self.weight_scale_inv).to(hidden.dtype),
+        )
 
 
 class BlockFP8ColumnParallelLinear(_BlockFP8Mixin, ColumnParallelLinear):

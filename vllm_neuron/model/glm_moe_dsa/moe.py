@@ -21,11 +21,10 @@ from torch import nn
 import vllm_neuron.functional as NF
 from vllm_neuron.nki.nki_hop import can_run_kernel, wrap_nki
 
-from .block_fp8 import BlockFP8Linear
+from .block_fp8 import BlockFP8Linear, RowFP8Linear, dequantize_block_fp8
 from .block_fp8_moe import selective_block_fp8_moe_nki
 from .config import GlmMoeDsaConfig
 from .mlp import GlmMoeDsaSwiGLUMLP
-
 
 _SELECTIVE_BLOCK_FP8_ENV = "GLM_ENABLE_EXPERIMENTAL_SELECTIVE_FP8_MOE"
 
@@ -156,13 +155,9 @@ class GlmMoeDsaExpertMLP(nn.Module):
     ) -> None:
         super().__init__()
         if fp8_weights:
-            self.gate_proj = BlockFP8Linear(
-                hidden_size, intermediate_size, device=device
-            )
-            self.up_proj = BlockFP8Linear(hidden_size, intermediate_size, device=device)
-            self.down_proj = BlockFP8Linear(
-                intermediate_size, hidden_size, device=device
-            )
+            self.gate_proj = RowFP8Linear(hidden_size, intermediate_size, device=device)
+            self.up_proj = RowFP8Linear(hidden_size, intermediate_size, device=device)
+            self.down_proj = RowFP8Linear(intermediate_size, hidden_size, device=device)
         else:
             self.gate_proj = nn.Linear(
                 hidden_size,
@@ -229,6 +224,11 @@ class GlmMoeDsaRoutedExperts(nn.Module):
         self.num_local_experts = num_experts // expert_parallel_size
         self.local_expert_start = expert_parallel_rank * self.num_local_experts
         self.block_size = block_size
+        self.register_buffer(
+            "expert_parallel_rank_tensor",
+            torch.tensor([[expert_parallel_rank]], dtype=torch.int32, device=device),
+            persistent=False,
+        )
         self.experts = nn.ModuleList(
             GlmMoeDsaExpertMLP(
                 hidden_size,
@@ -250,6 +250,57 @@ class GlmMoeDsaRoutedExperts(nn.Module):
         )
 
     def _kernel_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._uses_row_fp8:
+            gate_up = torch.stack(
+                [
+                    torch.stack(
+                        [expert.gate_proj.weight.T, expert.up_proj.weight.T], dim=1
+                    )
+                    for expert in self.experts
+                ],
+                dim=0,
+            )
+            down = torch.stack(
+                [expert.down_proj.weight.T for expert in self.experts], dim=0
+            )
+            return gate_up, down
+        if self._uses_block_fp8:
+            gate_up = torch.stack(
+                [
+                    torch.stack(
+                        [
+                            dequantize_block_fp8(
+                                expert.gate_proj.weight,
+                                expert.gate_proj.weight_scale_inv,
+                            )
+                            .to(torch.bfloat16)
+                            .T,
+                            dequantize_block_fp8(
+                                expert.up_proj.weight,
+                                expert.up_proj.weight_scale_inv,
+                            )
+                            .to(torch.bfloat16)
+                            .T,
+                        ],
+                        dim=1,
+                    )
+                    for expert in self.experts
+                ],
+                dim=0,
+            )
+            down = torch.stack(
+                [
+                    dequantize_block_fp8(
+                        expert.down_proj.weight,
+                        expert.down_proj.weight_scale_inv,
+                    )
+                    .to(torch.bfloat16)
+                    .T
+                    for expert in self.experts
+                ],
+                dim=0,
+            )
+            return gate_up, down
         gate_up = torch.stack(
             [
                 torch.stack([expert.gate_proj.weight.T, expert.up_proj.weight.T], dim=1)
@@ -274,6 +325,63 @@ class GlmMoeDsaRoutedExperts(nn.Module):
     @property
     def _uses_block_fp8(self) -> bool:
         return isinstance(self.experts[0].gate_proj, BlockFP8Linear)
+
+    @property
+    def _uses_row_fp8(self) -> bool:
+        return isinstance(self.experts[0].gate_proj, RowFP8Linear)
+
+    def _row_fp8_kernel_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the Trn2 token-generation MoE row-scale layouts."""
+
+        gate_up = torch.stack(
+            [
+                torch.stack(
+                    [
+                        expert.gate_proj.weight_scale_inv,
+                        expert.up_proj.weight_scale_inv,
+                    ],
+                    dim=0,
+                )
+                for expert in self.experts
+            ],
+            dim=0,
+        )
+        down = torch.stack(
+            [expert.down_proj.weight_scale_inv for expert in self.experts], dim=0
+        )
+        return gate_up, down
+
+    def _row_fp8_nki(
+        self,
+        hidden_states: torch.Tensor,
+        affinities: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run fused row-FP8 MoE in static token chunks supported by Trn2."""
+
+        gate_up, down = self._kernel_weights()
+        gate_up_scale, down_scale = self._row_fp8_kernel_scales()
+        outputs = []
+        for start in range(0, hidden_states.shape[0], 128):
+            stop = min(start + 128, hidden_states.shape[0])
+            outputs.append(
+                NF.moe_tkg(
+                    hidden_input=hidden_states[start:stop],
+                    expert_gate_up_weights=gate_up,
+                    expert_down_weights=down,
+                    expert_affinities=affinities[start:stop],
+                    expert_index=selected_experts[start:stop],
+                    is_all_expert=True,
+                    rank_id=self.expert_parallel_rank_tensor,
+                    expert_gate_up_weights_scale=gate_up_scale,
+                    expert_down_weights_scale=down_scale,
+                    mask_unselected_experts=True,
+                    expert_affinities_scaling_mode=(ExpertAffinityScaleMode.POST_SCALE),
+                    activation_fn=ActFnType.SiLU,
+                    output_dtype=hidden_states.dtype,
+                )
+            )
+        return torch.cat(outputs, dim=0)
 
     def _block_fp8_contract_violations(
         self,
@@ -474,11 +582,6 @@ class GlmMoeDsaRoutedExperts(nn.Module):
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
         gate_up, down = self._kernel_weights()
-        rank_id = torch.tensor(
-            [[self.expert_parallel_rank]],
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
         return NF.moe_tkg(
             hidden_input=hidden_states,
             expert_gate_up_weights=gate_up,
@@ -486,7 +589,7 @@ class GlmMoeDsaRoutedExperts(nn.Module):
             expert_affinities=affinities,
             expert_index=selected_experts,
             is_all_expert=True,
-            rank_id=rank_id,
+            rank_id=self.expert_parallel_rank_tensor,
             mask_unselected_experts=True,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             activation_fn=ActFnType.SiLU,
@@ -545,6 +648,10 @@ class GlmMoeDsaRoutedExperts(nn.Module):
             tp_degree=1,
         )
         gate_up, down = self._kernel_weights()
+        gate_up_scale = None
+        down_scale = None
+        if self._uses_row_fp8:
+            gate_up_scale, down_scale = self._row_fp8_kernel_scales()
         output = NF.moe_cte(
             implementation=MoECTEImplementation.shard_on_block,
             conditions=conditions,
@@ -552,6 +659,8 @@ class GlmMoeDsaRoutedExperts(nn.Module):
             expert_affinities_masked=affinities_masked,
             gate_up_proj_weight=gate_up,
             down_proj_weight=down,
+            gate_up_proj_scale=gate_up_scale,
+            down_proj_scale=down_scale,
             activation_function=ActFnType.SiLU,
             block_size=self.block_size,
             token_position_to_id=token_position_to_id,
@@ -571,18 +680,27 @@ class GlmMoeDsaRoutedExperts(nn.Module):
         *,
         is_decode: bool,
     ) -> torch.Tensor:
+        if self._uses_row_fp8:
+            if not can_run_kernel(hidden_states):
+                return self._torch_forward(hidden_states, affinities)
+            return self._row_fp8_nki(
+                hidden_states,
+                affinities,
+                selected_experts,
+            )
         if self._uses_block_fp8:
             if not can_run_kernel(hidden_states):
                 return self._torch_forward(hidden_states, affinities)
-            if os.getenv(_SELECTIVE_BLOCK_FP8_ENV) != "1":
-                return self._torch_forward(hidden_states, affinities)
-            violations = self._block_fp8_contract_violations(hidden_states, affinities)
-            if violations:
-                raise RuntimeError(
-                    "Selective GLM-5.2 block-FP8 MoE contract violation: "
-                    + "; ".join(violations)
+            if os.getenv(_SELECTIVE_BLOCK_FP8_ENV) == "1":
+                violations = self._block_fp8_contract_violations(
+                    hidden_states, affinities
                 )
-            return self._block_fp8_nki(hidden_states, affinities)
+                if violations:
+                    raise RuntimeError(
+                        "Selective GLM-5.2 block-FP8 MoE contract violation: "
+                        + "; ".join(violations)
+                    )
+                return self._block_fp8_nki(hidden_states, affinities)
         if not can_run_kernel(hidden_states):
             return self._torch_forward(hidden_states, affinities)
         if is_decode:
