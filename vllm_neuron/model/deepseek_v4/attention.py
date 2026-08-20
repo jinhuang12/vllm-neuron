@@ -737,18 +737,27 @@ def _masked_scatter_rows(
 
     ``rows`` is written as ELEMENT columns from column 0 — the convention the
     reader side uses (``mla_sparse_attention._gather_latent`` takes
-    ``part[..., :width]`` after casting the cache). The transfer goes through
-    an int8 view because fp8 tensors cannot be fancy-indexed
-    (``attention_decode.py:610-620``); at one byte per element that view is
-    column-identical, so it is a pure dtype relabel.
+    ``part[..., :width]`` after casting the cache).
+
+    fp8 is indexed DIRECTLY here — do not reintroduce a dtype view.
+
+    An earlier revision routed the fp8 transfer through ``.view(torch.int8)``,
+    justified by the claim that "fp8 tensors cannot be fancy-indexed
+    (``attention_decode.py:610-620``)". **That claim was false, and the view was
+    itself the defect (F-5).** A bit-reinterpreting ``Tensor.view(<dtype>)`` does
+    not lower through ``convert_fx_to_hlo``: it raises
+    ``RuntimeError: Expected XLA tensor. Got: XLACharType`` at
+    ``vllm_neuron/compile/hlo.py:176``. The element type was never the obstacle.
+
+    Measured, device-free, at this commit (probe ``ep9-P3``, legs A/B2a/B2b/B2c):
+    with the view present the graph raises ``XLACharType`` at ``hlo.py:176``;
+    with it removed, all three ops this function needs — ``torch.index_select``,
+    ``torch.where`` and ``Tensor.index_put_`` — lower on ``float8_e4m3fn``.
     """
     num_blocks, num_kv_heads, block_size, width = cache.shape
     src = _pad_columns(rows.to(cache.dtype), width)
 
     flat = cache.view(num_blocks * num_kv_heads * block_size, width)
-    if cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        flat = flat.view(torch.int8)
-        src = src.view(torch.int8)
 
     valid = (slot_mapping > _PAD_SLOT_ID).unsqueeze(-1)
     dest = torch.clamp(slot_mapping, min=0).to(torch.long)
@@ -796,17 +805,27 @@ def _gather_cache_rows(
     """Read whole slots out of a paged cache: ``[B, S]`` slots -> ``[B, S, width]``.
 
     Indexes FIRST and casts after, so the whole cache is never materialized in
-    fp32. fp8 tensors cannot be fancy-indexed
-    (``attention_decode.py:610-620``), so the gather goes through a
-    column-identical int8 view and is relabelled back.
+    fp32.
+
+    fp8 is indexed DIRECTLY here — do not reintroduce a dtype view.
+
+    An earlier revision gathered fp8 through a ``.view(torch.int8)`` and
+    relabelled back, justified by the claim that "fp8 tensors cannot be
+    fancy-indexed (``attention_decode.py:610-620``)". **That claim was false, and
+    the view was itself the defect (F-5).** ``Tensor.view(<dtype>)`` is a
+    bit-reinterpreting view and does not lower through ``convert_fx_to_hlo`` —
+    it raises ``RuntimeError: Expected XLA tensor. Got: XLACharType`` at
+    ``vllm_neuron/compile/hlo.py:176``. The element type was never the obstacle.
+
+    Measured, device-free, at this commit (probe ``ep9-P3``, legs A807/B807):
+    with the view present this gather raises ``XLACharType`` at ``hlo.py:176``;
+    with it removed, ``torch.index_select`` on ``float8_e4m3fn`` converts
+    cleanly through the whole of ``convert_fx_to_hlo``.
     """
     num_blocks, num_kv_heads, block_size, stored = cache.shape
     flat = cache.reshape(num_blocks * num_kv_heads * block_size, stored)
     rows = slot_ids.clamp(0, flat.shape[0] - 1).reshape(-1)
-    if cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        gathered = torch.index_select(flat.view(torch.int8), 0, rows).view(cache.dtype)
-    else:
-        gathered = torch.index_select(flat, 0, rows)
+    gathered = torch.index_select(flat, 0, rows)
     return (
         gathered[:, :width]
         .to(torch.float32)
