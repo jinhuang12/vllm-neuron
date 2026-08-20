@@ -549,9 +549,9 @@ def _quant_fp4_simulate(x: torch.Tensor, group: int = _FP4_QUANT_GROUP) -> torch
     per-group absmax, power-of-two scale against ``fp4_max = 6.0``, round to
     the nearest of the 8 representable E2M1 magnitudes, scale back. The model
     was QAT-trained against this grid, so the port has to land on it before
-    transporting the value through the (finer) FP8 cache. Snapping uses
-    ``bucketize`` against static boundaries — no data-dependent shape, no
-    boolean indexing.
+    transporting the value through the (finer) FP8 cache. Snapping counts the
+    static boundaries strictly below each magnitude and gathers the matching
+    level — no data-dependent shape, no boolean indexing.
     """
     tokens, width = x.shape
     groups = width // group
@@ -560,10 +560,29 @@ def _quant_fp4_simulate(x: torch.Tensor, group: int = _FP4_QUANT_GROUP) -> torch
     scales = torch.exp2(torch.ceil(torch.log2(absmax / _FP4_MAX))).unsqueeze(-1)
 
     scaled = torch.clamp(xb / scales, -_FP4_MAX, _FP4_MAX)
-    bounds = torch.tensor(_FP4_BOUNDS, dtype=torch.float32, device=x.device)
-    levels = torch.tensor(_FP4_LEVELS, dtype=torch.float32, device=x.device)
+    # DC-1 (ep7): `torch.tensor(<python sequence>, device=x.device)` on the meta
+    # device that parallel_trace traces on produces a REAL, NON-FAKE tensor, and
+    # ANY plain aten op mixing it with a FakeTensor aborts the Dynamo trace
+    # (validate_and_convert_non_fake_tensors). torch.full / torch.cat are
+    # dispatcher factories and stay fake. torch.as_tensor and Tensor.new_tensor
+    # are NOT safe substitutes -- both fail identically (ep7 leg A3 f/g).
+    # bucketize is also removed, not merely re-fed: sweep leg H10b1 recorded it
+    # SIGSEGV-ing convert_fx_to_hlo (F-4), re-proven at this commit by ep7 leg
+    # A6-ctrl. Comparisons are against 0-dim float32 TENSORS, never Python
+    # floats: sweep leg H11 recorded `x > 0.5` FAILING and
+    # `x > torch.full((), v, f32)` LOWERING.
+    a = scaled.abs()
+    idxf = torch.zeros_like(a)
+    for _b in _FP4_BOUNDS:
+        idxf = idxf + (
+            a > torch.full((), _b, dtype=torch.float32, device=x.device)
+        ).to(torch.float32)
+    levels = torch.cat(
+        [torch.full((1,), _v, dtype=torch.float32, device=x.device)
+         for _v in _FP4_LEVELS]
+    )
     snapped = torch.index_select(
-        levels, 0, torch.bucketize(scaled.abs(), bounds).reshape(-1)
+        levels, 0, idxf.to(torch.int64).reshape(-1)
     ).view_as(scaled)
     return (torch.sign(scaled) * snapped * scales).view(tokens, width)
 
