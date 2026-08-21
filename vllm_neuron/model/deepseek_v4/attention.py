@@ -2356,7 +2356,15 @@ class DeepseekV4Attention(nn.Module):
             # (sparse_indexer.py:638-645) admits only
             # ``columns < (pos + 1) // 4 <= 16384``. The surplus columns are
             # gathered, scored, masked and summed as exact zeros, so dividing
-            # by the ratio is BIT-EXACT and worth 4x here.
+            # by the ratio is exactly value-preserving and worth 4x here.
+            #
+            # Exactly value-preserving: the removed columns are masked to -1e30
+            # and exponentiate to 0.0, so the contributing term set is unchanged
+            # (fp64 softmax is byte-identical). In fp32 the contraction length
+            # changes, so BLAS re-tiles the K axis and the reduction ORDER
+            # changes: <=7.1e-07 rel, ~1-6 ulp. Not "bit-exact" in fp32. See
+            # FIX-RECORD §3.3. (This leg's own indexer output measured
+            # bit-identical in fp32 -- top-k selection is untouched.)
             raw = index_md["max_blocks_per_seq"] * index_md["block_size"]
             span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
             # ``qr``: the indexer consumes the SAME normed q latent the MLA
@@ -2434,7 +2442,15 @@ class DeepseekV4Attention(nn.Module):
                 # i.e. at most 512 of 65664 columns (0.78%) at any reachable
                 # position. Every removed column is masked to -1e30 and
                 # contributes exactly 0.0 to both softmax statistics, so this
-                # is BIT-EXACT and worth 128x on the 20 C128 layers.
+                # is exactly value-preserving and worth 128x on the 20 C128
+                # layers.
+                #
+                # Exactly value-preserving: the removed columns are masked to
+                # -1e30 and exponentiate to 0.0, so the contributing term set is
+                # unchanged (fp64 softmax is byte-identical). In fp32 the
+                # contraction length changes, so BLAS re-tiles the K axis and
+                # the reduction ORDER changes: <=7.1e-07 rel, ~1-6 ulp. Not
+                # "bit-exact" in fp32. See FIX-RECORD §3.3.
                 raw = latent_md["max_blocks_per_seq"] * latent_md["block_size"]
                 span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
                 topk_indices = (
@@ -2659,7 +2675,15 @@ class DeepseekV4Attention(nn.Module):
             # ``comp_idx < (pos + 1) // compress_ratio``. This branch serves
             # BOTH compressed classes, so the divisor must be the layer's own
             # ratio: 65664 -> 513 at C128 (cap needs 512) and -> 16416 at C4
-            # (cap needs 16384). Both cover the cap, so it is BIT-EXACT.
+            # (cap needs 16384). Both cover the cap, so it is exactly
+            # value-preserving.
+            #
+            # Exactly value-preserving: the removed columns are masked to -1e30
+            # and exponentiate to 0.0, so the contributing term set is unchanged
+            # (fp64 softmax is byte-identical). In fp32 the contraction length
+            # changes, so BLAS re-tiles the K axis and the reduction ORDER
+            # changes: <=7.1e-07 rel, ~1-6 ulp. Not "bit-exact" in fp32. See
+            # FIX-RECORD §3.3.
             raw = latent_md["max_blocks_per_seq"] * latent_md["block_size"]
             span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
             return NF.mla_decode_attention(
