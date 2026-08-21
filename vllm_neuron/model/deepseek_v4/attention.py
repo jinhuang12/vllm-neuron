@@ -2347,7 +2347,18 @@ class DeepseekV4Attention(nn.Module):
             # ``topk_index_offset`` is SUBTRACTED (mla_sparse_attention.py:412)
             # from indices whose contract is sequence-local. Any non-zero value
             # for either breaks p2a2's measured result.
-            span = index_md["max_blocks_per_seq"] * index_md["block_size"]
+            # LD-34 / F-38 (plan §3.11): the block table's ``max_blocks_per_seq
+            # * block_size`` product is the RAW TOKEN capacity, not the
+            # COMPRESSED SLOT count this op scans. Measured off-hardware from
+            # the shipped runner's own metadata builder (R-55 gate,
+            # p8-r55-gate.txt @ 36af2950): index_md reads 98 * 672 = 65856 raw
+            # tokens, while the indexer's causal cap
+            # (sparse_indexer.py:638-645) admits only
+            # ``columns < (pos + 1) // 4 <= 16384``. The surplus columns are
+            # gathered, scored, masked and summed as exact zeros, so dividing
+            # by the ratio is BIT-EXACT and worth 4x here.
+            raw = index_md["max_blocks_per_seq"] * index_md["block_size"]
+            span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
             # ``qr``: the indexer consumes the SAME normed q latent the MLA
             # path does (dsv4_ref/model.py:502, :517). NF.mla_qkv's fixed
             # return is (q_nope, q_rope, latent_kv) with no slot for it, so
@@ -2416,7 +2427,16 @@ class DeepseekV4Attention(nn.Module):
                 # causal cap itself from ``positions`` + ``compress_ratio``,
                 # so a plain arange over the static pool span IS the faithful
                 # "dense" list.
-                span = latent_md["max_blocks_per_seq"] * latent_md["block_size"]
+                # LD-34 / F-38 (plan §3.11): RAW TOKEN capacity -> COMPRESSED
+                # SLOT count. Measured (R-55 gate, p8-r55-gate.txt @ 36af2950):
+                # latent_md reads 171 * 384 = 65664 raw tokens, while the op's
+                # own causal cap admits only ``comp_idx < (pos + 1) // 128``,
+                # i.e. at most 512 of 65664 columns (0.78%) at any reachable
+                # position. Every removed column is masked to -1e30 and
+                # contributes exactly 0.0 to both softmax statistics, so this
+                # is BIT-EXACT and worth 128x on the 20 C128 layers.
+                raw = latent_md["max_blocks_per_seq"] * latent_md["block_size"]
+                span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
                 topk_indices = (
                     torch.arange(span, device=hidden_states.device, dtype=torch.int32)
                     .unsqueeze(0)
@@ -2629,6 +2649,19 @@ class DeepseekV4Attention(nn.Module):
 
         if self.has_compressed_cache:
             latent_md = attn_metadata[prefix]
+            # LD-34 / F-38 (plan §3.11): RAW TOKEN capacity -> COMPRESSED SLOT
+            # count, hoisted to a local because the product spanned the kwarg's
+            # line break. Call arity and every signature are unchanged.
+            # Measured (R-55 gate, p8-r55-gate.txt @ 36af2950): latent_md reads
+            # 171 * 384 = 65664 raw tokens. ``_compressed_pool_span``
+            # (mla_decode.py:56-62) then aranges this whole product while the
+            # op's causal cap (:263-266) admits only
+            # ``comp_idx < (pos + 1) // compress_ratio``. This branch serves
+            # BOTH compressed classes, so the divisor must be the layer's own
+            # ratio: 65664 -> 513 at C128 (cap needs 512) and -> 16416 at C4
+            # (cap needs 16384). Both cover the cap, so it is BIT-EXACT.
+            raw = latent_md["max_blocks_per_seq"] * latent_md["block_size"]
+            span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
             return NF.mla_decode_attention(
                 q,
                 self.latent_k_cache,
@@ -2640,8 +2673,7 @@ class DeepseekV4Attention(nn.Module):
                 compress_ratio=self.compress_ratio,
                 topk_indices=topk_indices,
                 topk_index_offset=0,
-                max_compressed_slots=latent_md["max_blocks_per_seq"]
-                * latent_md["block_size"],
+                max_compressed_slots=span,
                 latent_v_cache=self.latent_v_cache,
                 latent_rope_cache=self.rope_cache,
                 latent_scale_cache=self.scale_cache,
