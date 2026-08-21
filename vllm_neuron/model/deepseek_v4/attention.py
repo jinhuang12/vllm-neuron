@@ -530,19 +530,29 @@ def _pow2_ceil_scale(amax: torch.Tensor, fp8_max: float) -> torch.Tensor:
     would have produced scales off by a full binade at binade edges EVEN IF IT HAD
     LOWERED. No tolerance was moved to reach that statement.
 
-    This form uses ``log2`` only for a SEED and then removes its error entirely:
+    This form never computes the exponent transcendentally at all:
 
-      * ``pow(2.0, floor(log2(v)))`` is an EXACT power of two, and ``floor(log2)``
-        is within 1 of the true ``floor(log2 v)``.
+      * LD-58 -- THE SEED NO LONGER USES ``log2``, OR ANY TRANSCENDENTAL. It is
+        an 8-step binary decomposition of the exponent (see the body), and it
+        returns EXACTLY ``2**floor(log2 v)`` for every fp32 NORMAL ``v``: ZERO
+        binades of error, strictly better than the ``pow(2.0, floor(log2 v))``
+        seed it replaces, which was only within 1.
+      * WHY IT WAS REPLACED: ``func=Ln`` is one of the three [Act] activation
+        functions the ``NCC_INLA001`` wall requires removing -- the compiler
+        admits at most 8 DISTINCT [Act] functions per core module
+        (``lower_act.cpp:348``), three failing cores carried 11, and the
+        demonstrated-passing 8-set is those 11 minus ``{Ln, Softplus, Sqrt}``.
+        ``log2`` was this site's only ``Ln`` producer, and the tree held exactly
+        three such sites. The seed's error was already irrelevant to the RESULT;
+        what was not irrelevant was its activation table.
       * three fixups then run, each EXACT: halve once if ``s > v``; double once if
-        ``2s <= v``; double once unless ``s == v``. One step each is provably
-        enough because the seed is within one binade -- writing ``v`` in
-        ``[2**t, 2**(t+1))`` and the seed as ``2**k`` with ``k`` in
-        ``{t-1, t, t+1}``, each of the three cases reaches ``s <= v < 2s`` after
-        at most one correction.
+        ``2s <= v``; double once unless ``s == v``. They are KEPT UNCHANGED, and
+        with an exact seed fixups 1 and 2 become provable NO-OPS (an exact
+        ``2**floor(log2 v)`` already satisfies ``s <= v < 2s``), leaving fixup 3
+        to turn the floor into the ceiling. One step each was provably enough for
+        a seed within one binade, so it is more than enough for an exact one.
       * halving and doubling a power of two is exact in fp32 inside the normal
-        range, and the comparisons are exact, so ``log2``'s error cannot reach
-        the result.
+        range, and the comparisons are exact.
 
     DECLARED DEVIATION, CARRIED FORWARD, AND UNREACHABLE AT BOTH SITES HERE. For
     SUBNORMAL ``v`` the reference's IEEE-754 bit trick floors at ``2**-126`` (its
@@ -555,6 +565,15 @@ def _pow2_ceil_scale(amax: torch.Tensor, fp8_max: float) -> torch.Tensor:
     ``1.18e-38``, so both floors clear it by 31 and 29 orders of magnitude.
     Recorded rather than absorbed; no threshold moved.
 
+    LD-58 CHANGED THIS DEVIATION'S SHAPE, still outside the declared domain and
+    still unreachable. The 8-step seed cannot go BELOW ``2**-126``, so for deep
+    subnormal ``v`` it lands at ``2**-127`` after fixup 1 rather than at the true
+    ceiling: measured, ``v == 1e-40`` gives ``5.88e-39`` where the pre-LD-58 form
+    gave ``1.84e-40`` and the bit trick gives ``1.18e-38``. All THREE disagree
+    there, and none of the three is reachable, because every caller's clamp keeps
+    ``v`` at or above ``2**-29.2``. Recorded because it changed, not because it
+    matters; no threshold moved and no clamp touched.
+
     THE CALLER'S CEILING AND THIS DIVISOR MUST BE THE SAME. A scale computed
     against 448 with a clamp at 240 would saturate roughly half of every group's
     top values, which is a real accuracy loss rather than a re-encoding. Both
@@ -562,14 +581,39 @@ def _pow2_ceil_scale(amax: torch.Tensor, fp8_max: float) -> torch.Tensor:
 
     Every selector is ARITHMETIC on integer-valued or ratio quantities -- no
     boolean tensor, no index, no bitcast, no int32, no ``exp2``, no ``frexp``, no
-    ``ldexp`` -- so the graph stays static-shape and inside the lowerable subset.
+    ``ldexp``, and after LD-58 no ``log2`` and no ``pow`` either -- so the graph
+    stays static-shape and inside the lowerable subset. LD-58 adds 8 seed steps of
+    6 elementwise ops each and removes two ops, so the node count rises and the
+    PRIMITIVE SET does not. The tensor is a per-group ``absmax``, not an
+    activation, so the cost is paid on the smallest tensor in the op.
     """
     v = (amax.to(torch.float32) * (1.0 / fp8_max)).contiguous()
     zero = torch.zeros_like(v)
     one = torch.ones_like(v)
 
-    # Exact power-of-two seed, within one binade of the answer.
-    s = torch.pow(2.0, torch.floor(torch.log2(v)))
+    # LD-58 -- EXACT power-of-two seed, ZERO binades of error, NO transcendental.
+    # Binary decomposition of the exponent: start at the smallest fp32 NORMAL and
+    # greedily multiply by each increment. The increments sum to 254, so every
+    # normal binade from ``2**-126`` to ``2**127`` is reachable, and greedy is
+    # admissible because each increment is ``<= 1 +`` the sum of the later ones
+    # (127<=128, 64<=64, 32<=32, 16<=16, 8<=8, 4<=4, 2<=2, 1<=1) -- the same
+    # argument a binary search rests on. Products of exact fp32 powers of two are
+    # exact, so ``s`` is an EXACT power of two by construction, and every factor
+    # is an exact fp32 value (``2**127 == 1.701411835e+38``, finite; ``2**128``
+    # would NOT be, which is why the first increment is 127 and not 128).
+    s = one * (2.0 ** -126)
+    for _pow2 in (2.0 ** 127, 2.0 ** 64, 2.0 ** 32, 2.0 ** 16,
+                  2.0 ** 8, 2.0 ** 4, 2.0 ** 2, 2.0 ** 1):
+        # sel == 1 iff v >= s * _pow2. ``floor(r)`` is 0 for ``0 <= r < 1`` and
+        # ``>= 1`` otherwise, and the min/max pair clamps it to ``{0, 1}`` -- the
+        # SAME arithmetic selector the three fixups below use, so no boolean
+        # tensor, no comparison-to-float and no ``where`` enters the graph. An
+        # overflow of ``s * _pow2`` to ``inf`` gives ``r == 0`` and an overflow of
+        # ``r`` gives ``sel == 1``; both are the CORRECT branch, so the top binade
+        # needs no special case.
+        r = v / (s * _pow2)
+        sel = torch.minimum(torch.maximum(torch.floor(r), zero), one)
+        s = s * (_pow2 * sel + (one - sel))
 
     # Fixup 1 -- force s <= v. sel == 1 iff v/s < 1.
     r = v / s

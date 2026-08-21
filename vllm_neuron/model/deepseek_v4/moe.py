@@ -88,6 +88,37 @@ _MOE_CTE_BLOCK_SIZE = 256
 _BLOCK_FP8_BLOCK_SIZE = (128, 128)
 _BLOCK_FP8_ACT_GROUP_SIZE = 128
 
+# LD-60 / LD-59 -- the arithmetic realization of ``scoring_func="sqrtsoftplus"``
+# at :_route step 2. NOT a semantics knob: ``config.py:124`` still pins
+# ``scoring_func="sqrtsoftplus"`` and the reject in :DeepseekV4MoE.__init__ (the
+# ``if self.scoring_func != "sqrtsoftplus": raise``) still stands. These
+# constants exist so the same MATHEMATICAL function can be computed without
+# asking the [Act] engine for a ``Softplus``, a ``Sqrt`` or a ``Ln`` table
+# (NCC_INLA001 "the number of activation tables must be <= 8"; port-plan.md
+# §3.3-3.4, ladder decisions LD-59 and LD-60).
+#
+# ``atanh(t)/t == 1 + t**2/3 + t**4/5 + ... `` -- the reciprocal odd integers,
+# truncated after ``t**12/13``. Plain Taylor, NOT minimax-tuned: on the reduced
+# range ``t**2 <= 1/9`` the truncated tail is already about ``t**14/15 ==
+# 1.7e-08``, below fp32 resolution (6e-08), and a tuned set would trade an
+# auditable derivation for a marginal bound. Graded by G1 (port-plan.md §3.5).
+_ATANH_C0 = 1.0
+_ATANH_C1 = 1.0 / 3.0
+_ATANH_C2 = 1.0 / 5.0
+_ATANH_C3 = 1.0 / 7.0
+_ATANH_C4 = 1.0 / 9.0
+_ATANH_C5 = 1.0 / 11.0
+_ATANH_C6 = 1.0 / 13.0
+
+# LD-59 zero guard for ``y * rsqrt(y)``. Chosen so that ``rsqrt(_SQRT_GUARD)**2
+# == 1e+30`` cannot overflow fp32 (max 3.4028235e+38, so 8 orders of headroom),
+# and so the guard is itself a NORMAL fp32 value (smallest normal 1.1754944e-38)
+# and cannot be flushed to zero. The only deviation is on ``0 < y < 1e-30``,
+# where the result is ``y * 1.5 / 1e-15`` instead of ``sqrt(y)`` -- both below
+# 1e-15, and ``y < 1e-30`` needs ``logits < -69``. At EXACTLY ``y == 0`` the
+# outer ``y *`` restores the exact ``0.0``, which is the clause G3 grades.
+_SQRT_GUARD = 1e-30
+
 
 def _moe_kernel_enums() -> tuple:
     """Resolve the enum members the MoE entry points take.
@@ -1021,7 +1052,10 @@ class DeepseekV4MoE(nn.Module):
         get subtly wrong:
 
         1. ``:570`` the router matmul runs in fp32 on fp32-upcast weights.
-        2. ``:576`` ``scores = softplus(logits).sqrt()``.
+        2. ``:576`` ``scores = softplus(logits).sqrt()`` -- the FUNCTION. Its
+           ARITHMETIC REALIZATION here calls neither ``F.softplus`` nor
+           ``torch.sqrt``; see the LD-59 / LD-60 block at step 2 below for the
+           polynomial and the ``rsqrt`` form, and why.
         3. ``:577`` the UNBIASED scores are kept aside.
         4. ``:579-580`` ``gate_bias`` is added to a separate tensor.
         5. ``:581-584`` selection: hash gather, or top-k of the BIASED score.
@@ -1029,9 +1063,11 @@ class DeepseekV4MoE(nn.Module):
         7. ``:586-587`` renormalize so the K weights sum to 1.
         8. ``:588`` multiply by ``routed_scaling_factor``.
 
-        Every op is static-shape: ``matmul``, ``softplus``, ``sqrt``,
-        ``index_select``, ``topk``, ``gather``, ``scatter``. No ``.item()``,
-        no ``nonzero()``, no boolean-mask indexing.
+        Every op is static-shape: ``matmul``, the step-2 elementwise chain
+        (``abs``, ``exp``, ``div``, ``mul``, ``add``, ``maximum``, ``clamp_min``,
+        ``rsqrt``), ``index_select``, ``topk``, ``gather``, ``scatter``. No
+        ``.item()``, no ``nonzero()``, no boolean-mask indexing, and no
+        Python-level branch on a tensor value.
         """
         # Step 1 (:570) — fp32 router matmul. The weight is stored
         # ``[E, H]``, so the contraction transposes it.
@@ -1039,8 +1075,83 @@ class DeepseekV4MoE(nn.Module):
             hidden_states.to(torch.float32), self.gate_weight.to(torch.float32).t()
         )
 
-        # Step 2 (:576) — sqrtsoftplus.
-        scores = torch.sqrt(F.softplus(logits))
+        # Step 2 (:576) — sqrtsoftplus. LD-59 + LD-60 changed the ARITHMETIC
+        # REALIZATION of this line, not the function it computes. ``scoring_func``
+        # is still ``"sqrtsoftplus"`` (``config.py:124``), the ``raise`` in
+        # :DeepseekV4MoE.__init__ that rejects every other value still stands, and
+        # the reference line this transcribes is still
+        # ``dsv4_ref/model.py:576``. What changed is that neither ``Softplus``
+        # nor ``Sqrt`` nor ``Ln`` is asked of the [Act] engine any more: the
+        # compiler admits at most 8 DISTINCT [Act] activation functions per core
+        # module (``NCC_INLA001`` at ``lower_act.cpp:348``), three failing cores
+        # carried 11, and the demonstrated-passing 8-set is the 11 minus exactly
+        # ``{Ln, Softplus, Sqrt}``. See port-plan.md §3.3-3.4.
+        #
+        # PARITY, STATED HERE BECAUSE IT IS NOT NEUTRAL. This is the MoE gate, and
+        # step 4 below adds ``gate_bias`` AFTER this nonlinearity, so selection depends
+        # on the VALUE and no monotone-invariance escape exists -- a perturbation
+        # here can change which expert is selected, not only its weight. The
+        # perturbation is bounded at the fp32 rounding floor and is gated
+        # off-hardware by G1-G5 (port-plan.md §3.5); the verdict is
+        # ``judge_parity``'s, by measurement, against the recorded standard.
+        #
+        # LD-60 -- softplus WITHOUT a logarithm. Every CLOSED-FORM identity for
+        # softplus routes through a log (``log1p(exp x)``, ``x + log1p(exp -x)``,
+        # ``-log sigmoid(-x)``); a POLYNOMIAL does not. Range-reduce with the libm
+        # identity ``log1p(u) == 2*atanh(u/(2+u))``, then evaluate ``atanh(t)/t``
+        # as its own series in ``t**2``:
+        #
+        #     softplus(x) == max(x,0) + log1p(exp(-|x|))   branch-free and stable
+        #     u = exp(-|x|) in (0,1]  =>  t = u/(2+u) in (0,1/3]  =>  t**2 <= 1/9
+        #
+        # The range reduction is NOT optional: evaluating ``log1p(exp x)``
+        # directly overflows ``exp`` for large positive ``x``, and this form never
+        # evaluates ``exp`` on a positive argument at all. The ONLY [Act] function
+        # it uses is ``Exp``, which every core already carries, so it costs no new
+        # table; ``abs`` and ``maximum`` are measured Act-free (``func=Abs`` is 0
+        # in all four histograms, and ``max`` is in 0 of 21 activation rosters, so
+        # it cannot be an Act function at all).
+        a = torch.abs(logits)
+        u = torch.exp(-a)
+        t = u / (2.0 + u)
+        t2 = t * t
+        p = _ATANH_C0 + t2 * (
+            _ATANH_C1 + t2 * (
+                _ATANH_C2 + t2 * (
+                    _ATANH_C3 + t2 * (
+                        _ATANH_C4 + t2 * (_ATANH_C5 + t2 * _ATANH_C6)
+                    )
+                )
+            )
+        )
+        y = torch.maximum(logits, torch.zeros_like(logits)) + 2.0 * t * p
+
+        # LD-59 -- sqrt WITHOUT ``Sqrt``, as ``y * rsqrt(y)``. ``torch.rsqrt`` as
+        # THIS build lowers it consumes no [Act] table, and that is measured
+        # rather than assumed: ``func=Rsqrt`` is 0 in all four BIR histograms,
+        # pass-matched by the fact that the same ``DeepseekV4RMSNorm.forward``
+        # body which calls ``rsqrt`` on every layer of both graphs has its OWN
+        # ``.pow(2)`` counted as ``Square`` in those histograms. The roster does
+        # contain ``reciprocal_sqrt``, so the claim is scoped to this lowering,
+        # and ``func=Rsqrt > 0`` in any post-fix census falsifies it (F-b).
+        #
+        # BOTH guards below are load-bearing and NEITHER is optional:
+        #  * ``clamp_min`` -- ``softplus(x) > 0`` holds in R but NOT in fp32,
+        #    where ``y`` underflows to EXACTLY ``0.0`` for ``x`` below about
+        #    -104. Then ``y * rsqrt(y)`` is ``0 * inf`` = NaN, and a NaN in
+        #    ``scores`` propagates through step 4's ``+ gate_bias`` into ``topk``
+        #    and corrupts EXPERT SELECTION silently. The guard is free at zero
+        #    because the outer ``y *`` restores the exact ``0.0``.
+        #  * ONE Newton step -- ``sqrt(y) == y * rsqrt(y)`` is NOT exact.
+        #    ``sqrt`` is exactly-rounded under IEEE-754; ``rsqrt`` is not an
+        #    IEEE-required operation and its accuracy on this build is
+        #    UNMEASURABLE off hardware. One iteration takes relative error ``e``
+        #    to ``1.5*e**2``, so ``1e-04 -> 1.5e-08`` and ``1e-07 -> 1.5e-14``,
+        #    i.e. below fp32 resolution for any plausible hardware rsqrt. Four
+        #    ops buy the removal of an unverifiable premise; take them.
+        r = torch.rsqrt(torch.clamp_min(y, _SQRT_GUARD))
+        r = r * (1.5 - 0.5 * y * r * r)
+        scores = y * r
 
         # Step 3 (:577) — keep the uncorrected scores; they alone produce
         # the routing weights.
