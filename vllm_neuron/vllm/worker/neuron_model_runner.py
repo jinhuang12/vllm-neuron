@@ -1291,6 +1291,42 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
         hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+        # LD-43/LD-44 (plan §4 Phase 3, §6): cap the partitioner's per-module
+        # LAYER count, which is the only surface that reaches per-module
+        # INSTRUCTION count — the quantity NCC_ELUR015 rejects on the decode
+        # graph. A SOURCE edit, and it has to be: there is no configuration route
+        # to a compiler flag on this platform. ``compile_options["compiler_args"]``
+        # below is a hardcoded literal list, written once and never mutated; only
+        # ``-O{level}`` varies; ``envs.py`` has no entry and no ``additional_config``
+        # path reaches it. The earlier claim of a "proven" injection point via
+        # ``_apply_platform_compiler_args`` / ``_inject_hlo2tensorizer_opt`` is
+        # REFUTED — those symbols do not carry the flag. Shape copied from the
+        # ``+=`` precedent nine lines below.
+        #
+        # Measured basis, not projected: the partitioner splits BY LAYER COUNT at
+        # the model's own per-layer collectives, and cut the 43-layer decode graph
+        # 3/12/12/16. Per-layer cost is uniform over layers 3-42 (345,628 insts);
+        # layers 0-2 are dense/SWA-only and 5x cheaper. A 12-layer module is
+        # MEASURED to pass at 82.95% of the limit; sg03 holds 16 plus a
+        # 78,320-instruction epilogue, and that is the sole reason it breaches.
+        # ``estimateLayersPerModule: ... cliFlag? 0`` is the firing control that
+        # proves the flag is currently UNSET, and the ``cl`` parser is measured to
+        # ACCEPT it (sibling spellings are measured to be REJECTED).
+        #
+        # N=11 IS A STARTING VALUE, NOT A SETTLED ONE. Re-size it here — 11 -> 8
+        # -> 6 (43/6 ~ 8 modules of 5-6 layers) — against a measurement of the
+        # SPECULATED decode graph, never against 5,608,368. That figure and its
+        # 10.85% reduction come from a plain greedy ``LLM(...)`` smoke with NO
+        # speculative config, and ``decode_token_threshold = 1 +
+        # max_num_draft_tokens`` classifies a 6-token verify step as DECODE at
+        # T = 6 * batch. So 5,608,368 is a LOWER BOUND on the graph this port
+        # ships, not a target. Tunability through this one line is why this rung
+        # was chosen. Fallback through the same line, if N underdelivers:
+        # ``--modular-flow-mac-target`` (the compiler injects 200000000000; a
+        # probe measured 1000000000 accepted). Do NOT conflate that with
+        # ``--modular-flow-mac-threshold`` above, which is a different flag and is
+        # already saturated at 10.
+        hlo2tensorizer_opts += " --layers-per-module=11"
         # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
         # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
         from vllm_neuron.compile.platform import get_platform_target

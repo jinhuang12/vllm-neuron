@@ -1412,6 +1412,10 @@ class DeepseekV4KVCompressor(nn.Module):
         finite. That matters because an unwritten FP8 slot can decode to NaN,
         and ``torch.where`` discards a NaN in a non-selected lane whereas a
         multiply would propagate it.
+
+        The ``lead`` axis is read in CHUNKS — see LD-43 at the gate below. The
+        gather this function issues is what breached the SBUF byte limit, and
+        the chunk bound is the remedy.
         """
         window = self.window
         tokens = kv_win.shape[0]
@@ -1420,31 +1424,20 @@ class DeepseekV4KVCompressor(nn.Module):
             return kv_win, score_win
 
         block_size = state.block_size
-        seq = state.seq_ids[:lead].to(torch.long)
-        local = abs_src[:lead]
-        if state.pos_offset is not None:
-            # The leg is a SlidingWindowSpec, so at decode the runner has
-            # already replaced its block table with a window-relevant gather
-            # and published the offset of the first block it kept
-            # (``neuron_model_runner.py:3983-3999``). Absolute positions index
-            # the untrimmed table; subtracting the offset is what makes them
-            # index the trimmed one.
-            local = local - state.pos_offset.to(torch.long).index_select(
-                0, seq
-            ).unsqueeze(1)
-        table = state.block_table.to(torch.long).index_select(0, seq)
-        span = table.shape[1] * block_size
-        local = torch.clamp(local, 0, span - 1)
-        blocks = torch.gather(table, 1, torch.div(local, block_size, rounding_mode="floor"))
-        slots = blocks * block_size + torch.remainder(local, block_size)
-
         width = self.state_pair_width
         pw = self.proj_width
         ng = pw // _KV_QUANT_GROUP
-        limb1 = _gather_cache_rows(state.k_cache, slots, width)
-        limb2 = _gather_cache_rows(state.v_cache, slots, width)
 
-        def decode(offset: int, scale_offset: int) -> torch.Tensor:
+        def dequant_pair(
+            limb1: torch.Tensor, limb2: torch.Tensor, offset: int, scale_offset: int
+        ) -> torch.Tensor:
+            # Named ``dequant_pair`` and NOT ``decode``: this function's own gate
+            # turns on ``state.is_decode``, and a local called ``decode`` beside
+            # it invites reading a two-limb dequant as a phase test. Identity of
+            # NAME is not identity of CONSTRUCT. Hoisted out of the chunk loop so
+            # it takes its limbs as ARGUMENTS rather than closing over loop
+            # variables — a closure over ``limb1`` here would bind late and, if
+            # it were ever called after the loop, read the last chunk's rows.
             scale = limb1[..., 2 * pw + scale_offset : 2 * pw + scale_offset + ng]
             expanded = scale.unsqueeze(-1).expand(*scale.shape, _KV_QUANT_GROUP)
             return (
@@ -1452,9 +1445,118 @@ class DeepseekV4KVCompressor(nn.Module):
                 + limb2[..., offset : offset + pw] / _STATE_LIMB_SHIFT
             ) * expanded.reshape(*scale.shape[:-1], pw)
 
-        pick = from_state[:lead].unsqueeze(-1)
-        head_kv = torch.where(pick, decode(0, 0), kv_win[:lead])
-        head_score = torch.where(pick, decode(pw, ng), score_win[:lead])
+        # ── LD-43 (plan §4 Phase 1, §6): bound the state gather's SBUF bytes ──
+        # by chunking the LEAD axis. The two ``_gather_cache_rows`` calls below
+        # each materialize ``[lead, window, state_pair_width]``, and ``window``
+        # is the PARTITION axis, so the compiler's bytes-per-partition is
+        # ``lead * state_pair_width`` per copy. At prefill that is the measured
+        # breach exactly:
+        #
+        #   lead 127               = min(tokens, window - 1), window - 1 = 127
+        #   state_pair_width 1040  = 2*pw + 2*(pw // _KV_QUANT_GROUP) at pw 512
+        #   127 * 1040             = 132,080 per copy
+        #   two copies live        = 264,160  vs  229,376 legal  = +15.16%
+        #   127 * 1040 * 128 * 2   = 33,812,480 == the compiler's own reported
+        #                            Total Accessed Bytes, to the byte (IGCA044)
+        #
+        # k=2 at prefill: 64 + 63 -> 66,560 per copy -> 133,120 with both copies
+        # live = 58.0% of the 229,376 legal, 42.0% spare.
+        #
+        # SPLIT ``lead``, NEVER ``window``. ``window`` is the partition axis;
+        # splitting it cuts the partition COUNT and leaves bytes-per-partition
+        # where they are, which is not the quantity that failed.
+        #
+        # THE GATE IS STATIC, and that is the whole point. ``lead`` is a Python
+        # int — ``tokens`` is a static traced shape and ``state.is_decode`` is a
+        # Python bool (``CompressorState.is_decode: bool``) — so ``chunk`` and
+        # the ``range`` below are decided at TRACE time, exactly like the
+        # ``if lead <= 0`` and ``if lead == tokens`` branches this function
+        # already had. A single-chunk trace emits no ``torch.cat`` over the lead
+        # axis (see the ``len(...) == 1`` short-circuit), so any forward whose
+        # ``lead`` does not exceed the chunk width traces BYTE-IDENTICALLY to the
+        # pre-LD-43 graph. Its cost there is zero by construction, not by
+        # projection. A dynamic branch would put both paths in the graph and
+        # forfeit that; do not substitute one.
+        #
+        # WHEN THE GATE ACTUALLY FIRES — measured from source, correcting the
+        # plan's premise that decode traces ``lead`` in {1, 6}. ``lead`` at
+        # decode is ``tokens``, the FLAT token count T (``tokens =
+        # positions.shape[0]``), not tokens-per-sequence. So:
+        #   * prefill                T is the chunk length, lead = 127  -> FIRES
+        #   * decode, no speculation T = padded batch, buckets [1..32] powers of
+        #                            2 with buckets[-1] == max_num_seqs = 32,
+        #                            so lead <= 32 -> DOES NOT FIRE, byte-identical
+        #   * decode, mtp/5 verify   the runner classifies a 6-token step as
+        #                            DECODE (decode_token_threshold = 1 +
+        #                            max_num_draft_tokens = 6), so T = 6 * padded
+        #                            batch in {6,12,24,48,96,192} -> FIRES from 96
+        # That last row is NOT a cost this rung pays needlessly: unchunked at
+        # T=192 the same gather wants 192 * 1040 * 2 = 399,360 bytes/partition,
+        # +74.1% over the 229,376 legal, so the speculated decode graph needs
+        # this bound too. The plan's "zero decode instruction cost" holds for the
+        # no-speculation graph the campaign MEASURED; the speculated graph has
+        # never been traced (plan §4 Phase 2) and its cost is unpriced here.
+        #
+        # VALUE-PRESERVING. Deliberately NOT called bit-exact, per the plan and
+        # the LD-40 precedent at ``:2523``. There is no reduction along ``lead``
+        # anywhere in the chunked region — every op is a row-wise slice, gather,
+        # elementwise dequant, or ``torch.where``, and the loop keeps no
+        # cross-chunk state (no accumulator, no running max, no running sum) —
+        # so the math is per-row identical. But the compiler may tile a smaller
+        # ``index_select``/``torch.where`` differently, which is the mechanism
+        # behind LD-34's <=7.1e-07 drift. The parity capture settles it; this
+        # comment does not.
+        chunk_width = 64
+        chunk = chunk_width if lead > chunk_width else lead
+        # ONE explicit ``range`` generates both the full and the RAGGED chunk, so
+        # the 64 and the 63 are derived, never written as integer literals.
+        heads_kv: list[torch.Tensor] = []
+        heads_score: list[torch.Tensor] = []
+        for start in range(0, lead, chunk):
+            stop = min(start + chunk, lead)
+            seq = state.seq_ids[start:stop].to(torch.long)
+            local = abs_src[start:stop]
+            if state.pos_offset is not None:
+                # The leg is a SlidingWindowSpec, so at decode the runner has
+                # already replaced its block table with a window-relevant gather
+                # and published the offset of the first block it kept
+                # (``neuron_model_runner.py:3983-3999``). Absolute positions index
+                # the untrimmed table; subtracting the offset is what makes them
+                # index the trimmed one.
+                local = local - state.pos_offset.to(torch.long).index_select(
+                    0, seq
+                ).unsqueeze(1)
+            table = state.block_table.to(torch.long).index_select(0, seq)
+            span = table.shape[1] * block_size
+            local = torch.clamp(local, 0, span - 1)
+            blocks = torch.gather(
+                table, 1, torch.div(local, block_size, rounding_mode="floor")
+            )
+            slots = blocks * block_size + torch.remainder(local, block_size)
+
+            limb1 = _gather_cache_rows(state.k_cache, slots, width)
+            limb2 = _gather_cache_rows(state.v_cache, slots, width)
+
+            pick = from_state[start:stop].unsqueeze(-1)
+            heads_kv.append(
+                torch.where(pick, dequant_pair(limb1, limb2, 0, 0), kv_win[start:stop])
+            )
+            heads_score.append(
+                torch.where(
+                    pick, dequant_pair(limb1, limb2, pw, ng), score_win[start:stop]
+                )
+            )
+
+        # A one-chunk trace returns the single part UNWRAPPED. ``torch.cat`` over
+        # a one-element list is still a graph op, and emitting it would break the
+        # byte-identical guarantee above for every unchunked shape.
+        head_kv = heads_kv[0] if len(heads_kv) == 1 else torch.cat(heads_kv, dim=0)
+        head_score = (
+            heads_score[0] if len(heads_score) == 1 else torch.cat(heads_score, dim=0)
+        )
+        # Against TOTAL ``lead``, never a per-chunk ``stop``: this asks whether a
+        # non-state TAIL exists past the leading rows, which is a property of the
+        # whole read, not of the last chunk.
         if lead == tokens:
             return head_kv, head_score
         return (
