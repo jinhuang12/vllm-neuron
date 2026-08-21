@@ -110,14 +110,36 @@ _ATANH_C4 = 1.0 / 9.0
 _ATANH_C5 = 1.0 / 11.0
 _ATANH_C6 = 1.0 / 13.0
 
-# LD-59 zero guard for ``y * rsqrt(y)``. Chosen so that ``rsqrt(_SQRT_GUARD)**2
-# == 1e+30`` cannot overflow fp32 (max 3.4028235e+38, so 8 orders of headroom),
-# and so the guard is itself a NORMAL fp32 value (smallest normal 1.1754944e-38)
-# and cannot be flushed to zero. The only deviation is on ``0 < y < 1e-30``,
-# where the result is ``y * 1.5 / 1e-15`` instead of ``sqrt(y)`` -- both below
-# 1e-15, and ``y < 1e-30`` needs ``logits < -69``. At EXACTLY ``y == 0`` the
-# outer ``y *`` restores the exact ``0.0``, which is the clause G3 grades.
-_SQRT_GUARD = 1e-30
+# LD-59 zero guard for ``y * rsqrt(y)``. This is the SMALLEST NORMAL fp32 value,
+# and that is the largest choice that is also the smallest: it must be normal
+# (so it survives a subnormal flush-to-zero, which a device may do and which no
+# off-hardware run can rule out), and every value above it costs accuracy for
+# nothing, because a normal ``y`` needs no clamping at all.
+#
+# THE BOUND THE PLAN REQUIRES RECORDED. ``r_max = rsqrt(2**-126) == 2**63 ==
+# 9.223372e+18``, so even if the compiler reassociates the Newton step into a
+# literal ``r*r``, that product is ``2**126 == 8.507059e+37``, under fp32 max
+# 3.4028235e+38 with 4x headroom. The source below parenthesises ``(y * r)``
+# first, so the product ``r*r`` is not formed AS WRITTEN either -- ``y * r`` is
+# approximately ``sqrt(y)`` and cannot overflow. Both readings are safe.
+#
+# WHY NOT ``1e-30``, WHICH THIS FILE SHIPPED FIRST: ``1e-30`` is a NORMAL fp32
+# number, so it clamped normal, accurately-representable ``y`` values across the
+# whole band ``1e-38 < y < 1e-30`` (``-87 < logits < -69``) where the fp32
+# reference is trustworthy to 2.8e-08. Measured: it drove the relative error to
+# ~1.0 there. That was an authoring defect, found by the G1 leg of the gate, and
+# it is this constant alone. See ``artifacts/repairs/author_model_family-iter17/``.
+#
+# The remaining deviation is ``0 < y < 2**-126``, i.e. SUBNORMAL ``y`` only,
+# reached at ``logits < -87.3``. There the result is ``y * 1.5 * 2**63`` rather
+# than ``sqrt(y)``. That band is exactly the band in which the fp32 reference
+# ``torch.sqrt(F.softplus(x))`` is NOT A FUNCTION OF ITS INPUT -- measured, it
+# returns 28 grid units for a large tensor and 27 for a size-1 tensor at the
+# same ``x = -100.0`` -- so nothing there is worth matching. Both the deviating
+# and the reference value are below 1e-19, and G4 measures 0 top-k flips of 4096
+# in all 12 probed regimes, which is the only thing ``scores`` decides.
+# At EXACTLY ``y == 0`` the outer ``y *`` restores the exact ``0.0`` (G3).
+_SQRT_GUARD = 2.0 ** -126
 
 
 def _moe_kernel_enums() -> tuple:
@@ -1149,8 +1171,13 @@ class DeepseekV4MoE(nn.Module):
         #    to ``1.5*e**2``, so ``1e-04 -> 1.5e-08`` and ``1e-07 -> 1.5e-14``,
         #    i.e. below fp32 resolution for any plausible hardware rsqrt. Four
         #    ops buy the removal of an unverifiable premise; take them.
+        #  * The ``(y * r)`` parenthesisation is deliberate, not cosmetic: it
+        #    keeps the intermediate at approximately ``sqrt(y)``, so no
+        #    subexpression can overflow for any admitted ``y``. See the
+        #    ``_SQRT_GUARD`` bound above, which holds under the reassociated
+        #    reading too.
         r = torch.rsqrt(torch.clamp_min(y, _SQRT_GUARD))
-        r = r * (1.5 - 0.5 * y * r * r)
+        r = r * (1.5 - 0.5 * (y * r) * r)
         scores = y * r
 
         # Step 3 (:577) — keep the uncorrected scores; they alone produce
