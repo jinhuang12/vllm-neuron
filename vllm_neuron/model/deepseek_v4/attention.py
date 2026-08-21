@@ -2486,6 +2486,41 @@ class DeepseekV4Attention(nn.Module):
                 nope_dim=self.nope_head_dim,
                 rope_dim=self.rope_head_dim,
                 quant_group_size=_KV_QUANT_GROUP,
+                # LD-40 (plan §4 Phase 3, §5.2): bound the gathered-KV
+                # workspace by chunking the QUERY axis. The op ships this
+                # parameter (``mla_sparse_attention.py:307``) and consumes it as
+                # ``step = num_tokens if chunk_size is None else
+                # min(chunk_size, num_tokens)`` (``:451``); passing nothing took
+                # the ``None`` default, so the whole 640-column fp32 gather was
+                # materialized at once -- 640.0 MiB at a 512-token bucket.
+                # C=64 is an 8x cut to 80.0 MiB over 8 chunks, and the chunk
+                # count is a trace-time constant (``num_tokens`` is static), so
+                # the loop stays statically unrolled.
+                #
+                # VALUE-PRESERVING WITH NO REDUCTION-LENGTH CHANGE, which is the
+                # claim LD-34 could NOT make. In ``_mla_gathered_attention``
+                # (``:264-278``) ``scores = torch.bmm(q, latent_f.transpose(1,2))``
+                # batches over T and contracts over D: the contraction over
+                # D=512 (``head_dim``) and the softmax reduction over S=640 are
+                # both per-row and INVARIANT under chunking. T is the batch
+                # count and is the only axis chunked. The loop takes pure row
+                # slices, keeps no cross-chunk state (no accumulator, no running
+                # max, no running sum), hoists ``sink_f`` read-only, and
+                # reassembles with ``torch.cat(outputs, dim=0)``.
+                #
+                # Deliberately NOT called "bit-exact" here: the compiler may
+                # tile a smaller ``bmm`` differently, which is the mechanism
+                # behind LD-34's <=7.1e-07 drift. The math is identical; the
+                # emitted schedule may not be. The parity capture settles it --
+                # this comment does not.
+                #
+                # Anchor by SYMBOL, never by line: this is the ONLY
+                # ``NF.mla_sparse_attention(`` call in the repo. The six
+                # ``chunk_size=None`` hits in this file are ``LayerSpec`` FIELDS
+                # (``model/kv_cache.py:21``) feeding
+                # ``attention_chunk_size=layer.chunk_size`` -- an unrelated
+                # KV-cache construct that must NOT be set here.
+                chunk_size=64,
             )
 
         # ── Inverse RoPE, then the grouped o-projection ─────────────────
