@@ -1603,9 +1603,65 @@ class DeepseekV4KVCompressor(nn.Module):
         # whole read, not of the last chunk.
         if lead == tokens:
             return head_kv, head_score
+        # ── Carry the TAIL by SELECT, never by a dim-0 concatenate ──────────
+        # (ep18 iteration 10; no ledger id is minted here because no ledger
+        # entry accompanies this change.)
+        #
+        # The pre-fix form was ``torch.cat((head_kv, kv_win[lead:]), dim=0)``
+        # and its score twin. That copies ``tokens - lead`` rows OUT of
+        # ``kv_win`` and INTO a freshly materialized buffer at destination
+        # offset ``lead`` — a SHIFTED strided write whose source rows come from
+        # a ``pftranspose``d gather. On the ratio-4 leg at prefill the tail is
+        # 505 rows of ``[window, proj_width]``, and the compiler reported each
+        # of the resulting pair of memlocs acquiring 2,068,494 anti-dependency
+        # intervals (== 505 * 4096 + 14) against its own 100,000 threshold,
+        # then abandoning its normal algorithm for ``auto-conservative``
+        # 4KB-aligned coarsening (``AntiDependencyAnalyzer``, nc00/sg14). Both
+        # of those are the COMPILER's statements, quoted from its own log. NO
+        # device time is claimed for either, and none should be inferred.
+        #
+        # The select form never re-addresses those rows: ``kv_win`` is consumed
+        # WHOLE as the else-operand at IDENTITY row offsets, so the tail is
+        # read in place instead of copied to ``+lead``.
+        #
+        # ``pad`` + ``where`` is this port's OWN idiom for a shaped overwrite,
+        # not a new construct — ``fx_passes/inplace_rewrite_pass.py:346-362``
+        # lowers every traced ``setitem`` to exactly this pair and records that
+        # it "mirrors the HLO pad+select pattern that XLA produces". The mask
+        # here is an ``arange`` compare rather than that pass's padded
+        # ``ones_like`` because ``lead`` is a trace-time Python int, so the
+        # predicate is a constant iota compare and needs no data tensor.
+        #
+        # ``pad`` and NOT ``torch.cat`` for the widening: a cat against a zero
+        # block would put a dim-0 concatenate of the very same shape straight
+        # back into the graph and defeat the entire change.
+        #
+        # BIT-IDENTICAL, not merely value-preserving — a deliberately STRONGER
+        # claim than LD-43's above, which is weaker only because chunking
+        # re-tiles its region. Row ``i < lead`` selects ``head_kv[i]``, which is
+        # what the concatenate's first operand put there; row ``i >= lead``
+        # selects ``kv_win[i]``, which is what ``kv_win[lead:]`` put there. No
+        # arithmetic is performed on any row, so every output row is the same
+        # BIT. The pad rows fall in no selected lane, so their value is
+        # unobservable; ``torch.where`` also discards a NaN in a non-selected
+        # lane, which the docstring above already relies on.
+        #
+        # STATIC, like every other branch in this method: ``tokens`` is a traced
+        # static shape and ``lead`` is a Python int, so no data-dependent shape
+        # and no Python ``if`` on a tensor value is introduced.
+        tail_rows = tokens - lead
+        # ``pad`` takes pairs in REVERSE dim order, so the dim-0 pair goes LAST.
+        pad_spec = [0, 0] * (kv_win.dim() - 1) + [0, tail_rows]
+        row_mask = (torch.arange(tokens, device=kv_win.device) < lead).reshape(
+            tokens, *([1] * (kv_win.dim() - 1))
+        )
         return (
-            torch.cat((head_kv, kv_win[lead:]), dim=0),
-            torch.cat((head_score, score_win[lead:]), dim=0),
+            torch.where(
+                row_mask, torch.nn.functional.pad(head_kv, pad_spec), kv_win
+            ),
+            torch.where(
+                row_mask, torch.nn.functional.pad(head_score, pad_spec), score_win
+            ),
         )
 
 
