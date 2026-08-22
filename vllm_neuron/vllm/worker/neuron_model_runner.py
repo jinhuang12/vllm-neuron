@@ -4205,10 +4205,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     num_reqs, dtype=torch.int32, device=device
                 )
 
+            # Block IDs the KV cache actually owns. The block-table seq dims
+            # above are sized from a *token* budget (``max_model_len`` or a ctx
+            # bucket) and are unrelated to how many blocks were allocated: at
+            # ``max_model_len=65536`` with ``block_size=32`` the table is 2048
+            # wide while the cache holds ``num_blocks=1024``, so unwrapped
+            # sequential IDs 1024..2047 address past the end of the cache. The
+            # consumer gather in
+            # ``functional/attention/attention_segmented_cte.py``
+            # (``bt = block_tables[0].clamp_min(0)`` then ``k_cache[bt]``)
+            # bounds only the LOWER end, so nothing downstream catches it and
+            # the device raises "scatter/gather (indirect memory copy via
+            # vector DGE) out-of-bound access". At runtime the IDs come from the
+            # allocator and are in range by construction; only warmup fabricates
+            # IDs it does not own, so the bound belongs here at the producer.
+            # Wrapping changes VALUES ONLY - every traced shape, and therefore
+            # every compile-cache key, is unchanged.
+            num_kv_blocks = self.kv_cache_config.num_blocks
             # Dummy block_table_tensor: [num_reqs, max_num_blocks_per_req]
             # Use sequential block IDs starting from 0
             block_table_tensor = (
-                torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                (
+                    torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                    % num_kv_blocks
+                )
                 .unsqueeze(0)
                 .expand(num_reqs, -1)
                 .contiguous()
@@ -4219,7 +4239,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # (which needs to compute slot indices into the full KV cache)
             # traces a shape consistent with runtime.
             full_block_table_tensor = (
-                torch.arange(full_max_blocks_per_req, dtype=torch.int32)
+                (
+                    torch.arange(full_max_blocks_per_req, dtype=torch.int32)
+                    % num_kv_blocks
+                )
                 .unsqueeze(0)
                 .expand(num_reqs, -1)
                 .contiguous()
