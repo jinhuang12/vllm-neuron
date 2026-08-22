@@ -254,21 +254,54 @@ def _block_fp8_linear_nki(
         nisa.dma_copy(x_sb, x[m0 : m0 + m_sz, :])
 
         # -- per row, per 128-element K group: amax -> ue8m0 scale ------------
-        # ``nl.abs_max`` reduces to the element of largest MAGNITUDE but keeps
-        # its SIGN (measured), so the magnitude is taken explicitly with
-        # ``max(v, -v)`` rather than assumed.
-        signed = nl.ndarray((m_sz, KB), dtype=nl.float32, buffer=nl.sbuf)
+        # ``op=nl.abs_max`` IS UNENCODABLE and must not come back. The BIR
+        # ``TensorReduce(op=abs_max)`` it emits has no ``nir::AluOpKind``
+        # mapping, so ``narwhal``'s NIR encoder reaches LLVM's fatal-error
+        # handler and the backend dies on SIGABRT:
+        # ``LLVM ERROR: unknown nir::AluOpKind value in encode`` /
+        # ``Backend exited with code -6`` / driver code ``[F134]``.
+        # Named in ep17 iteration 1 by a single-variable A/B over ONE
+        # instruction: four scratch kernels byte-identical but for the one
+        # ``op=`` argument, where ``nl.add``, ``nl.max`` and ``nl.maximum`` all
+        # reach a ``.neff`` and only ``nl.abs_max`` aborts. The defect PREDATES
+        # the ep16 activation ladder -- ``op=abs_max`` is 890 in the pre-fix
+        # production BIR and 890 in the post-fix one -- and was masked purely by
+        # pass order, because ``lower_act`` aborted every earlier compile before
+        # ``narwhal`` could run.
+        #
+        # Replaced by the identity ``max|x| == max(max(x), -min(x))``, which is
+        # EXACT for finite inputs: negation is exact in IEEE-754 and these
+        # reductions already produce fp32. ``negate=True`` supplies the sign
+        # flip, so the previous ``signed * -1.0`` ``tensor_scalar`` is gone.
+        # ``nl.maximum`` and ``nl.minimum`` are ``_Op``; ``nl.min``/``nl.max``
+        # are plain FUNCTIONS and must NOT be substituted here. Both reductions,
+        # ``negate=True``, and this composed form are each proven encodable by
+        # the ep17 scratch probes p8a/p8b/p8e against a firing control and an
+        # ``abs_max`` alarm control.
+        #
+        # Cost, recorded rather than hidden: this is ``2*KB`` reductions plus one
+        # ``tensor_tensor`` where the abs_max form was ``KB`` reductions plus one
+        # ``tensor_scalar`` plus one ``tensor_tensor`` -- so ``KB - 1`` extra
+        # instructions per M tile, each on a tiny ``[m_sz, 1]`` output. A perf
+        # trade for the perf report, like the T2 transpose staging above.
+        hi = nl.ndarray((m_sz, KB), dtype=nl.float32, buffer=nl.sbuf)
+        lo_neg = nl.ndarray((m_sz, KB), dtype=nl.float32, buffer=nl.sbuf)
         for kb in range(KB):
             nisa.tensor_reduce(
-                dst=signed[:, kb : kb + 1],
-                op=nl.abs_max,
+                dst=hi[:, kb : kb + 1],
+                op=nl.maximum,
                 data=x_sb[:, kb * P : (kb + 1) * P],
                 axis=(1,),
             )
-        negated = nl.ndarray((m_sz, KB), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=negated, data=signed, op0=nl.multiply, operand0=-1.0)
+            nisa.tensor_reduce(
+                dst=lo_neg[:, kb : kb + 1],
+                op=nl.minimum,
+                data=x_sb[:, kb * P : (kb + 1) * P],
+                axis=(1,),
+                negate=True,
+            )
         amax = nl.ndarray((m_sz, KB), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=amax, data1=signed, data2=negated, op=nl.maximum)
+        nisa.tensor_tensor(dst=amax, data1=hi, data2=lo_neg, op=nl.maximum)
 
         # ``s = 2 ** ceil(log2(max(amax, floor) / fp8_max))`` in the IEEE-754
         # bit form of ``dsv4_ref/kernel.py:22-37``, NOT ``exp2(ceil(log2 v))``:
