@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Selected-latent MLA decode spike for GLM-5.2 long contexts.
+"""Selected-latent MLA decode for pinned GLM-5.2 context buckets.
 
 The kernel absorbs the non-rotary query into the MLA projection, gathers only
 the DSA-selected latent rows, and performs online softmax.  It never exports a
 ``[batch, query, selected, 576]`` tensor to Torch/HBM.
 
 This kernel is deliberately narrow: one query, one TP-local head, BF16 or raw
-E4M3 cache, checkpoint-native block-FP8 projection weights, and at most 2048
-selected positions. Production dispatch is guarded by an exact default-off
-contract.
+E4M3 cache, checkpoint-native block-FP8 projection weights, and an exact static
+selection width for each supported context bucket. Production dispatch is
+guarded by an exact default-off contract.
 """
 
 from __future__ import annotations
@@ -31,6 +31,11 @@ _VALUE_WIDTH = 256
 _WEIGHT_WIDTH = _QK_NOPE_WIDTH + _VALUE_WIDTH
 _SELECTED_TILE = 128
 _MASK_FLOOR = -9984.0
+SELECTED_LATENT_MLA_BLOCK_SIZES = (16, 32)
+SELECTED_LATENT_MLA_SHORT_CONTEXT_BUCKETS = (128, 512)
+SELECTED_LATENT_MLA_LONG_CONTEXT_BUCKETS = (4096, 8192)
+SELECTED_LATENT_MLA_SHORT_WIDTH = 512
+SELECTED_LATENT_MLA_LONG_WIDTH = 2048
 
 
 def _kernel_assert(condition: bool, error_text: str) -> None:
@@ -57,7 +62,8 @@ def _selected_latent_mla_decode_nki(
         B: Static batch size.
         P: Number of physical cache blocks.
         L: Maximum logical blocks per request.
-        K: Selected width, a multiple of 128 and at most 2048.
+        K: Static selected width: 512 for short buckets or 2048 for long
+            buckets.
 
     Args:
         queries: ``[B, 1, 1, 256]`` BF16 query tensor in HBM.
@@ -105,10 +111,14 @@ def _selected_latent_mla_decode_nki(
         mla_k_cache.shape[3] == _CACHE_HALF_WIDTH,
         "cache half width mismatch",
     )
-    _kernel_assert(block_size == 16, "pinned cache block size must be 16")
+    _kernel_assert(
+        block_size == 16 or block_size == 32,
+        "pinned cache block size must be 16 or 32",
+    )
     _kernel_assert(block_size == mla_k_cache.shape[2], "cache block size mismatch")
     _kernel_assert(len(block_table.shape) == 2, "block table must be rank two")
     _kernel_assert(block_table.shape[0] == queries.shape[0], "batch mismatch")
+    _kernel_assert(len(selected_indices.shape) == 3, "selection must be rank three")
     _kernel_assert(
         selected_indices.shape[:2] == queries.shape[:2],
         "selection/query shape mismatch",
@@ -122,15 +132,33 @@ def _selected_latent_mla_decode_nki(
         "weight scale shape mismatch",
     )
     _kernel_assert(row_offset == 0 or row_offset == 64, "row offset mismatch")
-    selected_count = selected_indices.shape[2]
-    _kernel_assert(selected_count <= 2048, "selected width exceeds 2048")
-    _kernel_assert(selected_count % _SELECTED_TILE == 0, "selected width alignment")
-
     batch_size = queries.shape[0]
     physical_block_count = mla_k_cache.shape[0]
     logical_block_count = block_table.shape[1]
     logical_key_count = logical_block_count * block_size
     physical_row_count = physical_block_count * block_size
+    short_context = logical_key_count == 128 or logical_key_count == 512
+    long_context = logical_key_count == 4096 or logical_key_count == 8192
+    _kernel_assert(
+        short_context or long_context,
+        "unsupported logical key bucket",
+    )
+    selected_count = selected_indices.shape[2]
+    expected_selected_count = (
+        SELECTED_LATENT_MLA_SHORT_WIDTH
+        if short_context
+        else SELECTED_LATENT_MLA_LONG_WIDTH
+    )
+    _kernel_assert(
+        selected_count == expected_selected_count,
+        "selected width does not match logical key bucket",
+    )
+    if block_size == 16:
+        block_shift = 4
+        block_row_mask = 15
+    else:
+        block_shift = 5
+        block_row_mask = 31
     scale = _QK_WIDTH**-0.5
     output = nl.ndarray(
         (batch_size, 1, 1, _VALUE_WIDTH),
@@ -281,7 +309,7 @@ def _selected_latent_mla_decode_nki(
                 dst=logical_blocks,
                 data=index_rows,
                 op0=nl.right_shift,
-                operand0=4,
+                operand0=block_shift,
                 engine=nisa.engine.vector,
             )
             logical_rows_in_block = nl.ndarray(
@@ -291,7 +319,7 @@ def _selected_latent_mla_decode_nki(
                 dst=logical_rows_in_block,
                 data=index_rows,
                 op0=nl.bitwise_and,
-                operand0=15,
+                operand0=block_row_mask,
                 engine=nisa.engine.vector,
             )
             block_table_rows = nl.ndarray(
@@ -869,8 +897,8 @@ def validate_selected_latent_mla_decode_contract(
         errors.append("MLA cache halves must have identical dtypes")
     if mla_k_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         errors.append("MLA cache halves must be BF16 or raw E4M3")
-    if block_size != 16:
-        errors.append("block_size must be 16")
+    if block_size not in SELECTED_LATENT_MLA_BLOCK_SIZES:
+        errors.append("block_size must be 16 or 32")
     if block_table.ndim != 2 or (
         queries.ndim == 4 and block_table.shape[0] != queries.shape[0]
     ):
@@ -881,8 +909,26 @@ def validate_selected_latent_mla_decode_contract(
         queries.ndim == 4 and selected_indices.shape[:2] != queries.shape[:2]
     ):
         errors.append("selected indices must have shape [batch, 1, selected]")
-    elif selected_indices.shape[2] != 2048:
-        errors.append("selected width must be 2048")
+    elif block_table.ndim == 2:
+        logical_key_count = block_table.shape[1] * block_size
+        if logical_key_count in SELECTED_LATENT_MLA_SHORT_CONTEXT_BUCKETS:
+            expected_selected_width = SELECTED_LATENT_MLA_SHORT_WIDTH
+        elif logical_key_count in SELECTED_LATENT_MLA_LONG_CONTEXT_BUCKETS:
+            expected_selected_width = SELECTED_LATENT_MLA_LONG_WIDTH
+        else:
+            expected_selected_width = None
+            errors.append(
+                f"unsupported logical key bucket {logical_key_count}"
+            )
+        if (
+            expected_selected_width is not None
+            and selected_indices.shape[2] != expected_selected_width
+        ):
+            errors.append(
+                "selected width must be "
+                f"{expected_selected_width} for logical key bucket "
+                f"{logical_key_count}"
+            )
     if selected_indices.dtype is not torch.int32:
         errors.append("selected indices must be int32")
     if weight.shape != (_WEIGHT_WIDTH, _LATENT_WIDTH):
@@ -911,6 +957,11 @@ def validate_selected_latent_mla_decode_contract(
 
 
 __all__ = [
+    "SELECTED_LATENT_MLA_BLOCK_SIZES",
+    "SELECTED_LATENT_MLA_LONG_CONTEXT_BUCKETS",
+    "SELECTED_LATENT_MLA_LONG_WIDTH",
+    "SELECTED_LATENT_MLA_SHORT_CONTEXT_BUCKETS",
+    "SELECTED_LATENT_MLA_SHORT_WIDTH",
     "selected_latent_mla_decode",
     "validate_selected_latent_mla_decode_contract",
 ]

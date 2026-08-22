@@ -25,13 +25,18 @@ from .block_fp8 import (
 from .cache import MLA_CACHE_HEAD_SIZE
 from .indexer import apply_interleaved_rope, rotary_cos_sin
 from .sparse_mla import (
+    SELECTED_LATENT_MLA_BLOCK_SIZES,
+    SELECTED_LATENT_MLA_LONG_CONTEXT_BUCKETS,
+    SELECTED_LATENT_MLA_LONG_WIDTH,
+    SELECTED_LATENT_MLA_SHORT_CONTEXT_BUCKETS,
+    SELECTED_LATENT_MLA_SHORT_WIDTH,
     selected_latent_mla_decode,
     validate_selected_latent_mla_decode_contract,
 )
 
 
 SELECTED_LATENT_MLA_ENV = "GLM_ENABLE_EXPERIMENTAL_SELECTED_LATENT_MLA"
-SELECTED_LATENT_MLA_CONTEXT_BUCKETS = (4096, 8192)
+SELECTED_LATENT_MLA_CONTEXT_BUCKETS = SELECTED_LATENT_MLA_LONG_CONTEXT_BUCKETS
 
 
 class GlmMoeDsaRMSNorm(nn.Module):
@@ -479,18 +484,57 @@ class GlmMoeDsaAttention(nn.Module):
     ) -> torch.Tensor:
         """Attend directly from selected physical cache rows."""
 
+        selected_for_kernel = self._selected_latent_mla_indices(
+            selected_indices,
+            block_table=block_table,
+            block_size=block_size,
+        )
         output = selected_latent_mla_decode(
             queries,
             mla_k_cache,
             mla_v_cache,
             block_table,
-            selected_indices.to(torch.int32),
+            selected_for_kernel,
             self.kv_b_proj.weight,
             self.kv_b_proj.weight_scale_inv,
             block_size=block_size,
             row_offset=self.kv_b_proj.row_offset,
         )
         return self.o_proj(output.flatten(-2))
+
+    @staticmethod
+    def _selected_latent_mla_indices(
+        selected_indices: torch.Tensor,
+        *,
+        block_table: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Return the exact static selection width for one kernel graph."""
+
+        logical_key_count = block_table.shape[1] * block_size
+        if logical_key_count in SELECTED_LATENT_MLA_SHORT_CONTEXT_BUCKETS:
+            if selected_indices.shape[-1] not in (
+                SELECTED_LATENT_MLA_SHORT_WIDTH,
+                SELECTED_LATENT_MLA_LONG_WIDTH,
+            ):
+                raise ValueError(
+                    "selected-latent MLA production contract violation: "
+                    "short buckets require a 512- or 2048-wide indexer result"
+                )
+            return selected_indices[
+                ..., :SELECTED_LATENT_MLA_SHORT_WIDTH
+            ].to(torch.int32)
+        if logical_key_count in SELECTED_LATENT_MLA_CONTEXT_BUCKETS:
+            if selected_indices.shape[-1] != SELECTED_LATENT_MLA_LONG_WIDTH:
+                raise ValueError(
+                    "selected-latent MLA production contract violation: "
+                    "long buckets require a 2048-wide indexer result"
+                )
+            return selected_indices.to(torch.int32)
+        raise ValueError(
+            "selected-latent MLA production contract violation: "
+            f"unsupported context bucket {logical_key_count}"
+        )
 
     def should_use_selected_latent_mla(
         self,
@@ -515,9 +559,11 @@ class GlmMoeDsaAttention(nn.Module):
         ):
             return False
         logical_key_count = block_table.shape[1] * block_size
-        if logical_key_count <= 2048:
+        if logical_key_count in SELECTED_LATENT_MLA_SHORT_CONTEXT_BUCKETS:
+            pass
+        elif logical_key_count <= 2048:
             return False
-        if logical_key_count not in SELECTED_LATENT_MLA_CONTEXT_BUCKETS:
+        elif logical_key_count not in SELECTED_LATENT_MLA_CONTEXT_BUCKETS:
             raise ValueError(
                 "selected-latent MLA production contract violation: "
                 f"unsupported context bucket {logical_key_count}; expected one of "
@@ -527,6 +573,11 @@ class GlmMoeDsaAttention(nn.Module):
         errors: list[str] = []
         if mla_k_cache is None or mla_v_cache is None:
             errors.append("paired physical MLA caches must be allocated")
+        if block_size not in SELECTED_LATENT_MLA_BLOCK_SIZES:
+            errors.append(
+                "cache block size must be one of "
+                f"{SELECTED_LATENT_MLA_BLOCK_SIZES}"
+            )
         if (
             self.num_heads != 64
             or self.local_heads != 1
@@ -553,7 +604,11 @@ class GlmMoeDsaAttention(nn.Module):
         assert mla_k_cache is not None
         assert mla_v_cache is not None
 
-        selected_for_kernel = selected_indices.to(torch.int32)
+        selected_for_kernel = self._selected_latent_mla_indices(
+            selected_indices,
+            block_table=block_table,
+            block_size=block_size,
+        )
         validate_selected_latent_mla_decode_contract(
             queries,
             mla_k_cache,
