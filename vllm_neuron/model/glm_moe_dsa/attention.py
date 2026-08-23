@@ -36,6 +36,9 @@ from .sparse_mla import (
 
 
 SELECTED_LATENT_MLA_ENV = "GLM_ENABLE_EXPERIMENTAL_SELECTED_LATENT_MLA"
+SELECTED_LATENT_MLA_B32_WEIGHT_REUSE_ENV = (
+    "GLM_ENABLE_EXPERIMENTAL_SELECTED_LATENT_MLA_B32_WEIGHT_REUSE"
+)
 SELECTED_LATENT_MLA_CONTEXT_BUCKETS = SELECTED_LATENT_MLA_LONG_CONTEXT_BUCKETS
 
 
@@ -291,6 +294,9 @@ class GlmMoeDsaAttention(nn.Module):
         self.v_head_dim = v_head_dim
         self.rope_theta = rope_theta
         self.enable_selected_latent_mla = os.environ.get(SELECTED_LATENT_MLA_ENV) == "1"
+        self.enable_selected_latent_mla_b32_weight_reuse = (
+            os.environ.get(SELECTED_LATENT_MLA_B32_WEIGHT_REUSE_ENV) == "1"
+        )
 
         if fp8_weights:
             tp_size = self.num_heads // local_heads
@@ -489,17 +495,31 @@ class GlmMoeDsaAttention(nn.Module):
             block_table=block_table,
             block_size=block_size,
         )
-        output = selected_latent_mla_decode(
-            queries,
-            mla_k_cache,
-            mla_v_cache,
-            block_table,
-            selected_for_kernel,
-            self.kv_b_proj.weight,
-            self.kv_b_proj.weight_scale_inv,
-            block_size=block_size,
-            row_offset=self.kv_b_proj.row_offset,
-        )
+        if self.enable_selected_latent_mla_b32_weight_reuse:
+            output = selected_latent_mla_decode(
+                queries,
+                mla_k_cache,
+                mla_v_cache,
+                block_table,
+                selected_for_kernel,
+                self.kv_b_proj.weight,
+                self.kv_b_proj.weight_scale_inv,
+                block_size=block_size,
+                row_offset=self.kv_b_proj.row_offset,
+                use_b32_weight_reuse=True,
+            )
+        else:
+            output = selected_latent_mla_decode(
+                queries,
+                mla_k_cache,
+                mla_v_cache,
+                block_table,
+                selected_for_kernel,
+                self.kv_b_proj.weight,
+                self.kv_b_proj.weight_scale_inv,
+                block_size=block_size,
+                row_offset=self.kv_b_proj.row_offset,
+            )
         return self.o_proj(output.flatten(-2))
 
     @staticmethod
