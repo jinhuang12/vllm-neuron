@@ -4505,8 +4505,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
         model_output = self.model(**warmup_kwargs)
-        if self.use_async_scheduling:
-            self._materialize_warmup_output(model_output)
+        # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
+        self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
@@ -4866,8 +4866,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 )
             )
         model_output = self.model(**kwargs)
-        if self.use_async_scheduling:
-            self._materialize_warmup_output(model_output)
+        # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
+        self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
@@ -4909,8 +4909,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     )
                 )
             model_output = self.model(**kwargs)
-            if self.use_async_scheduling:
-                self._materialize_warmup_output(model_output)
+            # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
+            self._materialize_warmup_output(model_output)
             if self._tensor_replacer is not None:
                 set_active_context(None)
             compile_elapsed = time.perf_counter() - compile_start
