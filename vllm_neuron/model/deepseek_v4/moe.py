@@ -82,6 +82,19 @@ logger = logging.getLogger(__name__)
 # validation.
 _MOE_CTE_BLOCK_SIZE = 256
 
+# LD-63 WITNESS BUFFER (port-plan §13.2, assessment §11.5). Module-level,
+# keyed by ``layer_idx``; each prefill forward OVERWRITES its own layer's
+# slot, so the buffer is bounded by the MoE layer count and never grows
+# across serve-time calls. ``_forward_prefill`` stashes per-layer SUMMARIES
+# of the blockwise index stream here; the runner materializes, logs
+# (``LD63-WITNESS`` lines) and clears it in ``warmup_prefill``
+# (``vllm/worker/neuron_model_runner.py``), beside the ep18/iter13 readback.
+# Materializing the summaries makes them GRAPH OUTPUTS, which pins the
+# ``block_to_expert`` producer chain in the compiled artifact — the leg is
+# witness and delivery-pin in the same act (LD-63). The tensors handed to
+# the kernel are NEVER touched by this instrument.
+LD63_WITNESS_BUFFER: dict[int, dict[str, object]] = {}
+
 # The block-FP8 contract for the shared expert, frozen by the family
 # interface contract §5. Every leg of the shared-expert MLP is called with
 # exactly these arguments.
@@ -568,6 +581,46 @@ class DeepseekV4RoutedExperts(nn.Module):
             # and their output rows are discarded downstream.
             padding_mask=None,
         )
+
+        # --- LD-63 WITNESS (port-plan §13.2, assessment §11.5) -----------
+        # Stash per-layer summaries of the index stream. The runner reads
+        # them back in ``warmup_prefill``, which makes these summaries
+        # graph outputs and PINS the ``block_to_expert`` producer chain in
+        # the compiled artifact. The histogram is taken over a CLAMPED
+        # VIEW only — a value ≥ E_local lands in the visible overflow
+        # bucket at index E_local — while ``block_to_expert`` itself goes
+        # to the kernel below bit-identical, never clamped (F-101: the
+        # clamp here is a histogram device, never a silencer).
+        _e_local = self.num_local_experts
+        _b2e_clamped_view = torch.clamp(block_to_expert, 0, _e_local)
+        # Computes torch.bincount(_b2e_clamped_view, minlength=_e_local+1)
+        # in the static-shape form fullgraph tracing accepts:
+        # aten::bincount's output extent is data-dependent to the tracer
+        # even though the clamp bounds it, and a graph break here would
+        # wedge the very leg this instrument serves.
+        _bucket_ids = torch.arange(
+            _e_local + 1,
+            device=block_to_expert.device,
+            dtype=block_to_expert.dtype,
+        )
+        _b2e_hist = (_b2e_clamped_view.view(-1, 1) == _bucket_ids).sum(dim=0)
+        # ``build_blockwise_mapping`` does not return its internal
+        # ``tokens_per_expert``, so the witness recomputes it from the SAME
+        # input, mirroring ``_build_blockwise_mapping_torch`` step 1 at
+        # tp_degree=1 (``functional/moe/moe_blockwise.py:328-337``).
+        _tokens_per_expert = (
+            (local_affinities != 0).to(torch.float32).sum(dim=0)
+        )
+        LD63_WITNESS_BUFFER[self.layer_idx] = {
+            "b2e_max": block_to_expert.max(),
+            "b2e_min": block_to_expert.min(),
+            "b2e_hist": _b2e_hist,
+            "b2e_len": block_to_expert.shape[0],
+            "tp2id_min": token_position_to_id.min(),
+            "tp2id_max": token_position_to_id.max(),
+            "tokens_per_expert": _tokens_per_expert,
+        }
+        # --- end LD-63 WITNESS -------------------------------------------
 
         # ``moe_cte`` reads ``conditions`` as ``[N + 2]`` (two trailing
         # zeros), while ``build_blockwise_mapping`` returns ``[N]``
