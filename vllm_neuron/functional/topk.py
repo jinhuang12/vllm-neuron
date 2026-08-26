@@ -375,6 +375,25 @@ def _topk_nki(tensor: Tensor, k: int, dim: int) -> tuple[Tensor, Tensor]:
     inp2d = tensor.reshape(-1, vocab_size)
     n_rows = inp2d.shape[0]
 
+    # --- ep18/LD-71 single-row dispatch gate (F-223, F-227) ----------------
+    # At BxS == 1 the vendor config factory silently downgrades to a
+    # single-program plan (``rotational_topk_utils.py:209-212``) while the
+    # kernel body asserts the two-program shape, and at the deployed compiler
+    # pin the LNC-2 lowering then silently ERASES the kernel on core 1
+    # ("skip lowering", TranslateNKIASTToBIR), leaving producer-less
+    # consumers whose never-written indices feed ``oob_is_err`` DMA and
+    # present as an all-core NRT_TIMEOUT (F-223, ep18 ITER-63..67).
+    # Dispatch the single-row case to the numerically matched torch
+    # composition instead of launching ``topk_kernel[config.n_prgs]``.
+    # DEPLOYED-PIN WORKAROUND, NOT A FIX (F-227): the vendor defect class is
+    # unchanged, and mitigating it claims at most servability — parity
+    # against the recorded standard stays the arbiter of health (F-224).
+    # Both single-row sampling stages ([1, 2020] and [1, 16384]) take this
+    # branch; the multi-row (router) path below is untouched.
+    if n_rows == 1:
+        return _topk_torch(tensor, k, dim)
+    # --- end ep18/LD-71 gate ------------------------------------------------
+
     nki_dtype = getattr(nl, torch_to_nki_dtype(inp2d.dtype))
     config = _get_rotational_topk_config(n_rows, vocab_size, k, nki_dtype)
 

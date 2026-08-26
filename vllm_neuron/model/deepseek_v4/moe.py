@@ -589,25 +589,6 @@ class DeepseekV4RoutedExperts(nn.Module):
             ]
         )
 
-        # --- ep18/LD-68 IN-EXECUTION WITNESS (port-plan SS15.3) -----------
-        # ``NF.moe_cte`` consumes the witness's OUTPUT, so the data
-        # dependence forces the witness custom call — and therefore its
-        # device prints of the b2e stream — to execute BEFORE the flooding
-        # ``oob_mode=error`` weight-gather consumers
-        # (``bwmm_shard_on_I.py:1681/:1693/:2426``) in every legal
-        # schedule, reading the same logical stream the kernel is handed.
-        # Identity pass-through (rtol=atol=0.0,
-        # ``numerics/ld68_witness.declaration.json``); volume budget
-        # all-43 per the LD-69 P-B B3 measurement
-        # (``FAMILY19-RAW-P611A4-ld69-pb.txt``: 129/129 sites arrived,
-        # zero ring drops). INSTRUMENT leg: this wiring is removed from
-        # the serving graph before any parity capture (SS15.3, Amendment 4).
-        b2e_witnessed = NF.ld68_witness(
-            block_to_expert.to(dtype=torch.int32),
-            layer_idx=self.layer_idx,
-        )
-        # --- end ep18/LD-68 WITNESS ---------------------------------------
-
         return NF.moe_cte(
             # LD-21: ``shard_on_i``, NOT ``shard_on_block``. Both accept fp8
             # weights with per-channel scales, but ``shard_on_block`` pins
@@ -629,9 +610,7 @@ class DeepseekV4RoutedExperts(nn.Module):
             # default to ``None`` (``functional/moe/moe_cte.py:61-62``), which
             # is the kernel's scale-free (non-quantized) form.
             token_position_to_id=token_position_to_id.to(dtype=torch.int32),
-            # ep18/LD-68: the WITNESSED tensor, never the raw one — the
-            # data dependence above is the ordering guarantee.
-            block_to_expert=b2e_witnessed,
+            block_to_expert=block_to_expert.to(dtype=torch.int32),
             block_size=_MOE_CTE_BLOCK_SIZE,
             conditions=conditions,
             # <-- MODEL-SPECIFIC: plain SiLU, not the Swish/1.702 variant
