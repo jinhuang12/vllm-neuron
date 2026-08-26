@@ -9,9 +9,11 @@ Three modules, in the order the data flows through them:
   ``gate_bias`` and, on the three hash layers only, the ``tid2eid`` table.
   It produces the per-token expert selection and weights, drives the routed
   experts and the shared expert, and sums the two contributions.
-* :class:`DeepseekV4RoutedExperts` — the 256 routed experts, 1-byte FP8 with
-  one power-of-two scale per output channel (NOT MX: the MX expert kernels are
-  NeuronCore-v4 and this venue is v3), four of them resident per core at
+* :class:`DeepseekV4RoutedExperts` — the 256 routed experts, bf16 with the
+  per-output-channel power-of-two scales FOLDED INTO THE WEIGHTS at load
+  (LD-67 containment; the fold is exact because every checkpoint value has
+  <= 4 significand bits, asserted at load). NOT MX: the MX expert kernels
+  are NeuronCore-v4 and this venue is v3. Four experts resident per core at
   ``ep_degree=64``.
 * :class:`DeepseekV4SharedExpert` — the single always-on expert, block-128x128
   FP8, sharded 16 ways and replicated four times across the TP group.
@@ -94,6 +96,20 @@ _MOE_CTE_BLOCK_SIZE = 256
 # witness and delivery-pin in the same act (LD-63). The tensors handed to
 # the kernel are NEVER touched by this instrument.
 LD63_WITNESS_BUFFER: dict[int, dict[str, object]] = {}
+
+# LD-67 DECODE WITNESS BUFFER (port-plan §14.3 item 2, assessment §12.6
+# Q-D2 reading (ii): the decode caveat closed statically for the flood
+# class, so this witness is CHEAP HEALTH INSTRUMENTATION, not a defect
+# probe). Same mechanics as ``LD63_WITNESS_BUFFER``: module-level, keyed by
+# ``layer_idx``, overwritten per decode forward, bounded by the MoE layer
+# count. ``_forward_decode`` stashes per-layer summaries of the routing
+# tensors handed to ``NF.moe_tkg``; the runner materializes and logs them
+# (``LD67-WITNESS-DECODE`` lines) beside BOTH ``warmup_decode`` readbacks.
+# ``expert_index`` here is in the GLOBAL id domain 0..n_routed_experts-1
+# (0..255): ``is_all_expert=True`` + ``rank_id`` means the KERNEL slices to
+# local experts, so the global domain is the correct health envelope. The
+# tensors handed to the kernel are NEVER touched by this instrument.
+LD67_DECODE_WITNESS_BUFFER: dict[int, dict[str, object]] = {}
 
 # The block-FP8 contract for the shared expert, frozen by the family
 # interface contract §5. Every leg of the shared-expert MLP is called with
@@ -253,28 +269,22 @@ class DeepseekV4RoutedExperts(nn.Module):
     <-- MODEL-SPECIFIC: 256 experts, top-6, SwiGLU with the asymmetric
     ``swiglu_limit`` clamp, ``w1`` = gate / ``w3`` = up / ``w2`` = down.
 
-    <-- FP8 PER-CHANNEL (LD-21/LD-23): the checkpoint stores these experts as
-    MXFP4 (``float4_e2m1fn_x2`` elements, ``[out, in // 32]`` E8M0 scales —
-    ``dsv4_ref/model.py:140-145``). Trainium2 has no FP4 datapath AND no MX
-    datapath: ``nisa.nc_matmul_mx`` / ``nisa.quantize_mx`` are NeuronCore-v4
-    instructions, and this venue is v3 (R-13). So the loader requantizes to
-    1-byte legacy-E4M3 elements plus ONE fp32 power-of-two scale per output
-    channel, which is the form the gen3-legal MoE entry points take:
-    ``NF.moe_cte`` non-MX ``shard_on_i`` (PER_CHANNEL) at prefill and
-    ``NF.moe_tkg`` ``QuantizationType.ROW`` at decode. Both were proven on the
-    installed wheel before this class was written —
-    ``artifacts/repairs/author_model_family-iter3/iter3-moe-gen3-probe.txt``.
-
-    THE 1-BYTE DTYPE IS A CARRIER, NOT AN ENCODING CLAIM. The parameters are
-    declared ``torch.float8_e4m3fn`` because that is the only 1-byte float
-    torch has, but the BYTES inside them are legacy ``nl.float8_e4m3`` (bias 7,
-    amax 240), written by the loader from a byte table and exponent-field
-    arithmetic. That is correct rather than merely tolerated: on trn2 the
-    plugin maps ``torch.float8_e4m3fn`` to ``nl.float8_e4m3`` in both
-    directions (``nki/nki_dtype.py:43,51-53``), so the kernel decodes exactly
-    the encoding the loader wrote. Never convert these tensors through torch's
-    own fp8 cast — that is the OCP ``e4m3fn`` encoding (amax 448) and would
-    reinterpret every exponent.
+    <-- BF16 FOLDED (LD-67, superseding the fp8-carrier form of LD-21/LD-23):
+    the checkpoint stores these experts as MXFP4 (``float4_e2m1fn_x2``
+    elements, ``[out, in // 32]`` E8M0 scales — ``dsv4_ref/model.py:140-145``).
+    Trainium2 has no FP4 datapath AND no MX datapath (R-13). The loader first
+    requantizes to legacy-E4M3 bytes plus ONE fp32 power-of-two scale per
+    output channel behind the LD-23 hard bit-exactness assertion, then —
+    LD-67 (Amendment 7, ADOPT) — FOLDS that scale into the weight and emits
+    bf16. The fold is exact: every value is ``(1 + m/8) * 2**k`` with at most
+    4 significand bits, inside bf16's 8, and the loader HARD-ASSERTS the bf16
+    round-trip rather than hoping (``weight_loaders.py``, LD-67 section).
+    Under this containment the kernels run their SCALE-FREE forms —
+    ``NF.moe_cte`` ``shard_on_i`` with no ``*_proj_scale`` at prefill,
+    ``NF.moe_tkg`` with no ``*_weights_scale`` (so NOT ``QuantizationType.
+    ROW``) at decode — and the in-kernel fp8-scale gather that carried the
+    ep18 flood-class exposure (F-101) ceases to exist in the traced graph.
+    Cost, recorded in the plan: +4.31 GiB/core (19.6 of 21.6).
 
     Parameter shapes are the *contraction-first* ``[E_local, in, out]``
     orientation, which is what the kernels take (``gate_up`` ``[E, H, 2, I]``,
@@ -328,45 +338,33 @@ class DeepseekV4RoutedExperts(nn.Module):
         # (``dsv4_ref/model.py:625-626``). <<<
         self.local_expert_start = self.ep_rank * self.num_local_experts
 
-        # <-- FP8 PER-CHANNEL: w1 = gate projection, w3 = up projection
+        # <-- BF16 FOLDED (LD-67): w1 = gate projection, w3 = up projection
         # (``dsv4_ref/model.py:602-603``: ``gate = self.w1(x)``,
         # ``up = self.w3(x)``). Logically ``[out=I, in=H]``; stored
         # CONTRACTION-FIRST as ``[in=H, out=I]`` because the kernels take
         # ``gate_up`` as ``[E, H, 2, I]`` and this class only ``view``s.
-        # The loader writes the transpose (LD-23).
+        # The loader writes the transpose (LD-23) and folds the per-output-
+        # channel power-of-two scale into the value (LD-67), so there are NO
+        # scale parameters on this module any more — the kernels run their
+        # scale-free forms and there is nothing for a fallback to drop.
         expert_shape = (self.num_local_experts, self.hidden_size, self.intermediate_size)
-        # ONE fp32 power-of-two multiplier per OUTPUT channel. Not a group
-        # grid: the gen3-legal kernels take PER_CHANNEL / ROW scales only, and
-        # the group-32 exponents were folded into these at load time.
-        scale_shape = (self.num_local_experts, self.intermediate_size)
         self.w1_weight = nn.Parameter(
-            torch.empty(*expert_shape, dtype=torch.float8_e4m3fn), requires_grad=False
-        )
-        self.w1_scale = nn.Parameter(
-            torch.empty(*scale_shape, dtype=torch.float32), requires_grad=False
+            torch.empty(*expert_shape, dtype=torch.bfloat16), requires_grad=False
         )
         self.w3_weight = nn.Parameter(
-            torch.empty(*expert_shape, dtype=torch.float8_e4m3fn), requires_grad=False
-        )
-        self.w3_scale = nn.Parameter(
-            torch.empty(*scale_shape, dtype=torch.float32), requires_grad=False
+            torch.empty(*expert_shape, dtype=torch.bfloat16), requires_grad=False
         )
 
-        # <-- FP8 PER-CHANNEL: w2 = down projection, logically ``[out=H, in=I]``,
-        # stored contraction-first as ``[in=I, out=H]`` — which is exactly the
-        # ``down`` layout the kernels document, so no fuse and no view here.
+        # <-- BF16 FOLDED (LD-67): w2 = down projection, logically
+        # ``[out=H, in=I]``, stored contraction-first as ``[in=I, out=H]`` —
+        # which is exactly the ``down`` layout the kernels document, so no
+        # fuse and no view here.
         self.w2_weight = nn.Parameter(
             torch.empty(
                 self.num_local_experts,
                 self.intermediate_size,
                 self.hidden_size,
-                dtype=torch.float8_e4m3fn,
-            ),
-            requires_grad=False,
-        )
-        self.w2_scale = nn.Parameter(
-            torch.empty(
-                self.num_local_experts, self.hidden_size, dtype=torch.float32
+                dtype=torch.bfloat16,
             ),
             requires_grad=False,
         )
@@ -399,33 +397,16 @@ class DeepseekV4RoutedExperts(nn.Module):
         """``w2`` already IS the ``[E_L, I, H]`` ``down`` layout — no view."""
         return self.w2_weight
 
-    def _gate_up_scale_row(self) -> Tensor:
-        """``moe_tkg`` ROW gate/up scale: ``[E_L, 2, I]``.
-
-        ``QuantizationType.ROW`` is selected by the mere PRESENCE of a weight
-        scale (``functional/moe/moe_tkg.py:390-410``), and its gate/up scale
-        carries the gate/up axis at dim 1 — the same axis convention as the
-        weight, one dimension shorter.
-        """
-        return torch.stack([self.w1_scale, self.w3_scale], dim=1)
-
-    def _down_scale_row(self) -> Tensor:
-        """``moe_tkg`` ROW down scale: ``[E_L, H]`` — the parameter as stored."""
-        return self.w2_scale
-
-    def _gate_up_scale_per_channel(self) -> Tensor:
-        """``moe_cte`` PER_CHANNEL gate/up scale: ``[E_L, 1, 2*I]``.
-
-        The kernel flattens the fused weight's last two axes, so the fused
-        output-channel axis runs ``[gate_0..gate_{I-1}, up_0..up_{I-1}]`` and
-        the scale must concatenate in exactly that order — a ``stack`` would
-        interleave and silently mis-scale every channel.
-        """
-        return torch.cat([self.w1_scale, self.w3_scale], dim=1).unsqueeze(1)
-
-    def _down_scale_per_channel(self) -> Tensor:
-        """``moe_cte`` PER_CHANNEL down scale: ``[E_L, 1, H]``."""
-        return self.w2_scale.unsqueeze(1)
+    # RETIRED (LD-67): ``_gate_up_scale_row`` / ``_down_scale_row`` (the
+    # ``moe_tkg`` ROW scale views) and ``_gate_up_scale_per_channel`` /
+    # ``_down_scale_per_channel`` (the ``moe_cte`` PER_CHANNEL scale views)
+    # built the kernel-facing scale tensors from ``w*_scale`` parameters that
+    # no longer exist — the loader folds the per-output-channel power-of-two
+    # scales into the bf16 weights, so both kernels are called scale-free and
+    # ``QuantizationType.ROW`` / PER_CHANNEL quantization is never selected.
+    # Kept as a comment so the fused-axis-order lesson survives: the
+    # PER_CHANNEL gate/up scale had to ``cat`` (never ``stack``) because the
+    # kernel flattens the fused weight's last two axes.
 
     # ------------------------------------------------------------------
     # Activation clamp
@@ -508,39 +489,15 @@ class DeepseekV4RoutedExperts(nn.Module):
         (``functional/moe/moe_block_tkg.py:435-437``) or pay all-expert cost
         per token.
         """
-        # R-17 GUARD. ``_can_use_moe_cte_kernel``'s non-MX branch checks
-        # neither dtype nor scales (``functional/moe/moe_cte.py:584-615``): it
-        # returns ``can_run_kernel(hidden_states)``, which is also False under
-        # ``VLLM_NEURON_DISABLE_NKI_KERNELS``. When it is False the call falls
-        # through to ``_torch_moe_impl`` (``moe_cte.py:448-461``), which takes
-        # NO scale arguments at all — so fp8 experts would be multiplied as raw
-        # E4M3 mantissas with every per-channel multiplier dropped. That is
-        # SILENTLY WRONG output, not an error, and the port plan records the
-        # rule as hard: never route fp8 weights to ``_torch_moe_impl``.
-        # Convert the silence into a refusal here, at the only call site that
-        # can.
-        # The guard is conditioned on the WEIGHTS being quantized rather than
-        # on the venue alone, because the harm is specific to dropped scales: a
-        # bf16 expert set has no scales to drop and reaching the torch fallback
-        # with one is correct, which is what makes the bf16 dataflow A/B
-        # (port-plan.md section 2 check 2) possible on CPU at all.
-        from vllm_neuron.functional.moe import moe_cte as _cte_mod
-
+        # R-17 GUARD RETIRED (LD-67). The guard refused the torch fallback
+        # (``_torch_moe_impl``) while the experts were fp8 bytes with separate
+        # per-channel scales, because that fallback takes NO scale arguments
+        # and would have silently dropped every multiplier. Under LD-67 the
+        # scales are folded into the bf16 weights at load, so the fallback is
+        # numerically matched again — reaching it is correct, exactly the
+        # property that made the bf16 dataflow A/B (port-plan.md section 2
+        # check 2) possible on CPU. Nothing left to refuse.
         gate_up_weight = self._gate_up_weight()
-        gate_up_scale = self._gate_up_scale_per_channel()
-        if gate_up_scale is not None and not _cte_mod.can_run_kernel(hidden_states):
-            raise RuntimeError(
-                "DeepseekV4RoutedExperts prefill cannot run the NKI moe_cte "
-                "kernel on this venue, and its torch fallback "
-                "(_torch_moe_impl) accepts no weight scales. These experts are "
-                f"{gate_up_weight.dtype} with per-output-channel scales "
-                f"{tuple(gate_up_scale.shape)}, so falling back would silently "
-                "drop every multiplier and produce wrong output with no error "
-                "(R-17). Refusing. Run the prefill path on a Neuron device "
-                "with the NKI kernels enabled, or exercise this module under "
-                "the NKI CPU simulator (VLLM_NEURON_CPU_MODE=1 with "
-                "NKI_SIMULATOR=1)."
-            )
 
         impl, act_fn, scale_mode, _ = _moe_kernel_enums()
         gate_hi, gate_lo, up_hi, up_lo = self._clamps()
@@ -648,8 +605,10 @@ class DeepseekV4RoutedExperts(nn.Module):
             expert_affinities_masked=expert_affinities_masked,
             gate_up_proj_weight=gate_up_weight,
             down_proj_weight=self._down_weight(),
-            gate_up_proj_scale=gate_up_scale,
-            down_proj_scale=self._down_scale_per_channel(),
+            # LD-67: NO ``gate_up_proj_scale`` / ``down_proj_scale``. The
+            # scales are folded into the bf16 weights at load; both kwargs
+            # default to ``None`` (``functional/moe/moe_cte.py:61-62``), which
+            # is the kernel's scale-free (non-quantized) form.
             token_position_to_id=token_position_to_id.to(dtype=torch.int32),
             block_to_expert=block_to_expert.to(dtype=torch.int32),
             block_size=_MOE_CTE_BLOCK_SIZE,
@@ -712,17 +671,41 @@ class DeepseekV4RoutedExperts(nn.Module):
             [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
         )
 
+        # --- LD-67 DECODE WITNESS (port-plan §14.3 item 2) ----------------
+        # Stash per-layer summaries of the routing tensors handed to the
+        # kernel. The runner reads them back in ``warmup_decode`` (BOTH
+        # readback sites), which makes these summaries graph outputs and
+        # logs them as ``LD67-WITNESS-DECODE`` lines. ``expert_index`` is in
+        # the GLOBAL id domain (0..n_routed_experts-1 = 0..255): the kernel
+        # slices to local experts itself under ``is_all_expert=True`` +
+        # ``rank_id``. All ops are static-shape; the tensors handed to the
+        # kernel are never touched. Health envelope, not a defect probe —
+        # Q-D2 closed the decode flood-class caveat statically (ITER-58).
+        _nnz_per_token = (expert_affinities != 0).to(torch.float32).sum(dim=1)
+        LD67_DECODE_WITNESS_BUFFER[self.layer_idx] = {
+            "ei_min": expert_index.min(),
+            "ei_max": expert_index.max(),
+            "ei_rows": expert_index.shape[0],
+            "ei_cols": expert_index.shape[1],
+            "aff_min": expert_affinities.min(),
+            "aff_max": expert_affinities.max(),
+            "nnz_min": _nnz_per_token.min(),
+            "nnz_max": _nnz_per_token.max(),
+        }
+        # --- end LD-67 DECODE WITNESS -------------------------------------
+
         return NF.moe_tkg(
             hidden_input=hidden_states,
             expert_gate_up_weights=self._gate_up_weight(),
             expert_down_weights=self._down_weight(),
-            # LD-21: presenting these two selects ``QuantizationType.ROW``
-            # (``functional/moe/moe_tkg.py:390-410``), which the installed wheel
-            # dequantizes correctly on a 1-byte fp8 carrier — rel_err 5.068e-03
-            # against the dequantized reference, versus 4.470e-03 for the bf16
-            # control at the same shapes (probe finding C, leg P3c).
-            expert_gate_up_weights_scale=self._gate_up_scale_row(),
-            expert_down_weights_scale=self._down_scale_row(),
+            # LD-67: NO ``expert_gate_up_weights_scale`` / ``expert_down_
+            # weights_scale``. Presence of a weight scale is what selects
+            # ``QuantizationType.ROW`` (``functional/moe/moe_tkg.py:390-410``);
+            # with the scales folded into the bf16 weights at load, both
+            # kwargs stay at their ``None`` defaults
+            # (``functional/moe/moe_tkg.py:26-27``) and the kernel runs its
+            # scale-free form — the ROW-scale gather never exists in the
+            # traced graph.
             expert_affinities=expert_affinities,
             expert_index=expert_index,
             is_all_expert=True,

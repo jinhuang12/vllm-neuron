@@ -1296,35 +1296,69 @@ def _split_weight_and_scale_slices(
     return list(slices[:n_local]), list(slices[n_local:])
 
 
-def _fp8_pow2_expert_weight_loader(
+def _build_legacy_e4m3_decode_table() -> torch.Tensor:
+    """The 256-entry legacy ``nl.float8_e4m3`` byte -> fp32 value table.
+
+    Built from :func:`_legacy_e4m3_magnitudes` (bytes ``0x00..0x77``,
+    float64-exact dyadic rationals, all inside fp32) with the sign bit
+    applied for ``0x80..0xF7``. The 16 field-15 slots (``0x78..0x7F``,
+    ``0xF8..0xFF``) are NaN ON PURPOSE: in this grid field 15 is inf/NaN,
+    :func:`_requantize_expert_to_pow2_per_channel` can never emit it (its
+    hard window is fields 1..14 plus signed zero), and a NaN here trips the
+    LD-67 round-trip assertion below rather than folding silently.
+    """
+    table = torch.full((256,), float("nan"), dtype=torch.float32)
+    for byte, mag in enumerate(_legacy_e4m3_magnitudes()):
+        table[byte] = mag
+        table[byte | 0x80] = -mag
+    return table
+
+
+_LEGACY_E4M3_DECODE_TABLE = _build_legacy_e4m3_decode_table()
+
+
+def _bf16_folded_expert_weight_loader(
     param_name: str,
     local_weight_keys: Sequence[str],
     local_scale_keys: Sequence[str],
     out_dim: int,
     logical_k: int,
 ) -> SafetensorsWeightLoader:
-    """Requantize this core's local experts to ``[E_local, K, N]`` FP8 bytes.
+    """Fold this core's local experts to ``[E_local, K, N]`` bf16 (LD-67).
 
-    TWO things happen here that the retired MX loader did not do.
+    THREE things happen here.
 
-    1. THE SCALES ARE FOLDED IN, so this loader needs BOTH checkpoint tensors
-       per expert -- the FP4 weight and its E8M0 grid. It gets them because
-       :func:`attach_moe_loaders` binds the weight keys followed by the scale
-       keys and ``expert_parallel_grouped_loader`` trims each group to the
-       local expert range independently.
+    1. THE LD-23 REQUANTIZATION RUNS UNCHANGED, hard assertions included:
+       both checkpoint tensors per expert (the FP4 weight and its E8M0 grid)
+       are folded to legacy-E4M3 bytes plus one fp32 power-of-two scale per
+       output channel, bit-exactly or raising. This loader gets both tensors
+       because :func:`attach_moe_loaders` binds the weight keys followed by
+       the scale keys and ``expert_parallel_grouped_loader`` trims each group
+       to the local expert range independently.
 
-    2. THE RESULT IS TRANSPOSED to ``[in, out]``. The gen3-legal MoE kernels
-       take ``gate_up`` as ``[E, H, 2, I]`` and ``down`` as ``[E, I, H]``
+    2. LD-67 (Amendment 7, ADOPT): THE PER-CHANNEL SCALE IS FOLDED INTO THE
+       VALUE and the result emitted as bf16. Exactness is ASSERTED, not
+       derived and hoped: every element is decoded through
+       :data:`_LEGACY_E4M3_DECODE_TABLE` (exact: 4 significand bits inside
+       fp32), multiplied by its channel's power of two (exact in fp32 for
+       every in-range exponent), converted to bf16, and the bf16 is
+       round-tripped against the fp32 product. Any mismatch — subnormal
+       underflow, exponent out of bf16's range, a NaN slot — raises with the
+       tensor and key named. The mathematical reason it passes: a checkpoint
+       value is ``±(1 + m/8) * 2**k`` with at most 4 significand bits, and
+       bf16 carries 8.
+
+    3. THE RESULT IS TRANSPOSED to ``[in, out]``. The MoE kernels take
+       ``gate_up`` as ``[E, H, 2, I]`` and ``down`` as ``[E, I, H]``
        (contraction axis first, output channel last), while the checkpoint
        stores ``[out, in]``. ``DeepseekV4RoutedExperts`` reinterprets these
-       parameters with pure ``view()`` calls, and a ``view`` cannot transpose,
-       so the transpose has to happen at load time -- exactly the constraint
-       that forced the retired path to pre-tile.
+       parameters with pure ``view()`` calls, and a ``view`` cannot
+       transpose, so the transpose happens at load time.
 
-    Every byte is emitted as ``uint8`` and reinterpreted once at the end:
-    several torch CPU builds lack float8 ``stack``/``index_select`` kernels,
-    and the byte route is bit-equivalent (same reasoning as
-    ``llama3/weight_pack_mx_fp8.py:121-124``).
+    There is NO separate scale loader any more: the scale ceases to exist as
+    a parameter, both MoE kernels are called in their scale-free forms, and
+    the in-kernel fp8-scale gather (the ep18 flood-class exposure, F-101)
+    ceases to exist in the traced graph.
     """
     n_local = len(local_weight_keys)
     weight_shape = (out_dim, logical_k // 2)
@@ -1341,69 +1375,52 @@ def _fp8_pow2_expert_weight_loader(
         ):
             _require_shape(param_name, w_key, w_slice, weight_shape)
             _require_shape(param_name, s_key, s_slice, scale_shape)
-            byts, _ = _requantize_expert_to_pow2_per_channel(
+            byts, scale = _requantize_expert_to_pow2_per_channel(
                 _as_bytes(w_slice[:], param_name, w_key),
                 s_slice[:],
                 param_name,
                 w_key,
                 logical_k,
             )
+            # LD-67 fold: decode (exact) * pow2 scale (exact) -> bf16, then
+            # HARD-ASSERT the round trip. ``torch.equal`` is the assertion
+            # of record: a NaN from a field-15 slot fails it (NaN != NaN),
+            # and so does any rounding.
+            values = _LEGACY_E4M3_DECODE_TABLE[byts.to(torch.long)]
+            folded = values * scale[:, None]
+            if not bool(torch.isfinite(folded).all()):
+                raise ValueError(
+                    f"LD-67 fold for {param_name!r} (key {w_key!r}) produced "
+                    "a non-finite fp32 value; the per-channel scale and the "
+                    "decoded weight cannot be folded without leaving fp32's "
+                    "finite range. Refusing to load."
+                )
+            folded_bf16 = folded.to(torch.bfloat16)
+            if not torch.equal(folded_bf16.to(torch.float32), folded):
+                bad = (folded_bf16.to(torch.float32) != folded).sum()
+                raise ValueError(
+                    f"LD-67 fold for {param_name!r} (key {w_key!r}) is not "
+                    f"bf16-exact: {int(bad)} element(s) fail the round-trip "
+                    "assertion. The checkpoint value grid was expected to "
+                    "carry <= 4 significand bits inside bf16's normal range; "
+                    "this tensor violates that. This loader will NOT round "
+                    "on its own authority — the numerics the parity standard "
+                    "measures would silently change (same doctrine as the "
+                    "LD-23 exactness raise, operator finding F-4 part 2)."
+                )
             # [out, in] -> [in, out]; ``contiguous`` because the parameter is
             # consumed by ``view``, which refuses a non-contiguous source.
-            per_expert.append(byts.t().contiguous())
-        stacked = torch.stack(per_expert, dim=0)
-        return stacked.contiguous().view(_FP8_DTYPE)
-
-    return SafetensorsWeightLoader(transform=transform)
-
-
-def _fp8_pow2_expert_scale_loader(
-    param_name: str,
-    local_weight_keys: Sequence[str],
-    local_scale_keys: Sequence[str],
-    out_dim: int,
-    logical_k: int,
-) -> SafetensorsWeightLoader:
-    """Emit this core's local experts' ``[E_local, N]`` fp32 per-channel scales.
-
-    Computed by the SAME function as the weights
-    (:func:`_requantize_expert_to_pow2_per_channel`), from the same two
-    checkpoint tensors, so the scale can never disagree with the bytes it
-    scales. Duplicating the derivation instead of caching it costs one extra
-    pass over the FP4 bytes at load and buys the guarantee that a future edit
-    cannot desynchronize the pair -- the failure mode here is silent numeric
-    corruption, not a crash.
-
-    No transpose: the scale is already one value per output channel, and the
-    kernels take it as ``[E, N]`` (``moe_tkg`` ROW) or ``[E, 1, N]``
-    (``moe_cte`` PER_CHANNEL, produced by an ``unsqueeze`` in ``moe.py``).
-    """
-    n_local = len(local_weight_keys)
-    weight_shape = (out_dim, logical_k // 2)
-    scale_shape = (out_dim, logical_k // _MX_GROUP)
-
-    def transform(slices: list, rank: int) -> torch.Tensor:
-        del rank
-        w_slices, s_slices = _split_weight_and_scale_slices(
-            param_name, slices, n_local
-        )
-        per_expert = []
-        for w_slice, s_slice, w_key, s_key in zip(
-            w_slices, s_slices, local_weight_keys, local_scale_keys
-        ):
-            _require_shape(param_name, w_key, w_slice, weight_shape)
-            _require_shape(param_name, s_key, s_slice, scale_shape)
-            _, scale = _requantize_expert_to_pow2_per_channel(
-                _as_bytes(w_slice[:], param_name, w_key),
-                s_slice[:],
-                param_name,
-                w_key,
-                logical_k,
-            )
-            per_expert.append(scale)
+            per_expert.append(folded_bf16.t().contiguous())
         return torch.stack(per_expert, dim=0).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)
+
+
+# RETIRED (LD-67): ``_fp8_pow2_expert_scale_loader`` emitted the ``[E_local,
+# N]`` fp32 per-channel scales as their own parameter, derived by a second
+# pass through the SAME requantization so the pair could never desynchronize.
+# The fold makes the pair a single tensor, which retires both the loader and
+# the desynchronization risk it existed to manage.
 
 
 # ---------------------------------------------------------------------------
@@ -1916,12 +1933,14 @@ def attach_moe_loaders(
     * **Router** (``gate_weight``, ``gate_bias``, ``tid2eid``): replicated.
       Every core must score every expert before dispatch.
     * **Routed experts**: expert-parallel, ``n_routed_experts // ep_degree``
-      local experts (4 of 256 at EP=64). LD-23: the checkpoint's MXFP4 weights
-      and group-32 E8M0 scales are REQUANTIZED here to legacy-E4M3 bytes plus
-      one fp32 power-of-two scale per output channel, and the bytes are written
-      transposed to ``[in, out]``. Both parameters read both checkpoint
-      tensors; see the LD-23 section header for why the fold is bit-exact and
-      why it raises instead of rounding.
+      local experts (4 of 256 at EP=64). LD-23 + LD-67: the checkpoint's MXFP4
+      weights and group-32 E8M0 scales are REQUANTIZED here to legacy-E4M3
+      bytes plus one fp32 power-of-two scale per output channel (LD-23, hard
+      bit-exactness assertion), the scale is then FOLDED into the value and
+      the result emitted bf16 behind a hard round-trip assertion (LD-67), and
+      the values are written transposed to ``[in, out]``. ONE parameter per
+      leaf now — no scale parameter — reading both checkpoint tensors; see
+      the LD-23 section header and ``_bf16_folded_expert_weight_loader``.
     * **Shared expert**: sharded over a ``shared_tp_size``-way subgroup and
       replicated across the remaining subgroups (16-way with 4-fold replication
       at TP=64). A 64-way split would give ``K_local = 32`` on ``w2``, which
@@ -2019,8 +2038,9 @@ def attach_moe_loaders(
     if experts is None:
         raise AttributeError(
             "DeepseekV4MoE has no 'experts' submodule; the contract fixes "
-            "experts.w1_weight / w1_scale / w3_* / w2_* as the routed-expert "
-            "parameter names."
+            "experts.w1_weight / w3_weight / w2_weight as the routed-expert "
+            "parameter names (LD-67: the scales are folded in, so there are "
+            "no *_scale parameters)."
         )
 
     # ``w1``/``w3`` are the gate/up projections (hidden -> intermediate) and
@@ -2029,13 +2049,13 @@ def attach_moe_loaders(
     # ``H``, ``w2`` over ``I``; that is the only per-leaf difference now that
     # the MX tiling is retired (see the LD-23 section header).
     #
-    # BOTH loaders take BOTH checkpoint tensors. The requantization folds the
-    # E8M0 group scales into one power-of-two per output channel, so neither
-    # the bytes nor the scale can be computed from its own tensor alone. The
-    # key list is therefore ``weights then scales``: two groups of
-    # ``n_experts``, which is exactly the layout
-    # ``expert_parallel_grouped_loader`` documents and trims group-wise
-    # (``utils/weight_loader.py:697-714``).
+    # The ONE loader per leaf takes BOTH checkpoint tensors: the
+    # requantization folds the E8M0 group scales into one power-of-two per
+    # output channel, and LD-67 then folds THAT into the bf16 value, so the
+    # result is computable only from the pair. The key list is therefore
+    # ``weights then scales``: two groups of ``n_experts``, which is exactly
+    # the layout ``expert_parallel_grouped_loader`` documents and trims
+    # group-wise (``utils/weight_loader.py:697-714``).
     for leaf, out_dim, logical_k in (
         ("w1", inter, hidden),
         ("w3", inter, hidden),
@@ -2055,30 +2075,17 @@ def attach_moe_loaders(
         # is a pure function of the config and cannot know this core's EP rank),
         # so the EP wrapper trims ``slices`` to the local contiguous range before
         # the requantization runs -- non-local experts are never read from disk.
+        #
+        # LD-67: no ``{leaf}_scale`` bind any more — the scale is folded into
+        # the bf16 weight by the one loader below.
         _bind(
             experts,
             f"{leaf}_weight",
             paired_keys,
             expert_parallel_grouped_loader(
                 local_indices,
-                _fp8_pow2_expert_weight_loader(
+                _bf16_folded_expert_weight_loader(
                     f"experts.{leaf}_weight",
-                    local_weight_keys,
-                    local_scale_keys,
-                    out_dim,
-                    logical_k,
-                ),
-                n_experts,
-            ),
-        )
-        _bind(
-            experts,
-            f"{leaf}_scale",
-            paired_keys,
-            expert_parallel_grouped_loader(
-                local_indices,
-                _fp8_pow2_expert_scale_loader(
-                    f"experts.{leaf}_scale",
                     local_weight_keys,
                     local_scale_keys,
                     out_dim,
@@ -2545,15 +2552,17 @@ def build_checkpoint_mappings(
             put(f"{moe}.gate_bias", f"{key_prefix}.ffn.gate.bias")
 
         for leaf in ("w1", "w3", "w2"):
-            # LD-23: BOTH routed-expert parameters read BOTH checkpoint
-            # tensors, because the requantization folds the E8M0 group scales
-            # into one power-of-two per output channel and neither result is
-            # computable from its own tensor alone. The order is
-            # ``all weights then all scales`` -- the two-group layout
-            # ``expert_parallel_grouped_loader`` trims group-wise
-            # (``utils/weight_loader.py:697-714``) and the layout
-            # ``_split_weight_and_scale_slices`` asserts. It must stay in step
-            # with the ``paired_keys`` list in ``attach_moe_loaders``.
+            # LD-23 + LD-67: the ONE routed-expert parameter per leaf reads
+            # BOTH checkpoint tensors, because the requantization folds the
+            # E8M0 group scales into one power-of-two per output channel and
+            # LD-67 folds that into the bf16 value — the result is computable
+            # only from the pair. The order is ``all weights then all
+            # scales`` -- the two-group layout ``expert_parallel_grouped_
+            # loader`` trims group-wise (``utils/weight_loader.py:697-714``)
+            # and the layout ``_split_weight_and_scale_slices`` asserts. It
+            # must stay in step with the ``paired_keys`` list in
+            # ``attach_moe_loaders``. LD-67 removed the ``{leaf}_scale`` row:
+            # there is no scale parameter for a mapping to feed.
             expert_weight_keys = [
                 f"{key_prefix}.ffn.experts.{e}.{leaf}.weight"
                 for e in range(n_experts)
@@ -2564,7 +2573,6 @@ def build_checkpoint_mappings(
             ]
             paired = [*expert_weight_keys, *expert_scale_keys]
             put(f"{moe}.experts.{leaf}_weight", paired)
-            put(f"{moe}.experts.{leaf}_scale", paired)
             put(
                 f"{moe}.shared_expert.{leaf}_weight",
                 f"{key_prefix}.ffn.shared_experts.{leaf}.weight",

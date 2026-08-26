@@ -4542,6 +4542,65 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             )
         buffer.clear()
 
+    def _log_ld67_decode_witness(self, bucket_name: str) -> None:
+        """Materialize, log and clear the LD-67 MoE decode routing witness.
+
+        LD-67 (port-plan §14.3 item 2):
+        ``DeepseekV4RoutedExperts._forward_decode`` stashes per-MoE-layer
+        summaries of the routing tensors handed to ``NF.moe_tkg`` into a
+        module-level buffer. Reading them back here (a) puts the values in
+        hand — the witness — and (b) makes the summary tensors graph
+        outputs. Wired beside BOTH ``warmup_decode`` readbacks (the spec and
+        non-spec compiles are separate graphs and each needs its own pin).
+        Clears the buffer after logging; a read that faults propagates —
+        an instrument defect must stay visible, never be swallowed. Same
+        mechanics as :meth:`_log_ld63_witness`; ``expert_index`` summaries
+        are in the GLOBAL expert-id domain (0..n_routed_experts-1).
+        """
+        moe_module = sys.modules.get("vllm_neuron.model.deepseek_v4.moe")
+        if moe_module is None:
+            # Not a deepseek_v4 serve; there is no witness to read.
+            return
+        buffer = moe_module.LD67_DECODE_WITNESS_BUFFER
+        if not buffer:
+            # Loudly visible absence, never silent — same discrimination
+            # rule as the LD-63 EMPTY line.
+            logger.info(
+                "LD67-WITNESS-DECODE EMPTY no_entries_after_decode_warmup "
+                "bucket=%s",
+                bucket_name,
+            )
+            return
+
+        def _as_int(value: Any) -> int:
+            if torch.is_tensor(value):
+                return int(value.cpu().item())
+            return int(value)
+
+        def _as_float(value: Any) -> float:
+            if torch.is_tensor(value):
+                return float(value.cpu().item())
+            return float(value)
+
+        for layer_idx in sorted(buffer):
+            entry = buffer[layer_idx]
+            logger.info(
+                "LD67-WITNESS-DECODE layer=%d ei_min=%d ei_max=%d "
+                "ei_rows=%d ei_cols=%d aff_min=%.6g aff_max=%.6g "
+                "nnz_min=%d nnz_max=%d bucket=%s",
+                layer_idx,
+                _as_int(entry["ei_min"]),
+                _as_int(entry["ei_max"]),
+                _as_int(entry["ei_rows"]),
+                _as_int(entry["ei_cols"]),
+                _as_float(entry["aff_min"]),
+                _as_float(entry["aff_max"]),
+                _as_int(entry["nnz_min"]),
+                _as_int(entry["nnz_max"]),
+                bucket_name,
+            )
+        buffer.clear()
+
     def warmup_prefill(self, bucket_size: int, kv_segment_size: int) -> None:
         """
         Warm up the model for prefill with a specific bucket size and KV segment size.
@@ -4940,6 +4999,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         model_output = self.model(**kwargs)
         # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
         self._materialize_warmup_output(model_output)
+        # LD-67 (port-plan §14.3 item 2): materialize + log + clear the MoE
+        # decode routing witness beside the readback. Always runs.
+        self._log_ld67_decode_witness(f"decode_b{batch_size}")
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
@@ -4983,6 +5045,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             model_output = self.model(**kwargs)
             # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
             self._materialize_warmup_output(model_output)
+            # LD-67: the non-spec decode compile is its OWN graph; pin and
+            # log its witness too.
+            self._log_ld67_decode_witness(f"decode_b{batch_size}_s1")
             if self._tensor_replacer is not None:
                 set_active_context(None)
             compile_elapsed = time.perf_counter() - compile_start
