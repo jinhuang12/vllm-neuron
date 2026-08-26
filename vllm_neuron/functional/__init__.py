@@ -6,6 +6,12 @@ from .argsort_unstable import argsort_unstable
 # `NF.block_fp8_linear`, so without this re-export the name does not resolve
 # at call time.
 from .block_fp8_linear import block_fp8_linear
+# <-- deepseek_v4 ep18/LD-68: in-execution b2e witness INSTRUMENT (port-plan
+# SS15.3), an identity pass-through whose device_print side effects are the
+# deliverable. Wired at one prefill call site (`deepseek_v4/moe.py`
+# `_forward_prefill`) through `NF.ld68_witness`; without this re-export the
+# name does not resolve at call time.
+from .ld68_witness import ld68_witness
 from .spec_decode_correction import (
     correct_spec_decode_positions_and_slot_mapping as correct_spec_decode_positions_and_slot_mapping,
 )  # noqa: F401
@@ -84,6 +90,7 @@ __all__ = [
     "gen_attention_decode_mask",
     "get_group_slice_indices",
     "get_local_expert_affinities",
+    "ld68_witness",
     "merge_prompt_embeds",
     "mla_decode_attention",
     "mla_grouped_oproj",
