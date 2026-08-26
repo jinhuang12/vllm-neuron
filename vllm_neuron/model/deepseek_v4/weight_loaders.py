@@ -1307,7 +1307,7 @@ def _build_legacy_e4m3_decode_table() -> torch.Tensor:
     hard window is fields 1..14 plus signed zero), and a NaN here trips the
     LD-67 round-trip assertion below rather than folding silently.
     """
-    table = torch.full((256,), float("nan"), dtype=torch.float32)
+    table = torch.full((256,), float("nan"), dtype=torch.float32, device="cpu")
     for byte, mag in enumerate(_legacy_e4m3_magnitudes()):
         table[byte] = mag
         table[byte | 0x80] = -mag
