@@ -150,8 +150,19 @@ def sample(
     sampled_idx = torch.where(is_greedy, greedy_sampled, random_sampled)
 
     # Map back to original vocab indices
+    # ep18/FP-70 tail-gather index sanitize -- ``sampled_idx`` is where-merged
+    # from a kernel-derived multinomial pick (unbounded; aws-neuron-sdk#1335
+    # family), so the gather is keyed ONLY by the clamped in-domain index
+    # (LD-73/FP-69 clamp-plus-collapse idiom). Greedy in-domain slots are
+    # unaffected. MASKS DEFECT EXPRESSION ONLY (F-224): no health claim;
+    # parity v3r1 remains the untouched arbiter.
+    K = sorted_indices.shape[-1]
+    valid = (sampled_idx >= 0) & (sampled_idx < K)
+    safe_sampled_idx = torch.clamp(
+        torch.where(valid, sampled_idx, torch.zeros_like(sampled_idx)), 0, K - 1
+    )
     result = (
-        torch.gather(sorted_indices, -1, sampled_idx.unsqueeze(-1))
+        torch.gather(sorted_indices, -1, safe_sampled_idx.unsqueeze(-1))
         .squeeze(-1)
         .to(torch.int32)
     )
