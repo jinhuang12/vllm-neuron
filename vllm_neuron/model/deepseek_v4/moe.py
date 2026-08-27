@@ -589,7 +589,97 @@ class DeepseekV4RoutedExperts(nn.Module):
             ]
         )
 
-        return NF.moe_cte(
+        # --- LD-73 SENTINEL MASK, prefill (CTE) family --------------------
+        # LADDER-DECISION LD-73 (assessment §15.3; plan §17.2). DEPLOYED-PIN
+        # WORKAROUND for defect (A), never a fix: F-229 — router-path
+        # dense-affinity-zero -> all-padding blockwise mapping (the
+        # -1/0xFFFFFFFF sentinel class) -> ISA-mandated vector-DGE OOB
+        # account -> NRT_EXEC_OOB=1006 on every completed prefill warmup
+        # execute (serve-26). The kernel-side mask route is vendor-locked at
+        # the deployed pin (F-231: ``bwmm_shard_on_I`` weight gathers are
+        # forced ``oob_mode=error``, kernel_assert :669); the vendor's
+        # ``ignore`` oob_mode is post-pin (aws-neuron-sdk#1335 family). The
+        # in-fork precedent for this fork-side class is the gpt_oss
+        # clamp-plus-collapse (``gpt_oss/model_bf16.py:1535-1554``, naming
+        # "nrta 1006" verbatim) — never a bare clamp.
+        #
+        # TENSOR SET, derived from the kernel's own contract (the pinned
+        # descriptor census ITER-60-RAW-P609, ``bwmm_shard_on_I.py`` sha
+        # 16ca33d6…):
+        #  * ``token_position_to_id`` keys the vector-DGE descriptors —
+        #    hidden gather :816, affinity gather :1775 (address
+        #    ``t*E_local + block_expert``, ``functional/moe/moe_cte.py:
+        #    114-116``), old-block loads :1851/:1867, output scatter :2491 —
+        #    THE sentinel carrier. Every sentinel (negative int32, i.e. the
+        #    -1/0xFFFFFFFF class) and any out-of-domain id is remapped to
+        #    the kernel's OWN documented padding-sink index T
+        #    (``functional/moe/moe_cte.py:112-113,127-128``: hidden
+        #    ``[T+1, H]`` "reserves the last row as a padding sink";
+        #    "Padding slots should map to index T").
+        #  * ``hidden_states`` gains one ZERO sink row -> ``[T+1, H]``.
+        #  * ``expert_affinities_masked`` gains ``E_local`` ZERO entries
+        #    (rows ``T*E_local .. T*E_local+E_local-1`` — exactly the sink
+        #    row's affinities under the ``[t*E + e]`` contract).
+        #  * ``block_to_expert`` keys the ERROR-mode weight gathers
+        #    (:1285/:1681/:1693/:2426): clamped into ``[0, E_local-1]`` to
+        #    make the scalar-offset domain explicit. NOT a bare clamp: a
+        #    degenerate block's positions are all sink by the tp2id remap,
+        #    so no real output row can receive a substituted-expert
+        #    contribution.
+        #  * ``conditions`` / ``local_expert_indices``: flags resp. arange —
+        #    no sentinel channel; untouched.
+        #
+        # EXACT-ZERO COLLAPSE: a masked position gathers the zero sink
+        # hidden row, its affinity gather reads an exact zero, POST_SCALE
+        # multiplies the contribution to exactly 0, and its output scatter
+        # lands in the discarded sink row — real rows are untouched by
+        # masked positions. The kernel launch below is unchanged (same
+        # kernel, same flags; with no sentinel present the ``skip_token``
+        # arm is simply never exercised). HONESTY BOUND (assessment §15.3
+        # item 4): NO computation-neutrality claim — where (A)'s degenerate
+        # mapping expresses, the masked graph computes DEFINED zero expert
+        # contributions where the unmasked graph's behavior is undefined;
+        # the detector is the parity verdict (F-224), never an in-graph
+        # witness (Amendment 4). The LD-63 witness above intentionally
+        # keeps reading the RAW producer stream, upstream of this mask.
+        _t_real = hidden_states.shape[0]
+        token_position_to_id = torch.clamp(
+            torch.where(
+                token_position_to_id < 0,
+                torch.full_like(token_position_to_id, _t_real),
+                token_position_to_id,
+            ),
+            min=0,
+            max=_t_real,
+        )
+        block_to_expert = torch.clamp(block_to_expert, 0, self.num_local_experts - 1)
+        hidden_states = torch.cat(
+            [
+                hidden_states,
+                torch.zeros(
+                    1,
+                    hidden_states.shape[1],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                ),
+            ],
+            dim=0,
+        )
+        expert_affinities_masked = torch.cat(
+            [
+                expert_affinities_masked,
+                torch.zeros(
+                    self.num_local_experts,
+                    1,
+                    dtype=expert_affinities_masked.dtype,
+                    device=expert_affinities_masked.device,
+                ),
+            ],
+            dim=0,
+        )
+        # --- end LD-73 SENTINEL MASK ---------------------------------------
+
+        output = NF.moe_cte(
             # LD-21: ``shard_on_i``, NOT ``shard_on_block``. Both accept fp8
             # weights with per-channel scales, but ``shard_on_block`` pins
             # ``gup_scale = down_scale = None`` under a "# Placeholder for FP8"
@@ -637,6 +727,14 @@ class DeepseekV4RoutedExperts(nn.Module):
             # True here would be a crash, not a slowdown.
             is_tensor_update_accumulating=False,
         )
+        # LD-73: discard the padding-sink row. The kernel contract returns
+        # rows matching its token extent; under the ``[T+1, H]`` sink
+        # convention the last row is the masked positions' write target and
+        # is dropped here. If the kernel returns ``[T, H]`` the slice is the
+        # identity — safe either way. The CPU fallback (``_torch_moe_impl``)
+        # derives its token count from the affinity extent (T+1) and returns
+        # ``[T+1, H]``, so the trim keeps the fallback numerically matched.
+        return output[:_t_real]
 
     def _forward_decode(
         self, hidden_states: Tensor, expert_affinities: Tensor, expert_index: Tensor
@@ -693,6 +791,42 @@ class DeepseekV4RoutedExperts(nn.Module):
             "nnz_max": _nnz_per_token.max(),
         }
         # --- end LD-67 DECODE WITNESS -------------------------------------
+
+        # --- LD-73 SENTINEL MASK, decode (TKG) family ----------------------
+        # LADDER-DECISION LD-73 (assessment §15.3; plan §17.2) — the same
+        # sentinel sanitization as the prefill family, same commit, applied
+        # at this family's kernel boundary. Decode has never executed under
+        # LD-71; if defect (A) expresses here the same way (F-229), an
+        # unmasked decode path would move the NRT_EXEC_OOB=1006 expression
+        # from prefill warmup to decode warmup.
+        #
+        # TENSOR SET, derived from the kernel's own contract:
+        #  * ``expert_index`` ``[T, K]`` int32 global-domain is the ONE
+        #    sentinel-capable index tensor handed to ``moe_tkg`` (the
+        #    aws-neuron-sdk#1335 class: max-int sentinels from topk-family
+        #    kernels read as 0xFFFFFFFF vector-DGE addresses). Clamped into
+        #    ``[0, n_routed_experts-1]``. The zero-contribution collapse is
+        #    STRUCTURAL here, not a bare clamp: per the kernel contract
+        #    (``functional/moe/moe_tkg.py:99-101``) ``expert_index`` is
+        #    consumed for compute only under ``mask_unselected_experts=
+        #    True``; this call passes the default False with
+        #    ``is_all_expert=True``, so contributions are driven entirely by
+        #    ``expert_affinities`` (dense VALUES, zero at unselected — no
+        #    index domain), which this mask never touches.
+        #  * ``rank_id`` ``[1, 1]``: built from ``self.ep_rank`` (a Python
+        #    int in ``[0, ep_degree)``) — in-bounds by construction; the
+        #    kernel's affinity slice it keys (``functional/moe/moe_tkg.py:
+        #    74-76``) has no sentinel channel. Untouched.
+        # ``moe_tkg`` carries ZERO error-mode oob lines at the deployed pin
+        # (ITER-60-RAW-P609 §5 control) and the decode flood-class was
+        # closed statically at Q-D2/ITER-58 — this arm is the plan's
+        # same-idiom defensive mask, keeping serve-27 single-variable at the
+        # commit level. HONESTY BOUND: as with prefill, no
+        # computation-neutrality claim; parity v3r1 is the arbiter (F-224).
+        # The LD-67 witness above intentionally keeps reading the RAW
+        # ``expert_index``, upstream of this mask.
+        expert_index = torch.clamp(expert_index, 0, self.total_num_experts - 1)
+        # --- end LD-73 SENTINEL MASK ---------------------------------------
 
         return NF.moe_tkg(
             hidden_input=hidden_states,
