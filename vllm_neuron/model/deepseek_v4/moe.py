@@ -1257,9 +1257,12 @@ class DeepseekV4MoE(nn.Module):
 
         Every op is static-shape: ``matmul``, the step-2 elementwise chain
         (``abs``, ``exp``, ``div``, ``mul``, ``add``, ``maximum``, ``clamp_min``,
-        ``rsqrt``), ``index_select``, ``topk``, ``gather``, ``scatter``. No
-        ``.item()``, no ``nonzero()``, no boolean-mask indexing, and no
-        Python-level branch on a tensor value.
+        ``rsqrt``), ``index_select``, ``topk``, ``gather``, ``scatter``, and
+        the FP-69 sanitization chain between steps 5 and 6 (``ge``, ``lt``,
+        ``where``, ``clamp``, ``full_like``). No ``.item()``, no
+        ``nonzero()``, no boolean-mask indexing, and no Python-level branch
+        on a tensor value (``self.is_hash_layer`` is a Python bool fixed at
+        construction).
         """
         # Step 1 (:570) — fp32 router matmul. The weight is stored
         # ``[E, H]``, so the contraction transposes it.
@@ -1398,8 +1401,44 @@ class DeepseekV4MoE(nn.Module):
             )[1]
         expert_index = expert_index.to(torch.int64)
 
-        # Step 6 (:585) — weights come from the UNCORRECTED scores.
+        # --- FP-69 ROUTER-BOUNDARY SENTINEL MASK (LD-73 idiom, re-sited) --
+        # ITER-69 / H-ROUTER-RAW (confirmed): the rotational-topk NKI kernel
+        # emits uint32 indices that can carry the aws-neuron-sdk#1335
+        # max-int sentinel class (0xFFFFFFFF), and defect (A) (F-229) can
+        # surface them HERE, upstream of the LD-73 kernel-boundary mask:
+        # this raw index stream feeds torch ``gather`` (step 6) and
+        # ``scatter`` (the densify below) directly, in every topk layer —
+        # the serve-27 residual OOB consumer class. The 3 hash layers key
+        # the parameter-backed ``tid2eid`` table and are in-domain by table
+        # construction (``valid = None`` skips the mask there); the DSA
+        # indexer topk class sanitizes in-graph already and is untouched.
+        # Same clamp-plus-collapse idiom as LD-73 (precedent: gpt_oss
+        # ``model_bf16.py:1535-1554``), same honesty bound: this masks
+        # defect (A)'s EXPRESSION only (F-224) — no health or correctness
+        # claim; parity v3r1 remains the untouched arbiter. Invalid slots
+        # contribute ZERO routing weight (the sanitized index 0 gathers a
+        # score whose weight is then zero-collapsed at step 6, BEFORE step
+        # 7's renormalization), and their densify writes are directed to a
+        # sink column ``E`` that the trim discards, so no in-domain expert
+        # slot can be read through, or clobbered by, an out-of-domain index.
+        if self.is_hash_layer:
+            valid = None
+        else:
+            raw_index = expert_index
+            valid = (raw_index >= 0) & (raw_index < self.n_routed_experts)
+            expert_index = torch.clamp(
+                torch.where(valid, raw_index, torch.zeros_like(raw_index)),
+                0,
+                self.n_routed_experts - 1,
+            )
+        # --- end FP-69 ROUTER-BOUNDARY SENTINEL MASK -----------------------
+
+        # Step 6 (:585) — weights come from the UNCORRECTED scores. FP-69:
+        # the gather is keyed only by in-domain indices, and invalid slots
+        # are zero-collapsed before renormalization so they carry no mass.
         weights = original_scores.gather(1, expert_index)
+        if valid is not None:
+            weights = torch.where(valid, weights, torch.zeros_like(weights))
 
         # Step 7 (:586-587).
         if self._renormalize:
@@ -1415,12 +1454,37 @@ class DeepseekV4MoE(nn.Module):
         # (``functional/moe/moe_cte.py:114-116``,
         # ``functional/moe/moe_tkg.py:74``). ``scatter`` is out-of-place and
         # static-shape.
-        dense = torch.zeros(
-            hidden_states.shape[0],
-            self.n_routed_experts,
-            dtype=torch.float32,
-            device=hidden_states.device,
-        ).scatter(1, expert_index, weights.to(torch.float32))
+        #
+        # FP-69, topk layers only: the scatter target is widened to ``E+1``
+        # columns and invalid slots are directed to the sink column ``E``,
+        # which the ``[:, :E]`` trim discards — the LD-73 sink-collapse
+        # idiom in column form. A fully-invalid row renormalizes 0/0 to NaN
+        # at step 7, but every one of its writes lands in the trimmed sink
+        # column, so the in-domain ``[T, E]`` result holds its zero init and
+        # no NaN escapes. The hash branch keeps the original ``[T, E]``
+        # scatter byte-for-byte.
+        if valid is None:
+            dense = torch.zeros(
+                hidden_states.shape[0],
+                self.n_routed_experts,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            ).scatter(1, expert_index, weights.to(torch.float32))
+        else:
+            dense = torch.zeros(
+                hidden_states.shape[0],
+                self.n_routed_experts + 1,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            ).scatter(
+                1,
+                torch.where(
+                    valid,
+                    expert_index,
+                    torch.full_like(expert_index, self.n_routed_experts),
+                ),
+                weights.to(torch.float32),
+            )[:, : self.n_routed_experts]
 
         return dense, expert_index.to(torch.int32)
 
