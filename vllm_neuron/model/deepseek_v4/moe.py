@@ -97,20 +97,6 @@ _MOE_CTE_BLOCK_SIZE = 256
 # the kernel are NEVER touched by this instrument.
 LD63_WITNESS_BUFFER: dict[int, dict[str, object]] = {}
 
-# LD-67 DECODE WITNESS BUFFER (port-plan §14.3 item 2, assessment §12.6
-# Q-D2 reading (ii): the decode caveat closed statically for the flood
-# class, so this witness is CHEAP HEALTH INSTRUMENTATION, not a defect
-# probe). Same mechanics as ``LD63_WITNESS_BUFFER``: module-level, keyed by
-# ``layer_idx``, overwritten per decode forward, bounded by the MoE layer
-# count. ``_forward_decode`` stashes per-layer summaries of the routing
-# tensors handed to ``NF.moe_tkg``; the runner materializes and logs them
-# (``LD67-WITNESS-DECODE`` lines) beside BOTH ``warmup_decode`` readbacks.
-# ``expert_index`` here is in the GLOBAL id domain 0..n_routed_experts-1
-# (0..255): ``is_all_expert=True`` + ``rank_id`` means the KERNEL slices to
-# local experts, so the global domain is the correct health envelope. The
-# tensors handed to the kernel are NEVER touched by this instrument.
-LD67_DECODE_WITNESS_BUFFER: dict[int, dict[str, object]] = {}
-
 # The block-FP8 contract for the shared expert, frozen by the family
 # interface contract §5. Every leg of the shared-expert MLP is called with
 # exactly these arguments.
@@ -799,29 +785,6 @@ class DeepseekV4RoutedExperts(nn.Module):
         # receives the identical ``[[ep_rank]]`` int32 runtime tensor. <<<
         rank_id = self.ep_rank_buf
 
-        # --- LD-67 DECODE WITNESS (port-plan §14.3 item 2) ----------------
-        # Stash per-layer summaries of the routing tensors handed to the
-        # kernel. The runner reads them back in ``warmup_decode`` (BOTH
-        # readback sites), which makes these summaries graph outputs and
-        # logs them as ``LD67-WITNESS-DECODE`` lines. ``expert_index`` is in
-        # the GLOBAL id domain (0..n_routed_experts-1 = 0..255): the kernel
-        # slices to local experts itself under ``is_all_expert=True`` +
-        # ``rank_id``. All ops are static-shape; the tensors handed to the
-        # kernel are never touched. Health envelope, not a defect probe —
-        # Q-D2 closed the decode flood-class caveat statically (ITER-58).
-        _nnz_per_token = (expert_affinities != 0).to(torch.float32).sum(dim=1)
-        LD67_DECODE_WITNESS_BUFFER[self.layer_idx] = {
-            "ei_min": expert_index.min(),
-            "ei_max": expert_index.max(),
-            "ei_rows": expert_index.shape[0],
-            "ei_cols": expert_index.shape[1],
-            "aff_min": expert_affinities.min(),
-            "aff_max": expert_affinities.max(),
-            "nnz_min": _nnz_per_token.min(),
-            "nnz_max": _nnz_per_token.max(),
-        }
-        # --- end LD-67 DECODE WITNESS -------------------------------------
-
         # --- LD-73 SENTINEL MASK, decode (TKG) family ----------------------
         # LADDER-DECISION LD-73 (assessment §15.3; plan §17.2) — the same
         # sentinel sanitization as the prefill family, same commit, applied
@@ -853,8 +816,6 @@ class DeepseekV4RoutedExperts(nn.Module):
         # same-idiom defensive mask, keeping serve-27 single-variable at the
         # commit level. HONESTY BOUND: as with prefill, no
         # computation-neutrality claim; parity v3r1 is the arbiter (F-224).
-        # The LD-67 witness above intentionally keeps reading the RAW
-        # ``expert_index``, upstream of this mask.
         expert_index = torch.clamp(expert_index, 0, self.total_num_experts - 1)
         # --- end LD-73 SENTINEL MASK ---------------------------------------
 
