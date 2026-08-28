@@ -4474,74 +4474,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         _to_cpu(model_output)
 
-    def _log_ld63_witness(self, bucket_size: int, kv_segment_size: int) -> None:
-        """Materialize, log and clear the LD-63 MoE index-stream witness.
-
-        LD-63 (port-plan §13.2, assessment §11.5):
-        ``DeepseekV4RoutedExperts._forward_prefill`` stashes per-MoE-layer
-        summaries of the ``block_to_expert`` index stream into a
-        module-level buffer. Reading them back here (a) puts the values in
-        hand — the witness — and (b) makes the summary tensors graph
-        outputs, pinning the index-stream producer chain in the compiled
-        artifact. Always runs during prefill warmup, exactly like the
-        ep18/iter13 readback beside its call site; clears the buffer after
-        logging. A read that faults propagates — reading R4 (instrument
-        defect) must stay visible, never be swallowed.
-        """
-        moe_module = sys.modules.get("vllm_neuron.model.deepseek_v4.moe")
-        if moe_module is None:
-            # Not a deepseek_v4 serve; there is no witness to read.
-            return
-        buffer = moe_module.LD63_WITNESS_BUFFER
-        if not buffer:
-            # The module is loaded but no prefill forward populated the
-            # buffer: log it loudly so an absent witness is visible
-            # (reading R4 discrimination), never silent.
-            logger.info(
-                "LD63-WITNESS EMPTY no_entries_after_prefill_warmup "
-                "bucket_size=%d kv_segment_size=%d",
-                bucket_size,
-                kv_segment_size,
-            )
-            return
-
-        def _as_int(value: Any) -> int:
-            if torch.is_tensor(value):
-                return int(value.cpu().item())
-            return int(value)
-
-        def _as_int_list(value: Any) -> str:
-            items = value.cpu().tolist() if torch.is_tensor(value) else value
-            return "[" + ",".join(str(int(v)) for v in items) + "]"
-
-        for layer_idx in sorted(buffer):
-            entry = buffer[layer_idx]
-            hist = entry["b2e_hist"]
-            hist_ints = (
-                hist.cpu().tolist() if torch.is_tensor(hist) else list(hist)
-            )
-            # The clamped-view histogram's LAST bucket (index E_local) is
-            # the overflow bucket: every value >= E_local lands there.
-            overflow = int(hist_ints[-1])
-            logger.info(
-                "LD63-WITNESS layer=%d b2e_max=%d b2e_overflow=%d "
-                "b2e_min=%d b2e_len=%d tp2id_min=%d tp2id_max=%d "
-                "b2e_hist=%s tokens_per_expert=%s "
-                "bucket_size=%d kv_segment_size=%d",
-                layer_idx,
-                _as_int(entry["b2e_max"]),
-                overflow,
-                _as_int(entry["b2e_min"]),
-                _as_int(entry["b2e_len"]),
-                _as_int(entry["tp2id_min"]),
-                _as_int(entry["tp2id_max"]),
-                "[" + ",".join(str(int(v)) for v in hist_ints) + "]",
-                _as_int_list(entry["tokens_per_expert"]),
-                bucket_size,
-                kv_segment_size,
-            )
-        buffer.clear()
-
     def warmup_prefill(self, bucket_size: int, kv_segment_size: int) -> None:
         """
         Warm up the model for prefill with a specific bucket size and KV segment size.
@@ -4576,9 +4508,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         model_output = self.model(**warmup_kwargs)
         # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
         self._materialize_warmup_output(model_output)
-        # LD-63 (port-plan §13.2): materialize + log + clear the MoE
-        # index-stream witness beside the iter13 readback. Always runs.
-        self._log_ld63_witness(bucket_size, kv_segment_size)
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
