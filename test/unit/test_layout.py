@@ -61,19 +61,29 @@ def test_layout(pytestconfig: pytest.Config) -> None:
 def _register_rows(register_text: str) -> dict[str, str]:
     """Map vendored filename -> recorded sha256, from ``OVERLAY.md``'s table.
 
-    Keyed on the *basename* so the row can spell the path however it likes; the
-    sha256 is found positionally-free, so a later column re-order cannot quietly
-    turn this check into a no-op.
+    The **subject** of a row is read from its first cell only. Other cells
+    legitimately mention paths under the vendored directory -- the quarantine
+    column names the ``conftest.py`` that applies the marker -- so scanning the
+    whole line for "the" path is ambiguous, and treating that ambiguity as
+    "unparseable" silently drops the row instead of checking it.
+
+    The sha256 is still matched anywhere in the row, so re-ordering the later
+    columns cannot turn this check into a no-op.
     """
     rows: dict[str, str] = {}
+    path_re = re.compile(rf"{re.escape(UPSTREAM_DIR)}/([A-Za-z0-9_.-]+\.py)")
     for line in register_text.splitlines():
-        if not line.lstrip().startswith("|") or UPSTREAM_DIR not in line:
+        stripped = line.strip()
+        if not stripped.startswith("|") or UPSTREAM_DIR not in stripped:
             continue
-        recorded = _SHA256_RE.search(line)
-        paths = re.findall(rf"{re.escape(UPSTREAM_DIR)}/([A-Za-z0-9_.-]+\.py)", line)
-        if recorded is None or len(paths) != 1:
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if not cells:
             continue
-        rows[paths[0]] = recorded.group(1)
+        subject = path_re.search(cells[0])
+        recorded = _SHA256_RE.search(stripped)
+        if subject is None or recorded is None:
+            continue
+        rows[subject.group(1)] = recorded.group(1)
     return rows
 
 
