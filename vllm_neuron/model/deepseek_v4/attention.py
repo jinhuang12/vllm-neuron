@@ -2012,6 +2012,21 @@ class DeepseekV4Attention(nn.Module):
         self.oproj_group_rank = oproj_group_rank
         self.oproj_group_size = oproj_group_size
 
+        # LADDER-DECISION LD-74 (E3 buffer, assessment §16.3; plan §18.2):
+        # the oproj-TILE position (``tp_rank % 8``, ``mla_oproj.py:203-204``)
+        # as a NON-PERSISTENT int32 buffer. Passed to
+        # ``NF.mla_grouped_oproj`` as ``group_rank`` so the per-rank 128-wide
+        # lane extraction renders value-free (clamped ``index_select`` keyed
+        # by a ``get_attr``) and the 8 ranks of one oproj tile share one
+        # compile key. ``device="cpu"`` IS LOAD-BEARING (plan §18.2 item 5;
+        # meta construction, ``neuron_model_runner.py:1195``; convention
+        # ``model.py:216-232``).
+        self.register_buffer(
+            "oproj_lane_buf",
+            torch.tensor([[oproj_group_rank]], dtype=torch.int32, device="cpu"),
+            persistent=False,
+        )
+
         # ── Parameters ──────────────────────────────────────────────────
         # Every weight is [out, in] — the checkpoint's own orientation and
         # the one the block-FP8 GEMM wants. Do NOT flag these as storage
@@ -2755,7 +2770,9 @@ class DeepseekV4Attention(nn.Module):
             self.oproj_group,
             wo_a_scale=self.wo_a_scale,
             wo_b_scale=self.wo_b_scale,
-            group_rank=self.oproj_group_rank,
+            # LD-74 (E3): the value-free lane buffer, not the Python int —
+            # the int would bake a per-rank slice start into the render.
+            group_rank=self.oproj_lane_buf,
             out_dtype=torch.float32,
         )
         if self.world_size > 1:

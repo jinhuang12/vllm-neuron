@@ -290,6 +290,22 @@ class DeepseekV4DSparkAttention(nn.Module):
         self.oproj_group_rank = oproj_group_rank
         self.oproj_group_size = oproj_group_size
 
+        # LADDER-DECISION LD-74 (E3 buffer, assessment §16.3; plan §18.2):
+        # the oproj-TILE position (``tp_rank % 8``, ``mla_oproj.py:203-204``)
+        # as a NON-PERSISTENT int32 buffer — same mechanics and rationale as
+        # the main stack's ``attention.py`` registration: value-free
+        # ``get_attr`` render, clamped ``index_select`` lane extraction, one
+        # compile key per 8-rank oproj tile. ``device="cpu"`` IS LOAD-BEARING
+        # (plan §18.2 item 5; meta construction,
+        # ``neuron_model_runner.py:1195``; convention ``model.py:216-232``).
+        # ``attach_attention_loaders`` below keeps the Python int: the loader
+        # runs at LOAD TIME and never enters the traced graph.
+        self.register_buffer(
+            "oproj_lane_buf",
+            torch.tensor([[oproj_group_rank]], dtype=torch.int32, device="cpu"),
+            persistent=False,
+        )
+
         q_lora = self.q_lora_rank
         latent = self.head_dim
         heads = self.num_local_heads
@@ -585,7 +601,9 @@ class DeepseekV4DSparkAttention(nn.Module):
             self.oproj_group,
             wo_a_scale=self.wo_a_scale,
             wo_b_scale=self.wo_b_scale,
-            group_rank=self.oproj_group_rank,
+            # LD-74 (E3): the value-free lane buffer, not the Python int —
+            # the int would bake a per-rank slice start into the render.
+            group_rank=self.oproj_lane_buf,
             out_dtype=torch.float32,
         )
         if self.world_size > 1:

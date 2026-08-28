@@ -110,14 +110,18 @@ def _linear(
     )
 
 
-def _group_topology(group_pg, group_rank: Optional[int]) -> tuple[int, int]:
+def _group_topology(
+    group_pg, group_rank: "int | Tensor | None"
+) -> "tuple[int, int | Tensor]":
     """Resolve ``(group_size, group_rank)`` for the intra-o_group process group.
 
     Returns ``(1, 0)`` when there is no process group (single-core CPU unit
     tests, or a hypothetical ``tp_size <= o_groups`` deployment where the whole
-    group is local and upstream's reduction is already a local sum). Both values
-    are Python ints resolved at trace time, so nothing here becomes a
-    data-dependent shape.
+    group is local and upstream's reduction is already a local sum).
+    ``group_size`` is always a Python int resolved at trace time, so nothing
+    here becomes a data-dependent shape. ``group_rank`` may pass through as a
+    value-free int32 buffer TENSOR (LD-74): the rank then binds at RUNTIME and
+    never renders as a graph literal.
     """
     if group_pg is None or not dist.is_available() or not dist.is_initialized():
         return 1, 0
@@ -135,7 +139,7 @@ def mla_grouped_oproj(
     *,
     wo_a_scale: Optional[Tensor] = None,
     wo_b_scale: Optional[Tensor] = None,
-    group_rank: Optional[int] = None,
+    group_rank: "int | Tensor | None" = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
     """Grouped MLA o-projection: local ``wo_a`` partial, group reduce, ``wo_b``.
@@ -205,6 +209,12 @@ def mla_grouped_oproj(
             the group must be 8 consecutive ranks. That is NOT true under the
             TRN2 8x8 mesh (``functional/process_groups.py:TRN2_8x8_MESH``), so
             the loader's shard order and this argument have to agree.
+            Under LD-74 the traced path passes a VALUE-FREE int32 buffer
+            ``[[tp_rank % 8]]`` here instead of the Python int: the lane
+            extraction below then becomes a runtime-indexed, clamped
+            ``index_select`` and the render carries no per-rank slice-start
+            literal, so the 8 ranks of one oproj tile share one compile key.
+            An int keeps the trace-time slice path (CPU unit tests).
             KEYWORD-ONLY EXTENSION.
         out_dtype: store dtype of the returned partial. Pass
             ``torch.float32`` to let the caller's TP all-reduce accumulate in
@@ -262,8 +272,34 @@ def mla_grouped_oproj(
         # exactly the j-th block of ITS OWN group's activation. So no redundancy
         # and no prescale: the caller's 64-way all-reduce sums each distinct K
         # block exactly once.
-        start = resolved_group_rank * k_local_b
-        z_in = z_group[:, start : start + k_local_b]
+        if isinstance(resolved_group_rank, Tensor):
+            # LADDER-DECISION LD-74 (E3, assessment §16.3; plan §18.2 item 3):
+            # the per-rank 128-wide lane extraction on the ``z_group`` stream,
+            # runtime-bound. ``resolved_group_rank`` is the value-free int32
+            # ``[[tp_rank % 8]]`` buffer, so the index vector is built from a
+            # ``get_attr`` plus STATIC arange arguments — no per-rank
+            # slice-start literal (``r*128`` ∈ {0,…,896}) survives in the
+            # render, and the 8 ranks of an oproj tile trace byte-identical
+            # graphs. The index feeds a NEW indirect consumer (a vector-DGE
+            # gather, the aws-neuron-sdk#1335 class), so it lands behind the
+            # LD-73 sanitize idiom FROM BIRTH (R-A): clamped into
+            # ``[0, z_group.size(1)-1]``. The collapse-to-zero half of the
+            # idiom is N/A here, WITH REASON: the index set is TOTAL by
+            # construction (``lane * k_local_b + [0, k_local_b)`` with
+            # ``lane ∈ [0, group_size)`` — no sentinel/padding class exists on
+            # this path), so the clamp is defense-in-depth against #1335, not
+            # a semantic mask. Numerics: ``index_select``-vs-slice bitwise
+            # equality is proven exhaustively over all 8 lanes (plan §18.3
+            # item 3(ii)); clamp idempotence on every in-range index is item
+            # 3(iii).
+            lane_index = resolved_group_rank.reshape(()) * k_local_b + torch.arange(
+                0, k_local_b, dtype=torch.int32, device=z_group.device
+            )
+            lane_index = torch.clamp(lane_index, 0, z_group.size(1) - 1)
+            z_in = torch.index_select(z_group, 1, lane_index)
+        else:
+            start = resolved_group_rank * k_local_b
+            z_in = z_group[:, start : start + k_local_b]
         scale = 1.0
     elif k_local_b == o_lora_rank:
         # Fallback layout (dataflow-shapes.md §B step 14 / GAPS-5): every core

@@ -338,6 +338,24 @@ class DeepseekV4RoutedExperts(nn.Module):
         # (``dsv4_ref/model.py:625-626``). <<<
         self.local_expert_start = self.ep_rank * self.num_local_experts
 
+        # LADDER-DECISION LD-74 (E1, assessment §16.3; plan §18.2): the EP rank
+        # enters the traced graph as a NON-PERSISTENT module buffer, never as a
+        # per-call ``torch.tensor([[int]])`` whose VALUE bakes into the render
+        # as a per-rank literal. A buffer renders as a value-free ``get_attr``
+        # node, so the 8 ranks of one oproj tile trace byte-identical graphs
+        # and share one compile key (F-235). ``device="cpu"`` IS LOAD-BEARING
+        # (plan §18.2 item 5): the runner constructs this family inside
+        # ``torch.device("meta")`` (``neuron_model_runner.py:1195``) and a
+        # non-persistent buffer has NO checkpoint key to load over — an
+        # unnamed device would leave it a valueless meta tensor and
+        # ``.to(device)`` would raise after load. Same convention as the RoPE
+        # tables (``model.py:216-232``).
+        self.register_buffer(
+            "ep_rank_buf",
+            torch.tensor([[self.ep_rank]], dtype=torch.int32, device="cpu"),
+            persistent=False,
+        )
+
         # <-- BF16 FOLDED (LD-67): w1 = gate projection, w3 = up projection
         # (``dsv4_ref/model.py:602-603``: ``gate = self.w1(x)``,
         # ``up = self.w3(x)``). Logically ``[out=I, in=H]``; stored
@@ -507,9 +525,21 @@ class DeepseekV4RoutedExperts(nn.Module):
         # (``functional/moe/moe_blockwise.py:36``). <<<
         local_affinities = expert_affinities
         if self.ep_degree > 1:
-            local_expert_indices = torch.arange(
-                self.local_expert_start,
-                self.local_expert_start + self.num_local_experts,
+            # LADDER-DECISION LD-74 (E2): the index vector is derived from the
+            # ``ep_rank_buf`` buffer (value-free ``get_attr``) with STATIC
+            # arange arguments, replacing a rank-VALUED
+            # ``torch.arange(local_expert_start, …)`` whose endpoints rendered
+            # as per-rank literals — one traced graph per oproj tile instead
+            # of one per rank. The consuming
+            # ``NF.get_local_expert_affinities`` gather ALREADY exists below:
+            # NO new indirect op on this path (plan §18.2 item 2). Numerics:
+            # index-set equality is exhaustive over all 64 ranks (§18.3
+            # item 3(i)).
+            local_expert_indices = self.ep_rank_buf.reshape(
+                ()
+            ) * self.num_local_experts + torch.arange(
+                0,
+                self.num_local_experts,
                 device=hidden_states.device,
                 dtype=torch.int32,
             )
@@ -762,12 +792,12 @@ class DeepseekV4RoutedExperts(nn.Module):
         _, act_fn, scale_mode, a2a = _moe_kernel_enums()
         gate_hi, gate_lo, up_hi, up_lo = self._clamps()
 
-        # >>> PARALLELISM: rank_id is a tensor, not a Python int, so the EP
-        # rank is not baked in as a graph constant and one compiled artifact
-        # serves every rank. <<<
-        rank_id = torch.tensor(
-            [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
-        )
+        # >>> PARALLELISM — LADDER-DECISION LD-74 (E1): ``rank_id`` is the
+        # ``ep_rank_buf`` module buffer (value-free ``get_attr`` render), so
+        # the EP rank is not baked into the graph as a VALUE literal and one
+        # compiled artifact serves every rank of an oproj tile. The kernel
+        # receives the identical ``[[ep_rank]]`` int32 runtime tensor. <<<
+        rank_id = self.ep_rank_buf
 
         # --- LD-67 DECODE WITNESS (port-plan §14.3 item 2) ----------------
         # Stash per-layer summaries of the routing tensors handed to the
