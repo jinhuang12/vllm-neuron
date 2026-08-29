@@ -696,7 +696,27 @@ class DeepseekV4RoutedExperts(nn.Module):
         # identity — safe either way. The CPU fallback (``_torch_moe_impl``)
         # derives its token count from the affinity extent (T+1) and returns
         # ``[T+1, H]``, so the trim keeps the fallback numerically matched.
-        return output[:_t_real]
+        #
+        # --- ep19 P35 mechanism (b) ZERO-MASK (ITER-07 §6) -----------------
+        # On device, ``moe_cte`` (``bwmm_shard_on_I``) leaves output rows its
+        # blockwise mapping does not write holding the PREVIOUS execution's
+        # data (ITER-07-RAW-P35.attempt2: E_zero as the allocation's 1st
+        # execution is exact zero; the same inputs as its 3rd execution read
+        # back max_abs 4.156 on the idx-local rows), and the EP all-reduce in
+        # :meth:`forward` SUMS 64 ranks' stale rows into every token. A token
+        # whose local affinity row is all-zero contributes exactly zero from
+        # this rank, so mask those rows to zero on EVERY execution,
+        # independent of kernel buffer state. Plain traced torch ops — no
+        # python-side conditional on data — so the mask lives in the compiled
+        # graph. On CPU the fallback already writes zeros on those rows, so
+        # this is a numerical no-op on the CPU leg (graded by the apply_fix
+        # A/B). SCOPE: mechanism (b) only; the mapped-row numerics defect (a)
+        # (rel_F 0.037 > the 2e-2 C1 bound, inside the shard_on_i compute)
+        # is NOT addressed here and stays open at kernel granularity.
+        _has_local = (local_affinities != 0).any(dim=-1, keepdim=True)
+        return torch.where(
+            _has_local, output[:_t_real], torch.zeros_like(output[:_t_real])
+        )
 
     def _forward_decode(
         self, hidden_states: Tensor, expert_affinities: Tensor, expert_index: Tensor
