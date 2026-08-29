@@ -49,6 +49,78 @@ _DEFAULT_DTYPE_TOLERANCE = {
     torch.float32: (1.3e-6, 1e-5),
 }
 
+#: The pair an unregistered dtype falls through to. Single-sited on purpose:
+#: before ``resolve_dtype_tolerance`` existed this literal was duplicated at
+#: both consumer sites, so "how many dtypes fall through" had two answers.
+_FALLTHROUGH_DTYPE_TOLERANCE = (1.6e-2, 1e-5)
+
+#: fp8 comparison pair, in this map's own ``(rtol, atol)`` order -- which is the
+#: REVERSE of ``vllm_neuron.accuracy.constants.DEFAULT_TOLERANCE_MAP``'s
+#: ``(atol, rtol)``. Do not "normalise" one order to the other: doing so would
+#: set the fp8 rtol to 1e-5 and its atol to 3e-2, a three-orders-of-magnitude
+#: loosening that still reads plausibly.
+#:
+#: ``3e-2`` is the bf16 module guidance ``1e-2`` loosened 3x for fp8 block
+#: comparison; it is a recorded provenance value and is not retuned here.
+FP8_DTYPE_TOLERANCE = (3e-2, 1e-5)
+
+
+def _exposed_fp8_dtypes() -> tuple:
+    """Every distinct fp8 ``torch.dtype`` this interpreter's ``torch`` exposes.
+
+    Classified, never name-matched: a ``torch`` module attribute qualifies when
+    it *is* a ``torch.dtype`` instance, its ``itemsize`` is 1 byte, and its
+    ``str()`` names ``float8``. Results are de-duplicated by object identity,
+    so two attribute names bound to the same dtype count once.
+
+    The set is read off ``torch`` rather than hard-coded because which fp8
+    dtypes exist is a property of the installed ``torch``, not of this file.
+    Hard-coding the names would raise ``AttributeError`` at import on a build
+    that lacks one, and would silently miss any dtype a newer build adds --
+    which is exactly the hole the registration below exists to close.
+    """
+    found: list = []
+    for value in vars(torch).values():
+        if not isinstance(value, torch.dtype):
+            continue
+        if getattr(value, "itemsize", None) != 1 or "float8" not in str(value):
+            continue
+        if any(value is seen for seen in found):
+            continue
+        found.append(value)
+    return tuple(found)
+
+
+# Close the fp8 hole: without an EXPLICIT entry an fp8 comparison inherits
+# bf16's (1.6e-2, 1e-5) through the fall-through above, silently and with no
+# diagnostic. Every exposed fp8 dtype therefore gets a registered entry, so the
+# count of fp8 dtypes that fall through is zero by construction.
+_DEFAULT_DTYPE_TOLERANCE.update(
+    {dtype: FP8_DTYPE_TOLERANCE for dtype in _exposed_fp8_dtypes()}
+)
+
+
+def resolve_dtype_tolerance(dtype: torch.dtype) -> tuple:
+    """Resolve the ``(rtol, atol)`` pair registered for ``dtype``.
+
+    Extracted from the two inline ``_DEFAULT_DTYPE_TOLERANCE.get(...)``
+    expressions in this module so the applied tolerances are observable
+    directly. Through the inline sites they were reachable only by calling the
+    enclosing comparison function and inferring the pair from the allclose
+    boundary -- and at the diagnostic-report site they never appeared in a
+    return value at all.
+
+    Args:
+        dtype: The dtype of the tensor being compared.
+
+    Returns:
+        The registered ``(rtol, atol)`` pair, or
+        ``_FALLTHROUGH_DTYPE_TOLERANCE`` when the dtype is unregistered. Note
+        the order: ``[0]`` is **rtol** and ``[1]`` is **atol**, matching both
+        consumers below.
+    """
+    return _DEFAULT_DTYPE_TOLERANCE.get(dtype, _FALLTHROUGH_DTYPE_TOLERANCE)
+
 
 @dataclass
 class AssertCloseResult:
@@ -193,7 +265,7 @@ def _neuron_allclose(
         )
 
     if rtol is None or atol is None:
-        default = _DEFAULT_DTYPE_TOLERANCE.get(expected.dtype, (1.6e-2, 1e-5))
+        default = resolve_dtype_tolerance(expected.dtype)
         rtol = rtol if rtol is not None else default[0]
         atol = atol if atol is not None else default[1]
 
@@ -295,7 +367,7 @@ def assert_close(
 
         # Resolve effective tolerances for the diagnostic report (matches
         # _neuron_allclose default-resolution logic).
-        default = _DEFAULT_DTYPE_TOLERANCE.get(exp.dtype, (1.6e-2, 1e-5))
+        default = resolve_dtype_tolerance(exp.dtype)
         eff_rtol = rtol if rtol is not None else default[0]
         eff_atol = atol if atol is not None else default[1]
 

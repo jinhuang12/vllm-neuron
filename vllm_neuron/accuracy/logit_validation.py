@@ -21,7 +21,11 @@ torch.use_deterministic_algorithms(mode=True, warn_only=True)
 import numpy as np
 
 # Import types and utilities
-from .constants import DEFAULT_TOLERANCE_MAP, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE
+from .constants import (
+    DEFAULT_TOLERANCE_MAP,
+    DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE,
+    GLM5NEXT_ARCH,
+)
 from .logit_visualization import visualize_logit_results
 from .types import MultiPromptValidationResult
 
@@ -65,6 +69,30 @@ DEFAULT_AGGREGATE_CONFIG = {
     "agg_linf_multipliers": [1.2, 1.5],  # per-token: max_tgt_linf < N * max_base_linf
     "agg_l2_multipliers": [1.2, 1.5],  # per-token: max_tgt_l2 < N * max_base_l2
     "agg_sigma_ratio_threshold": 1.0,  # σ-ratio ≤ threshold passes
+}
+
+# Arch-scoped aggregate threshold config, ADDED BESIDE the shared default above
+# and never overwriting it: every registered architecture reads
+# DEFAULT_AGGREGATE_CONFIG, so retuning it in place would move all of them.
+#
+# COMPLETENESS IS LOAD-BEARING. Consumers read these keys through `.get` with
+# their own fallbacks, so a partial dict does not fail -- it silently gates on a
+# different number and still reports green. A missing "agg_bc_threshold", for
+# instance, downgrades 0.99 to the function-level fallback of 0.95. Every key
+# DEFAULT_AGGREGATE_CONFIG declares is therefore restated here explicitly, even
+# where the value is unchanged.
+ARCH_AGGREGATE_CONFIG = {
+    GLM5NEXT_ARCH: {
+        "pp_static_thresholds": [0.03, 0.05, 0.09],  # adds the 0.09 rung
+        "pp_linf_multipliers": [1.5, 2.0],
+        "pp_l2_multipliers": [1.5, 2.0],
+        "pp_tok_linf_multipliers": [1.5, 2.0],
+        "pp_tok_l2_multipliers": [1.5, 2.0],
+        "agg_bc_threshold": 0.99,
+        "agg_linf_multipliers": [1.2, 1.5],
+        "agg_l2_multipliers": [1.2, 1.5],
+        "agg_sigma_ratio_threshold": 1.0,
+    },
 }
 
 
