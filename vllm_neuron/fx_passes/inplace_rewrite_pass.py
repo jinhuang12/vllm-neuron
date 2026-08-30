@@ -9,6 +9,24 @@ from .base import FXPass
 logger = logging.getLogger(__name__)
 
 
+# View ops that preserve element order over a contiguous base, so a write
+# through the view can be materialized back to the base with a single
+# reshape of the out-of-place result.  Non-reshape views (transpose,
+# permute, slice, select, ...) would need a scatter-back instead and are
+# rejected loudly in _rewire_base_readers.
+_RESHAPE_ONLY_VIEWS = {
+    "view",
+    "reshape",
+    "flatten",
+    "unflatten",
+    "squeeze",
+    "unsqueeze",
+    "view_as",
+    "reshape_as",
+    "_unsafe_view",
+}
+
+
 class InPlaceToOutOfPlacePass(FXPass):
     """Convert in-place operations to out-of-place equivalents.
 
@@ -35,15 +53,17 @@ class InPlaceToOutOfPlacePass(FXPass):
             **kwargs: Additional arguments passed from the pass manager.
 
         Returns:
-            Tuple of (transformed GraphModule, empty metadata dict).
+            Tuple of (transformed GraphModule, conversion-count metadata dict
+            with keys ``inplace_methods``, ``copy_``, ``setitem`` and
+            ``base_reader_rewires``).
 
         Raises:
             RuntimeError: If the conversion fails.
         """
         try:
-            self._convert_inplace_ops(gm)
+            counts = self._convert_inplace_ops(gm)
             gm.recompile()
-            return gm, {}
+            return gm, counts
         except Exception as e:
             raise RuntimeError(f"Inplace to outofplace conversion failed: {e}") from e
 
@@ -66,17 +86,26 @@ class InPlaceToOutOfPlacePass(FXPass):
         outofplace_op = inplace_op[:-1]
         return outofplace_op if hasattr(torch.Tensor, outofplace_op) else None
 
-    def _convert_inplace_ops(self, gm: torch.fx.GraphModule) -> None:
+    def _convert_inplace_ops(self, gm: torch.fx.GraphModule) -> dict:
         """Convert in-place method calls on graph inputs to out-of-place equivalents.
 
         Args:
             gm: The FX GraphModule whose graph will be mutated in place.
+
+        Returns:
+            Conversion counts, keyed by conversion kind.
         """
+        counts = {
+            "inplace_methods": 0,
+            "copy_": 0,
+            "setitem": 0,
+            "base_reader_rewires": 0,
+        }
         # Snapshot the node list: we mutate the graph (erase/insert) during
         # iteration, so iterating over a live view would skip or revisit nodes.
         for node in list(gm.graph.nodes):
             if node.op == "call_function" and node.target == operator.setitem:
-                self._convert_setitem(gm, node)
+                self._convert_setitem(gm, node, counts)
                 continue
 
             # Only target single-trailing-underscore methods (e.g. add_, copy_).
@@ -88,6 +117,11 @@ class InPlaceToOutOfPlacePass(FXPass):
 
             # args[0] is always the tensor being mutated (self in method call).
             original_input = node.args[0]
+
+            # root_input is the base placeholder stashed by the aliasing pass
+            # when the mutation traces back through views.  Read it up front:
+            # the mutated view and the base need separate rewiring below.
+            root_input = node.meta.get("root_input")
 
             if node.target == "copy_":
                 source = node.args[1]
@@ -109,6 +143,10 @@ class InPlaceToOutOfPlacePass(FXPass):
                 node.replace_all_uses_with(slice_scatter)
                 gm.graph.erase_node(node)
                 self._update_subsequent_ops(gm, slice_scatter, original_input)
+                counts["copy_"] += 1
+                counts["base_reader_rewires"] += self._rewire_base_readers(
+                    gm, slice_scatter, original_input, root_input
+                )
                 continue
             else:
                 # General case: swap the in-place target for its out-of-place
@@ -118,6 +156,7 @@ class InPlaceToOutOfPlacePass(FXPass):
                 if not outofplace_op:
                     raise NotImplementedError(f"'{node.target}' is not supported")
                 node.target = outofplace_op
+                counts["inplace_methods"] += 1
 
             # Rename the node so later passes (and debug output) can tell
             # which input was modified.  root_input is set by the aliasing
@@ -131,18 +170,150 @@ class InPlaceToOutOfPlacePass(FXPass):
             # the new out-of-place result so the SSA form stays valid.
             self._update_subsequent_ops(gm, node, original_input)
 
+            # When the mutation went through a view chain, later readers that
+            # re-derive from the BASE tensor still bind the pre-mutation
+            # value; rewire them to a base-shaped updated tensor.
+            counts["base_reader_rewires"] += self._rewire_base_readers(
+                gm, node, original_input, root_input
+            )
+
+        return counts
+
+    # =========================================================================
+    # Base-reader rewiring for view-mediated mutations
+    # =========================================================================
+
+    def _is_reshape_only_view_chain(
+        self, view_node: torch.fx.Node, root_input: torch.fx.Node
+    ) -> bool:
+        """Return True if *view_node* derives from *root_input* purely through
+        element-order-preserving reshape-class views.
+
+        Args:
+            view_node: The view node the in-place op mutated.
+            root_input: The base placeholder the chain must terminate at.
+
+        Returns:
+            True if every hop from *view_node* back to *root_input* is in
+            ``_RESHAPE_ONLY_VIEWS``, False otherwise.
+        """
+        current = view_node
+        visited: set[torch.fx.Node] = set()
+        while isinstance(current, torch.fx.Node) and current not in visited:
+            if current is root_input:
+                return True
+            visited.add(current)
+
+            if current.op == "call_method" and isinstance(current.target, str):
+                op_name = current.target
+            elif current.op == "call_function":
+                # ATen targets may carry an overload suffix (e.g.
+                # "view.default") — strip it before checking the set.
+                op_name = getattr(current.target, "__name__", str(current.target))
+                op_name = op_name.split(".")[0] if "." in op_name else op_name
+            else:
+                return False
+
+            if op_name not in _RESHAPE_ONLY_VIEWS:
+                return False
+            if not current.args or not isinstance(current.args[0], torch.fx.Node):
+                return False
+            current = current.args[0]
+        return False
+
+    def _rewire_base_readers(
+        self,
+        gm: torch.fx.GraphModule,
+        result_node: torch.fx.Node,
+        mutated_input,
+        root_input,
+    ) -> int:
+        """Rewire post-mutation readers of the BASE tensor after converting a
+        view-mediated in-place op to its out-of-place form.
+
+        For ``flat = base.view(...); flat.index_put_(dest, vals)`` the
+        conversion produces a view-shaped out-of-place result whose later
+        VIEW uses are rewritten by ``_update_subsequent_ops`` — but a reader
+        that re-derives from the BASE (``base.reshape(...)``) still binds the
+        pre-mutation tensor, freezing a read-before-write into the lowered
+        HLO.  Materialize a base-shaped updated tensor from the result and
+        rewrite subsequent uses of the base to it (dominance-safe: only nodes
+        after the insertion point are rewritten).
+
+        Args:
+            gm: The FX GraphModule whose graph will be mutated.
+            result_node: The out-of-place result of the converted mutation.
+            mutated_input: The tensor the in-place op targeted (``args[0]``).
+            root_input: The base placeholder traced by the aliasing pass
+                (``node.meta['root_input']``), or None.
+
+        Returns:
+            1 if a base-shaped update was materialized and rewired, else 0.
+
+        Raises:
+            NotImplementedError: If the view chain is not reshape-only (a
+                scatter-back would be required).
+            RuntimeError: If the base placeholder carries no shape metadata.
+        """
+        if not isinstance(root_input, torch.fx.Node) or root_input is mutated_input:
+            return 0
+        if root_input.op != "placeholder":
+            return 0
+
+        # Nothing to fix if no node after the mutation still reads the base.
+        nodes_list = list(gm.graph.nodes)
+        start_idx = nodes_list.index(result_node) + 1
+        if not any(
+            root_input in later.all_input_nodes for later in nodes_list[start_idx:]
+        ):
+            return 0
+
+        if not self._is_reshape_only_view_chain(mutated_input, root_input):
+            raise NotImplementedError(
+                f"'{result_node.name}' mutates '{root_input.name}' through a "
+                f"non-reshape view chain; materializing the update would need "
+                f"a scatter-back, which is not implemented"
+            )
+
+        base_value = root_input.meta.get("example_value")
+        if base_value is None or not hasattr(base_value, "shape"):
+            raise RuntimeError(
+                f"cannot materialize base-shaped update for "
+                f"'{root_input.name}': placeholder has no example_value "
+                f"shape metadata"
+            )
+
+        with gm.graph.inserting_after(result_node):
+            updated_base = gm.graph.call_method(
+                "reshape", args=(result_node, list(base_value.shape))
+            )
+        updated_base.meta["example_value"] = base_value
+        updated_base.name = f"{root_input.name}_updated"
+
+        # Rewrite all downstream references from the base placeholder to the
+        # materialized post-mutation value so no reader sees the pre-write
+        # tensor.
+        self._update_subsequent_ops(gm, updated_base, root_input)
+        return 1
+
     # =========================================================================
     # setitem conversion
     # =========================================================================
 
-    def _convert_setitem(self, gm: torch.fx.GraphModule, node: torch.fx.Node) -> None:
+    def _convert_setitem(
+        self, gm: torch.fx.GraphModule, node: torch.fx.Node, counts: dict
+    ) -> None:
         """Convert ``operator.setitem(buf, idx, value)`` to scatter ops.
 
         Args:
             gm: The FX GraphModule whose graph will be mutated in place.
             node: The setitem node to convert.
+            counts: Conversion-count dict updated in place.
         """
         buf, idx, value = node.args
+
+        # Read the aliasing pass's base placeholder before the node is erased.
+        root_input = node.meta.get("root_input")
 
         with gm.graph.inserting_before(node):
             scatter_node = self._build_scatter(gm, buf, idx, value)
@@ -159,6 +330,13 @@ class InPlaceToOutOfPlacePass(FXPass):
         node.replace_all_uses_with(scatter_node)
         gm.graph.erase_node(node)
         self._update_subsequent_ops(gm, scatter_node, buf)
+        counts["setitem"] += 1
+
+        # When the write went through a view chain, rewire post-write readers
+        # of the BASE tensor to a base-shaped updated value.
+        counts["base_reader_rewires"] += self._rewire_base_readers(
+            gm, scatter_node, buf, root_input
+        )
 
     def _ensure_tensor_node(
         self, gm: torch.fx.GraphModule, value, buf
