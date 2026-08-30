@@ -1,0 +1,707 @@
+# SPDX-License-Identifier: Apache-2.0
+"""``inc-glm53f-013`` acceptance -- WP1: model skeleton and ``KVSpec``.
+
+THE DECLARED ACCEPTANCE (increment plan revision 12, L3589), verbatim:
+
+    "``get_kv_spec()`` returns a ``KVSpec`` whose ``layers`` list has
+    **exactly 45** ``LayerSpec`` entries, of which **11** carry MLA/DSA
+    geometry (``head_size == 512`` from ``kv_lora_rank``) and **34** carry KDA
+    geometry; **0** entries have ``dtype is None``."
+
+Four counted conjuncts, measured below as C01 / C02 / C03 / C04. The plan
+declares no exit code for this block and no collected-item count, so neither
+is claimed here: the exit code is the default and the item count is reported
+as measured.
+
+WHY EVERY IMPORT OF THE MODULE UNDER TEST IS DEFERRED
+-----------------------------------------------------
+``test_factory.py:283-284`` is a **landed passing assertion** that
+``vllm_neuron.model.glm5_next.model_fp8`` is *not* in ``sys.modules`` -- it is
+what proves ``factory.py:68``'s lazy import stays lazy. pytest imports **every
+collected test module during collection, before it runs any test**, so a
+module-level ``import model_fp8`` in this file would put the module in
+``sys.modules`` before ``test_factory.py``'s test body ever runs and would
+break that landed test -- and it would do so regardless of how the filenames
+sort. Alphabetical ordering protects the *execution* order, not the *import*
+order. So this module imports the implementation only inside test bodies and
+fixtures, via :func:`_impl`, and the filename stays ``test_kv_spec.py`` so it
+also executes after ``test_factory.py``.
+
+WHAT C03 DOES AND DOES NOT CERTIFY -- STATED, NOT GLOSSED
+---------------------------------------------------------
+C03 names no field and no value where C02 names both, so it is adjudicable
+only by **complement**: the 34 are the entries that are not the MLA/DSA 11,
+and by C01's total the count is arithmetic. A KDA layer holds a **recurrent
+state**, and the pin's ``LayerSpec`` has no vocabulary for one -- adding those
+fields is ``inc-glm53f-015``'s declared surface at M1. So the 34 entries are
+certified as *not MLA/DSA, present, and carrying a non-``None`` dtype*; they
+are **not** certified as describing a correct KDA cache, because no vocabulary
+for that exists at this milestone. That is a coverage limit, recorded here and
+measured by :func:`test_kv_spec_the_pin_dataclass_is_not_widened`, which also
+proves this increment did not pre-empt ``-015`` by widening ``kv_cache.py``.
+
+PARAMETER NAMES ARE DERIVED, NOT CHOSEN
+---------------------------------------
+Per ``approvals/lead-ruling-013-param-name-authority.md``, the landed weight
+map's param-name side is the authority for this skeleton's parameter attribute
+paths. :func:`test_kv_spec_declared_parameter_names_match_the_landed_weight_map`
+asserts that derivation as an exact set equality against
+``build_weight_mappings``, with a mutation arm proving the comparison can
+fail. That is not an acceptance conjunct -- C01-C04 are unchanged -- it is the
+ruling's derivation made mechanical.
+
+FALSIFIABILITY
+--------------
+Every counted reading carries an arm that would fail if the reading were
+vacuous: the 45/11/34 counts are re-derived from three independent bases and
+proved to follow the schedule rather than a constant; C04's counted zero is
+paired with a live positive control on the counter and with the ``None``
+branch of the dtype resolver it depends on; and the zero-allocation claim is
+proved live by allocating one parameter inside the same patched window.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+
+from vllm_neuron.model.glm5_next.config import DSA_LAYER_TYPE, Glm5NextTextConfig
+from vllm_neuron.model.glm5_next.weight_loaders_fp8 import build_weight_mappings
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.neuron_config import NeuronConfig
+
+# ---------------------------------------------------------------------------
+# Declared values, and the pins that keep them honest.
+# ---------------------------------------------------------------------------
+
+FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
+
+# Same digest ``test_config.py:50`` pins, so a silent fixture edit cannot move
+# a declared value here either.
+FIXTURE_SHA256 = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+
+#: C01.
+DECLARED_TOTAL_ENTRIES = 45
+#: C02.
+DECLARED_MLA_ENTRIES = 11
+#: C03.
+DECLARED_KDA_ENTRIES = 34
+#: C02's value, ``kv_lora_rank`` with a zero rotary slice.
+DECLARED_MLA_HEAD_SIZE = 512
+#: C04.
+DECLARED_NONE_DTYPE_ENTRIES = 0
+
+#: BASE 3 for the schedule, as ``test_config.py:54`` enumerates it from the
+#: intake record. Repeated as a literal rather than imported so the two files
+#: are independent bases and not one base read twice.
+INTAKE_RECORDED_DSA_INDICES = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43]
+
+#: The landed split ``test_config.py:57`` pins, as ``(num_kda, num_dsa)``.
+EXPECTED_LAYER_SPLIT = (34, 11)
+
+#: KDA geometry from ``linear_attn_config`` (``config.py:110-117``).
+DECLARED_KDA_HEAD_SIZE = 128
+DECLARED_KDA_NUM_HEADS = 64
+
+#: The pin's ``LayerSpec`` field set, in order (``kv_cache.py:16-21``).
+PIN_LAYER_SPEC_FIELDS = (
+    "name",
+    "num_kv_heads",
+    "head_size",
+    "dtype",
+    "sliding_window_size",
+    "chunk_size",
+)
+
+IMPL_MODULE = "vllm_neuron.model.glm5_next.model_fp8"
+
+_RESULTS_PATH = Path(
+    os.environ.get("VLLM_NEURON_INC013_RESULTS_JSON")
+    or Path(tempfile.gettempdir()) / "vllm_neuron_inc013_predicates.json"
+)
+_RESULTS: dict[str, Any] = {}
+_RESULTS_PATH.write_text("{}\n")  # truncate stale values from an earlier run
+
+
+def _record(**values: Any) -> None:
+    _RESULTS.update(values)
+    _RESULTS_PATH.write_text(
+        json.dumps(_RESULTS, indent=2, sort_keys=True, default=str) + "\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The deferred import (see the module docstring) and the fixtures.
+# ---------------------------------------------------------------------------
+
+
+def _impl():
+    """Import the implementation module INSIDE a test body, never at import."""
+    from vllm_neuron.model.glm5_next import model_fp8
+
+    return model_fp8
+
+
+def _raw() -> dict:
+    with open(FIXTURE_PATH) as f:
+        return json.load(f)
+
+
+@pytest.fixture(scope="module")
+def raw() -> dict:
+    return _raw()
+
+
+@pytest.fixture(scope="module")
+def model(raw: dict):
+    """The skeleton built from the landed 45-layer fixture.
+
+    Built through the classmethod ``factory.py:70-74`` actually calls, so the
+    acceptance exercises the pinned construction signature rather than a
+    convenience path.
+    """
+    return _impl().Glm5NextForConditionalGeneration.from_configs(
+        copy.deepcopy(raw),
+        text_neuron_config=None,
+        vision_neuron_config=None,
+    )
+
+
+@pytest.fixture(scope="module")
+def spec(model) -> KVSpec:
+    return model.get_kv_spec()
+
+
+def _mla_entries(spec: KVSpec) -> list[LayerSpec]:
+    return [
+        layer for layer in spec.layers if layer.head_size == DECLARED_MLA_HEAD_SIZE
+    ]
+
+
+def _kda_entries(spec: KVSpec) -> list[LayerSpec]:
+    """The COMPLEMENT of the MLA/DSA set -- the reading C03 compels."""
+    return [
+        layer for layer in spec.layers if layer.head_size != DECLARED_MLA_HEAD_SIZE
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The instrument is the instrument it claims to be.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_fixture_is_the_pinned_forty_five_layer_config(raw: dict) -> None:
+    """The 45-layer instrument, pinned by digest before anything counts it."""
+    digest = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
+    assert digest == FIXTURE_SHA256
+
+    text = raw["text_config"]
+    assert text["num_hidden_layers"] == DECLARED_TOTAL_ENTRIES
+    assert len(text["layer_types"]) == DECLARED_TOTAL_ENTRIES
+    assert text["kv_lora_rank"] == DECLARED_MLA_HEAD_SIZE
+    assert text["qk_rope_head_dim"] == 0
+    assert text["linear_attn_config"]["head_dim"] == DECLARED_KDA_HEAD_SIZE
+    _record(report_fixture_sha256=digest)
+
+
+def test_kv_spec_the_pin_dataclass_is_not_widened() -> None:
+    """``kv_cache.py`` carries the pin's SIX fields and nothing more.
+
+    Two things at once. It measures the limit C03's complement reading
+    carries -- there is no recurrent-state field for a KDA entry to fill --
+    and it proves this increment did not widen ``LayerSpec``, which is
+    ``inc-glm53f-015``'s declared surface at M1 and whose own acceptance
+    asserts the 6-field construction still works with zero signature breaks.
+    """
+    from dataclasses import fields
+
+    assert tuple(f.name for f in fields(LayerSpec)) == PIN_LAYER_SPEC_FIELDS
+    assert tuple(f.name for f in fields(KVSpec)) == ("layers",)
+
+    # The pin's exact 6-argument positional form still constructs.
+    probe = LayerSpec("layers.0.self_attn", 1, 512, torch.bfloat16, None, None)
+    assert probe.sliding_window_size is None
+    assert probe.chunk_size is None
+
+
+# ---------------------------------------------------------------------------
+# C01 -- exactly 45 LayerSpec entries.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_c01_the_spec_has_exactly_forty_five_layer_entries(
+    spec: KVSpec, model
+) -> None:
+    """C01, plus a second base: the entry count equals the stack depth."""
+    assert isinstance(spec, KVSpec)
+    assert len(spec.layers) == DECLARED_TOTAL_ENTRIES
+    assert all(isinstance(layer, LayerSpec) for layer in spec.layers)
+
+    # BASE 2 -- the module tree's own layer count, not the declared literal.
+    assert len(model.model.layers) == DECLARED_TOTAL_ENTRIES
+    # BASE 3 -- the config's declared depth.
+    assert model.text_config.num_hidden_layers == DECLARED_TOTAL_ENTRIES
+    _record(report_c01_entry_count=len(spec.layers))
+
+
+# ---------------------------------------------------------------------------
+# C02 -- 11 entries carry MLA/DSA geometry, head_size == 512.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_c02_eleven_entries_carry_the_mla_latent_geometry(
+    spec: KVSpec, model
+) -> None:
+    """C02, with the positions checked against three independent bases."""
+    mla = _mla_entries(spec)
+    assert len(mla) == DECLARED_MLA_ENTRIES
+
+    positions = [
+        index
+        for index, layer in enumerate(spec.layers)
+        if layer.head_size == DECLARED_MLA_HEAD_SIZE
+    ]
+    # BASE 1 -- the fixture's own schedule, read through the config accessor.
+    assert positions == model.text_config.dsa_layer_indices
+    # BASE 2 -- the indices enumerated in the intake record.
+    assert positions == INTAKE_RECORDED_DSA_INDICES
+    # BASE 3 -- the 3:1 interleave rule, arithmetically.
+    assert positions == [
+        index for index in range(DECLARED_TOTAL_ENTRIES) if index % 4 == 3
+    ]
+
+    for layer in mla:
+        assert layer.name.endswith(".self_attn")
+        assert layer.head_size == DECLARED_MLA_HEAD_SIZE
+        assert layer.num_kv_heads == 1, "the MLA latent is one replicated KV head"
+        assert layer.chunk_size is None
+    _record(report_c02_mla_entry_count=len(mla), report_c02_positions=positions)
+
+
+def test_kv_spec_c02_the_head_size_is_the_latent_width_not_a_literal(model) -> None:
+    """512 is ``kv_lora_rank + qk_rope_head_dim``, and the rope slice is 0.
+
+    Non-vacuity for C02's value: the number is derived from two config fields
+    whose sum is asserted, so a hard-coded 512 in the resolver would not
+    survive the mutation arm below.
+    """
+    impl = _impl()
+    text_config = model.text_config
+    assert text_config.kv_lora_rank == DECLARED_MLA_HEAD_SIZE
+    assert text_config.qk_rope_head_dim == 0
+    assert text_config.mla_use_nope is True
+    assert impl._resolve_mla_head_size(text_config) == DECLARED_MLA_HEAD_SIZE
+
+    # MUTATION ARM: a config with a rotary slice must widen the latent.
+    with_rope = Glm5NextTextConfig(kv_lora_rank=512, qk_rope_head_dim=64)
+    assert impl._resolve_mla_head_size(with_rope) == 576
+
+
+# ---------------------------------------------------------------------------
+# C03 -- 34 entries carry KDA geometry, by complement.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_c03_thirty_four_entries_carry_the_kda_geometry(
+    spec: KVSpec, model
+) -> None:
+    """C03 by complement, and the complement is exhaustive.
+
+    The partition is unambiguous because ``128 != 512``: no KDA entry can be
+    mistaken for an MLA/DSA one, and the two counts sum to C01's total.
+    """
+    kda = _kda_entries(spec)
+    assert len(kda) == DECLARED_KDA_ENTRIES
+    assert len(kda) + len(_mla_entries(spec)) == DECLARED_TOTAL_ENTRIES
+
+    positions = [
+        index
+        for index, layer in enumerate(spec.layers)
+        if layer.head_size != DECLARED_MLA_HEAD_SIZE
+    ]
+    assert positions == model.text_config.kda_layer_indices
+
+    for layer in kda:
+        assert layer.name.endswith(".linear_attn")
+        assert layer.head_size == DECLARED_KDA_HEAD_SIZE
+        assert layer.head_size != DECLARED_MLA_HEAD_SIZE
+        assert layer.num_kv_heads == DECLARED_KDA_NUM_HEADS
+    _record(report_c03_kda_entry_count=len(kda))
+
+
+def test_kv_spec_the_split_reproduces_the_landed_config_pins(spec: KVSpec) -> None:
+    """The pair ``(34, 11)`` that ``test_config.py:57`` already pins.
+
+    Asserted as ONE pair, never as two independent equalities, for the same
+    reason ``test_config.py:9-14`` gives.
+    """
+    measured = (len(_kda_entries(spec)), len(_mla_entries(spec)))
+    assert measured == EXPECTED_LAYER_SPLIT
+    assert sum(measured) == DECLARED_TOTAL_ENTRIES
+    _record(report_layer_split=list(measured))
+
+
+def test_kv_spec_the_counts_follow_the_schedule_and_not_a_constant(raw: dict) -> None:
+    """MUTATION ARM for C01-C03: move one layer, and the counts must move.
+
+    Flipping layer 0 from KDA to DSA keeps the partition a valid exhaustive
+    one over 45 layers but makes the pair ``(33, 12)``. A ``get_kv_spec`` that
+    returned the declared numbers as constants would fail here.
+    """
+    mutated = copy.deepcopy(raw)
+    mutated["text_config"]["layer_types"][0] = DSA_LAYER_TYPE
+
+    model = _impl().Glm5NextForConditionalGeneration.from_configs(mutated)
+    spec = model.get_kv_spec()
+
+    assert len(spec.layers) == DECLARED_TOTAL_ENTRIES
+    assert len(_mla_entries(spec)) == DECLARED_MLA_ENTRIES + 1
+    assert len(_kda_entries(spec)) == DECLARED_KDA_ENTRIES - 1
+    assert spec.layers[0].name.endswith(".self_attn")
+    assert spec.layers[0].head_size == DECLARED_MLA_HEAD_SIZE
+
+
+def test_kv_spec_every_entry_name_is_unique_and_family_tagged(spec: KVSpec) -> None:
+    """45 distinct names, each carrying its family's module path.
+
+    ``inc-glm53f-016`` (M1) has to split the runner's spec dict **34 KDA / 11
+    DSA** by *"the model's layer names"*, so the names must distinguish the
+    families rather than merely being unique.
+    """
+    names = [layer.name for layer in spec.layers]
+    assert len(set(names)) == DECLARED_TOTAL_ENTRIES
+    assert names == [
+        f"layers.{index}."
+        + ("self_attn" if index in INTAKE_RECORDED_DSA_INDICES else "linear_attn")
+        for index in range(DECLARED_TOTAL_ENTRIES)
+    ]
+    assert sum(1 for name in names if name.endswith(".linear_attn")) == (
+        DECLARED_KDA_ENTRIES
+    )
+    assert sum(1 for name in names if name.endswith(".self_attn")) == (
+        DECLARED_MLA_ENTRIES
+    )
+    _record(report_entry_names_sample=names[:5])
+
+
+# ---------------------------------------------------------------------------
+# C04 -- 0 entries have ``dtype is None``.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_c04_no_entry_has_a_none_dtype(spec: KVSpec, model) -> None:
+    """C04, the counted zero, plus what every dtype actually is."""
+    none_dtypes = [layer for layer in spec.layers if layer.dtype is None]
+    assert len(none_dtypes) == DECLARED_NONE_DTYPE_ENTRIES
+
+    for layer in spec.layers:
+        assert isinstance(layer.dtype, torch.dtype)
+        assert layer.dtype is model.text_config.torch_dtype
+    assert model.text_config.torch_dtype is torch.bfloat16
+    _record(
+        report_c04_none_dtype_count=len(none_dtypes),
+        report_c04_dtypes=sorted({str(layer.dtype) for layer in spec.layers}),
+    )
+
+
+def test_kv_spec_c04_the_none_dtype_counter_is_proved_live(spec: KVSpec) -> None:
+    """POSITIVE CONTROL for C04: without this the zero above proves nothing.
+
+    The same predicate, over a population deliberately driven non-zero. This
+    is an instrument-liveness arm on the counter, not a change to C04 -- the
+    criterion and its expected value are untouched.
+    """
+    counted = [layer for layer in spec.layers if layer.dtype is None]
+    assert counted == []
+
+    salted = [*spec.layers, LayerSpec("probe", 1, 512, None)]
+    assert len([layer for layer in salted if layer.dtype is None]) == 1
+
+
+def test_kv_spec_c04_the_kda_state_dtype_resolver_has_a_live_none_branch() -> None:
+    """C04's zero rests on a resolver with a real ``None`` branch.
+
+    ``NeuronConfig.kda_state_dtype`` is declared as a dtype **name** with
+    *"None = follow the model's own dtype"* (``neuron_config.py:181-184``), so
+    the KDA entries' dtype comes from a resolution with three outcomes. All
+    three are exercised, and the ``None`` input is the one that would put a
+    ``None`` dtype into a ``LayerSpec`` if the fallback were missing.
+    """
+    impl = _impl()
+
+    # None override -> the model's own dtype, never None.
+    unset = Glm5NextTextConfig(neuron_config=NeuronConfig())
+    assert unset.neuron_config.kda_state_dtype is None
+    assert impl._resolve_kda_state_dtype(unset) is torch.bfloat16
+
+    # No neuron_config at all -> same fallback.
+    bare = Glm5NextTextConfig()
+    assert bare.neuron_config is None
+    assert impl._resolve_kda_state_dtype(bare) is torch.bfloat16
+
+    # A named override is honoured and coerced off the string.
+    named = Glm5NextTextConfig(neuron_config=NeuronConfig(kda_state_dtype="float32"))
+    assert impl._resolve_kda_state_dtype(named) is torch.float32
+
+    # A name that is not a dtype is raised, not passed through as a str.
+    with pytest.raises(ValueError, match="does not name a torch dtype"):
+        impl._resolve_kda_state_dtype(
+            Glm5NextTextConfig(neuron_config=NeuronConfig(kda_state_dtype="not_a_dtype"))
+        )
+
+
+def test_kv_spec_the_kda_state_dtype_override_reaches_the_spec(raw: dict) -> None:
+    """The resolver is wired: an override moves the 34 KDA entries only."""
+    model = _impl().Glm5NextForConditionalGeneration.from_configs(
+        copy.deepcopy(raw),
+        text_neuron_config=NeuronConfig(kda_state_dtype="float32"),
+    )
+    spec = model.get_kv_spec()
+
+    kda = _kda_entries(spec)
+    mla = _mla_entries(spec)
+    assert len(kda) == DECLARED_KDA_ENTRIES
+    assert all(layer.dtype is torch.float32 for layer in kda)
+    assert all(layer.dtype is torch.bfloat16 for layer in mla)
+    assert [layer for layer in spec.layers if layer.dtype is None] == []
+
+
+# ---------------------------------------------------------------------------
+# The skeleton is a skeleton: no allocation, and every compute site a stub.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_building_the_tree_allocates_no_parameters(
+    raw: dict, monkeypatch
+) -> None:
+    """45 layers of 4096 hidden with 288 routed experts, allocating nothing.
+
+    This is what makes the acceptance runnable in CPU mode at the real depth
+    instead of narrowed to a mini config, and it is measured rather than
+    asserted: the same counter is proved live inside the same patched window
+    by allocating one parameter on purpose. Shape borrowed from
+    ``test_factory.py:255-278``.
+    """
+    impl = _impl()
+    created: list[type] = []
+    original_new = torch.nn.Parameter.__new__
+
+    def counting_new(cls, *args, **kwargs):
+        created.append(cls)
+        return original_new(cls, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.Parameter, "__new__", staticmethod(counting_new))
+
+    model = impl.Glm5NextForConditionalGeneration.from_configs(copy.deepcopy(raw))
+    spec = model.get_kv_spec()
+
+    assert len(spec.layers) == DECLARED_TOTAL_ENTRIES
+    assert created == [], f"building the skeleton allocated {len(created)} Parameter(s)"
+
+    # POSITIVE CONTROL, same window.
+    torch.nn.Parameter(torch.zeros(1))
+    assert len(created) == 1
+    _record(report_parameters_allocated=0)
+
+
+def test_kv_spec_declared_parameters_are_reserved_and_unmaterialised(model) -> None:
+    """A declared name resolves to ``None`` and is skipped by torch's walks.
+
+    Both halves matter: the attribute path exists (so a later increment fills
+    a name that is already there), and ``named_parameters()`` / ``state_dict``
+    stay empty (so nothing here pretends to be a loadable weight).
+    """
+    layer_zero = model.model.layers[0]
+    assert layer_zero.input_layernorm_weight is None
+    assert "input_layernorm_weight" in layer_zero._parameters
+
+    assert list(model.named_parameters()) == []
+    assert model.state_dict() == {}
+
+
+def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
+    """Forward raises everywhere -- the substrate declaration's own ground.
+
+    This increment is declared NON-KERNEL-CLASS because every compute site is
+    a stub, so "a stub computes nothing" is a property worth measuring rather
+    than promising: a later increment that quietly implemented a torch
+    forward here would change that declaration and this test would fail.
+    """
+    impl = _impl()
+    with pytest.raises(NotImplementedError):
+        model.forward()
+    with pytest.raises(NotImplementedError):
+        model.model.forward()
+
+    modules = [model.model.layers[index] for index in (0, 3)]
+    modules += [model.model.layers[0].linear_attn, model.model.layers[0].mlp]
+    modules += [
+        model.model.layers[3].self_attn,
+        model.model.layers[3].self_attn.indexer,
+        model.model.layers[3].mlp,
+        model.model.layers[3].mlp.experts,
+        model.model.layers[3].mlp.shared_experts,
+    ]
+    for module in modules:
+        with pytest.raises(NotImplementedError):
+            module.forward()
+
+    # The two reserved names that are not wired into the tree.
+    with pytest.raises(NotImplementedError):
+        impl.Glm5NextQuantConfig()
+    with pytest.raises(NotImplementedError):
+        impl.Glm5NextHyperConnection().forward()
+
+
+def test_kv_spec_the_tree_carries_every_d14_section_name(model) -> None:
+    """D14's table names the sections later increments scope against.
+
+    ``-013`` is the creator of a coordinated merge point, so every name in
+    that table must exist when this increment lands, or eleven later
+    increments have no declared scope to write into.
+    """
+    impl = _impl()
+    for name in (
+        "Glm5NextQuantConfig",
+        "Glm5NextMoEBlock",
+        "Glm5NextHyperConnection",
+        "Glm5NextKDALayer",
+        "Glm5NextMLAAttention",
+        "Glm5NextDSALayer",
+    ):
+        assert hasattr(impl, name), f"D14 section name {name} is missing"
+
+    assert isinstance(model.model.layers[0], impl.Glm5NextKDALayer)
+    assert isinstance(model.model.layers[3], impl.Glm5NextDSALayer)
+    assert isinstance(model.model.layers[3].self_attn, impl.Glm5NextMLAAttention)
+    assert isinstance(model.model.layers[3].mlp, impl.Glm5NextMoEBlock)
+    assert isinstance(model.model.layers[0].mlp, impl.Glm5NextDenseMLP)
+
+
+# ---------------------------------------------------------------------------
+# The lead ruling's derivation: the landed weight map is the authority for
+# this skeleton's parameter attribute paths.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_declared_parameter_names_match_the_landed_weight_map(model) -> None:
+    """Exact set equality against ``build_weight_mappings``'s param-name side.
+
+    Per ``approvals/lead-ruling-013-param-name-authority.md``, the landed,
+    passing map is the authority and this skeleton derives from it. Neither
+    side is renamed here: this asserts the derivation, so a divergence is a
+    red test at CPU-mode rung 1 instead of a defect that surfaces only when a
+    real checkpoint is loaded on hardware.
+
+    NOT an acceptance conjunct -- C01-C04 are untouched.
+    """
+    declared = set(model.declared_parameter_names())
+    mapped = set(build_weight_mappings(model.text_config).keys())
+
+    assert declared == mapped, (
+        f"skeleton-only names: {sorted(declared - mapped)}; "
+        f"map-only names: {sorted(mapped - declared)}"
+    )
+    # No name is declared twice under the same path.
+    assert len(model.declared_parameter_names()) == len(declared)
+    _record(
+        report_declared_parameter_count=len(declared),
+        report_mapped_parameter_count=len(mapped),
+    )
+
+
+def test_kv_spec_the_map_comparison_is_proved_live(model) -> None:
+    """MUTATION ARM: the set equality above must be able to fail.
+
+    Without this, a comparison of two empty sets would pass and certify
+    nothing.
+    """
+    declared = set(model.declared_parameter_names())
+    mapped = set(build_weight_mappings(model.text_config).keys())
+    assert declared, "the skeleton declared no parameter names at all"
+    assert mapped, "the landed map produced no parameter names at all"
+
+    dropped = sorted(declared)[0]
+    assert (declared - {dropped}) != mapped
+
+
+def test_kv_spec_the_quantised_flag_does_not_move_the_param_name_side(model) -> None:
+    """The map's ``quantised`` switch changes checkpoint keys, not param names.
+
+    So the derivation above is a statement about the skeleton and the map's
+    parameter side only, and cannot be satisfied by accident on one setting
+    of a flag this increment does not own.
+    """
+    quantised = set(build_weight_mappings(model.text_config, quantised=True))
+    plain = set(build_weight_mappings(model.text_config, quantised=False))
+    assert quantised == plain
+    assert set(model.declared_parameter_names()) == quantised
+
+
+def test_kv_spec_the_tied_head_condition_mirrors_the_map(raw: dict) -> None:
+    """``lm_head_weight`` is declared iff the map declares it.
+
+    The map omits the key when ``tie_word_embeddings`` is set
+    (``weight_loaders_fp8.py:318-319``); the skeleton must omit the parameter
+    on the same condition or the two sides disagree on that one name.
+    """
+    tied = copy.deepcopy(raw)
+    tied["tie_word_embeddings"] = True
+
+    model = _impl().Glm5NextForConditionalGeneration.from_configs(tied)
+    declared = set(model.declared_parameter_names())
+    mapped = set(build_weight_mappings(model.text_config).keys())
+
+    assert model.text_config.tie_word_embeddings is True
+    assert "lm_head_weight" not in declared
+    assert declared == mapped
+
+
+# ---------------------------------------------------------------------------
+# Reporting -- the readings the evidence record quotes.
+#
+# NO P4 GUARD LIVES HERE, DELIBERATELY. An in-test screen for the run-wide
+# NxDI-import prohibition would have to carry the forbidden module prefix as a
+# string literal, which is itself a textual hit against the mechanical scan
+# that ``record_changeset`` runs over added lines -- a self-inflicted false
+# positive on a screen this increment does not own the shape of. Writing the
+# literal in split form to evade that scan would be worse: never soften a
+# run-wide guard to make one's own diff read clean. The prohibition is
+# enforced where it belongs, over the branch diff at ``record_changeset`` and
+# again at implementation review. This module tree imports torch, the local
+# config, ``kv_cache`` and ``neuron_config``, and nothing else.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_reports_the_measured_readings(spec: KVSpec, model) -> None:
+    """Write the measured values out; pytest swallows stdout on a pass."""
+    _record(
+        report_total_entries=len(spec.layers),
+        report_mla_entries=len(_mla_entries(spec)),
+        report_kda_entries=len(_kda_entries(spec)),
+        report_none_dtype_entries=len(
+            [layer for layer in spec.layers if layer.dtype is None]
+        ),
+        report_world_size=model.world_size,
+        report_kda_head_size=_kda_entries(spec)[0].head_size,
+        report_kda_num_kv_heads=_kda_entries(spec)[0].num_kv_heads,
+        report_mla_head_size=_mla_entries(spec)[0].head_size,
+        report_mla_num_kv_heads=_mla_entries(spec)[0].num_kv_heads,
+        report_chunk_sizes=sorted(
+            {str(layer.chunk_size) for layer in spec.layers}
+        ),
+        report_sliding_windows=sorted(
+            {str(layer.sliding_window_size) for layer in spec.layers}
+        ),
+        report_impl_module=IMPL_MODULE,
+        report_results_path=str(_RESULTS_PATH),
+    )
+    assert _RESULTS_PATH.exists()
