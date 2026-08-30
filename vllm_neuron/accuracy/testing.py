@@ -768,3 +768,93 @@ def _flatten_tensor_pairs(actual, expected, prefix=""):
             pairs.extend(_flatten_tensor_pairs(a, e, f"{prefix}[{i}]"))
         return pairs
     raise TypeError(f"Type mismatch: {type(actual)} vs {type(expected)}")
+
+
+#: Verbatim prefix every uncomparable-pair failure carries. A caller matches on
+#: this rather than on a message body, and a silent falsey return is never used
+#: to report an uncomparable pair.
+_UNCOMPARABLE_LOGIT_PAIR = "uncomparable logit pair"
+
+
+def assert_close_logit_pair(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rtol: float = None,
+    atol: float = None,
+    equal_nan_inf: bool = False,
+    name: str = "logit_pair",
+) -> AssertCloseResult:
+    """Adapt one aligned logit pair into an ``AssertCloseResult``.
+
+    The validation entry points in :mod:`vllm_neuron.accuracy.logit_validation`
+    compare logits internally and report a pass/fail summary; they do not yield
+    a result object. This adapter closes that join: given the aligned
+    actual/expected logit pair those entry points expose (see
+    ``logit_validation(..., logit_pair_sink=...)``), it returns the same
+    ``AssertCloseResult`` family the tensor comparators in this module produce.
+
+    It is deliberately a *tensor-level* adapter with no knowledge of how the
+    pair was produced. Everything modality-specific stays on the producing
+    side, which is what keeps the two return contracts separate: no existing
+    signature or return annotation in either module is widened by this
+    function's existence.
+
+    Tolerance provenance is explicit and carries no literal of its own: an
+    unspecified ``rtol``/``atol`` is resolved from the registered pair for
+    ``expected``'s dtype via :func:`resolve_dtype_tolerance`, so this function
+    authors no tolerance and no threshold.
+
+    Args:
+        actual: Target logits, any shape, aligned elementwise with ``expected``.
+        expected: Reference logits of the same shape and dtype.
+        rtol: Relative tolerance. Defaults to the registered value for
+            ``expected.dtype``.
+        atol: Absolute tolerance. Defaults to the registered value for
+            ``expected.dtype``.
+        equal_nan_inf: If True, matching NaN and matching same-sign infinities
+            compare equal -- useful for logits carrying masked ``-inf`` entries.
+        name: Label carried in failure messages.
+
+    Returns:
+        The ``AssertCloseResult`` produced for the pair, pass or fail. A pair
+        that compares badly still returns a result; the caller reads
+        ``allclose``.
+
+    Raises:
+        TypeError: If either side is not a ``torch.Tensor``.
+        ValueError: If the two sides disagree in shape or in dtype.
+
+        Both carry the verbatim prefix ``uncomparable logit pair`` and the
+        offending type. An uncomparable pair raises rather than returning a
+        falsey result, because a plain false answer is exactly the ambiguity
+        this adapter exists to remove.
+    """
+    for side, tensor in (("actual", actual), ("expected", expected)):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"{_UNCOMPARABLE_LOGIT_PAIR}: {name}: {side} is not a torch.Tensor; "
+                f"offending_type={type(tensor)!r}"
+            )
+
+    if actual.shape != expected.shape:
+        raise ValueError(
+            f"{_UNCOMPARABLE_LOGIT_PAIR}: {name}: shape mismatch "
+            f"actual={tuple(actual.shape)} expected={tuple(expected.shape)}; "
+            f"offending_type={type(actual)!r} dtype={actual.dtype}"
+        )
+
+    if actual.dtype != expected.dtype:
+        raise ValueError(
+            f"{_UNCOMPARABLE_LOGIT_PAIR}: {name}: dtype mismatch "
+            f"actual={actual.dtype} expected={expected.dtype}; "
+            f"offending_type={type(actual)!r} dtype={actual.dtype}"
+        )
+
+    if rtol is None or atol is None:
+        registered_rtol, registered_atol = resolve_dtype_tolerance(expected.dtype)
+        rtol = rtol if rtol is not None else registered_rtol
+        atol = atol if atol is not None else registered_atol
+
+    return _neuron_allclose(
+        actual, expected, rtol=rtol, atol=atol, equal_nan_inf=equal_nan_inf
+    )
