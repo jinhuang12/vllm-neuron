@@ -626,3 +626,477 @@ def scale_keys(keys: Iterable[str]) -> tuple[str, ...]:
 # the blockwise-FP8 scale loaders and the 240-max downscale-and-compensate.
 # Nothing above this line reads a tensor value.
 # --------------------------------------------------------------------------- #
+
+# ===========================================================================
+# inc-glm53f-012 -- WP1: block-fp8 scale loading with the 240-max downscale
+# ===========================================================================
+#
+# WHY THE IMPORTS FOR THIS HALF ARE HERE AND NOT AT THE TOP OF THE MODULE
+# ----------------------------------------------------------------------
+# The increment plan declares this increment's change to this file a **pure
+# addition** -- "no line ``inc-glm53f-011`` landed moves" -- and inserting an
+# import into the module's header block moves every one of the 628 lines below
+# it. Python resolves module-level imports wherever they appear, so the
+# constraint and the language agree here: this half's imports live in this
+# half's section. The diff for this file is therefore an append, and that is
+# checkable with ``git diff`` rather than asserted.
+
+import torch
+
+from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
+
+from .quantization import DEFAULT_WEIGHT_BLOCK_SIZE
+
+# --------------------------------------------------------------------------- #
+# Blockwise-FP8 range constants
+# --------------------------------------------------------------------------- #
+#
+# Trn2's kernels read fp8 SBUF as legacy ``nl.float8_e4m3`` (max finite 240),
+# while this checkpoint's bytes are OCP ``float8_e4m3fn`` (max finite 448). The
+# two encodings share a bit layout for every finite magnitude at or below 240,
+# so squeezing the bytes into the 240 range and compensating the per-block
+# dequant scale by the inverse factor preserves the dequantised tensor without
+# reinterpreting a single byte pattern. This is the same downscale-plus-
+# compensation as ``model/llama3/weight_loaders_static_fp8.py:51-110``, moved
+# from per-parameter to per-block granularity.
+
+#: The dtype the squeezed bytes are stored in. OCP ``float8_e4m3fn``, exactly as
+#: the llama3 static path stores them: the grid of representable magnitudes at or
+#: below 240 is shared with legacy ``e4m3``, so the trn2 kernel's
+#: reinterpretation of these bytes is value-preserving.
+_FP8_DTYPE = torch.float8_e4m3fn
+
+#: Legacy ``nl.float8_e4m3`` max finite magnitude (trn2).
+_FP8_E4M3_MAX = 240.0
+
+#: OCP ``float8_e4m3fn`` max finite magnitude (the checkpoint's scale space).
+_FP8_E4M3FN_MAX = 448.0
+
+#: Applied to the weight bytes.
+_FP8_WEIGHT_DOWNSCALE = _FP8_E4M3_MAX / _FP8_E4M3FN_MAX
+
+#: Applied to the per-block dequant scales -- the exact inverse, so the product
+#: ``byte * scale`` is preserved up to the bytes' own re-quantisation.
+_FP8_SCALE_COMPENSATION = _FP8_E4M3FN_MAX / _FP8_E4M3_MAX
+
+#: Floor for a stored per-block dequant scale.
+#:
+#: **Defined here, not imported.** The value is the increment plan's
+#: (``design/increment-plan.md`` L3582-L3583, ``MINVAL = 1e-5``); it appears
+#: nowhere else in this tree and it is **not** a registered comparator, so
+#: nothing about it is frozen by the acceptance pre-registration.
+#:
+#: What it protects: ``activation_scheme`` is ``"dynamic"``, so the consuming
+#: path derives activation scales at runtime from these weight scales, and a
+#: block whose scale has collapsed towards zero (an all-zero weight tile, or a
+#: quantiser that emitted a denormal) turns that reciprocal into ``inf``/``NaN``
+#: and poisons the whole matmul. Flooring the stored scale keeps the reciprocal
+#: finite. The floor is reported per block rather than applied silently -- see
+#: :class:`BlockScaleCompensation.floored_blocks`.
+MINVAL = 1e-5
+
+
+# --------------------------------------------------------------------------- #
+# The platform gate -- CONDITIONAL, per lead ruling
+# --------------------------------------------------------------------------- #
+
+
+def resolved_fp8_clamp_max() -> float:
+    """The FP8 clamp the vendor resolved for this process, read at call time.
+
+    Reads :data:`vllm_neuron.utils.dtype_utils.FP8_CLAMP_MAX` through the module
+    rather than binding it with a ``from`` import, so this half never takes an
+    import-time snapshot of a value the vendor already resolved once at *its*
+    import time (``dtype_utils.py:41``).
+
+    The import is **lazy** on purpose. ``dtype_utils`` imports
+    ``libtorch_neuronx_lite`` at module scope, and ``inc-glm53f-011``'s half of
+    this file -- with its own passing tests -- must keep importing on a host
+    where that vendor package is unavailable. A module-scope import here would
+    make the skeleton half's importability depend on the numerics half's
+    platform dependency.
+    """
+    from vllm_neuron.utils import dtype_utils
+
+    return dtype_utils.FP8_CLAMP_MAX
+
+
+def needs_240_downscale() -> bool:
+    """True iff the resolved platform clamp is 240.0 -- the trn2 squeeze.
+
+    **The downscale is CONDITIONAL, never unconditional.** Per
+    ``approvals/lead-ruling-012-downscale-gate.md``: the squeeze exists because
+    trn2's fp8 maximum is 240.0 while the checkpoint's OCP scale space is
+    448.0-max, so *"the downscale applies IFF the resolved platform clamp is
+    240.0 … On a 448.0-max platform an unconditional 240/448 rescale would
+    corrupt correct weights"*. The condition is expressed against the vendor's
+    own resolution rather than a second platform query of this module's own.
+
+    Why the clamp and not ``get_platform_target()`` directly, which is what the
+    llama3 static path uses (``weight_loaders_static_fp8.py:62-66``): that
+    helper has **no CPU-mode fallback**, so a copy of it raises ``RuntimeError``
+    on a bare CPU host with no NRT. ``_resolve_fp8_clamp_max()`` handles exactly
+    that case (``dtype_utils.py:25-32``), and the clamp it returns *is* the
+    quantity this squeeze is about.
+
+    Not exercised in both directions by this increment's acceptance, and that is
+    a recorded limitation rather than an oversight: the pinned Tier T instrument
+    fixes ``NEURON_PLATFORM_TARGET_OVERRIDE=trn2`` before collection
+    (``test/conftest.py:23-25``), so it cannot discriminate the two readings.
+    The ruling declines a trn3/448 discriminating test as out of this
+    increment's scope (ruling item 3).
+    """
+    return resolved_fp8_clamp_max() == _FP8_E4M3_MAX
+
+
+# --------------------------------------------------------------------------- #
+# The block grid
+# --------------------------------------------------------------------------- #
+
+
+def block_grid_shape(
+    weight_shape: tuple[int, ...],
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+) -> tuple[int, int]:
+    """The ``(rows, cols)`` shape of the scale grid a weight of this shape needs.
+
+    Ceiling division on both axes: a real projection dimension is not always a
+    multiple of the block edge, and the checkpoint ships a partial tile's scale
+    rather than dropping it.
+    """
+    if len(weight_shape) != 2:
+        raise Glm5NextWeightMapError(
+            f"blockwise FP8 expects a 2-D weight, got shape {tuple(weight_shape)}"
+        )
+    rows, cols = weight_shape
+    block_rows, block_cols = block_size
+    return (
+        (rows + block_rows - 1) // block_rows,
+        (cols + block_cols - 1) // block_cols,
+    )
+
+
+def _require_grid(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    block_size: tuple[int, int],
+) -> tuple[int, int]:
+    """Check the scale grid against the weight, and return the expected shape."""
+    expected = block_grid_shape(tuple(weight.shape), block_size)
+    if tuple(scale_inv.shape) != expected:
+        raise Glm5NextWeightMapError(
+            f"scale grid shape {tuple(scale_inv.shape)} does not match a "
+            f"{tuple(weight.shape)} weight at block size {block_size}: "
+            f"expected {expected}"
+        )
+    return expected
+
+
+def expand_block_scales(
+    scale_inv: torch.Tensor,
+    weight_shape: tuple[int, ...],
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Broadcast a ``[grid_rows, grid_cols]`` scale grid to the weight's shape.
+
+    Repeat-interleave then slice, so a partial edge tile is truncated to the
+    weight's real extent instead of padding the weight up to a whole tile.
+    """
+    rows, cols = weight_shape
+    block_rows, block_cols = block_size
+    expanded = scale_inv.repeat_interleave(block_rows, dim=0).repeat_interleave(
+        block_cols, dim=1
+    )
+    return expanded[:rows, :cols]
+
+
+def dequantise_blockwise(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Dequantise blockwise-FP8 bytes: ``byte * scale_inv[block]``, in fp32.
+
+    ``weight_scale_inv`` is the checkpoint's **dequant multiplier** per tile (the
+    reciprocal of the quantiser's scale -- hence the key's ``_inv`` suffix; see
+    :data:`FP8_SCALE_SUFFIX`), so dequantisation is a multiply, never a divide.
+    """
+    _require_grid(weight, scale_inv, block_size)
+    dense = weight.to(torch.float32)
+    return dense * expand_block_scales(
+        scale_inv.to(torch.float32), tuple(weight.shape), block_size
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The squeeze: bytes down, scales up
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class BlockScaleCompensation:
+    """A compensated per-block scale grid, with the census of what it changed.
+
+    The counts are the function's own report rather than something a caller
+    recomputes: the increment's expected result is stated in counts (*"0 scales
+    fall below MINVAL"*), and a count produced next to the transform cannot
+    disagree with the transform.
+    """
+
+    #: The grid to store: compensated and floored, fp32.
+    scale_inv: torch.Tensor
+    #: False when the resolved clamp is not 240.0 -- the grid is then the input.
+    applied: bool
+    #: Scales strictly below :data:`MINVAL` in the **input** grid.
+    below_minval_before: int
+    #: Scales strictly below :data:`MINVAL` in the **stored** grid.
+    below_minval_after: int
+    #: ``(row, col)`` of every block whose scale the floor raised.
+    floored_blocks: tuple[tuple[int, int], ...]
+
+
+def compensate_block_scales(scale_inv: torch.Tensor) -> BlockScaleCompensation:
+    """Multiply a block scale grid by 448/240 and floor it at :data:`MINVAL`.
+
+    Conditional on :func:`needs_240_downscale`, and the floor travels with the
+    compensation rather than standing alone: the floor exists to keep the grid
+    *this* transform produces safe to take a reciprocal of, so on a platform
+    where this transform is a no-op it stays a no-op and the checkpoint's own
+    scales are stored as shipped. The census is measured either way, so a caller
+    on either platform gets the same reported quantities.
+    """
+    grid = scale_inv.to(torch.float32)
+    below_before = int((grid < MINVAL).sum().item())
+
+    if not needs_240_downscale():
+        return BlockScaleCompensation(
+            scale_inv=grid,
+            applied=False,
+            below_minval_before=below_before,
+            below_minval_after=below_before,
+            floored_blocks=(),
+        )
+
+    compensated = grid * _FP8_SCALE_COMPENSATION
+    needs_floor = compensated < MINVAL
+    floored = compensated.clamp(min=MINVAL)
+    floored_blocks = tuple(
+        (int(row), int(col)) for row, col in needs_floor.nonzero().tolist()
+    )
+    return BlockScaleCompensation(
+        scale_inv=floored,
+        applied=True,
+        below_minval_before=below_before,
+        below_minval_after=int((floored < MINVAL).sum().item()),
+        floored_blocks=floored_blocks,
+    )
+
+
+def downscale_fp8_weight_bytes(weight: torch.Tensor) -> torch.Tensor:
+    """Squeeze fp8 weight bytes into the 240 range, or return them unchanged.
+
+    Conditional on :func:`needs_240_downscale`. The ``clamp`` is defensive: the
+    largest OCP magnitude, 448, maps to exactly 240, which is itself
+    representable, so no in-range input can exceed the bound. It is kept because
+    a checkpoint carrying a non-finite or out-of-spec byte would otherwise store
+    one, and because the llama3 precedent clamps at the same point
+    (``weight_loaders_static_fp8.py:69-75``).
+    """
+    if not needs_240_downscale():
+        return weight
+    return (
+        (weight.to(torch.float32) * _FP8_WEIGHT_DOWNSCALE)
+        .clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        .to(_FP8_DTYPE)
+    )
+
+
+@dataclass(frozen=True)
+class BlockwiseFp8Squeeze:
+    """The full downscale-and-compensate result over one weight and its grid."""
+
+    #: Stored bytes, ``_FP8_DTYPE``.
+    weight: torch.Tensor
+    #: Stored per-block dequant scales, fp32.
+    scale_inv: torch.Tensor
+    block_size: tuple[int, int]
+    #: False when the resolved clamp is not 240.0.
+    applied: bool
+    #: ``max(abs(stored bytes))``, as a Python float.
+    max_abs_stored: float
+    #: Share of stored bytes with ``abs(x) <= 240.0``. 1.0 is "100%".
+    fraction_within_240: float
+    below_minval_before: int
+    below_minval_after: int
+    floored_blocks: tuple[tuple[int, int], ...]
+
+
+def squeeze_blockwise_fp8(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+) -> BlockwiseFp8Squeeze:
+    """Downscale the bytes and compensate the block scales, as one transform.
+
+    The tensor-level entry point: the loader factories below wrap the same two
+    halves for the checkpoint path, where the weight and its ``weight_scale_inv``
+    companion arrive as separate keys and therefore separate loaders.
+    """
+    _require_grid(weight, scale_inv, block_size)
+
+    squeezed = downscale_fp8_weight_bytes(weight)
+    compensation = compensate_block_scales(scale_inv)
+
+    stored = squeezed.to(torch.float32).abs()
+    return BlockwiseFp8Squeeze(
+        weight=squeezed,
+        scale_inv=compensation.scale_inv,
+        block_size=block_size,
+        applied=compensation.applied,
+        max_abs_stored=float(stored.max().item()),
+        fraction_within_240=float(
+            (stored <= _FP8_E4M3_MAX).to(torch.float32).mean().item()
+        ),
+        below_minval_before=compensation.below_minval_before,
+        below_minval_after=compensation.below_minval_after,
+        floored_blocks=compensation.floored_blocks,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Per-block agreement, for the dequantisation claim
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class BlockAgreement:
+    """How well one block's dequantisation survived the squeeze.
+
+    The reference magnitude is the **block's** own absolute maximum, not the
+    tensor's: a global abs-max normalisation would let the largest-scaled block
+    set the tolerance for every other one and mask a small-scaled block's
+    disagreement entirely.
+    """
+
+    index: tuple[int, int]
+    #: ``max(abs(after - before))`` over the block.
+    max_abs_diff: float
+    #: ``max(abs(before))`` over the block -- the normalising reference.
+    max_abs_before: float
+    #: ``max_abs_diff / max_abs_before``, the block-normalised difference.
+    normalised_diff: float
+    #: ``atol + rtol * max_abs_before``.
+    tolerance: float
+    #: ``max_abs_diff <= tolerance``.
+    within: bool
+    #: The single worst **per-element** relative difference in the block.
+    #: Reported, never gated: it is disclosed so the choice of normalisation is
+    #: visible in the evidence rather than implicit in a pass.
+    worst_element_relative: float
+
+
+def block_agreement(
+    before: torch.Tensor,
+    after: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+    rtol: float,
+    atol: float,
+) -> tuple[BlockAgreement, ...]:
+    """Compare two dequantised tensors block by block.
+
+    ``rtol`` and ``atol`` are **required keyword arguments with no defaults**, on
+    purpose: the fork's tolerance map has no fp8 entry and silently falls back to
+    the bf16 pair, so every fp8 comparison in this campaign passes both
+    explicitly (acceptance pre-registration, PIT-13).
+    """
+    if before.shape != after.shape:
+        raise Glm5NextWeightMapError(
+            f"dequantisation shapes disagree: {tuple(before.shape)} vs "
+            f"{tuple(after.shape)}"
+        )
+    rows, cols = before.shape
+    block_rows, block_cols = block_size
+    grid_rows, grid_cols = block_grid_shape((rows, cols), block_size)
+
+    lhs = before.to(torch.float32)
+    rhs = after.to(torch.float32)
+
+    reports: list[BlockAgreement] = []
+    for grid_row in range(grid_rows):
+        row_slice = slice(grid_row * block_rows, min((grid_row + 1) * block_rows, rows))
+        for grid_col in range(grid_cols):
+            col_slice = slice(
+                grid_col * block_cols, min((grid_col + 1) * block_cols, cols)
+            )
+            block_before = lhs[row_slice, col_slice]
+            block_after = rhs[row_slice, col_slice]
+            diff = (block_after - block_before).abs()
+
+            max_abs_diff = float(diff.max().item())
+            max_abs_before = float(block_before.abs().max().item())
+            tolerance = atol + rtol * max_abs_before
+            nonzero = block_before.abs() > 0
+            worst_relative = (
+                float((diff[nonzero] / block_before.abs()[nonzero]).max().item())
+                if bool(nonzero.any())
+                else 0.0
+            )
+            reports.append(
+                BlockAgreement(
+                    index=(grid_row, grid_col),
+                    max_abs_diff=max_abs_diff,
+                    max_abs_before=max_abs_before,
+                    normalised_diff=(
+                        max_abs_diff / max_abs_before if max_abs_before else 0.0
+                    ),
+                    tolerance=tolerance,
+                    within=max_abs_diff <= tolerance,
+                    worst_element_relative=worst_relative,
+                )
+            )
+    return tuple(reports)
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint-path loaders (mirror the llama3 static-fp8 entry points)
+# --------------------------------------------------------------------------- #
+
+
+def wrap_with_blockwise_fp8_downscale(
+    loader: SafetensorsWeightLoader,
+) -> SafetensorsWeightLoader:
+    """Wrap a weight loader so its result is squeezed into the 240 range.
+
+    Same shape as ``weight_loaders_static_fp8.py``'s
+    ``_wrap_with_fp8_downscale``: on a platform that needs no squeeze the
+    original loader is returned unwrapped, so the identity path costs nothing.
+    """
+    if not needs_240_downscale():
+        return loader
+    base_transform = loader.transform or (lambda slices, rank: slices[0][:])
+
+    def transform(slices, rank):
+        return downscale_fp8_weight_bytes(base_transform(slices, rank))
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def blockwise_scale_loader() -> SafetensorsWeightLoader:
+    """Load a ``weight_scale_inv`` grid, compensated and floored.
+
+    The grid is loaded whole -- one fp32 value per weight tile, so it is four
+    orders of magnitude smaller than the weight and needs no sharding of its own
+    at this increment. A sharded scale grid follows the weight's own shard
+    geometry and lands with the module that declares that geometry
+    (``model_fp8.py``, ``inc-glm53f-013``).
+    """
+
+    def transform(slices, rank):
+        if len(slices) != 1:
+            raise Glm5NextWeightMapError(
+                f"blockwise_scale_loader expects 1 slice, got {len(slices)}"
+            )
+        return compensate_block_scales(slices[0][:]).scale_inv
+
+    return SafetensorsWeightLoader(transform=transform)
