@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import errno
+import functools
 import hashlib
 import os
 import socket
@@ -220,6 +221,28 @@ def save_cache(local_cache_dir: str, remote_cache_dir: str, hash_key: str) -> No
     save_nki_cache_to_remote(local_cache_dir, remote_cache_dir)
 
 
+@functools.lru_cache(maxsize=1)
+def _fx_passes_source_fingerprint() -> str:
+    """sha256 over the sorted ``vllm_neuron/fx_passes/*.py`` file bytes.
+
+    The cache key is computed from the PRE-FX-pass graph (capture_backend
+    keys before the passes run and hit-bails before they run), so an FX-pass
+    source edit must re-key every graph or a stale NEFF hit silently voids
+    the edit (ep19 F-35-1 / F-14-3). Memoized: the source tree is immutable
+    for the life of the process.
+    """
+    import vllm_neuron.fx_passes as _fx_passes
+
+    fx_passes_dir = os.path.dirname(os.path.abspath(_fx_passes.__file__))
+    digest = hashlib.sha256()
+    for filename in sorted(
+        f for f in os.listdir(fx_passes_dir) if f.endswith(".py")
+    ):
+        with open(os.path.join(fx_passes_dir, filename), "rb") as f:
+            digest.update(f.read())
+    return digest.hexdigest()
+
+
 def create_cache_hash(
     gm: torch.fx.GraphModule,
     example_inputs: List[torch.Tensor],
@@ -274,6 +297,11 @@ def create_cache_hash(
     hash_components.append(f"neuronxcc:{neuronxcc_version}")
     hash_components.append(f"nki:{nki_version}")
 
+    # FX-pass source fingerprint: an fx_passes edit re-keys every graph
+    # (ep19 F-14-3; the key is computed from the pre-pass graph).
+    fx_passes_fingerprint = _fx_passes_source_fingerprint()
+    hash_components.append(f"fx_passes:{fx_passes_fingerprint}")
+
     # Normalize compiler args into a canonical dict
     raw_compiler_args = options.get("compiler_args", "")
     compiler_args = _parse_compiler_args(raw_compiler_args)
@@ -296,6 +324,7 @@ def create_cache_hash(
         f"torch_neuronx={torch_neuronx_version}, "
         f"neuronxcc={neuronxcc_version}, "
         f"nki={nki_version}, "
+        f"fx_passes={fx_passes_fingerprint}, "
         f"compiler_args_canonical={sorted_args_str}"
     )
 

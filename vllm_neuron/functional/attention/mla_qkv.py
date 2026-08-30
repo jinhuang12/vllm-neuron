@@ -669,7 +669,14 @@ def mla_qkv(
     # per upstream's MergedColumnParallelLinear (deepseek_v4_attention.py:399-401
     # then :429).
     qr_kv = _linear(hidden, wqa_wkv_w, wqa_wkv_scale, out_dtype)
-    q_latent, kv_latent = qr_kv.split([q_lora_rank, head_dim], dim=-1)
+    # ep19 F-16-1: a sizes-list `.split([...], dim=-1)` lowers through a
+    # stride-ignoring aten::as_strided HLO emission when torch_xla runs with
+    # XLA_DISABLE_FUNCTIONALIZATION=1 (set at import time by
+    # libtorch_neuronx_lite; public prior pytorch/xla#8640) — only row 0 of
+    # each split part survives. narrow() lowers correctly at any offset
+    # (ITER-16 P58H v3, ITER-17 P60 v8/v8p). Eager semantics are identical.
+    q_latent = qr_kv.narrow(-1, 0, q_lora_rank)
+    kv_latent = qr_kv.narrow(-1, q_lora_rank, head_dim)
 
     # --- Step 2: q_norm on the q latent, kv_norm on the raw KV latent -------
     # dsv4_ref/model.py:502 and :509. Both legs are the same fp32 RMSNorm
