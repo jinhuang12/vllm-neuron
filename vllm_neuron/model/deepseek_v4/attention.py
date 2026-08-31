@@ -207,8 +207,9 @@ _LATENT_PAIR_HEAD_SIZE: int = 224
 #:
 #: The FLOOR is the binding constraint and it is per-TENSOR, not per-pair: the
 #: runner allocates each declared leg as TWO tensors of ``head_size`` columns
-#: (``neuron_model_runner.py:7747``, ``:7782``), and :func:`_pad_columns`
-#: raises ``ValueError: N columns do not fit width W`` on any shrink. Content
+#: (``neuron_model_runner.py:7747``, ``:7782``), and the ``NF.kv_cache_write``
+#: pad (``kv_cache_write._pad_columns``, LD-79) raises
+#: ``ValueError: N columns do not fit width W`` on any shrink. Content
 #: is NOT redistributable across a pair's halves without changing every writer
 #: and every reader.
 _ROPE_PAIR_HEAD_SIZE: int = 64
@@ -239,7 +240,7 @@ _ROPE_PAIR_HEAD_SIZE: int = 64
 #: :meth:`DeepseekV4Attention.kv_layer_specs`. The CONTENT width stays 512 and
 #: travels under a different name: ``self.head_dim``, passed to the readers as
 #: ``swa_widths=(512,)``. The 160 extra columns are zero pad written by
-#: :func:`_pad_columns` inside :func:`_masked_scatter_rows`, and the reader
+#: the ``NF.kv_cache_write`` zero pad (LD-79), and the reader
 #: side takes ``part[..., :width]``, so the pad is never read.
 #:
 #: WHY 672: every declared head in this module must divide ``H_max = 2688`` or
@@ -251,8 +252,9 @@ _ROPE_PAIR_HEAD_SIZE: int = 64
 #:
 #: The floor is per-TENSOR, not per-pair: the runner allocates each declared
 #: leg as TWO tensors of ``head_size`` columns
-#: (``neuron_model_runner.py:7747``, ``:7782``), and :func:`_pad_columns`
-#: raises ``ValueError: N columns do not fit width W`` on any shrink.
+#: (``neuron_model_runner.py:7747``, ``:7782``), and the ``NF.kv_cache_write``
+#: pad (``kv_cache_write._pad_columns``, LD-79) raises
+#: ``ValueError: N columns do not fit width W`` on any shrink.
 _SWA_PAIR_HEAD_SIZE: int = 672
 
 #: ``mtp.{stage}.self_attn.swa`` DECLARED pair width — the DSpark drafter's
@@ -752,66 +754,13 @@ def _quant_fp4_simulate(x: torch.Tensor, group: int = _FP4_QUANT_GROUP) -> torch
     return (torch.sign(scaled) * snapped * scales).view(tokens, width)
 
 
-def _pad_columns(rows: torch.Tensor, width: int) -> torch.Tensor:
-    """Right-pad ``[T, n]`` to ``[T, width]`` with zeros."""
-    extra = width - rows.shape[-1]
-    if extra == 0:
-        return rows
-    if extra < 0:
-        raise ValueError(f"{rows.shape[-1]} columns do not fit width {width}.")
-    return torch.cat(
-        (
-            rows,
-            torch.zeros(rows.shape[0], extra, dtype=rows.dtype, device=rows.device),
-        ),
-        dim=-1,
-    )
-
-
-def _masked_scatter_rows(
-    cache: torch.Tensor, slot_mapping: torch.Tensor, rows: torch.Tensor
-) -> None:
-    """Scatter whole slots into a paged ``cache``, skipping padded slots.
-
-    ``slot_mapping`` carries ``-1`` for padded tokens and — on compressed
-    layers — for every token whose compression group has not closed yet.
-    Those slots must keep whatever they already hold.
-
-    The skip is a *masked scatter*, never a boolean-mask index: padded
-    destinations are redirected to slot 0 by ``clamp`` and the value written
-    there is that slot's own current content, so the redirect is a no-op
-    write. Destination and mask are plain arithmetic, so all shapes stay
-    static.
-
-    ``rows`` is written as ELEMENT columns from column 0 — the convention the
-    reader side uses (``mla_sparse_attention._gather_latent`` takes
-    ``part[..., :width]`` after casting the cache).
-
-    fp8 is indexed DIRECTLY here — do not reintroduce a dtype view.
-
-    An earlier revision routed the fp8 transfer through ``.view(torch.int8)``,
-    justified by the claim that "fp8 tensors cannot be fancy-indexed
-    (``attention_decode.py:610-620``)". **That claim was false, and the view was
-    itself the defect (F-5).** A bit-reinterpreting ``Tensor.view(<dtype>)`` does
-    not lower through ``convert_fx_to_hlo``: it raises
-    ``RuntimeError: Expected XLA tensor. Got: XLACharType`` at
-    ``vllm_neuron/compile/hlo.py:176``. The element type was never the obstacle.
-
-    Measured, device-free, at this commit (probe ``ep9-P3``, legs A/B2a/B2b/B2c):
-    with the view present the graph raises ``XLACharType`` at ``hlo.py:176``;
-    with it removed, all three ops this function needs — ``torch.index_select``,
-    ``torch.where`` and ``Tensor.index_put_`` — lower on ``float8_e4m3fn``.
-    """
-    num_blocks, num_kv_heads, block_size, width = cache.shape
-    src = _pad_columns(rows.to(cache.dtype), width)
-
-    flat = cache.view(num_blocks * num_kv_heads * block_size, width)
-
-    valid = (slot_mapping > _PAD_SLOT_ID).unsqueeze(-1)
-    # min-only s64 clamp synthesizes iinfo(int64).max at FX→HLO; production warmup feeds slot_mapping int64 (neuron_model_runner.py:4272) — NCC_ESFH001 fix, ITER-22.
-    dest = torch.clamp(slot_mapping, min=0, max=_INT32_MAX).to(torch.long)
-    existing = torch.index_select(flat, 0, dest)
-    flat.index_put_((dest,), torch.where(valid, src, existing))
+# LD-79 (plan §20.2 Rule 4′): the paged cache write lives in
+# ``vllm_neuron/functional/kv_cache_write.py``. The former ``_pad_columns`` +
+# ``_masked_scatter_rows`` composition survives ONLY as that op's torch
+# fallback body (``_torch_kv_cache_write`` — CPU equivalence / simulator A/B,
+# never traced for production); every write site here calls
+# ``NF.kv_cache_write``. The F-5 fp8-direct-indexing record and the
+# C2/ESFH001 clamp form moved with the body, verbatim.
 
 
 def _paged_slot_ids(
@@ -1143,7 +1092,8 @@ class DeepseekV4KVCompressor(nn.Module):
         The declared head must (a) be at least :attr:`state_pair_width`,
         because the runner gives BOTH tensors of the pair exactly ``head_size``
         columns (``neuron_model_runner.py:7747``, ``:7782``) and
-        :func:`_pad_columns` raises ``ValueError`` rather than shrink, and
+        the ``NF.kv_cache_write`` pad (``kv_cache_write._pad_columns``,
+        LD-79) raises ``ValueError`` rather than shrink, and
         (b) divide ``H_max = 2688``, because page size is ``64 * head`` here so
         upstream's ``unify_kv_cache_spec_page_size``
         (``vllm/v1/core/kv_cache_utils.py:1007``) raises
@@ -1157,8 +1107,8 @@ class DeepseekV4KVCompressor(nn.Module):
                    512                         1040       1344                  2
                   1024                         2080       2688                  1
 
-        The extra columns are zero pad written by :func:`_pad_columns` inside
-        :func:`_masked_scatter_rows`; the reader takes ``gathered[:, :width]``
+        The extra columns are zero pad written inside ``NF.kv_cache_write``
+        (LD-79); the reader takes ``gathered[:, :width]``
         at :attr:`state_pair_width`, so the pad is never read.
 
         Raises:
@@ -1171,7 +1121,7 @@ class DeepseekV4KVCompressor(nn.Module):
         assert declared >= self.state_pair_width, (
             f"state leg declared head {declared} is below its own content "
             f"width {self.state_pair_width} at proj_width {self.proj_width}: "
-            f"_pad_columns (attention.py) cannot shrink and would raise"
+            f"the kv_cache_write pad cannot shrink and would raise"
         )
         return declared
 
@@ -1408,7 +1358,7 @@ class DeepseekV4KVCompressor(nn.Module):
         Column layout is the one :attr:`state_pair_width` documents. Codes are
         cast to fp32 before the concat because ``torch.cat`` on FP8 is avoided
         port-wide (the SWA write does the same); the cast is exact, every FP8
-        value being representable in fp32, and :func:`_masked_scatter_rows`
+        value being representable in fp32, and ``NF.kv_cache_write``
         casts back.
 
         The mapping is the RAW per-token one, not
@@ -1871,7 +1821,7 @@ class DeepseekV4Indexer(nn.Module):
             # T (each closing token owns a distinct slot), so the fp32 matmul
             # selects exactly one row and is bitwise-exact; the write cast
             # (``.to(cache dtype)``) is applied first, mirroring
-            # ``_masked_scatter_rows``, and the scale overlay mirrors
+            # ``NF.kv_cache_write``'s write cast, and the scale overlay mirrors
             # ``_gather_scale_columns``'s cast-then-expand.
             wvalid = index_slot_mapping > _PAD_SLOT_ID
             hit = (
@@ -2276,10 +2226,10 @@ class DeepseekV4Attention(nn.Module):
         | ``model.py``, not here)                     |       |           |           |        |            |
 
         The DECLARED figure is what the runner allocates for BOTH tensors of
-        the pair; the surplus is zero pad written by :func:`_pad_columns` and
+        the pair; the surplus is zero pad written by ``NF.kv_cache_write`` and
         never read back, because every reader takes its own explicit width.
         The per-leg constraint is therefore per-TENSOR —
-        ``declared >= max(k_content, v_content)`` — and :func:`_pad_columns`
+        ``declared >= max(k_content, v_content)`` — and the write pad
         raises rather than shrink, so a declaration below the floor fails loudly
         at the first write.
 
@@ -3302,8 +3252,10 @@ class DeepseekV4Attention(nn.Module):
         (``NULL_BLOCK_ID = 0``, ``neuron_model_runner.py:89``) and no real
         sequence can own it, so **the two frames never agreed in production**.
         Nothing raised: the reader clamps a negative block to zero
-        (``mla_sparse_attention.py:130``) and :func:`_masked_scatter_rows`
-        clamps ``min=0`` (``:504``), so the symptom was wrong output and, for
+        (``mla_sparse_attention.py:130``) and the cache write clamps
+        ``min=0`` (now ``NF.kv_cache_write``'s fallback body; formerly
+        ``_masked_scatter_rows`` ``:504`` at that commit), so the symptom was
+        wrong output and, for
         a scattered block table, cross-request cache corruption.
 
         The repair moves the WRITE frame to the READ frame, because the read
