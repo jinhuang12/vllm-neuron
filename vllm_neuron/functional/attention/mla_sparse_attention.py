@@ -65,7 +65,7 @@ LATENT_ROPE_DIM: int = 64
 LATENT_DIM: int = LATENT_NOPE_DIM + LATENT_ROPE_DIM  # 512
 
 
-def _flat_rows(cache: Tensor, dtype: torch.dtype) -> Tuple[Tensor, int]:
+def _flat_rows(cache: Tensor) -> Tuple[Tensor, int]:
     """Flatten a latent cache to ``[rows, width]`` plus its rows-per-sequence.
 
     Two layouts are accepted, both static-shape:
@@ -77,8 +77,18 @@ def _flat_rows(cache: Tensor, dtype: torch.dtype) -> Tuple[Tensor, int]:
         (``dsv4_ref/model.py:480``). ``rows_per_seq = num_slots``, so row id
         ``= seq * num_slots + local_index``.
 
-    The cast to ``dtype`` happens before any indexing because fp8 tensors cannot
-    be fancy-indexed (same reason as ``attention_decode.py:610-620``).
+    NO dtype conversion happens here — the cache is flattened in its STORAGE
+    dtype and the caller converts only the rows it actually gathered
+    (LD-78 / plan §19.2 Rule 2, F-241). An earlier revision converted the WHOLE
+    cache first (``cache.to(dtype)``), justified by the claim that "fp8 tensors
+    cannot be fancy-indexed (``attention_decode.py:610-620``)". **That claim was
+    false** (F-5, probe ep9-P3: ``torch.index_select`` on ``float8_e4m3fn``
+    lowers cleanly through ``convert_fx_to_hlo``), and the whole-cache convert
+    was itself a compile-breaking defect: it materializes every 88 MB fp8 cache
+    as a 352 MB fp32 mid-graph value — ep19 ITER-20 P76b counted 1,991 such
+    converts as the effective readers keeping NCC_EOOM002 alive (peak 28.23 GB
+    vs the 24.00 GB Trn2 limit). Elementwise conversion commutes with row
+    gather EXACTLY, so gather-first is bitwise-identical for every caller.
     """
     if cache.dim() == 4:
         num_blocks, num_kv_heads, block_size, width = cache.shape
@@ -86,13 +96,13 @@ def _flat_rows(cache: Tensor, dtype: torch.dtype) -> Tuple[Tensor, int]:
             "DSv4 latent caches are declared with num_kv_heads=1 (contract §4); "
             f"got {num_kv_heads}"
         )
-        return cache.to(dtype)[:, 0].reshape(num_blocks * block_size, width), 0
+        return cache[:, 0].reshape(num_blocks * block_size, width), 0
     assert cache.dim() == 3, (
         "latent cache must be 4-D paged [num_blocks, num_kv_heads, block_size, "
         f"width] or 3-D contiguous [batch, num_slots, width]; got {tuple(cache.shape)}"
     )
     batch, num_slots, width = cache.shape
-    return cache.to(dtype).reshape(batch * num_slots, width), num_slots
+    return cache.reshape(batch * num_slots, width), num_slots
 
 
 def _slot_ids(
@@ -164,7 +174,7 @@ def _gather_latent(
 
     parts: List[Tensor] = []
     for cache, width in zip(caches, widths):
-        flat, rows_per_seq = _flat_rows(cache, dtype)
+        flat, rows_per_seq = _flat_rows(cache)
         block_size = cache.shape[2] if cache.dim() == 4 else 0
         rows = _slot_ids(
             safe_local,
@@ -174,7 +184,14 @@ def _gather_latent(
             rows_per_seq=rows_per_seq,
         )
         rows = rows.clamp(0, flat.shape[0] - 1).reshape(-1)
-        part = torch.index_select(flat, 0, rows).view(num_tokens, span, -1)
+        # LD-78 / plan §19.2 Rule 2 (F-241): gather the STORAGE-dtype rows
+        # FIRST, convert only the gathered rows. Bitwise-identical to the old
+        # convert-then-gather (elementwise convert commutes with row gather);
+        # the whole-cache convert was the dominant NCC_EOOM002 reader class
+        # (ep19 ITER-20 P76b: 1,991 whole-cache converts).
+        part = (
+            torch.index_select(flat, 0, rows).to(dtype).view(num_tokens, span, -1)
+        )
         parts.append(part[..., :width])
 
     latent = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
@@ -188,7 +205,7 @@ def _gather_latent(
         # is stored bf16 unscaled (contract §4; write side
         # fused_compress_quant_cache.py:156-214, reference dsv4_ref/model.py:378
         # act_quant(kv[..., :-rd], 64, ...)).
-        flat_s, rows_per_seq_s = _flat_rows(scale_cache, torch.float32)
+        flat_s, rows_per_seq_s = _flat_rows(scale_cache)
         block_size_s = scale_cache.shape[2] if scale_cache.dim() == 4 else 0
         rows_s = _slot_ids(
             safe_local,
@@ -198,7 +215,14 @@ def _gather_latent(
             rows_per_seq=rows_per_seq_s,
         )
         rows_s = rows_s.clamp(0, flat_s.shape[0] - 1).reshape(-1)
-        scales = torch.index_select(flat_s, 0, rows_s).view(num_tokens, span, -1)
+        # LD-78 / Rule 2 again: gather storage-dtype scale rows, then convert
+        # only the gathered rows to fp32 (bitwise-commuting with the old
+        # whole-cache ``.to(float32)``).
+        scales = (
+            torch.index_select(flat_s, 0, rows_s)
+            .to(torch.float32)
+            .view(num_tokens, span, -1)
+        )
         nope = dequant_group_scales(
             latent[..., :nope_dim],
             scales,

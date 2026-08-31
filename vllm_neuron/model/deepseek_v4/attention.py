@@ -834,11 +834,17 @@ def _gather_scale_columns(
     can multiply them straight onto gathered keys — the ``key_scale``
     convention of ``NF.sparse_indexer_topk``, which does no group expansion
     of its own.
+
+    Indexes FIRST and casts after (LD-78 / plan §19.2 Rule 2, F-241): the old
+    ``scale_cache.to(float32)`` materialized the WHOLE cache as an fp32
+    mid-graph value — the ep19 ITER-20 P76b reader class behind NCC_EOOM002.
+    Elementwise convert commutes with row gather, so this is bitwise-identical;
+    fp8 ``index_select`` lowers directly (F-5, probe ep9-P3).
     """
     num_blocks, _, block_size, width = scale_cache.shape
-    flat = scale_cache.to(torch.float32).view(num_blocks * block_size, width)
+    flat = scale_cache.reshape(num_blocks * block_size, width)
     rows = torch.clamp(slot_ids, 0, flat.shape[0] - 1).reshape(-1)
-    grouped = torch.index_select(flat, 0, rows)[:, :num_scales]
+    grouped = torch.index_select(flat, 0, rows)[:, :num_scales].to(torch.float32)
     expanded = grouped.unsqueeze(-1).expand(-1, num_scales, group)
     return expanded.reshape(slot_ids.shape[0], slot_ids.shape[1], num_scales * group)
 
