@@ -1234,13 +1234,6 @@ class DeepseekV4KVCompressor(nn.Module):
             self.ape.to(torch.float32), 0, phase
         )
 
-        # ── Publish this step's rows for LATER steps to read (R-12) ──────
-        # Written before the read below purely for readability: this forward's
-        # own rows are always taken from ``kv_rows``/``score_rows`` directly,
-        # at full fp32, never round-tripped through the FP8 state.
-        if prev_state is not None:
-            self._write_state(prev_state, kv_rows, score_rows)
-
         # ── Window gather: rows [t-window+1 .. t] for every t ───────────
         # Built purely from arange arithmetic, so the shape is static and the
         # sequence head is handled by a mask rather than a short gather.
@@ -1296,6 +1289,21 @@ class DeepseekV4KVCompressor(nn.Module):
             kv_win, score_win = self._merge_state(
                 prev_state, kv_win, score_win, abs_src, (~in_forward) & valid
             )
+
+        # ── Publish this step's rows for LATER steps to read (R-12) ──────
+        # Written AFTER the state read above (plan §19.2 / LD-77; census
+        # ep19-P2 named this class: ``.compressor`` / ``.indexer_compressor``
+        # scatter groups carried gather readers when the write came first).
+        # Value-identical by the strictly-prior mask: ``_merge_state`` keeps a
+        # gathered lane only where ``(~in_forward) & valid`` — rows written by
+        # PRIOR forwards — and this forward's own rows are always taken from
+        # ``kv_rows``/``score_rows`` directly, at full fp32, never
+        # round-tripped through the FP8 state. Reads now trace against the
+        # pre-write cache parameter, so the write feeds only the aliased ROOT
+        # output instead of forcing a second whole-cache value (NCC_EOOM002,
+        # B2 mechanism).
+        if prev_state is not None:
+            self._write_state(prev_state, kv_rows, score_rows)
 
         # ── Role-dependent column selection (dsv4_ref/model.py:313-320) ─
         # C4: window slots [0:ratio] are the OLDER group and read columns
