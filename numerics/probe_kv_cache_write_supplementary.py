@@ -171,8 +171,15 @@ def run_leg(leg, outdir):
                 log(f"INSTRUMENT_ERROR fallback leg must not run under {v}")
                 return 2
 
+    import importlib
+
     import vllm_neuron.functional as NF
-    from vllm_neuron.functional import kv_cache_write as kvw_mod
+
+    # `from vllm_neuron.functional import kv_cache_write` binds the re-exported
+    # FUNCTION (functional/__init__.py), not the module — S2-r1 refusing line:
+    # "AttributeError: 'function' object has no attribute
+    # '_can_use_kv_cache_write'" (probe :198). Import the module explicitly.
+    kvw_mod = importlib.import_module("vllm_neuron.functional.kv_cache_write")
 
     counter = {"calls": 0}
     if leg == "fallback":
