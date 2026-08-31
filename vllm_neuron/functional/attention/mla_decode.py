@@ -88,7 +88,8 @@ def _masked_write_rows(cache: Tensor, slots: Tensor, rows: Tensor) -> None:
         )
     flat = cache.view(num_blocks * num_kv_heads * block_size, width)
     valid = (slots > _PAD_SLOT_ID).unsqueeze(-1)
-    dest = torch.clamp(slots, min=0).to(torch.long)
+    # min-only s64 clamp synthesizes iinfo(int64).max at FX→HLO; production warmup feeds slot_mapping int64 (neuron_model_runner.py:4272) — NCC_ESFH001 fix, ITER-22.
+    dest = torch.clamp(slots, min=0, max=_INT32_MAX).to(torch.long)
     existing = torch.index_select(flat, 0, dest)
     flat.index_put_((dest,), torch.where(valid, src, existing))
 

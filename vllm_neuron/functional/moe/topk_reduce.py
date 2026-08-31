@@ -22,6 +22,8 @@ _TK_PADDED_MAX = 16 * 1024
 _N_16BIT_ELEM_PER_INT32 = 2
 _SUPPORTED_INPUT_DTYPES = [nl.bfloat16, nl.float16]
 
+_INT32_MAX = 2**31 - 1
+
 
 def topk_reduce(
     input: torch.Tensor, T: int, K: int, is_sequence_parallel: bool = False
@@ -133,7 +135,7 @@ def _cpu_topk_reduce(
     # Shift indices: valid tokens are 1..T → map to rows 1..T; <=0 → maps to 0
     # We accumulate into row 0 as a garbage bin, then discard it.
     out = torch.zeros(T + 1, H, dtype=input.dtype)
-    bucket = indices.clamp(min=0).long()
+    bucket = indices.clamp(0, _INT32_MAX).long()
     out.scatter_add_(0, bucket.unsqueeze(1).expand(-1, H), input[:, :H])
     return out[1:]  # discard row 0 (garbage from -1 and 0 indices)
 

@@ -16,6 +16,8 @@ _TORCH_NKI_DTYPE_MAP = {
     torch.int32: nl.int32,
 }
 
+_INT32_MAX = 2**31 - 1
+
 
 def permute_routed_tokens(
     hidden_input: torch.Tensor,
@@ -171,7 +173,7 @@ def _torch_impl(
 
     # Step 2.3: Adjust inverse argsort so that all de-duped tokens have idx 0
     token_inv_argsort_adjusted = (
-        (token_inv_argsort - dedupe_count + 1).clamp(min=0).to(torch.int32)
+        (token_inv_argsort - dedupe_count + 1).clamp(0, _INT32_MAX).to(torch.int32)
     )
 
     # Step 3: Concatenate [hidden | affinities | token idx], with bitcast to hidden.dtype
