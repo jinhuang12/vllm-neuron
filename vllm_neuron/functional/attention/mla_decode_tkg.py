@@ -344,7 +344,9 @@ def _mla_decode_tkg_dispatch(
     lat_dim = nope_dim + rope_dim
 
     seq_ids = torch.arange(batch, device=device, dtype=torch.int64)
-    skip = torch.full((1,), _SKIP32, device=device, dtype=torch.int64)
+    # s64 −1 → uint32-max 0xFFFFFFFF at every consumer's ``.to(torch.uint32)``;
+    # NKI oob_mode.skip sentinel unchanged; ESFH001 fix, ITER-21.
+    skip = torch.full((1,), -1, device=device, dtype=torch.int64)
 
     pos: Optional[Tensor] = None
     if positions is not None:

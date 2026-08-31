@@ -329,7 +329,9 @@ def _mla_sparse_attention_cte_dispatch(
     num_scale_groups = nope_dim // quant_group_size
     compress_ratio = int(kw["compress_ratio"])
     lat_dim = nope_dim + rope_dim
-    skip = torch.full((1,), _SKIP32, device=device, dtype=torch.int64)
+    # s64 −1 → uint32-max 0xFFFFFFFF at every consumer's ``.to(torch.uint32)``;
+    # NKI oob_mode.skip sentinel unchanged; ESFH001 fix, ITER-21.
+    skip = torch.full((1,), -1, device=device, dtype=torch.int64)
 
     topk = (
         topk_indices.reshape(num_tokens, -1).to(torch.int64)
