@@ -545,8 +545,13 @@ def _mla_sparse_attention_cte_nki(
     swa_pieces = [(swa_flat, 0, D)]
     swa_scale_flat = _flat2(swa_scale) if swa_scale is not None else None
     comp_pieces = []
+    _comp_srcs = [comp0, comp1, comp2]
     col = 0
-    for piece, w in zip((comp0, comp1, comp2), comp_widths):
+    # P4-r3 fix: no zip / no tuple-unpack targets (deployed NKI 0.5.0
+    # parser: "expecting simple variable", TRIADS-RAW-G3-p4compile-r3.txt).
+    for _ci in range(len(comp_widths)):
+        piece = _comp_srcs[_ci]
+        w = comp_widths[_ci]
         if piece is not None:
             comp_pieces.append((_flat2(piece), col, w))
             col += w
@@ -644,8 +649,16 @@ def _mla_sparse_attention_cte_nki(
 
         outp = nl.ndarray((H, D), dtype=nl.float32, buffer=nl.psum)
         first = True
-        for leg_off, chunks in ((0, win_chunks), (W, comp_chunks)):
-            for f32c, c0, tw in chunks:
+        # P4-r3 fix: index loops, no tuple-unpack targets (parser).
+        _leg_offs = [0, W]
+        _leg_chunks = [win_chunks, comp_chunks]
+        for _leg in range(2):
+            leg_off = _leg_offs[_leg]
+            chunks = _leg_chunks[_leg]
+            for _ck in range(len(chunks)):
+                f32c = chunks[_ck][0]
+                c0 = chunks[_ck][1]
+                tw = chunks[_ck][2]
                 pT = nl.ndarray((tw, H), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_transpose(
                     dst=pT[0:tw, 0:H],

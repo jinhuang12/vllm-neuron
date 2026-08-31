@@ -580,7 +580,13 @@ def _gather_leg_chunk(
     mask — same masked result as the fallback's clamped-gather-then-mask."""
     stage = nl.ndarray((tw, lat_dim), dtype=stage_dtype, buffer=nl.sbuf)
     nisa.memset(stage, 0.0)
-    for flat, dst_col, w in pieces:
+    # P4-r3 fix: the deployed NKI 0.5.0 parser rejects tuple-unpacking
+    # for-loop targets ("expecting simple variable",
+    # TRIADS-RAW-G3-p4compile-r3.txt) — index loops throughout.
+    for _pi in range(len(pieces)):
+        flat = pieces[_pi][0]
+        dst_col = pieces[_pi][1]
+        w = pieces[_pi][2]
         nisa.dma_copy(
             dst=stage[0:tw, dst_col : dst_col + w],
             src=flat.ap(
@@ -591,7 +597,11 @@ def _gather_leg_chunk(
             ),
             oob_mode=oob_mode.skip,
         )
-    for rows_2d, src_col, dst_col, w in ovl_srcs:
+    for _oi in range(len(ovl_srcs)):
+        rows_2d = ovl_srcs[_oi][0]
+        src_col = ovl_srcs[_oi][1]
+        dst_col = ovl_srcs[_oi][2]
+        w = ovl_srcs[_oi][3]
         row_w = rows_2d.shape[1]
         nisa.dma_copy(
             dst=stage[0:tw, dst_col : dst_col + w],
@@ -767,8 +777,12 @@ def _mla_decode_tkg_nki(
         lat_scale_flat = swa_scale_flat
     else:
         lat_pieces = []
+        _lat_srcs = [lat0, lat1, lat2]
         col = 0
-        for piece, w in zip((lat0, lat1, lat2), lat_widths):
+        # P4-r3 fix: no zip / no tuple-unpack targets (parser).
+        for _li in range(len(lat_widths)):
+            piece = _lat_srcs[_li]
+            w = lat_widths[_li]
             if piece is not None:
                 lat_pieces.append((_flat2(piece), col, w))
                 col += w
@@ -878,8 +892,16 @@ def _mla_decode_tkg_nki(
         # ── PV: out[b] = (probs @ latent) / denom ────────────────────────
         outp = nl.ndarray((H, D), dtype=nl.float32, buffer=nl.psum)
         first = True
-        for leg_off, chunks in ((0, win_chunks), (W, comp_chunks)):
-            for f32c, c0, tw in chunks:
+        # P4-r3 fix: index loops, no tuple-unpack targets (parser).
+        _leg_offs = [0, W]
+        _leg_chunks = [win_chunks, comp_chunks]
+        for _leg in range(2):
+            leg_off = _leg_offs[_leg]
+            chunks = _leg_chunks[_leg]
+            for _ci in range(len(chunks)):
+                f32c = chunks[_ci][0]
+                c0 = chunks[_ci][1]
+                tw = chunks[_ci][2]
                 pT = nl.ndarray((tw, H), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_transpose(
                     dst=pT[0:tw, 0:H],
@@ -920,17 +942,25 @@ def _mla_decode_tkg_nki(
                 written.append(swa_scale)
         if cur_bundle is not None and not shared_lat:
             col = 0
-            for idxp, (flat, _dst_col, w) in enumerate(lat_pieces):
+            # P4-r3 fix: no enumerate / no tuple-unpack targets (parser).
+            for _wp in range(len(lat_pieces)):
+                flat = lat_pieces[_wp][0]
+                w = lat_pieces[_wp][2]
                 slot_col = 1 if col + w <= nope_dim else 2
                 plan.append((flat, slot_col, cur_bundle, col, w))
-                written.append((lat0, lat1, lat2)[idxp])
+                written.append(_lat_srcs[_wp])
                 col += w
             if lat_scale_flat is not None:
                 plan.append((lat_scale_flat, 2, cur_bundle, col, nsg))
                 written.append(lat_scale)
         for tb0 in range(0, B, _PMAX):
             tb = min(_PMAX, B - tb0)
-            for flat, slot_col, src2d, src_col, w_src in plan:
+            for _pl in range(len(plan)):
+                flat = plan[_pl][0]
+                slot_col = plan[_pl][1]
+                src2d = plan[_pl][2]
+                src_col = plan[_pl][3]
+                w_src = plan[_pl][4]
                 wid = nl.ndarray((tb, 1), dtype=nl.uint32, buffer=nl.sbuf)
                 nisa.dma_copy(
                     dst=wid,
@@ -958,9 +988,25 @@ def _mla_decode_tkg_nki(
                     oob_mode=oob_mode.skip,
                 )
 
-    if written:
-        # returning the mutated inputs keeps the output arity identical on
-        # the simulator and HOP paths (sibling precedent:
-        # attention_decode.py:1240-1246 "always returns (output, K, V)")
-        return (out, *written)
-    return out
+    # returning the mutated inputs keeps the output arity identical on
+    # the simulator and HOP paths (sibling precedent:
+    # attention_decode.py:1240-1246 "always returns (output, K, V)").
+    # P4-r3 fix: starred expansion is parser-illegal ("tuple expansion is
+    # not supported") — explicit arity chain over the static write count
+    # (at most 6 written pieces: swa, swa_scale, lat0/1/2, lat_scale).
+    n_w = len(written)
+    if n_w == 0:
+        return out
+    if n_w == 1:
+        return out, written[0]
+    if n_w == 2:
+        return out, written[0], written[1]
+    if n_w == 3:
+        return out, written[0], written[1], written[2]
+    if n_w == 4:
+        return out, written[0], written[1], written[2], written[3]
+    if n_w == 5:
+        return (out, written[0], written[1], written[2], written[3],
+                written[4])
+    return (out, written[0], written[1], written[2], written[3], written[4],
+            written[5])
