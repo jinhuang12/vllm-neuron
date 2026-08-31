@@ -671,10 +671,16 @@ def _leg_scores(
     Returns the list of (f32_rows, chunk_off, tw) for the PV pass."""
     n_dc = lat_dim // _PMAX
     H = scores_sb.shape[0]
-    latT = [
-        nl.ndarray((_PMAX, count), dtype=nl.float32, buffer=nl.sbuf)
-        for _ in range(n_dc)
-    ]
+    # P4-r2 fix (TRIADS-RAW-G3-p4compile-r2.txt line 674 "unsupported
+    # expression"): the deployed NKI 0.5.0 parser rejects list comprehensions
+    # in kernel code (no kernel-side comprehension exists anywhere in the
+    # installed nkilib either — torch-side files only). Explicit append loop;
+    # list literals + .append have kernel-side precedent (nkilib ssd_block).
+    latT = []
+    for _dc in range(n_dc):
+        latT.append(
+            nl.ndarray((_PMAX, count), dtype=nl.float32, buffer=nl.sbuf)
+        )
     chunks = []
     for c0 in range(0, count, _PMAX):
         tw = min(_PMAX, count - c0)
