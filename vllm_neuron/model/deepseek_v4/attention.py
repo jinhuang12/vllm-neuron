@@ -1815,19 +1815,25 @@ class DeepseekV4Indexer(nn.Module):
         """
         ratio = self.compress_ratio
 
-        # ── This step's fresh index-K rows, and the cache write ─────────
+        # ── This step's fresh index-K rows ───────────────────────────────
         # The compressor already applied the Hadamard rotation and the FP4
         # round trip; FP8 group-32 is only the transport format into the
         # cache, and the group size matches the FP4 group so no group's
-        # dynamic range gets merged.
+        # dynamic range gets merged. The cache write itself is traced LAST,
+        # after the pool reads below (plan §19.2 / LD-77).
         fresh = self.compressor(
             hidden_states, positions, prev_state=compressor_state
         )  # [T, 128] fp32
         codes, scales = _quant_fp8_ue8m0(fresh, _FP4_QUANT_GROUP)
-        _masked_scatter_rows(index_k_cache, index_slot_mapping, codes)
-        _masked_scatter_rows(index_v_cache, index_slot_mapping, scales)
 
         # ── Candidate pool ──────────────────────────────────────────────
+        # Reads trace BEFORE the cache writes below (plan §19.2 / LD-77;
+        # census ep19-P2 named this class: the ``.indexer`` scatter groups
+        # carried gather readers when the pool was read post-write). The pool
+        # is gathered from the PRE-WRITE cache exactly as the op's cache
+        # branch would gather it, and this forward's just-quantized rows are
+        # overlaid in the POOL — a pool-sized substitution, never a
+        # cache-sized read-after-write (B2 mechanism, NCC_EOOM002).
         index_k: torch.Tensor | None = None
         key_slot_ids: torch.Tensor | None = None
         key_scale: torch.Tensor | None = None
@@ -1837,9 +1843,55 @@ class DeepseekV4Indexer(nn.Module):
             # dropped by the op's own cap, so no extra validity map is
             # needed.
             key_slot_ids = _paged_slot_ids(block_table, pool_span, block_size)
+            # The op's cache-branch gather, verbatim (sparse_indexer.py
+            # ``_index_keys``): where/zeros redirect — NOT a clamp — then a
+            # flat index_select, reshaped to [B, S, head_dim]. Kept in the
+            # cache dtype so the op's ``.to(accum_dtype)`` lands on the same
+            # values the post-write read produced.
+            pool_valid = key_slot_ids >= 0
+            safe_slots = torch.where(
+                pool_valid, key_slot_ids, torch.zeros_like(key_slot_ids)
+            ).to(torch.int64)
+            flat_k = index_k_cache.reshape(-1, self.head_dim)
+            index_k = torch.index_select(flat_k, 0, safe_slots.reshape(-1)).reshape(
+                *key_slot_ids.shape, self.head_dim
+            )
             key_scale = _gather_scale_columns(
                 index_v_cache, key_slot_ids, _INDEX_NUM_SCALES, _FP4_QUANT_GROUP
             )
+            # ── In-flight overlay (D2-analog, strictly this forward's rows) ─
+            # A pool slot equal to a slot this forward writes must read this
+            # forward's row. Physical slots are per-sequence-unique, so the
+            # slot-id match IS the (seq, group) match. ``hit`` is one-hot along
+            # T (each closing token owns a distinct slot), so the fp32 matmul
+            # selects exactly one row and is bitwise-exact; the write cast
+            # (``.to(cache dtype)``) is applied first, mirroring
+            # ``_masked_scatter_rows``, and the scale overlay mirrors
+            # ``_gather_scale_columns``'s cast-then-expand.
+            wvalid = index_slot_mapping > _PAD_SLOT_ID
+            hit = (
+                key_slot_ids.unsqueeze(-1)
+                == index_slot_mapping.to(torch.int64).view(1, 1, -1)
+            ) & wvalid.view(1, 1, -1)
+            hitany = hit.any(dim=-1, keepdim=True)
+            onehot = hit.to(torch.float32)
+            over_k = onehot @ codes.to(index_k_cache.dtype).to(torch.float32)
+            index_k = torch.where(
+                hitany, over_k.to(index_k_cache.dtype), index_k
+            )
+            over_s = onehot @ scales[:, :_INDEX_NUM_SCALES].to(
+                index_v_cache.dtype
+            ).to(torch.float32)
+            over_s = (
+                over_s.unsqueeze(-1)
+                .expand(*over_s.shape, _FP4_QUANT_GROUP)
+                .reshape(
+                    key_slot_ids.shape[0],
+                    key_slot_ids.shape[1],
+                    _INDEX_NUM_SCALES * _FP4_QUANT_GROUP,
+                )
+            )
+            key_scale = torch.where(hitany, over_s, key_scale)
             if key_slot_ids.shape[0] == 1 and hidden_states.shape[0] != 1:
                 # <-- SEGMENTED PREFILL (LD-26 rung (B), Gap 1): a prefill
                 # forward carries T tokens of ONE sequence, so B == 1 while
@@ -1864,11 +1916,18 @@ class DeepseekV4Indexer(nn.Module):
                 )
                 key_slot_ids = key_slot_ids.reshape(pool_span)
                 key_scale = key_scale.reshape(pool_span, -1)
+                index_k = index_k.reshape(pool_span, -1)
         else:
             # In-forward pool: the closing token of group j is token
             # ``j * ratio + ratio - 1``, so a strided slice IS the pool in
             # pool-local order. Static shape, no gather.
             index_k = fresh[ratio - 1 :: ratio]
+
+        # ── Cache writes, traced LAST (plan §19.2 / LD-77) ──────────────
+        # The pool above already carries this forward's rows via the overlay,
+        # so these writes feed only the aliased ROOT outputs.
+        _masked_scatter_rows(index_k_cache, index_slot_mapping, codes)
+        _masked_scatter_rows(index_v_cache, index_slot_mapping, scales)
 
         return NF.sparse_indexer_topk(
             q_latent,

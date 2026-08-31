@@ -477,7 +477,12 @@ def _index_keys(
     """
     if index_k is not None:
         keys = index_k.to(accum_dtype)
-        slot_valid = None
+        # A caller that pre-gathered the pool itself (plan §19.2 gather-first:
+        # reads trace before the cache write, in-flight rows overlaid in the
+        # POOL) still needs the padded-slot backstop that the cache branch
+        # derives, so validity comes from ``key_slot_ids`` whenever the caller
+        # provides it. Callers passing ``index_k`` alone are unchanged.
+        slot_valid = None if key_slot_ids is None else key_slot_ids >= 0
     elif index_k_cache is not None and key_slot_ids is not None:
         flat_cache = index_k_cache.reshape(-1, index_head_dim)
         slot_valid = key_slot_ids >= 0
