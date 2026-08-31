@@ -33,6 +33,9 @@ from .attention.mla_qkv import mla_qkv
 from .attention.mla_oproj import mla_grouped_oproj
 from .attention.mla_sparse_attention import mla_sparse_attention
 from .attention.mla_decode import mla_decode_attention
+# LD-75 (plan §19.2 Amendment 11): without this re-export `NF.mla_decode_tkg`
+# never resolves at the call sites.
+from .attention.mla_decode_tkg import mla_decode_tkg
 from .attention.swa_attention import swa_attention
 from .attention.sparse_indexer import sparse_indexer_topk
 from .collectives.all_to_all import all_to_all
@@ -93,6 +96,7 @@ __all__ = [
     "ld68_witness",
     "merge_prompt_embeds",
     "mla_decode_attention",
+    "mla_decode_tkg",
     "mla_grouped_oproj",
     "mla_qkv",
     "mla_sparse_attention",

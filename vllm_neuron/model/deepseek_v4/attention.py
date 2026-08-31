@@ -3122,7 +3122,9 @@ class DeepseekV4Attention(nn.Module):
             # FIX-RECORD §3.3.
             raw = latent_md["max_blocks_per_seq"] * latent_md["block_size"]
             span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
-            return NF.mla_decode_attention(
+            # LD-75: kernel-rung dispatch (name swap only, prereg D2); the
+            # gate inside mla_decode_tkg falls back to mla_decode_attention.
+            return NF.mla_decode_tkg(
                 q,
                 self.latent_k_cache,
                 self.swa_k_cache,
@@ -3160,7 +3162,8 @@ class DeepseekV4Attention(nn.Module):
         absent = torch.full(
             (batch, 1), _PAD_INDEX, dtype=torch.int32, device=query.device
         )
-        return NF.mla_decode_attention(
+        # LD-75: kernel-rung dispatch (name swap only, prereg D2).
+        return NF.mla_decode_tkg(
             q,
             self.swa_k_cache,
             self.swa_k_cache,
