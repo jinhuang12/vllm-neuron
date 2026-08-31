@@ -1,0 +1,33 @@
+{
+  "op": "mla_sparse_attention_cte",
+  "_triad": "LD-76 (port-plan §19.2 Amendment 11; port-assessment §17.4). Committed BEFORE the kernel per the node contract; prereg TRIADS-Z0-PREREGISTRATION.md §D5/§D6 sha 5f5006b9b104fe7729c6482aef7e0124c1d59d7706403c29deec7dfdcd3fbdae (sealed 2026-08-31 before any edit).",
+  "timeout_seconds": 1800,
+  "reference": {
+    "callable": "numerics.mla_sparse_attention_cte_reference:mla_sparse_attention_cte_reference",
+    "_why": "Plain torch, outside the port package. Written directly against dsv4_ref/kernel.py:328-350 over the reference's single concatenated [window ++ topk] index list (dsv4_ref/model.py:520), while the triad's fallback goes through the family-19 gather-helper composition — two independent spellings of the declared math."
+  },
+  "_tolerance_derivation": "Identical to mla_decode_tkg.declaration.json (same out dtype, same math class): rtol = 2^-7 = 0.0078125, atol = 2^-10 = 0.0009765625, compared in fp32 after casting both legs. Fixed in the sealed prereg BEFORE any measurement; never widened.",
+  "_domain_notes": "positions omitted -> pos = arange(T) causal prefill (mla_sparse_attention.py:468-477 at 88b34e7). seq_ids omitted with 3-D caches [1, slots, 512] -> flat single-sequence addressing (_slot_ids falls through to local ids). compress_ratio=0 -> topk indices are raw row ids, -1 = absent, no causal cap on the compressed leg (the indexer owns causality at ratio 0). chunk_size omitted -> single chunk. No current-row operands; no scale caches; no cache write exists in this op at any setting (prefill writes are LD-77, model-level).",
+  "_uncovered_by_harness": "Graded instead by the committed probe numerics/probe_mla_sparse_attention_cte_supplementary.py (which reads rtol/atol FROM this declaration): 4-D paged fp8 caches with block tables, ue8m0 scale caches, the F-240 current-chunk provenance split (current_kv_rows/current_compressed_rows + writer-frame slot ids), ratio>0 pooling incl. ratio-128 groups closing in-chunk (prefill-side C128 coverage at the kernel rung), swa width splits, and chunked query processing. A recorded harness-vocabulary limit, never an absorbed one.",
+  "cases": [
+    {
+      "name": "c1-core",
+      "_role": "Core CTE math: topk gather with -1 sentinels, sliding-window band with causal edge, ONE softmax over [window ++ topk], per-head sink in the denominator only, fully-masked-query keep factor, 3-D contiguous addressing.",
+      "simulator": true,
+      "_simulator_note": "Small dims (T=8, H=2, 8 gathered rows/token). If the deployed simulator rejects an ISA op used by the kernel, the harness records UNCOVERED loudly - never a pass - and the same comparison is carried by the probe legs plus the compile_nki venue (prereg P3/P4).",
+      "inputs": [
+        {"shape": [8, 2, 512], "dtype": "bfloat16", "kind": "randn", "seed": 201},
+        {"shape": [1, 16, 512], "dtype": "bfloat16", "kind": "randn", "seed": 202},
+        {"shape": [1, 16, 512], "dtype": "bfloat16", "kind": "randn", "seed": 203},
+        {"shape": [8, 4], "dtype": "int32", "kind": "randint", "low": -1, "high": 16, "seed": 204},
+        {"shape": [2], "dtype": "float32", "kind": "randn", "seed": 205}
+      ],
+      "kwargs": {
+        "scale": 0.044194173824159216,
+        "window": 4,
+        "compress_ratio": 0
+      },
+      "tolerances": {"rtol": 0.0078125, "atol": 0.0009765625}
+    }
+  ]
+}
