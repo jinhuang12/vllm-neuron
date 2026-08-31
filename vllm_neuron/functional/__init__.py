@@ -12,6 +12,13 @@ from .block_fp8_linear import block_fp8_linear
 # `_forward_prefill`) through `NF.ld68_witness`; without this re-export the
 # name does not resolve at call time.
 from .ld68_witness import ld68_witness
+# <-- deepseek_v4 (LD-79, plan §20.2 Rule 4′): the in-place paged cache row
+# write. The SECOND new kernel triad this port authors (kernel body pending —
+# author_kernel_triads leg); every former `_masked_scatter_rows` /
+# `_write_compressed_cache` scatter site reaches it through
+# `NF.kv_cache_write`, so without this re-export the name does not resolve at
+# call time and the rewired sites break.
+from .kv_cache_write import kv_cache_write
 from .spec_decode_correction import (
     correct_spec_decode_positions_and_slot_mapping as correct_spec_decode_positions_and_slot_mapping,
 )  # noqa: F401
@@ -95,6 +102,7 @@ __all__ = [
     "gen_attention_decode_mask",
     "get_group_slice_indices",
     "get_local_expert_affinities",
+    "kv_cache_write",
     "ld68_witness",
     "merge_prompt_embeds",
     "mla_decode_attention",
