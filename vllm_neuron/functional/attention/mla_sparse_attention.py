@@ -325,6 +325,10 @@ def mla_sparse_attention(
     swa_widths: Optional[Sequence[int]] = None,
     swa_block_table: Optional[Tensor] = None,
     swa_ring: bool = False,
+    current_kv_rows: Optional[Tensor] = None,
+    current_kv_slot_ids: Optional[Tensor] = None,
+    current_compressed_rows: Optional[Tensor] = None,
+    current_compressed_slot_ids: Optional[Tensor] = None,
     nope_dim: int = LATENT_NOPE_DIM,
     rope_dim: int = LATENT_ROPE_DIM,
     quant_group_size: int = 64,
@@ -405,6 +409,32 @@ def mla_sparse_attention(
         swa_ring: the window cache is a ring of length ``window`` addressed at
             ``pos % window`` (the reference's decode-time layout,
             ``dsv4_ref/model.py:535``).
+        current_kv_rows: ``[T, sum(swa_widths) (+ num_scale_groups)]``
+            CACHE-FORM sliding-window rows produced by THIS forward — the exact
+            tensors the model's cache write will store (already cast to the
+            cache dtype), with the row's group-64 scale columns appended when
+            ``swa_scale_cache`` is in play. Plan §19.2 Rule 1 (LD-76, F-13):
+            with the KV-dataflow restructure the model TRACES ITS READS BEFORE
+            ITS WRITES, so the cache parameters this op receives hold only
+            PRIOR-forward rows; the rows written this forward ride here as
+            explicit operands and are dequantized in-op through the IDENTICAL
+            path gathered rows take, which keeps the round trip bitwise.
+        current_kv_slot_ids: ``[T]`` int — the writer's own frame (F-13): the
+            absolute position each token writes this forward, ``-1`` where the
+            writer masked the token (padding). A window slot is sourced from
+            ``current_kv_rows`` only when this frame CONFIRMS the slot was
+            written this forward; otherwise the slot must be strictly prior to
+            this forward's first position to stay valid.
+        current_compressed_rows: ``[T, nope_dim + rope_dim (+ groups)]``
+            CACHE-FORM compressed rows produced by THIS forward (closing
+            tokens carry their group's row; the rest are ignored), NoPE codes
+            ++ RoPE columns ++ scale columns, each cast exactly as the cache
+            write casts them (F-240: a group that closes inside this forward
+            must be visible to the queries behind it).
+        current_compressed_slot_ids: ``[T]`` int — the sequence-local
+            compressed GROUP id each token closes this forward, ``-1`` where
+            no group closes or the writer masked the token. The sequence-local
+            twin of the model's ``_coarse_slots`` frame.
         nope_dim / rope_dim: latent split, 448 + 64.
         quant_group_size: fp8 group size for the scale cache, 64.
         chunk_size: process the query tokens in chunks of this many, to bound
@@ -447,6 +477,95 @@ def mla_sparse_attention(
             pos = torch.arange(num_tokens, device=device, dtype=torch.int64)
     else:
         pos = positions.reshape(-1).to(torch.int64)
+
+    # ── Current-forward provenance operands (plan §19.2 Rules 1-2, LD-76) ──
+    # With the KV-dataflow restructure the model traces its reads BEFORE its
+    # writes, so the cache parameters hold only prior-forward rows and the rows
+    # written this forward arrive as explicit operands. The merge below sources
+    # every window slot / compressed group either from the PRE-WRITE cache
+    # (strictly prior to this forward's first position) or from these operands
+    # (validated against the writer's own frame, F-13) — never from a
+    # post-write cache read, which is what made every cache a mid-graph value
+    # (ep19 B2 mechanism, NCC_EOOM002).
+    cur_kv_lat: Optional[Tensor] = None
+    cur_kv_ids: Optional[Tensor] = None
+    cur_comp_lat: Optional[Tensor] = None
+    cur_comp_ids: Optional[Tensor] = None
+    first_pos: Optional[Tensor] = None
+    if current_kv_rows is not None or current_compressed_rows is not None:
+        # D8: the provenance split implements the family's established
+        # single-sequence-per-prefill-forward contract (the same one the
+        # indexer's paged pool asserts). Packed multi-sequence prefill must
+        # not pass current_* operands.
+        assert seq_ids is None and (not q_was_4d or batch == 1), (
+            "current_* provenance operands implement the single-sequence "
+            "prefill contract; do not combine them with packed multi-sequence "
+            "seq_ids"
+        )
+        assert not swa_ring, (
+            "current-row provenance is defined for the paged/absolute window "
+            "frame; the ring layout has no writer frame to validate against"
+        )
+        # This forward's first absolute position — a runtime read of a fixed
+        # slice, static shape, no .item().
+        first_pos = pos.reshape(-1)[:1]
+    num_scale_groups = nope_dim // quant_group_size
+    if current_kv_rows is not None:
+        assert current_kv_slot_ids is not None, (
+            "current_kv_rows needs current_kv_slot_ids (the writer's frame)"
+        )
+        swa_row_w = nope_dim + rope_dim
+        cur_rows_f = current_kv_rows[..., :swa_row_w].to(softmax_dtype)
+        if swa_scale_cache is not None:
+            # Identical dequant path to _gather_latent's, so an in-flight row
+            # and its written-then-read twin are BITWISE equal (D1).
+            cur_s = current_kv_rows[
+                ..., swa_row_w : swa_row_w + num_scale_groups
+            ].to(torch.float32)
+            cur_kv_lat = torch.cat(
+                (
+                    dequant_group_scales(
+                        cur_rows_f[..., :nope_dim],
+                        cur_s,
+                        group_size=quant_group_size,
+                        num_groups=num_scale_groups,
+                    ),
+                    cur_rows_f[..., nope_dim:],
+                ),
+                dim=-1,
+            )
+        else:
+            cur_kv_lat = cur_rows_f
+        cur_kv_ids = current_kv_slot_ids.reshape(-1).to(torch.int64)
+    if current_compressed_rows is not None:
+        assert current_compressed_slot_ids is not None, (
+            "current_compressed_rows needs current_compressed_slot_ids"
+        )
+        assert compress_ratio > 0, (
+            "the compressed provenance split needs compress_ratio to place "
+            "each group's closing token"
+        )
+        lat_w = nope_dim + rope_dim
+        cur_c_f = current_compressed_rows[..., :lat_w].to(softmax_dtype)
+        if compressed_scale_cache is not None:
+            cur_cs = current_compressed_rows[
+                ..., lat_w : lat_w + num_scale_groups
+            ].to(torch.float32)
+            cur_comp_lat = torch.cat(
+                (
+                    dequant_group_scales(
+                        cur_c_f[..., :nope_dim],
+                        cur_cs,
+                        group_size=quant_group_size,
+                        num_groups=num_scale_groups,
+                    ),
+                    cur_c_f[..., nope_dim:],
+                ),
+                dim=-1,
+            )
+        else:
+            cur_comp_lat = cur_c_f
+        cur_comp_ids = current_compressed_slot_ids.reshape(-1).to(torch.int64)
 
     if seq_ids is None and q_was_4d:
         seq_ids = (
@@ -500,6 +619,26 @@ def mla_sparse_attention(
             rope_dim=rope_dim,
             quant_group_size=quant_group_size,
         )
+        if cur_comp_lat is not None:
+            # Provenance split (Rule 1, F-240): a group is PRIOR iff it closed
+            # before this forward's first position — (g+1)*ratio <= first_pos,
+            # i.e. g < first_pos // ratio. A group closing INSIDE this forward
+            # is sourced from the explicit operand at its closing token's
+            # local index (g+1)*ratio - 1 - first_pos, accepted only when the
+            # writer's own frame confirms it wrote that group (F-13).
+            frontier = first_pos // compress_ratio  # [1], broadcasts
+            loc = (
+                (comp_idx + 1) * compress_ratio - 1 - first_pos
+            ).clamp(0, num_tokens - 1)
+            written_g = torch.index_select(
+                cur_comp_ids, 0, loc.reshape(-1)
+            ).view(comp_idx.shape)
+            use_cur_c = comp_valid & (comp_idx >= frontier) & (written_g == comp_idx)
+            cur_c_g = torch.index_select(
+                cur_comp_lat, 0, loc.reshape(-1)
+            ).view(comp_idx.shape[0], comp_idx.shape[1], -1)
+            comp_latent = torch.where(use_cur_c.unsqueeze(-1), cur_c_g, comp_latent)
+            comp_valid = comp_valid & ((comp_idx < frontier) | use_cur_c)
 
         # Sliding-window leg.
         win_idx, win_valid = _window_local_indices(chunk_pos, window, ring=swa_ring)
@@ -515,6 +654,24 @@ def mla_sparse_attention(
             rope_dim=rope_dim,
             quant_group_size=quant_group_size,
         )
+        if cur_kv_lat is not None:
+            # Provenance split (Rule 1): window slots at absolute positions
+            # >= first_pos belong to THIS forward — source them from the
+            # explicit operand at local index (win_idx - first_pos), accepted
+            # only when the writer's frame confirms that token wrote that
+            # position (F-13; a padded token carries -1 and never matches).
+            # Slots strictly before first_pos stay cache-sourced; everything
+            # else is masked.
+            local = (win_idx - first_pos).clamp(0, num_tokens - 1)
+            written_pos = torch.index_select(
+                cur_kv_ids, 0, local.reshape(-1)
+            ).view(win_idx.shape)
+            use_cur_kv = win_valid & (win_idx >= first_pos) & (written_pos == win_idx)
+            cur_kv_g = torch.index_select(
+                cur_kv_lat, 0, local.reshape(-1)
+            ).view(win_idx.shape[0], win_idx.shape[1], -1)
+            win_latent = torch.where(use_cur_kv.unsqueeze(-1), cur_kv_g, win_latent)
+            win_valid = win_valid & ((win_idx < first_pos) | use_cur_kv)
 
         # ONE softmax over [window ++ compressed], mirroring the reference's
         # single concatenated index list (dsv4_ref/model.py:520).
