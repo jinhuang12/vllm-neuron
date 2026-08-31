@@ -34,6 +34,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         hf_config: PretrainedConfig,
         text_neuron_config: NeuronConfig | None = None,
         vision_neuron_config: VisionNeuronConfig | None = None,
+        **kwargs,
     ) -> None:
         super().__init__()
         self._model = self._select_implementation(
@@ -42,6 +43,30 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self._model(*args, **kwargs)
+
+    def embed_input_ids(self, input_ids):
+        """Boundary member: present so config-time interface validation passes.
+
+        This class is a selection seam, never a compute path -- the selected
+        implementation owns embedding. No call site for this method exists in
+        ``vllm_neuron``, so the raise is the permanent contract.
+        """
+        raise NotImplementedError(
+            "Glm5NextForConditionalGeneration is a selection factory; "
+            "embed_input_ids belongs to the selected implementation."
+        )
+
+    def compute_logits(self, hidden_states):
+        """Boundary member: present so config-time interface validation passes.
+
+        Same contract as ``embed_input_ids`` -- the selected implementation
+        owns logits, and no call site for this method exists in
+        ``vllm_neuron``.
+        """
+        raise NotImplementedError(
+            "Glm5NextForConditionalGeneration is a selection factory; "
+            "compute_logits belongs to the selected implementation."
+        )
 
     @classmethod
     def from_configs(

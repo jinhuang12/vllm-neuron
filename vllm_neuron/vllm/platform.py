@@ -162,9 +162,16 @@ class NeuronPlatform(Platform):
         """Register Neuron model architectures before ModelConfig validation."""
         import os
 
-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
+        # Lazy string, not a class object: the pre-validation hook must stay
+        # import-free, and the string resolves through the package re-export.
+        ModelRegistry.register_model(
+            "Glm5NextForConditionalGeneration",
+            "vllm_neuron.model.glm5_next:Glm5NextForConditionalGeneration",
+        )
+
+        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
