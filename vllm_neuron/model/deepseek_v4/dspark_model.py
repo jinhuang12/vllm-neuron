@@ -37,11 +37,12 @@ checkpoint's ``mtp.*`` namespace holds DeepSeek's own **DSpark** drafter
 WHAT THIS MODULE REUSES RATHER THAN RESTATES
 
 Every numeric primitive comes from the settled family: :mod:`.attention`'s
-``_rms_norm`` / ``_gptj_rope`` / ``_quant_fp8_ue8m0`` / ``_masked_scatter_rows``
+``_rms_norm`` / ``_gptj_rope`` / ``_quant_fp8_ue8m0``
 / ``_gather_scale_columns``, :mod:`.model`'s :class:`DeepseekV4HashContext` and
 :class:`DeepseekV4RMSNorm`, :class:`~.moe.DeepseekV4MoE` verbatim, and the
 functional ops ``NF.mla_qkv`` / ``NF.swa_attention`` / ``NF.block_fp8_linear`` /
-``NF.mla_grouped_oproj``. No new functional op and no new NKI kernel is
+``NF.mla_grouped_oproj`` / ``NF.kv_cache_write`` (LD-79, the drafter's SWA
+cache write). No new functional op and no new NKI kernel is
 introduced here (ladder rows LD-18/LD-19/LD-20 are reuse-op, reuse-op and
 torch-composition).
 
@@ -102,7 +103,6 @@ from .attention import (
     _gather_cache_rows,
     _gather_scale_columns,
     _gptj_rope,
-    _masked_scatter_rows,
     _num_blocks,
     _quant_fp8_ue8m0,
     _rms_norm,
@@ -503,15 +503,15 @@ class DeepseekV4DSparkAttention(nn.Module):
     ) -> None:
         """Scatter :meth:`compute_main_kv`'s rows into the paged pair.
 
-        Called by the drafter AFTER every stage has read its window (Rule 4):
-        with no later reader left to rewire, the functionalized scatters feed
-        nothing but the aliased root outputs. ``_masked_scatter_rows`` casts
+        Called by the drafter AFTER every stage has read its window (Rule 4′,
+        LD-79): the writes are in-kernel in-place row writes — no page-sized
+        scatter exists in the traced graph at all. ``NF.kv_cache_write`` casts
         ``rows.to(cache.dtype)`` internally — a no-op on these already
         cache-form rows, so the stored bits equal the old fused write's.
         """
         k_row, scale_row, slot_mapping = current_kv
-        _masked_scatter_rows(self.swa_k_cache, slot_mapping, k_row)
-        _masked_scatter_rows(self.swa_v_cache, slot_mapping, scale_row)
+        NF.kv_cache_write(self.swa_k_cache, slot_mapping, k_row)
+        NF.kv_cache_write(self.swa_v_cache, slot_mapping, scale_row)
 
     def forward(
         self,
