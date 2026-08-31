@@ -1,0 +1,91 @@
+{
+  "op": "kv_cache_write",
+  "_triad": "LD-79 (port-plan §20.2 Rule 4′; port-assessment §18.4 LADDER-DECISION rows). Committed BEFORE any kernel line per the node contract; prereg TRIADS79-Z0-PREREGISTRATION.md §D6 sha 8cf4231b1384b7ac8fa0b7016b96d8a2da4dfd0831746f43111493adc856559c (sealed 2026-08-31T17:13:43Z before any edit).",
+  "timeout_seconds": 1800,
+  "reference": {
+    "callable": "numerics.kv_cache_write_reference:kv_cache_write_reference",
+    "_why": "Plain torch, outside the port package (the harness refuses a reference resolving inside vllm_neuron). Out-of-place index_put over boolean-selected valid rows, merged in fp32 over the cache-dtype-quantized payload — no clamp redirect, no index_select, no where, no in-place op — while the triad's fallback is the incumbent clamp-redirect masked-scatter composition (_torch_kv_cache_write): two independent spellings of the declared write."
+  },
+  "_tolerance_derivation": "BIT-EXACT obligation (LD-79 grep row: casts-reproduce-_masked_scatter_rows-bitwise): rtol=0.0 atol=0.0 on EVERY case — allclose at 0/0 is exact equality. The harness compares returned tensors in fp32; float8_e4m3fn→float32 is injective, so fp32 equality ⟺ byte equality. randn at unit scale cannot mint fp8 NaN/Inf (max |x| ≪ the 448 e4m3fn saturation bound), so the NaN≠NaN allclose edge cannot fire. Fixed in the sealed prereg BEFORE any measurement; NEVER widened — a post-hoc widening would turn the fallback into a lying discriminator for the accuracy loop (node contract).",
+  "_domain_notes": "The op RETURNS the written cache (Z0 D1 contract completion: the harness grades RETURNED tensors — torch.as_tensor(None) crashes every leg — and every call site discards the return; the traced-path in-place threading is the HOP operand_output_aliases, independent of the python return). Slot ids are unique by construction (arange) in every writing case; all-sentinel-skip is deterministically all -1 (randint in [-1,0)), duplicate sentinel rows all no-op with identical bytes. NO declared case both validly writes slot 0 and carries a sentinel row: that zone is order-unspecified in the INCUMBENT itself (index_put_ with duplicate destinations after the clamp-to-0 redirect) and is excluded from the op contract — F-13 row provenance gives every real token its own slot.",
+  "_uncovered_by_harness": "The harness passes tensors positionally and scalars via kwargs only; tensor keyword args are inexpressible — valid_mask is therefore NOT covered here and is graded instead by the committed probe numerics/probe_kv_cache_write_supplementary.py (which reads rtol/atol FROM this declaration): valid_mask mask-skip (mixed and all-False), mixed -1/valid slot vectors (valid ids unique, none targeting slot 0 while a sentinel row is present — the recorded contract zone), duplicate sentinel rows, the full per-class width sweep {64,128,224,512,672,896,1344,2688} with BITWISE post-call cache-byte compare (uint8 view), rows dtype sweep {fp8 identity, f32 cast, bf16 cast}, int32 slot_ids, and the eager-simulator in-place contract (after the PUBLIC op on the kernel leg, the CALLER's cache object carries the written bytes — the D-copyback). A recorded harness-vocabulary limit, never an absorbed one (LD-75 precedent).",
+  "cases": [
+    {
+      "name": "full-width-fp8",
+      "_role": "Latent-class width 224, full-width fp8 rows (cast is identity), unique arange slots — the core in-place row write with zero pad and zero cast effect.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [4, 1, 32, 224], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 211},
+        {"shape": [96], "dtype": "int64", "kind": "arange", "seed": 0},
+        {"shape": [96, 224], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 212}
+      ],
+      "tolerances": {"rtol": 0.0, "atol": 0.0}
+    },
+    {
+      "name": "pad-columns-fp32rows",
+      "_role": "Rope/scale-class width 64 with 7-column fp32 rows: grades the incumbent f32→fp8 write cast AND the zero pad 7→64 (the _pad_columns semantics, in-kernel memset on the kernel leg).",
+      "simulator": true,
+      "inputs": [
+        {"shape": [4, 1, 32, 64], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 221},
+        {"shape": [96], "dtype": "int64", "kind": "arange", "seed": 0},
+        {"shape": [96, 7], "dtype": "float32", "kind": "randn", "seed": 222}
+      ],
+      "tolerances": {"rtol": 0.0, "atol": 0.0}
+    },
+    {
+      "name": "multi-tile-swa",
+      "_role": "SWA-content width 512 at T=160: crosses the 128-row id-tile boundary (two kernel tiles, second partial), fp32→fp8 cast.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [8, 1, 32, 512], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 231},
+        {"shape": [160], "dtype": "int64", "kind": "arange", "seed": 0},
+        {"shape": [160, 512], "dtype": "float32", "kind": "randn", "seed": 232}
+      ],
+      "tolerances": {"rtol": 0.0, "atol": 0.0}
+    },
+    {
+      "name": "all-sentinel-skip",
+      "_role": "Every slot id is -1 (randint in [-1,0) is deterministically all -1): the kernel's uint32-max skip sentinel vs the incumbent's clamp-to-0 no-op redirect — cache bytes must be UNCHANGED on both legs.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [4, 1, 32, 128], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 241},
+        {"shape": [64], "dtype": "int64", "kind": "randint", "seed": 242, "low": -1, "high": 0},
+        {"shape": [64, 128], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 243}
+      ],
+      "tolerances": {"rtol": 0.0, "atol": 0.0}
+    },
+    {
+      "name": "state-pair-2688",
+      "_role": "Widest validated class (compressor state, width 2688) with the widest pad (2080→2688) and the fp32 state-row cast — the D8 envelope's upper width edge from inside.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [2, 1, 32, 2688], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 251},
+        {"shape": [32], "dtype": "int64", "kind": "arange", "seed": 0},
+        {"shape": [32, 2080], "dtype": "float32", "kind": "randn", "seed": 252}
+      ],
+      "tolerances": {"rtol": 0.0, "atol": 0.0}
+    },
+    {
+      "name": "dspark-896",
+      "_role": "Drafter MTP SWA class (width 896) with 512-column cache-form fp8 rows — the dspark_model.py commit_main_kv shape family.",
+      "simulator": true,
+      "inputs": [
+        {"shape": [4, 1, 32, 896], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 261},
+        {"shape": [64], "dtype": "int64", "kind": "arange", "seed": 0},
+        {"shape": [64, 512], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 262}
+      ],
+      "tolerances": {"rtol": 0.0, "atol": 0.0}
+    },
+    {
+      "name": "over-envelope-width",
+      "_role": "Width 4096 sits ABOVE the D8 gate cap (2688): the gate declines, the device is CPU, so BOTH legs take the torch fallback — grades decline-routing without a crash, never a silent device fallback (that path raises by design).",
+      "simulator": true,
+      "inputs": [
+        {"shape": [2, 1, 32, 4096], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 271},
+        {"shape": [32], "dtype": "int64", "kind": "arange", "seed": 0},
+        {"shape": [32, 64], "dtype": "float8_e4m3fn", "kind": "randn", "seed": 272}
+      ],
+      "tolerances": {"rtol": 0.0, "atol": 0.0}
+    }
+  ]
+}
