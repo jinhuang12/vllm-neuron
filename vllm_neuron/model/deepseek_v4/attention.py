@@ -258,7 +258,7 @@ _SWA_PAIR_HEAD_SIZE: int = 672
 #:
 #: Its CONTENT is identical to the target ``.swa`` leg's — 512 k columns
 #: (``cat(codes, latent[..., nope:])``) and ``_SWA_NUM_SCALES`` = 7 v columns,
-#: both written by ``dspark_model.py``'s ``write_main_kv`` — so it could reuse
+#: both written by ``dspark_model.py``'s ``compute_main_kv``/``commit_main_kv`` — so it could reuse
 #: :data:`_SWA_PAIR_HEAD_SIZE`. It deliberately does NOT, and the reason is
 #: pricing, not content (port plan §3.6.2, LD-29 / R-34):
 #:

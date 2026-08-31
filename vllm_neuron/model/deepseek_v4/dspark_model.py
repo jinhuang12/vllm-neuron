@@ -97,6 +97,7 @@ from vllm_neuron.utils.weight_loader import (
 from .attention import (
     _FP8_DTYPE,
     _KV_QUANT_GROUP,
+    _PAD_SLOT_ID,
     _cos_sin,
     _gather_cache_rows,
     _gather_scale_columns,
@@ -408,15 +409,31 @@ class DeepseekV4DSparkAttention(nn.Module):
         self.swa_k_cache, self.swa_v_cache = pair[0], pair[1]
 
     # ── The two cadences ───────────────────────────────────────────────────
-    def write_main_kv(
+    def compute_main_kv(
         self,
         main_x: torch.Tensor,
         positions: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         attn_metadata: dict[str, dict],
-    ) -> None:
-        """Cache one KV row per REAL token, from ``main_x``.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute one CACHE-FORM KV row per REAL token, from ``main_x``.
+
+        <-- KV-DATAFLOW RESTRUCTURE (plan §19.2, Rules 1/4, F-13). Formerly
+        ``write_main_kv``: compute + scatter in one call, traced BEFORE the
+        stage reads, so the FX in-place pass rewired the stage window reads to
+        the post-scatter value and every 88 MB drafter cache became a
+        mid-graph VALUE (ep19 B2 mechanism, NCC_EOOM002). Now split: this
+        method computes the rows and RETURNS them with the writer's own frame;
+        the stage merges them into its window read as explicit operands
+        (:meth:`forward` ``current_kv``); :meth:`commit_main_kv` scatters them
+        AFTER every read, so the scatters feed nothing but the aliased root
+        outputs.
+
+        Returns ``(k_row [T, 512] cache-form, scale_row [T, 7] cache-form,
+        slot_mapping [T])`` — the k/scale tensors carry the cache's own write
+        cast, so an in-flight row is BITWISE what a written-then-read row
+        dequantizes to (D1).
 
         ``dsv4_ref/model.py:759-761`` then ``:765-768`` (prefill, whole prompt)
         or ``:783`` (decode, one row at ``start_pos % window``). Both are the
@@ -464,12 +481,29 @@ class DeepseekV4DSparkAttention(nn.Module):
         # ``kv_nope_fp8_qat=True``.
         nope = self.nope_head_dim
         codes, scales = _quant_fp8_ue8m0(latent[..., :nope])
-        _masked_scatter_rows(
-            self.swa_k_cache,
-            md["slot_mapping"],
-            torch.cat((codes.to(torch.float32), latent[..., nope:]), dim=-1),
-        )
-        _masked_scatter_rows(self.swa_v_cache, md["slot_mapping"], scales)
+        # Cache-form (D1): the same single cast the masked scatter applies on
+        # the way into the cache, so scattering these rows later stores
+        # exactly the bits the old fused write stored.
+        k_row = torch.cat(
+            (codes.to(torch.float32), latent[..., nope:]), dim=-1
+        ).to(self.swa_k_cache.dtype)
+        scale_row = scales.to(self.swa_v_cache.dtype)
+        return k_row, scale_row, md["slot_mapping"]
+
+    def commit_main_kv(
+        self, current_kv: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ) -> None:
+        """Scatter :meth:`compute_main_kv`'s rows into the paged pair.
+
+        Called by the drafter AFTER every stage has read its window (Rule 4):
+        with no later reader left to rewire, the functionalized scatters feed
+        nothing but the aliased root outputs. ``_masked_scatter_rows`` casts
+        ``rows.to(cache.dtype)`` internally — a no-op on these already
+        cache-form rows, so the stored bits equal the old fused write's.
+        """
+        k_row, scale_row, slot_mapping = current_kv
+        _masked_scatter_rows(self.swa_k_cache, slot_mapping, k_row)
+        _masked_scatter_rows(self.swa_v_cache, slot_mapping, scale_row)
 
     def forward(
         self,
@@ -479,6 +513,9 @@ class DeepseekV4DSparkAttention(nn.Module):
         attn_metadata: dict[str, dict],
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        *,
+        current_kv: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
         """One block-parallel attention step.
 
@@ -492,6 +529,15 @@ class DeepseekV4DSparkAttention(nn.Module):
             attn_metadata: keyed by :attr:`kv_layer_name`.
             rope_cos / rope_sin: ``[B * block_size, rope_head_dim // 2]`` at
                 ``draft_positions``.
+            current_kv: :meth:`compute_main_kv`'s ``(k_row, scale_row,
+                slot_mapping)`` — the CACHE-FORM rows THIS forward produced
+                and the writer's own physical frame (plan §19.2 Rule 1,
+                F-13). With the KV-dataflow restructure the cache is read
+                PRE-WRITE, so any window slot whose physical slot appears in
+                the writer's frame is sourced from these operands instead;
+                physical slots are globally unique, so slot membership needs
+                no sequence guard, and padded writer entries (``-1``) never
+                match a real slot.
 
         Returns:
             ``[B * block_size, hidden_size]``.
@@ -553,6 +599,47 @@ class DeepseekV4DSparkAttention(nn.Module):
         win_latent = torch.cat(
             (win_row[..., :nope] * win_factors, win_row[..., nope:]), dim=-1
         )
+
+        if current_kv is not None:
+            # Provenance merge (Rule 1, F-13): rows written THIS forward are
+            # not in the pre-write cache — source them from the writer's own
+            # returned operands, matched by PHYSICAL slot membership against
+            # the writer's frame. The reconstruction below is the identical
+            # op chain the gathered path takes (fp8 -> f32 convert, per-group
+            # scale expand, multiply), so a merged row is bitwise the
+            # written-then-read one.
+            k_row, scale_row, frame = current_kv
+            num_rows = k_row.shape[0]
+            cur_row_f = k_row.to(torch.float32)[..., : self.head_dim]
+            cur_fac = (
+                scale_row.to(torch.float32)[..., :_SWA_NUM_SCALES]
+                .unsqueeze(-1)
+                .expand(-1, _SWA_NUM_SCALES, _KV_QUANT_GROUP)
+                .reshape(num_rows, _SWA_NUM_SCALES * _KV_QUANT_GROUP)
+            )
+            cur_lat = torch.cat(
+                (cur_row_f[..., :nope] * cur_fac, cur_row_f[..., nope:]), dim=-1
+            )
+            frame_l = frame.reshape(-1).to(torch.int64)
+            eq = (
+                (slot_ids.unsqueeze(-1) == frame_l.reshape(1, 1, -1))
+                & (frame_l > _PAD_SLOT_ID).reshape(1, 1, -1)
+                & (slot_ids >= 0).unsqueeze(-1)
+            )  # [B, window, T]
+            match = eq.any(dim=-1)
+            # At most one match per slot (physical slots are unique), so the
+            # weighted sum IS the matching row index — no argmax, no boolean
+            # indexing, static shapes throughout.
+            src = (
+                eq.to(torch.int64)
+                * torch.arange(
+                    num_rows, device=slot_ids.device, dtype=torch.int64
+                ).reshape(1, 1, -1)
+            ).sum(dim=-1)
+            cur_g = torch.index_select(cur_lat, 0, src.reshape(-1)).view(
+                batch, window, -1
+            )
+            win_latent = torch.where(match.unsqueeze(-1), cur_g, win_latent)
 
         # ── One key set per sequence: window slots then block slots ─────────
         keys = torch.cat(
@@ -888,8 +975,17 @@ class DeepseekV4DSparkStage(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         input_ids: torch.Tensor,
+        *,
+        current_kv: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
-        """Advance the ``[B * block_size, hc_mult, H]`` bundle by one stage."""
+        """Advance the ``[B * block_size, hc_mult, H]`` bundle by one stage.
+
+        ``current_kv`` threads this stage's :meth:`DeepseekV4DSparkAttention.
+        compute_main_kv` rows into the attention's window read (plan §19.2
+        Rule 1) — explicit dataflow rather than module state, so the traced
+        graph carries the operands.
+        """
         residual = bundle
         x, post, comb = DeepseekV4HashContext.pre(
             bundle,
@@ -903,7 +999,13 @@ class DeepseekV4DSparkStage(nn.Module):
         )
         x = self.attn_norm(x)
         x = self.self_attn(
-            x, draft_positions, real_positions, attn_metadata, rope_cos, rope_sin
+            x,
+            draft_positions,
+            real_positions,
+            attn_metadata,
+            rope_cos,
+            rope_sin,
+            current_kv=current_kv,
         )
         bundle = DeepseekV4HashContext.post(x, residual, post, comb)
 
@@ -1343,10 +1445,18 @@ class DeepseekV4DSparkDrafter(nn.Module):
             32.0,
             1.0,
         )
-        for stage in self.stages:
-            stage.self_attn.write_main_kv(
+        # <-- KV-DATAFLOW RESTRUCTURE (plan §19.2, Rules 1/4): compute every
+        # stage's rows FIRST (returned with the writer's frame), let each
+        # stage read its window from the PRE-WRITE cache merged with these
+        # operands, and scatter only after every stage has read — so the
+        # scatters feed nothing but the aliased root outputs and no drafter
+        # cache becomes a mid-graph value (ep19 B2 mechanism).
+        stage_kv = [
+            stage.self_attn.compute_main_kv(
                 main_x, positions_l, cos_main, sin_main, attn_metadata
             )
+            for stage in self.stages
+        ]
 
         # ── Block-parallel draft step ───────────────────────────────────────
         last_idx = sampling_positions.reshape(-1).to(torch.int64)
@@ -1386,7 +1496,7 @@ class DeepseekV4DSparkDrafter(nn.Module):
         embedded = self.embed_tokens(draft_ids, scatter_tokens=False, rank=rank)
         bundle = embedded.unsqueeze(-2).expand(-1, self.hc_mult, -1).contiguous()
 
-        for stage in self.stages:
+        for stage, cur_kv in zip(self.stages, stage_kv):
             bundle = stage(
                 bundle,
                 draft_pos,
@@ -1395,7 +1505,12 @@ class DeepseekV4DSparkDrafter(nn.Module):
                 cos_draft,
                 sin_draft,
                 draft_ids,
+                current_kv=cur_kv,
             )
+
+        # Writes traced AFTER every stage's window read (Rule 4).
+        for stage, cur_kv in zip(self.stages, stage_kv):
+            stage.self_attn.commit_main_kv(cur_kv)
 
         drafts_only, _confidence = last_stage.forward_head(
             bundle, seed, self.lm_head, batch, rank
