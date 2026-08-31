@@ -1418,7 +1418,7 @@ class DeepseekV4KVCompressor(nn.Module):
         """
         kv1, kv2, kv_scale = self._encode_state_row(kv_rows)
         gate1, gate2, gate_scale = self._encode_state_row(score_rows)
-        _masked_scatter_rows(
+        NF.kv_cache_write(
             state.k_cache,
             state.slot_mapping,
             torch.cat(
@@ -1431,7 +1431,7 @@ class DeepseekV4KVCompressor(nn.Module):
                 dim=-1,
             ),
         )
-        _masked_scatter_rows(
+        NF.kv_cache_write(
             state.v_cache,
             state.slot_mapping,
             torch.cat((kv2.to(torch.float32), gate2.to(torch.float32)), dim=-1),
@@ -1928,11 +1928,13 @@ class DeepseekV4Indexer(nn.Module):
             # pool-local order. Static shape, no gather.
             index_k = fresh[ratio - 1 :: ratio]
 
-        # ── Cache writes, traced LAST (plan §19.2 / LD-77) ──────────────
-        # The pool above already carries this forward's rows via the overlay,
-        # so these writes feed only the aliased ROOT outputs.
-        _masked_scatter_rows(index_k_cache, index_slot_mapping, codes)
-        _masked_scatter_rows(index_v_cache, index_slot_mapping, scales)
+        # ── Cache writes, traced LAST (plan §20.2 Rule 4′ / LD-79) ──────
+        # The pool above already carries this forward's rows via the overlay.
+        # LD-79: in-kernel in-place writes — no page-sized scatter exists in
+        # the traced graph at all (the torch form is measured-materialized by
+        # the deployed compiler even when fully aliased, F-245).
+        NF.kv_cache_write(index_k_cache, index_slot_mapping, codes)
+        NF.kv_cache_write(index_v_cache, index_slot_mapping, scales)
 
         return NF.sparse_indexer_topk(
             q_latent,
@@ -2908,14 +2910,17 @@ class DeepseekV4Attention(nn.Module):
                 chunk_size=64,
             )
 
-        # ── Cache writes, traced AFTER every read (Rules 3-4, LD-77) ────
-        # Prefill only: the scatters feed nothing but the aliased root
-        # outputs — the in-place pass has no later reader left to rewire, so
-        # no cache becomes a mid-graph value. Decode writes already happened
-        # inside NF.mla_decode_attention (update_cache, Rule 3).
+        # ── Cache writes, traced AFTER every read (Rules 1-3 + Rule 4′,
+        # LD-79) ─────────────────────────────────────────────────────────
+        # Prefill only: LD-79 in-kernel in-place writes — the reads above
+        # bound the pre-write caches, and no page-sized scatter exists in the
+        # traced graph at all (Rule 4′; the aliased-scatter torch form is
+        # measured-materialized by the deployed compiler, F-245). Decode
+        # writes already happened inside NF.mla_decode_attention
+        # (update_cache, Rule 3).
         if not is_decode:
-            _masked_scatter_rows(self.swa_k_cache, swa_md["slot_mapping"], swa_row)
-            _masked_scatter_rows(
+            NF.kv_cache_write(self.swa_k_cache, swa_md["slot_mapping"], swa_row)
+            NF.kv_cache_write(
                 self.swa_v_cache, swa_md["slot_mapping"], nope_scales
             )
             if self.compressor is not None:
@@ -3393,10 +3398,11 @@ class DeepseekV4Attention(nn.Module):
         KV-dataflow restructure (plan §19.2) the forward computes them once,
         BEFORE attention, because the same tensors ride into the attention op
         as the current-forward operands (Rule 1); this method is now nothing
-        but the four masked scatters, traced after every read (Rule 4).
+        but a thin caller of the four ``NF.kv_cache_write`` in-place row
+        writes, traced after every read (Rule 4′ / LD-79).
         """
         half = _LATENT_PAIR_HEAD_SIZE
-        _masked_scatter_rows(self.latent_k_cache, latent_slots, codes[:, :half])
-        _masked_scatter_rows(self.latent_v_cache, latent_slots, codes[:, half:])
-        _masked_scatter_rows(self.rope_cache, rope_slots, rope_cols)
-        _masked_scatter_rows(self.scale_cache, rope_slots, scales)
+        NF.kv_cache_write(self.latent_k_cache, latent_slots, codes[:, :half])
+        NF.kv_cache_write(self.latent_v_cache, latent_slots, codes[:, half:])
+        NF.kv_cache_write(self.rope_cache, rope_slots, rope_cols)
+        NF.kv_cache_write(self.scale_cache, rope_slots, scales)
