@@ -2493,42 +2493,80 @@ class DeepseekV4Attention(nn.Module):
         # the ordering both the caches and the inverse RoPE assume.
         query = torch.cat((q_nope, q_rope), dim=-1)
 
-        # ── Sliding-window cache write (every token, raw cadence) ───────
+        # ── This forward's cache payloads, computed BEFORE any cache read ──
+        # <-- KV-DATAFLOW RESTRUCTURE (plan §19.2, LD-77; ep19 B2 mechanism).
+        # The FX in-place pass rewires every cache read traced AFTER a write
+        # to the post-scatter value (InPlaceToOutOfPlacePass._rewire_base_
+        # readers is dominance-safe: it touches ONLY later nodes), which made
+        # each 88 MB cache a mid-graph VALUE the LNC=2 partitioner piped
+        # between subgraphs — NCC_EOOM002 on 16/16 production cold compiles.
+        # The restructure: compute the rows this forward produces (they are
+        # needed as attention operands anyway), run the indexer and attention
+        # against the PRE-WRITE cache parameters plus these explicit operands
+        # (Rule 1; masks strictly-prior, validated by the writer's own frame,
+        # F-13), and only THEN write — prefill writes at the model level after
+        # attention (Rule 4: the scatters feed nothing but the aliased root
+        # outputs), decode writes inside NF.mla_decode_attention
+        # (Rule 3 / LD-75 update_cache).
         # k_cache takes the whole 512-wide latent, v_cache its 7 group-64
         # scales. Re-deriving the codes from the round-tripped value is exact
         # because the round trip left it on the quantization grid.
-        nope_codes, nope_scales = _quant_fp8_ue8m0(latent_kv[..., : self.nope_head_dim])
-        _masked_scatter_rows(
-            self.swa_k_cache,
-            swa_md["slot_mapping"],
-            torch.cat(
-                (nope_codes.to(torch.float32), latent_kv[..., self.nope_head_dim :]),
-                dim=-1,
-            ),
+        nope = self.nope_head_dim
+        nope_codes, nope_scales = _quant_fp8_ue8m0(latent_kv[..., :nope])
+        swa_row = torch.cat(
+            (nope_codes.to(torch.float32), latent_kv[..., nope:]), dim=-1
         )
-        _masked_scatter_rows(self.swa_v_cache, swa_md["slot_mapping"], nope_scales)
+        # Cache-form operands (D1): the EXACT tensors the masked scatter will
+        # store — same single cast to the cache dtype — so the op-side dequant
+        # of an in-flight row is bitwise identical to a written-then-read one.
+        assert self.swa_k_cache.dtype == self.swa_v_cache.dtype, (
+            "the LD-76 window bundle rides as ONE cache-form tensor"
+        )
+        cur_kv_row = swa_row.to(self.swa_k_cache.dtype)        # [T, 512]
+        cur_kv_scale = nope_scales.to(self.swa_v_cache.dtype)  # [T, 7]
 
-        # ── Compressed cache write (coarse cadence) ─────────────────────
+        compressed = None
+        comp_codes = comp_scales = None
+        latent_slots = rope_slots = None
+        cur_comp_bundle = None
         if self.compressor is not None:
-            self._write_compressed_cache(
-                self.compressor(
-                    hidden_states,
-                    positions_l,
-                    prev_state=self._compressor_state(
-                        self.compressor_state_k,
-                        self.compressor_state_v,
-                        attn_metadata[f"{prefix}.compressor"],
-                        hidden_states.shape[0],
-                        is_decode,
-                    ),
+            compressed = self.compressor(
+                hidden_states,
+                positions_l,
+                prev_state=self._compressor_state(
+                    self.compressor_state_k,
+                    self.compressor_state_v,
+                    attn_metadata[f"{prefix}.compressor"],
+                    hidden_states.shape[0],
+                    is_decode,
                 ),
-                # F-13: each leg's OWN metadata entry, whole — the write frame
-                # must translate through the same block table the reader is
-                # handed for that leg. See ``_coarse_slots``.
-                self._coarse_slots(attn_metadata[prefix], positions_l, is_decode),
-                self._coarse_slots(
-                    attn_metadata[f"{prefix}.rope"], positions_l, is_decode
+            )
+            # F-13: each leg's OWN metadata entry, whole — the write frame
+            # must translate through the same block table the reader is
+            # handed for that leg. See ``_coarse_slots``.
+            latent_slots = self._coarse_slots(
+                attn_metadata[prefix], positions_l, is_decode
+            )
+            rope_slots = self._coarse_slots(
+                attn_metadata[f"{prefix}.rope"], positions_l, is_decode
+            )
+            comp_codes, comp_scales = _quant_fp8_ue8m0(compressed[..., :nope])
+            assert (
+                self.latent_k_cache.dtype
+                == self.latent_v_cache.dtype
+                == self.rope_cache.dtype
+                == self.scale_cache.dtype
+            ), "the compressed bundle rides as ONE cache-form tensor"
+            # Cache-form compressed bundle (F-240): NoPE codes ++ RoPE columns
+            # ++ scale columns, each cast exactly as _write_compressed_cache
+            # casts them on the way into its cache piece.
+            cur_comp_bundle = torch.cat(
+                (
+                    comp_codes.to(self.latent_k_cache.dtype),
+                    compressed[..., nope:].to(self.rope_cache.dtype),
+                    comp_scales.to(self.scale_cache.dtype),
                 ),
+                dim=-1,
             )
 
         # ── Which compressed slots may this layer see? ──────────────────
@@ -2618,8 +2656,29 @@ class DeepseekV4Attention(nn.Module):
 
         # ── Attention ───────────────────────────────────────────────────
         if is_decode:
+            # Rule 3 (LD-75): NO model-level write on the decode KV path. The
+            # op receives the current token's cache-form rows plus the
+            # writer's PHYSICAL [B, 3] frame (raw SWA slot, coarse latent
+            # slot, coarse rope slot; -1 where masked) and owns the write.
+            swa_slot_col = swa_md["slot_mapping"].reshape(-1).to(torch.long)
+            if latent_slots is not None:
+                lat_slot_col = latent_slots.reshape(-1).to(torch.long)
+                rope_slot_col = rope_slots.reshape(-1).to(torch.long)
+            else:
+                lat_slot_col = torch.full_like(swa_slot_col, _PAD_SLOT_ID)
+                rope_slot_col = torch.full_like(swa_slot_col, _PAD_SLOT_ID)
             attn_out = self._decode_attention(
-                query, positions_l, attn_metadata, prefix, topk_indices
+                query,
+                positions_l,
+                attn_metadata,
+                prefix,
+                topk_indices,
+                current_latent_rows=cur_kv_row,
+                current_scale_rows=cur_kv_scale,
+                current_compressed_rows=cur_comp_bundle,
+                current_slot_ids=torch.stack(
+                    (swa_slot_col, lat_slot_col, rope_slot_col), dim=1
+                ),
             )
         elif self.layer_class == LAYER_CLASS_SWA_ONLY:
             # No compressed pool on this layer, so the sliding window is the
@@ -2681,6 +2740,28 @@ class DeepseekV4Attention(nn.Module):
                     .unsqueeze(0)
                     .expand(hidden_states.shape[0], span)
                 )
+            # Rule 1 (LD-76): the writer-frame twins of the sequence-local
+            # provenance split. current_kv_slot_ids carries the position each
+            # token writes this forward (-1 where the runner padded it);
+            # current_compressed_slot_ids the group each token closes (-1
+            # where none closes — latent_slots already encodes fires & valid,
+            # so its sentinel IS the writer's mask, F-13).
+            slot_valid = swa_md["slot_mapping"].reshape(-1) > _PAD_SLOT_ID
+            cur_kv_ids = torch.where(
+                slot_valid,
+                positions_l,
+                torch.full_like(positions_l, _PAD_SLOT_ID),
+            )
+            cur_comp_ids = None
+            if latent_slots is not None:
+                group = torch.div(
+                    positions_l, self.compress_ratio, rounding_mode="floor"
+                )
+                cur_comp_ids = torch.where(
+                    latent_slots.reshape(-1) > _PAD_SLOT_ID,
+                    group,
+                    torch.full_like(group, _PAD_SLOT_ID),
+                )
             # ONE call covers both KV legs under one shared softmax, matching
             # the reference's single concatenated index list (``:520``).
             attn_out = NF.mla_sparse_attention(
@@ -2692,6 +2773,10 @@ class DeepseekV4Attention(nn.Module):
                 self.scale,
                 self.sliding_window,
                 positions=positions_l,
+                current_kv_rows=torch.cat((cur_kv_row, cur_kv_scale), dim=-1),
+                current_kv_slot_ids=cur_kv_ids,
+                current_compressed_rows=cur_comp_bundle,
+                current_compressed_slot_ids=cur_comp_ids,
                 compressed_v_cache=self.latent_v_cache,
                 compressed_rope_cache=self.rope_cache,
                 compressed_scale_cache=self.scale_cache,
@@ -2745,6 +2830,25 @@ class DeepseekV4Attention(nn.Module):
                 # KV-cache construct that must NOT be set here.
                 chunk_size=64,
             )
+
+        # ── Cache writes, traced AFTER every read (Rules 3-4, LD-77) ────
+        # Prefill only: the scatters feed nothing but the aliased root
+        # outputs — the in-place pass has no later reader left to rewire, so
+        # no cache becomes a mid-graph value. Decode writes already happened
+        # inside NF.mla_decode_attention (update_cache, Rule 3).
+        if not is_decode:
+            _masked_scatter_rows(self.swa_k_cache, swa_md["slot_mapping"], swa_row)
+            _masked_scatter_rows(
+                self.swa_v_cache, swa_md["slot_mapping"], nope_scales
+            )
+            if self.compressor is not None:
+                self._write_compressed_cache(
+                    comp_codes,
+                    comp_scales,
+                    compressed[..., nope:],
+                    latent_slots,
+                    rope_slots,
+                )
 
         # ── Inverse RoPE, then the grouped o-projection ─────────────────
         # <-- MODEL-SPECIFIC: the attention output still carries the RoPE
@@ -2890,6 +2994,11 @@ class DeepseekV4Attention(nn.Module):
         attn_metadata: dict[str, dict],
         prefix: str,
         topk_indices: torch.Tensor | None,
+        *,
+        current_latent_rows: torch.Tensor | None = None,
+        current_scale_rows: torch.Tensor | None = None,
+        current_compressed_rows: torch.Tensor | None = None,
+        current_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Single-token-per-sequence attention over the paged caches.
 
@@ -2971,6 +3080,11 @@ class DeepseekV4Attention(nn.Module):
                 swa_widths=(self.head_dim,),
                 swa_block_table=swa_md["block_table_tensor"],
                 swa_pos_offset=swa_pos_offset,
+                current_latent_rows=current_latent_rows,
+                current_scale_rows=current_scale_rows,
+                current_compressed_rows=current_compressed_rows,
+                current_slot_ids=current_slot_ids,
+                update_cache=True,
                 nope_dim=self.nope_head_dim,
                 rope_dim=self.rope_head_dim,
                 quant_group_size=_KV_QUANT_GROUP,
@@ -2997,6 +3111,12 @@ class DeepseekV4Attention(nn.Module):
             swa_widths=(self.head_dim,),
             swa_block_table=swa_md["block_table_tensor"],
             swa_pos_offset=swa_pos_offset,
+            # SWA-only layer: no compressed pool, so only the window row and
+            # its scales ride in (and get written in-op, Rule 3).
+            current_latent_rows=current_latent_rows,
+            current_scale_rows=current_scale_rows,
+            current_slot_ids=current_slot_ids,
+            update_cache=True,
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
             quant_group_size=_KV_QUANT_GROUP,
@@ -3176,7 +3296,9 @@ class DeepseekV4Attention(nn.Module):
 
     def _write_compressed_cache(
         self,
-        compressed: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        rope_cols: torch.Tensor,
         latent_slots: torch.Tensor,
         rope_slots: torch.Tensor,
     ) -> None:
@@ -3186,12 +3308,15 @@ class DeepseekV4Attention(nn.Module):
         ``[0:224]`` and ``[224:448]`` into the ``self_attn`` pair, the 64
         RoPE columns into ``.rope``'s ``k_cache`` and the 7 group-64 scales
         into its ``v_cache``.
-        """
-        nope = self.nope_head_dim
-        half = _LATENT_PAIR_HEAD_SIZE
 
-        codes, scales = _quant_fp8_ue8m0(compressed[..., :nope])
+        Takes the PRE-QUANTIZED pieces rather than quantizing here: with the
+        KV-dataflow restructure (plan §19.2) the forward computes them once,
+        BEFORE attention, because the same tensors ride into the attention op
+        as the current-forward operands (Rule 1); this method is now nothing
+        but the four masked scatters, traced after every read (Rule 4).
+        """
+        half = _LATENT_PAIR_HEAD_SIZE
         _masked_scatter_rows(self.latent_k_cache, latent_slots, codes[:, :half])
         _masked_scatter_rows(self.latent_v_cache, latent_slots, codes[:, half:])
-        _masked_scatter_rows(self.rope_cache, rope_slots, compressed[..., nope:])
+        _masked_scatter_rows(self.rope_cache, rope_slots, rope_cols)
         _masked_scatter_rows(self.scale_cache, rope_slots, scales)
