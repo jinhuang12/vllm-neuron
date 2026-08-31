@@ -54,6 +54,10 @@ from vllm_neuron.functional.attention.swa_attention import dequant_group_scales
 #: not import from ``model``.
 _PAD_SLOT_ID: int = -1
 
+#: Explicit max for int64 index clamps — a min-only s64 clamp lowers with a
+#: synthesized ``iinfo(int64).max`` operand, which NCC_ESFH001 rejects (ITER-21).
+_INT32_MAX: int = 2**31 - 1
+
 
 def _masked_write_rows(cache: Tensor, slots: Tensor, rows: Tensor) -> None:
     """Write one whole slot per row into a paged ``cache``, skipping ``-1``.
@@ -283,7 +287,7 @@ def mla_decode_attention(
     if positions is not None:
         pos = positions.reshape(-1).to(torch.int64)
     elif context_lens is not None:
-        pos = (context_lens.reshape(-1).to(torch.int64) - 1).clamp_min(0)
+        pos = (context_lens.reshape(-1).to(torch.int64) - 1).clamp(0, _INT32_MAX)
 
     # ── Sliding-window leg ───────────────────────────────────────────────
     if pos is None:
@@ -302,7 +306,9 @@ def mla_decode_attention(
         # translation-invariant, so this is exact rather than approximate.
         swa_pos = pos
         if swa_pos_offset is not None:
-            swa_pos = (pos - swa_pos_offset.reshape(-1).to(torch.int64)).clamp_min(0)
+            swa_pos = (pos - swa_pos_offset.reshape(-1).to(torch.int64)).clamp(
+                0, _INT32_MAX
+            )
         win_idx, win_valid = _window_local_indices(swa_pos, window, ring=swa_ring)
 
     swa_caches: List[Tensor] = [swa_cache]

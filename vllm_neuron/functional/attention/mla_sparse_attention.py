@@ -58,6 +58,10 @@ from vllm_neuron.functional.attention.swa_attention import (
     dequant_group_scales,
 )
 
+#: Explicit max for int64 index clamps — a min-only s64 clamp lowers with a
+#: synthesized ``iinfo(int64).max`` operand, which NCC_ESFH001 rejects (ITER-21).
+_INT32_MAX: int = 2**31 - 1
+
 # Latent geometry (DSv4-Flash). Kept as module constants so the docstrings and
 # the default kwargs cannot drift apart. dsv4_ref/model.py:453-455.
 LATENT_NOPE_DIM: int = 448
@@ -255,7 +259,7 @@ def _window_local_indices(
     device = q_pos.device
     offsets = torch.arange(window, device=device, dtype=torch.int64).unsqueeze(0)
     base = q_pos.reshape(-1, 1).to(torch.int64)
-    idx = (base - window + 1).clamp_min(0) + offsets
+    idx = (base - window + 1).clamp(0, _INT32_MAX) + offsets
     valid = idx <= base
     if ring:
         idx = idx % window

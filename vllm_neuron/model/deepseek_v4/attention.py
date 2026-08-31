@@ -173,6 +173,10 @@ _PAD_SLOT_ID: int = -1
 #: (``dsv4_ref/model.py:436``, ``dsv4_ref/kernel.py:323-327``).
 _PAD_INDEX: int = -1
 
+#: Explicit max for int64 index clamps — a min-only s64 clamp lowers with a
+#: synthesized ``iinfo(int64).max`` operand, which NCC_ESFH001 rejects (ITER-21).
+_INT32_MAX: int = 2**31 - 1
+
 #: Compressed-latent pair width: the 448 NoPE columns split evenly across
 #: ``k_cache``/``v_cache``, which the runner allocates with identical shape.
 _LATENT_PAIR_HEAD_SIZE: int = 224
@@ -1241,7 +1245,7 @@ class DeepseekV4KVCompressor(nn.Module):
         lag = torch.arange(window - 1, -1, -1, device=device).unsqueeze(0)
         gather_idx = token_idx - lag  # [T, window] index into THIS forward
         abs_src = positions_l.unsqueeze(1) - lag  # [T, window] absolute position
-        gather_flat = torch.clamp(gather_idx, min=0).reshape(-1)
+        gather_flat = torch.clamp(gather_idx, min=0, max=_INT32_MAX).reshape(-1)
 
         kv_win = torch.index_select(kv_rows, 0, gather_flat).view(
             tokens, window, self.proj_width
@@ -3016,10 +3020,10 @@ class DeepseekV4Attention(nn.Module):
         # Addressing frame. Positions stay ABSOLUTE for the mask; the offset
         # correction applies to the block-table lookup only, the same split
         # ``_decode_attention`` and ``dspark_model.py:521-531`` make.
-        local = prior_abs.clamp_min(0)
+        local = prior_abs.clamp(0, _INT32_MAX)
         pos_offset = swa_md.get("swa_kv_pos_offset")
         if pos_offset is not None:
-            local = (local - pos_offset.reshape(-1)[:1]).clamp_min(0)
+            local = (local - pos_offset.reshape(-1)[:1]).clamp(0, _INT32_MAX)
 
         block_table = swa_md["block_table_tensor"].to(torch.int64)
         block_size = swa_md["block_size"]

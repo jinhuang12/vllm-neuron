@@ -125,6 +125,10 @@ logger = logging.getLogger(__name__)
 #: Number of group-64 UE8M0 scales stored per SWA slot (448 NoPE / 64).
 _SWA_NUM_SCALES: int = 7
 
+#: Explicit max for int64 index clamps — a min-only s64 clamp lowers with a
+#: synthesized ``iinfo(int64).max`` operand, which NCC_ESFH001 rejects (ITER-21).
+_INT32_MAX: int = 2**31 - 1
+
 
 # =============================================================================
 # Section 0: accepted-token extraction
@@ -159,7 +163,7 @@ def _extract_accepted_tokens(
     """
     valid_mask = (raw_sampled_token_ids != -1) & (raw_sampled_token_ids < vocab_size)
     valid_count = valid_mask.sum(dim=1)
-    last_valid_idx = torch.clamp(valid_count - 1, min=0)
+    last_valid_idx = torch.clamp(valid_count - 1, min=0, max=_INT32_MAX)
     next_token_ids = (
         raw_sampled_token_ids.gather(1, last_valid_idx.unsqueeze(1).to(torch.long))
         .squeeze(1)
@@ -172,9 +176,13 @@ def _extract_accepted_tokens(
     # Prefill passes one column and needs no rejection adjustment; a
     # steady-state spec step passes ``num_spec + 1`` columns and does.
     if raw_sampled_token_ids.shape[1] > 1:
-        num_rejected = torch.clamp(num_speculative_tokens + 1 - valid_count, min=0)
+        num_rejected = torch.clamp(
+            num_speculative_tokens + 1 - valid_count, min=0, max=_INT32_MAX
+        )
         sampling_positions = torch.clamp(
-            sampling_positions - num_rejected.to(sampling_positions.dtype), min=0
+            sampling_positions - num_rejected.to(sampling_positions.dtype),
+            min=0,
+            max=_INT32_MAX,
         )
 
     input_ids = input_ids.scatter(0, sampling_positions.to(torch.long), next_token_ids)
@@ -196,7 +204,7 @@ def _window_indices(
     """
     offsets = torch.arange(window, device=positions.device, dtype=torch.int64)
     base = positions.reshape(-1, 1).to(torch.int64)
-    idx = (base - window + 1).clamp_min(0) + offsets.unsqueeze(0)
+    idx = (base - window + 1).clamp(0, _INT32_MAX) + offsets.unsqueeze(0)
     return idx, idx <= base
 
 
@@ -583,7 +591,9 @@ class DeepseekV4DSparkAttention(nn.Module):
         offset = md.get("swa_kv_pos_offset")
         win_local = win_abs
         if offset is not None:
-            win_local = (win_abs - offset.reshape(-1, 1).to(torch.int64)).clamp_min(0)
+            win_local = (win_abs - offset.reshape(-1, 1).to(torch.int64)).clamp(
+                0, _INT32_MAX
+            )
 
         block_table = md["block_table_tensor"].to(torch.int64)
         cache_block = md["block_size"]

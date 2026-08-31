@@ -72,6 +72,10 @@ _SKIP32: int = 0xFFFFFFFF
 _PMAX: int = 128
 _PSUM_F: int = 512  # gen3 PSUM free-dim limit (prereg D4)
 
+#: Explicit max for int64 index clamps — a min-only s64 clamp lowers with a
+#: synthesized ``iinfo(int64).max`` operand, which NCC_ESFH001 rejects (ITER-21).
+_INT32_MAX: int = 2**31 - 1
+
 
 # ---------------------------------------------------------------------------
 # Gate (prereg D8: cheap, total, monotonic; shape/dtype/layout only — never
@@ -352,7 +356,7 @@ def _mla_decode_tkg_dispatch(
     if positions is not None:
         pos = positions.reshape(-1).to(torch.int64)
     elif context_lens is not None:
-        pos = (context_lens.reshape(-1).to(torch.int64) - 1).clamp_min(0)
+        pos = (context_lens.reshape(-1).to(torch.int64) - 1).clamp(0, _INT32_MAX)
 
     # ── window leg indices (mirrors mla_decode.py:289-306) ──────────────
     if pos is None:
@@ -368,7 +372,7 @@ def _mla_decode_tkg_dispatch(
         if kw["swa_pos_offset"] is not None:
             swa_pos = (
                 pos - kw["swa_pos_offset"].reshape(-1).to(torch.int64)
-            ).clamp_min(0)
+            ).clamp(0, _INT32_MAX)
         win_idx, win_valid = _window_local_indices(swa_pos, window, ring=False)
 
     swa_bs, swa_rps = _piece_geometry(swa_cache)
