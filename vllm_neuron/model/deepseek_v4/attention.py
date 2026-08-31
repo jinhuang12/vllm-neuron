@@ -2831,7 +2831,10 @@ class DeepseekV4Attention(nn.Module):
                 )
             # ONE call covers both KV legs under one shared softmax, matching
             # the reference's single concatenated index list (``:520``).
-            attn_out = NF.mla_sparse_attention(
+            # LD-76: kernel-rung dispatch (name swap only, prereg D2); the
+            # gate inside mla_sparse_attention_cte falls back to
+            # mla_sparse_attention.
+            attn_out = NF.mla_sparse_attention_cte(
                 query,
                 self.latent_k_cache,
                 self.swa_k_cache,
@@ -2890,7 +2893,9 @@ class DeepseekV4Attention(nn.Module):
                 # this comment does not.
                 #
                 # Anchor by SYMBOL, never by line: this is the ONLY
-                # ``NF.mla_sparse_attention(`` call in the repo. The six
+                # ``NF.mla_sparse_attention_cte(`` call in the repo (LD-76
+                # renamed the dispatch; the fallback op keeps this
+                # chunk_size contract). The six
                 # ``chunk_size=None`` hits in this file are ``LayerSpec`` FIELDS
                 # (``model/kv_cache.py:21``) feeding
                 # ``attention_chunk_size=layer.chunk_size`` -- an unrelated

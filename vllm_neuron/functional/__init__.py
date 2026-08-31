@@ -33,9 +33,11 @@ from .attention.mla_qkv import mla_qkv
 from .attention.mla_oproj import mla_grouped_oproj
 from .attention.mla_sparse_attention import mla_sparse_attention
 from .attention.mla_decode import mla_decode_attention
-# LD-75 (plan §19.2 Amendment 11): without this re-export `NF.mla_decode_tkg`
-# never resolves at the call sites.
+# LD-75/LD-76 (plan §19.2 Amendment 11): without these re-exports
+# `NF.mla_decode_tkg` / `NF.mla_sparse_attention_cte` never resolve at the
+# call sites.
 from .attention.mla_decode_tkg import mla_decode_tkg
+from .attention.mla_sparse_attention_cte import mla_sparse_attention_cte
 from .attention.swa_attention import swa_attention
 from .attention.sparse_indexer import sparse_indexer_topk
 from .collectives.all_to_all import all_to_all
@@ -100,6 +102,7 @@ __all__ = [
     "mla_grouped_oproj",
     "mla_qkv",
     "mla_sparse_attention",
+    "mla_sparse_attention_cte",
     "mlp",
     "moe_block_tkg",
     "moe_cte",
