@@ -37,6 +37,40 @@ onto ``model_static_fp8`` / ``model_mx_fp8`` module classes, and this package's
 modeling file (``model_fp8.py``) is ``inc-glm53f-013``. Adding a dispatcher
 against modules that do not exist would be a stub asserting nothing, so the
 class dispatch lands with the module tree it dispatches to.
+
+<-- ``inc-glm53f-023`` (WP6) adds the QUANT-METHOD half of that dispatch, and
+only that half: :class:`BlockFp8QuantMethod` and :func:`resolve_quant_method`
+below turn a parsed :class:`QuantizationSpec` into the *method* a call site
+consults, while the module-class dispatch above stays absent. The distinction is
+load-bearing -- parsing a ``weight_block_size`` into a spec (which this file
+already did) is NOT the same as resolving a method for it, and until
+``inc-glm53f-023`` a spec carrying ``(128, 128)`` resolved to nothing at all.
+
+Why a SUPPORTED SET rather than "any two positive ints"
+-------------------------------------------------------
+:data:`SUPPORTED_WEIGHT_BLOCK_SIZES` is exactly ``{(128, 128)}``. Three grounds,
+each cited rather than re-derived:
+
+* the campaign's target is frozen at ``zai-org/GLM-5.3-Flash`` native blockwise
+  FP8 e4m3 with ``weight_block_size [128, 128]`` (``approvals/DECISIONS.md``
+  section 2);
+* the substrate's block-quantisation granularity is the single constant
+  ``BLOCK_QUANT_SIZE = 256`` (``nkilib`` ``core/moe/moe_cte/bwmm_shard_on_I.py``
+  line 50, measured at ``increments/evidence-007.md``) -- it is structural and
+  this campaign cannot change it;
+* a 256-granular block is therefore exactly **four** ``[128, 128]`` checkpoint
+  blocks (2 H-tiles x 2 I-tiles), which is the mapping ``inc-glm53f-024``
+  authors and ``inc-glm53f-025`` consumes.
+
+So a well-formed block shape that is not ``(128, 128)`` has no authored path.
+It is refused HERE, at method resolution, with a named error -- not silently
+carried into a retile and a kernel that cannot represent it.
+
+:meth:`QuantizationSpec.from_hf_quantization_config` deliberately stays
+PERMISSIVE (any two positive ints still parse into a spec). Narrowing the parser
+would move a refusal that belongs to this arch's authored kernel path onto the
+platform's config-time admission, which ``inc-glm53f-019`` owns and which this
+increment does not touch.
 """
 
 from __future__ import annotations
@@ -85,6 +119,32 @@ _SUPPORTED_ACTIVATION_SCHEMES: frozenset[str] = frozenset({"dynamic"})
 
 #: ``quant_method`` values that mean "blockwise FP8" in this checkpoint family.
 _FP8_QUANT_METHODS: frozenset[str] = frozenset({"fp8"})
+
+#: The weight block shapes this arch has an authored block-fp8 path for, as
+#: ``(rows, cols)``. See the module docstring for the three grounds. A spec may
+#: legally *carry* another shape; :func:`resolve_quant_method` is what refuses to
+#: build a method for one.
+SUPPORTED_WEIGHT_BLOCK_SIZES: frozenset[tuple[int, int]] = frozenset(
+    {DEFAULT_WEIGHT_BLOCK_SIZE}
+)
+
+#: The substrate's block-quantisation granularity, CITED not derived:
+#: ``BLOCK_QUANT_SIZE = 256`` at ``nkilib`` ``core/moe/moe_cte/bwmm_shard_on_I.py``
+#: line 50, the sole such constant in the ``bwmm_*`` family
+#: (``increments/evidence-007.md``). Used in the refusal message below so a
+#: reader of the failure learns why the shape has no path.
+SUBSTRATE_BLOCK_QUANT_SIZE: int = 256
+
+
+class UnsupportedWeightBlockSize(ValueError):
+    """A well-formed ``weight_block_size`` this arch has no authored path for.
+
+    A subclass of :class:`ValueError` on purpose: every existing caller of
+    :meth:`QuantizationSpec.from_hf_quantization_config` catches ``ValueError``,
+    and this error is a refusal of the same family. The distinct type exists so
+    a call site can tell "this shape is unsupported" apart from "this config is
+    malformed" without matching on message text.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -314,4 +374,145 @@ def _parse_fp8_block(quantization_config: dict[str, Any]) -> QuantizationSpec:
         kv_cache_scheme=QuantScheme.NONE,
         weight_block_size=block_size,
         activation_scheme=activation_scheme,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quant-method resolution -- ``inc-glm53f-023``
+#
+# A SPEC says what the checkpoint declares. A METHOD says what this arch will
+# actually do about it. The two are separate objects because they answer to
+# different authorities: the spec answers to the checkpoint's
+# ``quantization_config``, the method answers to the block-fp8 path this
+# campaign authors (``inc-glm53f-024`` retile, ``-025``/``-026`` kernels,
+# ``-027`` call site).
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class BlockFp8QuantMethod:
+    """The blockwise-FP8 method resolved for a module.
+
+    Attributes:
+        block_h: Rows of the weight tile one fp32 scale covers.
+        block_w: Columns of the same tile.
+        activation_scheme: The checkpoint's ``activation_scheme``, carried so a
+            call site does not have to keep the spec alive to know whether
+            activations are quantized dynamically.
+
+    The two block extents are stored as separate ints rather than as a tuple
+    because that is how call sites index a scale grid, and because a tuple field
+    invites the shape being passed around as opaque data. :attr:`block_shape`
+    gives the tuple form where one is wanted.
+    """
+
+    block_h: int
+    block_w: int
+    activation_scheme: str
+
+    #: Fixed: this class exists for exactly one scheme. Present so a call site
+    #: can branch on ``method.scheme`` uniformly across future methods.
+    scheme: QuantScheme = QuantScheme.FP8_BLOCK_DYNAMIC
+
+    @property
+    def block_shape(self) -> tuple[int, int]:
+        """``(block_h, block_w)`` as a tuple."""
+        return (self.block_h, self.block_w)
+
+    def __post_init__(self) -> None:
+        """Refuse a block shape this arch has no authored path for.
+
+        The membership test lives here rather than in
+        :func:`resolve_quant_method` so that NO construction path -- including a
+        direct call from a future call site -- can produce a method for an
+        unsupported shape.
+        """
+        if self.scheme is not QuantScheme.FP8_BLOCK_DYNAMIC:
+            raise ValueError(
+                f"BlockFp8QuantMethod carries scheme={self.scheme.value!r}; only "
+                f"{QuantScheme.FP8_BLOCK_DYNAMIC.value!r} is meaningful here."
+            )
+        if self.activation_scheme not in _SUPPORTED_ACTIVATION_SCHEMES:
+            raise ValueError(
+                "GLM-5.3-Flash blockwise FP8 requires activation_scheme in "
+                f"{sorted(_SUPPORTED_ACTIVATION_SCHEMES)}, got "
+                f"{self.activation_scheme!r}."
+            )
+        if self.block_shape not in SUPPORTED_WEIGHT_BLOCK_SIZES:
+            raise UnsupportedWeightBlockSize(
+                f"weight_block_size={list(self.block_shape)!r} has no block-fp8 "
+                f"path in this build. Supported: "
+                f"{sorted(SUPPORTED_WEIGHT_BLOCK_SIZES)}. The substrate's "
+                f"block-quantisation granularity is fixed at "
+                f"{SUBSTRATE_BLOCK_QUANT_SIZE}, which this arch's scale mapping "
+                f"covers with four "
+                f"{list(sorted(SUPPORTED_WEIGHT_BLOCK_SIZES)[0])!r} checkpoint "
+                f"blocks; another shape would need a different mapping, which is "
+                f"a design change rather than a configuration."
+            )
+
+
+def resolve_quant_method(
+    spec: QuantizationSpec | None,
+    layer_index: int | None = None,
+    prefix: str = "",
+) -> BlockFp8QuantMethod | None:
+    """Return the quantisation method for the module at ``(layer_index, prefix)``.
+
+    This is the dispatcher gap ``inc-glm53f-023`` closes: before it, a parsed
+    spec carrying ``weight_block_size (128, 128)`` reached no method at all.
+
+    The route is deliberately NOT the vendor ``quantization_type=`` keyword.
+    ``nkilib``'s quantisation enum carries no blockwise member at this pin, and
+    adding one is a vendor change this campaign cannot make (plan section 11,
+    constraint B.6), so the block-quant path calls the inner kernel directly
+    (design decision D5(b)). Nothing here names or imports that enum.
+
+    Args:
+        spec: Result of :meth:`QuantizationSpec.from_hf_quantization_config` or
+            :meth:`QuantizationSpec.from_model_config`. ``None`` means the
+            checkpoint is not quantized.
+        layer_index: Zero-based transformer-block index, or ``None`` for modules
+            outside any block. Forwarded to :meth:`QuantizationSpec.get_scheme`
+            so per-layer dispatch lands there rather than here.
+        prefix: Qualified or leaf module name, forwarded the same way.
+
+    Returns:
+        A :class:`BlockFp8QuantMethod` for a blockwise-FP8 module, or ``None``
+        when the module is not quantized. ``None`` means "run the unquantized
+        path", which is the same convention
+        :meth:`QuantizationSpec.from_hf_quantization_config` uses for an
+        unquantized checkpoint.
+
+    Raises:
+        UnsupportedWeightBlockSize: the scheme is blockwise FP8 but the block
+            shape has no authored path.
+        ValueError: the spec is internally inconsistent (a blockwise scheme with
+            no block shape). :meth:`QuantizationSpec.__post_init__` already
+            forbids that state, so this arm guards a spec built by some future
+            path that bypasses it.
+        NotImplementedError: the resolved scheme is one no method is wired for.
+    """
+    if spec is None:
+        return None
+
+    scheme = spec.get_scheme(layer_index, prefix)
+
+    if scheme is QuantScheme.NONE:
+        return None
+
+    if scheme is QuantScheme.FP8_BLOCK_DYNAMIC:
+        block = spec.weight_block_size
+        if block is None:
+            raise ValueError(
+                f"spec.linear_scheme={scheme.value!r} carries no "
+                "weight_block_size; a blockwise method cannot be resolved."
+            )
+        return BlockFp8QuantMethod(
+            block_h=int(block[0]),
+            block_w=int(block[1]),
+            activation_scheme=str(spec.activation_scheme),
+        )
+
+    raise NotImplementedError(
+        f"No quantisation method is wired for scheme {scheme.value!r} in "
+        "vllm_neuron.model.glm5_next."
     )

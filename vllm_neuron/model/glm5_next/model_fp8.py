@@ -198,29 +198,114 @@ def _resolve_mla_head_size(text_config: Glm5NextTextConfig) -> int:
 
 # ---------------------------------------------------------------------------
 # ``Glm5NextQuantConfig`` / quant-method selection -- D14 owner:
-# ``inc-glm53f-023`` (M2, Lane B 1st).
+# ``inc-glm53f-023`` (M2, Lane B 1st). LANDED HERE.
 #
-# A NAME ONLY. ``quantization.py:33-39`` records why the dispatcher cannot
-# land before the module tree it dispatches to; it does not assign the
-# dispatcher to this increment. Construction raises so the name cannot be
-# used as though it resolved anything.
+# THE DISPATCHER GAP THIS CLOSES. ``quantization.py`` already parsed the
+# checkpoint's ``quantization_config`` into a ``QuantizationSpec`` carrying
+# ``weight_block_size (128, 128)``. What did not exist was anything that turned
+# that spec into a METHOD -- so a spec declaring blockwise FP8 resolved to
+# nothing, and a call site had no way to ask "what do I run for this module?".
+# Measured at the unmodified parent ``6affd98``: the spec reported
+# ``(128, 128)`` while ``Glm5NextQuantConfig()`` raised, and a well-formed but
+# unsupported shape such as ``[64, 64]`` was ACCEPTED silently.
+#
+# WHAT THIS SECTION DOES NOT DO, deliberately:
+#   * it does NOT attach itself to ``Glm5NextForConditionalGeneration`` -- that
+#     tree is ``-013``'s / ``-054``'s D14 section;
+#   * it does NOT reach a kernel; the MoE block-quant call site is ``-027``'s;
+#   * it does NOT name or import the vendor quantisation enum. There is no
+#     blockwise member in it at this pin and adding one is forbidden to this
+#     campaign (plan section 11, constraint B.6), so the route is D5(b)'s direct
+#     inner-kernel call and this class carries a plugin-side method object.
+#
+# Imports are FUNCTION-LOCAL rather than added to the module import block, for
+# two reasons: the import block is ``-013``'s D14 section and this increment
+# does not widen its surface into it; and it is the file family's own idiom --
+# ``llama3/quantization.py`` imports its modeling module inside
+# ``resolve_attention_mlp_classes`` for the same reason.
 # ---------------------------------------------------------------------------
 
 
 class Glm5NextQuantConfig:
     """Per-module blockwise-FP8 quantisation policy for this arch.
 
-    Section reserved for ``inc-glm53f-023``. The scheme vocabulary it will
-    consult already exists in
-    :mod:`vllm_neuron.model.glm5_next.quantization`; the *selection* is not
-    written here.
+    Holds the parsed :class:`~vllm_neuron.model.glm5_next.quantization.QuantizationSpec`
+    and the method resolved from it, and answers the one question a modeling
+    call site has: *what do I run for this module?*
+
+    Attributes:
+        spec: The parsed spec, or ``None`` for an unquantized checkpoint.
+        method: The method resolved for the model-wide scheme, or ``None`` when
+            nothing is quantized. Per-module resolution goes through
+            :meth:`get_quant_method`, which is the form that survives mixed
+            precision; this attribute is the model-wide answer today because
+            :meth:`QuantizationSpec.get_scheme` returns one scheme for every
+            module.
+
+    Construction raises rather than degrading when the checkpoint declares a
+    block shape this build has no authored path for -- see
+    :data:`~vllm_neuron.model.glm5_next.quantization.SUPPORTED_WEIGHT_BLOCK_SIZES`.
     """
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        raise NotImplementedError(
-            "Glm5NextQuantConfig is a declared section name created by "
-            "inc-glm53f-013; quant-method selection lands with inc-glm53f-023"
-        )
+    def __init__(self, spec: object | None) -> None:
+        from vllm_neuron.model.glm5_next.quantization import resolve_quant_method
+
+        self.spec = spec
+        self.method = resolve_quant_method(spec)
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_model_config(cls, config: Glm5NextConfig) -> Glm5NextQuantConfig:
+        """Build from the config the model itself is built from.
+
+        This is the recognition path end to end: the checkpoint's
+        ``quantization_config`` was lifted onto :class:`Glm5NextConfig` by
+        ``config.py``, is parsed into a spec by
+        :meth:`QuantizationSpec.from_model_config`, and is resolved to a method
+        here. Nothing in the chain is hand-fed.
+        """
+        from vllm_neuron.model.glm5_next.quantization import QuantizationSpec
+
+        return cls(QuantizationSpec.from_model_config(config))
+
+    # ------------------------------------------------------------------
+    # Per-module query
+    # ------------------------------------------------------------------
+    def get_quant_method(
+        self,
+        layer_index: int | None = None,
+        prefix: str = "",
+    ) -> object | None:
+        """Return the method for the module at ``(layer_index, prefix)``.
+
+        Returns ``None`` when that module is not quantized, which means "run the
+        unquantized path". The arguments are forwarded to
+        :meth:`QuantizationSpec.get_scheme`, so when per-layer dispatch becomes
+        real it lands there and every call site here is already passing what it
+        needs.
+        """
+        from vllm_neuron.model.glm5_next.quantization import resolve_quant_method
+
+        return resolve_quant_method(self.spec, layer_index, prefix)
+
+    # ------------------------------------------------------------------
+    # Derived views
+    # ------------------------------------------------------------------
+    @property
+    def is_block_quantized(self) -> bool:
+        """True when a blockwise-FP8 method was resolved."""
+        return self.method is not None
+
+    @property
+    def block_shape(self) -> tuple[int, int] | None:
+        """``(block_h, block_w)`` of the resolved method, or ``None``.
+
+        Delegates rather than storing a copy: the method is the authority for
+        the shape, and a second copy is a second thing that can go stale.
+        """
+        return None if self.method is None else self.method.block_shape
 
 
 # ---------------------------------------------------------------------------

@@ -584,9 +584,12 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
         with pytest.raises(NotImplementedError):
             module.forward()
 
-    # The two reserved names that are not wired into the tree.
-    with pytest.raises(NotImplementedError):
-        impl.Glm5NextQuantConfig()
+    # The reserved name that is still not wired into the tree. The
+    # `Glm5NextQuantConfig()` arm that stood here was retired by
+    # `inc-glm53f-023`, the DECLARED lander of that D14 section -- this census
+    # is a tripwire against a QUIET implementation, and a declared handover is
+    # the signal it exists to let through. `-013`'s four declared counts
+    # (45 / 11 / 34 / 0) are untouched, as is every other arm above.
     with pytest.raises(NotImplementedError):
         impl.Glm5NextHyperConnection().forward()
 
