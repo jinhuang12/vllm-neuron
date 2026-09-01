@@ -70,6 +70,21 @@ implementation that ignores the bias pass the index arm), and
 ``test_kernel_corrected_selection_differs_from_substrate_selection`` reads the
 same difference off the FUSED kernel's own two outputs rather than off a torch
 recomputation.
+
+SELF-CONSISTENCY, SEPARATE FROM THE ORACLE.
+``test_kernel_affinity_columns_are_its_own_emitted_indices`` compares the
+kernel's two outputs against EACH OTHER and involves no reference at all. It was
+added after attempt 1, whose failure showed that "the index sets are right" and
+"each row has 8 nonzeros" together still do not say the nonzeros sit on the
+emitted indices (``increments/investigation-032.md`` §6).
+
+REFERENCE ASSEMBLY IS GUARDED BY SHAPE. A dense ``[T, E]`` reference is compared
+directly; only a ``[T, K]`` per-slot weight block goes through
+``scatter_reference``, which now REFUSES a mismatched shape by name
+(``ReferenceShapeError``). Attempt 1 fed a dense tensor to that scatter and
+``Tensor.scatter_``'s permissive shape rule accepted it silently, producing a
+mis-assembled reference that failed three arms while the implementation was
+correct.
 """
 
 import importlib
@@ -358,9 +373,43 @@ def rows_with_k_distinct(index: torch.Tensor) -> int:
     )
 
 
-def scatter_reference(affinities_like: torch.Tensor, index, weights):
+class ReferenceShapeError(AssertionError):
+    """A reference tensor whose shape does not match its scatter index.
+
+    This exists because ``Tensor.scatter_(1, index, src)`` is PERMISSIVE in
+    exactly the direction that hides a defect: it reads ``src[i][j]`` only at the
+    positions ``index`` names, so an oversized ``src`` is silently accepted and
+    only its first ``K`` columns are ever read. Attempt 1 of this increment fed
+    the oracle's already-scattered ``[T, E]`` affinity tensor here as if it were
+    a ``[T, K]`` weight block; the call quietly scattered ``affinities[:, 0:8]``
+    onto the selected columns and produced a reference that was zero on most
+    selected cells. The three declared arms then failed against a
+    mis-assembled reference while the implementation itself was correct
+    (``increments/investigation-032.md`` §4).
+
+    Removing the three bad call sites fixes today. This refusal fixes the class.
+    """
+
+
+def scatter_reference(
+    affinities_like: torch.Tensor, index: torch.Tensor, weights_tk: torch.Tensor
+) -> torch.Tensor:
+    """Scatter a ``[T, K]`` weight block into a dense ``[T, E]`` tensor.
+
+    ``weights_tk`` must be ``[T, K]``, the same shape as ``index``. Use this ONLY
+    for a reference that reports its weights per selected slot (the verbatim
+    upstream stage). A reference that already returns a dense ``[T, E]`` tensor --
+    such as ``noaux_tc_correct_torch_oracle`` -- is compared DIRECTLY and never
+    passed through here.
+    """
+    if tuple(weights_tk.shape) != tuple(index.shape):
+        raise ReferenceShapeError(
+            f"scatter_reference expects a [T, K] weight block matching its index "
+            f"{tuple(index.shape)}, got {tuple(weights_tk.shape)}. A dense "
+            f"[T, E] reference must be compared directly, not scattered again."
+        )
     want = torch.zeros_like(affinities_like)
-    want.scatter_(1, index.to(torch.int64), weights)
+    want.scatter_(1, index.to(torch.int64), weights_tk)
     return want
 
 
@@ -438,6 +487,8 @@ def test_oracle_equals_verbatim_upstream_at_n_group_1() -> None:
     upstream_index, upstream_weights = verbatim_upstream_stage(logits, bias)
 
     equal_rows = set_equal_rows(reduced_index, upstream_index)
+    # `upstream_weights` IS a [T, K] block, so the scatter is the right tool here
+    # -- this is the one call site the helper was written for.
     upstream_scattered = scatter_reference(
         reduced_affinities, upstream_index, upstream_weights
     )
@@ -526,16 +577,75 @@ def test_declared_index_sets_match_the_noaux_tc_reference_exactly() -> None:
     assert int(nonzero.max()) == NOAUX_TC_K
 
 
-def test_declared_gate_weights_match_within_declared_tolerances() -> None:
-    """DECLARED ARM 2: gate weights at ``assert_close(rtol=1e-2, atol=1e-5)``."""
+def test_kernel_affinity_columns_are_its_own_emitted_indices() -> None:
+    """The kernel's two outputs must agree with EACH OTHER.
+
+    THE GAP THIS CLOSES, named. Attempt 1 asserted that the index sets match the
+    reference and that each row carries exactly 8 nonzero affinities -- but never
+    that the 8 nonzero COLUMNS are the 8 experts the kernel itself emitted in
+    `expert_index`. That agreement was assumed. Both outputs come from the same
+    mask inside the authored stage, so a mask defect could in principle move the
+    weights while leaving the indices right, and every attempt-1 arm would still
+    have read green on the index side.
+
+    This is a self-consistency reading, not a reference comparison: it involves
+    no oracle at all, which is exactly why it catches a class the oracle
+    comparisons cannot isolate.
+    """
     logits, bias = build_designed_logits()
-    want_index, want_weights = noaux_tc_correct_torch_oracle(
+    reset_noaux_tc_counters()
+    with _SimulatorCounter() as sim:
+        got_index, got_affinities = noaux_tc_correct(
+            logits,
+            bias,
+            top_k=DECLARED_TOP_K,
+            norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+            routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+        )
+    _assert_route(sim, 1, "affinity-index-agreement")
+
+    nonzero_columns = [
+        sorted(torch.nonzero(row, as_tuple=True)[0].tolist())
+        for row in got_affinities
+    ]
+    emitted = [sorted(row.tolist()) for row in got_index.to(torch.int64)]
+    agreeing = sum(1 for a, b in zip(nonzero_columns, emitted) if a == b)
+    print(
+        f"[affinity-index-agreement] rows_where_nonzero_columns_equal_index="
+        f"{agreeing}/{DECLARED_T}"
+    )
+    assert agreeing == DECLARED_ROWS, (
+        "the kernel's affinity nonzeros and its own emitted expert_index "
+        "disagree; the mask inside the authored stage is not the one that "
+        "produced the indices"
+    )
+
+    # D1.5: the comparison must be able to fail. Shift one row's index set by one
+    # column and the row must stop agreeing.
+    shifted = [sorted(((e + 1) % DECLARED_E) for e in emitted[0])]
+    print(
+        f"[affinity-index-agreement] control shifted_row_agrees="
+        f"{nonzero_columns[0] == shifted[0]}"
+    )
+    assert nonzero_columns[0] != shifted[0], "the control is a no-op"
+
+
+def test_declared_gate_weights_match_within_declared_tolerances() -> None:
+    """DECLARED ARM 2: gate weights at ``assert_close(rtol=1e-2, atol=1e-5)``.
+
+    Both sides are DENSE ``[T, E]`` tensors and are compared as they stand.
+    ``noaux_tc_correct_torch_oracle`` returns an already-scattered affinity
+    tensor (``router.py:1535-1537``); passing it through a second scatter is what
+    broke attempt 1 (``increments/investigation-032.md`` §4).
+    """
+    logits, bias = build_designed_logits()
+    want_index, want_affinities = noaux_tc_correct_torch_oracle(
         logits, bias, DECLARED_NORM_TOPK_PROB, DECLARED_ROUTED_SCALING_FACTOR
     )
 
     reset_noaux_tc_counters()
     with _SimulatorCounter() as sim:
-        _got_index, got_affinities = noaux_tc_correct(
+        got_index, got_affinities = noaux_tc_correct(
             logits,
             bias,
             top_k=DECLARED_TOP_K,
@@ -545,7 +655,12 @@ def test_declared_gate_weights_match_within_declared_tolerances() -> None:
     _assert_route(sim, 1, "declared-weight-arm")
 
     got = got_affinities.to(torch.float32)
-    want = scatter_reference(got, want_index, want_weights)
+    want = want_affinities.to(torch.float32)
+    assert got.shape == want.shape == (DECLARED_T, DECLARED_E)
+    # The comparison is only about weights if the two sides agree on WHERE the
+    # weights go, so the selection is re-read here rather than assumed from the
+    # arm above.
+    assert set_equal_rows(got_index, want_index) == DECLARED_ROWS
     diff = (got - want).abs()
     relative = diff / (want.abs() + 1e-30)
     print(
@@ -779,12 +894,12 @@ def test_fused_seam_matches_the_reference_on_its_own_logits() -> None:
     assert tuple(substrate_index.shape) == (DECLARED_T, NOAUX_TC_K)
     assert bool(torch.isfinite(logits).all())
 
-    want_index, want_weights = noaux_tc_correct_torch_oracle(
+    want_index, want_affinities = noaux_tc_correct_torch_oracle(
         logits, bias, DECLARED_NORM_TOPK_PROB, DECLARED_ROUTED_SCALING_FACTOR
     )
     equal_rows = set_equal_rows(expert_index, want_index)
     got = expert_affinities.to(torch.float32)
-    want = scatter_reference(got, want_index, want_weights)
+    want = want_affinities.to(torch.float32)
     print(
         f"[fused-seam] set_equal_rows={equal_rows}/{DECLARED_T} "
         f"max_abs_error={float((got - want).abs().max()):.6e} "
@@ -866,14 +981,14 @@ def test_model_call_site_routes_through_the_seam() -> None:
     assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_K)
     assert tuple(expert_affinities.shape) == (DECLARED_T, DECLARED_E)
 
-    want_index, want_weights = noaux_tc_correct_torch_oracle(
+    want_index, want_affinities = noaux_tc_correct_torch_oracle(
         logits,
         bank.router_bias.detach(),
         bool(text_config.norm_topk_prob),
         float(text_config.routed_scaling_factor),
     )
     got = expert_affinities.to(torch.float32)
-    want = scatter_reference(got, want_index, want_weights)
+    want = want_affinities.to(torch.float32)
     print(
         f"[model-call-site] set_equal_rows="
         f"{set_equal_rows(expert_index, want_index)}/{DECLARED_T} "
