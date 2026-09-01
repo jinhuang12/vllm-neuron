@@ -355,10 +355,52 @@ class Glm5NextRoutedExperts(nn.Module):
     ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:458-459``).
     """
 
-    def __init__(self, text_config: Glm5NextTextConfig) -> None:
+    # ── expert partitioning -- D14 owner: ``inc-glm53f-031`` ─────────────
+    #
+    # WHAT THIS SECTION CLOSES. At the unmodified parent ``031535b`` this bank
+    # reported ``num_routed_experts == 288`` and nothing else: it carried no
+    # per-rank expert count, no local expert index set, and no shard plan
+    # (measured -- ``num_local_experts``, ``local_expert_indices`` and
+    # ``expert_partition`` were all absent). So an assertion written against
+    # ``num_routed_experts`` would have passed at the parent and certified
+    # nothing; the partition below is what this increment actually authors.
+    #
+    # WHY THE ARITHMETIC IS IMPORTED RATHER THAN WRITTEN HERE. It lives in
+    # ``factory.py``, which nothing on the arch-lookup path pulls the modeling
+    # module into. The import is FUNCTION-LOCAL, following the landed
+    # ``inc-glm53f-023`` precedent in this file and for the same two reasons:
+    # this file's module import block is ``-013``'s D14 section, and the
+    # file family's own idiom is a local import at the consuming member.
+    #
+    # THE 288/64 CONSEQUENCE IS DELIBERATE AND VISIBLE. At the registered TP
+    # degree freeze of 64, 288 experts are ragged, so building this bank RAISES
+    # a named error instead of padding or flooring. That is campaign gap G4
+    # surfaced where the model is built, and it is the lead's to dispose.
+
+    def __init__(
+        self,
+        text_config: Glm5NextTextConfig,
+        world_size: int | None = None,
+    ) -> None:
         super().__init__()
+        from vllm_neuron.model.glm5_next.factory import (
+            require_uniform_expert_partition,
+        )
+
         self.num_routed_experts = int(text_config.n_routed_experts)
         self.num_experts_per_tok = int(text_config.num_experts_per_tok)
+        # ``_resolve_world_size()`` is ``-013``'s helper, called rather than
+        # edited: an explicit ``world_size`` is what a caller with a degree
+        # supplies, and ``None`` means "read the process group", which is 1 when
+        # this stack is built undistributed.
+        self.tp_degree = (
+            _resolve_world_size() if world_size is None else int(world_size)
+        )
+        self.expert_partition = require_uniform_expert_partition(
+            self.num_routed_experts, self.tp_degree
+        )
+        # Uniform by the gate above, so rank 0's count is every rank's count.
+        self.num_local_experts = self.expert_partition.counts[0]
         _declare_parameters(
             self,
             "router_weight",
@@ -367,6 +409,14 @@ class Glm5NextRoutedExperts(nn.Module):
             "up_proj_weight",
             "down_proj_weight",
         )
+
+    def local_expert_indices(self, rank: int) -> tuple[int, ...]:
+        """The global expert indices ``rank`` owns, ascending.
+
+        Delegates to the plan rather than recomputing the arithmetic, so there
+        is one partition and not two that can disagree.
+        """
+        return self.expert_partition.local_expert_indices(rank)
 
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(
@@ -405,9 +455,16 @@ class Glm5NextMoEBlock(nn.Module):
     under ``mlp.experts`` or ``mlp.shared_experts``.
     """
 
-    def __init__(self, text_config: Glm5NextTextConfig) -> None:
+    def __init__(
+        self,
+        text_config: Glm5NextTextConfig,
+        world_size: int | None = None,
+    ) -> None:
         super().__init__()
-        self.experts = Glm5NextRoutedExperts(text_config)
+        # ``world_size`` is a trailing optional addition by ``inc-glm53f-031``,
+        # threaded to the routed bank only. ``_build_mlp``'s call site is
+        # unchanged and stays outside this increment's surface.
+        self.experts = Glm5NextRoutedExperts(text_config, world_size=world_size)
         if text_config.n_shared_experts:
             self.shared_experts = Glm5NextSharedExperts(text_config)
 

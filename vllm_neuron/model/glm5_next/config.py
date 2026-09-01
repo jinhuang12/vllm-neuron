@@ -43,6 +43,17 @@ _DSA_PERIOD = 4
 _DSA_PHASE = 3
 
 
+class Glm5NextExpertConfigError(ValueError):
+    """An expert-count field the routed-MoE stack cannot be built from.
+
+    ``inc-glm53f-031``. Named rather than a bare ``ValueError`` for the same
+    reason ``RaggedExpertPartitionError`` is: the expert-count path has two
+    distinct failure classes -- a count that is out of range (here) and a count
+    that is in range but does not shard uniformly (``factory.py``) -- and a
+    caller that must tell them apart cannot do so from ``ValueError``.
+    """
+
+
 def default_layer_types(num_hidden_layers: int) -> list[str]:
     """The 3:1 KDA/DSA schedule, generated from the interleave rule."""
     return [
@@ -149,6 +160,63 @@ class Glm5NextTextConfig:
         if self.layer_types is None:
             self.layer_types = default_layer_types(self.num_hidden_layers)
         self._validate_layer_types()
+        self._validate_expert_counts()
+
+    def _validate_expert_counts(self) -> None:
+        """The expert-count fields the MoE-288 stack is built from, PER FIELD.
+
+        ``inc-glm53f-031``. Loud rather than defaulted, for the same reason
+        :meth:`_validate_layer_types` is: an out-of-range count produces a
+        routed-expert bank whose shard arithmetic is wrong in a way no
+        downstream shape assertion could attribute back to here.
+
+        **Measured at the unmodified parent ``031535b`` before this was
+        authored: every one of ``n_routed_experts=0``, ``n_routed_experts=-8``,
+        ``num_experts_per_tok=0``, ``num_experts_per_tok=999`` and
+        ``n_shared_experts=-1`` was ACCEPTED silently**, so this validator is
+        the whole per-field path.
+
+        WHERE THE BOUNDARY IS, AND WHY IT IS HERE. This method validates
+        **well-formedness** -- each field inside its own range -- which is
+        exactly what :meth:`_validate_layer_types` already does for the
+        schedule (a length, and family membership). Two **cross-field**
+        questions are deliberately NOT asked here, and each has a named home on
+        the sharding path instead:
+
+        * ``num_experts_per_tok <= n_routed_experts`` -- a **router**
+          precondition, enforced by ``factory.py``'s
+          :func:`~vllm_neuron.model.glm5_next.factory.require_routable_expert_counts`.
+        * the uniform-partition question -- depends on a tensor-parallel degree
+          this dataclass does not carry, enforced by ``factory.py``'s
+          :func:`~vllm_neuron.model.glm5_next.factory.require_uniform_expert_partition`.
+
+        **The boundary is not a convenience, and it was measured.** Asking the
+        router question at construction time rejected ``inc-glm53f-011``'s
+        landed ``mini_config`` fixture, which declares a 4-expert bank while
+        inheriting the checkpoint's top-8 default -- a structural key-mapping
+        fixture that never routes a token. That fixture's latent incoherence is
+        recorded and routed to the lead; it is NOT repaired here, because
+        ``test_weight_loaders.py`` is outside this increment's declared surface.
+        A config dataclass that refuses a structural fixture has moved a router
+        precondition to the wrong layer, and the refusal is kept -- just at the
+        layer that routes.
+        """
+        if int(self.n_routed_experts) < 1:
+            raise Glm5NextExpertConfigError(
+                f"n_routed_experts must be >= 1, got {self.n_routed_experts}; "
+                "a sparse MLP with no routed expert has nothing to route to"
+            )
+        if int(self.num_experts_per_tok) < 1:
+            raise Glm5NextExpertConfigError(
+                f"num_experts_per_tok must be >= 1, got "
+                f"{self.num_experts_per_tok}; a top-k router with k < 1 selects "
+                "no expert for any token"
+            )
+        if int(self.n_shared_experts) < 0:
+            raise Glm5NextExpertConfigError(
+                f"n_shared_experts must be >= 0, got {self.n_shared_experts}; "
+                "0 is the declared no-shared-expert value, negative is not a value"
+            )
 
     def _validate_layer_types(self) -> None:
         """The schedule must be a length-correct, EXHAUSTIVE two-family partition.

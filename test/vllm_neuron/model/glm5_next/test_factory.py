@@ -279,9 +279,44 @@ def test_c03_the_lookup_allocates_no_parameters_and_the_counter_is_proved_live(
 
 def test_c03_the_implementation_module_is_not_imported_at_module_level():
     """The factory's lazy import is what lets the class be looked up before the
-    model skeleton exists -- and is why no weights can be allocated."""
-    assert FACTORY_MODULE in sys.modules
-    assert IMPL_MODULE not in sys.modules
+    model skeleton exists -- and is why no weights can be allocated.
+
+    MEASURED IN A FRESH INTERPRETER, and that is load-bearing. The property is
+    about what importing ``factory.py`` pulls in, so it is an import-time
+    property of one module. Asserted against *this session's* ``sys.modules`` it
+    became a SESSION-GLOBAL invariant instead, which any earlier-sorting file in
+    this package falsifies by legitimately importing the implementation inside a
+    test body -- and three declared files sort before ``test_factory.py``:
+    ``test_block_quant_recognition.py`` (``inc-glm53f-023``),
+    ``test_experts.py`` (``inc-glm53f-031``) and ``test_dsa_layer.py``
+    (``inc-glm53f-051``). A subprocess measures the true property and is immune
+    to session pollution.
+
+    Repaired by ``inc-glm53f-031`` under the lead's ruling on
+    ``evidence-023.md`` routed item 1. **The property is unchanged and is not
+    weakened**, ``inc-glm53f-009``'s declared counts do not move, and no other
+    item in this file changes. Per-file ``sys.modules`` displacement stays
+    prohibited (D15) and is not used here.
+    """
+    import json
+    import subprocess
+
+    source = (
+        "import json, sys\n"
+        f"import {FACTORY_MODULE}\n"
+        "print(json.dumps({"
+        f"'factory': {FACTORY_MODULE!r} in sys.modules, "
+        f"'impl': {IMPL_MODULE!r} in sys.modules"
+        "}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, f"probe exited {proc.returncode}: {proc.stderr}"
+    observed = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert observed["factory"] is True
+    assert observed["impl"] is False
 
 
 def test_c03_falsifiable_the_class_predicate_rejects_a_real_instance(declared_env):
