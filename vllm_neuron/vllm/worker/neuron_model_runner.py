@@ -8596,6 +8596,70 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            # A linear-attention (KDA) layer holds no key/value pair: it holds a
+            # short-convolution state plus a recurrent state, and its spec
+            # reports BOTH on two positional carriers -- shapes[0]/dtypes[0] the
+            # conv state, shapes[1]/dtypes[1] the recurrent state. That is the
+            # order `get_kv_cache_spec` constructs them in and the order the
+            # vendor's own page formula pairs them in, so the allocation below
+            # walks the carriers rather than naming a state.
+            #
+            # THE PAGE COMES FROM THE SPEC, never from a number derived here:
+            # `page_size_bytes` is the sum over the declared carriers, so
+            # `num_blocks` and every stride below are functions of what the spec
+            # reports. `get_kv_cache_spec` passes no `page_size_padded`, which
+            # the vendor would otherwise return verbatim in place of that sum.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    page_size_bytes = kv_cache_spec.page_size_bytes
+                    assert raw_tensor.numel() % page_size_bytes == 0
+
+                    num_blocks = raw_tensor.numel() // page_size_bytes
+
+                    # Both states live side by side INSIDE each page, so each
+                    # state is a block-strided view of the same raw buffer: the
+                    # block stride is the whole page and the within-block
+                    # strides are contiguous for that state's own shape.
+                    # `strict=True` is deliberate -- the vendor pairs the two
+                    # carriers with a non-strict zip, so a short `dtypes` tuple
+                    # would shorten the page and silently under-allocate here.
+                    state_tensors = []
+                    state_offset_bytes = 0
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
+                    ):
+                        dtype_size = dtype.itemsize
+                        # The page must be a whole number of this state's
+                        # elements, or the block stride below would truncate.
+                        assert page_size_bytes % dtype_size == 0
+                        target_shape = (num_blocks, *shape)
+                        # Contiguous strides for the target shape, read off a
+                        # meta tensor: correct by construction and allocating
+                        # no storage for a reading used only as arithmetic.
+                        contiguous = torch.empty(target_shape, device="meta").stride()
+                        assert state_offset_bytes % dtype_size == 0
+                        state_tensors.append(
+                            torch.as_strided(
+                                _shared_dtype_view(raw_tensor, dtype),
+                                size=target_shape,
+                                stride=(
+                                    page_size_bytes // dtype_size,
+                                    *contiguous[1:],
+                                ),
+                                storage_offset=state_offset_bytes // dtype_size,
+                            )
+                        )
+                        # Advance by this state's own per-block footprint, so the
+                        # next carrier starts where this one ends inside a page.
+                        state_offset_bytes += contiguous[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+                    # Deliberately NOT registered in `_kv_cache_full_tensors`:
+                    # that dict feeds the KV-transfer connector's full
+                    # (2, num_blocks, ...) K/V view, and a recurrent state has
+                    # no K/V pair to hand it.
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
