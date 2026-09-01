@@ -798,11 +798,209 @@ class Glm5NextSharedExperts(nn.Module):
             self, "gate_proj_weight", "up_proj_weight", "down_proj_weight"
         )
 
+    # ── shared-expert path -- D14 owner: ``inc-glm53f-033`` ───────────────
+    #
+    # SCOPE. This section adds ONE method and edits no line above or below it.
+    # ``__init__`` above is ``inc-glm53f-013``'s landed code and ``forward``
+    # below is ``-013``'s stub; both stay byte-identical, so nothing any landed
+    # acceptance asserts can move. The residual add lives on
+    # ``Glm5NextMoEBlock`` -- this increment's second section -- because adding
+    # the routed and shared halves needs both children and neither child owns
+    # the other.
+    #
+    # THE COUNT IS 3, AND IT IS WHY THE STRUCTURE BELOW IS THREE CALLS. The
+    # route predicate (plan L934-935, revision 33) reads ``-026``'s dispatch
+    # counter as EXACTLY 3 -- one per projection site -- per shared-expert call.
+    # Three sequential entries into ``blockwise_fp8_mm`` is therefore the
+    # criterion and not an implementation convenience: a reading of 3 proves all
+    # three projections crossed the block-quant seam, so no projection can
+    # silently reach the substrate's non-blockwise MLP path and ignore the block
+    # scales, and a bypassed projection reads 2 and fails. ``-033`` attempt 1
+    # measured why the earlier declared ``1`` was structurally unreachable
+    # (``increments/evidence-033.md``): ``silu`` is non-linear, so ``down``
+    # cannot fold into either predecessor, and ``blockwise_fp8_mm`` takes a 2-D
+    # weight and adds exactly ``+1`` per invocation at a single unlooped site.
+    #
+    # NO FUSION IS AUTHORED (plan L938 and the Substrate bullet's own words).
+    # ``-013`` landed ``gate_proj_weight``, ``up_proj_weight`` and
+    # ``down_proj_weight`` as THREE UNFUSED parameters, matching the weight map
+    # (``weight_loaders_fp8.py:481-489``) and the fork's own dense precedent
+    # (``Glm5NextDenseMLP`` below: "Gate and up stay **separate** parameters").
+    # Concatenating gate and up into one ``[H, 2I]`` operand would author a
+    # scale-grid concatenation this increment may not author, and it would read
+    # 2 rather than the declared 3.
+    #
+    # WHY THE WEIGHTS, SCALES AND CONFIG ARE ARGUMENTS -- ``-027``'s measured
+    # shape contract (``increments/evidence-027.md`` §2.3), inherited rather
+    # than re-litigated. ``-013``'s ``__init__`` declares the three projections
+    # by ``register_parameter(name, None)`` and NO scale parameter, and retains
+    # no config. Producing the block scales is the weight loader's step, not
+    # this section's, so everything this site consumes is threaded in at the
+    # call -- ``-032``'s and ``-027``'s precedent for the config argument.
+    #
+    # THE SCALE OPERAND IS THE PUBLIC GRID, SO NEITHER ``to_kernel_scale_layout``
+    # IS IMPORTED HERE. The campaign carries two helpers of that name at
+    # different arities (``functional/blockwise_fp8_mm.py:309`` takes
+    # ``(weight_scale, rows, cols)``; ``functional/moe/moe_blockwise_fp8.py:170``
+    # takes ``(consumer_scales, num_experts, rows, cols, projection)``).
+    # ``blockwise_fp8_mm`` applies the dense one ITSELF at ``:436``, so this site
+    # passes the public ``[K//256, N//256]`` grid and imports neither -- the
+    # disambiguation hazard is removed rather than navigated.
+    #
+    # Imports are FUNCTION-LOCAL, following the landed ``-023``, ``-031``,
+    # ``-032`` and ``-027`` precedent in this file: the module import block is
+    # ``-013``'s D14 section.
+
+    def shared_expert_mm(
+        self,
+        hidden_states: torch.Tensor,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        gate_proj_scale: torch.Tensor,
+        up_proj_scale: torch.Tensor,
+        down_proj_scale: torch.Tensor,
+        quant_config: Glm5NextQuantConfig,
+    ) -> torch.Tensor:
+        """Run the always-on shared expert through ``-026``'s dense block GEMM.
+
+        The SwiGLU the checkpoint stores: ``down(silu(gate(x)) * up(x))``, with
+        each of the three projections a separate entry into
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`.
+
+        Args:
+            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
+                whole number of ``TILE_SIZE`` rows -- the seam tiles ``M`` over
+                the PSUM partition axis and does not pad
+                (``blockwise_fp8_mm.py:239-245``), so padding is the caller's.
+            gate_proj_weight: ``[H, I]`` fp8-e4m3, expressed against
+                ``gate_proj_scale``.
+            up_proj_weight: ``[H, I]`` fp8-e4m3.
+            down_proj_weight: ``[I, H]`` fp8-e4m3.
+            gate_proj_scale: ``[H//256, I//256]`` fp32, the PUBLIC block-scale
+                grid :func:`~vllm_neuron.functional.blockwise_fp8_mm.scale_grid_shape`
+                declares -- one scale per ``256 x 256`` weight block.
+            up_proj_scale: the same, for ``up_proj_weight``.
+            down_proj_scale: ``[I//256, H//256]`` fp32, for ``down_proj_weight``.
+            quant_config: the resolved per-model quantisation policy, and the
+                route selector; see the section note above.
+
+        Returns:
+            ``[T, H]`` **fp32** -- the seam's own return dtype, not re-cast here.
+            The layer forward decides the residual dtype and that is
+            ``inc-glm53f-054``'s section, exactly as ``-027`` left it.
+
+        Raises:
+            Glm5NextSharedExpertRouteError: when ``quant_config`` resolved no
+                block-quant method, when its block shape is not the one the
+                retile bridges, or when two operand extents contradict each
+                other. Named rather than coerced, so a mis-wired call site fails
+                where it is wrong instead of computing a different function.
+        """
+        from torch.nn.functional import silu
+
+        from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm
+        from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
+
+        # ---- ROUTE SELECTION. The certifying component (D1.4). ----------- #
+        # Same shape as ``-027``'s: the route is selected by WHICH FUNCTION IS
+        # CALLED and the not-block-quant branch RAISES BY NAME, so it cannot
+        # fall through to the substrate's ``QuantizationType.NONE`` default
+        # (``functional/mlp.py:81``, ``:249`` -- a default reached by OMISSION).
+        # No quantisation enum member is named or added (plan section 11
+        # constraint B.6). The counter clause DETECTS that silent fallback; this
+        # raise makes it impossible.
+        if not quant_config.is_block_quantized:
+            raise Glm5NextSharedExpertRouteError(
+                "shared_expert_mm is the block-quant shared-expert route and "
+                f"quant_config resolved method={quant_config.method!r}. "
+                "Refusing to run: there is no unquantised shared-expert path at "
+                "this site, and silently continuing is what would reach the "
+                "substrate's QuantizationType.NONE default by omission."
+            )
+        block_shape = quant_config.block_shape
+        if block_shape is None or tuple(block_shape) != (TILE_SIZE, TILE_SIZE):
+            raise Glm5NextSharedExpertRouteError(
+                f"quant_config declares weight_block_size={block_shape!r}; this "
+                f"route consumes scales retiled from ({TILE_SIZE}, {TILE_SIZE}) "
+                f"checkpoint blocks onto BLOCK_QUANT_SIZE granularity and has no "
+                f"path for any other checkpoint block shape."
+            )
+
+        # ---- Extents, read off the operands rather than off the config. -- #
+        # Only the cross-operand agreements the seam cannot see are checked
+        # here. ``blockwise_fp8_mm`` already refuses a K mismatch (``:420``), a
+        # mis-sized or non-fp32 scale grid (``:328``, ``:335``) and every
+        # blocking condition (``_require_blocked``), and repeating those would
+        # create a second authority that can drift from the first.
+        if hidden_states.dim() != 2:
+            raise Glm5NextSharedExpertRouteError(
+                f"hidden_states must be [T, H], got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        hidden = int(hidden_states.shape[1])
+        if tuple(gate_proj_weight.shape) != tuple(up_proj_weight.shape):
+            raise Glm5NextSharedExpertRouteError(
+                f"gate_proj_weight {tuple(gate_proj_weight.shape)} and "
+                f"up_proj_weight {tuple(up_proj_weight.shape)} must have the "
+                f"same [H, I] extents; they are multiplied elementwise after "
+                f"the activation"
+            )
+        if gate_proj_weight.dim() != 2 or int(gate_proj_weight.shape[0]) != hidden:
+            raise Glm5NextSharedExpertRouteError(
+                f"gate_proj_weight must be [H={hidden}, I], got shape "
+                f"{tuple(gate_proj_weight.shape)}"
+            )
+        intermediate = int(gate_proj_weight.shape[1])
+        if tuple(down_proj_weight.shape) != (intermediate, hidden):
+            raise Glm5NextSharedExpertRouteError(
+                f"down_proj_weight must be [I={intermediate}, H={hidden}], got "
+                f"shape {tuple(down_proj_weight.shape)}"
+            )
+
+        # ---- The three projection sites. The counted seam entries. ------- #
+        # ENTRY 1 of 3 -- gate.
+        gate = blockwise_fp8_mm(hidden_states, gate_proj_weight, gate_proj_scale)
+        # ENTRY 2 of 3 -- up.
+        up = blockwise_fp8_mm(hidden_states, up_proj_weight, up_proj_scale)
+
+        # The SwiGLU wiring. This is call-site plumbing, not authored numerics:
+        # ``silu`` is torch's own, the product is elementwise, and both run in
+        # the seam's fp32 return dtype so no precision is thrown away between
+        # the projections. This is also the exact reason the declared count
+        # cannot be 1 -- ``silu`` is non-linear, so ``down`` cannot fold into
+        # either predecessor and the product must be materialised here.
+        activated = silu(gate) * up
+
+        # The down projection re-enters the seam, whose declared input dtype is
+        # ``bfloat16`` (``blockwise_fp8_mm.py:408``), so the fp32 intermediate is
+        # cast back to the activation dtype. The cast is named rather than
+        # implicit because it is a real precision step and the acceptance's torch
+        # reference mirrors it at the same point.
+        # ENTRY 3 of 3 -- down.
+        return blockwise_fp8_mm(
+            activated.to(hidden_states.dtype), down_proj_weight, down_proj_scale
+        )
+
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(
             "Glm5NextSharedExperts.forward is a stub created by "
             "inc-glm53f-013; the shared-expert path lands with inc-glm53f-033"
         )
+
+
+# ``inc-glm53f-033``'s named refusal, at module level for the same reason
+# ``-027``'s is: an exception a caller catches belongs in the module namespace
+# and not nested in the class that raises it. It is a pure insertion between two
+# classes -- no line of ``Glm5NextSharedExperts`` above it or
+# ``Glm5NextMoEBlock`` below it moves.
+class Glm5NextSharedExpertRouteError(ValueError):
+    """A shared-expert call this route refuses, named rather than coerced.
+
+    Raised in preference to continuing, because the failure this closes is a
+    call site that reaches the substrate's ``QuantizationType.NONE`` default by
+    OMISSION and computes a different function while every shape check passes.
+    """
 
 
 class Glm5NextMoEBlock(nn.Module):
@@ -824,6 +1022,118 @@ class Glm5NextMoEBlock(nn.Module):
         self.experts = Glm5NextRoutedExperts(text_config, world_size=world_size)
         if text_config.n_shared_experts:
             self.shared_experts = Glm5NextSharedExperts(text_config)
+
+    # ── the residual add -- D14 owner: ``inc-glm53f-033`` ─────────────────
+    #
+    # SCOPE. This section adds ONE method and edits no line above or below it.
+    # ``__init__`` above and ``forward`` below are ``inc-glm53f-013``'s landed
+    # code and stay byte-identical.
+    #
+    # WHY THE ADD LIVES HERE AND NOT ON EITHER CHILD. It needs the routed half
+    # and the shared half, and neither ``Glm5NextRoutedExperts`` nor
+    # ``Glm5NextSharedExperts`` owns the other. ``Glm5NextMoEBlock`` holds both
+    # (``__init__`` above), so it is the one place the two halves meet. D14's
+    # sub-class rule sends the compute to the child that owns the weights --
+    # which is why ``-027`` put the routed matmul on the routed bank and this
+    # increment put the shared matmul on the shared bank -- and it sends the
+    # combination to their parent.
+    #
+    # "ADDED EXACTLY ONCE" IS STRUCTURAL HERE, NOT ASSERTED. The plan's second
+    # acceptance conjunct (L933) proves the shared contribution enters the layer
+    # output once rather than twice. That property is made true by construction
+    # below: this method contains EXACTLY ONE call to ``shared_expert_mm`` and
+    # EXACTLY ONE ``+``, and it is the only place in this file that adds a shared
+    # contribution to a routed one. The acceptance measures the property
+    # numerically; this structure is what makes the measurement reproducible
+    # rather than incidental.
+    #
+    # WHAT THIS SECTION DOES NOT DO, deliberately: it does not assemble the layer
+    # forward (``-013`` / ``-054``), it does not call the routed path (``-027``'s
+    # ``block_quant_expert_mm``, landed and separately accepted), and it authors
+    # no numerics. ``routed_output`` arrives as an argument precisely so this
+    # method composes the two halves without owning either.
+
+    def combine_routed_and_shared(
+        self,
+        routed_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        gate_proj_scale: torch.Tensor,
+        up_proj_scale: torch.Tensor,
+        down_proj_scale: torch.Tensor,
+        quant_config: Glm5NextQuantConfig,
+    ) -> torch.Tensor:
+        """``routed_output + shared_expert(hidden_states)`` -- the layer output.
+
+        Args:
+            routed_output: ``[T, H]`` the routed experts' contribution, as
+                ``inc-glm53f-027``'s ``block_quant_expert_mm`` returns it. Passed
+                in rather than computed here; see the section note above.
+            hidden_states: ``[T, H]`` the shared expert's own input -- the same
+                pre-norm activations the routed half consumed.
+            gate_proj_weight: forwarded verbatim to
+                :meth:`Glm5NextSharedExperts.shared_expert_mm`, which documents
+                every operand's layout and is the single authority for it.
+            up_proj_weight: as above.
+            down_proj_weight: as above.
+            gate_proj_scale: as above.
+            up_proj_scale: as above.
+            down_proj_scale: as above.
+            quant_config: as above.
+
+        Returns:
+            ``[T, H]`` fp32 -- the sum, in the shared half's fp32 seam dtype.
+            The residual dtype for the decoder layer is ``inc-glm53f-054``'s.
+
+        Raises:
+            Glm5NextSharedExpertRouteError: when this block declares no shared
+                expert, or when ``routed_output`` and the shared contribution
+                disagree in extent. A silent broadcast is the failure this
+                refuses: ``[T, H] + [1, H]`` and ``[T, H] + [T, 1]`` both
+                broadcast without error and both compute a different layer.
+        """
+        # ``n_shared_experts == 0`` leaves the attribute undeclared -- ``-013``'s
+        # ``__init__`` mirrors the weight map's own condition
+        # (``weight_loaders_fp8.py:481``). Checked rather than assumed, because
+        # ``getattr`` on a missing module would raise ``AttributeError`` from
+        # inside the shared path and read as a wiring bug rather than a config.
+        shared_experts = getattr(self, "shared_experts", None)
+        if shared_experts is None:
+            raise Glm5NextSharedExpertRouteError(
+                "combine_routed_and_shared was called on a block that declares "
+                "no shared expert (n_shared_experts == 0), so there is no shared "
+                "contribution to add. The routed output is already the layer "
+                "output on such a block and calling this method is the bug."
+            )
+
+        # THE ONE call to the shared path.
+        shared_output = shared_experts.shared_expert_mm(
+            hidden_states,
+            gate_proj_weight,
+            up_proj_weight,
+            down_proj_weight,
+            gate_proj_scale,
+            up_proj_scale,
+            down_proj_scale,
+            quant_config,
+        )
+
+        # Extents compared EXACTLY, before the add. ``torch`` would broadcast a
+        # disagreeing extent silently and return a plausible tensor of the wrong
+        # shape, which no downstream shape check would catch.
+        if tuple(routed_output.shape) != tuple(shared_output.shape):
+            raise Glm5NextSharedExpertRouteError(
+                f"routed_output has shape {tuple(routed_output.shape)} and the "
+                f"shared contribution has shape {tuple(shared_output.shape)}; "
+                f"they must agree exactly. Refusing to add: torch would "
+                f"broadcast these and compute a different layer without error."
+            )
+
+        # THE ONE add. The shared contribution enters the layer output here and
+        # nowhere else in this file.
+        return routed_output + shared_output
 
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(

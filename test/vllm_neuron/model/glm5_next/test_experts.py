@@ -840,3 +840,1174 @@ def test_sharding_report_the_measured_readings(capsys):
     assert _READINGS["s01_duplicated"] == 0
     assert _READINGS["s03_dropped_total"] == 0
     assert _READINGS["s07_total_code_refs"] == 0
+
+
+# ===========================================================================
+# ``inc-glm53f-033`` -- WP7: the shared expert. THE OTHER HALF OF THIS
+# CO-AUTHORED FILE.
+#
+# THE PARTITION IS A RULE, NOT AN ETIQUETTE (plan L940). ``-031`` owns every
+# item ``-k sharding`` collects and this increment owns every item ``-k shared``
+# collects. Every item below carries ``shared`` in its name and NONE carries the
+# token ``sharding``, so the two acceptance commands cannot collect each other's
+# items and neither counted predicate can be satisfied or broken by the other
+# increment's tests. Both counts are MEASURED by dedicated ``--collect-only -q``
+# runs and recorded in ``increments/evidence-033.md``, never declared here.
+#
+# EVERYTHING BELOW IS ADDED, NOTHING ABOVE IS TOUCHED. ``-031``'s items are
+# LANDED and its recorded acceptance asserts them, so a modification of any line
+# above this banner is ``evidence_contradicts_design`` rather than a repair
+# (plan L940). This section therefore appends, keeps its own readings dict rather
+# than writing ``-031``'s ``_READINGS``, and takes every import inside a function
+# body -- the file's own ``_impl()`` idiom, kept so no line of the landed import
+# block moves either.
+#
+# THE DECLARED ACCEPTANCE (plan L933), verbatim:
+#
+#     "the layer output equals routed-plus-shared from a torch reference at
+#     ``assert_close(rtol=3e-2, atol=1e-5)``; **and** a zeroed-shared-expert
+#     case reproduces the routed-only output at **atol 1e-5**, proving the shared
+#     contribution is added exactly once rather than twice."
+#
+# THE DECLARED ROUTE PREDICATE (plan L934-935, revision 33): ``-026``'s dispatch
+# counter reads EXACTLY 3 -- one per projection site -- per shared-expert call,
+# and its torch-fallback counter reads 0. The count was re-derived at revision 33
+# from this seat's attempt-1 measurement (``increments/evidence-033.md``); the
+# earlier ``1`` was structurally unreachable. No tolerance, count or comparator
+# below is invented, widened or narrowed.
+# ===========================================================================
+
+
+# --------------------------------------------------------------------------- #
+# Declared values. The tolerances and the count are the plan's; the tiny-config  #
+# extents are chosen to ADMIT ``-026``'s kernel, which is a fixture decision.    #
+# --------------------------------------------------------------------------- #
+
+#: The plan's tolerance pair for conjunct 1, and its atol for conjunct 2.
+SHARED_RTOL = 3e-2
+SHARED_ATOL = 1e-5
+
+#: The plan's route-predicate count (L934-935): one seam entry per projection.
+SHARED_DECLARED_SEAM_ENTRIES = 3
+
+#: Tiny config. Every extent is forced by ``-026``'s own admission gates
+#: (``blockwise_fp8_mm.py::_require_blocked``), read off that source rather than
+#: guessed, and chosen to ADMIT because a geometry the kernel REFUSES raises --
+#: it does not fall back -- and a refused shape would leave the counter at 0.
+#:   T % TILE_SIZE == 0        (``:239`` -- M tiles over the PSUM partition axis)
+#:   H % BLOCK_QUANT_SIZE == 0 (``:246`` -- K needs a whole number of block scales)
+#:   I % BLOCK_QUANT_SIZE == 0 (``:252`` -- N likewise)
+#: H and I are 2 blocks rather than 1 deliberately: a ``[1, 1]`` scale grid cannot
+#: distinguish a transposed flat index, and this fixture's block scales are
+#: distinct and asymmetric so that a mis-mapping is numerically visible.
+SHARED_T = 128
+SHARED_H = 512
+SHARED_I = 512
+
+#: Per-block exponents for the three projections' scale grids. DETERMINISTIC, not
+#: sampled: three properties are load-bearing and a draw satisfies them only by
+#: luck -- every entry an exact power of two (F1, below), the four entries
+#: DISTINCT so a transposed flat index moves the numbers, and the matrix
+#: ASYMMETRIC so a transpose is not the identity.
+SHARED_GATE_EXPONENTS = ((-2, 1), (0, -1))
+SHARED_UP_EXPONENTS = ((1, -1), (-2, 0))
+SHARED_DOWN_EXPONENTS = ((0, 2), (-1, 1))
+
+
+class SharedRouteInstrumentError(AssertionError):
+    """A route reading that is not what the plan declares."""
+
+
+class SharedF1PreconditionError(AssertionError):
+    """The pow2 losslessness precondition did not hold on this case's scales."""
+
+
+class SharedVacuousControlError(AssertionError):
+    """A control whose input could not have made it fail.
+
+    A zero or a pass over vacuous input measures nothing, so the control refuses
+    to report a result it did not earn.
+    """
+
+
+class SharedSectionOwnershipError(AssertionError):
+    """A structural claim about this increment's own section did not hold."""
+
+
+_SHARED_READINGS: dict[str, object] = {}
+
+
+def _shared_record(**readings: object) -> None:
+    """Collect a reading for the reporting item.
+
+    Writes this increment's OWN dict. ``-031``'s ``_READINGS`` and its
+    ``len(_READINGS) >= 40`` floor are landed and are not touched, so neither
+    increment's reporting item can be moved by the other's readings.
+    """
+    _SHARED_READINGS.update(readings)
+    for key, value in readings.items():
+        print(f"{key}={value}")
+
+
+# --------------------------------------------------------------------------- #
+# Route instrumentation. Counts the VENDOR entry point as well as this          #
+# campaign's own counters, so a bug in ours cannot fake the reading.            #
+# --------------------------------------------------------------------------- #
+class _SharedSimulatorCounter:
+    """Counts real ``nki.simulator.simulate_kernel`` calls for the duration.
+
+    Structure carried verbatim from ``-026``'s landed
+    ``test_blockwise_fp8_mm.py::_SimulatorCounter``; the import is function-local
+    for this file's reasons rather than that file's.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._nki = None
+        self._real = None
+
+    def __enter__(self) -> "_SharedSimulatorCounter":
+        # BOTH imports are required and the second is not redundant:
+        # ``nki.simulator`` is a SUBMODULE, so ``import nki`` alone leaves
+        # ``nki.simulator`` unbound and attribute access raises
+        # ``AttributeError: module 'nki' has no attribute 'simulator'``. This is
+        # ``-026``'s landed pair (``test_blockwise_fp8_mm.py`` imports ``nki``
+        # and ``nki.simulator`` on consecutive lines) and it is repeated here for
+        # the same reason rather than trusted to import order elsewhere.
+        import nki
+        import nki.simulator  # noqa: F401  -- binds nki.simulator
+
+        self._nki = nki
+        self._real = nki.simulator.simulate_kernel
+        real = self._real
+
+        def counting(*args, **kwargs):
+            self.calls += 1
+            return real(*args, **kwargs)
+
+        nki.simulator.simulate_kernel = counting
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._nki.simulator.simulate_kernel = self._real
+
+
+def _shared_seam():
+    """``-026``'s module, re-acquired through ``importlib``.
+
+    THIS IS THE R-2 FORM AND THE MECHANISM IS THE POINT. The counted seam is
+    ``-026``'s, not this increment's, so this module resets and reads counters it
+    does not own, across a module boundary, exactly as ``-026``'s own
+    ``test_dispatch_counters_are_module_level_state_reachable_from_elsewhere``
+    proved was possible. Re-acquiring by ``importlib`` rather than binding the
+    functions once makes the module-level state visible as shared state.
+    """
+    import importlib
+
+    return importlib.import_module("vllm_neuron.functional.blockwise_fp8_mm")
+
+
+def _assert_shared_route(
+    sim: _SharedSimulatorCounter, expected_entries: int, label: str
+) -> str:
+    """Read all four route instruments; return the reading for the transcript.
+
+    Four instruments, and instrument 4 is the vendor's own entry point, so a
+    defect in this campaign's three counters cannot fake a green route reading.
+    """
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    import torch
+
+    seam = _shared_seam()
+    nki_dispatch, torch_fallback = seam.dispatch_counters()
+    gate = can_run_kernel(torch.zeros(1))
+    reading = (
+        f"[{label}] nki_dispatch={nki_dispatch} torch_fallback={torch_fallback} "
+        f"can_run_kernel={gate} simulate_kernel_calls={sim.calls} "
+        f"declared={expected_entries}"
+    )
+    print(reading)
+    if nki_dispatch != expected_entries:
+        raise SharedRouteInstrumentError(
+            f"{label}: -026's seam dispatch counter read {nki_dispatch}, declared "
+            f"{expected_entries} (one per projection site: gate, up, down). A "
+            f"bypassed projection reads fewer and is exactly what this counts. "
+            f"{reading}"
+        )
+    if torch_fallback != 0:
+        raise SharedRouteInstrumentError(
+            f"{label}: -026's torch-fallback counter read {torch_fallback}, "
+            f"declared exactly 0 -- a fallback pass would compare torch against "
+            f"torch and is this campaign's F1 false green. {reading}"
+        )
+    if gate is not True:
+        raise SharedRouteInstrumentError(
+            f"{label}: can_run_kernel() read {gate!r}, declared True. {reading}"
+        )
+    if sim.calls != expected_entries:
+        raise SharedRouteInstrumentError(
+            f"{label}: nki.simulator.simulate_kernel ran {sim.calls} times, "
+            f"declared {expected_entries}. A numeric pass without a simulator "
+            f"call is the F1 false green. {reading}"
+        )
+    return reading
+
+
+# --------------------------------------------------------------------------- #
+# Fixture construction.                                                        #
+# --------------------------------------------------------------------------- #
+def _shared_pow2_scales(exponents, rows: int, cols: int):
+    """The PUBLIC ``[rows//256, cols//256]`` block-scale grid, every entry pow2.
+
+    F1, AND WHY IT IS HERE RATHER THAN INHERITED. ``-026``'s kernel accumulates
+    the two ``128``-wide contraction tiles of one ``256`` block in PSUM and
+    applies the block scale AFTER that accumulation
+    (``blockwise_fp8_mm.py:203-220``, and its module docstring states the order
+    is deliberate). ``increments/evidence-071.md`` F1 measured **720 fp32 ulp**
+    of remapping error under a non-pow2 block scale against **0** under a pow2
+    one. So a non-pow2 fixture would make ``rtol=3e-2`` certify remapping error
+    on top of this increment's plumbing, and the tolerance would no longer mean
+    what it says. The tolerance is UNCHANGED; only the world it is measured in is
+    narrowed -- exactly what the plan's own F1 clause does for ``-025``/``-026``.
+    """
+    import torch
+
+    from vllm_neuron.functional.blockwise_fp8_mm import scale_grid_shape
+
+    want = scale_grid_shape(rows, cols)
+    grid = torch.zeros(want, dtype=torch.int64)
+    for k_block in range(want[0]):
+        for n_block in range(want[1]):
+            grid[k_block, n_block] = exponents[k_block % 2][n_block % 2]
+    return torch.ldexp(torch.ones(want, dtype=torch.float32), grid)
+
+
+def _shared_fp8_grid(seed: int, *shape: int, signed: bool = False):
+    """Values already on the fp8-e4m3 grid, so every cast in the fixture is exact.
+
+    ``signed=False`` IS A CONDITIONING CHOICE CARRIED FROM ``-025`` ATTEMPT 1,
+    which read ``max_rel_error=8.32e+01`` against this same ``rtol=3e-2`` from
+    catastrophic cancellation in a SIGNED fixture over a 512-wide contraction --
+    not from a kernel defect. With signed values the reference lands arbitrarily
+    close to zero while the terms that built it are ~1e2, so a pointwise RELATIVE
+    tolerance is dominated by cancellation and no correct implementation can
+    satisfy it. The hazard is sharper here because this increment chains THREE
+    contractions, so cancellation compounds. Signed coverage is kept as its own
+    arm at the SAME declared tolerances
+    (:func:`test_shared_expert_signed_fixture_agrees_in_norm_under_cancellation`).
+    """
+    import torch
+
+    generator = torch.Generator().manual_seed(seed)
+    low = -7 if signed else 1
+    return torch.randint(low, 8, shape, generator=generator).to(torch.float32) / 8.0
+
+
+def _shared_build_case(zero_shared: bool = False, signed: bool = False) -> dict:
+    """The tiny config: three fp8 projections, three pow2 public scale grids.
+
+    ``zero_shared=True`` zeroes the three projection weights, which is the plan's
+    second declared conjunct. The SCALES are left alone and the extents are
+    unchanged, so the geometry the kernel admits does not move and all three seam
+    entries still happen -- the count is a statement about the route, not about
+    whether the numbers are nonzero.
+    """
+    import torch
+
+    fp8 = torch.float8_e4m3fn
+
+    gate_w = _shared_fp8_grid(11, SHARED_H, SHARED_I, signed=signed)
+    up_w = _shared_fp8_grid(12, SHARED_H, SHARED_I, signed=signed)
+    down_w = _shared_fp8_grid(13, SHARED_I, SHARED_H, signed=signed)
+    if zero_shared:
+        gate_w = torch.zeros_like(gate_w)
+        up_w = torch.zeros_like(up_w)
+        down_w = torch.zeros_like(down_w)
+
+    hidden_states = _shared_fp8_grid(31, SHARED_T, SHARED_H, signed=signed).to(
+        torch.bfloat16
+    )
+
+    return {
+        "hidden_states": hidden_states,
+        "gate_w": gate_w.to(fp8),
+        "up_w": up_w.to(fp8),
+        "down_w": down_w.to(fp8),
+        "gate_s": _shared_pow2_scales(SHARED_GATE_EXPONENTS, SHARED_H, SHARED_I),
+        "up_s": _shared_pow2_scales(SHARED_UP_EXPONENTS, SHARED_H, SHARED_I),
+        "down_s": _shared_pow2_scales(SHARED_DOWN_EXPONENTS, SHARED_I, SHARED_H),
+    }
+
+
+def _shared_block_quant_config():
+    """``Glm5NextQuantConfig`` for the pinned checkpoint -- nothing hand-fed.
+
+    The pinned fixture is digest-verified before it is parsed, so the
+    quantisation policy this call site routes on is the campaign's registered one
+    and not a value this test invented. Idiom and digest carried from ``-027``'s
+    landed ``test_moe_path.py:363-390``.
+    """
+    import hashlib
+    import json
+    from pathlib import Path
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "config.json"
+    expected = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+    digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    if digest != expected:
+        raise SharedVacuousControlError(
+            f"pinned fixture digest moved: {digest} != {expected}. The "
+            f"quantisation policy this call site routes on would no longer be "
+            f"the campaign's registered one."
+        )
+
+    from vllm_neuron.model.glm5_next.config import Glm5NextConfig
+
+    model_fp8 = _impl()
+    return model_fp8.Glm5NextQuantConfig.from_model_config(
+        Glm5NextConfig.from_configs(json.loads(fixture.read_text()))
+    )
+
+
+def _shared_build_block():
+    """A ``Glm5NextMoEBlock`` whose shared expert exists, at the tiny config.
+
+    ``world_size=1`` keeps ``-031``'s uniformity gate satisfied at this tiny
+    expert count; the routed bank is built but never driven here, because the
+    routed path is ``-027``'s landed and separately-accepted surface.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    model_fp8 = _impl()
+    text_config = Glm5NextTextConfig(
+        hidden_size=SHARED_H,
+        moe_intermediate_size=SHARED_I,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+    )
+    return model_fp8.Glm5NextMoEBlock(text_config, world_size=1)
+
+
+def _shared_expert_torch_reference(case: dict):
+    """The independent torch formulation of ``down(silu(gate(x)) * up(x))``.
+
+    WHY THIS IS A REAL COMPARISON AND NOT A RESTATEMENT. Each projection goes
+    through ``-026``'s ``blockwise_fp8_mm_torch_oracle``, which dequantises the
+    whole weight FIRST and contracts in one fp32 matmul, where the kernel
+    contracts per ``256`` block and applies the block scale BETWEEN blocks and
+    never consults ``flat_scale_index`` on this side. The two therefore disagree
+    in arithmetic ORDER while agreeing in value, so a transposed block-to-scale
+    assignment in the seam shows up as a numeric disagreement here.
+
+    THE DTYPE FLOW IS MIRRORED AT THE SAME POINTS, deliberately. The reference
+    applies the same ``.to(bfloat16)`` before the down projection that the
+    implementation applies, because that cast is a real precision step and a
+    reference that skipped it would make this comparison measure a dtype
+    mismatch this test invented rather than the plumbing under acceptance.
+    """
+    from torch.nn.functional import silu
+
+    from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm_torch_oracle
+
+    hidden = case["hidden_states"]
+    gate = blockwise_fp8_mm_torch_oracle(hidden, case["gate_w"], case["gate_s"])
+    up = blockwise_fp8_mm_torch_oracle(hidden, case["up_w"], case["up_s"])
+    activated = silu(gate) * up
+    return blockwise_fp8_mm_torch_oracle(
+        activated.to(hidden.dtype), case["down_w"], case["down_s"]
+    )
+
+
+def _shared_routed_stand_in(shared_reference):
+    """A conditioned ``[T, H]`` routed contribution, at the shared half's scale.
+
+    WHY THE ROUTED HALF IS A FIXTURE AND NOT A CALL. The routed path is
+    ``-027``'s ``block_quant_expert_mm``, LANDED and separately accepted against
+    its own criteria. Driving it here would (i) import ``-025``'s five admission
+    gates into this increment's acceptance, so a refusal there would read as a
+    failure here, and (ii) put another increment's seam inside this increment's
+    counter window. This increment's surface is the shared-expert path and the
+    residual add, and ``combine_routed_and_shared`` takes the routed output as an
+    argument precisely so the two halves compose without either owning the other.
+
+    THE MAGNITUDE IS MEASURED, NOT HOPED. It is rescaled to the shared half's own
+    absmax, which is what makes the double-add control below able to fail: if the
+    routed half dominated by orders of magnitude, doubling the shared
+    contribution would move the sum by less than ``rtol`` and the control would
+    report a pass it had not earned.
+    """
+    import torch
+
+    routed = _shared_fp8_grid(41, SHARED_T, SHARED_H).to(torch.float32)
+    scale = shared_reference.abs().max() / routed.abs().max().clamp_min(1e-12)
+    return routed * scale
+
+
+def _shared_max_rel_error(got, want) -> float:
+    """``max |got - want| / (|want| + atol)`` -- a number, not a verdict."""
+    return float(((got - want).abs() / (want.abs() + SHARED_ATOL)).max())
+
+
+def _shared_call_layer(block, case: dict, quant_config, routed):
+    """Drive the increment's own call site once, under all four instruments."""
+    seam = _shared_seam()
+    seam.reset_dispatch_counters()
+    with _SharedSimulatorCounter() as sim:
+        got = block.combine_routed_and_shared(
+            routed,
+            case["hidden_states"],
+            case["gate_w"],
+            case["up_w"],
+            case["down_w"],
+            case["gate_s"],
+            case["up_s"],
+            case["down_s"],
+            quant_config,
+        )
+    return got, sim
+
+
+def _shared_source_method(class_name: str, method_name: str):
+    """The AST of one method of ``model_fp8.py``, located by name.
+
+    Used by the structural items below. Reads the file rather than
+    ``inspect.getsource`` on a bound method so the reading is of the shipped
+    bytes at HEAD and not of anything a test import may have rebound.
+    """
+    source = Path(_impl().__file__).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for member in node.body:
+                if isinstance(member, ast.FunctionDef) and member.name == method_name:
+                    return member
+    raise SharedSectionOwnershipError(
+        f"{class_name}.{method_name} not found in model_fp8.py -- this increment's "
+        f"own section is missing, so every structural reading below would be "
+        f"vacuous"
+    )
+
+
+def _shared_count_calls(fn, callee: str) -> int:
+    """How many times ``fn`` calls the function or method named ``callee``."""
+    total = 0
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name == callee:
+            total += 1
+    return total
+
+
+# ---------------------------------------------------------------------------
+# H01 -- DECLARED CONJUNCT 1: layer output == routed + shared, rtol 3e-2 / atol 1e-5
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_layer_output_equals_routed_plus_shared():
+    """The plan's first declared conjunct, at the plan's declared tolerances.
+
+    The comparison is against an independent torch formulation (see
+    :func:`_shared_expert_torch_reference`), and the route is read in the SAME
+    window as the numbers, because under F1 a numeric pass alone cannot prove the
+    substrate ran.
+    """
+    import torch
+
+    case = _shared_build_case()
+    block = _shared_build_block()
+    quant_config = _shared_block_quant_config()
+
+    shared_reference = _shared_expert_torch_reference(case)
+    routed = _shared_routed_stand_in(shared_reference)
+    want = routed + shared_reference
+
+    got, sim = _shared_call_layer(block, case, quant_config, routed)
+    reading = _assert_shared_route(sim, SHARED_DECLARED_SEAM_ENTRIES, "acceptance")
+
+    # NON-VACUITY GATE. An all-zero reference would make assert_close pass on a
+    # function that returns zeros, so the comparison refuses to run over one.
+    nonzero_rows = int((want.abs().sum(dim=1) > 0).sum())
+    if nonzero_rows != SHARED_T:
+        raise SharedVacuousControlError(
+            f"only {nonzero_rows}/{SHARED_T} reference rows are nonzero; a "
+            f"tolerance over a vacuous reference measures nothing"
+        )
+
+    max_rel = _shared_max_rel_error(got, want)
+    max_abs = float((got - want).abs().max())
+    print(
+        f"[acceptance] cases=1/1 nonzero_reference_rows={nonzero_rows}/{SHARED_T} "
+        f"max_rel_error={max_rel:.6e} max_abs_error={max_abs:.6e} "
+        f"rtol={SHARED_RTOL} atol={SHARED_ATOL} "
+        f"reference_absmax={float(want.abs().max()):.6e}"
+    )
+    torch.testing.assert_close(got, want, rtol=SHARED_RTOL, atol=SHARED_ATOL)
+
+    assert tuple(got.shape) == (SHARED_T, SHARED_H)
+    _shared_record(
+        h01_max_rel_error=f"{max_rel:.6e}",
+        h01_max_abs_error=f"{max_abs:.6e}",
+        h01_rtol=SHARED_RTOL,
+        h01_atol=SHARED_ATOL,
+        h01_nonzero_reference_rows=f"{nonzero_rows}/{SHARED_T}",
+        h01_route_reading=reading,
+        h01_cases="1/1",
+    )
+
+
+# ---------------------------------------------------------------------------
+# H02 -- DECLARED CONJUNCT 2: zeroed shared reproduces routed-only at atol 1e-5
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_zeroed_case_reproduces_routed_only():
+    """The plan's second declared conjunct: the shared half is added exactly once.
+
+    ``rtol`` is pinned to ``0`` because the plan declares ONLY ``atol 1e-5`` for
+    this conjunct; ``0`` is the strictest reading of that declaration and the one
+    that cannot be mistaken for a widening. The shared contribution is separately
+    shown to be EXACTLY zero, so "reproduces" is an exact statement here and the
+    tolerance is headroom rather than the thing being used.
+
+    The route is read in the same window: all three seam entries still happen on
+    zeroed weights, which is what makes the count a statement about the ROUTE and
+    not a proxy for the output being nonzero.
+    """
+    import torch
+
+    case = _shared_build_case(zero_shared=True)
+    block = _shared_build_block()
+    quant_config = _shared_block_quant_config()
+
+    shared_reference = _shared_expert_torch_reference(case)
+    shared_absmax = float(shared_reference.abs().max())
+
+    # The routed-only output. Built from the NONZERO case's shared scale so this
+    # arm's routed operand has the same magnitude as H01's -- otherwise "equals
+    # routed-only" could be a comparison of two tiny tensors.
+    routed = _shared_routed_stand_in(_shared_expert_torch_reference(_shared_build_case()))
+
+    # NON-VACUITY GATE on the routed half: if it were zero, this arm would be
+    # comparing zero against zero and would pass for the wrong reason.
+    nonzero_rows = int((routed.abs().sum(dim=1) > 0).sum())
+    if nonzero_rows != SHARED_T:
+        raise SharedVacuousControlError(
+            f"only {nonzero_rows}/{SHARED_T} routed rows are nonzero; "
+            f"'reproduces the routed-only output' would be vacuous"
+        )
+
+    got, sim = _shared_call_layer(block, case, quant_config, routed)
+    reading = _assert_shared_route(sim, SHARED_DECLARED_SEAM_ENTRIES, "zeroed-shared")
+
+    max_abs = float((got - routed).abs().max())
+    print(
+        f"[zeroed-shared] shared_absmax={shared_absmax:.6e} "
+        f"nonzero_routed_rows={nonzero_rows}/{SHARED_T} "
+        f"max_abs_error_vs_routed_only={max_abs:.6e} atol={SHARED_ATOL} rtol=0"
+    )
+    assert shared_absmax == 0.0, (
+        f"the zeroed shared expert produced a nonzero contribution "
+        f"({shared_absmax}); the zeroing did not take effect"
+    )
+    torch.testing.assert_close(got, routed, rtol=0, atol=SHARED_ATOL)
+
+    _shared_record(
+        h02_shared_absmax=f"{shared_absmax:.6e}",
+        h02_max_abs_error_vs_routed_only=f"{max_abs:.6e}",
+        h02_atol=SHARED_ATOL,
+        h02_rtol=0,
+        h02_nonzero_routed_rows=f"{nonzero_rows}/{SHARED_T}",
+        h02_route_reading=reading,
+    )
+
+
+# ---------------------------------------------------------------------------
+# H03 -- D1.5: the declared tolerance can DETECT a double add
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_double_add_is_refused_by_the_declared_tolerance():
+    """Add the shared half twice; the DECLARED comparison must raise.
+
+    This is the arm that makes "added exactly once" a measurement rather than a
+    claim. Without it, H01's pass would be indistinguishable from a comparison
+    that cannot fail. No tolerance is changed: the control uses the declared pair,
+    and the magnitude of the perturbation is measured and reported so the margin
+    is visible rather than assumed.
+    """
+    import torch
+
+    case = _shared_build_case()
+    shared_reference = _shared_expert_torch_reference(case)
+    routed = _shared_routed_stand_in(shared_reference)
+
+    once = routed + shared_reference
+    twice = routed + 2.0 * shared_reference
+
+    perturbation = _shared_max_rel_error(twice, once)
+    print(
+        f"[double-add-control] max_rel_error_of_double_add={perturbation:.6e} "
+        f"rtol={SHARED_RTOL} atol={SHARED_ATOL}"
+    )
+    if perturbation <= SHARED_RTOL:
+        raise SharedVacuousControlError(
+            f"doubling the shared contribution moved the sum by only "
+            f"{perturbation:.6e}, which is inside rtol={SHARED_RTOL}. This "
+            f"control could not have failed, so it certifies nothing about the "
+            f"once-versus-twice property."
+        )
+
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(twice, once, rtol=SHARED_RTOL, atol=SHARED_ATOL)
+
+    _shared_record(
+        h03_double_add_max_rel_error=f"{perturbation:.6e}",
+        h03_declared_comparison_refused_double_add=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# H04 -- THE ROUTE PREDICATE: 3 per call, one per projection site (plan L934-935)
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_seam_entries_are_one_per_projection_site():
+    """``-026``'s counter reads 3 per shared-expert call, and 3 is per-call.
+
+    BOTH READINGS ARE RECORDED, which is the reviewer's round-26 item N2: the
+    PER-CALL value (3) and the PER-CASE total with the case's call multiplicity
+    stated, so the case-level number is recorded rather than silently chosen.
+    Two calls inside one reset window must read 6 -- that is what shows 3 is a
+    per-call delta and not a constant the counter happens to sit at.
+    """
+    case = _shared_build_case()
+    block = _shared_build_block()
+    quant_config = _shared_block_quant_config()
+    routed = _shared_routed_stand_in(_shared_expert_torch_reference(case))
+    seam = _shared_seam()
+
+    seam.reset_dispatch_counters()
+    assert seam.dispatch_counters() == (0, 0), (
+        "the reset did not zero -026's counters, so every reading below would be "
+        "cumulative and none of them would mean what it says"
+    )
+
+    readings = []
+    with _SharedSimulatorCounter() as sim:
+        for call_index in range(2):
+            block.combine_routed_and_shared(
+                routed,
+                case["hidden_states"],
+                case["gate_w"],
+                case["up_w"],
+                case["down_w"],
+                case["gate_s"],
+                case["up_s"],
+                case["down_s"],
+                quant_config,
+            )
+            readings.append(seam.dispatch_counters())
+            print(
+                f"[route-arity] after_call={call_index + 1} "
+                f"counters={readings[-1]} simulate_kernel_calls={sim.calls}"
+            )
+
+    per_call = [readings[0][0], readings[1][0] - readings[0][0]]
+    if readings[0] != (SHARED_DECLARED_SEAM_ENTRIES, 0):
+        raise SharedRouteInstrumentError(
+            f"after one shared-expert call -026's counters read {readings[0]}, "
+            f"declared ({SHARED_DECLARED_SEAM_ENTRIES}, 0)"
+        )
+    if readings[1] != (2 * SHARED_DECLARED_SEAM_ENTRIES, 0):
+        raise SharedRouteInstrumentError(
+            f"after two calls -026's counters read {readings[1]}, expected "
+            f"({2 * SHARED_DECLARED_SEAM_ENTRIES}, 0). The declared 3 is a "
+            f"PER-CALL delta; a counter that cannot advance is not an instrument."
+        )
+    assert per_call == [SHARED_DECLARED_SEAM_ENTRIES, SHARED_DECLARED_SEAM_ENTRIES]
+    assert sim.calls == 2 * SHARED_DECLARED_SEAM_ENTRIES
+
+    # The structural reading behind the number: three call sites in the source.
+    method = _shared_source_method("Glm5NextSharedExperts", "shared_expert_mm")
+    source_entries = _shared_count_calls(method, "blockwise_fp8_mm")
+    assert source_entries == SHARED_DECLARED_SEAM_ENTRIES, (
+        f"shared_expert_mm contains {source_entries} calls to blockwise_fp8_mm, "
+        f"declared {SHARED_DECLARED_SEAM_ENTRIES} (gate, up, down)"
+    )
+
+    _shared_record(
+        h04_per_call_deltas=per_call,
+        h04_per_call_declared=SHARED_DECLARED_SEAM_ENTRIES,
+        h04_case_call_multiplicity=2,
+        h04_per_case_total=readings[1][0],
+        h04_declared_case_multiplicity_for_h01=1,
+        h04_declared_case_total_for_h01=SHARED_DECLARED_SEAM_ENTRIES,
+        h04_torch_fallback=readings[1][1],
+        h04_simulate_kernel_calls=sim.calls,
+        h04_source_call_sites=source_entries,
+    )
+
+
+# ---------------------------------------------------------------------------
+# H05 -- D1.5: the (3, 0) reading is a measurement, not an always-3 counter
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_route_control_fallback_counter_discriminates(monkeypatch):
+    """With the simulator off, the same call reads ``(0, 3)`` and the route FAILS.
+
+    This is what makes ``torch_fallback == 0`` and ``nki_dispatch == 3`` above
+    meaningful: the same instruments are shown reading the opposite values
+    through the real gate rather than a mock, and ``_assert_shared_route`` is
+    shown REFUSING that reading. It is also the measured form of the plan's claim
+    that a pure-torch shared expert cannot pass.
+    """
+    import os
+
+    import torch
+
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    case = _shared_build_case()
+    block = _shared_build_block()
+    quant_config = _shared_block_quant_config()
+    routed = _shared_routed_stand_in(_shared_expert_torch_reference(case))
+
+    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
+    assert can_run_kernel(torch.zeros(1)) is False, (
+        "the gate did not flip with NKI_SIMULATOR=0, so this control is unarmed"
+    )
+
+    got, sim = _shared_call_layer(block, case, quant_config, routed)
+    counters = _shared_seam().dispatch_counters()
+    print(
+        f"[route-control] counters={counters} simulate_kernel_calls={sim.calls} "
+        f"can_run_kernel=False"
+    )
+
+    assert counters == (0, SHARED_DECLARED_SEAM_ENTRIES), (
+        f"expected (0, {SHARED_DECLARED_SEAM_ENTRIES}) on the fallback path, got "
+        f"{counters}"
+    )
+    assert sim.calls == 0, f"the simulator ran {sim.calls} times with it disabled"
+    assert tuple(got.shape) == (SHARED_T, SHARED_H)
+
+    # The route assertion must REFUSE this reading. Without this leg the control
+    # would show the counters moving but not that the acceptance notices.
+    with pytest.raises(SharedRouteInstrumentError):
+        _assert_shared_route(sim, SHARED_DECLARED_SEAM_ENTRIES, "route-control")
+
+    _shared_record(
+        h05_fallback_counters=counters,
+        h05_fallback_simulate_kernel_calls=sim.calls,
+        h05_route_assertion_refused_the_fallback=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# H06 -- "exactly once" is STRUCTURAL, not only numeric
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_add_is_structurally_exactly_once():
+    """One call to the shared path and one ``+`` in ``combine_routed_and_shared``.
+
+    The numeric conjuncts measure the once-versus-twice property on one fixture.
+    This item settles it over the SOURCE, so the property does not depend on the
+    fixture having been chosen well: if a second add or a second shared call ever
+    appears, this reading moves even when the numbers happen to still agree.
+    """
+    method = _shared_source_method("Glm5NextMoEBlock", "combine_routed_and_shared")
+
+    shared_calls = _shared_count_calls(method, "shared_expert_mm")
+    adds = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
+    ]
+    aug_adds = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add)
+    ]
+    print(
+        f"[structure] shared_expert_mm_calls={shared_calls} add_binops={len(adds)} "
+        f"augmented_adds={len(aug_adds)}"
+    )
+
+    if shared_calls != 1:
+        raise SharedSectionOwnershipError(
+            f"combine_routed_and_shared calls shared_expert_mm {shared_calls} "
+            f"times, declared exactly 1"
+        )
+    if len(adds) != 1 or aug_adds:
+        raise SharedSectionOwnershipError(
+            f"combine_routed_and_shared contains {len(adds)} '+' expressions and "
+            f"{len(aug_adds)} '+=' statements, declared exactly one '+' and no "
+            f"'+='. Two adds is the defect the plan's second conjunct exists to "
+            f"exclude."
+        )
+
+    _shared_record(
+        h06_shared_calls_in_combine=shared_calls,
+        h06_add_binops_in_combine=len(adds),
+        h06_augmented_adds_in_combine=len(aug_adds),
+    )
+
+
+# ---------------------------------------------------------------------------
+# H07 -- the two same-named scale helpers: neither is imported by this section
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_section_imports_neither_scale_layout_helper():
+    """This increment's section imports no ``to_kernel_scale_layout`` at all.
+
+    The campaign carries two helpers of that name at different arities
+    (``functional/blockwise_fp8_mm.py:309`` takes ``(weight_scale, rows, cols)``;
+    ``functional/moe/moe_blockwise_fp8.py:170`` takes ``(consumer_scales,
+    num_experts, rows, cols, projection)``), and they are deliberately not
+    flat-exported. This section removes the hazard instead of navigating it: it
+    passes the PUBLIC scale grid and lets ``blockwise_fp8_mm`` apply the dense
+    helper itself. Asserted mechanically so a later edit cannot quietly
+    reintroduce the ambiguity -- and, in particular, cannot reach the 5-arg MoE
+    helper from the dense path, where an arity failure reads as a shape bug.
+    """
+    names: list[str] = []
+    for class_name, method_name in (
+        ("Glm5NextSharedExperts", "shared_expert_mm"),
+        ("Glm5NextMoEBlock", "combine_routed_and_shared"),
+    ):
+        method = _shared_source_method(class_name, method_name)
+        for node in ast.walk(method):
+            if isinstance(node, ast.ImportFrom):
+                names += [f"{node.module}.{alias.name}" for alias in node.names]
+            elif isinstance(node, ast.Import):
+                names += [alias.name for alias in node.names]
+
+    print(f"[imports] this_section_imports={names}")
+    offenders = [name for name in names if "to_kernel_scale_layout" in name]
+    moe_offenders = [name for name in names if "moe_blockwise_fp8" in name]
+
+    # Non-vacuity: the scan must have read a real, non-empty import list.
+    if not names:
+        raise SharedVacuousControlError(
+            "no imports were found in this increment's section, so the scan read "
+            "nothing and its zero certifies nothing"
+        )
+    assert offenders == [], (
+        f"this section imports a to_kernel_scale_layout helper: {offenders}. "
+        f"blockwise_fp8_mm applies the dense one itself at :436."
+    )
+    assert moe_offenders == [], (
+        f"this section imports from the MoE scale module: {moe_offenders}. The "
+        f"dense path must not reach the 5-arg MoE helper."
+    )
+
+    _shared_record(
+        h07_section_import_count=len(names),
+        h07_scale_layout_imports=len(offenders),
+        h07_moe_scale_module_imports=len(moe_offenders),
+    )
+
+
+# ---------------------------------------------------------------------------
+# H08 -- F1: every block scale this acceptance runs on is an exact power of two
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_f1_precondition_block_scales_are_pow2():
+    """All three projections' block scales are exact pow2, over N/N blocks.
+
+    Why this belongs in this file: ``-026``'s kernel applies the block scale AFTER
+    accumulating the two contraction tiles of a block, and
+    ``increments/evidence-071.md`` F1 measured 720 fp32 ulp of remapping error
+    under a non-pow2 block scale against 0 under a pow2 one. Asserted HERE rather
+    than inherited from ``-026``'s test, because it is this file's fixture that
+    the declared tolerance is measured on.
+    """
+    from vllm_neuron.functional.moe.blockwise_fp8_retile import is_pow2_exact
+
+    case = _shared_build_case()
+    checked = 0
+    distinct: set[float] = set()
+    for label in ("gate_s", "up_s", "down_s"):
+        grid = case[label]
+        for value in grid.reshape(-1).tolist():
+            checked += 1
+            distinct.add(value)
+            if not is_pow2_exact(value):
+                raise SharedF1PreconditionError(
+                    f"{label} carries {value!r}, which is not an exact power of "
+                    f"two; the declared rtol would then certify remapping error "
+                    f"on top of this increment's plumbing"
+                )
+
+    print(
+        f"[f1] pow2_block_scales={checked}/{checked} distinct_values={len(distinct)}"
+    )
+    if checked == 0:
+        raise SharedVacuousControlError("no block scales were checked")
+    # The detector must be able to say no -- otherwise the N/N above is a
+    # tautology about is_pow2_exact rather than about this fixture.
+    assert not is_pow2_exact(3.0), "the pow2 detector accepts a non-pow2 value"
+    assert len(distinct) > 1, (
+        "every block scale is the same value, so a transposed block-to-scale "
+        "assignment would be numerically invisible in this fixture"
+    )
+
+    _shared_record(
+        h08_pow2_block_scales=f"{checked}/{checked}",
+        h08_distinct_block_scales=len(distinct),
+        h08_detector_rejects_non_pow2=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# H09 -- the named refusal: no silent path to QuantizationType.NONE (B.6)
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_refuses_a_non_block_quant_config_by_name():
+    """An unquantised ``quant_config`` raises by name rather than falling through.
+
+    The failure this closes is a call site that reaches the substrate's
+    ``QuantizationType.NONE`` default by OMISSION (``functional/mlp.py:81``,
+    ``:249``) and computes a different function while every shape check passes.
+    The route-counter clause DETECTS that; this raise makes it impossible.
+
+    No quantisation enum member is named or added anywhere in this increment
+    (constraint B.6) -- the route is selected by which function is called.
+    """
+    case = _shared_build_case()
+    block = _shared_build_block()
+    model_fp8 = _impl()
+
+    unquantised = model_fp8.Glm5NextQuantConfig(None)
+    if unquantised.is_block_quantized:
+        raise SharedVacuousControlError(
+            "Glm5NextQuantConfig(None) reports is_block_quantized=True, so this "
+            "control could not fire"
+        )
+
+    seam = _shared_seam()
+    seam.reset_dispatch_counters()
+    with pytest.raises(model_fp8.Glm5NextSharedExpertRouteError, match="block-quant"):
+        block.combine_routed_and_shared(
+            _shared_routed_stand_in(_shared_expert_torch_reference(case)),
+            case["hidden_states"],
+            case["gate_w"],
+            case["up_w"],
+            case["down_w"],
+            case["gate_s"],
+            case["up_s"],
+            case["down_s"],
+            unquantised,
+        )
+    refused_counters = seam.dispatch_counters()
+    print(f"[refusal] counters_after_refusal={refused_counters}")
+    assert refused_counters == (0, 0), (
+        f"the refusal ran {refused_counters} seam entries; it must refuse BEFORE "
+        f"touching the seam"
+    )
+
+    # B.6, over this increment's own two methods. The walk counts ``Name`` /
+    # ``Attribute`` / ``ImportFrom`` nodes ONLY -- ``-031``'s landed
+    # ``test_sharding_adds_no_vendor_quantisation_enum_reference`` is the
+    # authority for that scoping and the reason is load-bearing here: this
+    # section NAMES the enum in prose, in the refusal message that explains which
+    # default-by-omission it exists to block (``-027``'s landed raise carries the
+    # same sentence). A raw-text count would score that prose as a violation and
+    # would pressure the message to be made less clear to satisfy the scan, which
+    # inverts what B.6 is for. A CODE reference is what B.6 forbids.
+    def enum_refs(node_tree) -> int:
+        hits = 0
+        for node in ast.walk(node_tree):
+            if isinstance(node, ast.Name) and node.id == FORBIDDEN_ENUM:
+                hits += 1
+            elif isinstance(node, ast.Attribute) and node.attr == FORBIDDEN_ENUM:
+                hits += 1
+            elif isinstance(node, ast.ImportFrom):
+                hits += sum(1 for a in node.names if a.name == FORBIDDEN_ENUM)
+        return hits
+
+    enum_hits = 0
+    prose_mentions = 0
+    for class_name, method_name in (
+        ("Glm5NextSharedExperts", "shared_expert_mm"),
+        ("Glm5NextMoEBlock", "combine_routed_and_shared"),
+    ):
+        method = _shared_source_method(class_name, method_name)
+        enum_hits += enum_refs(method)
+        prose_mentions += ast.unparse(method).count(FORBIDDEN_ENUM)
+
+    # The control must FIRE, over real non-empty input, or the zero above is a
+    # statement about the walk rather than about this section.
+    control = enum_refs(
+        ast.parse(
+            f"from nkilib.core.utils.common_types import {FORBIDDEN_ENUM}\n"
+            f"x = {FORBIDDEN_ENUM}.NONE\n"
+        )
+    )
+    print(
+        f"[b6] enum_code_references_in_this_section={enum_hits} "
+        f"prose_mentions={prose_mentions} control={control}"
+    )
+    assert enum_hits == 0
+    assert control == 2, (
+        f"the B.6 walk scored {control} on a source that really does reference "
+        f"the enum twice; the zero above would certify nothing"
+    )
+    if prose_mentions == 0:
+        raise SharedVacuousControlError(
+            "this section mentions the enum in no prose at all, so the "
+            "code-versus-prose distinction this scan draws is untested here"
+        )
+
+    _shared_record(
+        h09_refusal_error="Glm5NextSharedExpertRouteError",
+        h09_counters_after_refusal=refused_counters,
+        h09_enum_code_references_in_this_section=enum_hits,
+        h09_enum_prose_mentions=prose_mentions,
+        h09_b6_control=control,
+    )
+
+
+# ---------------------------------------------------------------------------
+# H10 -- signed coverage, at the SAME declared tolerances
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_signed_fixture_agrees_in_norm_under_cancellation():
+    """A signed fixture, compared in a cancellation-robust norm at the same tolerances.
+
+    The declared arms run on a positive fixture, and
+    :func:`_shared_fp8_grid` records why: ``-025`` attempt 1 died to catastrophic
+    cancellation at this same ``rtol``, and this increment chains THREE
+    contractions so cancellation compounds. Dropping signed coverage entirely
+    would leave the sign path unexercised, so it is kept here and compared in a
+    RELATIVE FROBENIUS NORM -- which is dominated by the bulk of the tensor rather
+    than by whichever single element happened to land near zero.
+
+    THE TOLERANCES ARE THE PLAN'S, UNCHANGED. Only the norm the residual is
+    measured in differs from H01's pointwise form, and that difference is the
+    point of this arm rather than a relaxation of it.
+    """
+    case = _shared_build_case(signed=True)
+    block = _shared_build_block()
+    quant_config = _shared_block_quant_config()
+
+    shared_reference = _shared_expert_torch_reference(case)
+    routed = _shared_routed_stand_in(shared_reference)
+    want = routed + shared_reference
+
+    got, sim = _shared_call_layer(block, case, quant_config, routed)
+    reading = _assert_shared_route(sim, SHARED_DECLARED_SEAM_ENTRIES, "signed")
+
+    reference_norm = float(want.norm())
+    if reference_norm == 0.0:
+        raise SharedVacuousControlError("the signed reference is identically zero")
+    relative_norm = float((got - want).norm()) / reference_norm
+    pointwise = _shared_max_rel_error(got, want)
+    print(
+        f"[signed] relative_frobenius={relative_norm:.6e} rtol={SHARED_RTOL} "
+        f"pointwise_max_rel_error={pointwise:.6e} (recorded, not asserted) "
+        f"reference_norm={reference_norm:.6e}"
+    )
+    assert relative_norm <= SHARED_RTOL, (
+        f"signed fixture disagrees in norm: {relative_norm:.6e} > "
+        f"rtol={SHARED_RTOL}"
+    )
+
+    _shared_record(
+        h10_signed_relative_frobenius=f"{relative_norm:.6e}",
+        h10_signed_pointwise_max_rel_error=f"{pointwise:.6e}",
+        h10_signed_route_reading=reading,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reporting -- the readings the evidence record quotes
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_report_the_measured_readings(capsys):
+    """Prints every reading this increment's evidence record quotes.
+
+    Mirrors ``-031``'s landed reporting convention and reads this increment's OWN
+    dict, so neither increment's reporting item depends on the other's items
+    having run. Last by declaration order, for the same reason ``-031``'s is.
+    """
+    with capsys.disabled():
+        print()
+        print(
+            f"[H01] layer output == routed+shared: "
+            f"max_rel_error={_SHARED_READINGS.get('h01_max_rel_error')} vs "
+            f"rtol={_SHARED_READINGS.get('h01_rtol')} "
+            f"atol={_SHARED_READINGS.get('h01_atol')} "
+            f"cases={_SHARED_READINGS.get('h01_cases')}"
+        )
+        print(
+            f"[H02] zeroed shared: shared_absmax="
+            f"{_SHARED_READINGS.get('h02_shared_absmax')} "
+            f"max_abs_vs_routed_only="
+            f"{_SHARED_READINGS.get('h02_max_abs_error_vs_routed_only')} "
+            f"atol={_SHARED_READINGS.get('h02_atol')}"
+        )
+        print(
+            f"[H03] double-add refused: "
+            f"{_SHARED_READINGS.get('h03_declared_comparison_refused_double_add')} "
+            f"at max_rel_error={_SHARED_READINGS.get('h03_double_add_max_rel_error')}"
+        )
+        print(
+            f"[H04] R-2 per-call={_SHARED_READINGS.get('h04_per_call_deltas')} "
+            f"declared={_SHARED_READINGS.get('h04_per_call_declared')} "
+            f"per-case total={_SHARED_READINGS.get('h04_per_case_total')} "
+            f"at multiplicity={_SHARED_READINGS.get('h04_case_call_multiplicity')} "
+            f"| H01 case: multiplicity="
+            f"{_SHARED_READINGS.get('h04_declared_case_multiplicity_for_h01')} "
+            f"total={_SHARED_READINGS.get('h04_declared_case_total_for_h01')} "
+            f"fallback={_SHARED_READINGS.get('h04_torch_fallback')}"
+        )
+        print(
+            f"[H05] fallback control: {_SHARED_READINGS.get('h05_fallback_counters')} "
+            f"refused={_SHARED_READINGS.get('h05_route_assertion_refused_the_fallback')}"
+        )
+        print(
+            f"[H06] structure: shared_calls="
+            f"{_SHARED_READINGS.get('h06_shared_calls_in_combine')} adds="
+            f"{_SHARED_READINGS.get('h06_add_binops_in_combine')}"
+        )
+        print(
+            f"[H08] F1 pow2: {_SHARED_READINGS.get('h08_pow2_block_scales')} "
+            f"distinct={_SHARED_READINGS.get('h08_distinct_block_scales')}"
+        )
+        print(
+            f"[H09] refusal={_SHARED_READINGS.get('h09_refusal_error')} "
+            f"enum_code_refs={_SHARED_READINGS.get('h09_enum_code_references_in_this_section')} "
+            f"prose={_SHARED_READINGS.get('h09_enum_prose_mentions')}"
+        )
+        print(
+            f"[H10] signed norm="
+            f"{_SHARED_READINGS.get('h10_signed_relative_frobenius')}"
+        )
+        print("--- all readings ---")
+        for key in sorted(_SHARED_READINGS):
+            print(f"{key}={_SHARED_READINGS[key]}")
+
+    # The two declared conjuncts and the route predicate must all have reported.
+    assert _SHARED_READINGS["h04_per_call_deltas"] == [
+        SHARED_DECLARED_SEAM_ENTRIES,
+        SHARED_DECLARED_SEAM_ENTRIES,
+    ]
+    assert _SHARED_READINGS["h04_torch_fallback"] == 0
+    assert _SHARED_READINGS["h02_shared_absmax"] == f"{0.0:.6e}"
+    assert _SHARED_READINGS["h03_declared_comparison_refused_double_add"] is True
+    assert _SHARED_READINGS["h06_add_binops_in_combine"] == 1
+    assert _SHARED_READINGS["h09_enum_code_references_in_this_section"] == 0
+    assert len(_SHARED_READINGS) >= 30
