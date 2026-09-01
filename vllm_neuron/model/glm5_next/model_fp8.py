@@ -494,6 +494,273 @@ class Glm5NextRoutedExperts(nn.Module):
         )
         return logits, expert_index, expert_affinities
 
+    # ── block-quant kernel call site -- D14 owner: ``inc-glm53f-027`` ─────
+    #
+    # SCOPE. This section adds ONE method and edits no line above or below it.
+    # ``__init__`` and ``local_expert_indices`` are ``inc-glm53f-031``'s landed
+    # code, ``route_tokens`` is ``inc-glm53f-032``'s, and ``forward`` is
+    # ``inc-glm53f-013``'s stub; all four stay byte-identical, so nothing any
+    # of those three recorded acceptances asserts can move. The method sits on
+    # ``Glm5NextRoutedExperts`` rather than on ``Glm5NextMoEBlock`` under D14's
+    # sub-class rule -- the same reading ``-032`` landed for the sibling
+    # router-call-site row, and for the same reason: the routed bank is where
+    # the expert weights and the partition live.
+    #
+    # D5(b): THE INNER KERNEL IS CALLED DIRECTLY. The public ``moe_cte``
+    # dispatcher will not forward block scales, so this site enters
+    # ``inc-glm53f-025``'s ``blockwise_fp8_moe`` seam instead of the dispatcher.
+    #
+    # NO QUANTISATION ENUM MEMBER IS NAMED OR ADDED (plan section 11 constraint
+    # B.6, and the ``-023`` section above already declares the same negative).
+    # The route is selected by WHICH FUNCTION IS CALLED, and the not-block-quant
+    # branch RAISES BY NAME rather than falling through to the substrate's
+    # ``QuantizationType.NONE`` default (``functional/mlp.py:81``, ``:249`` --
+    # a default reached by OMISSION, so a call site that forgot to route gets it
+    # with no error at all). The acceptance's dispatch-counter clause exists to
+    # exclude exactly that silent fallback; the raise makes it IMPOSSIBLE rather
+    # than merely detectable.
+    #
+    # WHY THE WEIGHTS, SCALES AND CONFIG ARE ARGUMENTS. ``-031``'s ``__init__``
+    # declares ``gate_proj_weight`` / ``up_proj_weight`` / ``down_proj_weight``
+    # by ``register_parameter(name, None)`` and NO scale parameter, and it
+    # retains no config. So there is no landed layout to read: the fused
+    # ``[E, H, 2, I_TP]`` gate/up tensor the kernel needs is not the
+    # checkpoint's per-projection storage, and turning one into the other is the
+    # weight loader's step, not this section's. Adding fields to that landed
+    # ``__init__`` would edit ``-031``'s code, which D14's section-ownership
+    # rule does not permit here, so everything this site consumes is threaded in
+    # at the call -- the smaller change, and ``-032``'s own precedent for the
+    # config argument. What IS read off ``self`` is the partition
+    # (``num_local_experts``, ``num_experts_per_tok``), which is what ``-031``
+    # landed this bank to carry.
+    #
+    # WHAT THIS SITE DOES NOT DO, deliberately: it does not touch the shared
+    # expert (``-033``), it authors no numerics of its own (``-025``'s kernel and
+    # ``-024``'s retile producer own those), it does not fuse or transpose
+    # checkpoint tensors, and it does not assemble the layer forward
+    # (``-013`` / ``-054``). It reuses ``build_blockwise_mapping`` (F9) for the
+    # token-block mapping rather than re-deriving one.
+    #
+    # Imports are FUNCTION-LOCAL, following the landed ``-023``, ``-031`` and
+    # ``-032`` precedent in this file: the module import block is ``-013``'s D14
+    # section. The two ``to_kernel_scale_layout`` helpers in this campaign have
+    # THE SAME NAME AND DIFFERENT SIGNATURES
+    # (``functional/blockwise_fp8_mm.py:309`` takes ``(weight_scale, rows,
+    # cols)``; ``functional/moe/moe_blockwise_fp8.py:170`` takes
+    # ``(consumer_scales, num_experts, rows, cols, projection)``), so the one
+    # this site needs is imported from its own module UNDER AN ALIAS that names
+    # the module -- an unqualified import of both would be an arity failure that
+    # reads as a shape bug.
+
+    def block_quant_expert_mm(
+        self,
+        hidden_states: torch.Tensor,
+        expert_affinities: torch.Tensor,
+        gate_up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        gate_up_consumer_scales: torch.Tensor,
+        down_consumer_scales: torch.Tensor,
+        quant_config: Glm5NextQuantConfig,
+        *,
+        block_size: int | None = None,
+        moe_group: object | None = None,
+        tp_degree: int = 1,
+    ) -> torch.Tensor:
+        """Run this rank's routed experts through the block-quant NKI kernel.
+
+        Args:
+            hidden_states: ``[T, H]`` real tokens only -- the kernel's
+                padding-token slot is appended here, not by the caller
+                (``bwmm_shard_on_I.py:157``).
+            expert_affinities: ``[T, E_local]`` scattered router scores, the
+                form :meth:`route_tokens` returns: the gate weight at each
+                selected expert's column and zero elsewhere.
+            gate_up_proj_weight: ``[E_local, H, 2, I_TP]`` fp8-e4m3, retiled
+                onto ``BLOCK_QUANT_SIZE`` granularity.
+            down_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3, retiled.
+            gate_up_consumer_scales: the retile producer's FLAT emission for the
+                fused gate/up bank, shape
+                :func:`~vllm_neuron.functional.moe.blockwise_fp8_retile.consumer_scale_shape`
+                at ``projection=GATE_UP``. Both fusion halves must be present:
+                the producer writes one half per call and leaves the other
+                ``NaN``, and merging them is the loader's step.
+            down_consumer_scales: the same, at ``projection=DOWN``.
+            quant_config: the resolved per-model quantisation policy. This is
+                the route selector; see the section note above.
+            block_size: tokens per block, a multiple of ``BLOCK_QUANT_SIZE``.
+                Defaults to ``BLOCK_QUANT_SIZE`` itself.
+            moe_group: the MoE ``GroupCoordinator``, forwarded verbatim to
+                ``build_blockwise_mapping``. It is UNREAD on both of that
+                function's flows when ``tp_degree == 1``
+                (``moe_blockwise.py:354`` and ``:398`` gate every use behind
+                ``tp_degree > 1``), which is why an undistributed call site may
+                leave it ``None``; a sharded one supplies the real group rather
+                than having this site invent one.
+            tp_degree: ranks sharding each expert's intermediate dimension.
+
+        Returns:
+            ``[T, H]`` -- the padding-token row is sliced off. The dtype is the
+            seam's own (``bfloat16`` on the NKI route) and is not re-cast here:
+            the layer forward decides the residual dtype and that is
+            ``inc-glm53f-054``'s section.
+
+        Raises:
+            Glm5NextBlockQuantRouteError: when ``quant_config`` resolved no
+                block-quant method, when its block shape is not the one the
+                retile bridges, or when an operand extent contradicts another.
+                Named rather than coerced, so a mis-wired call site fails where
+                it is wrong instead of computing a different function.
+        """
+        from vllm_neuron.functional import build_blockwise_mapping
+        from vllm_neuron.functional.moe.blockwise_fp8_retile import (
+            BLOCK_QUANT_SIZE,
+            DOWN,
+            GATE_UP,
+            TILE_SIZE,
+        )
+        from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+            blockwise_fp8_moe,
+        )
+        from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+            to_kernel_scale_layout as moe_to_kernel_scale_layout,
+        )
+
+        # ---- ROUTE SELECTION. The certifying component (D1.4). ----------- #
+        if not quant_config.is_block_quantized:
+            raise Glm5NextBlockQuantRouteError(
+                "block_quant_expert_mm is the D5(b) block-quant route and "
+                f"quant_config resolved method={quant_config.method!r}. "
+                "Refusing to run: there is no unquantised expert path at this "
+                "site, and silently continuing is what would reach the "
+                "substrate's QuantizationType.NONE default by omission."
+            )
+        block_shape = quant_config.block_shape
+        if block_shape is None or tuple(block_shape) != (TILE_SIZE, TILE_SIZE):
+            raise Glm5NextBlockQuantRouteError(
+                f"quant_config declares weight_block_size={block_shape!r}; this "
+                f"route consumes scales retiled from "
+                f"({TILE_SIZE}, {TILE_SIZE}) checkpoint blocks onto "
+                f"{BLOCK_QUANT_SIZE} granularity and has no path for any other "
+                f"checkpoint block shape."
+            )
+
+        # ---- Extents, read off the operands rather than off the config. -- #
+        if hidden_states.dim() != 2:
+            raise Glm5NextBlockQuantRouteError(
+                f"hidden_states must be [T, H], got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        tokens, hidden = (int(extent) for extent in hidden_states.shape)
+        if gate_up_proj_weight.dim() != 4 or gate_up_proj_weight.shape[2] != 2:
+            raise Glm5NextBlockQuantRouteError(
+                f"gate_up_proj_weight must be [E, H, 2, I_TP], got shape "
+                f"{tuple(gate_up_proj_weight.shape)}"
+            )
+        num_experts = int(gate_up_proj_weight.shape[0])
+        intermediate = int(gate_up_proj_weight.shape[-1])
+        if num_experts != int(self.num_local_experts):
+            raise Glm5NextBlockQuantRouteError(
+                f"gate_up_proj_weight carries {num_experts} experts but this "
+                f"rank owns {self.num_local_experts}; the bank and the "
+                f"partition must agree"
+            )
+        if int(gate_up_proj_weight.shape[1]) != hidden:
+            raise Glm5NextBlockQuantRouteError(
+                f"gate_up_proj_weight has H={int(gate_up_proj_weight.shape[1])} "
+                f"but hidden_states has H={hidden}"
+            )
+        if tuple(down_proj_weight.shape) != (num_experts, intermediate, hidden):
+            raise Glm5NextBlockQuantRouteError(
+                f"down_proj_weight must be [E={num_experts}, "
+                f"I_TP={intermediate}, H={hidden}], got shape "
+                f"{tuple(down_proj_weight.shape)}"
+            )
+        if tuple(expert_affinities.shape) != (tokens, num_experts):
+            raise Glm5NextBlockQuantRouteError(
+                f"expert_affinities must be [T={tokens}, E={num_experts}], got "
+                f"shape {tuple(expert_affinities.shape)}"
+            )
+        block = BLOCK_QUANT_SIZE if block_size is None else int(block_size)
+        if block <= 0 or block % BLOCK_QUANT_SIZE:
+            raise Glm5NextBlockQuantRouteError(
+                f"block_size={block} is not a positive multiple of "
+                f"BLOCK_QUANT_SIZE={BLOCK_QUANT_SIZE} "
+                f"(bwmm_shard_on_I.py:667)"
+            )
+
+        # ---- The padding-token slot. Appended here, once. ---------------- #
+        # The kernel reads a ``-1`` token position as the LAST row of
+        # ``hidden_states`` (``bwmm_shard_on_I.py:157``), so both the hidden
+        # tensor and the affinity tensor grow one zero row and the mapping is
+        # built over ``T + 1`` tokens. Slicing it back off is the last step.
+        pad_hidden = torch.zeros(
+            1, hidden, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        padded_hidden = torch.cat([hidden_states, pad_hidden], dim=0)
+        pad_affinities = torch.zeros(
+            1,
+            num_experts,
+            dtype=expert_affinities.dtype,
+            device=expert_affinities.device,
+        )
+        padded_affinities = torch.cat([expert_affinities, pad_affinities], dim=0)
+
+        # ---- The token-block mapping. REUSED (F9), not authored. --------- #
+        # ``conditions`` is deliberately unconsumed: it feeds the
+        # ``*_hybrid`` dynamic-while variant of the vendor kernel, and D5(b)
+        # calls the non-hybrid inner member, whose signature has no such
+        # parameter. Named with a leading underscore rather than dropped so the
+        # unused fourth return is visible instead of implied.
+        (
+            expert_affinities_masked,
+            token_position_to_id,
+            block_to_expert,
+            _conditions,
+        ) = build_blockwise_mapping(
+            expert_affinities=padded_affinities,
+            num_local_experts=num_experts,
+            num_experts_per_token=int(self.num_experts_per_tok),
+            block_size=block,
+            moe_group=moe_group,
+            tp_degree=tp_degree,
+        )
+
+        # ---- The scale bridge. ``-025``'s helper, at its own arity. ------ #
+        # The mapping is built from the fp32 affinities so the nonzero mask is
+        # exact, and the masked tensor is cast to the activation dtype only
+        # afterwards -- the kernel multiplies it into the hidden states.
+        gate_up_proj_scale = moe_to_kernel_scale_layout(
+            gate_up_consumer_scales,
+            num_experts,
+            hidden,
+            intermediate,
+            projection=GATE_UP,
+        )
+        down_proj_scale = moe_to_kernel_scale_layout(
+            down_consumer_scales,
+            num_experts,
+            hidden,
+            intermediate,
+            projection=DOWN,
+        )
+
+        output = blockwise_fp8_moe(
+            hidden_states=padded_hidden,
+            expert_affinities_masked=expert_affinities_masked.to(
+                hidden_states.dtype
+            ),
+            gate_up_proj_weight=gate_up_proj_weight,
+            down_proj_weight=down_proj_weight,
+            block_size=block,
+            token_position_to_id=token_position_to_id,
+            # ``[N]`` from the mapping, ``[N, 1]`` at the seam
+            # (``moe_blockwise_fp8.py:323``).
+            block_to_expert=block_to_expert.reshape(-1, 1),
+            gate_up_proj_scale=gate_up_proj_scale,
+            down_proj_scale=down_proj_scale,
+        )
+        return output[:tokens]
+
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(
             "Glm5NextRoutedExperts.forward is a stub created by "
@@ -501,6 +768,20 @@ class Glm5NextRoutedExperts(nn.Module):
             "the router call site with inc-glm53f-032, and the block-quant "
             "kernel call site with inc-glm53f-027"
         )
+
+
+# ``inc-glm53f-027``'s named refusal, at module level because an exception a
+# caller catches belongs in the module namespace and not nested in the class
+# that raises it. It is the second and last hunk of this increment in this file,
+# and it is a pure insertion: no line of ``Glm5NextRoutedExperts`` above it or
+# ``Glm5NextSharedExperts`` below it moves.
+class Glm5NextBlockQuantRouteError(ValueError):
+    """A block-quant expert call this route refuses, named rather than coerced.
+
+    Raised in preference to continuing, because the failure this closes is a
+    call site that reaches the substrate's ``QuantizationType.NONE`` default by
+    OMISSION and computes a different function while every shape check passes.
+    """
 
 
 class Glm5NextSharedExperts(nn.Module):
