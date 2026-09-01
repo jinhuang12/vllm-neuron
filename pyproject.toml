@@ -66,7 +66,7 @@ omit = [
     "doc/*",
     "*.md",
     "setup.py",
-    "vllm_neuron/patches/*",
+    "vllm_neuron/vllm/patches/*",
     "test/evaluation/*",
 ]
 
