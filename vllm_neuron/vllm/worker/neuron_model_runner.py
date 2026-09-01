@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -8648,10 +8649,46 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
+            # A linear-attention (KDA) layer holds no key/value history: it holds
+            # a short-convolution state plus a recurrent state, reported on
+            # LayerSpec's four recurrent-state fields. The layer is recognised
+            # BY THE FIELDS IT CARRIES, never by its name.
+            recurrent_state = (
+                layer.kda_conv_state_shape,
+                layer.kda_recurrent_state_shape,
+                layer.kda_conv_state_dtype,
+                layer.kda_recurrent_state_dtype,
+            )
+            if any(value is not None for value in recurrent_state):
+                if None in recurrent_state:
+                    raise ValueError(
+                        f"KV layer '{layer_name}' declares recurrent-state "
+                        "geometry but leaves part of it unset; the conv and "
+                        "recurrent carriers are paired positionally, so a "
+                        "missing member would shorten the reported page."
+                    )
+                # ONE order shared by both carriers: position 0 conv, position 1
+                # recurrent, the order the vendor's page formula pairs them in.
+                # Dtypes come from the MODEL, per state -- the global KV cache
+                # dtype describes a key/value cache and would mistype an fp32
+                # recurrent state. page_size_padded is deliberately NOT passed:
+                # the vendor returns such an override verbatim, reporting a page
+                # the spec's own geometry does not describe.
+                spec = MambaSpec(
+                    block_size=block_size,
+                    shapes=(
+                        tuple(layer.kda_conv_state_shape),
+                        tuple(layer.kda_recurrent_state_shape),
+                    ),
+                    dtypes=(
+                        layer.kda_conv_state_dtype,
+                        layer.kda_recurrent_state_dtype,
+                    ),
+                )
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
             # this enables block clipping in the NiXL connector.
-            if layer.sliding_window_size is None:
+            elif layer.sliding_window_size is None:
                 spec = FullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
