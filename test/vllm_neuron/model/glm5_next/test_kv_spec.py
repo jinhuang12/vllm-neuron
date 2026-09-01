@@ -584,14 +584,17 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
         with pytest.raises(NotImplementedError):
             module.forward()
 
-    # The reserved name that is still not wired into the tree. The
-    # `Glm5NextQuantConfig()` arm that stood here was retired by
-    # `inc-glm53f-023`, the DECLARED lander of that D14 section -- this census
-    # is a tripwire against a QUIET implementation, and a declared handover is
-    # the signal it exists to let through. `-013`'s four declared counts
-    # (45 / 11 / 34 / 0) are untouched, as is every other arm above.
-    with pytest.raises(NotImplementedError):
-        impl.Glm5NextHyperConnection().forward()
+    # NO reserved-name arm is left in this census, and both retirements were
+    # declared handovers rather than losses of coverage. `Glm5NextQuantConfig()`
+    # was retired by `inc-glm53f-023` and `Glm5NextHyperConnection().forward()`
+    # by `inc-glm53f-030`, each the DECLARED lander of that D14 section -- this
+    # census is a tripwire against a QUIET implementation, and a declared lander
+    # is the opposite of quiet. `-030` implements the mHC wiring its section
+    # reserved, so the constructor now takes the config the layer is sized from
+    # and `forward` computes instead of raising.
+    # `-013`'s four declared counts (45 / 11 / 34 / 0) are untouched, as is
+    # every arm above. The class NAME still exists and is still pinned, by
+    # `test_kv_spec_the_tree_carries_every_d14_section_name` below, unchanged.
 
 
 def test_kv_spec_the_tree_carries_every_d14_section_name(model) -> None:

@@ -310,29 +310,404 @@ class Glm5NextQuantConfig:
 
 # ---------------------------------------------------------------------------
 # ``Glm5NextHyperConnection`` -- mHC wiring. D14 owner: ``inc-glm53f-030``
-# (M2, Lane B 6th).
+# (M2, Lane B 6th, and Lane B's last).
 #
-# A NAME ONLY, and deliberately NOT instantiated in the tree: the landed
-# weight map declares no mHC parameter, so wiring this module in would invent
-# a parameter path the map's param-name side does not carry. ``-030`` owns the
-# wiring.
+# WHAT LANDS HERE, AND WHAT DELIBERATELY DOES NOT
+# -----------------------------------------------
+# The whole mHC layer: the pre block, ONE entry into ``inc-glm53f-028``'s
+# Sinkhorn seam, ONE entry into ``inc-glm53f-029``'s combine seam, and the
+# residual plumbing between them. **Calling this layer from the decoder is NOT
+# here.** ``Glm5NextKDALayer`` and ``Glm5NextDSALayer`` are other increments'
+# D14 sections (``-038``, ``-051``), and D14's rule is to raise rather than
+# widen, so this increment stops at its own section boundary and the decoder
+# call site is left to those owners. :meth:`Glm5NextHyperConnection.forward` is
+# shaped as the seam they will call.
+#
+# NO WEIGHT-MAP FAMILY IS ADDED, and that is a lead ruling rather than an
+# omission. ``weight_loaders_fp8.py:82-86`` declares ``multi_hyper_connections``
+# deliberately absent -- "no settled checkpoint leaf names; mapping them here
+# would be invention, not porting". This increment's acceptance is a synthetic
+# tiny case that builds these parameters in-test, so the map is not on its
+# route, and the checkpoint-leaf question stays a lead-owned open question for a
+# later design revision. ``weight_loaders_fp8.py`` is untouched.
+#
+# NO TOKEN TILING IS AUTHORED HERE, also a lead ruling. ``-028``'s kernel
+# refuses its ``M`` above ``PARTITION_MAX`` by raising ``SinkhornError`` and has
+# no torch path (``sinkhorn.py:321-330``); the refusal is allowed to propagate
+# unchanged. A host-side tiling loop and a large-``M`` torch fallback are both
+# out of scope, the second by P13 outright. The measured consequence -- see the
+# token-ceiling note on :meth:`mhc_pre` -- is recorded for the design revision
+# that settles the policy.
 # ---------------------------------------------------------------------------
 
 
-class Glm5NextHyperConnection(nn.Module):
-    """Multi-hyper-connection (mHC) residual mixing.
+class Glm5NextHyperConnectionError(ValueError):
+    """A rank, extent or configuration this layer refuses, named not coerced.
 
-    Section reserved for ``inc-glm53f-030``. ``text_config`` already carries
-    the checkpoint's dials (``mhc``, ``hc_mult``, ``hc_sinkhorn_iters``,
-    ``hc_eps`` -- ``config.py:139-143``) and ``NeuronConfig`` the overrides
-    (``mhc_sinkhorn_iters``, ``mhc_eps``).
+    Only the cross-argument agreements the two seams cannot see are checked
+    here. Each seam already refuses its own extents by name
+    (``sinkhorn.py:312-342``, ``hyper_connection.py:238-308``), and restating
+    those bounds would create a second authority that can drift from the first
+    -- the same reason ``-033``'s route error checks only its own call site.
     """
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextHyperConnection.forward is a stub created by "
-            "inc-glm53f-013; mHC wiring lands with inc-glm53f-030"
+
+class Glm5NextHyperConnection(nn.Module):
+    """Multi-hyper-connection (mHC) residual mixing, one layer call.
+
+    The operation is the pinned base's own pair of mHC blocks, ``MHCPreOp`` and
+    ``MHCPostOp`` (``vllm/model_executor/layers/mhc.py`` at ``vllm==0.24.0``),
+    with the two device-side pieces routed to this fork's NKI kernels:
+
+    1. **pre** -- project the ``hc_mult`` residual streams through ``fn``, RMS
+       scale, and split the result into three heads: ``pre_mix`` (which folds
+       the streams into the sub-block's single input), ``post_mix``, and the
+       ``[S, S]`` per-token stream-mixing matrix. The mixing matrix is then
+       Sinkhorn-normalised by **``inc-glm53f-028``'s kernel**.
+    2. the caller's sub-block runs on the folded input.
+    3. **post** -- mix the streams back out by **``inc-glm53f-029``'s kernel**.
+
+    WHERE THE ARITHMETIC COMES FROM -- IT IS NOT CHOSEN HERE
+    -------------------------------------------------------
+    Every line below is the base's, read at tag ``v0.24.0`` because the
+    campaign's target base is the 0.24 line, and read in **two independent
+    spellings that agree**: ``mhc_pre_torch`` / ``mhc_post_torch`` in
+    ``vllm/model_executor/kernels/mhc/torch.py`` (the plain-torch backend), and
+    ``mhc_pre_ref`` / ``mhc_post_ref`` in ``tests/kernels/test_mhc_kernels.py``
+    (the TileLang-repo reference). The acceptance carries both and asserts they
+    agree, so the transcription rests on two statements rather than on one
+    reading of one file.
+
+    THE ONE COMPOSITION QUESTION THIS SECTION HAD TO ANSWER
+    ------------------------------------------------------
+    ``-028``'s seam normalises **one** ``[M, N]`` matrix; the target needs
+    **``T`` independent** ``[S, S]`` ones, and this increment's route predicate
+    declares the Sinkhorn seam is entered **exactly once per layer call**. The
+    two are reconciled by a **block-diagonal embedding**: the ``T`` little
+    matrices are scattered onto the diagonal of one ``[T*S, T*S]`` matrix, so
+    ``-028``'s column target ``M / N`` is exactly ``1`` -- the target's own
+    column target -- and the off-diagonal zeros stay zero under multiplicative
+    rescaling, which makes every row sum and every column sum range over
+    exactly one token's block. **The alternative was measured and rejected:** a
+    flat ``[T*S, S]`` reshape lets ``-028``'s column pass sum ACROSS tokens, and
+    ``probe-030-composition-algebra.out`` reads ``max_abs`` up to ``4.68e-01``
+    against the target for it while the block-diagonal embedding reads
+    ``8.99e-07``, with the off-block maximum exactly ``0.0``. This is layout,
+    not authored numerics: all of the Sinkhorn arithmetic stays inside ``-028``'s
+    kernel.
+
+    :func:`torch.block_diag` is torch's own member, reused rather than written.
+
+    TWO DIVERGENCES FROM THE BASE THAT THIS LAYER CANNOT REMOVE
+    ----------------------------------------------------------
+    Both live inside ``-028``'s landed kernel, so both are recorded rather than
+    repaired: the base adds ``hc_sinkhorn_eps`` to every Sinkhorn denominator
+    while ``-028`` adds an inert ``1e-30`` (``sinkhorn.py:148``), and the base's
+    schedule is ``softmax`` then one column pass then ``(R-1)`` row/column pairs
+    while ``-028``'s is ``R`` pairs starting with a row pass. Sinkhorn-Knopp has
+    one fixed point, so at the target's ``20`` iterations the gap is small --
+    ``probe-030-layer-delta.out`` measures it using at most **3.2 %** of the
+    declared tolerance budget, in exact double precision so the reading is the
+    schedule-and-eps gap alone. The acceptance measures it again through the
+    real kernels.
+
+    PRECISION: fp32 IN AND OUT, following ``-028`` and ``-029``
+    ---------------------------------------------------------
+    The base's mHC takes bf16 and its own kernel test therefore compares at
+    ``atol=5e-2``; this increment is declared at ``atol=1e-5``, three orders
+    tighter, and bf16's ~3 decimal digits cannot express that difference. Both
+    seams are fp32 in and fp32 out for exactly this reason, so this layer keeps
+    fp32 across them and returns the seam's own dtype. Casting the result to the
+    decoder's residual dtype is the decoder's business, as ``-027`` and ``-033``
+    both left it.
+    """
+
+    def __init__(
+        self,
+        text_config: Glm5NextTextConfig,
+        neuron_config: NeuronConfig | None = None,
+        post_mult_value: float = 1.0,
+    ) -> None:
+        """Size the layer from the checkpoint's own dials.
+
+        Args:
+            text_config: carries ``hc_mult``, ``hc_sinkhorn_iters`` and
+                ``hc_eps`` (``config.py:151-154``).
+            neuron_config: framework overrides. ``mhc_sinkhorn_iters`` and
+                ``mhc_eps`` (``neuron_config.py:194,197``) win when not
+                ``None``, which is the override contract ``-013``'s section note
+                for this class already stated.
+            post_mult_value: the base's ``hc_post_mult_value``. **Its default is
+                the base's own test value**, ``hc_post_alpha = 1.0``
+                (``tests/kernels/test_mhc_kernels.py:126``); no fork config
+                field carries it, so it is a constructor argument rather than an
+                invented config default.
+
+        ONE EPSILON, THREE USES, AND THAT MATCHES THE BASE. The fork's config
+        carries a single ``hc_eps`` where the base's signature takes three
+        (``rms_eps``, ``hc_pre_eps``, ``hc_sinkhorn_eps``). This is **not** a
+        gap: the base's own kernel test sets all three to one value --
+        ``hc_sinkhorn_eps = hc_pre_eps = rms_eps = 1e-6``
+        (``tests/kernels/test_mhc_kernels.py:121``) -- and the fork's
+        ``hc_eps`` default is that same ``1e-06``. So the single field is
+        faithful, and it is recorded here because a reader comparing signatures
+        would otherwise read a missing dial.
+
+        Raises:
+            Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
+                ``hidden_size`` or iteration count.
+        """
+        super().__init__()
+        hc_mult = int(text_config.hc_mult)
+        hidden = int(text_config.hidden_size)
+        iters = int(text_config.hc_sinkhorn_iters)
+        eps = float(text_config.hc_eps)
+        if neuron_config is not None:
+            if neuron_config.mhc_sinkhorn_iters is not None:
+                iters = int(neuron_config.mhc_sinkhorn_iters)
+            if neuron_config.mhc_eps is not None:
+                eps = float(neuron_config.mhc_eps)
+
+        problems: list[str] = []
+        if hc_mult <= 0:
+            problems.append(f"hc_mult={hc_mult} must be positive")
+        if hidden <= 0:
+            problems.append(f"hidden_size={hidden} must be positive")
+        if iters <= 0:
+            problems.append(
+                f"sinkhorn iterations={iters} must be positive; the checkpoint "
+                f"declares hc_sinkhorn_iters={text_config.hc_sinkhorn_iters}"
+            )
+        if problems:
+            raise Glm5NextHyperConnectionError(
+                "mHC layer refuses this configuration: " + "; ".join(problems)
+            )
+
+        self.hc_mult = hc_mult
+        self.hidden_size = hidden
+        self.sinkhorn_iters = iters
+        self.hc_eps = eps
+        self.post_mult_value = float(post_mult_value)
+
+        # ``hc_mult3`` is the base's own name for the projection's output width:
+        # ``hc_mult`` pre weights + ``hc_mult`` post weights + ``hc_mult ** 2``
+        # mixing weights, in that order, which is the order the three heads are
+        # sliced out of ``mixes`` below.
+        self.hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+
+        # ORDINARY PARAMETERS, not ``_declare_parameters``' reservations, and
+        # that is the lead's ruling for this section: the weight map declares
+        # this family absent, so there is no map name to reserve, and the
+        # declared acceptance is a synthetic case whose test SETS these tensors.
+        # The three names are the base's own ``mhc_pre`` argument names, taken
+        # rather than chosen, exactly as ``-029`` took its seam's signature.
+        self.fn = nn.Parameter(
+            torch.zeros(self.hc_mult3, hc_mult * hidden, dtype=torch.float32)
         )
+        self.hc_scale = nn.Parameter(torch.zeros(3, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.zeros(self.hc_mult3, dtype=torch.float32))
+
+    # ── mHC pre -- the folded input, and ONE Sinkhorn dispatch ────────────
+    def mhc_pre(
+        self, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The base's ``mhc_pre``, with its Sinkhorn on ``-028``'s kernel.
+
+        Args:
+            residual: ``[T, S, H]`` -- the ``S = hc_mult`` residual streams.
+
+        Returns:
+            ``(post_mix, comb_mix, layer_input)`` -- ``[T, S, 1]``,
+            ``[T, S, S]`` and ``[T, H]``, all fp32. ``comb_mix[t, i, j]``
+            weights input stream ``i`` into output stream ``j``, the base's
+            convention and the one ``-029``'s kernel reads.
+
+        THE TOKEN CEILING, MEASURED AND DELIBERATELY NOT WORKED AROUND. The
+        block-diagonal embedding puts ``T * S`` on the Sinkhorn's ``M``, and
+        ``-028`` refuses ``M > PARTITION_MAX``. So this layer serves
+        ``T <= PARTITION_MAX // S`` -- **32** at the checkpoint's ``hc_mult 4``
+        -- where ``-029``'s combine kernel on its own would serve ``T <= 128``.
+        The Sinkhorn therefore binds first. Nothing here pads, tiles or falls
+        back: the seam's ``SinkhornError`` propagates to the caller unchanged,
+        which is what the lead ruled and what P13 requires. The reading is in
+        ``probe-030-m129.out``.
+
+        Raises:
+            Glm5NextHyperConnectionError: on a non-3-D ``residual`` or a stream
+                or hidden extent that contradicts this layer's configuration.
+            SinkhornError: from the seam, on a token count this layer's
+                embedding puts above ``-028``'s ``M`` bound. Propagated, never
+                caught.
+        """
+        from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise
+
+        tokens, streams, hidden = self._require_streams(residual)
+
+        flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
+        mixes = flat @ self.fn.to(torch.float32).t()
+        # The RMS scale. Both upstream spellings divide the squared sum by the
+        # projection's own input width -- ``hc_mult * hidden_size`` in
+        # ``mhc_pre_torch``, ``fn.shape[-1]`` in ``mhc_pre_ref`` -- and those are
+        # the same number.
+        sqrsum = flat.square().sum(dim=-1, keepdim=True)
+        mixes = mixes * torch.rsqrt(sqrsum / float(streams * hidden) + self.hc_eps)
+
+        scale = self.hc_scale.to(torch.float32)
+        base = self.hc_base.to(torch.float32)
+        pre_mix = (
+            torch.sigmoid(mixes[:, :streams] * scale[0] + base[:streams])
+            + self.hc_eps
+        )
+        post_mix = (
+            torch.sigmoid(
+                mixes[:, streams : 2 * streams] * scale[1]
+                + base[streams : 2 * streams]
+            )
+            * self.post_mult_value
+        )
+        comb_logits = mixes[:, 2 * streams :].reshape(
+            tokens, streams, streams
+        ) * scale[2] + base[2 * streams :].reshape(1, streams, streams)
+        # ``softmax`` and the ``+ eps`` are the base's, and they sit OUTSIDE the
+        # seam because ``-028``'s kernel starts from an affinity matrix. This is
+        # elementwise glue, which P13 leaves to torch.
+        comb_start = torch.softmax(comb_logits, dim=-1) + self.hc_eps
+
+        # ---- ENTRY 1 of 1 into ``-028``'s Sinkhorn seam. ----------------- #
+        # The counted dispatch. One call for all ``T`` tokens, which is what the
+        # block-diagonal embedding buys and what the route predicate declares.
+        normalised = sinkhorn_normalise(
+            torch.block_diag(*comb_start.unbind(0)), iters=self.sinkhorn_iters
+        )
+        comb_mix = self._diagonal_blocks(normalised, tokens, streams)
+
+        layer_input = (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1)
+        return post_mix.reshape(tokens, streams, 1), comb_mix, layer_input
+
+    # ── mHC post -- ONE combine dispatch ──────────────────────────────────
+    def mhc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        """The base's ``mhc_post``, on ``-029``'s kernel.
+
+        Args:
+            x: ``[T, H]`` -- the sub-block's single-stream output.
+            residual: ``[T, S, H]`` -- the streams, unchanged from
+                :meth:`mhc_pre`'s input.
+            post_layer_mix: ``[T, S, 1]`` from :meth:`mhc_pre`.
+            comb_res_mix: ``[T, S, S]`` from :meth:`mhc_pre`.
+
+        Returns:
+            ``[T, S, H]`` fp32 -- the seam's own return dtype, not re-cast.
+
+        Raises:
+            HyperConnectionError: from the seam, on any inadmissible rank or
+                extent. Propagated, never caught: a geometry the kernel cannot
+                serve must not quietly reach a torch path (P13, D6).
+        """
+        from vllm_neuron.functional.mhc.hyper_connection import (
+            hyper_connection_combine,
+        )
+
+        # ---- ENTRY 1 of 1 into ``-029``'s combine seam. ------------------ #
+        # Argument names and order are the seam's, which are the base's, so this
+        # is a call rather than a translation -- ``hyper_connection.py:375-376``
+        # asks for exactly that.
+        return hyper_connection_combine(
+            x=x.to(torch.float32),
+            residual=residual.to(torch.float32),
+            post_layer_mix=post_layer_mix.to(torch.float32),
+            comb_res_mix=comb_res_mix.to(torch.float32),
+        )
+
+    # ── one layer call ────────────────────────────────────────────────────
+    def forward(self, residual: torch.Tensor, sublayer: object) -> torch.Tensor:
+        """One mHC layer call: pre, then the sub-block, then post.
+
+        This is the shape the decoder sections call, and it is why "per layer
+        call" is a well-defined read window for the two counters: one entry here
+        is exactly one Sinkhorn dispatch and one combine dispatch.
+
+        Args:
+            residual: ``[T, S, H]`` residual streams.
+            sublayer: the wrapped sub-block, a callable ``[T, H] -> [T, H]``.
+                Annotated ``object`` rather than ``Callable`` on purpose -- the
+                module-level import block is ``-013``'s D14 section, and ``-023``
+                set the precedent that a later section adds nothing to it, so
+                every import in this section is function-local.
+
+        Returns:
+            ``[T, S, H]`` fp32 -- the re-mixed streams.
+
+        Raises:
+            Glm5NextHyperConnectionError: if ``sublayer`` is not callable, or if
+                its output does not have the ``[T, H]`` shape the combine needs.
+        """
+        if not callable(sublayer):
+            raise Glm5NextHyperConnectionError(
+                f"sublayer must be a callable [T, H] -> [T, H], got "
+                f"{type(sublayer).__name__}"
+            )
+        post_mix, comb_mix, layer_input = self.mhc_pre(residual)
+        x = sublayer(layer_input)
+        if not isinstance(x, torch.Tensor) or tuple(x.shape) != tuple(
+            layer_input.shape
+        ):
+            got = tuple(x.shape) if isinstance(x, torch.Tensor) else type(x).__name__
+            raise Glm5NextHyperConnectionError(
+                f"sublayer returned {got}, expected the [T, H] shape it was "
+                f"given, {tuple(layer_input.shape)} -- the combine reads x and "
+                f"the streams on the same token and hidden extents"
+            )
+        return self.mhc_post(x, residual, post_mix, comb_mix)
+
+    # ── layout helpers -- no arithmetic, and that is the point ────────────
+    def _require_streams(self, residual: torch.Tensor) -> tuple[int, int, int]:
+        """``(T, S, H)``, once the cross-argument agreements hold.
+
+        Only what the seams cannot see: they read their extents off the tensors
+        they are handed, so neither can tell that a stream or hidden extent
+        disagrees with the CONFIG this layer was built from -- and a wrong
+        stream count would silently mis-slice ``mixes`` instead of failing.
+        """
+        if residual.dim() != 3:
+            raise Glm5NextHyperConnectionError(
+                f"residual must be 3-D [T, S, H], got shape "
+                f"{tuple(residual.shape)}"
+            )
+        tokens, streams, hidden = (int(v) for v in residual.shape)
+        if streams != self.hc_mult:
+            raise Glm5NextHyperConnectionError(
+                f"residual carries S={streams} streams and this layer was built "
+                f"for hc_mult={self.hc_mult}; the projection's output width "
+                f"{self.hc_mult3} is sliced into three heads by that number, so "
+                f"a mismatch would mis-slice rather than fail"
+            )
+        if hidden != self.hidden_size:
+            raise Glm5NextHyperConnectionError(
+                f"residual carries H={hidden} and this layer was built for "
+                f"hidden_size={self.hidden_size}; fn is "
+                f"[{self.hc_mult3}, {self.hc_mult * self.hidden_size}]"
+            )
+        return tokens, streams, hidden
+
+    @staticmethod
+    def _diagonal_blocks(
+        normalised: torch.Tensor, tokens: int, streams: int
+    ) -> torch.Tensor:
+        """Read the ``T`` per-token blocks back off a ``[T*S, T*S]`` diagonal.
+
+        The inverse of :func:`torch.block_diag` for equal-sized blocks. Pure
+        indexing: it selects, and computes nothing.
+        """
+        index = torch.arange(tokens, device=normalised.device)
+        return normalised.reshape(tokens, streams, tokens, streams)[
+            index, :, index, :
+        ]
 
 
 # ---------------------------------------------------------------------------
