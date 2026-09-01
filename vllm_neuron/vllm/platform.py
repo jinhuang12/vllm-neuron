@@ -497,13 +497,57 @@ class NeuronPlatform(Platform):
         """Validate quantization config. Only KV cache quantization
         (q_scale/k_scale/v_scale) is supported for compressed-tensors, except on
         Neuron CPU-dequant paths (e.g. quantization="mxfp8") where the device
-        never sees on-device weight/activation quant."""
+        never sees on-device weight/activation quant.
+
+        Two checkpoint-format branches sit between the CPU-dequant waiver and
+        the compressed-tensors guard, and both are keyed on the CHECKPOINT's
+        ``quant_method`` rather than on operator intent:
+
+        * **Block-scaled fp8 is admitted explicitly.** A ``quant_method="fp8"``
+          checkpoint carrying ``weight_block_size`` is what this platform's
+          block-fp8 path consumes, so the admission is logged. Without the log
+          the config is still accepted -- by falling through the
+          compressed-tensors guard without ever being examined -- and there is
+          no observable difference between "recognised and admitted" and "not
+          recognised at all".
+        * **MX quantisation methods are refused.** The compile target is trn2
+          (gen3), whose matmul substrate carries no MX path, so an MX
+          checkpoint has to fail at config time with a readable message rather
+          than reach a kernel. The refusal runs AFTER the CPU-dequant waiver by
+          design: the waiver is keyed on ``neuron_config["quantization"]``
+          (operator intent), so the pin's CPU-dequant path keeps its behaviour
+          and this method refuses no configuration the pin accepts.
+        """
         neuron_config = vllm_config.additional_config.get("neuron_config", {})
         if neuron_config.get("quantization") in cls._cpu_dequant_quantizations:
             return
         model_config = vllm_config.model_config
         quant_cfg = getattr(model_config.hf_config, "quantization_config", None)
-        if not quant_cfg or quant_cfg.get("quant_method") != "compressed-tensors":
+        if not quant_cfg:
+            return
+        quant_method = quant_cfg.get("quant_method")
+        # Substring, not prefix: the MX family is spelled both ways in vLLM's
+        # own registry ("mxfp8" and "modelopt_mxfp8"), so a prefix test would
+        # admit half of it. No method this platform allowlists contains "mx".
+        if isinstance(quant_method, str) and "mx" in quant_method.lower():
+            raise ValueError(
+                f"Neuron does not support MX quantization: quant_method="
+                f"{quant_method!r}. The compile target is trn2 (gen3), whose "
+                f"matmul substrate has no MX path. Use one of "
+                f"{cls.supported_quantization}, or select a Neuron CPU-dequant "
+                f"path with additional_config['neuron_config']['quantization']."
+            )
+        if quant_method == "fp8":
+            weight_block_size = quant_cfg.get("weight_block_size")
+            if weight_block_size:
+                logger.info(
+                    "Admitting block-scaled fp8 checkpoint: "
+                    "weight_block_size=%s, activation_scheme=%s",
+                    weight_block_size,
+                    quant_cfg.get("activation_scheme"),
+                )
+            return
+        if quant_method != "compressed-tensors":
             return
         for group_name, group in quant_cfg.get("config_groups", {}).items():
             if group.get("weights"):
