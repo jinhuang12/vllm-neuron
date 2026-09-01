@@ -345,6 +345,127 @@ class NeuronPlatform(Platform):
             )
         cls._enable_structured_outputs = enable_structured_outputs
 
+        # ---- Hybrid KDA/DSA KV-cache block size -----------------------------
+        # Resolved here, before _validate_dcp_config reads cache_config.
+        # block_size for its ownership stride, so a hybrid run validates DCP
+        # against the block size it will actually allocate with.
+        #
+        # The VALUE is a frozen user decision -- approvals/DECISIONS.md section
+        # 6, verbatim "128 (Recommended)" -- and is valid ONLY under two
+        # registered preconditions: tensor-parallel degree 64 and a bfloat16 KV
+        # cache. Both are READ here; neither is chosen here, and a seat that
+        # needs a different value re-derives it rather than editing this
+        # literal. The DSA indexer's own cache is a separate page-size question
+        # this value does not answer.
+        #
+        # Every guard below RAISES rather than warns. On Neuron nothing
+        # downstream catches an under-sized page: update_block_size_for_backend
+        # hard-sets 32 and never calls the vendor's
+        # Platform._align_hybrid_block_size, so a warning would leave the run
+        # proceeding on a page too small for the KDA recurrent state and
+        # surface as corrupt output far from its cause.
+        if neuron_config.get("enable_hybrid_kv_cache", False):
+            cache_config = vllm_config.cache_config
+
+            # hybrid_kv_block_size documents itself as an OVERRIDE, so an
+            # operator value is HONOURED -- but only when it satisfies both
+            # constraints section 6's registered derivation names: the KDA
+            # state-page floor expressed in tokens, and the DSA indexer's
+            # kernel-granularity multiple. Both values are READ from section 6
+            # and neither is re-derived here; the decided 128 is section 6's
+            # own result and satisfies both. An unset knob resolves to that
+            # decided value.
+            #
+            # `is None` rather than falsiness, deliberately: an operator 0 is
+            # an offending value this path must report, never a value that
+            # silently becomes the default.
+            HYBRID_BLOCK_SIZE_FLOOR_TOKENS = 67  # DECISIONS.md section 6
+            HYBRID_BLOCK_SIZE_GRANULARITY = 64  # DECISIONS.md section 6
+            operator_block_size = neuron_config.get("hybrid_kv_block_size")
+            if operator_block_size is None:
+                hybrid_block_size = 128
+            else:
+                hybrid_block_size = operator_block_size
+                # -- BEGIN section-6 constraint validation --
+                if hybrid_block_size < HYBRID_BLOCK_SIZE_FLOOR_TOKENS:
+                    raise ValueError(
+                        f"The operator-supplied hybrid KDA/DSA KV-cache block "
+                        f"size {hybrid_block_size} is below the registered KDA "
+                        f"state-page floor of "
+                        f"{HYBRID_BLOCK_SIZE_FLOOR_TOKENS} tokens "
+                        f"(approvals/DECISIONS.md section 6). A shorter page "
+                        f"cannot hold the KDA recurrent state, and nothing "
+                        f"downstream on Neuron catches an under-sized page. "
+                        f"Supply a value at or above the floor, or unset "
+                        f"hybrid_kv_block_size to use the decided value."
+                    )
+                if hybrid_block_size % HYBRID_BLOCK_SIZE_GRANULARITY:
+                    raise ValueError(
+                        f"The operator-supplied hybrid KDA/DSA KV-cache block "
+                        f"size {hybrid_block_size} is not a multiple of the "
+                        f"registered DSA indexer kernel granularity "
+                        f"{HYBRID_BLOCK_SIZE_GRANULARITY} "
+                        f"(approvals/DECISIONS.md section 6). Supply a "
+                        f"multiple of that granularity, or unset "
+                        f"hybrid_kv_block_size to use the decided value."
+                    )
+                # -- END section-6 constraint validation --
+
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            if tp_size != 64:
+                raise ValueError(
+                    f"The hybrid KDA/DSA KV-cache block size "
+                    f"{hybrid_block_size} is registered ONLY at "
+                    f"tensor_parallel_size=64; got tensor_parallel_size="
+                    f"{tp_size}. The value is derived from the per-rank KDA "
+                    f"recurrent-state page at TP=64, so another TP degree "
+                    f"invalidates it. Re-derive the block size for this TP "
+                    f"degree before enabling enable_hybrid_kv_cache."
+                )
+
+            # Resolve the KV cache dtype exactly as vLLM's own hybrid
+            # alignment resolves it (vllm/platforms/interface.py): "auto"
+            # follows the model dtype, anything else maps through
+            # STR_DTYPE_TO_TORCH_DTYPE. An unmapped spelling resolves to None
+            # and fails the guard rather than passing unexamined.
+            from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+            if cache_config.cache_dtype == "auto":
+                kv_cache_dtype = model_config.dtype
+            else:
+                kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(cache_config.cache_dtype)
+            if kv_cache_dtype is not torch.bfloat16:
+                raise ValueError(
+                    f"The hybrid KDA/DSA KV-cache block size "
+                    f"{hybrid_block_size} is registered ONLY for a bfloat16 KV "
+                    f"cache; the resolved KV cache dtype is {kv_cache_dtype} "
+                    f"(cache_dtype={cache_config.cache_dtype!r}). The value is "
+                    f"derived from the bf16 per-token page, so electing "
+                    f"another KV dtype invalidates it and it must be "
+                    f"re-derived rather than reused."
+                )
+
+            # Both preconditions hold, so publish the block size. Nothing here
+            # sets cache_config.mamba_page_size_padded and nothing calls
+            # Platform._align_hybrid_block_size: the KV-cache specs report
+            # their pages from shapes and dtypes, and this path leaves that
+            # intact.
+            cache_config.block_size = hybrid_block_size
+            # update_block_size_for_backend runs LATER (from the executor, not
+            # from VllmConfig.__post_init__) and hard-sets 32 unless this latch
+            # is set, which would silently undo the line above before a single
+            # block is allocated. Setting the latch here is what makes the
+            # resolved value reach the allocator; that method itself is
+            # unchanged.
+            cache_config.user_specified_block_size = True
+            logger.info(
+                "Hybrid KDA/DSA KV cache enabled: block_size=%d "
+                "(tensor_parallel_size=%d, kv_cache_dtype=%s)",
+                hybrid_block_size,
+                tp_size,
+                kv_cache_dtype,
+            )
+
         # Component DP on dense models needs the MoE/DP engine path to
         # preserve data_parallel_size across engine core subprocesses.
         if cls._has_neuron_component_dp(vllm_config):
