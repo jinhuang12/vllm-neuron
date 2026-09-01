@@ -203,7 +203,7 @@ def test_kv_spec_patch_is_live_after_importing_the_plugin():
     )
     assert kv_spec_patch._bound is True, (
         "the patch is wired but not bound: in THIS import order the eager path "
-        "should have rebound the attribute without needing the audit hook"
+        "should have rebound the attribute without needing the deferral"
     )
     installed = getattr(_kv_cache_utils(), TARGET_ATTR)
     assert installed is kv_spec_patch._unify_kv_cache_spec_page_size_widened, (
@@ -584,10 +584,22 @@ def test_e04_evidence_production_import_order_keeps_the_plugin_loadable():
     platform does not register AT ALL. Attempt 2 of this increment's acceptance
     passed 7/7 while that was true, because no item used the production order.
 
+    IT THEN CAUGHT A SECOND, QUIETER DEFECT. With the eager import replaced by
+    the audit-hook fallback the pin's patch inventory prescribes (porter rule 7),
+    the plugin loaded again -- and this item read ``APPLIED=True BOUND=False``:
+    wired, never bound, so the widening was INERT on the production path and
+    engine start would still have raised. CPython raises the ``import`` audit
+    event before the module body runs, so the hook can only bind on some later
+    import that happens to follow. ``increments/probe-018-loader-hook.py``
+    isolates that mechanism reading with a firing control.
+
     Import order is process-global, so this is measured in a CHILD PROCESS, on
-    ``-014``'s two-subprocess precedent. Three readings, all from the child's own
-    stdout: the plugin loaded, the attribute is the wrapper, and the wrapper's
-    ``__wrapped__`` is upstream's function.
+    ``-014``'s two-subprocess precedent. Four assertions, all from the child's
+    own stdout: the plugin loaded, the attribute is the wrapper, the wrapper's
+    ``__wrapped__`` is upstream's function, and the patch is both wired and
+    bound. ``DEFERRED`` is RECORDED, never asserted: it says which of the two
+    routes production took, and asserting it would false-fire the day upstream's
+    circular import goes away and the eager route starts working.
     """
     import subprocess
 
@@ -612,6 +624,8 @@ def test_e04_evidence_production_import_order_keeps_the_plugin_loadable():
         import vllm_neuron.vllm.patches.kv_spec_patch as p
         print("APPLIED=%s" % p._applied)
         print("BOUND=%s" % p._bound)
+        # Recorded, not asserted: which route bound the wrapper.
+        print("DEFERRED=%s" % p._deferred)
         """
     )
 
@@ -655,5 +669,6 @@ def test_e04_evidence_production_import_order_keeps_the_plugin_loadable():
     )
     assert readings.get("BOUND") == "True", (
         "the patch was wired but never bound in the production order, so the "
-        f"deferred audit hook did not fire: {readings}"
+        "widening is inert there and engine start would still raise; the "
+        f"deferred install never ran: {readings}"
     )

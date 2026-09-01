@@ -55,8 +55,9 @@ which is what makes a single module-attribute rebinding sufficient.
 
 The *binding moment* is not always import time, and that is deliberate: when
 ``vllm`` is imported before ``vllm_neuron`` the target module is mid-initialisation
-and importing it here breaks plugin loading, so the rebinding defers to an audit
-hook. :func:`_install_deferred` records the measurement that forced this.
+and importing it here breaks plugin loading, so the rebinding defers until the
+import system finishes loading the target. :func:`_install_deferred` records the
+two measurements that forced that shape.
 """
 
 from __future__ import annotations
@@ -77,11 +78,17 @@ _PAD_FIELD = "page_size_padded"
 #
 # TWO flags, because wiring and binding can happen at different moments: when the
 # target module is not importable at plugin-registration time the wiring is done
-# (`_applied`) while the rebinding still waits on an audit hook (`_bound`). One
-# flag would either install a second hook or let a second wrapper stack.
+# (`_applied`) while the rebinding still waits on the import system (`_bound`).
+# One flag would either install a second hook or let a second wrapper stack.
 _applied = False
 _bound = False
 _original_unify = None
+
+# Diagnostic only, never a branch condition: True once the deferred route was
+# taken, so a test can RECORD which of the two routes production actually used
+# instead of inferring it. Asserting on it would false-fire the day upstream's
+# circular import goes away and the eager route starts working.
+_deferred = False
 
 
 class KvSpecPatchTargetError(RuntimeError):
@@ -178,7 +185,7 @@ def _unify_kv_cache_spec_page_size_widened(kv_cache_spec):
 
 
 def _install(kv_cache_utils) -> None:
-    """Rebind the module attribute. Called eagerly, or later from the audit hook."""
+    """Rebind the module attribute. Called eagerly, or later from the loader hook."""
     global _original_unify, _bound
 
     if _bound:
@@ -223,30 +230,83 @@ def _install_deferred() -> None:
     initialized module`` and ``Failed to load plugin neuron`` -- the Neuron
     platform not registering at all.
 
-    The remedy is the one the pin's own patch inventory prescribes for this
-    exact case (porter rule 7: "circular-import timing at registration -- only
-    the DCP patch has an audit-hook fallback -- copy that pattern if your patch
-    must run at registration"). The precedent is
-    ``vllm_neuron/vllm/platform.py:67-90``; this is the same shape, with the
-    same self-disabling flag, applied to a different target.
+    WHY NOT THE AUDIT-HOOK PATTERN THE INVENTORY PRESCRIBES. Porter rule 7 says
+    "circular-import timing at registration -- only the DCP patch has an
+    audit-hook fallback -- copy that pattern if your patch must run at
+    registration", and that was tried first, copied from
+    ``vllm_neuron/vllm/platform.py:67-90``. It was MEASURED not to bind: CPython
+    raises the ``import`` audit event BEFORE the module body runs, so at hook
+    time ``sys.modules`` does not yet hold the target and the hook does nothing;
+    it can only bind on some LATER import that happens to follow. The reading
+    was ``APPLIED=True BOUND=False`` with the attribute still upstream's.
+
+    So the deferral hangs off the import system itself rather than off an audit
+    event: a meta-path finder for exactly one module name, which delegates to
+    the real finder and wraps only its loader, so :func:`_install` runs the
+    moment the module body has finished executing. Deterministic, and it still
+    imports nothing eagerly. (This is a note for the lead about the inventory's
+    rule 7 and about the landed DCP patch, which appears to carry the same
+    latent hole; no landed code is changed here.)
     """
+    import importlib.abc
     import sys
 
-    def _audit_hook(event, args):
-        if _bound:
-            return
-        if event != "import":
-            return
-        if "vllm" not in str(args[0]):
-            return
-        module = sys.modules.get(_TARGET_MODULE)
-        if module is not None and hasattr(module, _TARGET_ATTR):
-            _install(module)
+    global _deferred
+    _deferred = True
 
-    sys.addaudithook(_audit_hook)
+    # It may already be loaded -- e.g. partially, which is how we got here. If
+    # the symbol is present, bind now; the finder would never fire for a module
+    # that is already in sys.modules.
+    already = sys.modules.get(_TARGET_MODULE)
+    if already is not None and hasattr(already, _TARGET_ATTR):
+        _install(already)
+        return
+
+    class _LoaderProxy(importlib.abc.Loader):
+        """Upstream's own loader, plus one call after the module body runs."""
+
+        def __init__(self, inner, finder):
+            self._inner = inner
+            self._finder = finder
+
+        def create_module(self, spec):
+            return self._inner.create_module(spec)
+
+        def exec_module(self, module):
+            # Upstream runs first and unchanged; if it raises, we install
+            # nothing and the import fails exactly as it would have.
+            self._inner.exec_module(module)
+            _install(module)
+            # One-shot: leave no finder behind on the hot import path.
+            try:
+                sys.meta_path.remove(self._finder)
+            except ValueError:
+                pass
+
+        def __getattr__(self, name):
+            # get_code, is_package, get_source, ... all stay upstream's.
+            return getattr(self._inner, name)
+
+    class _TargetFinder(importlib.abc.MetaPathFinder):
+        """Claims exactly one module name, then hands the work back upstream."""
+
+        def find_spec(self, fullname, path=None, target=None):
+            if _bound or fullname != _TARGET_MODULE:
+                return None
+            for finder in sys.meta_path:
+                if finder is self or not hasattr(finder, "find_spec"):
+                    continue
+                spec = finder.find_spec(fullname, path, target)
+                if spec is not None and spec.loader is not None:
+                    spec.loader = _LoaderProxy(spec.loader, self)
+                    return spec
+            # Nobody can load it; say so and let the real machinery raise.
+            return None
+
+    sys.meta_path.insert(0, _TargetFinder())
     logger.debug(
-        "Neuron: KV-spec widening deferred to an audit hook; %s was not "
-        "importable at plugin-registration time (circular import).",
+        "Neuron: KV-spec widening deferred to a meta-path loader hook; %s was "
+        "not importable at plugin-registration time (circular import).",
         _TARGET_MODULE,
     )
 
