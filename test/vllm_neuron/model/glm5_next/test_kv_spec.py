@@ -31,14 +31,25 @@ WHAT C03 DOES AND DOES NOT CERTIFY -- STATED, NOT GLOSSED
 ---------------------------------------------------------
 C03 names no field and no value where C02 names both, so it is adjudicable
 only by **complement**: the 34 are the entries that are not the MLA/DSA 11,
-and by C01's total the count is arithmetic. A KDA layer holds a **recurrent
-state**, and the pin's ``LayerSpec`` has no vocabulary for one -- adding those
-fields is ``inc-glm53f-015``'s declared surface at M1. So the 34 entries are
-certified as *not MLA/DSA, present, and carrying a non-``None`` dtype*; they
-are **not** certified as describing a correct KDA cache, because no vocabulary
-for that exists at this milestone. That is a coverage limit, recorded here and
-measured by :func:`test_kv_spec_the_pin_dataclass_is_not_widened`, which also
-proves this increment did not pre-empt ``-015`` by widening ``kv_cache.py``.
+and by C01's total the count is arithmetic. So the 34 entries are certified as
+*not MLA/DSA, present, and carrying a non-``None`` dtype*.
+
+They are still **not** certified as describing a correct KDA cache. That
+conclusion is unchanged; only its ground has moved. When this file landed the
+ground was that the pin's ``LayerSpec`` had no vocabulary for a recurrent state
+at all -- **history now**, true at ``-013`` and ended by ``inc-glm53f-015``,
+which appended the four KDA state fields. The ground today is that the
+vocabulary exists but **nothing in this file populates or certifies its
+contents**: filling those fields per layer is ``-016``'s and ``-017``'s work,
+so the coverage limit survives the widening instead of evaporating with it.
+C03's **34** does not move -- the widening is additive with ``None`` defaults,
+so no entry's geometry split, ``head_size`` or ``dtype`` changes.
+
+:func:`test_kv_spec_the_pin_dataclass_is_not_widened` is **superseded** by that
+increment and now measures the opposite of its own name: the pin's six survive
+as an in-order PREFIX at arity ten, with ``-015``'s four declared fields as the
+tail. The name is kept byte-unchanged because it is the item id this file's
+landed acceptance collects.
 
 PARAMETER NAMES ARE DERIVED, NOT CHOSEN
 ---------------------------------------
@@ -213,17 +224,36 @@ def test_kv_spec_fixture_is_the_pinned_forty_five_layer_config(raw: dict) -> Non
 
 
 def test_kv_spec_the_pin_dataclass_is_not_widened() -> None:
-    """``kv_cache.py`` carries the pin's SIX fields and nothing more.
+    """SUPERSEDED by ``inc-glm53f-015``: the pin's SIX survive as a PREFIX.
 
-    Two things at once. It measures the limit C03's complement reading
-    carries -- there is no recurrent-state field for a KDA entry to fill --
-    and it proves this increment did not widen ``LayerSpec``, which is
-    ``inc-glm53f-015``'s declared surface at M1 and whose own acceptance
-    asserts the 6-field construction still works with zero signature breaks.
+    This guard's landed docstring named its own retirer -- *"it proves this
+    increment did not widen ``LayerSpec``, which is ``inc-glm53f-015``'s
+    declared surface at M1"* -- and that increment has now landed, so it
+    retires the guard inside its own changeset rather than leave a landed test
+    red. What the guard exists to catch is KEPT and gains a count: a rename, a
+    reorder or a removal of the pin's six still fails the prefix assertion.
+    The other half of the old reading -- *"there is no recurrent-state field
+    for a KDA entry to fill"* -- is what ``-015`` makes false BY DESIGN, so it
+    is INVERTED into two positive counted statements (arity ten, and the four
+    declared KDA state fields as the tail in order) rather than deleted. The
+    6-argument construction below is ``-015``'s own "0 signature breaks"
+    conjunct, preserved here as landed bytes.
+
+    The function NAME is deliberately byte-unchanged: it is the item id this
+    file's landed ``-013`` acceptance command collects, and renaming it would
+    silently change that collected set to buy a more accurate label.
     """
     from dataclasses import fields
 
-    assert tuple(f.name for f in fields(LayerSpec)) == PIN_LAYER_SPEC_FIELDS
+    names = tuple(f.name for f in fields(LayerSpec))
+    assert names[:6] == PIN_LAYER_SPEC_FIELDS
+    assert len(names) == 10
+    assert names[6:] == (
+        "kda_conv_state_shape",
+        "kda_recurrent_state_shape",
+        "kda_conv_state_dtype",
+        "kda_recurrent_state_dtype",
+    )
     assert tuple(f.name for f in fields(KVSpec)) == ("layers",)
 
     # The pin's exact 6-argument positional form still constructs.
