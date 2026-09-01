@@ -418,6 +418,82 @@ class Glm5NextRoutedExperts(nn.Module):
         """
         return self.expert_partition.local_expert_indices(rank)
 
+    # ── router call site -- D14 owner: ``inc-glm53f-032`` ────────────────
+    #
+    # SCOPE. This section adds ONE method and edits no line above it.
+    # ``__init__`` and ``local_expert_indices`` are ``inc-glm53f-031``'s landed
+    # code and ``forward`` is ``inc-glm53f-013``'s stub; all three stay
+    # byte-identical, so nothing ``-031``'s recorded acceptance asserts can move.
+    #
+    # WHY THE CONFIG IS AN ARGUMENT RATHER THAN STATE. The routing
+    # hyperparameters live on ``Glm5NextTextConfig``, and ``-031``'s ``__init__``
+    # does not retain it. Adding a field would edit that landed ``__init__``, so
+    # the config is threaded in at the call instead -- the smaller change, and
+    # the one D14's section-ownership rule permits.
+    #
+    # WHAT THIS SITE DOES NOT DO. It returns GLOBAL expert indices over all
+    # ``n_routed_experts``, exactly as the checkpoint's router does. Mapping
+    # those onto this rank's ``expert_partition`` slice is the DISPATCH step,
+    # and it belongs to the block-quant call site (``-027``) and the
+    # shared-expert path (``-033``). Doing it here would put two owners on one
+    # behaviour.
+    #
+    # ``rms_norm_eps`` IS ABSENT, MEASURED NOT ASSUMED. Neither
+    # ``Glm5NextTextConfig`` nor the campaign's pinned
+    # ``fixtures/config.json`` carries an ``rms_norm_eps``, so the substrate's
+    # own default (``rmsnorm_router_topk_tkg``'s ``eps=1e-6``) is the only value
+    # available and is surfaced as a parameter rather than buried.
+
+    def route_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        gamma: torch.Tensor,
+        text_config: Glm5NextTextConfig,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Route ``[B, S, H]`` tokens to the top-``k`` experts with ``noaux_tc``.
+
+        Args:
+            hidden_states: ``[B, S, H]`` pre-norm decoder activations.
+            gamma: ``[H]`` or ``[1, H]`` router RMSNorm weights.
+            text_config: the decoder config the routing hyperparameters live on.
+            eps: RMSNorm epsilon; see the section note above.
+
+        Returns:
+            ``(router_logits [T, E], expert_index [T, k] int32,
+            expert_affinities [T, E] float32)``. ``expert_affinities`` is the
+            scattered form the downstream MoE consumes: the gate weight at each
+            selected expert's column, zero elsewhere.
+
+        The seam is entered with ``correction_bias=self.router_bias``, and that
+        parameter is ``mlp.gate.e_score_correction_bias``
+        (``weight_loaders_fp8.py:463-467``) -- the ``noaux_tc`` correction bias,
+        NOT a router projection bias. The seam's own signature keeps the two
+        apart by name, because adding this tensor to the logits instead of to
+        the sigmoid scores would compute a different router that no shape check
+        could catch.
+        """
+        # Function-local import, following the landed ``inc-glm53f-023`` and
+        # ``-031`` precedent in this file: this file's module import block is
+        # ``-013``'s D14 section.
+        from vllm_neuron.functional.moe.router import (
+            noaux_tc_rmsnorm_router_topk,
+        )
+
+        logits, expert_index, expert_affinities, _substrate_index = (
+            noaux_tc_rmsnorm_router_topk(
+                hidden_states=hidden_states,
+                gamma=gamma,
+                router_weights=self.router_weight,
+                correction_bias=self.router_bias,
+                top_k=int(text_config.num_experts_per_tok),
+                eps=eps,
+                norm_topk_prob=bool(text_config.norm_topk_prob),
+                routed_scaling_factor=float(text_config.routed_scaling_factor),
+            )
+        )
+        return logits, expert_index, expert_affinities
+
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(
             "Glm5NextRoutedExperts.forward is a stub created by "
