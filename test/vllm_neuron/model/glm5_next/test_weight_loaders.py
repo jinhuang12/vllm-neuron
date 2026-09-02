@@ -1729,10 +1729,19 @@ def test_fp8_downscale_quantization_spec_parses_the_block_config() -> None:
     assert spec.activation_scheme == "dynamic"
     assert spec.is_block_quantized
     # The lookup is uniform over both call shapes, in-block and outside.
-    assert (
-        spec.get_scheme(0, "linear_attn.out_proj") is QuantScheme.FP8_BLOCK_DYNAMIC
-    )
-    assert spec.get_scheme(None, "lm_head") is QuantScheme.FP8_BLOCK_DYNAMIC
+    #
+    # `inc-glm53f-079` SUPERSEDED the two assertions that stood here. They said
+    # `get_scheme(0, "linear_attn.out_proj")` and `get_scheme(None, "lm_head")`
+    # were both block-FP8. Both are false against the real checkpoint --
+    # `lm_head` is skip-listed and has no scale key, and `linear_attn.out_proj`
+    # is not a name this checkpoint contains at all -- and the standing answers
+    # for those call shapes are that increment's conjunct (c), measured against
+    # the checkpoint. What is still this item's to say is that a spec parsed from
+    # a block config carrying NO skip list has an empty one, and that both call
+    # shapes then get `linear_scheme`.
+    assert spec.modules_to_not_convert == ()
+    assert spec.get_scheme(0, "model.layers.0.self_attn.o_proj") is spec.linear_scheme
+    assert spec.get_scheme(None, "lm_head") is spec.linear_scheme
 
     # An unquantized checkpoint is None, not a NONE-scheme spec.
     assert QuantizationSpec.from_hf_quantization_config(None) is None
@@ -1780,3 +1789,416 @@ def test_fp8_downscale_reports_the_measured_readings(
         report_results_path=str(_FP8_RESULTS_PATH),
     )
     assert _FP8_RESULTS_PATH.exists()
+
+
+# =========================================================================== #
+# inc-glm53f-079 -- WP6 REPAIR: the checkpoint's FP8 skip list is honoured
+# =========================================================================== #
+#
+# WHY THIS SECTION IS APPENDED AT THE END
+# ---------------------------------------
+# `inc-glm53f-079` is the FOURTH writer on this file (plan section 11 row A.1,
+# partitioned by pytest selection and by concern: `-011` owns the shard index and
+# the key map's shape, `-078` the checkpoint-key namespace and the family names,
+# `-012` the `-k fp8_downscale` numerics, and this increment whether a family asks
+# for a scale companion AT ALL). It appends rather than inserts, so it moves no
+# landed line of the three sections above it. Every item below carries `skeleton`
+# and none carries `fp8_downscale`, so the two selections stay disjoint.
+#
+# WHAT IS BEING SETTLED
+# ---------------------
+# The checkpoint names 1,509 modules to keep in BF16 and, before this increment,
+# the plugin read none of them: `config.py` lifted three of the five
+# `quantization_config` fields, and `QuantizationSpec.get_scheme` discarded both
+# of its arguments and answered "block-FP8" for `lm_head`, for the KDA
+# projections and for the DSA indexer alike. The four items below are the four
+# counted conjuncts of the declared acceptance, ONE ITEM EACH, NO PARAMETRIZE
+# (section 6 rule 6), and every denominator is derived from a fixture.
+#
+# THE AGREEMENT IS BETWEEN TWO INSTRUMENTS, WHICH IS WHAT MAKES IT FALSIFIABLE
+# ---------------------------------------------------------------------------
+# Conjunct (b) compares the checkpoint's DECLARED policy -- the 1,509-entry list
+# in `hf-config.json` -- against the checkpoint's ACTUAL scale keys -- presence
+# or absence of a `weight_scale_inv` companion in the 76,108-key index. Neither
+# side is computed from the other, both are vendor files this directory pins by
+# digest (`-078` conjunct (h)), and a predicate that answered one way for
+# everything fails on one arm or the other.
+#
+# THE TWO NAMESPACES (`-078`)
+# ---------------------------
+# The skip entries are MODULE-namespace (`model.layers.0.self_attn.q_proj`); the
+# index keys are CHECKPOINT-namespace (`model.language_model.layers.0...`). The
+# fork's substring rule resolves one against the other only because
+# `language_model` ends in the literal `model`. That alignment is recorded rather
+# than designed, so conjunct (c) asserts the qualified spellings out loud instead
+# of leaving the match implicit.
+
+from vllm_neuron.model.glm5_next.quantization import keeps_bf16
+
+# --------------------------------------------------------------------------- #
+# Declared values. Each is CROSS-CHECKED against a number derived from a
+# fixture, never used as the expectation on its own.
+# --------------------------------------------------------------------------- #
+
+#: The five `quantization_config` fields the published config carries, and the
+#: two the adapter used to drop.
+C079_DECLARED_QUANT_CONFIG_KEYS = 5
+C079_DECLARED_SKIP_ENTRIES = 1509
+C079_DECLARED_FMT = "e4m3"
+
+#: Conjunct (b)'s population and its two non-vacuity arms (D1.5).
+C079_DECLARED_BASE_TENSORS = 37534
+C079_DECLARED_QUANTIZED = 36467
+C079_DECLARED_UNQUANTIZED = 1067
+
+#: How the checkpoint spells a scale companion: the base key plus this tail.
+#: Appending a tail rather than substituting a leaf makes the rule TOTAL over
+#: every base tensor -- a parameter that is not a `.weight` (`A_log`, `dt_bias`,
+#: the six hyper-connection tensors) gets a name the index cannot contain, which
+#: is the right answer, since it has no scale companion.
+C079_SCALE_COMPANION_TAIL = "_scale_inv"
+
+#: Conjunct (d)'s firing control. `shared_experts` is a token the real skip list
+#: does NOT carry, so adding it makes the suppressed count move; the number of
+#: requests it removes is derived from the config below, not typed in here.
+C079_SYNTHETIC_SKIP_TOKEN = "shared_experts"
+C079_DECLARED_SYNTHETIC_DROP = 126
+
+
+@pytest.fixture(scope="module")
+def real_raw_config() -> dict[str, Any]:
+    """The published config, parsed. `-078` landed the file; this reads it."""
+    return json.loads(REAL_CONFIG_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def real_quant_config(real_raw_config) -> dict[str, Any]:
+    """The published `quantization_config` block, verbatim."""
+    return real_raw_config["quantization_config"]
+
+
+@pytest.fixture(scope="module")
+def real_config() -> Glm5NextConfig:
+    """The config the REAL adapter produces from the REAL published config.
+
+    `Glm5NextConfig.from_configs` on a fresh parse -- the same entry point
+    `test_config.py` drives -- so conjunct (a) measures the adapter rather than a
+    dict this file assembled. Fresh parse, so nothing the adapter touches can
+    reach the expectation side of an assertion.
+    """
+    return Glm5NextConfig.from_configs(json.loads(REAL_CONFIG_PATH.read_text()))
+
+
+@pytest.fixture(scope="module")
+def real_spec(real_config) -> QuantizationSpec:
+    """The spec built through the whole chain: file -> config -> spec.
+
+    `from_model_config` is the bridge the increment taught to forward the fourth
+    name, so driving it here means a bridge that forwarded three of four would
+    fail these items rather than pass them with an empty skip list.
+    """
+    spec = QuantizationSpec.from_model_config(real_config)
+    assert spec is not None
+    return spec
+
+
+@pytest.fixture(scope="module")
+def real_base_tensors(real_in_scope) -> list[str]:
+    """The in-scope BASE tensors: every in-scope key that is not a scale key."""
+    return sorted(
+        key for key in real_in_scope if not key.endswith(f".{SCALE_SUFFIX}")
+    )
+
+
+def _c079_layer_index(key: str) -> int | None:
+    """The layer number inside a key, or `None` for a key outside any block."""
+    parts = key.split(".")
+    if "layers" in parts:
+        position = parts.index("layers") + 1
+        if position < len(parts) and parts[position].isdigit():
+            return int(parts[position])
+    return None
+
+
+def _c079_companion(key: str) -> str:
+    """The scale key the checkpoint would carry for `key`, spelled its way."""
+    return key + C079_SCALE_COMPANION_TAIL
+
+
+def _c079_score(
+    spec: QuantizationSpec, base_keys: list[str], index_keys: frozenset[str]
+) -> dict[str, Any]:
+    """Score one spec against the index over every base tensor.
+
+    One pass, four counters: agreements and disagreements of the two
+    independently produced answers, and the population split that keeps both
+    arms of the comparison non-empty.
+    """
+    agreements = disagreements = quantized = unquantized = 0
+    examples: list[str] = []
+    for key in base_keys:
+        has_scale = _c079_companion(key) in index_keys
+        unquantised = spec.get_scheme(_c079_layer_index(key), key) is QuantScheme.NONE
+        if unquantised == (not has_scale):
+            agreements += 1
+        else:
+            disagreements += 1
+            if len(examples) < 5:
+                examples.append(key)
+        quantized += has_scale
+        unquantized += not has_scale
+    return {
+        "agreements": agreements,
+        "disagreements": disagreements,
+        "quantized": quantized,
+        "unquantized": unquantized,
+        "examples": examples,
+    }
+
+
+def _c079_requested_scales(mappings: dict[str, str | list[str]]) -> list[str]:
+    """Every `weight_scale_inv` key the mapping asks the checkpoint for."""
+    return sorted(
+        {
+            key
+            for value in mappings.values()
+            for key in (value if isinstance(value, list) else [value])
+            if key.endswith(f".{SCALE_SUFFIX}")
+        }
+    )
+
+
+def _c079_base_of(scale_key: str) -> str:
+    """The base tensor a requested scale key belongs to."""
+    assert scale_key.endswith(C079_SCALE_COMPANION_TAIL)
+    return scale_key[: -len(C079_SCALE_COMPANION_TAIL)]
+
+
+def test_skeleton_config_lifts_the_skip_list_and_the_fp8_format(
+    real_quant_config, real_config
+) -> None:
+    """(a) 5/5: the adapter lifts all five `quantization_config` fields.
+
+    The two it used to drop are `modules_to_not_convert` and `fmt`. Both
+    expectations are READ OFF the published config rather than typed in: the
+    entry count is `len()` of the fixture's own list, and the format string is
+    the fixture's own value. The declared numbers are asserted beside them as a
+    cross-check that this is the file the plan measured -- legitimate only
+    because `-078` pins the fixture by the vendor's digest.
+    """
+    assert sorted(real_quant_config) == [
+        "activation_scheme",
+        "fmt",
+        "modules_to_not_convert",
+        "quant_method",
+        "weight_block_size",
+    ]
+    assert len(real_quant_config) == C079_DECLARED_QUANT_CONFIG_KEYS
+
+    declared_skip = real_quant_config["modules_to_not_convert"]
+    assert len(declared_skip) == C079_DECLARED_SKIP_ENTRIES
+
+    # The lift loses no entry and reorders none.
+    assert real_config.modules_to_not_convert == declared_skip
+    assert real_config.fmt == real_quant_config["fmt"] == C079_DECLARED_FMT
+
+    # The three fields that were already lifted still are.
+    assert real_config.quant_method == real_quant_config["quant_method"]
+    assert real_config.activation_scheme == real_quant_config["activation_scheme"]
+    assert real_config.weight_block_size == real_quant_config["weight_block_size"]
+
+    # The list's composition, measured, because `get_scheme` documents that a
+    # bare module name cannot match a qualified entry and conjunct (c) asserts
+    # it. Nine entries are bare tokens; the other 1,500 are dotted paths.
+    bare = sorted(entry for entry in declared_skip if "." not in entry)
+    assert len(bare) == 9
+    assert "lm_head" in bare
+    assert len(declared_skip) - len(bare) == 1500
+
+    _record(
+        c079a_quant_config_keys=sorted(real_quant_config),
+        c079a_skip_entries=len(declared_skip),
+        c079a_fmt=real_config.fmt,
+        c079a_bare_entries=bare,
+        c079a_qualified_entries=len(declared_skip) - len(bare),
+    )
+
+
+def test_skeleton_skip_list_agrees_with_the_index_scale_keys(
+    real_spec, real_base_tensors, real_in_scope, real_quant_config
+) -> None:
+    """(b) 37,534/37,534: the declared policy and the actual scale keys agree.
+
+    `get_scheme` returns the unquantized scheme for a base tensor exactly when
+    that tensor has no scale companion in the index. The left side is the
+    1,509-entry list in the config; the right side is a key census over the
+    76,108-key index. Neither is derived from the other.
+
+    D1.5 CONTROL, IN THIS ITEM: the same census against a spec built from the
+    same block with the skip list REMOVED. The disagreement counter has to
+    become non-zero -- it becomes 1,067, one per BF16 tensor -- or the agreement
+    above would be true of any predicate at all.
+    """
+    # The two spellings of one suffix, pinned together so neither can drift.
+    assert _c079_companion("m.weight") == f"m.{SCALE_SUFFIX}"
+
+    index_keys = frozenset(real_in_scope)
+    scored = _c079_score(real_spec, real_base_tensors, index_keys)
+
+    assert scored["disagreements"] == 0, scored["examples"]
+    assert scored["agreements"] == len(real_base_tensors)
+    assert len(real_base_tensors) == C079_DECLARED_BASE_TENSORS
+    assert scored["quantized"] == C079_DECLARED_QUANTIZED
+    assert scored["unquantized"] == C079_DECLARED_UNQUANTIZED
+    assert scored["quantized"] + scored["unquantized"] == len(real_base_tensors)
+    assert len(real_spec.modules_to_not_convert) == C079_DECLARED_SKIP_ENTRIES
+
+    blind_spec = QuantizationSpec.from_hf_quantization_config(
+        {
+            key: value
+            for key, value in real_quant_config.items()
+            if key != "modules_to_not_convert"
+        }
+    )
+    assert blind_spec is not None
+    assert blind_spec.modules_to_not_convert == ()
+    blind = _c079_score(blind_spec, real_base_tensors, index_keys)
+    assert blind["disagreements"] == C079_DECLARED_UNQUANTIZED > 0
+    assert blind["agreements"] == C079_DECLARED_QUANTIZED
+
+    _record(
+        c079b_base_tensors=len(real_base_tensors),
+        c079b_agreements=scored["agreements"],
+        c079b_disagreements=scored["disagreements"],
+        c079b_quantized=scored["quantized"],
+        c079b_unquantized=scored["unquantized"],
+        c079b_control_disagreements=blind["disagreements"],
+        c079b_control_agreements=blind["agreements"],
+    )
+
+
+def test_skeleton_three_named_cases_pin_the_scheme(
+    real_spec, real_text_config, real_in_scope
+) -> None:
+    """(c) 3/3: two projections the checkpoint keeps in BF16, and one it does not.
+
+    The third case is why this is a discrimination and not a refusal: a
+    predicate that answered "unquantized" for every name would fail on
+    `q_a_proj`. Each case is also checked against the index, so the expected
+    answer traces to the checkpoint rather than to this docstring.
+
+    THE BLOCK SPELLS THESE CASES LEAF-STYLE (`layers.0.self_attn.q_proj`) AND
+    THAT SPELLING MATCHES NO ENTRY. The 1,500 qualified entries are dotted paths
+    under `model.`, so a bare name cannot be a substring of one; the item
+    asserts every case in both qualified namespaces and asserts the bare
+    spelling's answer out loud rather than leaving the requirement implicit.
+    """
+    cases = (
+        ("layers.0.self_attn.q_proj", QuantScheme.NONE, KDA_LAYER_TYPE),
+        ("layers.3.self_attn.kv_b_proj", QuantScheme.NONE, DSA_LAYER_TYPE),
+        (
+            "layers.3.self_attn.q_a_proj",
+            QuantScheme.FP8_BLOCK_DYNAMIC,
+            DSA_LAYER_TYPE,
+        ),
+    )
+    rows = []
+    for short, want, family in cases:
+        layer = int(short.split(".")[1])
+        assert real_text_config.layer_types[layer] == family
+
+        module_ns = f"model.{short}"
+        checkpoint_ns = f"model.language_model.{short}"
+        for name in (module_ns, checkpoint_ns, f"{checkpoint_ns}.weight"):
+            got = real_spec.get_scheme(layer, name)
+            assert got is want, f"{name}: {got.name} != {want.name}"
+
+        # The index's own answer for the same projection.
+        has_scale = _c079_companion(f"{checkpoint_ns}.weight") in real_in_scope
+        assert has_scale == (want is QuantScheme.FP8_BLOCK_DYNAMIC)
+
+        # A bare name matches no qualified entry, so it reads as quantized.
+        assert real_spec.get_scheme(layer, short) is real_spec.linear_scheme
+
+        rows.append(
+            {
+                "case": short,
+                "layer_type": family,
+                "scheme": want.value,
+                "index_has_scale_key": has_scale,
+            }
+        )
+
+    assert len(rows) == 3
+    assert len({row["scheme"] for row in rows}) == 2
+    _record(c079c_cases=rows, c079c_named_cases=len(rows))
+
+
+def test_skeleton_no_scale_companion_is_requested_for_a_bf16_tensor(
+    real_text_config, real_quant_config, real_in_scope
+) -> None:
+    """(d) 2/2: no scale request for a BF16 tensor, and none the index lacks.
+
+    Two censuses over the map the real skip list produces: the number of
+    requested scale keys whose base tensor the skip list keeps in BF16, and the
+    number of requested scale keys the index does not contain. Both are 0, and
+    the 36,467 requests that remain are exactly the index's own scale-key
+    population -- the non-vacuity arm.
+
+    D1.5 CONTROL, IN THIS ITEM, AND WHY IT IS SYNTHETIC. The suppression is
+    measured with a token the real list does not carry, `shared_experts`, and the
+    count it removes is derived from the config: one scale request per shared
+    expert leaf on each MoE layer. Against the real list alone the counter cannot
+    fire, because `-078` already made every BF16 family structurally unquantised
+    in this builder -- so switching the real list off changes no request, and a
+    control resting on it would prove nothing about this increment's predicate.
+    """
+    skip = tuple(real_quant_config["modules_to_not_convert"])
+    honoured = build_weight_mappings(real_text_config, modules_to_not_convert=skip)
+    requested = _c079_requested_scales(honoured)
+
+    kept_bf16 = [key for key in requested if keeps_bf16(_c079_base_of(key), skip)]
+    assert kept_bf16 == []
+    # The predicate's other spelling -- the module name without the parameter
+    # leaf -- so the two forms cannot disagree unnoticed.
+    assert [
+        key
+        for key in requested
+        if keeps_bf16(_c079_base_of(key).removesuffix(".weight"), skip)
+    ] == []
+
+    absent = [key for key in requested if key not in real_in_scope]
+    assert absent == []
+
+    index_scales = {
+        key for key in real_in_scope if key.endswith(f".{SCALE_SUFFIX}")
+    }
+    assert len(requested) == len(index_scales) == C079_DECLARED_QUANTIZED
+
+    probe = skip + (C079_SYNTHETIC_SKIP_TOKEN,)
+    moe_layers = (
+        real_text_config.num_hidden_layers - real_text_config.first_k_dense_replace
+    )
+    shared_leaves = 3
+    unsuppressed = _c079_requested_scales(
+        build_weight_mappings(real_text_config, modules_to_not_convert=())
+    )
+    fires = [key for key in unsuppressed if keeps_bf16(_c079_base_of(key), probe)]
+    assert len(fires) == moe_layers * shared_leaves
+    assert len(fires) == C079_DECLARED_SYNTHETIC_DROP > 0
+
+    suppressed = _c079_requested_scales(
+        build_weight_mappings(real_text_config, modules_to_not_convert=probe)
+    )
+    assert [key for key in suppressed if keeps_bf16(_c079_base_of(key), probe)] == []
+    assert len(suppressed) == len(requested) - len(fires)
+
+    _record(
+        c079d_scale_requests=len(requested),
+        c079d_index_scale_keys=len(index_scales),
+        c079d_requests_for_a_bf16_tensor=len(kept_bf16),
+        c079d_requested_but_absent=len(absent),
+        c079d_control_fires=len(fires),
+        c079d_control_suppressed_requests=len(suppressed),
+        c079d_control_token=C079_SYNTHETIC_SKIP_TOKEN,
+    )

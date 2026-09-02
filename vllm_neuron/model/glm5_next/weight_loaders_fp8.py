@@ -44,6 +44,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from .config import DSA_LAYER_TYPE, Glm5NextTextConfig
+from .quantization import keeps_bf16
 
 #: The HF shard-index filename. Read for its ``weight_map`` object; see
 #: :meth:`Glm5NextShardIndex.from_weight_map` for why loading it is lossy.
@@ -267,15 +268,32 @@ class Glm5NextShardIndex:
 # --------------------------------------------------------------------------- #
 
 
-def _quantised(prefix: str, leaf: str, *, quantised: bool) -> list[str]:
+def _quantised(
+    prefix: str,
+    leaf: str,
+    *,
+    quantised: bool,
+    skip: Sequence[str] = (),
+) -> list[str]:
     """Checkpoint key(s) for one projection: the weight, plus its FP8 scale.
 
     A blockwise-FP8 projection contributes **two** checkpoint keys, and both
     have to be referenced or the scale key shows up as unmatched. Norms, biases
     and embeddings are not quantised in this checkpoint and contribute one.
+
+    **THE SCALE-SUPPRESSION PREDICATE** (``inc-glm53f-079``). ``skip`` is the
+    checkpoint's own ``modules_to_not_convert``, and a tensor it names gets NO
+    scale companion however ``quantised`` is set: the checkpoint keeps that
+    tensor in BF16, so no scale key exists to ask for and asking makes the
+    parameter unmatched. The predicate is :func:`keeps_bf16`, the fork's own,
+    applied to the tensor's checkpoint name -- this function invents no rule of
+    its own and holds no per-family table.
+
+    An empty ``skip`` suppresses nothing, so every caller that passed no skip
+    list keeps the behaviour it had before this increment.
     """
     weight = f"{prefix}.{leaf}.weight"
-    if not quantised:
+    if not quantised or keeps_bf16(f"{prefix}.{leaf}", skip):
         return [weight]
     return [weight, f"{prefix}.{leaf}.{FP8_SCALE_SUFFIX}"]
 
@@ -303,6 +321,7 @@ def build_weight_mappings(
     text_config: Glm5NextTextConfig,
     *,
     quantised: bool = True,
+    modules_to_not_convert: Sequence[str] = (),
 ) -> dict[str, str | list[str]]:
     """Build ``{param_name: checkpoint_key | [checkpoint_key, ...]}``.
 
@@ -323,11 +342,22 @@ def build_weight_mappings(
     ``language_model.`` because that is what the published index says. Keeping
     one string for both is the defect this increment repairs.
 
+    **THE CHECKPOINT'S SKIP LIST DECIDES WHICH PROJECTIONS CARRY A SCALE**
+    (``inc-glm53f-079``). Pass ``modules_to_not_convert`` and no tensor the
+    checkpoint keeps in BF16 gets a ``weight_scale_inv`` companion asked for.
+    The families that carry no scale at all are still declared structurally by
+    their own adders, which ``inc-glm53f-078`` measured off the index; the two
+    agree on this checkpoint, and each is a check on the other.
+
     Args:
         text_config: drives every count -- layer schedule, ``first_k_dense_replace``,
             ``n_routed_experts``, ``n_shared_experts``, ``tie_word_embeddings``.
-        quantised: when True (the checkpoint's own case) every projection also
-            references its ``weight_scale_inv`` companion.
+        quantised: when True (the checkpoint's own case) a projection also
+            references its ``weight_scale_inv`` companion -- unless the skip
+            list keeps it in BF16.
+        modules_to_not_convert: the checkpoint's own BF16 skip list, as
+            ``Glm5NextConfig`` lifts it. Empty suppresses nothing, which is the
+            behaviour before this increment.
 
     Returns:
         The mapping. Parameter names are this half's declaration and settle
@@ -336,6 +366,7 @@ def build_weight_mappings(
     """
     mappings: dict[str, str | list[str]] = {}
     layer_types = list(text_config.layer_types or ())
+    skip = tuple(modules_to_not_convert or ())
 
     # -- outside the layer stack (GROUNDED) --------------------------------- #
     # The two namespaces part company here: the parameter names are the module
@@ -371,18 +402,25 @@ def build_weight_mappings(
 
         if layer_type == DSA_LAYER_TYPE:
             _add_dsa_attention(
-                mappings, ckpt_prefix, param_prefix, quantised=quantised
+                mappings, ckpt_prefix, param_prefix, quantised=quantised, skip=skip
             )
         else:
             _add_kda_attention(
-                mappings, ckpt_prefix, param_prefix, quantised=quantised
+                mappings, ckpt_prefix, param_prefix, quantised=quantised, skip=skip
             )
 
         if layer_id < text_config.first_k_dense_replace:
-            _add_dense_mlp(mappings, ckpt_prefix, param_prefix, quantised=quantised)
+            _add_dense_mlp(
+                mappings, ckpt_prefix, param_prefix, quantised=quantised, skip=skip
+            )
         else:
             _add_moe_mlp(
-                mappings, ckpt_prefix, param_prefix, text_config, quantised=quantised
+                mappings,
+                ckpt_prefix,
+                param_prefix,
+                text_config,
+                quantised=quantised,
+                skip=skip,
             )
 
     return mappings
@@ -457,6 +495,7 @@ def _add_dsa_attention(
     param_prefix: str,
     *,
     quantised: bool,
+    skip: Sequence[str] = (),
 ) -> None:
     """MLA on the ``deepseek_sparse_attention`` half, plus the DSA indexer.
 
@@ -479,7 +518,7 @@ def _add_dsa_attention(
         _add(
             mappings,
             f"{param_attn}.{leaf}_weight",
-            _quantised(ckpt_attn, leaf, quantised=quantised),
+            _quantised(ckpt_attn, leaf, quantised=quantised, skip=skip),
         )
     # kv_b_proj is a real projection with no scale in this checkpoint, so it sits
     # here rather than in the loop above. Not an oversight -- a reading.
@@ -515,6 +554,7 @@ def _add_kda_attention(
     param_prefix: str,
     *,
     quantised: bool,
+    skip: Sequence[str] = (),
 ) -> None:
     """The ``linear_attention`` (KDA, gated-delta) half.
 
@@ -526,11 +566,17 @@ def _add_kda_attention(
     per-projection convolutions, an output norm, an output projection and two
     bare state tensors. There is no ``conv1d.bias`` anywhere in the index.
 
-    ``quantised`` is accepted and deliberately unused: this family asks for no
-    scale companion at any setting, which is what conjunct (e) counts. The
-    parameter keeps the argument so the four adders share one call shape.
+    ``quantised`` and ``skip`` are both accepted and deliberately unused: this
+    family asks for no scale companion at any setting, so there is nothing for
+    the skip list to suppress here. The parameters keep the arguments so the four
+    adders share one call shape. **The two declarations agree and neither is
+    redundant:** this one is structural and was measured off the index by
+    ``inc-glm53f-078``, and the skip list says the same thing independently --
+    every one of these 15 leaves is named in ``modules_to_not_convert``, which
+    ``inc-glm53f-079``'s conjunct (b) counts through ``get_scheme``.
     """
     del quantised  # this family is unquantised in the checkpoint, at any setting
+    del skip  # nothing to suppress: no leaf here asks for a scale companion
 
     ckpt_attn = f"{ckpt_prefix}.self_attn"
     param_attn = f"{param_prefix}.self_attn"
@@ -551,6 +597,7 @@ def _add_dense_mlp(
     param_prefix: str,
     *,
     quantised: bool,
+    skip: Sequence[str] = (),
 ) -> None:
     """The dense MLP on the first ``first_k_dense_replace`` layers (GROUNDED).
 
@@ -564,7 +611,7 @@ def _add_dense_mlp(
         _add(
             mappings,
             f"{param_mlp}.{leaf}_weight",
-            _quantised(ckpt_mlp, leaf, quantised=quantised),
+            _quantised(ckpt_mlp, leaf, quantised=quantised, skip=skip),
         )
 
 
@@ -575,6 +622,7 @@ def _add_moe_mlp(
     text_config: Glm5NextTextConfig,
     *,
     quantised: bool,
+    skip: Sequence[str] = (),
 ) -> None:
     """Routed + shared experts on the sparse layers (GROUNDED).
 
@@ -604,7 +652,10 @@ def _add_moe_mlp(
         for expert_id in range(text_config.n_routed_experts):
             expert_keys.extend(
                 _quantised(
-                    f"{ckpt_mlp}.experts.{expert_id}", leaf, quantised=quantised
+                    f"{ckpt_mlp}.experts.{expert_id}",
+                    leaf,
+                    quantised=quantised,
+                    skip=skip,
                 )
             )
         _add(mappings, f"{param_mlp}.experts.{leaf}_weight", expert_keys)
@@ -615,7 +666,7 @@ def _add_moe_mlp(
             _add(
                 mappings,
                 f"{param_mlp}.shared_experts.{leaf}_weight",
-                _quantised(ckpt_shared, leaf, quantised=quantised),
+                _quantised(ckpt_shared, leaf, quantised=quantised, skip=skip),
             )
 
 

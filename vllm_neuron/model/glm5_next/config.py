@@ -309,11 +309,27 @@ class Glm5NextConfig:
     tie_word_embeddings: bool = False
 
     # -- Blockwise-FP8 fields lifted from quantization_config ---------------
-    # Only the two this module needs. The quantization SPEC (scheme
-    # resolution, per-module policy) is deliberately NOT modelled here.
+    # ALL FIVE of them since ``inc-glm53f-079``. The quantization SPEC (scheme
+    # resolution, per-module policy) is still deliberately NOT modelled here;
+    # this dataclass only carries what the checkpoint declares.
     quant_method: str | None = "fp8"
     activation_scheme: str | None = "dynamic"
     weight_block_size: list[int] | None = field(default_factory=lambda: [128, 128])
+
+    #: Substring-match list of module names the checkpoint keeps in BF16, taken
+    #: verbatim off ``quantization_config.modules_to_not_convert``. The real
+    #: checkpoint ships 1,509 entries and this adapter read NONE of them before
+    #: ``inc-glm53f-079``, so every BF16 family was treated as block-FP8. The
+    #: matching rule is the fork's own and is not restated here
+    #: (``neuron_config.py``'s ``modules_to_not_convert``, consumed by
+    #: ``qwen3_vl/model_mxfp8.py``'s ``_keep_bf16``): a module keeps BF16 when
+    #: any entry is a substring of its qualified name.
+    modules_to_not_convert: list[str] | None = None
+
+    #: The FP8 byte format the checkpoint declares (``"e4m3"``). Lifted so a
+    #: consumer can check it rather than assume it; nothing in this campaign
+    #: branches on a second format yet, and a surprise here is worth seeing.
+    fmt: str | None = None
 
     @property
     def is_block_quantized(self) -> bool:
@@ -367,4 +383,9 @@ class Glm5NextConfig:
             quant_method=quant_cfg.get("quant_method"),
             activation_scheme=quant_cfg.get("activation_scheme"),
             weight_block_size=quant_cfg.get("weight_block_size"),
+            # inc-glm53f-079: the two fields this adapter used to drop on the
+            # floor. The skip list is the checkpoint's own quantisation policy,
+            # so leaving it unread meant the policy could not be honoured.
+            modules_to_not_convert=quant_cfg.get("modules_to_not_convert"),
+            fmt=quant_cfg.get("fmt"),
         )

@@ -75,6 +75,7 @@ increment does not touch.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -148,6 +149,33 @@ class UnsupportedWeightBlockSize(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# The BF16 skip-list predicate -- ``inc-glm53f-079``
+# ---------------------------------------------------------------------------
+def keeps_bf16(name: str, skip: Sequence[str] | None) -> bool:
+    """True when ``name`` is one the checkpoint keeps in BF16.
+
+    THE FORK'S OWN RULE, REUSED RATHER THAN REPLACED. ``neuron_config.py``
+    declares ``modules_to_not_convert`` as a *"Substring-match list of parameter
+    FQNs to KEEP in bf16 … A parameter keeps bf16 iff any entry in this list is
+    a substring of its fully-qualified name"*, and
+    ``qwen3_vl/model_mxfp8.py``'s ``_keep_bf16`` is the landed consumer. This is
+    that predicate, with the same semantics, so the two paths cannot drift into
+    two different answers. No regex, no per-family table, no normalisation.
+
+    An empty or ``None`` skip list keeps nothing in BF16, which is the
+    behaviour every caller had before this increment.
+
+    The substring rule is what lets a module-namespace entry
+    (``model.layers.0.self_attn.q_proj``) match a checkpoint-namespace key
+    (``model.language_model.layers.0.self_attn.q_proj``) at all: the entry is a
+    substring of the key because ``language_model`` ends in the literal
+    ``model``. That alignment is recorded in the design and no increment
+    tightens it.
+    """
+    return bool(skip) and any(token in name for token in skip)
+
+
+# ---------------------------------------------------------------------------
 # Spec
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -160,13 +188,16 @@ class QuantizationSpec:
 
     Attributes:
         linear_scheme:
-            Scheme applied to quantizable linear modules.
+            Scheme applied to quantizable linear modules -- that is, to the
+            modules :attr:`modules_to_not_convert` does NOT name.
 
-            TODO(quant, mixed-precision): a single scheme for the whole model
-            today, as llama3's spec also is. Per-layer / per-module mixed
-            precision extends this field (or moves the decision into
-            :meth:`get_scheme`); call sites that read ``linear_scheme``
-            directly will need revisiting then.
+            MIXED PRECISION IS NO LONGER A TODO HERE, and the decision moved
+            where the TODO said it would: :meth:`get_scheme` answers per module
+            off the checkpoint's own skip list (``inc-glm53f-079``). This field
+            stays one scheme because the checkpoint declares one, so **a call
+            site that reads ``linear_scheme`` directly now bypasses the skip
+            list and will call a BF16 module block-FP8.** Query
+            :meth:`get_scheme`.
         kv_cache_scheme:
             Scheme applied to the KV cache. ``NONE`` for this checkpoint --
             see :data:`_VALID_KV_CACHE_SCHEMES`.
@@ -178,12 +209,21 @@ class QuantizationSpec:
         activation_scheme:
             The checkpoint's ``activation_scheme``, or ``None`` when
             unquantized.
+        modules_to_not_convert:
+            The checkpoint's own list of module names to KEEP in BF16, taken
+            verbatim off ``quantization_config.modules_to_not_convert``
+            (``inc-glm53f-079``). Empty means "quantize everything the scheme
+            supports", which is what this class assumed before that increment.
+            Stored as a tuple rather than the config's list so the frozen
+            dataclass stays hashable, the same reason
+            :attr:`weight_block_size` is a tuple.
     """
 
     linear_scheme: QuantScheme
     kv_cache_scheme: QuantScheme
     weight_block_size: tuple[int, int] | None = None
     activation_scheme: str | None = None
+    modules_to_not_convert: tuple[str, ...] = ()
 
     # ------------------------------------------------------------------
     # Uniform per-module query
@@ -195,26 +235,40 @@ class QuantizationSpec:
     ) -> QuantScheme:
         """Return the scheme applied to the module at ``(layer_index, prefix)``.
 
+        The answer is the checkpoint's own, since ``inc-glm53f-079``: a module
+        named by :attr:`modules_to_not_convert` keeps BF16 and gets
+        :attr:`QuantScheme.NONE`; everything else gets :attr:`linear_scheme`.
+        Before that increment this returned :attr:`linear_scheme`
+        unconditionally, so the answer was "block-FP8" for ``lm_head``, for the
+        KDA projections and for the DSA indexer alike -- for 1,067 of the real
+        checkpoint's 37,534 base tensors, all of them BF16.
+
         Args:
             layer_index: Transformer-block index (0-based) for modules inside a
                 block (e.g. ``self_attn.q_b_proj``). ``None`` for modules
-                outside any block (``lm_head``, ``embed_tokens``).
-            prefix: Qualified module name. Either the full dotted path
-                (``"model.layers.7.linear_attn.out_proj"``) or a leaf-style
-                name (``"out_proj"``) is accepted.
+                outside any block (``lm_head``, ``embed_tokens``). Not consulted:
+                the skip list carries its own layer qualification, so the layer
+                is already inside ``prefix`` for every entry that names one.
+            prefix: Qualified module name, e.g.
+                ``"model.layers.3.self_attn.kv_b_proj"``. **QUALIFY IT.** The
+                match is the fork's substring rule and 1,500 of the real
+                checkpoint's 1,509 entries are qualified dotted paths (1,150
+                under ``model.layers.``, 347 under ``visual.``, 3 top-level
+                modules), so a leaf-style ``"kv_b_proj"`` cannot match one and
+                would be reported quantized. The nine bare entries (``lm_head``,
+                ``router``, ``visual``, ``dt_bias``, ``weights_proj``, and four
+                more) match either way.
 
         Returns:
-            The :class:`QuantScheme` to apply. Today this is always
-            :attr:`linear_scheme`; the signature is fixed now so call sites can
-            be wired without churn when dispatch becomes richer.
+            The :class:`QuantScheme` to apply.
 
         Notes:
-            TODO(quant, mixed-precision): the hybrid stack is a live reason
-            this will get richer -- the DSA indexer and the KDA convolution
-            are the two families most likely to stay unquantized while the
-            projections around them do not.
+            The matcher is the fork's own and this method adds none of its own:
+            see :func:`keeps_bf16`.
         """
-        del layer_index, prefix  # reserved for future per-module dispatch
+        del layer_index  # the skip list qualifies its own entries; see Args
+        if keeps_bf16(prefix, self.modules_to_not_convert):
+            return QuantScheme.NONE
         return self.linear_scheme
 
     # ------------------------------------------------------------------
@@ -269,13 +323,19 @@ class QuantizationSpec:
         """Build from the fields ``Glm5NextConfig`` already lifted.
 
         ``config.py`` lifts ``quant_method`` / ``activation_scheme`` /
-        ``weight_block_size`` off the top-level ``quantization_config`` while
-        deliberately not modelling the spec. This is the bridge back, so a
-        caller holding a parsed :class:`~vllm_neuron.model.glm5_next.config.Glm5NextConfig`
+        ``weight_block_size`` / ``modules_to_not_convert`` off the top-level
+        ``quantization_config`` while deliberately not modelling the spec. This
+        is the bridge back, so a caller holding a parsed
+        :class:`~vllm_neuron.model.glm5_next.config.Glm5NextConfig`
         does not have to keep the raw HF dict alive to get a spec. Untyped
         deliberately: importing the config module here would make a cycle out of
         a one-way dependency (``config`` -> nothing, this module -> ``config``),
-        and the three attribute names are the whole contract.
+        and the attribute names are the whole contract.
+
+        ``inc-glm53f-079`` added the fourth name. A bridge that forwarded three
+        of four would hand back a spec whose skip list is empty, and an empty
+        skip list quantizes everything -- the exact defect this increment
+        repairs, reintroduced one layer up.
         """
         quant_method = getattr(config, "quant_method", None)
         if not quant_method:
@@ -285,6 +345,9 @@ class QuantizationSpec:
                 "quant_method": quant_method,
                 "activation_scheme": getattr(config, "activation_scheme", None),
                 "weight_block_size": getattr(config, "weight_block_size", None),
+                "modules_to_not_convert": getattr(
+                    config, "modules_to_not_convert", None
+                ),
             }
         )
 
@@ -369,11 +432,27 @@ def _parse_fp8_block(quantization_config: dict[str, Any]) -> QuantizationSpec:
             )
         block_size = (int(raw_block[0]), int(raw_block[1]))
 
+    # inc-glm53f-079: the checkpoint's BF16 skip list, carried verbatim and
+    # only shape-checked. A list of non-strings would match nothing and would do
+    # it silently, so it raises instead.
+    raw_skip = quantization_config.get("modules_to_not_convert") or ()
+    if not isinstance(raw_skip, (list, tuple)):
+        raise ValueError(
+            "quantization_config.modules_to_not_convert must be a list of "
+            f"strings, got {type(raw_skip).__name__}."
+        )
+    if any(not isinstance(token, str) for token in raw_skip):
+        raise ValueError(
+            "quantization_config.modules_to_not_convert entries must be "
+            "strings; got a non-string entry."
+        )
+
     return QuantizationSpec(
         linear_scheme=QuantScheme.FP8_BLOCK_DYNAMIC,
         kv_cache_scheme=QuantScheme.NONE,
         weight_block_size=block_size,
         activation_scheme=activation_scheme,
+        modules_to_not_convert=tuple(raw_skip),
     )
 
 
