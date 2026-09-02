@@ -36,6 +36,20 @@ to the criterion it was measured against.
   one in each direction, with the D1.5 control that drops the validation and
   moves arm A's raise count to ``0/1``.
 
+**``inc-glm53f-081`` ADDS FOUR ITEMS AT THE END OF THIS FILE, one per NEW arm,
+so the derivable collected count for this file is now NINE.** `-020`'s five
+items above, the helpers they call and the constants they read are **re-run
+whole and not edited** -- they are `-081`'s own acceptance, so `-081` cannot
+redden one without reddening itself. The four new items are conjunct **(a)** the
+automatic engagement at the registered TP degree, conjunct **(b) arm 2** the
+bfloat16 guard reached on the DEFAULT path, and conjuncts **(d2)** and **(d3)**
+the quiet-and-unchanged and the audible halves of the same non-engagement. They
+bring their own level-aware log context because ``_RecordingHandler`` above
+keeps messages without their level and ``(d3)`` counts records BY LEVEL.
+`-081`'s subject is the decision ABOVE the limb -- whether to enter it -- so it
+moves no registered value, no guard, no message and no derivation, and it adds
+no ``parametrize``.
+
 **Conjunct 3 (the vision limb) is DEFERRED to M5 at plan revision 28, and this
 file adds NO item for the retired number.** The deferral rests on measurements,
 not on preference, and they are recorded once rather than twice: the ground is
@@ -658,3 +672,302 @@ def test_operator_override_is_honoured_only_within_registered_constraints() -> N
         control_cfg.cache_config.block_size
         == OFF_VALUE_OPERATOR_BLOCK_SIZE_BELOW_FLOOR
     )
+
+
+# =========================================================================
+# inc-glm53f-081 -- the platform ENGAGES the limb above for this architecture
+# =========================================================================
+# Four items, one per NEW arm, appended so that not one byte of `-020` above is
+# edited. The subject is the three-question decision immediately above the limb
+# in ``check_and_update_config``, never the limb itself.
+
+# The non-engagement marker the decision emits. Deliberately NOT a substring of
+# HYBRID_MARKER in either direction, so the landed engagement differential
+# cannot be inflated by it; both directions are asserted in item (d3).
+OFF_MARKER = "Hybrid KDA/DSA KV cache left OFF"
+
+# The campaign's architecture string, the decision's own question-1 predicate.
+CAMPAIGN_ARCH = "Glm5NextForConditionalGeneration"
+
+# Conjunct (b) arm 2's match: the substring the RENDERED landed message carries,
+# quoted from HEAD 3e53891c and edited nowhere. Arm 1's counterpart substring is
+# NOT declared here -- arm 1 is `-020`'s landed item, which this file re-runs
+# whole, and its rendered message is read off the transcript's own recording
+# rather than re-asserted by a constant no item would use.
+BF16_REFUSAL_SUBSTRING = "registered ONLY for a bfloat16 KV cache"
+
+
+class _LevelRecordingHandler(logging.Handler):
+    """``_RecordingHandler``'s shape, keeping each record's LEVEL as well."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[tuple[str, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append((record.levelname, record.getMessage()))
+
+
+@contextlib.contextmanager
+def _capture_platform_records():
+    """``_capture_platform_log``'s shape, level-aware.
+
+    A separate context rather than an edit to `-020`'s helper, for `-020`'s own
+    reason -- the handler attaches to ``platform.logger`` directly, never
+    through ``caplog`` -- and because the five landed items are this block's
+    acceptance and are left byte-identical.
+    """
+    handler = _LevelRecordingHandler()
+    target = platform_module.logger
+    previous_level = target.level
+    target.addHandler(handler)
+    target.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous_level)
+
+
+def _marker_records(
+    handler: _LevelRecordingHandler, marker: str, level: str | None = None
+) -> list[str]:
+    """The messages carrying ``marker``, optionally narrowed to one level."""
+    return [
+        message
+        for levelname, message in handler.records
+        if marker in message and (level is None or levelname == level)
+    ]
+
+
+def test_engagement_is_automatic_at_the_registered_tp_degree() -> None:
+    """Conjunct (a) -- 1/1. No knob set, TP=64, bf16: the limb is ENTERED.
+
+    The reading the repair exists for. At the parent the same input leaves the
+    page at the vendor default and ``update_block_size_for_backend`` then hard
+    sets 32; the parent reading is measured in the acceptance transcript's own
+    parent row rather than restated here.
+    """
+    cfg = _build_config()
+    # The domain, asserted rather than assumed: NOTHING sets the knob.
+    assert cfg.additional_config == {}
+    default_block_size = cfg.cache_config.block_size
+    _record("a_default_block_size_before_call", default_block_size)
+
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        NeuronPlatform.check_and_update_config(cfg)
+        engaged = _marker_records(handler, HYBRID_MARKER)
+        off = _marker_records(handler, OFF_MARKER)
+
+    _record("a_block_size", cfg.cache_config.block_size)
+    _record("a_latch", cfg.cache_config.user_specified_block_size)
+    _record("a_engagement_records", len(engaged))
+    _record("a_off_records", len(off))
+    _record("a_additional_config", cfg.additional_config)
+
+    assert cfg.cache_config.block_size == DECIDED_HYBRID_BLOCK_SIZE
+    assert cfg.cache_config.user_specified_block_size is True
+    assert len(engaged) == 1
+    # The decision is READABLE DOWNSTREAM: the write-back, not just the local
+    # mapping the limb read. Without it a later NeuronConfig construction would
+    # see no decision at all.
+    assert cfg.additional_config["neuron_config"]["enable_hybrid_kv_cache"] is True
+    # The engagement path stays quiet -- the OFF warning is (d3)'s alone.
+    assert off == []
+    # The value the engagement produced is NOT the value it started from, so
+    # this 1/1 cannot be read off a config that already carried 128.
+    assert default_block_size != DECIDED_HYBRID_BLOCK_SIZE
+
+    # Recorded, adding no conjunct: the resolved page SURVIVES to the allocator,
+    # which is the consequence the repair is for. Measured against the LANDED
+    # method, unchanged here.
+    NeuronPlatform.update_block_size_for_backend(cfg)
+    _record(
+        "a_block_size_after_update_block_size_for_backend",
+        cfg.cache_config.block_size,
+    )
+    assert cfg.cache_config.block_size == DECIDED_HYBRID_BLOCK_SIZE
+
+
+def test_bfloat16_guard_is_reached_on_the_default_path() -> None:
+    """Conjunct (b) arm 2 -- the knob UNSET at TP=64 with fp16 still RAISES.
+
+    Why this arm is not vacuous: the bfloat16 precondition is deliberately left
+    INSIDE the limb rather than pre-checked by the decision above it, so a
+    DEFAULT run at the registered degree with a non-bf16 KV cache must still
+    reach `-020`'s loud guard. Arm 1 of this conjunct is `-020`'s landed
+    operator-explicit item, re-run by this file and not duplicated here.
+    """
+    cfg = _build_config(model_dtype=OFF_VALUE_MODEL_DTYPE)
+    # The domain: no knob, registered TP degree, off-value model dtype.
+    assert cfg.additional_config == {}
+    assert cfg.parallel_config.tensor_parallel_size == REGISTERED_TP_DEGREE
+    before = _cache_snapshot(cfg)
+
+    with pytest.raises(ValueError) as exc:
+        with _isolated_platform_class_state():
+            NeuronPlatform.check_and_update_config(cfg)
+    message = str(exc.value)
+    _record("b_arm2_message", message)
+
+    # Matched on the substring the RENDERED landed message carries.
+    assert BF16_REFUSAL_SUBSTRING in message
+    assert str(OFF_VALUE_MODEL_DTYPE) in message
+    assert str(DECIDED_HYBRID_BLOCK_SIZE) in message
+    # The raise happened BEFORE any block-size assignment.
+    assert _cache_snapshot(cfg) == before
+    assert cfg.cache_config.user_specified_block_size is False
+
+    # D1.5 CONTROL -- the raise MOVES to 0 when the engagement declines. The
+    # same off-value dtype at the off-value TP degree raises nothing, because
+    # there the decision never enters the limb. That is what makes this arm's
+    # raise attributable to the engagement rather than to the dtype alone.
+    quiet_cfg = _build_config(
+        model_dtype=OFF_VALUE_MODEL_DTYPE, tp=OFF_VALUE_TP_DEGREE
+    )
+    control_raises = 0
+    with _isolated_platform_class_state():
+        try:
+            NeuronPlatform.check_and_update_config(quiet_cfg)
+        except ValueError:
+            control_raises = 1
+    _record("b_arm2_control_raise_count", control_raises)
+    _record("b_arm2_control_block_size", quiet_cfg.cache_config.block_size)
+    assert control_raises == 0, (
+        "the control still raised, so this arm cannot distinguish the "
+        "engagement from the dtype"
+    )
+    assert quiet_cfg.cache_config.user_specified_block_size is False
+
+
+def test_default_run_at_off_value_tp_is_quiet_and_unchanged() -> None:
+    """Conjunct (d2) -- no knob, TP != 64: nothing raises and nothing moves."""
+    cfg = _build_config(tp=OFF_VALUE_TP_DEGREE)
+    assert cfg.additional_config == {}
+    before = _cache_snapshot(cfg)
+    block_size_before = cfg.cache_config.block_size
+    _record("d2_off_value_tensor_parallel_size", OFF_VALUE_TP_DEGREE)
+    _record("d2_block_size_before_call", block_size_before)
+
+    raised = None
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        try:
+            NeuronPlatform.check_and_update_config(cfg)
+        except BaseException as exc:  # recorded, then adjudicated below
+            raised = f"{type(exc).__name__}: {exc}"
+        engaged = _marker_records(handler, HYBRID_MARKER)
+
+    _record("d2_raised", raised)
+    _record("d2_block_size", cfg.cache_config.block_size)
+    _record("d2_latch", cfg.cache_config.user_specified_block_size)
+    _record("d2_engagement_records", len(engaged))
+
+    assert raised is None, f"the non-engagement path raised: {raised}"
+    assert cfg.cache_config.block_size == block_size_before
+    assert cfg.cache_config.user_specified_block_size is False
+    assert len(engaged) == 0
+    assert _cache_snapshot(cfg) == before
+    # The write-back is engagement-only, so nothing downstream can read a
+    # decision this path never took.
+    assert "neuron_config" not in cfg.additional_config
+
+    # D1.5 CONTROL -- all four readings MOVE at the registered degree, so this
+    # quiet tracks the TP degree rather than a decision that never fires.
+    control_cfg = _build_config()
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        NeuronPlatform.check_and_update_config(control_cfg)
+        control_engaged = _marker_records(handler, HYBRID_MARKER)
+    _record("d2_control_block_size", control_cfg.cache_config.block_size)
+    _record("d2_control_latch", control_cfg.cache_config.user_specified_block_size)
+    _record("d2_control_engagement_records", len(control_engaged))
+    assert control_cfg.cache_config.block_size == DECIDED_HYBRID_BLOCK_SIZE
+    assert control_cfg.cache_config.user_specified_block_size is True
+    assert len(control_engaged) == 1
+    assert "neuron_config" in control_cfg.additional_config
+
+
+def test_default_run_at_off_value_tp_warns_exactly_once() -> None:
+    """Conjunct (d3) -- the SAME construction says so, once, at WARNING.
+
+    The half of (d2) that keeps the non-engagement AUDIBLE: a reading of 0
+    warning records here fails the block, because a silent TP!=64 run is
+    review 36's defect coming back.
+    """
+    cfg = _build_config(tp=OFF_VALUE_TP_DEGREE)
+    assert cfg.additional_config == {}
+
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        NeuronPlatform.check_and_update_config(cfg)
+        at_warning = _marker_records(handler, OFF_MARKER, level="WARNING")
+        at_any_level = _marker_records(handler, OFF_MARKER)
+        all_records = list(handler.records)
+
+    _record("d3_all_platform_records", all_records)
+    _record("d3_marker_records_any_level", len(at_any_level))
+    _record("d3_marker_records_at_warning", len(at_warning))
+
+    assert len(at_any_level) == 1, f"expected exactly 1 record, got {at_any_level}"
+    assert len(at_warning) == 1, f"the record was not at WARNING: {all_records}"
+    message = at_warning[0]
+    _record("d3_message", message)
+
+    # It names BOTH degrees -- what this run resolved and what is registered.
+    # Matched on the RENDERED key=value pair rather than on the bare number,
+    # because the bare 32 also occurs in the page the sentence promises and a
+    # bare-number match would pass with the resolved degree missing entirely.
+    assert f"tensor_parallel_size={OFF_VALUE_TP_DEGREE}" in message
+    assert f"tensor_parallel_size={REGISTERED_TP_DEGREE}" in message
+    # ... and the architecture, so one line tells the operator which model lost
+    # the page.
+    assert CAMPAIGN_ARCH in message
+    # ... and what re-enabling it elsewhere costs.
+    assert "re-derive" in message
+    assert "enable_hybrid_kv_cache" in message
+    # Neither marker is a substring of the other, in EITHER direction, so the
+    # landed engagement differential cannot be inflated by this warning.
+    assert HYBRID_MARKER not in message
+    assert OFF_MARKER not in HYBRID_MARKER
+    assert HYBRID_MARKER not in OFF_MARKER
+
+    # The page the warning PROMISES is the page the run actually gets, measured
+    # rather than restated: the landed update_block_size_for_backend's own
+    # output has to appear in the sentence. This is what pins the one number the
+    # warning duplicates, so a drift in either place reddens a test.
+    NeuronPlatform.update_block_size_for_backend(cfg)
+    delivered = cfg.cache_config.block_size
+    _record("d3_delivered_block_size", delivered)
+    assert f"{delivered}-token page" in message
+
+    # D1.5 CONTROL -- the 1 MOVES to 0 at the registered degree, so the count
+    # tracks the declined engagement and not an unconditional warning.
+    control_cfg = _build_config()
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        NeuronPlatform.check_and_update_config(control_cfg)
+        control_off = _marker_records(handler, OFF_MARKER)
+    _record("d3_control_off_records", len(control_off))
+    assert len(control_off) == 0
+
+    # SECOND CONTROL -- a non-campaign architecture at the SAME off-value degree
+    # is silent, so question 1 ends the decision and the warning is scoped to
+    # this architecture instead of firing for every model on the pin.
+    other_arch = _pin_archs()[0]
+    other_cfg = _build_config(arch=other_arch, tp=OFF_VALUE_TP_DEGREE)
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        NeuronPlatform.check_and_update_config(other_cfg)
+        other_off = _marker_records(handler, OFF_MARKER)
+    _record("d3_other_arch", other_arch)
+    _record("d3_other_arch_off_records", len(other_off))
+    assert len(other_off) == 0
+
+    # THIRD CONTROL -- an operator who set the knob is not lectured: question 2
+    # ends the decision before the warning. Explicit False is measured here;
+    # explicit True at this degree is `-020`'s landed arm 1, which raises inside
+    # the limb and so never reaches this warning either.
+    explicit_cfg = _build_config(
+        neuron_config={"enable_hybrid_kv_cache": False}, tp=OFF_VALUE_TP_DEGREE
+    )
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        NeuronPlatform.check_and_update_config(explicit_cfg)
+        explicit_off = _marker_records(handler, OFF_MARKER)
+    _record("d3_explicit_false_off_records", len(explicit_off))
+    assert len(explicit_off) == 0

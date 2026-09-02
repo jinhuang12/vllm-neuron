@@ -345,6 +345,65 @@ class NeuronPlatform(Platform):
             )
         cls._enable_structured_outputs = enable_structured_outputs
 
+        # ---- Does THIS architecture get the hybrid KDA/DSA KV cache? --------
+        # inc-glm53f-081. The knob's own comment in
+        # vllm_neuron/model/neuron_config.py promises "the platform turns it on
+        # for the archs that need it"; this is that decision. It is taken HERE,
+        # above the limb below, so that not one byte of section 6's registered
+        # derivation moves: the decision is about WHETHER TO ENTER the limb,
+        # never about what the limb computes.
+        #
+        # Three questions in order, and the first "no" ends the decision.
+        # Question 3 pre-checks the ONE precondition that decides whether the
+        # registered value is valid at all. The bfloat16 precondition is
+        # deliberately NOT pre-checked: it stays inside the limb, so a default
+        # run at the registered degree with a non-bf16 KV cache still reaches
+        # the loud guard there instead of being quietly skipped here.
+        HYBRID_KV_REGISTERED_TP_DEGREE = 64  # DECISIONS.md section 6
+        architectures = getattr(model_config.hf_config, "architectures", None) or ()
+        if (
+            # 1. Is the resolved architecture this campaign's? Tested on the
+            #    same string pre_register_and_update registers above. The
+            #    config-side spelling glm5_next is NOT a second predicate --
+            #    one identity, read in one place.
+            "Glm5NextForConditionalGeneration" in architectures
+            # 2. Did the operator leave the knob unset? PRESENCE, not
+            #    falsiness: an explicit False is an operator decision this path
+            #    honours and an explicit True is passed through untouched, so
+            #    an operator-explicit run stays byte-for-byte what it was.
+            and "enable_hybrid_kv_cache" not in neuron_config
+        ):
+            # 3. Is the tensor-parallel degree the registered one?
+            resolved_tp_size = vllm_config.parallel_config.tensor_parallel_size
+            if resolved_tp_size == HYBRID_KV_REGISTERED_TP_DEGREE:
+                # Set in the SAME mapping the limb reads through its own .get,
+                # so the limb needs no edit -- and stored back under
+                # additional_config, because the .get above returns a FRESH {}
+                # when the key is absent and a later NeuronConfig construction
+                # would otherwise read a decision this path never published.
+                neuron_config["enable_hybrid_kv_cache"] = True
+                vllm_config.additional_config["neuron_config"] = neuron_config
+            else:
+                # The case that must not be silent. No section 6 guard is
+                # reached, the run keeps the uniform page
+                # update_block_size_for_backend hard-sets in this file, and the
+                # operator is TOLD once. The marker below is deliberately not a
+                # substring of the engagement record the limb logs, so a
+                # differential that counts engagements cannot be inflated here.
+                logger.warning(
+                    "Hybrid KDA/DSA KV cache left OFF for "
+                    "Glm5NextForConditionalGeneration: the registered block "
+                    "size is valid only at tensor_parallel_size=%d and this "
+                    "run resolved tensor_parallel_size=%d, so the KV cache "
+                    "keeps the uniform 32-token page "
+                    "update_block_size_for_backend sets. To enable it at this "
+                    "degree, re-derive the block size for that degree "
+                    "(approvals/DECISIONS.md section 6) and set "
+                    "enable_hybrid_kv_cache explicitly.",
+                    HYBRID_KV_REGISTERED_TP_DEGREE,
+                    resolved_tp_size,
+                )
+
         # ---- Hybrid KDA/DSA KV-cache block size -----------------------------
         # Resolved here, before _validate_dcp_config reads cache_config.
         # block_size for its ownership stride, so a hybrid run validates DCP
