@@ -65,6 +65,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import nki
+import nki.language as nl
 import torch
 from torch import Tensor
 
@@ -74,6 +76,11 @@ from nkilib.core.moe.moe_cte.bwmm_shard_on_I import (
 )
 from nkilib.core.moe.moe_cte.bwmm_shard_on_I_torch import (
     blockwise_mm_baseline_shard_intermediate_torch_ref,
+)
+from nkilib.core.moe.moe_cte.moe_cte import (
+    ActFnType,
+    ExpertAffinityScaleMode,
+    SkipMode,
 )
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import (
@@ -299,6 +306,97 @@ def can_run_blockwise_fp8_moe(
     return can_run_kernel(hidden_states)
 
 
+@nki.jit(mode="trace")
+def _torch_compatible_blockwise_mm_baseline_shard_intermediate(
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
+    block_size: int,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    gate_and_up_proj_bias: Optional[nl.NkiTensor] = None,
+    down_proj_bias: Optional[nl.NkiTensor] = None,
+    gate_up_proj_scale: Optional[nl.NkiTensor] = None,
+    down_proj_scale: Optional[nl.NkiTensor] = None,
+    gate_up_hidden_scale: Optional[nl.NkiTensor] = None,
+    down_hidden_scale: Optional[nl.NkiTensor] = None,
+    is_block_quant: bool = False,
+    is_per_tensor: bool = False,
+    activation_function: ActFnType = ActFnType.SiLU,
+    # The vendor's own ``skip_dma: SkipMode = SkipMode()`` becomes these two
+    # flat booleans; the object is rebuilt in the kernel body below.
+    skip_token: bool = False,
+    skip_weight: bool = False,
+    compute_dtype: Any = nl.bfloat16,
+    is_tensor_update_accumulating: bool = True,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode = (
+        ExpertAffinityScaleMode.PRE_SCALE
+    ),
+    gate_clamp_upper_limit: Optional[float] = None,
+    gate_clamp_lower_limit: Optional[float] = None,
+    up_clamp_lower_limit: Optional[float] = None,
+    up_clamp_upper_limit: Optional[float] = None,
+    checkpoint_activation: bool = False,
+    expert_affinity_multiply_on_I: bool = False,
+    accumulation_dtype: Optional[Any] = None,
+    skip_gate_proj: bool = False,
+):
+    """The vendor kernel with a torch-traceable signature. Numerics unchanged.
+
+    The kernel this seam dispatches to defaults one parameter to a live vendor
+    object -- ``skip_dma: SkipMode = SkipMode()``
+    (``bwmm_shard_on_I.py:119``). ``wrap_nki`` folds a kernel's stored default
+    set at trace time, and Dynamo can turn that object neither into a Python
+    constant nor into a graph proxy, so tracing the seam through the raw kernel
+    dies before the graph is built. Every default here is ``None``, a primitive
+    or an enum member instead, and the object is built inside the kernel body,
+    where the NKI parser reads it.
+
+    The vendor states the rule this implements in the target kernel's own
+    comment at ``bwmm_shard_on_I.py:113-114``: flat booleans rather than a
+    nested object, "because the NKI parser frontend cannot read attributes off
+    a nested NKIObject inside a kernel." The same construction is already
+    landed twice on this vendor family, at ``moe_cte.py:677`` and ``:766``.
+
+    ``skip_token`` and ``skip_weight`` default to ``False``, which is the
+    switch state ``SkipMode()`` already produced, so no caller's behaviour
+    moves.
+    """
+    skip_dma = SkipMode(skip_token=skip_token, skip_weight=skip_weight)
+
+    return blockwise_mm_baseline_shard_intermediate(
+        hidden_states=hidden_states,
+        expert_affinities_masked=expert_affinities_masked,
+        gate_up_proj_weight=gate_up_proj_weight,
+        down_proj_weight=down_proj_weight,
+        block_size=block_size,
+        token_position_to_id=token_position_to_id,
+        block_to_expert=block_to_expert,
+        gate_and_up_proj_bias=gate_and_up_proj_bias,
+        down_proj_bias=down_proj_bias,
+        gate_up_proj_scale=gate_up_proj_scale,
+        down_proj_scale=down_proj_scale,
+        gate_up_hidden_scale=gate_up_hidden_scale,
+        down_hidden_scale=down_hidden_scale,
+        is_block_quant=is_block_quant,
+        is_per_tensor=is_per_tensor,
+        activation_function=activation_function,
+        skip_dma=skip_dma,
+        compute_dtype=compute_dtype,
+        is_tensor_update_accumulating=is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        checkpoint_activation=checkpoint_activation,
+        expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+        accumulation_dtype=accumulation_dtype,
+        skip_gate_proj=skip_gate_proj,
+    )
+
+
 def blockwise_fp8_moe(
     hidden_states: Tensor,
     expert_affinities_masked: Tensor,
@@ -356,7 +454,7 @@ def blockwise_fp8_moe(
     _COUNTERS.nki_dispatch += 1
     # `wrap_nki(...)[NUM_SHARDS]` is the SPMD launch grid, not an output arity:
     # the kernel reads `nl.num_programs(axes=0)` as NUM_SHARDS (:80).
-    wrapped = wrap_nki(blockwise_mm_baseline_shard_intermediate)
+    wrapped = wrap_nki(_torch_compatible_blockwise_mm_baseline_shard_intermediate)
     return wrapped[NUM_SHARDS](
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
