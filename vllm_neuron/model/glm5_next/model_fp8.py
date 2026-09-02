@@ -25,7 +25,7 @@ experts. Allocating it is not a CPU-mode unit test. So every parameter is
 **declared** rather than materialised: :func:`_declare_parameters` calls
 ``register_parameter(name, None)``, which is torch's own way to reserve a
 parameter attribute path that a later increment fills in. The attribute path
-genuinely exists on the module (``module.out_proj_weight`` returns ``None``),
+genuinely exists on the module (``module.o_proj_weight`` returns ``None``),
 the name is enumerable through :meth:`declared_parameter_names`, and the tree
 allocates **zero** ``torch.nn.Parameter`` objects. ``get_kv_spec`` therefore
 reads geometry off layer objects -- the same construction shape as
@@ -35,8 +35,10 @@ allocation that shape would otherwise imply.
 WHERE THE PARAMETER NAMES COME FROM -- THEY ARE NOT CHOSEN HERE
 ---------------------------------------------------------------
 Per the lead ruling *"-013's skeleton parameter names: the LANDED weight map's
-param-name side is the authority"*
-(``approvals/lead-ruling-013-param-name-authority.md``), every parameter
+param-name side is the authority"* -- recorded at
+``artifacts/campaigns/glm-5.3-flash-port/increments/evidence-013.md`` L212,
+since the original ``approvals/lead-ruling-013-param-name-authority.md`` was
+deleted in the 2026-08-31 residue purge -- every parameter
 attribute path below is **derived from**
 :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.build_weight_mappings`
 as landed by ``inc-glm53f-011`` / ``inc-glm53f-012``, measured off the bytes at
@@ -511,11 +513,19 @@ class Glm5NextHyperConnection(nn.Module):
         self.hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
 
         # ORDINARY PARAMETERS, not ``_declare_parameters``' reservations, and
-        # that is the lead's ruling for this section: the weight map declares
-        # this family absent, so there is no map name to reserve, and the
-        # declared acceptance is a synthetic case whose test SETS these tensors.
-        # The three names are the base's own ``mhc_pre`` argument names, taken
-        # rather than chosen, exactly as ``-029`` took its seam's signature.
+        # that is the lead's ruling for this section: the declared acceptance is
+        # a synthetic case whose test SETS these tensors. The three names are
+        # the base's own ``mhc_pre`` argument names, taken rather than chosen,
+        # exactly as ``-029`` took its seam's signature -- they are THIS CLASS'S
+        # OWN SIGNATURE AND NOT MAP NAMES.
+        #
+        # RE-GROUNDED BY ``inc-glm53f-082``. This note used to add "the weight
+        # map declares this family absent, so there is no map name to reserve",
+        # which ``inc-glm53f-078`` falsified: the map now emits six mHC names
+        # per layer (``MHC_LEAVES``). Those six are reserved FLAT ON THE LAYER
+        # by ``Glm5NextKDALayer`` and ``Glm5NextDSALayer``, not here, because
+        # this class is not bound into a layer anywhere in this tree. The three
+        # ``nn.Parameter`` names below are unchanged.
         self.fn = nn.Parameter(
             torch.zeros(self.hc_mult3, hc_mult * hidden, dtype=torch.float32)
         )
@@ -1584,17 +1594,26 @@ def _build_mlp(text_config: Glm5NextTextConfig, layer_idx: int) -> nn.Module:
 # The KDA (``linear_attention``) half. D14 owner: ``inc-glm53f-038`` (M3),
 # whose acceptance runs "a 3-layer KDA stack" -- so ``Glm5NextKDALayer`` is
 # the decoder layer, and the gated-delta module it holds sits at the map's
-# ``linear_attn`` path.
+# ``self_attn`` path. RE-GROUNDED BY ``inc-glm53f-082``: this header used to
+# call ``linear_attn`` the map's path, which it stopped being when
+# ``inc-glm53f-078`` measured the family off the published checkpoint index.
+# ``linear_attn`` survives below only as ``CACHE_NAME_SUFFIX``, which names
+# the KV-cache entry and is not a module path.
 # ---------------------------------------------------------------------------
 
 
 class Glm5NextKDAAttention(nn.Module):
-    """Gated-delta linear attention at ``linear_attn``.
+    """Gated-delta linear attention at ``self_attn``.
 
-    Every parameter name here is the landed map's
-    (``weight_loaders_fp8.py:406-418``), including the three unprojected
-    entries that have no ``.weight`` leaf: ``conv1d_bias``, ``dt_bias`` and
-    ``A_log``.
+    Every parameter name here is the landed map's ``KDA_PROJECTIONS`` plus
+    ``KDA_BARE_LEAVES``, as ``weight_loaders_fp8.py``'s ``_add_kda_attention``
+    emits them: thirteen ``<leaf>_weight`` names and the two bare state tensors
+    ``A_log`` and ``dt_bias``, **fifteen in all and not one scale companion**.
+    RE-GROUNDED BY ``inc-glm53f-082``: ``inc-glm53f-078`` measured that set off
+    the published checkpoint index and retired the six fused ``linear_attn.*``
+    names this class used to declare. ``conv1d_bias`` is gone with them because
+    the index carries no conv1d bias of any spelling. Cites here name symbols
+    rather than line numbers, because the line numbers are what went stale.
 
     THE CACHE GEOMETRY THIS CARRIES, STATED EXACTLY. A linear-attention layer
     holds a **recurrent state**, not a key/value history. The pin's
@@ -1630,16 +1649,25 @@ class Glm5NextKDAAttention(nn.Module):
             text_config.neuron_config, "kda_state_chunk_size", None
         )
 
+        # The map's fifteen, in the map's own order: ``KDA_PROJECTIONS`` as
+        # ``<leaf>_weight``, then ``KDA_BARE_LEAVES`` with no suffix at all.
         _declare_parameters(
             self,
-            "in_proj_qkvz_weight",
-            "in_proj_ba_weight",
-            "out_proj_weight",
-            "conv1d_weight",
-            "norm_weight",
-            "conv1d_bias",
-            "dt_bias",
+            "q_proj_weight",
+            "k_proj_weight",
+            "v_proj_weight",
+            "b_proj_weight",
+            "f_a_proj_weight",
+            "f_b_proj_weight",
+            "g_a_proj_weight",
+            "g_b_proj_weight",
+            "q_conv1d_weight",
+            "k_conv1d_weight",
+            "v_conv1d_weight",
+            "o_norm_weight",
+            "o_proj_weight",
             "A_log",
+            "dt_bias",
         )
 
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
@@ -1657,8 +1685,13 @@ class Glm5NextKDALayer(nn.Module):
     """
 
     #: Attribute the family's attention module is bound to -- the map's own
-    #: module path (``weight_loaders_fp8.py:406``).
-    ATTENTION_ATTR = "linear_attn"
+    #: module path, which ``weight_loaders_fp8.py``'s ``_add_kda_attention``
+    #: builds as ``f"{param_prefix}.self_attn"``. RE-GROUNDED BY
+    #: ``inc-glm53f-082``, which moved this off ``linear_attn`` because
+    #: ``declared_parameter_names`` builds its paths from ``named_modules()``.
+    #: **NOT the same string as ``Glm5NextKDAAttention.CACHE_NAME_SUFFIX``**,
+    #: which stays ``linear_attn`` and names a KV-cache entry, not a module.
+    ATTENTION_ATTR = "self_attn"
 
     def __init__(
         self, text_config: Glm5NextTextConfig, layer_idx: int, world_size: int
@@ -1667,9 +1700,25 @@ class Glm5NextKDALayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = KDA_LAYER_TYPE
         _declare_parameters(
-            self, "input_layernorm_weight", "post_attention_layernorm_weight"
+            self,
+            "input_layernorm_weight",
+            "post_attention_layernorm_weight",
+            # The six mHC weights sit FLAT ON THE LAYER because that is where
+            # the map puts them: ``MHC_LEAVES``, emitted for every layer by an
+            # unconditional ``_add_mhc`` as ``f"{param_prefix}.{leaf}"`` -- no
+            # ``.weight`` leaf, no scale companion, no submodule. A later
+            # increment that binds a ``Glm5NextHyperConnection`` instance keeps
+            # them here at layer level; moving them under a submodule attribute
+            # reddens the map equality, and re-opening the map is the lead's
+            # call rather than that increment's.
+            "hc_attn_base",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_ffn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
         )
-        self.linear_attn = Glm5NextKDAAttention(text_config, world_size)
+        self.self_attn = Glm5NextKDAAttention(text_config, world_size)
         self.mlp = _build_mlp(text_config, layer_idx)
 
     @property
@@ -1705,8 +1754,19 @@ class Glm5NextDSAIndexer(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        # The map's seven, in the map's own order: the four scaled projections,
+        # then ``k_norm_bias``, then the two bare compress tensors.
+        # ``inc-glm53f-082`` replaced the provisional ``wq_weight`` with the
+        # ``wq_b_weight`` the checkpoint actually carries.
         _declare_parameters(
-            self, "wq_weight", "wk_weight", "k_norm_weight", "weights_proj_weight"
+            self,
+            "wq_b_weight",
+            "wk_weight",
+            "k_norm_weight",
+            "weights_proj_weight",
+            "k_norm_bias",
+            "index_kpool_compress_ape",
+            "index_kpool_compress_gate",
         )
 
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
@@ -1782,7 +1842,10 @@ class Glm5NextDSALayer(nn.Module):
     """
 
     #: Attribute the family's attention module is bound to -- the map's own
-    #: module path (``weight_loaders_fp8.py:366``).
+    #: module path, which ``weight_loaders_fp8.py``'s ``_add_dsa_attention``
+    #: builds as ``f"{param_prefix}.self_attn"``. RE-GROUNDED BY
+    #: ``inc-glm53f-082``: the old cite pointed at a line that is now the
+    #: post-attention-layernorm mapping. The value itself does not move.
     ATTENTION_ATTR = "self_attn"
 
     def __init__(
@@ -1792,7 +1855,18 @@ class Glm5NextDSALayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = DSA_LAYER_TYPE
         _declare_parameters(
-            self, "input_layernorm_weight", "post_attention_layernorm_weight"
+            self,
+            "input_layernorm_weight",
+            "post_attention_layernorm_weight",
+            # The same six mHC weights, flat on the layer for the same reason as
+            # ``Glm5NextKDALayer``: ``_add_mhc`` runs for EVERY layer of the
+            # stack, not only the linear-attention half.
+            "hc_attn_base",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_ffn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
         )
         self.self_attn = Glm5NextMLAAttention(text_config)
         self.mlp = _build_mlp(text_config, layer_idx)

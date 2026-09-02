@@ -53,13 +53,23 @@ landed acceptance collects.
 
 PARAMETER NAMES ARE DERIVED, NOT CHOSEN
 ---------------------------------------
-Per ``approvals/lead-ruling-013-param-name-authority.md``, the landed weight
+Per the lead ruling recorded at
+``artifacts/campaigns/glm-5.3-flash-port/increments/evidence-013.md`` L212 --
+the original ``approvals/lead-ruling-013-param-name-authority.md`` was deleted
+in the 2026-08-31 residue purge -- the landed weight
 map's param-name side is the authority for this skeleton's parameter attribute
 paths. :func:`test_kv_spec_declared_parameter_names_match_the_landed_weight_map`
 asserts that derivation as an exact set equality against
 ``build_weight_mappings``, with a mutation arm proving the comparison can
 fail. That is not an acceptance conjunct -- C01-C04 are unchanged -- it is the
 ruling's derivation made mechanical.
+
+``inc-glm53f-082`` is the THIRD writer here (after ``-013``'s creation and
+``-015``'s pin-widening guard), declared in the plan's ``§9`` row for this file.
+It adds four counted items -- one per declared parameter-name family -- and
+repairs one attribute access onto the stable ``.attention`` property. It owns no
+KV-geometry census item, and ``-013``'s four counted values (45 / 11 / 34 / 0)
+do not move.
 
 FALSIFIABILITY
 --------------
@@ -84,7 +94,11 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_neuron.model.glm5_next.config import DSA_LAYER_TYPE, Glm5NextTextConfig
+from vllm_neuron.model.glm5_next.config import (
+    DSA_LAYER_TYPE,
+    KDA_LAYER_TYPE,
+    Glm5NextTextConfig,
+)
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import build_weight_mappings
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -130,6 +144,29 @@ PIN_LAYER_SPEC_FIELDS = (
     "dtype",
     "sliding_window_size",
     "chunk_size",
+)
+
+#: The six fused KDA names ``inc-glm53f-078`` retired, listed so ``-082``'s
+#: KDA item can count SURVIVALS of them rather than assert a bare absence.
+#: These are the ONLY literal names ``-082`` types on an expectation side; every
+#: count below is derived from the landed map inside the test body.
+RETIRED_KDA_FUSED_NAMES = (
+    "in_proj_qkvz_weight",
+    "in_proj_ba_weight",
+    "out_proj_weight",
+    "conv1d_weight",
+    "norm_weight",
+    "conv1d_bias",
+)
+
+#: The provisional DSA indexer name ``-078`` retired for ``wq_b_weight``.
+RETIRED_DSA_INDEXER_NAME = "wq_weight"
+
+#: ``-013``'s two layer-level names, read here only to ISOLATE the mHC leaves
+#: from the map's layer-level set. Their count is not a ``-082`` reading.
+LANDED_LAYER_LEVEL_LAYERNORMS = (
+    "input_layernorm_weight",
+    "post_attention_layernorm_weight",
 )
 
 IMPL_MODULE = "vllm_neuron.model.glm5_next.model_fp8"
@@ -201,6 +238,33 @@ def _kda_entries(spec: KVSpec) -> list[LayerSpec]:
     """The COMPLEMENT of the MLA/DSA set -- the reading C03 compels."""
     return [
         layer for layer in spec.layers if layer.head_size != DECLARED_MLA_HEAD_SIZE
+    ]
+
+
+def _map_leaves(names: set[str], prefix: str) -> set[str]:
+    """Leaf names in ``names`` sitting DIRECTLY under ``prefix``, no deeper.
+
+    ``inc-glm53f-082``'s helper. The "no deeper" rule is what separates an
+    attention module's own leaves from its ``indexer`` submodule's, so the two
+    families can be counted independently out of one map.
+    """
+    leaves = set()
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        leaf = name[len(prefix) :]
+        if "." in leaf:
+            continue
+        leaves.add(leaf)
+    return leaves
+
+
+def _layer_indices(model, layer_type: str) -> list[int]:
+    """Indices of one family, read off the built layers' own ``layer_type``."""
+    return [
+        index
+        for index, layer in enumerate(model.model.layers)
+        if layer.layer_type == layer_type
     ]
 
 
@@ -572,7 +636,10 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
         model.model.forward()
 
     modules = [model.model.layers[index] for index in (0, 3)]
-    modules += [model.model.layers[0].linear_attn, model.model.layers[0].mlp]
+    # ``.attention`` rather than a family attribute name: ``inc-glm53f-082``
+    # moved the KDA module onto the map's ``self_attn`` path, and the property
+    # is the access that survives such a move.
+    modules += [model.model.layers[0].attention, model.model.layers[0].mlp]
     modules += [
         model.model.layers[3].self_attn,
         model.model.layers[3].self_attn.indexer,
@@ -631,7 +698,10 @@ def test_kv_spec_the_tree_carries_every_d14_section_name(model) -> None:
 def test_kv_spec_declared_parameter_names_match_the_landed_weight_map(model) -> None:
     """Exact set equality against ``build_weight_mappings``'s param-name side.
 
-    Per ``approvals/lead-ruling-013-param-name-authority.md``, the landed,
+    Per the lead ruling recorded at
+    ``artifacts/campaigns/glm-5.3-flash-port/increments/evidence-013.md`` L212
+    (the original ``approvals/lead-ruling-013-param-name-authority.md`` was
+    deleted in the 2026-08-31 residue purge), the landed,
     passing map is the authority and this skeleton derives from it. Neither
     side is renamed here: this asserts the derivation, so a divergence is a
     red test at CPU-mode rung 1 instead of a defect that surfaces only when a
@@ -699,6 +769,215 @@ def test_kv_spec_the_tied_head_condition_mirrors_the_map(raw: dict) -> None:
     assert model.text_config.tie_word_embeddings is True
     assert "lm_head_weight" not in declared
     assert declared == mapped
+
+
+# ---------------------------------------------------------------------------
+# ``inc-glm53f-082``: one counted item per declared parameter-name family.
+#
+# The set equality above is the BINDING reading and it is family-blind -- it
+# passes or fails on the whole map at once. These four say WHICH family moved,
+# so a later regression names itself instead of surfacing as one opaque diff.
+# Every denominator is derived from the landed map inside the body: no count is
+# typed, and there is no ``parametrize`` (plan ``§6`` rule 6 -- one item per
+# counted conjunct).
+# ---------------------------------------------------------------------------
+
+
+def test_kv_spec_kda_attention_declares_the_maps_fifteen_leaf_names(model) -> None:
+    """The KDA half's declared names ARE the map's, per module and per path.
+
+    ``inc-glm53f-078`` measured fifteen ``self_attn.*`` leaves off the published
+    checkpoint index where the skeleton had eight fused ones. This reads the
+    leaf set out of the map's own keys, so the expectation cannot drift from the
+    authority it is quoting.
+    """
+    mapped = set(build_weight_mappings(model.text_config))
+    declared = set(model.declared_parameter_names())
+    kda_indices = _layer_indices(model, KDA_LAYER_TYPE)
+    assert kda_indices, "the fixture produced no linear-attention layer"
+
+    leaves = _map_leaves(mapped, f"model.layers.{kda_indices[0]}.self_attn.")
+    for index in kda_indices:
+        assert (
+            _map_leaves(mapped, f"model.layers.{index}.self_attn.") == leaves
+        ), f"the map is not uniform across the KDA family at layer {index}"
+
+    module = model.model.layers[kda_indices[0]].attention
+    assert set(module.declared_param_names) == leaves, (
+        f"module-only: {sorted(set(module.declared_param_names) - leaves)}; "
+        f"map-only: {sorted(leaves - set(module.declared_param_names))}"
+    )
+    # The two bare state tensors have no ``.weight`` leaf and the map keeps
+    # them, so their presence is part of the family's shape, not an accident.
+    assert {"A_log", "dt_bias"} <= leaves
+
+    present = {
+        name
+        for index in kda_indices
+        for name in declared
+        if name.startswith(f"model.layers.{index}.self_attn.")
+    }
+    assert len(present) == len(leaves) * len(kda_indices)
+
+    # SURVIVALS, scoped to the family's own module paths: ``norm_weight`` is
+    # also the legitimate ``model.norm_weight``, so an unscoped scan would
+    # false-fire on a name this block must leave alone.
+    survivals = sorted(
+        name
+        for name in declared
+        if name.rsplit(".", 1)[0].endswith(".self_attn")
+        and name.rsplit(".", 1)[-1] in RETIRED_KDA_FUSED_NAMES
+    )
+    assert survivals == []
+
+    _record(
+        report_kda_attention_leaf_count=len(leaves),
+        report_kda_attention_path_count=len(present),
+        report_kda_layer_count=len(kda_indices),
+        report_kda_retired_name_survivals=len(survivals),
+    )
+
+
+def test_kv_spec_dsa_indexer_declares_the_maps_seven_leaf_names(model) -> None:
+    """The sparse indexer's declared names ARE the map's seven.
+
+    Three of the four names the skeleton carried were right; ``wq_weight`` named
+    a tensor the checkpoint does not carry, and three more were missing.
+    """
+    mapped = set(build_weight_mappings(model.text_config))
+    declared = set(model.declared_parameter_names())
+    dsa_indices = _layer_indices(model, DSA_LAYER_TYPE)
+    assert dsa_indices, "the fixture produced no sparse-attention layer"
+
+    prefix = f"model.layers.{dsa_indices[0]}.self_attn.indexer."
+    leaves = _map_leaves(mapped, prefix)
+    for index in dsa_indices:
+        assert (
+            _map_leaves(mapped, f"model.layers.{index}.self_attn.indexer.") == leaves
+        ), f"the map is not uniform across the indexer family at layer {index}"
+
+    module = model.model.layers[dsa_indices[0]].attention.indexer
+    assert set(module.declared_param_names) == leaves, (
+        f"module-only: {sorted(set(module.declared_param_names) - leaves)}; "
+        f"map-only: {sorted(leaves - set(module.declared_param_names))}"
+    )
+
+    present = {
+        name
+        for index in dsa_indices
+        for name in declared
+        if name.startswith(f"model.layers.{index}.self_attn.indexer.")
+    }
+    assert len(present) == len(leaves) * len(dsa_indices)
+
+    survivals = sorted(
+        name
+        for name in declared
+        if name.endswith(f".indexer.{RETIRED_DSA_INDEXER_NAME}")
+    )
+    assert survivals == []
+
+    _record(
+        report_dsa_indexer_leaf_count=len(leaves),
+        report_dsa_indexer_path_count=len(present),
+        report_dsa_layer_count=len(dsa_indices),
+        report_dsa_indexer_retired_name_survivals=len(survivals),
+    )
+
+
+def test_kv_spec_both_layer_classes_declare_the_maps_mhc_names_flat(model) -> None:
+    """The mHC weights sit FLAT ON THE LAYER, on both layer classes.
+
+    The map emits them from an unconditional ``_add_mhc``, so every layer of the
+    stack carries them and neither layer class declared any of them before. The
+    "flat" half is measured, not assumed: a name of this set found under any
+    submodule attribute fails here.
+    """
+    mapped = set(build_weight_mappings(model.text_config))
+    declared = set(model.declared_parameter_names())
+    layers = list(model.model.layers)
+    assert layers
+
+    layer_paths = {f"model.layers.{index}" for index in range(len(layers))}
+    first = _map_leaves(mapped, "model.layers.0.")
+    for index, layer in enumerate(layers):
+        at_layer = _map_leaves(mapped, f"model.layers.{index}.")
+        assert at_layer == first, (
+            f"layer {index} layer-level leaves differ: {sorted(at_layer)}"
+        )
+        assert set(layer.declared_param_names) == at_layer, (
+            f"layer {index} module-only: "
+            f"{sorted(set(layer.declared_param_names) - at_layer)}; map-only: "
+            f"{sorted(at_layer - set(layer.declared_param_names))}"
+        )
+
+    mhc_leaves = first - set(LANDED_LAYER_LEVEL_LAYERNORMS)
+    assert mhc_leaves, "the map emits no layer-level name beyond the layernorms"
+
+    misplaced = sorted(
+        name
+        for name in declared
+        if name.rsplit(".", 1)[-1] in mhc_leaves
+        and name.rsplit(".", 1)[0] not in layer_paths
+    )
+    assert misplaced == []
+
+    present = {
+        name for name in declared if name.rsplit(".", 1)[-1] in mhc_leaves
+    }
+    assert len(present) == len(mhc_leaves) * len(layers)
+
+    # BOTH classes, so a single-family regression cannot hide behind the other.
+    class_names = {type(layer).__name__ for layer in layers}
+    assert len(class_names) == 2, sorted(class_names)
+    for layer in layers:
+        assert mhc_leaves <= set(layer.declared_param_names)
+
+    _record(
+        report_mhc_leaf_count=len(mhc_leaves),
+        report_mhc_path_count=len(present),
+        report_mhc_layer_classes=sorted(class_names),
+        report_mhc_misplaced_paths=len(misplaced),
+    )
+
+
+def test_kv_spec_mla_attention_names_are_unchanged_and_match_the_map(model) -> None:
+    """A MEASURED NEGATIVE: the MLA names already agreed and still do.
+
+    ``inc-glm53f-082`` writes no line in this class. The item exists so "the
+    fourth family needed nothing" is a reading off the instrument rather than a
+    claim in a record.
+    """
+    mapped = set(build_weight_mappings(model.text_config))
+    declared = set(model.declared_parameter_names())
+    dsa_indices = _layer_indices(model, DSA_LAYER_TYPE)
+    assert dsa_indices
+
+    leaves = _map_leaves(mapped, f"model.layers.{dsa_indices[0]}.self_attn.")
+    module = model.model.layers[dsa_indices[0]].attention
+    assert set(module.declared_param_names) == leaves, (
+        f"module-only: {sorted(set(module.declared_param_names) - leaves)}; "
+        f"map-only: {sorted(leaves - set(module.declared_param_names))}"
+    )
+    # No name declared twice on the module.
+    assert len(module.declared_param_names) == len(leaves)
+
+    present = {
+        name
+        for index in dsa_indices
+        for name in _map_leaves(declared, f"model.layers.{index}.self_attn.")
+    }
+    assert present == leaves
+    total = sum(
+        len(_map_leaves(declared, f"model.layers.{index}.self_attn."))
+        for index in dsa_indices
+    )
+    assert total == len(leaves) * len(dsa_indices)
+
+    _record(
+        report_mla_declared_leaf_count=len(leaves),
+        report_mla_declared_path_count=total,
+    )
 
 
 # ---------------------------------------------------------------------------
