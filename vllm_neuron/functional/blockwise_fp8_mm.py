@@ -337,7 +337,9 @@ def to_kernel_scale_layout(weight_scale: Tensor, rows: int, cols: int) -> Tensor
             f"weight_scale must be fp32, got {weight_scale.dtype}"
         )
     n_k_blocks, n_n_blocks = want
-    flat = torch.empty(n_k_blocks * n_n_blocks, dtype=torch.float32)
+    flat = torch.empty(
+        n_k_blocks * n_n_blocks, dtype=torch.float32, device=weight_scale.device
+    )
     for k_block in range(n_k_blocks):
         for n_block in range(n_n_blocks):
             flat[flat_scale_index(k_block, n_block, n_n_blocks)] = weight_scale[
