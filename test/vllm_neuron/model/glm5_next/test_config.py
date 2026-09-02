@@ -21,6 +21,12 @@ pinned revision `04c4e9e95c5da8862dced7e5056455116f83a7e0` at fetch time (that
 artifact's L28 and L45). This file performs ZERO network access; the fixture's
 bytes are pinned by digest below, so a silent edit fails loudly.
 
+`inc-glm53f-080` re-transcribed the fixture's `text_config` from the in-repo
+copy of that same vendor config, `fixtures/hf-config.json`, which `inc-glm53f-078`
+lands and pins by its own digest. The pin below therefore moved; the ten
+equalities above did not, because every value they read is unchanged. The
+`-080` section at the end of this file carries that increment's four conjuncts.
+
 FALSIFIABILITY: every counted or compared reading here carries an arm that
 would fail if the reading were vacuous. The ten equalities each get a mutation
 arm proving the extractor reads the fixture rather than returning a constant;
@@ -29,13 +35,17 @@ partition is proved exhaustive, because an unrecognised family name would be
 dropped by a counting pass and inflate the other family's count silently.
 """
 
+import contextlib
 import copy
 import hashlib
 import json
+import logging
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
 
+from vllm_neuron.model.glm5_next import config as config_module
 from vllm_neuron.model.glm5_next.config import (
     DSA_LAYER_TYPE,
     KDA_LAYER_TYPE,
@@ -47,7 +57,10 @@ from vllm_neuron.model.glm5_next.config import (
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
 
 # Pinned so an edit to the fixture cannot silently move a declared value.
-FIXTURE_SHA256 = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+# Moved by `inc-glm53f-080`, which re-transcribed the fixture's `text_config`
+# from the in-repo vendor copy; the previous pin was
+# f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802.
+FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
 
 # BASE 3 for the layer schedule: the DSA layer indices as ENUMERATED in the
 # intake record (03-glm53flash-weights.md L119, `full_attn_layers (DSA)`).
@@ -323,3 +336,282 @@ def test_no_weights_are_referenced_by_the_fixture(raw):
     blob = json.dumps(raw)
     for banned in ("safetensors", "model.safetensors.index.json", "weight_map"):
         assert banned not in blob, f"fixture references weights via {banned!r}"
+
+
+# ===========================================================================
+# `inc-glm53f-080` acceptance -- WP1/WP7 repair.
+#
+# THE DEFECT, in one sentence: the real text config carries 58 keys, the fork's
+# dataclass modelled 30 of them, and the adapter dropped the other 28 without a
+# word -- one of the dropped keys was the model's own RMSNorm epsilon.
+#
+# FOUR counted conjuncts, ONE item each, no `parametrize` (plan section 6 rule
+# 6). Every expected value is DERIVED here from the two pinned fixtures; the
+# plan's own figures are pinned as constants beside the derivation, so the two
+# cannot drift apart silently.
+# ===========================================================================
+
+# `inc-glm53f-078` lands this byte-identical copy of the vendor config and pins
+# it by this digest in its own conjunct (h). This section READS it and never
+# writes it: it is the only side of the comparison that speaks for the vendor.
+REAL_CONFIG_PATH = FIXTURE_PATH.parent / "hf-config.json"
+REAL_CONFIG_SHA256 = "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f"
+
+# The plan's declared figures for this block.
+C080_REAL_TEXT_KEYS = 58
+C080_DROPPED_KEYS = 26
+C080_KDA_LAYERS = 34
+C080_FULL_ATTN_LAYERS = 11
+C080_QUANT_CONFIG_KEYS = 4
+
+# The checkpoint's two epsilons. They are DIFFERENT numbers, which is the whole
+# point of the repair: one field cannot carry both.
+C080_RMS_NORM_EPS = 1e-05
+C080_HC_EPS = 1e-06
+
+# Conjunct (d)'s two readings. The non-default value is what makes reading 1
+# falsifiable: a hard-wired `1e-05` in the resolution would fail it.
+C080_NON_DEFAULT_RMS_NORM_EPS = 3e-05
+C080_EXPLICIT_OVERRIDE_EPS = 1e-6
+
+
+def _real_text_config() -> dict:
+    """The vendor config's `text_config`, digest-checked before it is trusted."""
+    digest = hashlib.sha256(REAL_CONFIG_PATH.read_bytes()).hexdigest()
+    assert digest == REAL_CONFIG_SHA256, f"hf-config.json moved: sha256={digest}"
+    return json.loads(REAL_CONFIG_PATH.read_text())["text_config"]
+
+
+class _RecordingHandler(logging.Handler):
+    """Collects records off the config module's own logger object."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _capture_drop_log():
+    """Attach to `config.logger` directly, not through `caplog`.
+
+    Directly, because `caplog`'s handler lives on the root logger, so a
+    propagation setting anywhere in vLLM's logging configuration would make
+    this read zero for a reason that has nothing to do with the code under
+    test. This is the pattern `test_platform_quant_validation.py` landed.
+    """
+    handler = _RecordingHandler()
+    target = config_module.logger
+    previous_level = target.level
+    target.addHandler(handler)
+    target.setLevel(logging.WARNING)
+    try:
+        yield handler
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous_level)
+
+
+class _RouterBankStub:
+    """Only the two attributes `route_tokens` reads off `self`.
+
+    A real `Glm5NextRoutedExperts` is not built, because the seam is replaced
+    by a recorder and nothing downstream of it runs: no kernel is entered and
+    no accelerator is reached.
+    """
+
+    def __init__(self) -> None:
+        self.router_weight = object()
+        self.router_bias = object()
+
+
+class _SeamRecorder:
+    """Stands in for the router seam and records the `eps=` it was handed.
+
+    Returns the FOUR values the caller unpacks -- logits, expert index, expert
+    affinities, substrate index -- so `route_tokens` completes normally.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return ("logits", "expert_index", "expert_affinities", "substrate_index")
+
+
+def test_c080_a_the_two_epsilons_are_two_distinct_values(cfg):
+    """(a) `rms_norm_eps == 1e-05`, `hc_eps == 1e-06`, and the two are unequal.
+
+    The inequality is the conjunct. Before this block the fork carried one
+    epsilon field, so every RMSNorm that reached for a config epsilon got the
+    mHC number; the two values being distinct is what proves that is over.
+    """
+    text = cfg.text_config
+    real = _real_text_config()
+    print(f"\n[C080-a] config rms_norm_eps={text.rms_norm_eps!r}")
+    print(f"[C080-a] config hc_eps={text.hc_eps!r}")
+    print(f"[C080-a] vendor rms_norm_eps={real['rms_norm_eps']!r}")
+    print(f"[C080-a] vendor hc_eps={real['hc_eps']!r}")
+
+    assert text.rms_norm_eps == C080_RMS_NORM_EPS
+    assert text.hc_eps == C080_HC_EPS
+    assert text.rms_norm_eps != text.hc_eps
+    # Both readings are the vendor's own, so neither is a dataclass default
+    # that happens to agree with the fixture.
+    assert real["rms_norm_eps"] == C080_RMS_NORM_EPS
+    assert real["hc_eps"] == C080_HC_EPS
+
+
+def test_c080_b_the_retranscribed_fixture_agrees_with_the_vendor_config(raw):
+    """(b) 58 keys, none absent from the vendor config, both layer lists present.
+
+    Plus the declared negative that keeps ONE source of truth for the skip
+    list: `quantization_config` stays at its 4 keys with
+    `modules_to_not_convert` ABSENT, so the 1,509-entry list exists in this
+    repository exactly once -- in `hf-config.json`.
+    """
+    real = _real_text_config()
+    fixture_text = raw["text_config"]
+    absent = sorted(k for k in real if k not in fixture_text)
+    extra = sorted(k for k in fixture_text if k not in real)
+    lac = fixture_text["linear_attn_config"]
+    quant = raw["quantization_config"]
+    real_quant = json.loads(REAL_CONFIG_PATH.read_text())["quantization_config"]
+
+    print(f"\n[C080-b] fixture text_config keys={len(fixture_text)}")
+    print(f"[C080-b] vendor  text_config keys={len(real)}")
+    print(f"[C080-b] vendor keys the fixture lacks={absent}")
+    print(f"[C080-b] fixture keys the vendor lacks={extra}")
+    print(f"[C080-b] kda_layers={len(lac['kda_layers'])}")
+    print(f"[C080-b] full_attn_layers={len(lac['full_attn_layers'])}")
+    print(f"[C080-b] quantization_config keys={sorted(quant)}")
+
+    assert len(fixture_text) == C080_REAL_TEXT_KEYS
+    assert len(real) == C080_REAL_TEXT_KEYS
+    assert absent == []
+    assert extra == []
+    assert len(lac["kda_layers"]) == C080_KDA_LAYERS
+    assert len(lac["full_attn_layers"]) == C080_FULL_ATTN_LAYERS
+    assert lac["kda_layers"] == real["linear_attn_config"]["kda_layers"]
+    assert lac["full_attn_layers"] == real["linear_attn_config"]["full_attn_layers"]
+    # The two lists partition the 45 layers, and the DSA half is the same set
+    # the intake record enumerated -- two bases, one answer.
+    assert len(lac["kda_layers"]) + len(lac["full_attn_layers"]) == 45
+    assert lac["full_attn_layers"] == INTAKE_RECORDED_DSA_INDICES
+    # ONE source of truth for the skip list: present there, absent here.
+    assert len(quant) == C080_QUANT_CONFIG_KEYS
+    assert "modules_to_not_convert" not in quant
+    assert "modules_to_not_convert" in real_quant
+
+
+def test_c080_c_the_filter_names_every_key_it_drops():
+    """(c) The drop log names exactly the keys the dataclass does not model.
+
+    The expected set is DERIVED from the vendor config and the dataclass, never
+    typed in: it is the vendor's keys that are neither a `fields(cls)` name nor
+    the key the `dtype` -> `torch_dtype` remap consumes. `dtype` is therefore
+    absent from the log, because the adapter reads it.
+
+    Non-vacuity (D1.5): the set must be NON-EMPTY, so a log that named nothing
+    fails this item.
+    """
+    real = _real_text_config()
+    field_names = {f.name for f in fields(Glm5NextTextConfig)}
+    # The remap's own condition, restated once from the data rather than
+    # asserted by name: it fires only when the HF dict carries `dtype`, lacks
+    # `torch_dtype`, and the dataclass declares `torch_dtype`.
+    remapped = set()
+    if "dtype" in real and "torch_dtype" not in real and "torch_dtype" in field_names:
+        remapped.add("dtype")
+    expected = sorted(set(real) - field_names - remapped)
+
+    with _capture_drop_log() as handler:
+        built = Glm5NextTextConfig.from_hf_config(copy.deepcopy(real))
+
+    warnings = [r for r in handler.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected one drop-log record, got {len(warnings)}"
+    logged = sorted(warnings[0].args[-1].split(", "))
+
+    print(f"\n[C080-c] logged {len(logged)} dropped keys={logged}")
+    print(f"[C080-c] expected {len(expected)} dropped keys={expected}")
+    print(f"[C080-c] message={warnings[0].getMessage()}")
+    print(f"[C080-c] remap consumed={sorted(remapped)}")
+    print(f"[C080-c] built torch_dtype={built.torch_dtype}")
+
+    assert logged == expected
+    assert len(logged) == C080_DROPPED_KEYS
+    assert logged, "the drop log named nothing, so this item would be vacuous"
+    # The remap really did fire, which is the ground for `dtype` not being in
+    # the log: the value landed on the dataclass field.
+    assert str(built.torch_dtype) == "torch.bfloat16"
+    assert "dtype" not in logged
+    # And the key this block adds is no longer dropped.
+    assert "rms_norm_eps" not in logged
+    assert "rms_norm_eps" in field_names
+
+
+def test_c080_d_the_seam_receives_the_config_epsilon(raw, cfg, monkeypatch):
+    """(d) The seam gets the CONFIG's epsilon on a call that passes no `eps`.
+
+    Reading 1 -- the production call shape, `route_tokens(hidden, gamma,
+    text_config)`. It is measured on a config whose `rms_norm_eps` is set to a
+    NON-DEFAULT `3e-05`, so a hard-wired `1e-05` in the resolution fails it;
+    the dataclass default `1e-05` is recorded alongside as the fixture reading.
+
+    Reading 2 -- the explicit-override control (D1.5): `eps=1e-6` is still
+    delivered unchanged. This is what proves the resolution honours a caller,
+    and it is what keeps `inc-glm53f-032`'s landed call honoured.
+
+    Both values are read back from the RECORDED call, never from the signature
+    default. No kernel runs and no accelerator is reached.
+    """
+    from vllm_neuron.functional.moe import router as router_module
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextRoutedExperts
+
+    mutated = copy.deepcopy(raw)
+    mutated["text_config"]["rms_norm_eps"] = C080_NON_DEFAULT_RMS_NORM_EPS
+    non_default_text = Glm5NextConfig.from_configs(mutated).text_config
+    fixture_reading = cfg.text_config.rms_norm_eps
+
+    recorder = _SeamRecorder()
+    monkeypatch.setattr(
+        router_module, "noaux_tc_rmsnorm_router_topk", recorder, raising=True
+    )
+    bank = _RouterBankStub()
+    hidden, gamma = object(), object()
+
+    # Reading 1: the production call shape -- no `eps` argument at all. This is
+    # byte-for-byte the shape `-032`'s landed test calls with.
+    Glm5NextRoutedExperts.route_tokens(bank, hidden, gamma, non_default_text)
+    # Reading 2: the explicit override.
+    Glm5NextRoutedExperts.route_tokens(
+        bank, hidden, gamma, non_default_text, eps=C080_EXPLICIT_OVERRIDE_EPS
+    )
+
+    assert len(recorder.calls) == 2, f"seam entered {len(recorder.calls)} times"
+    reading1 = recorder.calls[0]["eps"]
+    reading2 = recorder.calls[1]["eps"]
+
+    print(f"\n[C080-d] reading 1 (no eps passed) seam eps={reading1!r}")
+    print(f"[C080-d] config rms_norm_eps={non_default_text.rms_norm_eps!r}")
+    print(f"[C080-d] fixture default reading={fixture_reading!r}")
+    print(f"[C080-d] reading 2 (eps passed) seam eps={reading2!r}")
+
+    # Reading 1: the seam got the config's number, not a literal.
+    assert reading1 == C080_NON_DEFAULT_RMS_NORM_EPS
+    assert reading1 == non_default_text.rms_norm_eps
+    assert reading1 != C080_RMS_NORM_EPS, "a hard-wired 1e-05 would pass vacuously"
+    # ... and the fixture's own reading is the checkpoint's 1e-05.
+    assert fixture_reading == C080_RMS_NORM_EPS
+    # Reading 2: the override survives, so the resolution is not a clamp.
+    assert reading2 == C080_EXPLICIT_OVERRIDE_EPS
+    assert reading2 != reading1
+    # The recorded call is the one this method made, so the recorded `eps`
+    # belongs to it and to nothing else.
+    assert recorder.calls[0]["hidden_states"] is hidden
+    assert recorder.calls[0]["gamma"] is gamma
+    assert recorder.calls[0]["correction_bias"] is bank.router_bias
+    assert recorder.calls[0]["router_weights"] is bank.router_weight

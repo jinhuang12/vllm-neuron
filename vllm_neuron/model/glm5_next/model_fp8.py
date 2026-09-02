@@ -443,15 +443,30 @@ class Glm5NextHyperConnection(nn.Module):
                 field carries it, so it is a constructor argument rather than an
                 invented config default.
 
-        ONE EPSILON, THREE USES, AND THAT MATCHES THE BASE. The fork's config
-        carries a single ``hc_eps`` where the base's signature takes three
-        (``rms_eps``, ``hc_pre_eps``, ``hc_sinkhorn_eps``). This is **not** a
-        gap: the base's own kernel test sets all three to one value --
-        ``hc_sinkhorn_eps = hc_pre_eps = rms_eps = 1e-6``
-        (``tests/kernels/test_mhc_kernels.py:121``) -- and the fork's
-        ``hc_eps`` default is that same ``1e-06``. So the single field is
-        faithful, and it is recorded here because a reader comparing signatures
-        would otherwise read a missing dial.
+        TWO EPSILONS FOR THE BASE'S THREE, GROUNDED ON THE CHECKPOINT. The
+        base's signature takes three (``rms_eps``, ``hc_pre_eps``,
+        ``hc_sinkhorn_eps``) and the fork's config carries two fields. The
+        split follows what the checkpoint sets, not what the base's test sets:
+
+        * ``hc_pre_eps`` and ``hc_sinkhorn_eps`` are mHC-native, and the
+          checkpoint's own ``text_config.hc_eps`` is ``1e-06``, so both keep
+          ``hc_eps`` and the base's collapse onto one value is faithful for
+          them. That is the value ``inc-glm53f-030`` measured its tiny case on,
+          and nothing it recorded moves.
+        * ``rms_eps`` is an RMSNorm epsilon, and the checkpoint's RMSNorm
+          epsilon is ``1e-05`` -- a different number. It lives on
+          ``Glm5NextTextConfig.rms_norm_eps`` (``inc-glm53f-080``) and reaches
+          the router seam through :meth:`Glm5NextRoutedExperts.route_tokens`.
+          It reaches no mHC line: ``self.hc_eps`` and the three sites that
+          consume it below are unchanged.
+
+        WHAT THIS CORRECTS. The earlier wording argued the single field was
+        faithful for all three uses, and grounded that on the base's own kernel
+        test setting ``hc_sinkhorn_eps = hc_pre_eps = rms_eps = 1e-6``
+        (``tests/kernels/test_mhc_kernels.py:121``). That is the base's number,
+        not the target's. Two thirds of the claim stand on the checkpoint's own
+        ``hc_eps``; the RMSNorm third is settled against the checkpoint
+        instead, which is where it always belonged.
 
         Raises:
             Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
@@ -813,18 +828,24 @@ class Glm5NextRoutedExperts(nn.Module):
     # shared-expert path (``-033``). Doing it here would put two owners on one
     # behaviour.
     #
-    # ``rms_norm_eps`` IS ABSENT, MEASURED NOT ASSUMED. Neither
-    # ``Glm5NextTextConfig`` nor the campaign's pinned
-    # ``fixtures/config.json`` carries an ``rms_norm_eps``, so the substrate's
-    # own default (``rmsnorm_router_topk_tkg``'s ``eps=1e-6``) is the only value
-    # available and is surfaced as a parameter rather than buried.
+    # ``rms_norm_eps`` IS THE CONFIG'S, MEASURED NOT ASSUMED. The earlier note
+    # here read the key as absent. Both halves of that reading were true when
+    # taken -- neither ``Glm5NextTextConfig`` nor the pinned
+    # ``fixtures/config.json`` carried an ``rms_norm_eps`` -- but the conclusion
+    # drawn from them, that the substrate's own ``eps=1e-6`` was the only value
+    # available, is refuted by the checkpoint: its ``text_config`` carries
+    # ``rms_norm_eps = 1e-05``. ``inc-glm53f-080`` adds the field and
+    # re-transcribes the fixture, so this method resolves the epsilon from the
+    # config it already receives and hands THAT number to the seam. ``eps``
+    # stays a parameter so a caller can still override it; a caller that passes
+    # nothing now gets the checkpoint's value rather than the kernel's.
 
     def route_tokens(
         self,
         hidden_states: torch.Tensor,
         gamma: torch.Tensor,
         text_config: Glm5NextTextConfig,
-        eps: float = 1e-6,
+        eps: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route ``[B, S, H]`` tokens to the top-``k`` experts with ``noaux_tc``.
 
@@ -832,7 +853,9 @@ class Glm5NextRoutedExperts(nn.Module):
             hidden_states: ``[B, S, H]`` pre-norm decoder activations.
             gamma: ``[H]`` or ``[1, H]`` router RMSNorm weights.
             text_config: the decoder config the routing hyperparameters live on.
-            eps: RMSNorm epsilon; see the section note above.
+            eps: RMSNorm epsilon. ``None``, the default, resolves it from
+                ``text_config.rms_norm_eps`` -- the checkpoint's ``1e-05``.
+                Pass a float to override it. See the section note above.
 
         Returns:
             ``(router_logits [T, E], expert_index [T, k] int32,
@@ -848,6 +871,13 @@ class Glm5NextRoutedExperts(nn.Module):
         the sigmoid scores would compute a different router that no shape check
         could catch.
         """
+        # The config's epsilon is the operative one unless a caller overrides
+        # it. Resolved here rather than as a signature default, because a
+        # signature default hard-wires one number into the code and this one
+        # belongs to the checkpoint.
+        if eps is None:
+            eps = float(text_config.rms_norm_eps)
+
         # Function-local import, following the landed ``inc-glm53f-023`` and
         # ``-031`` precedent in this file: this file's module import block is
         # ``-013``'s D14 section.

@@ -23,12 +23,15 @@ unusual enough to call out, because both drive downstream shape decisions:
 """
 
 import json
+import logging
 from dataclasses import dataclass, field, fields
 
 import torch
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
+
+logger = logging.getLogger(__name__)
 
 # Layer-family names exactly as they appear in text_config.layer_types.
 # Compared by EQUALITY, never by substring: "attention" is a substring of both,
@@ -68,6 +71,14 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     Filters the HF dict to fields declared on the target dataclass, coerces
     the dtype string, and attaches the neuron_config. Same shape as the
     sibling arch packages use, so the two read alike.
+
+    EVERY DROPPED KEY IS NAMED AT ``WARNING`` (``inc-glm53f-080``). The filter
+    below keeps only declared fields, and it used to drop the rest without a
+    word: the real checkpoint's ``text_config`` carries 58 keys and this
+    dataclass family models 30 of them, so 26 real keys reached nothing and a
+    reader had no way to learn which. One of them was the model's own
+    ``rms_norm_eps``. The log is the repair, so the next missing field is found
+    by reading a warning rather than by counting fields by hand.
     """
     if isinstance(hf_sub_config, PretrainedConfig):
         config_dict = hf_sub_config.to_dict()
@@ -80,14 +91,34 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     filtered = {k: v for k, v in config_dict.items() if k in field_names}
 
     # HF config.json uses "dtype"; the dataclass uses "torch_dtype".
+    # ``remapped`` records the HF key this branch CONSUMES, so the drop log
+    # below cannot report a key the adapter actually reads. It is filled only
+    # when the branch fires: an HF dict carrying both names leaves "dtype"
+    # genuinely unused, and then it is a dropped key like any other.
+    remapped: set[str] = set()
     if (
         "torch_dtype" not in filtered
         and "dtype" in config_dict
         and "torch_dtype" in field_names
     ):
         filtered["torch_dtype"] = config_dict["dtype"]
+        remapped.add("dtype")
     if "torch_dtype" in filtered and isinstance(filtered["torch_dtype"], str):
         filtered["torch_dtype"] = getattr(torch, filtered["torch_dtype"])
+
+    dropped = sorted(set(config_dict) - field_names - remapped)
+    if dropped:
+        # One record, every name in it: a per-key record would put 26 lines in
+        # the log for one config and get filtered out as noise.
+        logger.warning(
+            "%s models %d of the %d keys in this HF config and DROPS the "
+            "other %d: %s",
+            cls.__name__,
+            len(config_dict) - len(dropped),
+            len(config_dict),
+            len(dropped),
+            ", ".join(dropped),
+        )
 
     if neuron_config is not None:
         filtered["neuron_config"] = neuron_config
@@ -146,6 +177,15 @@ class Glm5NextTextConfig:
     scoring_func: str = "sigmoid"
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 2.5
+
+    # -- Normalisation epsilons, TWO of them and not one -------------------
+    # ``rms_norm_eps`` is the decoder's RMSNorm epsilon and ``hc_eps`` is the
+    # mHC epsilon. The checkpoint sets them to DIFFERENT values (1e-05 and
+    # 1e-06), so collapsing them onto one field would change what every
+    # RMSNorm computes. The default here is the checkpoint's own 1e-05, so a
+    # config that omits the key resolves to the target's number rather than to
+    # whatever a kernel happens to default to (``inc-glm53f-080``).
+    rms_norm_eps: float = 1e-05
 
     # -- Multi-hyper-connections (mHC) -------------------------------------
     mhc: bool = True
