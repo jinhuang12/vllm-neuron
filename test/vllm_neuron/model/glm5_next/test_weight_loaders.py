@@ -82,6 +82,7 @@ pins them, the acceptance says 3, and
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -157,35 +158,57 @@ def _hf_keys_for_layer(
     """
     keys = ["input_layernorm.weight", "post_attention_layernorm.weight"]
 
+    # Multi-hyper-connections: six bare tensors on every layer of the real stack.
+    # inc-glm53f-078 -- declared ABSENT before the real index was on disk.
+    keys += [
+        "hc_attn_base",
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_ffn_base",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+    ]
+
     if is_dsa:
-        for leaf in (
-            "q_a_proj",
-            "q_b_proj",
-            "kv_a_proj_with_mqa",
-            "kv_b_proj",
-            "o_proj",
-        ):
+        # inc-glm53f-078: only these four carry a scale companion.
+        for leaf in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"):
             keys += [f"self_attn.{leaf}.weight", f"self_attn.{leaf}.{SCALE_SUFFIX}"]
-        keys += ["self_attn.q_a_layernorm.weight", "self_attn.kv_a_layernorm.weight"]
-        for leaf in ("wq", "wk"):
-            keys += [
-                f"self_attn.indexer.{leaf}.weight",
-                f"self_attn.indexer.{leaf}.{SCALE_SUFFIX}",
-            ]
         keys += [
+            "self_attn.kv_b_proj.weight",  # real projection, no scale in this ckpt
+            "self_attn.q_a_layernorm.weight",
+            "self_attn.kv_a_layernorm.weight",
+        ]
+        # inc-glm53f-078: wq_b not wq, no indexer scales, plus the three leaves
+        # nothing mapped before.
+        keys += [
+            "self_attn.indexer.wq_b.weight",
+            "self_attn.indexer.wk.weight",
             "self_attn.indexer.k_norm.weight",
+            "self_attn.indexer.k_norm.bias",
             "self_attn.indexer.weights_proj.weight",
+            "self_attn.indexer.index_kpool_compress_ape",
+            "self_attn.indexer.index_kpool_compress_gate",
         ]
     else:
-        for leaf in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
-            keys += [f"linear_attn.{leaf}.weight", f"linear_attn.{leaf}.{SCALE_SUFFIX}"]
-        keys += [
-            "linear_attn.conv1d.weight",
-            "linear_attn.norm.weight",
-            "linear_attn.conv1d.bias",
-            "linear_attn.dt_bias",
-            "linear_attn.A_log",
-        ]
+        # inc-glm53f-078: the KDA family is 15 self_attn leaves and no scales,
+        # not the qwen3_next linear_attn convention this file first guessed.
+        for leaf in (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "f_b_proj",
+            "g_a_proj",
+            "g_b_proj",
+            "q_conv1d",
+            "k_conv1d",
+            "v_conv1d",
+            "o_norm",
+            "o_proj",
+        ):
+            keys += [f"self_attn.{leaf}.weight"]
+        keys += ["self_attn.A_log", "self_attn.dt_bias"]
 
     if is_moe:
         keys += ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
@@ -216,6 +239,32 @@ def _non_layer_hf_keys(*, tie_word_embeddings: bool) -> list[str]:
     return keys
 
 
+#: The module-tree prefix ``hf_state_to_fake_slices`` applies, and the
+#: checkpoint prefix the real index actually uses (``inc-glm53f-078``).
+MODULE_PREFIX = "model."
+CKPT_PREFIX = "model.language_model."
+
+
+def _into_checkpoint_namespace(key: str) -> str:
+    """Move one module-namespace key into the checkpoint's namespace.
+
+    ``hf_state_to_fake_slices`` (``test/vllm_neuron/model/utils.py``) qualifies
+    every layer key as ``model.layers.<i>.<leaf>``, which is the module tree's
+    namespace and what this file's miniature was built in. The real checkpoint
+    puts every text-model tensor under ``model.language_model.`` instead, so the
+    miniature is moved after the shared helper runs rather than by changing the
+    helper -- that helper is another increment's surface and other models use it.
+
+    ``lm_head.weight`` is outside the text-model prefix in the real index and is
+    left alone, which is why this is a prefix rewrite and not a blanket one.
+    """
+    if key.startswith(CKPT_PREFIX):
+        return key
+    if key.startswith(MODULE_PREFIX):
+        return CKPT_PREFIX + key[len(MODULE_PREFIX) :]
+    return key
+
+
 # --------------------------------------------------------------------------- #
 # The fixture: slice map via the helper, 3-shard composition authored here.
 # --------------------------------------------------------------------------- #
@@ -232,8 +281,8 @@ def _build_slice_map(cfg: Glm5NextTextConfig) -> dict[str, FakeSafeSlice]:
     One ``hf_state_to_fake_slices`` call per layer (so the helper applies each
     layer's own prefix) plus one with ``layer_idx=None`` for the rest.
     """
-    slice_map: dict[str, FakeSafeSlice] = {}
-    slice_map.update(
+    raw: dict[str, FakeSafeSlice] = {}
+    raw.update(
         hf_state_to_fake_slices(
             _fake_state(
                 _non_layer_hf_keys(tie_word_embeddings=cfg.tie_word_embeddings)
@@ -248,7 +297,12 @@ def _build_slice_map(cfg: Glm5NextTextConfig) -> dict[str, FakeSafeSlice]:
             n_routed=cfg.n_routed_experts,
             n_shared=cfg.n_shared_experts,
         )
-        slice_map.update(hf_state_to_fake_slices(_fake_state(layer_keys), layer_id))
+        raw.update(hf_state_to_fake_slices(_fake_state(layer_keys), layer_id))
+    # inc-glm53f-078: the helper qualifies into the module namespace, the real
+    # checkpoint is one namespace over. Rewriting is injective on this key set
+    # (asserted), so the count cannot change under it.
+    slice_map = {_into_checkpoint_namespace(key): sl for key, sl in raw.items()}
+    assert len(slice_map) == len(raw), "namespace rewrite collided two keys"
     return slice_map
 
 
@@ -383,7 +437,9 @@ def test_skeleton_unmatched_counters_can_report_nonzero(
     all_keys = list(slice_map)
 
     # (a) drop one checkpoint key the mapping asks for -> unmatched parameter.
-    dropped = "model.layers.3.mlp.shared_experts.down_proj.weight"
+    # inc-glm53f-078 re-namespaced the checkpoint side; the parameter name below
+    # is unchanged, which is exactly the split this literal now demonstrates.
+    dropped = "model.language_model.layers.3.mlp.shared_experts.down_proj.weight"
     assert dropped in slice_map, "fixture no longer holds the key this arm drops"
     short_index = Glm5NextShardIndex.from_shard_key_lists(
         _partition_into_shards([k for k in all_keys if k != dropped])
@@ -441,7 +497,9 @@ def test_skeleton_duplicate_is_certified_by_the_loader_not_the_fixture(
     Leg 2: the pin's own flattened ``{key: file}`` dict silently loses it.
     Leg 3: the loader reports it, and raises under ``strict``.
     """
-    duplicated = "model.layers.0.linear_attn.out_proj.weight"
+    # inc-glm53f-078: layer 0 is KDA, and the KDA family's real output projection
+    # is ``self_attn.o_proj`` in the checkpoint namespace.
+    duplicated = "model.language_model.layers.0.self_attn.o_proj.weight"
     assert duplicated in slice_map
 
     shards = _partition_into_shards(list(slice_map))
@@ -534,10 +592,14 @@ def test_skeleton_key_families_are_all_tagged() -> None:
     """Every declared family carries a provenance tag, and absences are named."""
     assert KEY_FAMILY_PROVENANCE
     assert set(KEY_FAMILY_PROVENANCE.values()) <= {GROUNDED, PROVISIONAL}
+    # inc-glm53f-078 re-tagged both: each leaf is now a name the published index
+    # itself carries, measured rather than guessed from a sibling architecture.
     assert {"dsa_indexer", "kda_linear_attention"} <= {
-        name for name, tag in KEY_FAMILY_PROVENANCE.items() if tag == PROVISIONAL
+        name for name, tag in KEY_FAMILY_PROVENANCE.items() if tag == GROUNDED
     }
-    assert set(ABSENT_KEY_FAMILIES) == {"multi_hyper_connections", "vision_tower"}
+    # inc-glm53f-078 removed multi_hyper_connections: the family is present in
+    # the index and is now mapped, so declaring it absent would be false.
+    assert set(ABSENT_KEY_FAMILIES) == {"vision_tower"}
     assert all(reason.strip() for reason in ABSENT_KEY_FAMILIES.values())
     _record(
         provisional_families=sorted(
@@ -597,6 +659,496 @@ def test_skeleton_reports_the_measured_readings(coverage, shard_index, slice_map
         report_results_path=str(_RESULTS_PATH),
     )
     assert _RESULTS_PATH.exists()
+
+
+# =========================================================================== #
+# inc-glm53f-078 -- WP1 REPAIR: the real checkpoint index and config as fixtures
+# =========================================================================== #
+#
+# WHY THESE ITEMS ARE HERE AND NOT IN A NEW FILE
+# ----------------------------------------------
+# `inc-glm53f-078` is a SECOND WRITER on `inc-glm53f-011`'s `-k skeleton` side
+# (plan section 11 row A.1, partitioned by concern: `-011` owns the shard index
+# and the key map's shape, `-078` owns the checkpoint-key namespace and the
+# family names). Every item below carries `skeleton` and none carries
+# `fp8_downscale`, so `inc-glm53f-012`'s selection cannot collect them.
+#
+# WHAT IS DIFFERENT ABOUT THEM
+# ----------------------------
+# Everything above runs on a 4-layer miniature this file authors. These eight
+# run on the REAL published checkpoint index -- 76,108 keys over 62 shards --
+# landed as `fixtures/model.safetensors.index.json`. That is the whole point of
+# the increment: `-011` wrote the key map against no checkpoint at all.
+#
+# EIGHT ITEMS, ONE PER COUNTED CONJUNCT, NO PARAMETRIZE (section 6 rule 6), and
+# every denominator is DERIVED from the fixture rather than typed in, so a
+# fixture that changed would move the expectation with it instead of silently
+# disagreeing with a literal.
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+REAL_INDEX_PATH = FIXTURES_DIR / "model.safetensors.index.json"
+REAL_CONFIG_PATH = FIXTURES_DIR / "hf-config.json"
+
+#: The two families excluded from this increment's scope, each with its reason.
+#: Prefixes, not counts: the counts are read off the fixture below.
+MTP_LAYER_PREFIX = "model.language_model.layers.45."
+VISION_PREFIX = "model.visual."
+
+#: The vendor's own numbers for the two fixtures, fixed before this increment
+#: ran. They are usable as expected values ONLY because each fixture is a
+#: byte-identical copy of the published file -- see each fixture's provenance
+#: sidecar. A digest this increment computed after editing a file would certify
+#: nothing.
+VENDOR_INDEX_SHA256 = (
+    "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05"
+)
+VENDOR_INDEX_BYTES = 8406613
+VENDOR_CONFIG_SHA256 = (
+    "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f"
+)
+VENDOR_CONFIG_BYTES = 69416
+
+
+@pytest.fixture(scope="module")
+def real_weight_map() -> dict[str, str]:
+    """The published index's own ``weight_map``: ``{checkpoint_key: shard}``."""
+    return json.loads(REAL_INDEX_PATH.read_text())["weight_map"]
+
+
+@pytest.fixture(scope="module")
+def real_text_config() -> Glm5NextTextConfig:
+    """The text config built from the real published config, not from defaults."""
+    raw = json.loads(REAL_CONFIG_PATH.read_text())
+    return Glm5NextTextConfig.from_hf_config(raw["text_config"])
+
+
+@pytest.fixture(scope="module")
+def real_in_scope(real_weight_map) -> dict[str, str]:
+    """The in-scope key population: the whole map less the two named families."""
+    return {
+        key: shard
+        for key, shard in real_weight_map.items()
+        if not key.startswith(MTP_LAYER_PREFIX) and not key.startswith(VISION_PREFIX)
+    }
+
+
+@pytest.fixture(scope="module")
+def real_index(real_in_scope) -> Glm5NextShardIndex:
+    """A shard index over the in-scope keys, built the FAITHFUL way.
+
+    ``from_shard_key_lists`` off per-shard lists rather than
+    ``from_weight_map``, because the flattened direction is documented as unable
+    to report a cross-shard duplicate at all -- and conjunct (d) is a duplicate
+    reading, so it has to run on the direction that can report one.
+    """
+    per_shard: dict[str, list[str]] = {}
+    for key, shard in real_in_scope.items():
+        per_shard.setdefault(shard, []).append(key)
+    return Glm5NextShardIndex.from_shard_key_lists(per_shard)
+
+
+@pytest.fixture(scope="module")
+def real_mappings(real_text_config) -> dict[str, str | list[str]]:
+    """The mapping under test, over the real 45-layer schedule."""
+    return build_weight_mappings(real_text_config)
+
+
+@pytest.fixture(scope="module")
+def real_referenced(real_mappings) -> frozenset[str]:
+    """Every checkpoint key the mapping references, flattened."""
+    return frozenset(
+        key
+        for value in real_mappings.values()
+        for key in (value if isinstance(value, list) else [value])
+    )
+
+
+@pytest.fixture(scope="module")
+def real_coverage(real_index, real_mappings):
+    return check_key_coverage(real_index, real_mappings)
+
+
+def _layers_of(text_config: Glm5NextTextConfig, family: str) -> list[int]:
+    """Layer indices of one attention family, by equality on ``layer_types``."""
+    return [i for i, t in enumerate(text_config.layer_types) if t == family]
+
+
+def _self_attn_keys(referenced: frozenset[str], layers: list[int]) -> list[str]:
+    """Referenced ``self_attn`` keys on the named layers, checkpoint namespace."""
+    prefixes = tuple(f"model.language_model.layers.{i}.self_attn." for i in layers)
+    return sorted(key for key in referenced if key.startswith(prefixes))
+
+
+def _leaf_after(key: str, marker: str) -> str:
+    return key.split(marker, 1)[1]
+
+
+# --------------------------------------------------------------------------- #
+# (a) The in-scope population is the two exclusions subtracted, and they sum.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_index_population_is_the_two_exclusions_subtracted(
+    real_weight_map, real_in_scope
+) -> None:
+    """(a) 74,001 = 76,108 - 1,760 - 347, each term counted off the fixture.
+
+    The two exclusions are named and counted rather than assumed, and the three
+    parts are asserted to sum to the whole: a subtraction nobody adds back up is
+    how a silently-dropped family hides.
+    """
+    total = len(real_weight_map)
+    mtp = [k for k in real_weight_map if k.startswith(MTP_LAYER_PREFIX)]
+    vision = [k for k in real_weight_map if k.startswith(VISION_PREFIX)]
+    in_scope = len(real_in_scope)
+
+    assert total == 76_108
+    assert len(mtp) == 1_760
+    assert len(vision) == 347
+    assert in_scope == 74_001
+    # The sum, which is what makes the subtraction a partition.
+    assert in_scope + len(mtp) + len(vision) == total
+    # And the two exclusions are disjoint, so no key was subtracted twice.
+    assert set(mtp).isdisjoint(vision)
+
+    _record(
+        c078a_total_weight_map_keys=total,
+        c078a_mtp_excluded=len(mtp),
+        c078a_vision_excluded=len(vision),
+        c078a_in_scope=in_scope,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (b) check_key_coverage reports k/N == 100% over that population.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_index_coverage_is_one_hundred_percent(
+    real_coverage, real_in_scope
+) -> None:
+    """(b) 74,001 / 74,001 mapped, 0 unmatched in either direction.
+
+    A shortfall here is ``evidence_contradicts_design`` to the lead and never a
+    fixture edit or a parameter rename (plan section 11 row A.3). The two
+    unmatched lists are asserted empty before the count, so a failure names the
+    keys rather than only the number.
+    """
+    assert real_coverage.unmatched_checkpoint_keys == ()
+    assert real_coverage.unmatched_parameters == {}
+    assert real_coverage.unmatched_count == 0
+    assert real_coverage.unique_checkpoint_key_count == len(real_in_scope)
+    assert real_coverage.mapped_key_count == len(real_in_scope)
+    assert real_coverage.coverage_fraction == 1.0
+    assert real_coverage.is_complete
+
+    _record(
+        c078b_unique_checkpoint_keys=real_coverage.unique_checkpoint_key_count,
+        c078b_mapped_key_count=real_coverage.mapped_key_count,
+        c078b_coverage_fraction=real_coverage.coverage_fraction,
+        c078b_unmatched_count=real_coverage.unmatched_count,
+        c078b_parameter_count=len(real_coverage.matched_parameters),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (c) Zero orphan scale keys, over a scale population that is not empty.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_index_has_no_orphan_scale_keys(
+    real_in_scope, real_referenced
+) -> None:
+    """(c) Every in-scope ``weight_scale_inv`` has its ``weight`` partner mapped.
+
+    NON-VACUITY (design decision D1.5) is the scale population itself: 36,467
+    scale keys are in scope, so the zero is a reading over a non-empty set. The
+    control goes further and shows the predicate can report non-zero, by asking
+    it about a scale key whose partner is deliberately not in the mapping.
+    """
+    scales = sorted(scale_keys(real_in_scope))
+    scale_population = len(scales)
+
+    def orphans(referenced: frozenset[str]) -> list[str]:
+        out = []
+        for key in scales:
+            partner = key[: -len(f".{SCALE_SUFFIX}")] + ".weight"
+            if partner not in referenced:
+                out.append(key)
+        return out
+
+    real_orphans = orphans(real_referenced)
+
+    # The non-empty denominator, first: a zero over nothing is not a reading.
+    assert scale_population == 36_467
+    assert scale_population > 0
+    assert real_orphans == []
+
+    # FIRING CONTROL: drop one partner and the same predicate must report it.
+    victim = scales[0]
+    victim_partner = victim[: -len(f".{SCALE_SUFFIX}")] + ".weight"
+    assert victim_partner in real_referenced
+    poisoned = orphans(frozenset(real_referenced - {victim_partner}))
+    assert poisoned == [victim], "the orphan predicate cannot report non-zero"
+
+    _record(
+        c078c_scale_population=scale_population,
+        c078c_orphan_scale_keys=len(real_orphans),
+        c078c_control_orphans=len(poisoned),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (d) Zero duplicated keys, on require_no_duplicates over per-shard lists.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_index_has_no_duplicated_keys(
+    real_index, real_coverage, real_in_scope
+) -> None:
+    """(d) 0 duplicates across the 62 shards, and the check can report one.
+
+    Read off per-shard key lists, not off the flattened map: the flattened
+    direction is documented as unable to represent a duplicate at all, so a zero
+    from it would be an artefact of the container. The control re-runs the same
+    method with one key placed in a second shard.
+    """
+    assert real_index.duplicated_keys() == {}
+    assert real_coverage.duplicated_count == 0
+    real_index.require_no_duplicates()  # must not raise
+    # Sum over shards equals the unique count exactly when nothing is duplicated.
+    assert real_index.total_shard_key_count == len(real_in_scope)
+    assert real_index.unique_key_count == len(real_in_scope)
+
+    # FIRING CONTROL: the same method over a deliberately dirty per-shard set.
+    per_shard = {shard: list(keys) for shard, keys in real_index.shard_keys.items()}
+    shard_names = list(per_shard)
+    assert len(shard_names) > 1
+    victim = per_shard[shard_names[0]][0]
+    per_shard[shard_names[-1]] = [*per_shard[shard_names[-1]], victim]
+    dirty = Glm5NextShardIndex.from_shard_key_lists(per_shard)
+    assert set(dirty.duplicated_keys()) == {victim}
+    assert dirty.total_shard_key_count == len(real_in_scope) + 1
+    with pytest.raises(DuplicateShardKeyError, match=victim):
+        dirty.require_no_duplicates()
+
+    _record(
+        c078d_num_shards=real_index.num_shards,
+        c078d_duplicated_count=real_coverage.duplicated_count,
+        c078d_control_duplicated_count=len(dirty.duplicated_keys()),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (e) The KDA family: 15 leaves on each of 34 layers, 510 keys, 0 scales.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_kda_family_is_fifteen_leaves_and_no_scales(
+    real_text_config, real_referenced, real_in_scope
+) -> None:
+    """(e) 510 = 15 x 34, and not one scale companion anywhere in the family.
+
+    This is the family the skeleton got wholly wrong: it mapped the
+    ``qwen3_next`` gated-delta convention (``linear_attn.in_proj_qkvz`` and
+    friends), and the checkpoint carries 15 ``self_attn.*`` leaves instead. Both
+    the leaf set and the layer count are derived, and the mapping's leaf set is
+    asserted equal to the FIXTURE's, so agreement is with the checkpoint rather
+    than with this module's own constants.
+    """
+    kda_layers = _layers_of(real_text_config, KDA_LAYER_TYPE)
+    marker = ".self_attn."
+
+    mapped = _self_attn_keys(real_referenced, kda_layers)
+    mapped_leaves = {_leaf_after(key, marker) for key in mapped}
+
+    fixture = _self_attn_keys(frozenset(real_in_scope), kda_layers)
+    fixture_leaves = {_leaf_after(key, marker) for key in fixture}
+
+    assert len(kda_layers) == 34
+    assert mapped_leaves == fixture_leaves  # the checkpoint is the authority
+    assert len(mapped_leaves) == 15
+    assert len(mapped) == 15 * len(kda_layers) == 510
+    assert scale_keys(mapped) == ()
+    # And the absence is the checkpoint's, not the mapping's opinion of it.
+    assert scale_keys(fixture) == ()
+    # No leaf survives from the old convention.
+    assert not any("linear_attn" in key for key in real_referenced)
+
+    _record(
+        c078e_kda_layers=len(kda_layers),
+        c078e_kda_keys=len(mapped),
+        c078e_kda_distinct_leaves=sorted(mapped_leaves),
+        c078e_kda_scale_keys=len(scale_keys(mapped)),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (f) The mHC family: 270 keys, 6 per layer over 0-44, 0 on the MTP layer.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_mhc_family_is_six_per_layer_and_none_on_the_mtp_layer(
+    real_text_config, real_referenced, real_weight_map
+) -> None:
+    """(f) 270 = 6 x 45, zero on layer 45, and no longer declared absent.
+
+    The declaration this replaces was honest and wrong: the leaf names were
+    settled in the published index all along. The per-layer six is checked on
+    every layer rather than in aggregate, so 6-and-0 on two layers could not
+    average into the total.
+    """
+    leaves = sorted(
+        {
+            key.rsplit(".", 1)[1]
+            for key in real_weight_map
+            if key.rsplit(".", 1)[1].startswith(("hc_attn_", "hc_ffn_"))
+        }
+    )
+    assert leaves == [
+        "hc_attn_base",
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_ffn_base",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+    ]
+
+    mapped = sorted(key for key in real_referenced if key.rsplit(".", 1)[1] in leaves)
+    num_layers = len(real_text_config.layer_types)
+    assert num_layers == 45
+    assert len(mapped) == 6 * num_layers == 270
+
+    per_layer = {
+        i: [
+            key
+            for key in mapped
+            if key.startswith(f"model.language_model.layers.{i}.")
+        ]
+        for i in range(num_layers)
+    }
+    assert sorted({len(v) for v in per_layer.values()}) == [6]
+
+    # 0 on the MTP layer, read off the FIXTURE (that layer is not in the map).
+    mtp_mhc = [
+        key
+        for key in real_weight_map
+        if key.startswith(MTP_LAYER_PREFIX) and key.rsplit(".", 1)[1] in leaves
+    ]
+    assert mtp_mhc == []
+
+    # The family is no longer declared absent, and it is tagged.
+    assert "multi_hyper_connections" not in ABSENT_KEY_FAMILIES
+    assert KEY_FAMILY_PROVENANCE["multi_hyper_connections"] == GROUNDED
+
+    _record(
+        c078f_mhc_leaves=leaves,
+        c078f_mhc_keys=len(mapped),
+        c078f_mhc_per_layer=sorted({len(v) for v in per_layer.values()}),
+        c078f_mhc_on_mtp_layer=len(mtp_mhc),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (g) The DSA half: 198 keys over 11 layers, exactly 44 scaled, four named.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_dsa_half_is_eighteen_leaves_with_four_scaled(
+    real_text_config, real_referenced, real_in_scope
+) -> None:
+    """(g) 198 = 18 x 11 keys, of which exactly 44 = 4 x 11 carry a scale.
+
+    18 counts TENSOR LEAVES as a key map emits them -- 14 tensors, four of which
+    have a ``weight_scale_inv`` companion -- and not sub-modules; the same 18 sit
+    under 12 distinct sub-modules. The four scaled leaves are named, because
+    asking for a scale the checkpoint does not supply is one of the four defects
+    this increment repairs.
+    """
+    dsa_layers = _layers_of(real_text_config, DSA_LAYER_TYPE)
+    marker = ".self_attn."
+
+    mapped = _self_attn_keys(real_referenced, dsa_layers)
+    fixture = _self_attn_keys(frozenset(real_in_scope), dsa_layers)
+
+    assert len(dsa_layers) == 11
+    assert {_leaf_after(k, marker) for k in mapped} == {
+        _leaf_after(k, marker) for k in fixture
+    }
+    assert len(mapped) == 18 * len(dsa_layers) == 198
+
+    scaled = sorted(
+        {
+            _leaf_after(key, marker)[: -len(f".{SCALE_SUFFIX}")]
+            for key in scale_keys(mapped)
+        }
+    )
+    assert len(scale_keys(mapped)) == 4 * len(dsa_layers) == 44
+    assert scaled == ["kv_a_proj_with_mqa", "o_proj", "q_a_proj", "q_b_proj"]
+
+    # The three corrections, each as its own presence reading.
+    per_layer_leaves = {_leaf_after(key, marker) for key in mapped}
+    assert "indexer.wq_b.weight" in per_layer_leaves
+    assert "indexer.wq.weight" not in per_layer_leaves
+    assert "indexer.k_norm.bias" in per_layer_leaves
+    assert "indexer.index_kpool_compress_ape" in per_layer_leaves
+    assert "indexer.index_kpool_compress_gate" in per_layer_leaves
+    # And no indexer or kv_b_proj scale is requested anywhere.
+    assert not any("indexer" in key for key in scale_keys(mapped))
+    assert not any("kv_b_proj" in key for key in scale_keys(mapped))
+
+    _record(
+        c078g_dsa_layers=len(dsa_layers),
+        c078g_dsa_keys=len(mapped),
+        c078g_dsa_scale_keys=len(scale_keys(mapped)),
+        c078g_dsa_scaled_leaves=scaled,
+        c078g_dsa_distinct_leaves=len(per_layer_leaves),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (h) Both fixtures are pinned by digest and byte count -- 2/2.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_real_fixtures_are_pinned_by_digest() -> None:
+    """(h) 2/2: one sha256 and one byte count per fixture, read off disk.
+
+    The expected values are the VENDOR's own numbers, fixed before this
+    increment ran, and they can be used as expected values only because each
+    fixture is a byte-identical copy of the published file. This is what makes
+    plan section 11 row A.3 mechanical for both files instead of a promise: a
+    later hand cannot quietly edit either fixture to make a comparison pass.
+
+    The two provenance sidecars are deliberately NOT hashed and add no conjunct:
+    a sidecar says where the bytes came from, and what the bytes ARE is what
+    this item settles.
+    """
+    readings = []
+    for path, want_sha, want_bytes in (
+        (REAL_INDEX_PATH, VENDOR_INDEX_SHA256, VENDOR_INDEX_BYTES),
+        (REAL_CONFIG_PATH, VENDOR_CONFIG_SHA256, VENDOR_CONFIG_BYTES),
+    ):
+        data = path.read_bytes()
+        got_sha = hashlib.sha256(data).hexdigest()
+        assert got_sha == want_sha, f"{path.name}: sha256 {got_sha} != {want_sha}"
+        assert len(data) == want_bytes, f"{path.name}: {len(data)} != {want_bytes} B"
+        readings.append({"fixture": path.name, "sha256": got_sha, "bytes": len(data)})
+
+    assert len(readings) == 2
+
+    # Each fixture has its provenance sidecar beside it, carrying the same
+    # numbers this item just measured. Read, not hashed.
+    for reading in readings:
+        sidecar = FIXTURES_DIR / f"{reading['fixture']}.provenance.json"
+        assert sidecar.is_file(), f"missing provenance sidecar for {reading['fixture']}"
+        recorded = json.loads(sidecar.read_text())
+        assert recorded["sha256"] == reading["sha256"]
+        assert recorded["bytes"] == reading["bytes"]
+        assert recorded["fixture_form"] == "BYTE-IDENTICAL COPY"
+        assert "ZERO network access was used to build this file" in recorded["note"]
+
+    _record(c078h_fixture_digests=readings, c078h_fixtures_pinned=len(readings))
 
 
 # =========================================================================== #

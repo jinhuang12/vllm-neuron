@@ -56,6 +56,18 @@ SHARD_INDEX_FILENAME = "model.safetensors.index.json"
 #: that consume it are ``inc-glm53f-012``'s half.
 FP8_SCALE_SUFFIX = "weight_scale_inv"
 
+#: The checkpoint's own prefix for the whole text model. **Two namespaces, not
+#: one:** every text-model tensor in this checkpoint is named
+#: ``model.language_model.<...>`` while the module tree ``inc-glm53f-013`` landed
+#: is named ``model.<...>``, so a mapping needs both strings and they are not
+#: interchangeable. ``lm_head.weight`` is outside both and is spelled the same on
+#: each side. Measured off the real index at ``inc-glm53f-078``; before that this
+#: module had never seen a checkpoint.
+CKPT_TEXT_PREFIX = "model.language_model"
+
+#: The module-tree prefix -- what ``model_fp8.py`` calls the same tensors.
+PARAM_TEXT_PREFIX = "model"
+
 #: Provenance tags for a key family -- see the module docstring.
 GROUNDED = "GROUNDED"
 PROVISIONAL = "PROVISIONAL"
@@ -68,8 +80,12 @@ KEY_FAMILY_PROVENANCE: dict[str, str] = {
     "embeddings_and_head": GROUNDED,
     "layer_norms": GROUNDED,
     "mla_dsa_attention": GROUNDED,
-    "dsa_indexer": PROVISIONAL,
-    "kda_linear_attention": PROVISIONAL,
+    # Both were PROVISIONAL until inc-glm53f-078 read the real index: each leaf
+    # below is now a name the checkpoint itself carries, not a convention guess.
+    "dsa_indexer": GROUNDED,
+    "kda_linear_attention": GROUNDED,
+    # Declared ABSENT until inc-glm53f-078 found all 270 keys in the index.
+    "multi_hyper_connections": GROUNDED,
     "dense_mlp": GROUNDED,
     "moe_router": GROUNDED,
     "moe_routed_experts": GROUNDED,
@@ -79,11 +95,13 @@ KEY_FAMILY_PROVENANCE: dict[str, str] = {
 #: Families ``config.json`` requires that this module deliberately does **not**
 #: map, and why. Declared rather than omitted: an absent family that nobody
 #: wrote down is indistinguishable from one that was forgotten.
+#:
+#: ``multi_hyper_connections`` was here until ``inc-glm53f-078``. The declaration
+#: was honest and it was wrong: the real index carries ``hc_attn_{base,fn,scale}``
+#: and ``hc_ffn_{base,fn,scale}`` on every one of layers 0-44, so the leaf names
+#: were settled all along and the family is mapped off the file rather than
+#: invented.
 ABSENT_KEY_FAMILIES: dict[str, str] = {
-    "multi_hyper_connections": (
-        "mhc/hc_mult have no in-repo precedent and no settled checkpoint leaf "
-        "names; mapping them here would be invention, not porting"
-    ),
     "vision_tower": (
         "glm5_next_vision is a separate module surface, following the "
         "qwen3_vl split between the decoder and its vision encoder"
@@ -298,6 +316,13 @@ def build_weight_mappings(
     by **equality**, never substring: ``"attention"`` is a substring of both
     family names (``config.py:33-37``).
 
+    **TWO PREFIXES, NOT ONE** (``inc-glm53f-078``). Each layer builds a
+    ``ckpt_prefix`` in the checkpoint's namespace and a ``param_prefix`` in the
+    module tree's, and both are threaded into every family adder. The parameter
+    side is unchanged from ``inc-glm53f-011``; the checkpoint side gained
+    ``language_model.`` because that is what the published index says. Keeping
+    one string for both is the defect this increment repairs.
+
     Args:
         text_config: drives every count -- layer schedule, ``first_k_dense_replace``,
             ``n_routed_experts``, ``n_shared_experts``, ``tie_word_embeddings``.
@@ -313,42 +338,123 @@ def build_weight_mappings(
     layer_types = list(text_config.layer_types or ())
 
     # -- outside the layer stack (GROUNDED) --------------------------------- #
-    _add(mappings, "model.embed_tokens_weight", ["model.embed_tokens.weight"])
-    _add(mappings, "model.norm_weight", ["model.norm.weight"])
+    # The two namespaces part company here: the parameter names are the module
+    # tree's and stay byte-identical, the checkpoint keys gain the text-model
+    # prefix the real index actually uses. ``lm_head.weight`` is the one key the
+    # module already spelled right and it is unprefixed on both sides.
+    _add(
+        mappings,
+        "model.embed_tokens_weight",
+        [f"{CKPT_TEXT_PREFIX}.embed_tokens.weight"],
+    )
+    _add(mappings, "model.norm_weight", [f"{CKPT_TEXT_PREFIX}.norm.weight"])
     if not text_config.tie_word_embeddings:
         _add(mappings, "lm_head_weight", ["lm_head.weight"])
 
     for layer_id, layer_type in enumerate(layer_types):
-        prefix = f"model.layers.{layer_id}"
+        ckpt_prefix = f"{CKPT_TEXT_PREFIX}.layers.{layer_id}"
+        param_prefix = f"{PARAM_TEXT_PREFIX}.layers.{layer_id}"
 
         # -- per-layer norms (GROUNDED) ------------------------------------- #
         _add(
             mappings,
-            f"{prefix}.input_layernorm_weight",
-            [f"{prefix}.input_layernorm.weight"],
+            f"{param_prefix}.input_layernorm_weight",
+            [f"{ckpt_prefix}.input_layernorm.weight"],
         )
         _add(
             mappings,
-            f"{prefix}.post_attention_layernorm_weight",
-            [f"{prefix}.post_attention_layernorm.weight"],
+            f"{param_prefix}.post_attention_layernorm_weight",
+            [f"{ckpt_prefix}.post_attention_layernorm.weight"],
         )
 
+        _add_mhc(mappings, ckpt_prefix, param_prefix)
+
         if layer_type == DSA_LAYER_TYPE:
-            _add_dsa_attention(mappings, prefix, quantised=quantised)
+            _add_dsa_attention(
+                mappings, ckpt_prefix, param_prefix, quantised=quantised
+            )
         else:
-            _add_kda_attention(mappings, prefix, quantised=quantised)
+            _add_kda_attention(
+                mappings, ckpt_prefix, param_prefix, quantised=quantised
+            )
 
         if layer_id < text_config.first_k_dense_replace:
-            _add_dense_mlp(mappings, prefix, quantised=quantised)
+            _add_dense_mlp(mappings, ckpt_prefix, param_prefix, quantised=quantised)
         else:
-            _add_moe_mlp(mappings, prefix, text_config, quantised=quantised)
+            _add_moe_mlp(
+                mappings, ckpt_prefix, param_prefix, text_config, quantised=quantised
+            )
 
     return mappings
 
 
+#: The six multi-hyper-connection leaves each layer carries, in index order.
+#: Bare tensors: none has a ``.weight`` leaf and none has a scale companion.
+MHC_LEAVES: tuple[str, ...] = (
+    "hc_attn_base",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+)
+
+#: The DSA half's four scaled projections -- the ONLY ``self_attn`` leaves on a
+#: sparse-attention layer that carry a ``weight_scale_inv`` companion. Measured:
+#: ``kv_b_proj`` and every indexer leaf carry none, so asking for one makes the
+#: parameter unmatched.
+DSA_SCALED_PROJECTIONS: tuple[str, ...] = (
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "o_proj",
+)
+
+#: The KDA half's 15 leaves, as ``self_attn.*`` on each linear-attention layer.
+#: **None is quantised** -- there is not one ``weight_scale_inv`` under any KDA
+#: ``self_attn`` in the index. Split by whether the leaf has a ``.weight``.
+KDA_PROJECTIONS: tuple[str, ...] = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "b_proj",
+    "f_a_proj",
+    "f_b_proj",
+    "g_a_proj",
+    "g_b_proj",
+    "q_conv1d",
+    "k_conv1d",
+    "v_conv1d",
+    "o_norm",
+    "o_proj",
+)
+#: The two unprojected per-head state tensors: no ``.weight`` leaf at all.
+KDA_BARE_LEAVES: tuple[str, ...] = ("A_log", "dt_bias")
+
+
+def _add_mhc(
+    mappings: dict[str, str | list[str]],
+    ckpt_prefix: str,
+    param_prefix: str,
+) -> None:
+    """The multi-hyper-connection leaves (GROUNDED at ``inc-glm53f-078``).
+
+    Six bare tensors per layer, hanging off the layer and not off the attention
+    or the MLP -- they are the layer's own residual-mixing state. Every one of
+    layers 0-44 carries all six; the MTP layer carries none, which this function
+    never has to know because that layer is not in ``layer_types``.
+
+    Declared ABSENT before this increment because the leaf names were unknown.
+    They were in the published index the whole time.
+    """
+    for leaf in MHC_LEAVES:
+        _add(mappings, f"{param_prefix}.{leaf}", [f"{ckpt_prefix}.{leaf}"])
+
+
 def _add_dsa_attention(
     mappings: dict[str, str | list[str]],
-    prefix: str,
+    ckpt_prefix: str,
+    param_prefix: str,
     *,
     quantised: bool,
 ) -> None:
@@ -359,68 +465,90 @@ def _add_dsa_attention(
     ``*_rope_*`` projection is mapped. A reused DeepSeek-MLA mapping that
     assumes a RoPE split would ask for keys this checkpoint does not have.
 
-    The lora projections are GROUNDED (the HF DeepSeek-MLA leaf names). The
-    indexer block is PROVISIONAL -- ``index_n_heads``/``index_head_dim`` are in
-    ``config.json`` but the indexer's leaf names are unconfirmed.
+    **18 checkpoint keys per layer: 14 tensors, 4 of which carry a scale.**
+    Three corrections ``inc-glm53f-078`` measured off the real index:
+    ``indexer.wq`` is really ``indexer.wq_b``; ``kv_b_proj`` and both indexer
+    projections carry NO scale companion, so only the four in
+    ``DSA_SCALED_PROJECTIONS`` ask for one; and ``indexer.k_norm.bias`` plus
+    ``indexer.index_kpool_compress_{ape,gate}`` were mapped by nothing.
     """
-    attn = f"{prefix}.self_attn"
-    for leaf in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-        _add(
-            mappings,
-            f"{attn}.{leaf}_weight",
-            _quantised(attn, leaf, quantised=quantised),
-        )
-    for leaf in ("q_a_layernorm", "kv_a_layernorm"):
-        _add(mappings, f"{attn}.{leaf}_weight", _quantised(attn, leaf, quantised=False))
+    ckpt_attn = f"{ckpt_prefix}.self_attn"
+    param_attn = f"{param_prefix}.self_attn"
 
-    # <-- PROVISIONAL: DSA indexer leaf names unconfirmed against the index.
-    indexer = f"{attn}.indexer"
-    for leaf in ("wq", "wk"):
+    for leaf in DSA_SCALED_PROJECTIONS:
         _add(
             mappings,
-            f"{attn}.indexer.{leaf}_weight",
-            _quantised(indexer, leaf, quantised=quantised),
+            f"{param_attn}.{leaf}_weight",
+            _quantised(ckpt_attn, leaf, quantised=quantised),
         )
-    for leaf in ("k_norm", "weights_proj"):
+    # kv_b_proj is a real projection with no scale in this checkpoint, so it sits
+    # here rather than in the loop above. Not an oversight -- a reading.
+    for leaf in ("kv_b_proj", "q_a_layernorm", "kv_a_layernorm"):
         _add(
             mappings,
-            f"{attn}.indexer.{leaf}_weight",
-            _quantised(indexer, leaf, quantised=False),
+            f"{param_attn}.{leaf}_weight",
+            _quantised(ckpt_attn, leaf, quantised=False),
         )
+
+    ckpt_indexer = f"{ckpt_attn}.indexer"
+    param_indexer = f"{param_attn}.indexer"
+    for leaf in ("wq_b", "wk", "k_norm", "weights_proj"):
+        _add(
+            mappings,
+            f"{param_indexer}.{leaf}_weight",
+            _quantised(ckpt_indexer, leaf, quantised=False),
+        )
+    # k_norm carries a bias as well as a weight; the compress pair are bare
+    # tensors with no ``.weight`` leaf.
+    _add(
+        mappings,
+        f"{param_indexer}.k_norm_bias",
+        [f"{ckpt_indexer}.k_norm.bias"],
+    )
+    for leaf in ("index_kpool_compress_ape", "index_kpool_compress_gate"):
+        _add(mappings, f"{param_indexer}.{leaf}", [f"{ckpt_indexer}.{leaf}"])
 
 
 def _add_kda_attention(
     mappings: dict[str, str | list[str]],
-    prefix: str,
+    ckpt_prefix: str,
+    param_prefix: str,
     *,
     quantised: bool,
 ) -> None:
     """The ``linear_attention`` (KDA, gated-delta) half.
 
-    <-- PROVISIONAL: every leaf here is required by ``linear_attn_config``
-    (``num_heads``, ``head_dim``, ``short_conv_kernel_size``,
-    ``gate_lower_bound`` -- ``config.py:110-117``) and follows the gated-delta
-    convention of the nearest relative named at intake (``qwen3_next``), but
-    none is confirmed against this checkpoint's index.
+    **15 checkpoint keys per layer and not one scale companion.** The family was
+    wholly misnamed before ``inc-glm53f-078``: it was mapped as
+    ``linear_attn.{in_proj_qkvz, in_proj_ba, out_proj, conv1d, norm}`` on the
+    ``qwen3_next`` gated-delta convention, and the checkpoint carries 15 distinct
+    ``self_attn.*`` leaves instead -- eight separate projections, three separate
+    per-projection convolutions, an output norm, an output projection and two
+    bare state tensors. There is no ``conv1d.bias`` anywhere in the index.
+
+    ``quantised`` is accepted and deliberately unused: this family asks for no
+    scale companion at any setting, which is what conjunct (e) counts. The
+    parameter keeps the argument so the four adders share one call shape.
     """
-    attn = f"{prefix}.linear_attn"
-    for leaf in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
+    del quantised  # this family is unquantised in the checkpoint, at any setting
+
+    ckpt_attn = f"{ckpt_prefix}.self_attn"
+    param_attn = f"{param_prefix}.self_attn"
+
+    for leaf in KDA_PROJECTIONS:
         _add(
             mappings,
-            f"{attn}.{leaf}_weight",
-            _quantised(attn, leaf, quantised=quantised),
+            f"{param_attn}.{leaf}_weight",
+            _quantised(ckpt_attn, leaf, quantised=False),
         )
-    for leaf in ("conv1d", "norm"):
-        _add(mappings, f"{attn}.{leaf}_weight", _quantised(attn, leaf, quantised=False))
-    # Unprojected per-head state: no ``.weight`` leaf, so not via _quantised.
-    _add(mappings, f"{attn}.conv1d_bias", [f"{attn}.conv1d.bias"])
-    _add(mappings, f"{attn}.dt_bias", [f"{attn}.dt_bias"])
-    _add(mappings, f"{attn}.A_log", [f"{attn}.A_log"])
+    for leaf in KDA_BARE_LEAVES:
+        _add(mappings, f"{param_attn}.{leaf}", [f"{ckpt_attn}.{leaf}"])
 
 
 def _add_dense_mlp(
     mappings: dict[str, str | list[str]],
-    prefix: str,
+    ckpt_prefix: str,
+    param_prefix: str,
     *,
     quantised: bool,
 ) -> None:
@@ -430,18 +558,20 @@ def _add_dense_mlp(
     precedent (``llama3/model.py`` maps ``mlp.gate_proj_weight`` and
     ``mlp.up_proj_weight`` one-to-one) rather than fusing them here.
     """
-    mlp = f"{prefix}.mlp"
+    ckpt_mlp = f"{ckpt_prefix}.mlp"
+    param_mlp = f"{param_prefix}.mlp"
     for leaf in ("gate_proj", "up_proj", "down_proj"):
         _add(
             mappings,
-            f"{mlp}.{leaf}_weight",
-            _quantised(mlp, leaf, quantised=quantised),
+            f"{param_mlp}.{leaf}_weight",
+            _quantised(ckpt_mlp, leaf, quantised=quantised),
         )
 
 
 def _add_moe_mlp(
     mappings: dict[str, str | list[str]],
-    prefix: str,
+    ckpt_prefix: str,
+    param_prefix: str,
     text_config: Glm5NextTextConfig,
     *,
     quantised: bool,
@@ -458,14 +588,15 @@ def _add_moe_mlp(
     ``topk_method = "noaux_tc"`` (``config.py:134``) is why the router carries
     ``e_score_correction_bias`` alongside its weight.
     """
-    mlp = f"{prefix}.mlp"
+    ckpt_mlp = f"{ckpt_prefix}.mlp"
+    param_mlp = f"{param_prefix}.mlp"
 
     # Router. Not quantised: it runs in float32 (``moe_router_dtype``).
-    _add(mappings, f"{mlp}.experts.router_weight", [f"{mlp}.gate.weight"])
+    _add(mappings, f"{param_mlp}.experts.router_weight", [f"{ckpt_mlp}.gate.weight"])
     _add(
         mappings,
-        f"{mlp}.experts.router_bias",
-        [f"{mlp}.gate.e_score_correction_bias"],
+        f"{param_mlp}.experts.router_bias",
+        [f"{ckpt_mlp}.gate.e_score_correction_bias"],
     )
 
     for leaf in ("gate_proj", "up_proj", "down_proj"):
@@ -473,18 +604,18 @@ def _add_moe_mlp(
         for expert_id in range(text_config.n_routed_experts):
             expert_keys.extend(
                 _quantised(
-                    f"{mlp}.experts.{expert_id}", leaf, quantised=quantised
+                    f"{ckpt_mlp}.experts.{expert_id}", leaf, quantised=quantised
                 )
             )
-        _add(mappings, f"{mlp}.experts.{leaf}_weight", expert_keys)
+        _add(mappings, f"{param_mlp}.experts.{leaf}_weight", expert_keys)
 
     if text_config.n_shared_experts:
-        shared = f"{mlp}.shared_experts"
+        ckpt_shared = f"{ckpt_mlp}.shared_experts"
         for leaf in ("gate_proj", "up_proj", "down_proj"):
             _add(
                 mappings,
-                f"{mlp}.shared_experts.{leaf}_weight",
-                _quantised(shared, leaf, quantised=quantised),
+                f"{param_mlp}.shared_experts.{leaf}_weight",
+                _quantised(ckpt_shared, leaf, quantised=quantised),
             )
 
 
