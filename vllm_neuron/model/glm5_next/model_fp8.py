@@ -980,6 +980,7 @@ class Glm5NextRoutedExperts(nn.Module):
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
+        expert_parallel_rank: int = 0,
     ) -> torch.Tensor:
         """Run this rank's routed experts through the block-quant NKI kernel.
 
@@ -987,9 +988,21 @@ class Glm5NextRoutedExperts(nn.Module):
             hidden_states: ``[T, H]`` real tokens only -- the kernel's
                 padding-token slot is appended here, not by the caller
                 (``bwmm_shard_on_I.py:157``).
-            expert_affinities: ``[T, E_local]`` scattered router scores, the
-                form :meth:`route_tokens` returns: the gate weight at each
-                selected expert's column and zero elsewhere.
+            expert_affinities: ``[T, E]`` scattered router scores over ALL
+                ``n_routed_experts``, which is the form :meth:`route_tokens`
+                returns: the gate weight at each selected expert's column and
+                zero elsewhere. THIS SITE DOES THE GLOBAL-TO-LOCAL MAPPING, so
+                the caller hands the router's output straight through and slices
+                nothing. ``inc-glm53f-032``'s landed note above assigns the step
+                here in those words. Until repair batch R5 this parameter was
+                documented as ``[T, E_local]`` and the extent check enforced
+                that, which no caller could satisfy from ``route_tokens`` at any
+                expert-parallel degree above 1 -- finding ``B21-027``.
+            expert_parallel_rank: which rank's expert slice to select, read
+                through :meth:`local_expert_indices`. It is an argument rather
+                than an attribute because ``__init__`` is ``inc-glm53f-031``'s
+                landed code and this section edits no line above itself. The
+                default 0 is the only rank that exists at degree 1.
             gate_up_proj_weight: ``[E_local, H, 2, I_TP]`` fp8-e4m3, retiled
                 onto ``BLOCK_QUANT_SIZE`` granularity.
             down_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3, retiled.
@@ -1026,7 +1039,10 @@ class Glm5NextRoutedExperts(nn.Module):
                 Named rather than coerced, so a mis-wired call site fails where
                 it is wrong instead of computing a different function.
         """
-        from vllm_neuron.functional import build_blockwise_mapping
+        from vllm_neuron.functional import (
+            build_blockwise_mapping,
+            get_local_expert_affinities,
+        )
         from vllm_neuron.functional.moe.blockwise_fp8_retile import (
             BLOCK_QUANT_SIZE,
             DOWN,
@@ -1090,10 +1106,40 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"I_TP={intermediate}, H={hidden}], got shape "
                 f"{tuple(down_proj_weight.shape)}"
             )
+        # ---- THE DISPATCH STEP. Global router columns -> this rank's slice.  #
+        # ``inc-glm53f-032``'s landed note above says in its own words that
+        # mapping global expert indices onto this rank's ``expert_partition``
+        # slice "belongs to the block-quant call site (``-027``)". Until repair
+        # batch R5 this site did the opposite: it REFUSED the global form, so
+        # nothing could feed it from ``route_tokens`` above degree 1 and the MoE
+        # path could not run on more than one rank. Finding ``B21-027``.
+        #
+        # The fork's own MoE call site is the precedent, including the guard:
+        # ``gpt_oss/model_mxfp4.py:1506-1516`` maps only when the degree is
+        # above 1 and passes the affinities through untouched at degree 1.
+        routed = int(self.num_routed_experts)
+        if tuple(expert_affinities.shape) != (tokens, routed):
+            raise Glm5NextBlockQuantRouteError(
+                f"expert_affinities must be [T={tokens}, E={routed}] -- the "
+                f"GLOBAL router width, which is what route_tokens returns and "
+                f"what this site maps onto this rank's {num_experts} experts -- "
+                f"got shape {tuple(expert_affinities.shape)}"
+            )
+        if routed != num_experts:
+            local_indices = torch.tensor(
+                self.local_expert_indices(int(expert_parallel_rank)),
+                dtype=torch.int64,
+                device=expert_affinities.device,
+            )
+            expert_affinities = get_local_expert_affinities(
+                expert_affinities, local_indices
+            )
         if tuple(expert_affinities.shape) != (tokens, num_experts):
             raise Glm5NextBlockQuantRouteError(
-                f"expert_affinities must be [T={tokens}, E={num_experts}], got "
-                f"shape {tuple(expert_affinities.shape)}"
+                f"the global-to-local mapping produced "
+                f"{tuple(expert_affinities.shape)} and this rank owns "
+                f"{num_experts} experts over {tokens} tokens; the partition and "
+                f"the gather disagree"
             )
         block = BLOCK_QUANT_SIZE if block_size is None else int(block_size)
         if block <= 0 or block % BLOCK_QUANT_SIZE:

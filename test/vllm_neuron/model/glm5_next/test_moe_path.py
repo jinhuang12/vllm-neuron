@@ -1489,3 +1489,377 @@ def test_moe_path_landed_sections_are_untouched() -> None:
         f"num_local_experts={bank.num_local_experts} "
         f"local_expert_indices(0)={bank.local_expert_indices(0)}"
     )
+
+
+# ===========================================================================
+# The DISPATCH step: global router columns -> this rank's slice.
+# Repair batch R5, finding ``B21-027-router-affinities-are-global-not-local``.
+# ===========================================================================
+#
+# WHY THIS SECTION EXISTS. Every arm above builds the bank through
+# :func:`_build_bank`, which passes ``world_size=1``. At degree 1 the global and
+# the local expert counts COINCIDE at ``E``, so that is the one configuration in
+# which the call site's affinity contract cannot be wrong -- and no arm above can
+# see whether the site consumes the router's global ``[T, E]`` or this rank's
+# local ``[T, E_local]``. These two arms run at a degree ABOVE 1, where the two
+# shapes differ and the question has an answer.
+#
+# NOTHING HERE IS HAND-CHOSEN. The global expert width and the router's ``top_k``
+# are the PINNED CHECKPOINT's own values, read off the same digest-verified
+# fixture the rest of this file routes on, and the degree is derived from them.
+
+
+#: This rank's local expert extent, at the degree below. ``E`` rather than a new
+#: number, because ``E`` is the extent :func:`_build_case` already builds weights
+#: and scales for, and the dispatch is a SHAPE question that must not be answered
+#: by rebuilding the fixture around it.
+EP_LOCAL_EXPERTS = E
+
+#: Fixture-only seed for this section's router inputs. This file's own choice.
+EP_ROUTER_SEED = 9027
+
+
+def _ep_partition() -> tuple[int, int, int]:
+    """``(global experts, expert-parallel degree, router top_k)``, all measured.
+
+    The global width and ``top_k`` are READ off the pinned config rather than
+    written here, so this arm always runs at the router the campaign registered.
+    The pinned values are 288 experts at ``top_k=8``; the degree is then derived
+    as the one that makes this rank own exactly :data:`EP_LOCAL_EXPERTS`.
+
+    The fixture's own ``K=2`` cannot drive this section at all. The router seam
+    admits exactly one ``top_k`` and refuses every other by name::
+
+        NoauxTcRouterError: top_k must be exactly 8: `nisa.max8` emits 8 values
+        per partition and `nisa.nc_find_index8` consumes exactly 8, and nkilib
+        refuses k > 8 (router_topk.py:582-583). got top_k=2
+
+    That reading is why ``top_k`` is taken from the checkpoint here instead of
+    from ``K``, and the checkpoint's value happens to be the seam's only
+    admissible one.
+    """
+    text = _pinned_raw_config()["text_config"]
+    global_experts = int(text["n_routed_experts"])
+    top_k = int(text["num_experts_per_tok"])
+    if global_experts % EP_LOCAL_EXPERTS:
+        raise VacuousControlError(
+            f"the pinned config's n_routed_experts={global_experts} is not "
+            f"divisible by the fixture's local extent {EP_LOCAL_EXPERTS}, so no "
+            f"uniform degree gives this rank the weights _build_case builds"
+        )
+    degree = global_experts // EP_LOCAL_EXPERTS
+    if degree <= 1:
+        raise VacuousControlError(
+            f"the derived expert-parallel degree is {degree}; this section's "
+            f"whole subject is a degree ABOVE 1 and cannot be tested at 1"
+        )
+    return global_experts, degree, top_k
+
+
+def _build_ep_bank():
+    """A bank at a degree above 1 whose LOCAL extent is the fixture's ``E``.
+
+    Returns ``(bank, text_config, global_experts, degree)``. The campaign's
+    registered TP freeze of 64 is deliberately not used: 288 experts do not
+    divide 64 ways, so that bank raises during construction. That refusal is
+    campaign gap G4 and the lead's to dispose; this arm needs a degree the
+    partition admits, and derives one.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextRoutedExperts
+
+    global_experts, degree, top_k = _ep_partition()
+    text_config = Glm5NextTextConfig(
+        hidden_size=H,
+        moe_intermediate_size=I_TP,
+        n_routed_experts=global_experts,
+        num_experts_per_tok=top_k,
+    )
+    bank = Glm5NextRoutedExperts(text_config, world_size=degree)
+    if int(bank.num_local_experts) != EP_LOCAL_EXPERTS:
+        raise VacuousControlError(
+            f"the bank reports num_local_experts={bank.num_local_experts} at "
+            f"degree {degree}, but this section's fixture is built for "
+            f"{EP_LOCAL_EXPERTS}; the weight extent check would fire before any "
+            f"affinity was looked at"
+        )
+    if int(bank.num_routed_experts) == int(bank.num_local_experts):
+        raise VacuousControlError(
+            "the global and local expert counts coincide, so this bank is the "
+            "degree-1 case again and the dispatch step would be a no-op"
+        )
+    # ``-031``'s partition, checked as a PARTITION before this arm indexes with
+    # it. If it did not cover every global column exactly once, the per-rank
+    # column comparisons below would be against the wrong reference.
+    seen: list[int] = []
+    for rank in range(degree):
+        seen.extend(bank.local_expert_indices(rank))
+    if sorted(seen) != list(range(global_experts)):
+        raise VacuousControlError(
+            f"local_expert_indices over {degree} ranks does not cover "
+            f"0..{global_experts - 1} exactly once, so the columns this arm "
+            f"compares against are not a partition"
+        )
+    return bank, text_config, global_experts, degree
+
+
+def _ep_route(bank, global_experts: int, text_config):
+    """Run ``route_tokens`` FOR REAL and return its own output tensors.
+
+    The affinity tensor this returns is handed to the call site unchanged; that
+    is what finding ``B21-027`` means by "no slicing done by the caller". The
+    router is executed rather than imitated, so the form the call site consumes
+    is the form the producer actually emits and not this file's idea of it.
+    """
+    gen = torch.Generator().manual_seed(EP_ROUTER_SEED)
+    hidden_bsh = (torch.randn(1, T, H, generator=gen) * 0.5).to(torch.bfloat16)
+    gamma = torch.ones(1, H, dtype=torch.bfloat16)
+    bank.router_weight = torch.nn.Parameter(
+        (torch.randn(H, global_experts, generator=gen) * 0.1).to(torch.bfloat16),
+        requires_grad=False,
+    )
+    bank.router_bias = torch.nn.Parameter(
+        (torch.randn(global_experts, generator=gen) * 0.05).to(torch.bfloat16),
+        requires_grad=False,
+    )
+    _logits, expert_index, affinities = bank.route_tokens(
+        hidden_bsh, gamma, text_config
+    )
+    if tuple(affinities.shape) != (T, global_experts):
+        raise VacuousControlError(
+            f"route_tokens returned {tuple(affinities.shape)}; this section's "
+            f"whole subject is its GLOBAL [T={T}, E={global_experts}] form"
+        )
+    if int((affinities != 0).sum()) == 0:
+        raise VacuousControlError(
+            "route_tokens returned an all-zero affinity tensor, so every "
+            "reading below would hold for the wrong reason"
+        )
+    return affinities, expert_index
+
+
+class _MappingAffinitySpy:
+    """Captures the affinity tensor ``build_blockwise_mapping`` is handed.
+
+    The call site imports the mapping FUNCTION-LOCALLY from
+    ``vllm_neuron.functional`` (``model_fp8.py:1042``), so replacing the
+    attribute on that module is what a call actually resolves. The real mapping
+    still runs and its result is still used, so the kernel below is measured on
+    the real path rather than on a stub.
+    """
+
+    def __init__(self) -> None:
+        self.seen: list[torch.Tensor] = []
+        self._module = None
+        self._real = None
+
+    def __enter__(self) -> "_MappingAffinitySpy":
+        import vllm_neuron.functional as NF
+
+        self._module = NF
+        self._real = NF.build_blockwise_mapping
+        real = self._real
+
+        def spy(expert_affinities, *args, **kwargs):
+            self.seen.append(expert_affinities.detach().clone())
+            return real(expert_affinities, *args, **kwargs)
+
+        NF.build_blockwise_mapping = spy
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self._module.build_blockwise_mapping = self._real
+        return False
+
+    @property
+    def only(self) -> torch.Tensor:
+        if len(self.seen) != 1:
+            raise VacuousControlError(
+                f"the mapping was entered {len(self.seen)} times, not once; "
+                f"every per-rank reading here assumes exactly one entry"
+            )
+        return self.seen[0]
+
+
+def test_moe_path_dispatch_maps_global_router_output_at_degree_above_one() -> None:
+    """``route_tokens``' GLOBAL output reaches the kernel as ``[T, E_local]``.
+
+    This is the demonstration finding ``B21-027`` requires: one case at an
+    expert-parallel degree above 1 in which ``route_tokens``' output reaches the
+    kernel as ``[T, E_local]`` with no slicing done by the caller. What the
+    caller hands in carries the GLOBAL width; what the mapping seam receives is
+    read out of the seam itself rather than inferred.
+
+    Three ranks are probed rather than one, chosen by MEASURED occupancy, so a
+    gather that ignored its rank argument would have to produce the same slice
+    three times over disjoint column sets to survive.
+    """
+    bank, text_config, global_experts, degree = _build_ep_bank()
+    quant_config = _block_quant_config()
+    case = _build_case()
+    affinities, expert_index = _ep_route(bank, global_experts, text_config)
+    print(
+        f"[dispatch] degree={degree} global_experts={global_experts} "
+        f"local_experts={bank.num_local_experts} "
+        f"top_k={bank.num_experts_per_tok} "
+        f"route_affinities_shape={tuple(affinities.shape)} "
+        f"route_affinities_dtype={affinities.dtype} "
+        f"expert_index_shape={tuple(expert_index.shape)} "
+        f"global_nonzeros={int((affinities != 0).sum())}"
+    )
+
+    # Rank choice is MEASURED: the three ranks carrying the most routing mass,
+    # so no probed slice is all zero and no two are trivially equal.
+    occupancy = {}
+    for rank in range(degree):
+        cols = torch.tensor(bank.local_expert_indices(rank), dtype=torch.int64)
+        occupancy[rank] = int((affinities[:, cols] != 0).sum())
+    probed = sorted(occupancy, key=lambda r: (-occupancy[r], r))[:3]
+    zero_ranks = sum(1 for value in occupancy.values() if value == 0)
+    print(
+        f"[dispatch] probed_ranks={probed} "
+        f"probed_occupancies={[occupancy[r] for r in probed]} "
+        f"zero_occupancy_ranks={zero_ranks}/{degree}"
+    )
+    assert len(probed) == 3, (
+        f"only {len(probed)} ranks exist at degree {degree}; the rank-liveness "
+        f"reading below needs three distinct column sets"
+    )
+    assert min(occupancy[r] for r in probed) > 0, (
+        "a probed rank owns no routed tokens at all, so its slice is all zero "
+        "and the gather reading below would hold for the wrong reason"
+    )
+
+    gathered: dict[int, torch.Tensor] = {}
+    for rank in probed:
+        inputs = dict(case["call_site_inputs"])
+        inputs["expert_affinities"] = affinities
+        # The no-slicing claim, stated as a reading rather than an assumption:
+        # what goes in is the GLOBAL width, which is not this rank's extent.
+        assert tuple(inputs["expert_affinities"].shape) == (T, global_experts)
+        assert global_experts != EP_LOCAL_EXPERTS
+        reset_dispatch_counters()
+        with _MappingAffinitySpy() as spy:
+            out = bank.block_quant_expert_mm(
+                quant_config=quant_config,
+                block_size=B,
+                expert_parallel_rank=rank,
+                **inputs,
+            )
+        seam_affinities = spy.only
+        counters = dispatch_counters()
+        columns = torch.tensor(
+            bank.local_expert_indices(rank), dtype=torch.int64
+        )
+        # The expectation is built by plain advanced indexing, which is a
+        # DIFFERENT mechanism from the ``torch.gather`` the call site uses, so
+        # this is a comparison and not a restatement.
+        want = affinities[:, columns]
+        got = seam_affinities[:T]
+        pad_row = seam_affinities[T:]
+        print(
+            f"[dispatch-rank] rank={rank} columns={tuple(columns.tolist())} "
+            f"seam_affinity_shape={tuple(seam_affinities.shape)} "
+            f"gathered_equals_columns={bool(torch.equal(got, want))} "
+            f"gathered_nonzeros={int((got != 0).sum())} "
+            f"pad_row_all_zero="
+            f"{bool(torch.equal(pad_row, torch.zeros_like(pad_row)))} "
+            f"out_shape={tuple(out.shape)} "
+            f"out_absmax={float(out.abs().max()):.6e} "
+            f"seam_counters={counters}"
+        )
+        assert tuple(seam_affinities.shape) == (T + 1, EP_LOCAL_EXPERTS), (
+            f"the mapping was handed {tuple(seam_affinities.shape)}; the whole "
+            f"point of the dispatch step is that it sees "
+            f"[T+1={T + 1}, E_local={EP_LOCAL_EXPERTS}]"
+        )
+        assert torch.equal(got, want), (
+            f"rank {rank}'s gathered slice is not its own global columns "
+            f"{tuple(columns.tolist())}"
+        )
+        assert torch.equal(pad_row, torch.zeros_like(pad_row)), (
+            "the appended padding row must stay zero through the gather"
+        )
+        assert tuple(out.shape) == (T, H)
+        assert bool(torch.isfinite(out).all())
+        assert float(out.abs().max()) > 0.0, (
+            "the kernel returned an all-zero output, so nothing downstream of "
+            "the dispatch actually computed"
+        )
+        assert counters == (1, 0), (
+            f"seam counters {counters}: the dispatch must not change how many "
+            f"times the block-quant kernel is entered, nor take a fallback"
+        )
+        gathered[rank] = got
+
+    # The rank argument is LIVE: disjoint column sets give different slices.
+    for index, left in enumerate(probed):
+        for right in probed[index + 1 :]:
+            assert not torch.equal(gathered[left], gathered[right]), (
+                f"ranks {left} and {right} received the same slice over "
+                f"disjoint columns, so the gather is not reading its rank"
+            )
+
+    # The default rank is documented as 0, and it is the same call as an
+    # explicit 0. Read rather than asserted from the signature.
+    inputs = dict(case["call_site_inputs"])
+    inputs["expert_affinities"] = affinities
+    with _MappingAffinitySpy() as spy_default:
+        bank.block_quant_expert_mm(
+            quant_config=quant_config, block_size=B, **inputs
+        )
+    with _MappingAffinitySpy() as spy_zero:
+        bank.block_quant_expert_mm(
+            quant_config=quant_config,
+            block_size=B,
+            expert_parallel_rank=0,
+            **inputs,
+        )
+    same = bool(torch.equal(spy_default.only, spy_zero.only))
+    print(f"[dispatch-default] default_rank_equals_explicit_zero={same}")
+    assert same, "the default expert_parallel_rank is documented as rank 0"
+
+
+def test_moe_path_dispatch_refuses_a_caller_sliced_local_form_above_degree_one() -> None:
+    """Above degree 1 the call site REFUSES a caller-sliced ``[T, E_local]``.
+
+    "With no slicing done by the caller" is a two-sided claim and this is the
+    other side. A caller that does the slice itself is the outcome
+    ``inc-glm53f-032``'s landed note exists to prevent -- two owners for one
+    behaviour -- and it now fails by name instead of quietly computing on a
+    slice this site did not make.
+
+    At degree 1 the local and global widths coincide, so this refusal cannot
+    fire there and no landed arm is affected by it.
+    """
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextBlockQuantRouteError
+
+    bank, text_config, global_experts, degree = _build_ep_bank()
+    quant_config = _block_quant_config()
+    case = _build_case()
+    affinities, _expert_index = _ep_route(bank, global_experts, text_config)
+    columns = torch.tensor(bank.local_expert_indices(1), dtype=torch.int64)
+    pre_sliced = affinities[:, columns]
+    assert tuple(pre_sliced.shape) == (T, EP_LOCAL_EXPERTS), (
+        "the control must hand in exactly the local form a slicing caller "
+        "would produce"
+    )
+    inputs = dict(case["call_site_inputs"])
+    inputs["expert_affinities"] = pre_sliced
+    reset_dispatch_counters()
+    with pytest.raises(Glm5NextBlockQuantRouteError, match="GLOBAL router width"):
+        bank.block_quant_expert_mm(
+            quant_config=quant_config,
+            block_size=B,
+            expert_parallel_rank=1,
+            **inputs,
+        )
+    counters = dispatch_counters()
+    print(
+        f"[dispatch-refusal] degree={degree} "
+        f"passed_shape={tuple(pre_sliced.shape)} "
+        f"global_width={global_experts} seam_counters={counters}"
+    )
+    assert counters == (0, 0), (
+        "the refusal must happen before the block-quant kernel is entered"
+    )
