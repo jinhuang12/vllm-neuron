@@ -14,6 +14,12 @@ when it is set the caller's value is kept; and one explicit contradiction is
 refused. Every run then prints what it resolved, so the pinning is visible in
 the transcript rather than assumed.
 
+IT ALSO RECORDS WHERE EACH VALUE CAME FROM (:data:`RESOLUTION_ORIGIN`), because
+defaulting made the value alone ambiguous: ``trn2`` in the environment no longer
+says whether the invocation pinned it or this file supplied it, and the design's
+D2 invocation rule needs that difference to stay checkable. The origin is a
+recorded fact only -- nothing here reads it to decide behaviour.
+
 WHY IT NO LONGER DEMANDS THE VALUES FROM THE CALLER. It used to raise
 ``pytest.UsageError`` unless the environment already carried exactly
 ``VLLM_NEURON_CPU_MODE=1`` and ``NEURON_PLATFORM_TARGET_OVERRIDE=trn2``. That
@@ -56,6 +62,20 @@ ACCEPTED_TARGET_FAMILIES = ("trn2", "trn3")
 #: over that request would hide the disagreement instead of reporting it.
 CPU_MODE = "VLLM_NEURON_CPU_MODE"
 
+#: How each variable in :data:`DEFAULTED_ENV` got its value. RECORDED, never acted
+#: on: nothing in this file reads it to decide anything, and it is not a third
+#: default.
+#:
+#: WHY IT EXISTS. Defaulting the two variables removed the only way to tell an
+#: invocation that pinned ``trn2`` from a conftest that defaulted ``trn2`` -- both
+#: leave the identical value in the environment. The design's D2 invocation rule
+#: says which one a given run is, so the origin has to be a fact a test can read,
+#: not something inferred from a value that is now the same in both cases. Landed by
+#: ``inc-glm53f-014``'s R2 round on the lead's design call N7.
+SUPPLIED = "supplied"
+DEFAULTED = "defaulted"
+RESOLUTION_ORIGIN: dict[str, str] = {}
+
 #: Filled by :func:`pytest_configure`, read by :func:`pytest_report_header`.
 _RESOLUTION: dict[str, str] = {}
 
@@ -79,8 +99,10 @@ def pytest_configure(config: pytest.Config) -> None:
         if current is None:
             os.environ[name] = default
             _RESOLUTION[name] = f"{default} (DEFAULTED by test/conftest.py)"
+            RESOLUTION_ORIGIN[name] = DEFAULTED
         else:
             _RESOLUTION[name] = f"{current} (from the invocation)"
+            RESOLUTION_ORIGIN[name] = SUPPLIED
 
     target = os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"]
     family = next(
@@ -103,6 +125,9 @@ def pytest_report_header() -> list[str]:
     """
     if not _RESOLUTION:
         return []
+    origins = ", ".join(
+        f"{name}={RESOLUTION_ORIGIN[name]}" for name in sorted(RESOLUTION_ORIGIN)
+    )
     return [
         "overlay environment pinned by test/conftest.py:",
         *(
@@ -111,4 +136,5 @@ def pytest_report_header() -> list[str]:
             if not name.startswith("_")
         ),
         f"  expected FP8_CLAMP_MAX={_RESOLUTION['_clamp']}",
+        f"  resolution origin: {origins}",
     ]

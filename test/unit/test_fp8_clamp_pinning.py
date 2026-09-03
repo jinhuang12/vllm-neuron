@@ -24,7 +24,10 @@ deliberately contradicts it:
    its own live process, reads the constant again, then calls the resolver directly.
    The constant must not move; the resolver must.
 4. The **mechanism** that pins the parent: ``test/conftest.py``'s pre-collection
-   check, exercised in a child pytest -- defaulted, supplied, and refused.
+   check, exercised in a child pytest -- defaulted, supplied, and refused -- plus the
+   origin it records, read both from the live plugin module and from each child's
+   header. A supplied ``trn2`` and a defaulted ``trn2`` leave the identical value
+   behind, so the origin is the only thing that separates them.
 
 The readings travel the branch at ``:34-37`` -- the ``trn3`` arm (``:34-35``)
 and the ``else`` arm (``:36-37``). What none of them exercises is the bare-CPU
@@ -63,6 +66,11 @@ changed:
   check. It is exercised here, in its post-``-001`` form: the two variables are
   DEFAULTED when unset, a caller's value is kept, and one explicit contradiction is
   refused.
+* **The recorded origin is asserted too**, on the lead's design call N7. Defaulting
+  the variables removed the only way to tell a supplied ``trn2`` from a defaulted
+  ``trn2`` -- the environment reads the same either way -- so the conftest now records
+  which it was and arm 4 asserts the pair comes back different for the same value.
+  Without that reading the design's D2 invocation rule is unfalsifiable.
 """
 
 from __future__ import annotations
@@ -105,6 +113,7 @@ READING = re.compile(r"^FP8_CLAMP_MAX=(.+)$", re.MULTILINE)
 CONFTEST_HEADER = "overlay environment pinned by test/conftest.py:"
 DEFAULTED_NOTE = "(DEFAULTED by test/conftest.py)"
 INVOCATION_NOTE = "(from the invocation)"
+ORIGIN_LINE = "resolution origin: "
 
 #: pytest's exit code for a ``pytest.UsageError`` (``ExitCode.USAGE_ERROR``).
 USAGE_ERROR = 4
@@ -180,6 +189,30 @@ def _read_across_a_live_flip(
         assert found, f"probe printed no {label} line:\n{out}"
         values.append(float(found.group(1)))
     return values[0], values[1], values[2]
+
+
+def _origin_line(text: str) -> str:
+    """The recorded-origin line out of a session header, without its label."""
+    found = re.search(rf"^\s*{re.escape(ORIGIN_LINE)}(.+)$", text, re.MULTILINE)
+    assert found, f"no {ORIGIN_LINE!r} line in:\n{text}"
+    return found.group(1).strip()
+
+
+def _root_conftest(config: pytest.Config):
+    """The live ``test/conftest.py`` plugin module, so its record is read at source.
+
+    Reading the origin out of the module the running session actually loaded is what
+    makes it a fact rather than a re-implementation: a copy of the logic here would
+    pass even if the conftest stopped recording anything.
+    """
+    for _name, plugin in config.pluginmanager.list_name_plugin():
+        path = getattr(plugin, "__file__", "") or ""
+        if path.replace(os.sep, "/").endswith("/test/conftest.py"):
+            return plugin
+    raise AssertionError(
+        "the root test/conftest.py is not among this session's registered plugins, "
+        "so nothing pinned the overlay environment"
+    )
 
 
 def _collect_only(env: dict[str, str], cwd: str) -> subprocess.CompletedProcess[str]:
@@ -317,8 +350,41 @@ def test_conftest_defaults_the_two_variables_and_refuses_one_contradiction(
     default an unset variable, keep a supplied one, and refuse ``VLLM_NEURON_CPU_MODE``
     set to anything but ``1``. The middle case is the one the pre-``inc-glm53f-001``
     gate refused outright, so it is asserted to SUCCEED.
+
+    AND IT ASSERTS THE RECORDED ORIGIN, not just the value. Once the two variables are
+    defaulted, ``trn2`` in the environment no longer says whether the invocation pinned
+    it or the conftest supplied it, so the design's D2 invocation rule could not be
+    falsified by reading the value. The conftest records the origin
+    (``test/conftest.py`` ``RESOLUTION_ORIGIN``); this arm reads it out of the live
+    plugin module for its own session, and reads it again from each child's header,
+    where the two cases must come back DIFFERENT for the same value.
     """
     root = str(pytestconfig.rootpath)
+
+    # 0. This session's own origin, read from the module that actually pinned it.
+    conftest = _root_conftest(pytestconfig)
+    recorded = dict(conftest.RESOLUTION_ORIGIN)
+    print(f"PARENT_RESOLUTION_ORIGIN={recorded!r}")
+    assert set(recorded) == set(conftest.DEFAULTED_ENV), (
+        f"the conftest recorded an origin for {sorted(recorded)}, but it resolves "
+        f"{sorted(conftest.DEFAULTED_ENV)}; a variable with no recorded origin cannot "
+        f"be checked against D2's invocation rule"
+    )
+    assert set(recorded.values()) <= {conftest.SUPPLIED, conftest.DEFAULTED}, recorded
+
+    # The record and what the run reports must be one fact, not two.
+    parent_header = "\n".join(conftest.pytest_report_header())
+    parent_origin = _origin_line(parent_header)
+    print(f"PARENT_ORIGIN_LINE={parent_origin!r}")
+    for name, origin in sorted(recorded.items()):
+        assert f"{name}={origin}" in parent_origin, (
+            f"{name} is recorded as {origin!r} but the header says {parent_origin!r}"
+        )
+        note = INVOCATION_NOTE if origin == conftest.SUPPLIED else DEFAULTED_NOTE
+        assert f"  {name}={os.environ[name]} {note}" in parent_header, (
+            f"{name} is recorded as {origin!r}, so the header must tag its value "
+            f"{note}; the header is:\n{parent_header}"
+        )
 
     # 1. Neither variable set: both are defaulted, and the run collects.
     env = _base_env()
@@ -332,6 +398,9 @@ def test_conftest_defaults_the_two_variables_and_refuses_one_contradiction(
     assert f"{CPU_MODE}=1 {DEFAULTED_NOTE}" in unset.stdout, unset.stdout
     assert f"{OVERRIDE}={DEFAULTED_OVERRIDE} {DEFAULTED_NOTE}" in unset.stdout, unset.stdout
     assert f"expected FP8_CLAMP_MAX={E4M3_MAX}" in unset.stdout, unset.stdout
+    unset_origin = _origin_line(unset.stdout)
+    print(f"CONFTEST_UNSET_ORIGIN={unset_origin!r}")
+    assert unset_origin == f"{OVERRIDE}={conftest.DEFAULTED}, {CPU_MODE}={conftest.DEFAULTED}", unset_origin
 
     # 2. A supplied trn3 is KEPT, and the run is allowed. The old gate refused this.
     env = _base_env()
@@ -344,6 +413,36 @@ def test_conftest_defaults_the_two_variables_and_refuses_one_contradiction(
     )
     assert f"{OVERRIDE}=trn3 {INVOCATION_NOTE}" in supplied.stdout, supplied.stdout
     assert f"expected FP8_CLAMP_MAX={E4M3FN_MAX}" in supplied.stdout, supplied.stdout
+    supplied_origin = _origin_line(supplied.stdout)
+    print(f"CONFTEST_SUPPLIED_ORIGIN={supplied_origin!r}")
+    assert supplied_origin == f"{OVERRIDE}={conftest.SUPPLIED}, {CPU_MODE}={conftest.SUPPLIED}", supplied_origin
+
+    # 2b. THE READING D2 NEEDS: same resolved value, different recorded origin. A
+    # child that supplies trn2 and a child that lets the conftest default trn2 leave
+    # the identical environment behind, so only the origin separates them.
+    env = _base_env()
+    env[CPU_MODE] = "1"
+    env[OVERRIDE] = DEFAULTED_OVERRIDE
+    same_value_supplied = _collect_only(env, root)
+    print(f"CONFTEST_SUPPLIED_TRN2_EXIT={same_value_supplied.returncode}")
+    assert same_value_supplied.returncode == 0, (
+        f"{same_value_supplied.stdout}{same_value_supplied.stderr}"
+    )
+    supplied_trn2_origin = _origin_line(same_value_supplied.stdout)
+    print(f"CONFTEST_SUPPLIED_TRN2_ORIGIN={supplied_trn2_origin!r}")
+    assert f"{OVERRIDE}={DEFAULTED_OVERRIDE} {INVOCATION_NOTE}" in same_value_supplied.stdout, (
+        same_value_supplied.stdout
+    )
+    assert f"{OVERRIDE}={conftest.SUPPLIED}" in supplied_trn2_origin, supplied_trn2_origin
+    assert supplied_trn2_origin != unset_origin, (
+        f"a supplied trn2 and a defaulted trn2 recorded the same origin "
+        f"{supplied_trn2_origin!r}, so nothing distinguishes them and D2's invocation "
+        f"rule cannot be falsified by any reading in this tree"
+    )
+    # And the value really is identical in both, which is what makes the pair the point.
+    assert f"expected FP8_CLAMP_MAX={E4M3_MAX}" in same_value_supplied.stdout, (
+        same_value_supplied.stdout
+    )
 
     # 3. The one contradiction that is still refused.
     env = _base_env()
