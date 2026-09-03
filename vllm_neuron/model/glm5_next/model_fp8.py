@@ -2015,7 +2015,10 @@ class Glm5NextKDAAttention(nn.Module):
         )
         from vllm_neuron.functional.kda.decode_state import kda_decode_step
         from vllm_neuron.functional.kda.depthwise_conv1d import depthwise_conv1d
-        from vllm_neuron.functional.kda.gate_clamp import kda_gate_clamp
+        from vllm_neuron.functional.kda.gate_clamp import (
+            MAX_TILE as GATE_MAX_TILE,
+            kda_gate_clamp,
+        )
 
         if hidden_states.dim() != 2:
             raise ValueError(
@@ -2084,21 +2087,45 @@ class Glm5NextKDAAttention(nn.Module):
         q_conv, k_conv, v_conv = conv_out.split(width, dim=-1)
         self._store_conv_history(conv_state, padded[padded.shape[0] - state_rows :])
 
-        # --- seam 2: the gate clamp, one dispatch per head -------------------
+        # --- seam 2: the gate clamp, one dispatch per head per token tile -----
         # The seam takes ONE head per call: it refuses an ``a_log`` holding more
         # than one value, because the decay rate is per head while the bias and
         # the gate are per key channel.
+        #
+        # It also refuses more than ``GATE_MAX_TILE`` tokens in one call, because
+        # both of its axes pass through a transpose that serves that width. So a
+        # prompt longer than one tile is handed over in tiles and reassembled
+        # here, in the caller. The seam keeps its refusal rather than growing a
+        # quiet fallback: tiling is a caller's concern, and a kernel that stretched
+        # its own bound would be the torch-level fallback the substrate rule
+        # forbids.
+        #
+        # Tiling is exact here, not approximate. The gate applies a per-channel
+        # bias, one scalar decay rate and a sigmoid, with NO reduction along the
+        # token axis, so tile boundaries cannot move a value: a tiled call and a
+        # whole call agree bit for bit.
         a_log = self.A_log.to(torch.float32).reshape(-1)
         dt_bias = self.dt_bias.to(torch.float32).reshape(-1)
-        gate_parts = [
-            kda_gate_clamp(
-                raw_gate[:, h * kdim : (h + 1) * kdim].contiguous(),
-                a_log[h],
-                bias=dt_bias[h * kdim : (h + 1) * kdim],
-                lower=self.gate_lower_bound,
-            )
-            for h in range(heads)
-        ]
+
+        def clamp_one_head(h: int) -> torch.Tensor:
+            """One head's gate over the whole prompt, in tiles the seam accepts."""
+            span = slice(h * kdim, (h + 1) * kdim)
+            head_bias = dt_bias[span]
+            head_decay = a_log[h]
+            tiles = [
+                kda_gate_clamp(
+                    raw_gate[start : start + GATE_MAX_TILE, span].contiguous(),
+                    head_decay,
+                    bias=head_bias,
+                    lower=self.gate_lower_bound,
+                )
+                for start in range(0, tokens, GATE_MAX_TILE)
+            ]
+            # A prompt that already fits is returned as the single tile it is, so
+            # it still costs exactly one dispatch and no concatenation.
+            return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0)
+
+        gate_parts = [clamp_one_head(h) for h in range(heads)]
         beta = torch.sigmoid(raw_beta)
 
         # --- seams 3 to 5: the recurrence, per head --------------------------

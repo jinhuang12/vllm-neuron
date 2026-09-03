@@ -8,7 +8,10 @@ THE DECLARED ACCEPTANCE, the block's Tier N harness as ``inc-glm53f-025``:
       test/vllm_neuron/model/glm5_next/test_kda_layer.py -q -s --timeout 60 \\
       -p no:cacheprovider
 
-Four arms over ONE tiny case, one test item each, no ``parametrize``:
+Six arms, one test item each, no ``parametrize``. A01 to A04 read ONE tiny
+17-token case; A05 and A06 were added by ``inc-glm53f-038a`` repair round 1 and
+read a second case that crosses the gate seam's token bound, because an arm that
+stays under that bound is blind to it:
 
 * A01 -- the prefill arm. A three-layer KDA stack over 17 tokens matches an
   independent torch reference, and each of the five landed seams is entered
@@ -21,6 +24,13 @@ Four arms over ONE tiny case, one test item each, no ``parametrize``:
   ``get_kv_spec`` and driven through the runner's landed translation.
 * A04 -- the non-vacuity control (D1.5) on A03's zero: one field cleared on a
   COPY makes the runner's pairing guard raise.
+* A05 -- the token wall. A prompt ONE token past the gate seam's bound is served
+  and matches the reference; the gate is entered once per token tile, a count
+  derived from the seam's own bound, and the other four seams stay at one entry
+  per layer.
+* A06 -- the negative control on A05. The seam itself still refuses an over-long
+  single call, and tiling it is bit-exact rather than merely inside a tolerance.
+  Without this arm, widening the seam would also make A05 pass.
 
 WHY THE REFERENCE CARRIES STATE INSTEAD OF WALKING ONE FLAT SEQUENCE
 -------------------------------------------------------------------
@@ -740,3 +750,249 @@ def test_kda_layer_a04_the_pairing_guard_is_live_when_one_field_is_cleared(
 
     with pytest.raises(ValueError, match="part of it unset"):
         _drive_runner_translation(SimpleNamespace(get_kv_spec=lambda: mutated))
+
+
+# ---------------------------------------------------------------------------
+# A05 and A06 -- the token wall. ``inc-glm53f-038a`` repair round 1, for
+# ``B36-F1-gate-seam-token-wall``.
+#
+# The four arms above all run at 17 tokens, which never reaches the gate seam's
+# bound, so they could not see that a longer prompt raised. These two arms sit
+# either side of that bound: A05 drives a prompt past it and requires an answer,
+# A06 requires the seam itself to keep refusing an over-long single call.
+#
+# This case is built on its own rather than by generalising ``case``. That is a
+# deliberate choice: A01's and A02's recorded per-seam readings are the guard
+# that this repair moved nothing, so the fixture they read from stays untouched.
+# ---------------------------------------------------------------------------
+def _gate_tile_bound() -> int:
+    """The most tokens the gate seam serves in ONE call, read from the seam.
+
+    Never typed as a literal here. The bound is one object shared with the
+    chunked module -- the same partition-axis limit, not two constants that
+    happen to agree -- and this asserts that, so the two cannot drift apart and
+    leave this case sitting below the wall it exists to cross.
+    """
+    from vllm_neuron.functional.kda import chunked_recurrence, gate_clamp
+
+    assert gate_clamp.MAX_TILE is chunked_recurrence.MAX_TILE, (
+        "the gate seam's tile bound is no longer the same object as the chunked "
+        "module's; one of them has been redeclared and this case can no longer "
+        "trust it to be the wall"
+    )
+    return int(gate_clamp.MAX_TILE)
+
+
+@pytest.fixture(scope="module")
+def long_case() -> SimpleNamespace:
+    """Drive the stack over a prompt ONE token longer than the gate serves."""
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    bound = _gate_tile_bound()
+    total = bound + 1
+
+    text_config = Glm5NextTextConfig()
+    hidden = int(text_config.hidden_size)
+    heads = DECLARED_KDA_NUM_HEADS // REGISTERED_TP_WORLD_SIZE
+    head_dim = DECLARED_KDA_HEAD_SIZE
+    eps = float(text_config.rms_norm_eps)
+
+    torch.manual_seed(SEED)
+    weights = [
+        _make_weights(hidden, heads, head_dim, DECLARED_KDA_CONV_KERNEL_SIZE)
+        for _ in range(DECLARED_STACK_LAYERS)
+    ]
+    torch.manual_seed(SEED + 1)
+    tokens = torch.randn(total, hidden, dtype=torch.float32)
+
+    layers = []
+    for index, layer_weights in enumerate(weights):
+        layer = _impl().Glm5NextKDALayer(text_config, index, REGISTERED_TP_WORLD_SIZE)
+        attention = layer.attention
+        for name, tensor in layer_weights.items():
+            target = layer if name == "input_layernorm_weight" else attention
+            setattr(target, name, nn.Parameter(tensor.clone(), requires_grad=False))
+        layers.append(layer)
+
+    bank = [
+        (
+            torch.zeros(
+                layer.attention.kda_conv_state_shape,
+                dtype=layer.attention.kda_conv_state_dtype,
+            ),
+            torch.zeros(
+                layer.attention.kda_recurrent_state_shape,
+                dtype=layer.attention.kda_recurrent_state_dtype,
+            ),
+        )
+        for layer in layers
+    ]
+
+    _reset_counters()
+    out = tokens
+    for layer, (conv_state, recurrent_state) in zip(layers, bank):
+        out = layer(
+            out,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            is_prefill=True,
+            chunk_size=DECLARED_CHUNK,
+        )
+    counts = _read_counters()
+
+    conv_carrier_dtype = layers[0].attention.kda_conv_state_dtype
+    kernel_rows = DECLARED_KDA_CONV_KERNEL_SIZE - 1
+    history = [
+        torch.zeros(kernel_rows, 3 * heads * head_dim, dtype=torch.float32)
+        for _ in range(DECLARED_STACK_LAYERS)
+    ]
+    state: list[list[torch.Tensor] | None] = [None] * DECLARED_STACK_LAYERS
+    want = tokens
+    for index, layer_weights in enumerate(weights):
+        want, history[index], state[index] = _reference_layer(
+            want,
+            layer_weights,
+            history[index],
+            state[index],
+            heads=heads,
+            head_dim=head_dim,
+            eps=eps,
+            conv_carrier_dtype=conv_carrier_dtype,
+        )
+
+    return SimpleNamespace(
+        bound=bound,
+        total=total,
+        layers=layers,
+        heads=heads,
+        out=out,
+        counts=counts,
+        reference=want,
+    )
+
+
+def test_kda_layer_a05_a_prompt_past_the_gate_bound_is_served(
+    long_case: SimpleNamespace,
+) -> None:
+    """A prompt one token past the gate seam's bound returns, and is right.
+
+    Before this repair the same prompt raised: the layer handed the whole prefill
+    to a seam that serves one tile, so any prompt past the bound failed rather
+    than being tiled. A06 holds the other half -- that the seam still refuses the
+    over-long call this arm no longer makes.
+    """
+    assert long_case.total == long_case.bound + 1
+    assert tuple(long_case.out.shape) == (
+        long_case.total,
+        long_case.layers[0].attention.o_proj_weight.shape[0],
+    )
+    assert bool(torch.isfinite(long_case.out).all()), (
+        "the long prompt returned a non-finite value, so it was served in name "
+        "only"
+    )
+    torch.testing.assert_close(
+        long_case.out,
+        long_case.reference,
+        rtol=DECLARED_RTOL,
+        atol=DECLARED_ATOL,
+    )
+    print(f"A05_TOKENS={long_case.total} BOUND={long_case.bound}")
+    print(
+        "A05_MAXABS="
+        f"{float((long_case.out - long_case.reference).abs().max()):.3e}"
+    )
+
+    # The gate is entered once per tile, and the tile count is DERIVED from the
+    # bound rather than declared, so this reading follows the seam. The other four
+    # seams are untouched by this repair and stay at one entry per layer.
+    tiles = -(-long_case.total // long_case.bound)
+    per_layer = DECLARED_STACK_LAYERS * DECLARED_PER_RANK_HEADS
+    expected = {
+        "conv": per_layer,
+        "gate": tiles * per_layer,
+        "intra": per_layer,
+        "inter": per_layer,
+        "decode": per_layer,
+    }
+    print(f"A05_TILES_PER_HEAD={tiles} A05_COUNTS={long_case.counts}")
+    for seam, want_dispatches in expected.items():
+        dispatches, fallbacks = long_case.counts[seam]
+        assert dispatches == want_dispatches, (
+            f"{seam} read {dispatches} dispatches, expected {want_dispatches} at "
+            f"{long_case.total} tokens"
+        )
+        assert fallbacks == DECLARED_FALLBACKS, (
+            f"{seam} took the torch fallback {fallbacks} times; tiling must reach "
+            f"the kernel on every tile, and a fallback for kernel-class work is a "
+            f"P13 defect"
+        )
+
+
+def test_kda_layer_a06_the_gate_seam_still_refuses_an_over_long_call(
+    long_case: SimpleNamespace,
+) -> None:
+    """The seam keeps its refusal; only the caller learned to tile.
+
+    This is the negative control for A05. If the seam were widened or given a
+    quiet fallback instead, A05 would still pass and the repair would be
+    unmeasured -- so the refusal is asserted rather than assumed.
+    """
+    from vllm_neuron.functional.kda.gate_clamp import GateClampError, kda_gate_clamp
+
+    bound = long_case.bound
+    head_dim = DECLARED_KDA_HEAD_SIZE
+    torch.manual_seed(SEED + 2)
+    decay = torch.tensor(0.3, dtype=torch.float32)
+    bias = torch.randn(head_dim, dtype=torch.float32) * 0.3
+
+    # Exactly at the bound: served. This is the population check that makes the
+    # refusal below a reading about the extent and not about the whole call.
+    at_bound = kda_gate_clamp(
+        torch.randn(bound, head_dim, dtype=torch.float32),
+        decay,
+        bias=bias,
+        lower=DECLARED_GATE_LOWER_BOUND,
+    )
+    assert tuple(at_bound.shape) == (bound, head_dim)
+    print(f"A06_SERVED_AT_BOUND={bound}")
+
+    with pytest.raises(GateClampError, match="must both be in"):
+        kda_gate_clamp(
+            torch.randn(bound + 1, head_dim, dtype=torch.float32),
+            decay,
+            bias=bias,
+            lower=DECLARED_GATE_LOWER_BOUND,
+        )
+    print(f"A06_REFUSED_AT={bound + 1}")
+
+    # And the tiling is exact, not merely inside a tolerance: the gate carries no
+    # reduction along the token axis, so a tile boundary cannot move a value.
+    whole_input = torch.randn(bound, head_dim, dtype=torch.float32)
+    half = bound // 2
+    whole = kda_gate_clamp(
+        whole_input, decay, bias=bias, lower=DECLARED_GATE_LOWER_BOUND
+    )
+    tiled = torch.cat(
+        [
+            kda_gate_clamp(
+                whole_input[:half].contiguous(),
+                decay,
+                bias=bias,
+                lower=DECLARED_GATE_LOWER_BOUND,
+            ),
+            kda_gate_clamp(
+                whole_input[half:].contiguous(),
+                decay,
+                bias=bias,
+                lower=DECLARED_GATE_LOWER_BOUND,
+            ),
+        ],
+        dim=0,
+    )
+    print(
+        f"A06_TILED_MAXABS={float((whole - tiled).abs().max()):.3e}"
+    )
+    assert torch.equal(whole, tiled), (
+        "tiling the gate changed a value, so the token axis carries a reduction "
+        "and reassembly in the caller is not sound"
+    )
