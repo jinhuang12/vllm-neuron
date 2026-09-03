@@ -76,7 +76,10 @@ Always use a timeout (e.g. `--timeout 60`) when running tests with the simulator
 # NKI unit tests (dtype conversion, can_run_kernel)
 VLLM_NEURON_CPU_MODE=1 pytest test/vllm_neuron/nki/test_nki_cpu_sim.py -v --timeout=60
 
-# Functional tests in CPU mode (no simulator — fast)
+# Functional tests on the PyTorch fallback path (no simulator — fast).
+# This is NOT a green run of this tree: 41 of the 158 items assert that a kernel
+# was dispatched, and on the fallback path they correctly report that none was.
+# Expect 41 failed / 117 passed. Use it to exercise the fallback, not to gate.
 VLLM_NEURON_CPU_MODE=1 pytest test/vllm_neuron/functional/ -v --timeout=60
 
 # Functional tests with simulator (slow — small shapes only)
