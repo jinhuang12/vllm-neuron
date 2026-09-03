@@ -20,7 +20,7 @@ WHY IT NO LONGER DEMANDS THE VALUES FROM THE CALLER. It used to raise
 refused the repository's own documented invocations -- ``pytest test/unit -v
 --timeout=300`` and ``pytest test/vllm_neuron/functional/ -v --timeout=60``
 (``docs/model-dev/cpu-development.md:63``, ``:69``;
-``docs/model-dev/nki_cpu_simulator.md:80``, ``:83``) set no platform override,
+``docs/model-dev/nki_cpu_simulator.md:85``, ``:88``) set no platform override,
 so they collected zero tests and stopped. Worse, it refused
 ``NEURON_PLATFORM_TARGET_OVERRIDE=trn3`` outright, and ``dtype_utils.py:34-37``
 returns the 448.0 clamp only for a ``trn3`` target -- so on a trn3 machine the
