@@ -745,14 +745,31 @@ class DeepseekV4RoutedExperts(nn.Module):
             up_clamp_upper_limit=up_hi,
             up_clamp_lower_limit=up_lo,
             skip_token=True,
-            # LD-21: FALSE for ``shard_on_i``, which returns a plain ``[T, H]``
-            # tensor. The plugin's own trim branch under this flag
-            # (``functional/moe/moe_cte.py:395-402``) indexes ``output[:, 0, :H]``,
-            # which is ``shard_on_block``'s ``[T, 2, H+E]`` allocation and
-            # raises ``IndexError: too many indices for tensor of dimension 2``
-            # on this implementation (probe finding B, leg P2d). Setting this
-            # True here would be a crash, not a slowdown.
-            is_tensor_update_accumulating=False,
+            # F-302 (SUPERSEDES LD-21). This was FALSE, and the comment that
+            # justified it was right about the crash and wrong about the cost.
+            # The plugin's trim branch under this flag
+            # (``functional/moe/moe_cte.py``) keyed on the FLAG ALONE, so
+            # ``shard_on_i``'s plain ``[T, H]`` return hit a trim shaped for
+            # ``shard_on_block``'s ``[T, 2, H+E]`` and raised
+            # ``IndexError: too many indices for tensor of dimension 2``.
+            # Passing False dodged that crash -- and in doing so ALSO disabled
+            # the vendor kernel's ACCUMULATION and its ZERO-INIT
+            # (``bwmm_shard_on_I.py``: ``output[token_indices] += block_output``
+            # only under this flag, and ``output_initialization(output)`` is
+            # SKIPPED without it; the vendor's own default is True).
+            #
+            # Two consequences, one root cause: a token routed to >= 2 experts
+            # hosted on the same rank kept ONLY THE LAST expert's contribution
+            # (ep19 mechanism (a)), and rows no block wrote kept the PREVIOUS
+            # execution's data, which the EP all-reduce then summed across 64
+            # ranks into every token (mechanism (b), worked around downstream by
+            # the zero-mask in :meth:`_forward_prefill`). Measured on the NKI CPU
+            # simulator: rel_F 0.727 / 0.836 / 0.786 / 0.096 on the four
+            # multi-expert cases, against a 2e-2 bound.
+            #
+            # The trim is now keyed on the IMPLEMENTATION, so True is correct
+            # here rather than a crash.
+            is_tensor_update_accumulating=True,
         )
         # LD-73: discard the padding-sink row. The kernel contract returns
         # rows matching its token extent; under the ``[T+1, H]`` sink

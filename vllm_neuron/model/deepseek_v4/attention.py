@@ -1335,15 +1335,43 @@ class DeepseekV4KVCompressor(nn.Module):
         the scale itself is stored in an FP8 cache: a group whose absmax is
         below ~0.9 would otherwise want a scale under ``2**-9``, which is not
         representable in ``e4m3`` and reads back as ZERO, wiping the whole
-        group's value rather than degrading it. Flooring costs a little
-        relative precision in exactly the groups that contribute least.
+        group's value rather than degrading it.
+
+        **What flooring costs, MEASURED — this paragraph used to claim it "costs
+        a little relative precision in exactly the groups that contribute
+        least", and that claim is REFUTED (F-298).** Measured over 14 cells: at
+        input scale ``s`` in {4, 2, 1, 0.5, 0.25} nothing floors and rel_F is
+        ~6.2e-4; at ``s = 0.1`` about 30 % of groups floor and rel_F is 0.39 —
+        a hundred times over the 3.9e-3 gate; at ``s = 0.05`` every group floors
+        and rel_F reaches 1.33–1.38. The switch spans two binades of input
+        scale, and the per-group trigger is ``absmax <= 240 * 2**-10 =
+        0.234375``. The cost was never small; it was a wrong decode, for the
+        ORDER reason stated next.
+
+        THE FLOOR IS APPLIED BEFORE LIMB 1 IS QUANTIZED, and that ORDER is
+        load-bearing: both limbs and the decode must divide by the one scale
+        that is actually stored. Flooring after the limb-1 cast leaves the pair
+        referring to a scale the reader never sees, which is not a small
+        precision cost but a factor-of-``stored/unfloored`` error -- up to
+        ``2**12`` at the ``1e-4`` absmax clamp, where the group decodes to zero.
         """
-        limb1, scale = _quant_fp8_ue8m0(x)
+        # THE FLOOR COMES FIRST. `_quant_fp8_ue8m0`'s own codes are discarded
+        # and limb 1 is re-formed against the FLOORED scale, because the decode
+        # (:meth:`_merge_state`'s ``dequant_pair``) multiplies by the STORED
+        # scale. A limb 1 rounded against the UNFLOORED scale is wrong by the
+        # whole floor ratio, and limb 2 cannot repair it: its own
+        # ``[-_FP8_MAX, _FP8_MAX]`` clamp saturates as soon as that ratio
+        # exceeds 2, and at the ratio the ``1e-4`` absmax clamp produces the
+        # saturated limb 2 cancels limb 1 exactly and the group decodes to
+        # ZERO -- the very wipe this floor exists to prevent.
+        _, scale = _quant_fp8_ue8m0(x)
         scale = scale.clamp_min(_FP8_MIN_SCALE)
         expanded = _dequant_fp8(
-            torch.ones_like(limb1, dtype=torch.float32), scale, _KV_QUANT_GROUP
+            torch.ones_like(x, dtype=torch.float32), scale, _KV_QUANT_GROUP
         )
-        residual = (x / expanded - limb1.to(torch.float32)) * _STATE_LIMB_SHIFT
+        scaled = x / expanded
+        limb1 = torch.clamp(scaled, -_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+        residual = (scaled - limb1.to(torch.float32)) * _STATE_LIMB_SHIFT
         limb2 = torch.clamp(residual, -_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
         return limb1, limb2, scale
 
@@ -3032,13 +3060,28 @@ class DeepseekV4Attention(nn.Module):
         current_compressed_rows: torch.Tensor | None = None,
         current_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Single-token-per-sequence attention over the paged caches.
+        """Decode attention over the paged caches, ``S >= 1`` tokens per sequence.
 
-        ``NF.mla_decode_attention`` wants ``q`` as ``[B, H, 512]``, so the
-        flat token axis is folded by the batch size the block table reports.
-        A step that generates more than one token per sequence (speculative
-        decoding / MTP) has ``max_query_len > decode_token_threshold`` and so
-        has already been dispatched to the prefill op instead.
+        ``NF.mla_decode_attention`` wants ``q`` as ``[B, H, 512]`` at ``S == 1``
+        and ``[B, S, H, 512]`` above it, so the flat token axis is folded by the
+        batch size the block table reports.
+
+        **LD-54.** The paragraph that used to stand here claimed a step
+        generating more than one token per sequence "has
+        ``max_query_len > decode_token_threshold`` and so has already been
+        dispatched to the prefill op instead." That is FALSE under DSpark
+        speculative decoding, and it was the whole defect. The runner sets
+        ``decode_token_threshold = 1 + max_num_draft_tokens``
+        (``neuron_model_runner.py:3953-3954``), so a verify step carrying
+        ``1 + num_speculative_tokens`` tokens per sequence satisfies
+        ``max_query_len <= threshold`` and is classified as DECODE. With five
+        drafts that is SIX tokens per sequence arriving here. The old
+        ``query.reshape(batch, ...)`` then demanded ``B*H*D`` elements from a
+        ``6*B*H*D`` tensor and raised.
+
+        ``S`` is derived from the shapes, so the branch below is resolved at
+        TRACE time, not at runtime: no data-dependent control flow enters the
+        graph, and the ``S == 1`` path emits exactly the ops it emitted before.
 
         SWA-only layers have no compressed pool. Rather than a second op they
         pass their window cache in BOTH cache slots with an all-``-1``
@@ -3048,8 +3091,22 @@ class DeepseekV4Attention(nn.Module):
         """
         swa_md = attn_metadata[f"{prefix}.swa"]
         batch = swa_md["block_table_tensor"].shape[0]
-        q = query.reshape(batch, self.num_local_heads, self.head_dim)
-        pos = positions.reshape(batch)
+        tokens = query.shape[0]
+        if batch <= 0 or tokens % batch != 0:
+            raise ValueError(
+                f"_decode_attention: {tokens} query rows do not divide into "
+                f"{batch} sequences (block-table rows); a decode step must "
+                "carry the same number of tokens for every sequence."
+            )
+        spec_len = tokens // batch
+        if spec_len == 1:
+            q = query.reshape(batch, self.num_local_heads, self.head_dim)
+            pos = positions.reshape(batch)
+        else:
+            q = query.reshape(
+                batch, spec_len, self.num_local_heads, self.head_dim
+            )
+            pos = positions.reshape(batch, spec_len)
 
         # <-- The SWA leg's block table is TRIMMED at decode. The runner
         # replaces a SlidingWindowSpec group's ``block_table_tensor`` with a
@@ -3089,7 +3146,7 @@ class DeepseekV4Attention(nn.Module):
             span = -(-raw // self.compress_ratio)      # ceil-div, compressed slots
             # LD-75: kernel-rung dispatch (name swap only, prereg D2); the
             # gate inside mla_decode_tkg falls back to mla_decode_attention.
-            return NF.mla_decode_tkg(
+            out = NF.mla_decode_tkg(
                 q,
                 self.latent_k_cache,
                 self.swa_k_cache,
@@ -3123,12 +3180,22 @@ class DeepseekV4Attention(nn.Module):
                 rope_dim=self.rope_head_dim,
                 quant_group_size=_KV_QUANT_GROUP,
             )
+            # LD-54: the op returns ``[B, S, H, D]`` when it was handed a 4-D
+            # query. Callers of this helper consume a FLAT ``[T, H, D]``, so fold
+            # the token axis back. At ``S == 1`` nothing is emitted at all.
+            return (
+                out
+                if spec_len == 1
+                else out.reshape(tokens, self.num_local_heads, self.head_dim)
+            )
 
+        # LD-54: one candidate row per TOKEN, not per sequence. Identical to the
+        # old ``(batch, 1)`` whenever S == 1, which is every non-verify step.
         absent = torch.full(
-            (batch, 1), _PAD_INDEX, dtype=torch.int32, device=query.device
+            (tokens, 1), _PAD_INDEX, dtype=torch.int32, device=query.device
         )
         # LD-75: kernel-rung dispatch (name swap only, prereg D2).
-        return NF.mla_decode_tkg(
+        out = NF.mla_decode_tkg(
             q,
             self.swa_k_cache,
             self.swa_k_cache,
@@ -3155,6 +3222,12 @@ class DeepseekV4Attention(nn.Module):
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
             quant_group_size=_KV_QUANT_GROUP,
+        )
+        # LD-54: fold the token axis back, as the compressed leg above does.
+        return (
+            out
+            if spec_len == 1
+            else out.reshape(tokens, self.num_local_heads, self.head_dim)
         )
 
     def _q_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -3193,20 +3266,38 @@ class DeepseekV4Attention(nn.Module):
         CPU/unit construction that never called :meth:`bind_kv_cache`; the
         compressor then falls back to in-forward pooling and says so.
 
-        ``seq_ids`` is derived, not read: at decode the runner lays out exactly
-        one token per sequence in block-table row order, so ``arange`` IS the
-        mapping; at prefill one forward carries one sequence, which is the
-        same contract the prefill attention ops rely on by taking no sequence
-        ids at all.
+        ``seq_ids`` is derived, not read: at decode the runner lays out the
+        step's tokens in block-table row order, ``S`` per sequence; at prefill
+        one forward carries one sequence, which is the same contract the prefill
+        attention ops rely on by taking no sequence ids at all.
+
+        **LD-54.** ``S`` is NOT always 1 at decode. A DSpark verify step carries
+        ``1 + num_speculative_tokens`` tokens per sequence and the runner still
+        classifies it as decode (``neuron_model_runner.py:3953-3954``), so the
+        map is ``arange(B).repeat_interleave(S)`` and only COINCIDES with
+        ``arange(T)`` at ``S == 1``. This site is the dangerous one of the pair:
+        unlike ``_coarse_slots`` it does not raise on the wrong shape, it
+        silently hands the compressor's gather ids that belong to other
+        sequences.
         """
         if k_cache is None or v_cache is None:
             return None
         device = metadata["slot_mapping"].device
-        seq_ids = (
-            torch.arange(tokens, dtype=torch.long, device=device)
-            if is_decode
-            else torch.zeros(tokens, dtype=torch.long, device=device)
-        )
+        batch = metadata["block_table_tensor"].shape[0]
+        if batch <= 0 or tokens % batch != 0:
+            raise ValueError(
+                f"_compressor_state: {tokens} tokens do not divide into "
+                f"{batch} sequences (block-table rows)."
+            )
+        spec_len = tokens // batch
+        if not is_decode:
+            seq_ids = torch.zeros(tokens, dtype=torch.long, device=device)
+        elif spec_len == 1:
+            seq_ids = torch.arange(tokens, dtype=torch.long, device=device)
+        else:
+            seq_ids = torch.arange(
+                batch, dtype=torch.long, device=device
+            ).repeat_interleave(spec_len)
         return CompressorState(
             k_cache=k_cache,
             v_cache=v_cache,
@@ -3308,11 +3399,28 @@ class DeepseekV4Attention(nn.Module):
         group = torch.div(positions, ratio, rounding_mode="floor")
 
         tokens = positions.shape[0]
-        seq_ids = (
-            torch.arange(tokens, dtype=torch.long, device=positions.device)
-            if is_decode
-            else torch.zeros(tokens, dtype=torch.long, device=positions.device)
-        )
+        # LD-54: ``arange(T)`` is the token->sequence map ONLY when T == B. A
+        # DSpark verify step is classified as decode with S = 1 + drafts tokens
+        # per sequence, and at T = S*B this indexed rows B..S*B-1 of a B-row
+        # block table, so the ``index_select`` below raised IndexError. This is
+        # the site that fires FIRST in a real compressed-layer forward
+        # (``forward`` reaches ``_coarse_slots`` before ``_decode_attention``),
+        # which is why fixing the ``:3051`` reshape alone only MOVED the crash.
+        batch = block_table.shape[0]
+        if batch <= 0 or tokens % batch != 0:
+            raise ValueError(
+                f"_coarse_slots: {tokens} tokens do not divide into {batch} "
+                f"sequences (block-table rows)."
+            )
+        spec_len = tokens // batch
+        if not is_decode:
+            seq_ids = torch.zeros(tokens, dtype=torch.long, device=positions.device)
+        elif spec_len == 1:
+            seq_ids = torch.arange(tokens, dtype=torch.long, device=positions.device)
+        else:
+            seq_ids = torch.arange(
+                batch, dtype=torch.long, device=positions.device
+            ).repeat_interleave(spec_len)
         table = torch.index_select(block_table.to(torch.int64), 0, seq_ids)
         max_blocks = table.shape[1]
         block_of = torch.clamp(

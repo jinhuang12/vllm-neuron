@@ -167,8 +167,11 @@ def mla_decode_attention(
     (``dsv4_ref/model.py:480``, ``:538``, ``:539``).
 
     Args (plan-fixed positional order, contract §5):
-        q: ``[B, H, 512]`` (or ``[B, 1, H, 512]``) queries for the one token
-            each sequence is generating.
+        q: ``[B, H, 512]``, or ``[B, S, H, 512]`` for the ``S`` tokens each
+            sequence is generating this step. ``S == 1`` is ordinary decode;
+            ``S = 1 + num_speculative_tokens`` is a DSpark verify step, which
+            the runner also classifies as decode (LD-54). The flat 3-D form is
+            one row per token.
         latent_cache: compressed-latent cache — 4-D paged
             ``[num_blocks, 1, block_size, width]`` (contract §4; pass the other
             physical pieces via ``latent_v_cache``/``latent_rope_cache``) or 3-D
@@ -261,28 +264,46 @@ def mla_decode_attention(
         out_dtype: bf16 output dtype.
 
     Returns:
-        ``[B, H, 512]`` (or ``[B, 1, H, 512]`` if ``q`` was 4-D).
+        ``[B*S, H, 512]`` (or ``[B, S, H, 512]`` if ``q`` was 4-D).
     """
     q_was_4d = q.dim() == 4
     if q_was_4d:
-        batch, q_len, num_heads, head_dim = q.shape
-        assert q_len == 1, (
-            "mla_decode_attention generates one token per sequence; got "
-            f"q_len={q_len} (use mla_sparse_attention for multi-token queries)"
-        )
-        q_flat = q.reshape(batch, num_heads, head_dim)
+        # LD-54: ``q_len > 1`` is ACCEPTED. The assertion that used to stand
+        # here ("mla_decode_attention generates one token per sequence") was
+        # false as a precondition: the runner classifies a DSpark verify step of
+        # ``1 + num_speculative_tokens`` tokens per sequence as DECODE
+        # (``neuron_model_runner.py:3953-3954``), so this op really is handed
+        # ``q_len = 6`` and rejected the caller instead of serving it.
+        n_seqs, q_len, num_heads, head_dim = q.shape
+        rows = n_seqs * q_len
+        q_flat = q.reshape(rows, num_heads, head_dim)
     else:
-        assert q.dim() == 3, f"q must be [B, H, D] or [B, 1, H, D], got {tuple(q.shape)}"
+        assert q.dim() == 3, f"q must be [B, H, D] or [B, S, H, D], got {tuple(q.shape)}"
         q_flat = q
-        batch, num_heads, head_dim = q_flat.shape
+        rows, num_heads, head_dim = q_flat.shape
+        n_seqs, q_len = rows, 1
     assert head_dim == nope_dim + rope_dim, (
         f"q head_dim {head_dim} != nope_dim + rope_dim ({nope_dim} + {rope_dim}); "
         "the absorbed-MLA latent is 512 = 448 NoPE + 64 RoPE"
     )
     device = q_flat.device
 
-    # One token per sequence, so token index == sequence index.
-    seq_ids = torch.arange(batch, device=device, dtype=torch.int64)
+    # ``batch`` below means ROW COUNT -- one row per TOKEN, which is what every
+    # per-token reshape/expand in this body needs. It equals the sequence count
+    # only at ``q_len == 1``; ``n_seqs`` and ``q_len`` are kept separately for
+    # the sequence-indexed derivations (``seq_ids``) and the final view.
+    batch = rows
+
+    # LD-54: PER-TOKEN sequence ids. At q_len == 1 token index IS sequence
+    # index and this is ``arange(n_seqs)`` exactly as before; above it, the S
+    # tokens of a sequence must all carry that sequence's id or every
+    # block-table gather in this body reads another sequence's blocks.
+    if q_len == 1:
+        seq_ids = torch.arange(n_seqs, device=device, dtype=torch.int64)
+    else:
+        seq_ids = torch.arange(
+            n_seqs, device=device, dtype=torch.int64
+        ).repeat_interleave(q_len)
 
     pos: Optional[Tensor] = None
     if positions is not None:
@@ -527,5 +548,7 @@ def mla_decode_attention(
                 )
 
     if q_was_4d:
-        return out.view(batch, 1, num_heads, head_dim)
+        # LD-54: ``q_len``, not a hard-coded 1 — the 4-D caller gets back the
+        # same ``[B, S, H, D]`` geometry it handed in.
+        return out.view(n_seqs, q_len, num_heads, head_dim)
     return out

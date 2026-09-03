@@ -243,6 +243,84 @@ def _fx_passes_source_fingerprint() -> str:
     return digest.hexdigest()
 
 
+#: Packages whose source is folded into :func:`_functional_nki_source_fingerprint`.
+#: Kept as a module constant so a test can assert the SCOPE, not just the digest.
+_FUNCTIONAL_NKI_FINGERPRINT_PACKAGES = ("functional", "nki")
+
+
+@functools.lru_cache(maxsize=1)
+def _functional_nki_source_fingerprint() -> str:
+    """sha256 over the RECURSIVE ``vllm_neuron/{functional,nki}/**/*.py`` tree.
+
+    S1. Same argument as :func:`_fx_passes_source_fingerprint`, applied to the
+    two packages that hold the kernels and the functional ops: the compile
+    cache key is taken from the PRE-FX-pass graph, and this module deliberately
+    normalizes NKI kernel identity down to ``func_name``/``grid``/``mac_count``
+    (see :func:`_add_kernel_backend_config_for_hashing`) while
+    ``nki/nki_cache.py`` hashes only the decorated kernel ``def``
+    (``inspect.getsource(func)``). Between those two facts a MAC-PRESERVING
+    edit -- to a kernel body's helpers, to a module-level constant, to a
+    vendor-call argument, or to any ``functional/`` op -- changes the NKI cache
+    key but NOT this one, so the serve replays a NEFF that does not contain the
+    edit. That is the P-A hazard; this component closes it from the
+    ``cache.py`` side.
+
+    RECURSIVE BY REQUIREMENT (F-311). ``vllm_neuron/fx_passes/`` is a FLAT
+    package, so the sibling fingerprint's ``os.listdir`` is complete there.
+    ``functional/`` and ``nki/`` are TREES -- ``functional/moe/moe_cte.py``,
+    ``functional/attention/mla_decode.py``, ``functional/collectives/all_to_all.py``
+    -- and a copy-pasted flat listing would fingerprint almost NONE of the
+    files that matter. It walks, and it sorts by the path RELATIVE to the
+    package root rather than by basename, because two files can share a
+    basename in different subpackages.
+
+    The relative path is hashed ALONGSIDE the bytes, so a pure rename re-keys.
+    ``__pycache__`` and every non-``.py`` file are skipped.
+
+    Resolved by PATH from this module's own location, deliberately NOT by
+    importing the two packages: ``nki`` pulls in the vendor SDK at module
+    import, and computing a cache key must never depend on that being
+    installed. Memoized exactly as ``:224`` is -- the source tree is immutable
+    for the life of the process.
+    """
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    digest = hashlib.sha256()
+    total_files = 0
+    for package in _FUNCTIONAL_NKI_FINGERPRINT_PACKAGES:
+        sub_root = os.path.join(package_root, package)
+        if not os.path.isdir(sub_root):
+            # A silently EMPTY fingerprint is the F-308 failure mode wearing a
+            # different hat: it would weaken the key without a symptom.
+            raise RuntimeError(
+                f"cannot fingerprint vllm_neuron/{package}: {sub_root} is not a "
+                "directory. Refusing to emit a cache key with a silently empty "
+                "source-fingerprint component."
+            )
+        entries = []
+        for dirpath, dirnames, filenames in os.walk(sub_root):
+            dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+            for filename in filenames:
+                if not filename.endswith(".py"):
+                    continue
+                abs_path = os.path.join(dirpath, filename)
+                rel_path = os.path.relpath(abs_path, sub_root).replace(os.sep, "/")
+                entries.append((rel_path, abs_path))
+        for rel_path, abs_path in sorted(entries):
+            # Package-qualified so the two trees can never alias each other.
+            digest.update(f"{package}/{rel_path}\0".encode())
+            with open(abs_path, "rb") as f:
+                digest.update(f.read())
+            total_files += 1
+
+    if total_files == 0:
+        raise RuntimeError(
+            "vllm_neuron/{functional,nki} fingerprint walked ZERO .py files; "
+            "refusing to emit a cache key with a vacuous source fingerprint."
+        )
+    return digest.hexdigest()
+
+
 def create_cache_hash(
     gm: torch.fx.GraphModule,
     example_inputs: List[torch.Tensor],
@@ -274,6 +352,28 @@ def create_cache_hash(
 
     normalized_gm = _add_kernel_backend_config_for_hashing(normalized_gm)
 
+    # S0(b) -- MUST run BEFORE the ``str()`` on the next line.
+    #
+    # ``node.meta`` alone is NOT enough. FX graph printing renders
+    # op/target/args/kwargs and NOT ``node.meta``, so the rank identity that
+    # reaches ``str(normalized_gm.graph)`` is the group NAME STRING sitting in
+    # ``node.args[-1]``: ``torch.distributed`` names groups from a monotonically
+    # increasing counter, so rank 0 prints "N" where rank 8 prints "N+1" for the
+    # same logical collective. Writing meta fixes the replica-groups component
+    # below; rewriting ``args[-1]`` fixes the graph-text component here. S0
+    # needs BOTH, which is why the order matters.
+    #
+    # Mutating ``normalized_gm`` in place at this point is safe by exactly the
+    # argument this file already makes for itself: ``:273`` returned a private
+    # ``copy.deepcopy`` and ``_add_kernel_backend_config_for_hashing`` above
+    # already rewrites ``node.kwargs`` on it. The live graph is never touched.
+    #
+    # Deliberately placed HERE, outside ``_get_collective_replica_groups_for_hashing``'s
+    # ``try``, so a resolver failure is LOUD (F-308): inside that helper a bare
+    # ``except`` used to turn the raise into ``return None``, which dropped the
+    # replica-groups component and silently SHORTENED the key.
+    _canonicalize_collective_group_names_for_hashing(normalized_gm)
+
     hash_components = [str(normalized_gm.graph)]
 
     # Include resolved replica group ranks so that different process group
@@ -302,6 +402,13 @@ def create_cache_hash(
     fx_passes_fingerprint = _fx_passes_source_fingerprint()
     hash_components.append(f"fx_passes:{fx_passes_fingerprint}")
 
+    # S1 / F-311: RECURSIVE functional/** + nki/** source fingerprint. Kept a
+    # SEPARATE component from ``fx_passes:`` above -- deliberately not folded
+    # into that string -- so the two are independently attributable in the
+    # debug line below when a key moves and somebody has to say why.
+    functional_nki_fingerprint = _functional_nki_source_fingerprint()
+    hash_components.append(f"functional_nki:{functional_nki_fingerprint}")
+
     # Normalize compiler args into a canonical dict
     raw_compiler_args = options.get("compiler_args", "")
     compiler_args = _parse_compiler_args(raw_compiler_args)
@@ -325,6 +432,7 @@ def create_cache_hash(
         f"neuronxcc={neuronxcc_version}, "
         f"nki={nki_version}, "
         f"fx_passes={fx_passes_fingerprint}, "
+        f"functional_nki={functional_nki_fingerprint}, "
         f"compiler_args_canonical={sorted_args_str}"
     )
 
@@ -404,15 +512,86 @@ class CompilationLock:
         return self._acquired
 
 
+def _canonicalize_collective_group_names_for_hashing(
+    gm: torch.fx.GraphModule,
+) -> int:
+    """S0(b). Replace each collective's group NAME with a partition TOKEN.
+
+    Rewrites, IN PLACE on the hashing deepcopy, the last positional argument of
+    every ``COLLECTIVE_OPS`` node -- the ``group_name`` string, which
+    ``_extract_group_name`` documents as always last -- with a canonical token
+    of the FULL rank partition that group belongs to.
+
+    Why the graph TEXT and not just ``node.meta``: ``str(gm.graph)`` renders
+    args and kwargs but never ``meta``, and the name is a per-rank counter
+    value, so without this rewrite the hashed text still differs per rank and
+    one compilation still keys eight ways.
+
+    Distinct partitions stay distinct; identical partitions reached through
+    different group objects collapse, which is correct -- the compiler is only
+    ever handed ``replica_groups``.
+
+    Raises:
+        ReplicaGroupResolutionError: propagated deliberately. Called from
+            ``create_cache_hash`` OUTSIDE any ``except``, because the F-308
+            failure mode is a silently WEAKER key rather than a crash.
+
+    Returns:
+        the number of collective nodes rewritten.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0
+
+    from vllm_neuron.fx_passes.collective_replica_groups_pass import (
+        COLLECTIVE_OPS,
+        CollectiveReplicaGroupsPass,
+    )
+    from vllm_neuron.parallel.replica_groups import canonical_partition_token
+
+    # Populates ``node.meta["replica_groups"]`` with the FULL partition.
+    CollectiveReplicaGroupsPass().run(gm)
+
+    rewritten = 0
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in COLLECTIVE_OPS:
+            continue
+        if not node.args or not isinstance(node.args[-1], str):
+            continue
+        partition = node.meta.get("replica_groups")
+        if partition is None:
+            continue
+        node.args = tuple(node.args[:-1]) + (
+            canonical_partition_token(partition),
+        )
+        rewritten += 1
+
+    if rewritten:
+        logger.debug(
+            "S0(b): canonicalized %d collective group name(s) to partition "
+            "tokens before hashing the graph text",
+            rewritten,
+        )
+    return rewritten
+
+
 def _get_collective_replica_groups_for_hashing(
     gm: torch.fx.GraphModule,
 ) -> Optional[str]:
-    """Run CollectiveReplicaGroupsPass on a copy and return a deterministic
-    string encoding the resolved replica groups for all collective nodes.
+    """Return a deterministic string encoding the resolved replica groups.
+
+    Runs on the hashing copy the caller already deepcopied. Under S0 each
+    node's ``replica_groups`` is the FULL rank partition, so this component is
+    rank-independent too; its per-node prefix is ``node.name``, which is
+    graph-structural and was already rank-independent.
 
     Returns None when torch.distributed is not initialised or no collectives
     are present.
+
+    Raises:
+        ReplicaGroupResolutionError: NOT swallowed (F-308). See below.
     """
+    from vllm_neuron.parallel.replica_groups import ReplicaGroupResolutionError
+
     if not (dist.is_available() and dist.is_initialized()):
         return None
 
@@ -421,9 +600,22 @@ def _get_collective_replica_groups_for_hashing(
             CollectiveReplicaGroupsPass,
         )
 
-        gm, metadata = CollectiveReplicaGroupsPass().run(gm)
-        if metadata.get("resolved_count", 0) == 0:
-            return None
+        # S0(b) ORDERING. ``create_cache_hash`` already ran this pass on THIS
+        # object and then rewrote every collective's ``args[-1]`` to a partition
+        # token, so re-running the pass here would hand that token to
+        # ``_resolve_process_group`` as a group name and raise. Reuse the
+        # populated meta when it is there; only run the pass for direct callers
+        # and tests that never went through the canonicalization step. (The
+        # plan's alternative -- making the pass idempotent -- was not taken;
+        # this is the meta-reuse form.)
+        already_populated = any(
+            node.meta.get("replica_groups") is not None
+            for node in gm.graph.nodes
+        )
+        if not already_populated:
+            gm, metadata = CollectiveReplicaGroupsPass().run(gm)
+            if metadata.get("resolved_count", 0) == 0:
+                return None
 
         # Build a deterministic string from the resolved groups in node order.
         parts = []
@@ -432,8 +624,27 @@ def _get_collective_replica_groups_for_hashing(
             if groups is not None:
                 parts.append(f"{node.name}:{groups}")
         return "|".join(parts) if parts else None
+    except ReplicaGroupResolutionError:
+        # F-308. This USED TO return None, and returning None here means
+        # ``create_cache_hash`` sees a falsy ``replica_groups_str`` and OMITS
+        # the component entirely -- so two graphs differing only in parallel
+        # topology hash IDENTICALLY, and the whole failure is a single
+        # ``logger.debug`` line that no gate reads. A resolver failure is a
+        # real defect and must stop the compile, not weaken the key.
+        logger.error(
+            "Replica-group resolution FAILED on the hashing path. REFUSING to "
+            "emit a cache key without the replica-groups component: omitting "
+            "it would let two different parallel topologies share one NEFF.",
+            exc_info=True,
+        )
+        raise
     except Exception as e:
-        logger.debug(f"Failed to resolve collective replica groups for hashing: {e}")
+        # Kept broad for genuinely unrelated failures, but at ERROR now, never
+        # debug: this branch still shortens the key and must be visible.
+        logger.error(
+            f"Failed to resolve collective replica groups for hashing: {e}",
+            exc_info=True,
+        )
         return None
 
 

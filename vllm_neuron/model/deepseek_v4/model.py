@@ -72,6 +72,7 @@ import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
+from vllm_neuron.parallel.replica_groups import register_full_partition
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
@@ -714,12 +715,27 @@ class DeepseekV4Model(nn.Module):
             )
         my_group = None
         my_rank = 0
+        # S0 / F-309: keep EVERY tile's handle, not just this rank's. The
+        # sibling groups already exist -- ``new_group`` is collective, so this
+        # loop really does construct all of them on every rank -- but ``group``
+        # is a loop-local the next iteration overwrites, so before S0 nothing
+        # could map a group NAME back to the partition it belongs to, and
+        # ``_resolve_process_group(name)`` returns one group, never its
+        # siblings. Arm 1 of the resolver was a lookup against a table that did
+        # not exist. This is that table.
+        created: list[tuple[object, list[int]]] = []
         for start in range(0, self.world_size, group_size):
             ranks = list(range(start, start + group_size))
             group = dist.new_group(ranks)
+            created.append((group, ranks))
             if self.rank in ranks:
                 my_group = group
                 my_rank = ranks.index(self.rank)
+        # Registered under EVERY tile's name, all mapping to the SAME partition:
+        # that is what collapses the 8-way per-rank compile-key split. Groups
+        # created OUTSIDE this method (TP, EP, lm_head) are world-wide and are
+        # arm-2 cases, so they are deliberately not registered here.
+        register_full_partition(created, world_size=self.world_size)
         return my_group, my_rank, group_size
 
     def forward(
