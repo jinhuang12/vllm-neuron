@@ -38,6 +38,7 @@ probe whose observable consequence differs between the two candidate orders.
 
 from __future__ import annotations
 
+import ast
 import os
 
 import pytest
@@ -64,6 +65,7 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     kernel_identity,
     kernel_scale_shape,
     reset_dispatch_counters,
+    seam_identity,
     to_kernel_scale_layout,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -741,6 +743,70 @@ def test_cte_seam_dispatches_to_the_adapted_nkilib_member() -> None:
     assert module == "nkilib.core.moe.moe_cte.bwmm_shard_on_I", module
     assert qualname == "blockwise_mm_baseline_shard_intermediate", qualname
     assert NUM_SHARDS == 2
+
+
+def test_cte_identity_readings_are_derived_through_the_seam() -> None:
+    """`B26-M1`, `inc-glm53f-077`: both readings follow the real call chain.
+
+    The seam wraps a shim and the shim forwards to the vendor kernel, so there
+    are TWO substitutable hops. The reading this repair replaced looked at
+    neither: it read this module's own import of the kernel, so a substitution at
+    either hop left it byte-identical and the silence read as reassurance.
+
+    What this arm settles, and what it does NOT. It settles that each reading
+    resolves to the object at its own hop, that the two hops are different
+    objects, and that a chain which cannot be derived RAISES rather than falling
+    back to the import. It does NOT discriminate the repair from the reading it
+    replaced -- that needs the call site itself edited, which the acceptance
+    harness does as its graded mutation arms (``accept-077-r1-host.out``).
+    """
+    import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
+
+    seam_module, seam_qualname = seam_identity()
+    kernel_module, kernel_qualname = kernel_identity()
+    print(f"[identity] seam={seam_module}.{seam_qualname}")
+    print(f"[identity] kernel={kernel_module}.{kernel_qualname}")
+
+    # Hop 1: what ``wrap_nki`` wraps is THIS module's shim, not the vendor member.
+    assert seam_module == "vllm_neuron.functional.moe.moe_blockwise_fp8", seam_module
+    assert seam_qualname == (
+        "_torch_compatible_blockwise_mm_baseline_shard_intermediate"
+    ), seam_qualname
+
+    # Hop 2: the kernel reading is unchanged by this repair, to the byte.
+    assert kernel_module == "nkilib.core.moe.moe_cte.bwmm_shard_on_I", kernel_module
+    assert kernel_qualname == "blockwise_mm_baseline_shard_intermediate", (
+        kernel_qualname
+    )
+
+    # The pair is not vacuous: two hops, two different objects, two readings.
+    wrapped = moe._seam_wrapped_object()
+    forwarded = moe._shim_forward_target()
+    if wrapped is forwarded:
+        raise RouteInstrumentError(
+            "the seam's wrapped object and the shim's forward target are the "
+            "same object, so the two readings cannot separate the two hops and "
+            "this arm asserts a property of nothing"
+        )
+    assert (seam_module, seam_qualname) != (kernel_module, kernel_qualname)
+
+    # Each reading is the object at its own hop, by identity rather than by name.
+    assert wrapped is moe._torch_compatible_blockwise_mm_baseline_shard_intermediate
+    assert forwarded is moe.blockwise_mm_baseline_shard_intermediate
+
+    # A chain that cannot be derived RAISES. No fall back to the import: that
+    # fall back is the silence `B26-M1` found.
+    with pytest.raises(MoeBlockwiseFp8Error) as no_source:
+        moe._function_ast(object())
+    assert "cannot read the source" in str(no_source.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as not_a_name:
+        moe._resolved(seam_identity, ast.Constant(value=1), "a test probe")
+    assert "not a plain name" in str(not_a_name.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as unbound:
+        moe._resolved(seam_identity, ast.Name(id="not_bound_anywhere"), "a probe")
+    assert "not bound in" in str(unbound.value)
 
 
 @pytest.mark.parametrize(

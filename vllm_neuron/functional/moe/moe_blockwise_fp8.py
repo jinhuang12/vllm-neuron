@@ -61,7 +61,10 @@ diagnostics.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import logging
+import textwrap
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -128,6 +131,7 @@ __all__ = [
     "kernel_identity",
     "kernel_scale_shape",
     "reset_dispatch_counters",
+    "seam_identity",
     "to_kernel_scale_layout",
 ]
 
@@ -517,15 +521,163 @@ def blockwise_fp8_moe_torch_oracle(
     return result["output"]
 
 
-def kernel_identity() -> tuple[str, str]:
-    """``(module, qualname)`` of the adapted NKI member, read off the object.
+# --------------------------------------------------------------------------- #
+# The two identity readings, DERIVED THROUGH THE SEAM.                          #
+# --------------------------------------------------------------------------- #
+# WHAT WAS WRONG (`B26-M1`, repaired at `inc-glm53f-077`). This function used to
+# read the MODULE-LEVEL import at the top of this file:
+#
+#     func = getattr(blockwise_mm_baseline_shard_intermediate, "func", None)
+#     target = func if func is not None else blockwise_mm_baseline_shard_intermediate
+#     return target.__module__, target.__qualname__
+#
+# That reads a name this module imports, NOT the object the seam sends work to.
+# The seam wraps the shim (`blockwise_fp8_moe`, the `wrap_nki(...)` call below
+# it), and the shim forwards to the vendor kernel from inside its own body. So
+# every substitution the reading exists to catch was invisible to it: change
+# what the shim forwards to, or change which object `wrap_nki` wraps, and the
+# reading stayed byte-identical. `evidence-077.md` §5 recorded that silence as
+# "identical" and read it as reassurance, which is the defect.
+#
+# WHAT IS DIFFERENT NOW. Both readings start at the seam and follow the real
+# call chain, resolving each step through the LIVE module binding:
+#
+#     blockwise_fp8_moe  --wrap_nki(...)-->  the shim  --return-->  the kernel
+#                              |                            |
+#                        seam_identity()             kernel_identity()
+#
+# so `seam_identity()` moves when the `wrap_nki` argument is substituted, and
+# `kernel_identity()` moves when EITHER hop is substituted. The readings are
+# graded rather than equal, which is what lets one arm separate the two hazards.
+#
+# THE SHIM'S BODY IS NOT TOUCHED. Deriving by introspection rather than by an
+# indirection the shim calls keeps every line of the NKI-traced body identical,
+# so no kernel numerics and no trace-time behaviour moves for this repair.
+#
+# A BROKEN DERIVATION RAISES. There is deliberately no fall back to the
+# module-level import: falling back is exactly the silence this repair removes,
+# and a reading that cannot be derived must say so rather than return a
+# plausible answer.
+def _unwrap_nki(obj: Any) -> Any:
+    """The plain Python function behind an ``nki.jit`` object, else ``obj``.
 
-    Exposed so a test can assert *which* kernel the seam dispatches to without
-    re-importing it, and so a substitution shows up as a changed reading rather
-    than as silence.
+    ``nki.jit`` stores the decorated function on ``.func``; the vendor kernel and
+    this module's shim are both such objects, and ``__module__``/``__qualname__``
+    of the wrapper are not the kernel's. ``__wrapped__`` is tried second because
+    it is what ``functools.wraps`` sets, and which of the two a given ``nki``
+    build populates is read here rather than assumed.
     """
-    func: Optional[Any] = getattr(
-        blockwise_mm_baseline_shard_intermediate, "func", None
+    for attribute in ("func", "__wrapped__"):
+        inner = getattr(obj, attribute, None)
+        if inner is not None:
+            return inner
+    return obj
+
+
+def _function_ast(obj: Any) -> tuple[Any, ast.FunctionDef]:
+    """``(function, its def node)``, parsed from the function's own source."""
+    fn = _unwrap_nki(obj)
+    try:
+        source = textwrap.dedent(inspect.getsource(fn))
+    except (OSError, TypeError) as exc:  # no source: editable install broken
+        raise MoeBlockwiseFp8Error(
+            f"cannot read the source of {getattr(fn, '__name__', fn)!r}, so the "
+            f"seam's dispatch target cannot be derived: {exc}"
+        ) from exc
+    name = getattr(fn, "__name__", None)
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return fn, node
+    raise MoeBlockwiseFp8Error(
+        f"no `def {name}` found in the source read for it, so the seam's "
+        f"dispatch target cannot be derived"
     )
-    target = func if func is not None else blockwise_mm_baseline_shard_intermediate
+
+
+def _resolved(fn: Any, node: ast.expr, what: str) -> Any:
+    """Resolve a bare name in ``fn``'s source against ``fn``'s live globals.
+
+    Going through ``__globals__`` rather than through this module's own
+    namespace is what makes the reading move: a rebound module global moves it
+    too, not only an edited call site.
+    """
+    if not isinstance(node, ast.Name):
+        raise MoeBlockwiseFp8Error(
+            f"{what} is not a plain name ({type(node).__name__}), so the object "
+            f"it denotes cannot be resolved"
+        )
+    try:
+        return fn.__globals__[node.id]
+    except KeyError as exc:
+        raise MoeBlockwiseFp8Error(
+            f"{what} is {node.id!r}, which is not bound in "
+            f"{fn.__module__!r}; the seam's dispatch target cannot be resolved"
+        ) from exc
+
+
+def _seam_wrapped_object() -> Any:
+    """The object :func:`blockwise_fp8_moe` hands to ``wrap_nki``."""
+    fn, tree = _function_ast(blockwise_fp8_moe)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "wrap_nki"
+    ]
+    if len(calls) != 1:
+        raise MoeBlockwiseFp8Error(
+            f"the seam makes {len(calls)} `wrap_nki(...)` calls, expected exactly "
+            f"one; which object it wraps is therefore ambiguous"
+        )
+    if len(calls[0].args) != 1:
+        raise MoeBlockwiseFp8Error(
+            f"the seam's `wrap_nki(...)` takes {len(calls[0].args)} positional "
+            f"arguments, expected exactly one"
+        )
+    return _resolved(fn, calls[0].args[0], "the seam's `wrap_nki` argument")
+
+
+def _shim_forward_target() -> Any:
+    """The object the wrapped shim returns the result of calling."""
+    shim = _seam_wrapped_object()
+    fn, tree = _function_ast(shim)
+    returns = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
+    ]
+    if len(returns) != 1:
+        raise MoeBlockwiseFp8Error(
+            f"{getattr(fn, '__name__', fn)!r} returns the result of "
+            f"{len(returns)} calls, expected exactly one; its forward target is "
+            f"therefore ambiguous"
+        )
+    call = returns[0].value
+    assert isinstance(call, ast.Call)
+    return _resolved(fn, call.func, "the shim's forward target")
+
+
+def seam_identity() -> tuple[str, str]:
+    """``(module, qualname)`` of the object ``wrap_nki`` actually wraps.
+
+    This is the shim, not the vendor kernel. Substituting the seam's ``wrap_nki``
+    argument moves this reading; substituting what the shim forwards to does not.
+    """
+    obj = _unwrap_nki(_seam_wrapped_object())
+    return obj.__module__, obj.__qualname__
+
+
+def kernel_identity() -> tuple[str, str]:
+    """``(module, qualname)`` of the NKI member the seam ultimately forwards to.
+
+    Derived through the seam and then through the shim's own forward target, so a
+    substitution at either hop moves the reading instead of leaving it silent.
+
+    Raises:
+        MoeBlockwiseFp8Error: if the chain cannot be derived. There is no fall
+            back to this module's import of the kernel -- that fall back is the
+            silence `B26-M1` found.
+    """
+    target = _unwrap_nki(_shim_forward_target())
     return target.__module__, target.__qualname__
