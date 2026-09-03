@@ -1339,13 +1339,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
         if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
             hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+        # Backend (walrus) options, space-separated in ONE list element exactly as
+        # the hlo2tensorizer element below it. neuronx-cc joins this value and
+        # re-splits it on spaces before walrus sees it, and appends it LAST so its
+        # flags override earlier ones (WalrusDriver.py:926-927).
+        #
+        # ``--enable-neff-debug-info=false`` is a DEVIATION from the compiler
+        # default: walrus declares the switch ``cl::init(true), cl::Hidden``
+        # (codegen.cpp:35), so every NEFF carries per-instruction debug protobuf
+        # unless suppressed. On this decode graph that was 12
+        # ``debug_info_backend_*`` members = 1,439,356,142 B, which libnrt
+        # deserializes into a host object graph on load. MEASURED on the preserved
+        # graph.hlo, same input sha, same compiler: the single-process load peak
+        # fell 35.636 GiB -> 22.109 GiB (-37.96%), and 64 ranks of the former needs
+        # 1.25x this host while the latter fits at 22.3% margin. The compressed NEFF
+        # fell 614,947,873 -> 228,613,320 B with the ``.bin`` instruction stream
+        # byte-identical, so nothing but debug info was removed.
+        #
+        # NOT a complete removal, and deliberately recorded as such: the 10
+        # ``debug_info_asm_*`` members (249,911,071 B) come from a second producer
+        # this switch does not gate and they survive. See F-331.
+        #
+        # Set VLLM_NEURON_NEFF_DEBUG_INFO=1 to keep debug info for neuron-profile
+        # instruction-to-source mapping; production serving does not need it.
+        backend_opts = "--enable-verifier=false"
+        if not envs.VLLM_NEURON_NEFF_DEBUG_INFO:
+            backend_opts += " --enable-neff-debug-info=false"
         # vLLM optimization levels map 1:1 onto neuronx-cc optlevels (CHRS-721).
         self.compile_options["compiler_args"] = [
             "--auto-cast=none",
             "--verbose=35",
             f"-O{self.vllm_config.optimization_level.value}",
             f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
-            "--internal-backend-options=--enable-verifier=false",
+            f"--internal-backend-options={backend_opts}",
         ]
         logger.info(
             "neuronx-cc optlevel -O%s (from vLLM optimization_level)",

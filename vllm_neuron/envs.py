@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     VLLM_NEURON_ASSERT_CACHE_HIT: bool = False
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
     VLLM_NEURON_KERNEL_DEVICE_DUMP: bool = False
+    VLLM_NEURON_NEFF_DEBUG_INFO: bool = False
     VLLM_NEURON_SKIP_PREFILL_WARMUP: bool = False
     VLLM_NEURON_SKIP_DECODE_WARMUP: bool = False
     VLLM_NEURON_LIBTORCH_NEURONX_LITE: bool = True
@@ -260,6 +261,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Capture at runtime via NEURON_RT_DEBUG_OUTPUT_DIR.
     "VLLM_NEURON_KERNEL_DEVICE_DUMP": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_KERNEL_DEVICE_DUMP")) or False
+    ),
+    # Emit walrus NEFF debug info. OFF by default, which is a DEVIATION from the
+    # compiler's own default: walrus declares
+    # ``enableNeffDebugInfo("enable-neff-debug-info", cl::init(true), cl::Hidden)``
+    # (codegen.cpp:35), so debug info ships in every NEFF unless suppressed. On the
+    # DeepSeek-V4 decode graph that was 12 ``debug_info_backend_*`` members =
+    # 1,439,356,142 B of per-instruction protobuf, which libnrt deserializes into a
+    # host object graph on ``nrt_load``. Measured: suppressing it took the
+    # single-process load peak from 35.636 GiB to 22.109 GiB (-37.96%); at 64 ranks
+    # the former does not fit the host and the latter does.
+    # Set to "1" to restore it for neuron-profile runs that need
+    # instruction-to-source mapping; production serving does not.
+    "VLLM_NEURON_NEFF_DEBUG_INFO": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_NEFF_DEBUG_INFO")) or False
     ),
     # Skip prefill warmup/compilation without requiring kv-transfer-config.
     # Useful for decode-only profiling workflows.
