@@ -135,7 +135,9 @@ def _fake_layers(
 ) -> list[LayerSpec]:
     """The fake model's 45 layers, derived end to end.
 
-    ``populate_kda=False`` leaves the four fields ``None`` (C03's other half);
+    ``populate_kda=False`` CLEARS the four fields to ``None`` (C03's other half) --
+    it clears rather than inherits, because since ``inc-glm53f-038a`` the real
+    model's own spec carries real values on the 34 linear-attention layers;
     ``name_blind=True`` strips every family suffix (C01's control) -- which is
     why the family is read off the fixture's own schedule and never off a name.
     """
@@ -166,7 +168,28 @@ def _fake_layers(
                 )
             )
         else:
-            layers.append(replace(layer, name=name))
+            # CLEARED EXPLICITLY, never inherited. `inc-glm53f-038a` filled these
+            # four fields on the real model's own spec, so a bare
+            # `replace(layer, name=name)` started PRESERVING real values on the 34
+            # linear-attention layers -- and C03's "fields are unset" control below
+            # quietly became a second populated case, which is the regression
+            # `B36-F2` found. A control has to BUILD the absence it claims.
+            #
+            # No other caller is affected: every other call takes the default
+            # `populate_kda=True`, where the 34 KDA layers go through the branch
+            # above and the 11 MLA layers arrive here already carrying `None`, so
+            # clearing them is a no-op. Measured, not assumed -- the C01/C02/C04
+            # readings are unchanged by this edit.
+            layers.append(
+                replace(
+                    layer,
+                    name=name,
+                    kda_conv_state_shape=None,
+                    kda_recurrent_state_shape=None,
+                    kda_conv_state_dtype=None,
+                    kda_recurrent_state_dtype=None,
+                )
+            )
     return layers
 
 
@@ -334,6 +357,28 @@ def test_get_kv_cache_spec_c03_the_four_state_fields_are_read() -> None:
     )
     emptied = _call(emptied_layers)
     not_engaged = sum(1 for spec in emptied.values() if isinstance(spec, MambaSpec))
+
+    # WHY THE CONTROL HAS TO CLEAR RATHER THAN INHERIT, read off the real model.
+    # This number was 0 before `inc-glm53f-038a` and is 34 after it. The arm used
+    # to inherit these fields and assume they were absent, which is exactly the
+    # regression `B36-F2` found; recording the number here means a future change
+    # to it is visible in the transcript instead of turning the control hollow.
+    from vllm_neuron.model.glm5_next.model_fp8 import (
+        Glm5NextForConditionalGeneration,
+    )
+
+    parent_populated = sum(
+        1
+        for layer in Glm5NextForConditionalGeneration.from_configs(
+            copy.deepcopy(raw)
+        ).get_kv_spec().layers
+        if layer.kda_conv_state_shape is not None
+    )
+    _record(c03_parent_layers_carrying_kda_fields=parent_populated)
+    assert parent_populated == DECLARED_KDA_ENTRIES, (
+        f"the real spec carries KDA fields on {parent_populated} layers, so the "
+        f"control below must clear them explicitly rather than inherit"
+    )
 
     _record(c03_engaged=engaged, c03_not_engaged=not_engaged)
     assert (engaged, not_engaged) == (DECLARED_KDA_ENTRIES, PARENT_ENGAGED_ENTRIES)
