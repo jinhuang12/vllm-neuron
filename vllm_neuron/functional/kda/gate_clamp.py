@@ -1,63 +1,75 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KDA gate activation with its lower bound, fused, in NKI.
+"""KDA gate: a bounded sigmoid, in NKI.
 
-`inc-glm53f-037`. The KDA gate turns a projected pre-gate tensor into the
-per-key-channel log-decay the recurrence consumes, and this checkpoint bounds that
-decay from below at ``-5.0``. This module computes the activation and the bound as
-one device op.
+`inc-glm53f-084`. The KDA gate turns a projected pre-gate tensor into the
+per-key-channel log-decay that the recurrence consumes. This module computes that
+gate as one device op::
+
+    gate = gate_lower_bound * sigmoid(exp(A_log) * (g + dt_bias))
+
+``A_log`` is one head's learned decay exponent, ``g`` is the projected pre-gate
+tensor, ``dt_bias`` is the per-key-channel gate bias, and ``gate_lower_bound`` is
+the bound the checkpoint carries. THE AUTHORITY FOR THIS EXPRESSION IS THE SCREEN
+NOTE, NOT THIS DOCSTRING: ``pin-feasibility-note-lap-0903b.md`` S2 holds the
+reference function, every reference line it cites, and the closed-form comparison
+against what this module used to compute. Nothing of it is restated here.
+
+WHY THIS FILE WAS REWRITTEN. `inc-glm53f-037` landed a different function in this
+file -- an unbounded softplus floored at the bound -- and the campaign's declared
+correctness reference multiplies a saturating sigmoid BY the bound instead. The two
+are different functions, not two spellings of one, and the screen note prices the
+gap. `inc-glm53f-037`'s history is not re-opened; this block is a second writer
+into the same file and the co-authorship is declared on both sides in the plan's
+own register.
+
+THE BOUND IS NOW A FACTOR AND NO LONGER A FLOOR, which is why no clamp op appears
+below. ``sigmoid`` is bounded in ``(0, 1)`` at every input, so multiplying by a
+negative ``gate_lower_bound`` puts the result in ``(gate_lower_bound, 0)`` by
+construction. There is nothing left for a floor to do, and an op that can never
+change a value is dead weight in a kernel-class chain.
+
+THE FILE AND FUNCTION NAMES ARE HISTORY, NOT DESCRIPTION. ``gate_clamp`` and
+``kda_gate_clamp`` are `inc-glm53f-037`'s names, kept on purpose so that the
+rewrite is one diff in one file rather than a rename fanning out across call sites
+and records. The function no longer clamps anything. A reader who trusts the name
+over this paragraph will be wrong about the arithmetic.
+
+THE REFERENCE'S SOFTPLUS LIMB IS NOT IMPLEMENTED. In the reference it is the
+``else`` limb of a bound that is never absent for this checkpoint, so it cannot be
+reached here (screen note S2). An unreachable branch is untestable code, so it is
+not written.
 
 WHY THIS IS A KERNEL AND NOT TORCH GLUE (P13). The gate is a per-token elementwise
-op fused into the middle of the KDA chain: the recurrence reads its output
-directly as ``exp(g)``. Computing it in torch would move the tensor off device and
-back inside a kernel-class chain, which is the fallback P13 forbids. Small size
-does not change the classification -- the block says so in its own Substrate
-bullet.
+op fused into the middle of the KDA chain: the recurrence reads its output directly
+as ``exp(g)``. Computing it in torch would move the tensor off device and back
+inside a kernel-class chain, which is the fallback P13 forbids. Small size does not
+change the classification -- the block says so in its own Substrate bullet.
 
-THE ACTIVATION IS PINNED UPSTREAM AND IS QUOTED, NOT INVENTED. It is
-``kda_gate_fwd_kernel`` in the vLLM the fork targets, at
-``vllm/model_executor/layers/fla/ops/kda.py:1541-1600`` (1647 lines, sha256
-``84e0bfd395f6e739...``, the same file and digest ``invest-035`` §7.3 pinned), with
-its python entry ``fused_kda_gate`` at ``:1603-1647``. In the Triton source's own
-terms::
+THE SIGMOID IS ONE ACTIVATION-ENGINE OP, NOT A COMPOSITION. ``nl.sigmoid`` is an
+activation function this image's ``nisa.activation`` serves directly, measured
+against torch over ``g`` from ``-200`` to ``+200``: worst absolute difference
+``5.960464e-08``, which is one float32 step at ``0.5``, and no non-finite value at
+any input. The landed softplus form needed nine ISA ops and a branch-free identity
+to stay finite; this needs one, and the identity it replaced is gone with it.
 
-    b_a = -exp(A[h])                                          # :1558-1559
-    b_g = g + g_bias                                          # :1584-1590
-    sp  = where(beta*b_g > threshold, b_g,
-                (1/beta) * log(1 + exp(beta*b_g)))            # :1595-1597
-    b_y = b_a * sp                                            # :1598
+THIS OP DECLARES NO MAGNITUDE LIMIT, and the absence is deliberate rather than
+overlooked. The chunked and decode modules bound their gate inputs because they
+call ``exp`` on a positive quantity, which overflows float32 near ``88``. A sigmoid
+cannot overflow: it saturates toward ``0`` or ``1``, so the gate saturates toward
+``0`` or toward ``gate_lower_bound``, and both are correct answers. Measured in the
+acceptance transcript at ``|g| = 30`` in both signs with zero non-finite elements.
 
-``beta`` defaults to ``1.0`` and ``threshold`` to ``20.0`` (``:1608-1609``), and
-the output is float32 (``:1627``). Since ``-exp(A) < 0`` and ``softplus >= 0``, the
-gate is never positive, so a LOWER bound is the only bound that can bite.
-
-THE BOUND IS THIS CAMPAIGN'S OWN LANDED VALUE, NOT AN UPSTREAM ONE. It is
-``"gate_lower_bound": -5.0`` at ``vllm_neuron/model/glm5_next/config.py:157``,
-inside the ``linear_attn_config`` field of ``Glm5NextTextConfig``
-(``:152-159``). Upstream's KDA carries no ``-5.0`` anywhere -- searched, and the
-search came back empty -- so the composition this module implements is the
-port's, and only the activation half is upstream's.
-
-THIS KERNEL COMPUTES SOFTPLUS BY THE BRANCH-FREE IDENTITY, NOT BY UPSTREAM'S
-THRESHOLD FORM::
-
-    softplus_beta(z) = (1/beta) * ( max(beta*z, 0) + log(1 + exp(-|beta*z|)) )
-
-The two are the same function. Upstream needs its ``threshold`` because
-``log(1 + exp(y))`` overflows float32 near ``y = 88`` and the linear branch is what
-saves it; this form never evaluates ``exp`` at a positive argument, so it needs no
-branch and no threshold at all. Measured: at ``g = 100`` upstream's threshold
-branch returns ``-100.0``, the same form WITHOUT the branch returns ``-inf``, and
-this identity returns ``-100.0``. The two forms are therefore not bit-identical,
-and the block's tolerance is what covers the difference -- measured at
-``2.384e-07`` against a ``1e-5`` bound on the acceptance case.
+NEITHER IS THERE A CONSTRAINT ON ``gate_lower_bound`` ITSELF, and that is also
+deliberate. The landed module rejected a non-positive softplus ``beta`` because its
+identity divided by ``beta``; this function only multiplies by the bound, so no
+value of it is arithmetically inadmissible and inventing a range check here would
+add a rule the design never declared.
 
 INTERNALLY THE TILE IS HELD TRANSPOSED, as ``[D, T]``. The bias is per key channel,
 so with ``D`` on the partition axis it becomes a ``[D, 1]`` operand broadcast along
 the FREE axis, which is exactly what ``nisa.tensor_scalar`` does; a ``[T, D]``
 layout would need a partition-axis broadcast, which it does not do. The boundary
-orientation stays ``[T, D]``, the layout upstream's ``fused_kda_gate`` returns, so
-two transposes are paid, one in and one out, and both are exact -- measured at
-``0.000e+00``.
+orientation stays ``[T, D]``, so two transposes are paid, one in and one out.
 
 THIS KERNEL CONTAINS NO LOOP AT ALL. The op is elementwise over one tile, so one
 dispatch serves one call and the route predicate is an equality: each declared case
@@ -91,23 +103,8 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 logger = logging.getLogger(__name__)
 
 
-#: The gate's lower bound, read from this campaign's landed model config rather
-#: than chosen here: ``vllm_neuron/model/glm5_next/config.py:157`` declares
-#: ``"gate_lower_bound": -5.0`` inside the ``linear_attn_config`` field of
-#: ``Glm5NextTextConfig``. A LOWER bound is the only bound that can bite,
-#: because the activation is never positive.
-KDA_GATE_LOWER_BOUND = -5.0
-
-#: ``fused_kda_gate``'s own defaults, at ``kda.py:1608-1609``. ``beta`` reaches the
-#: kernel; ``threshold`` reaches only the torch oracle, because the kernel's
-#: branch-free identity has no threshold to take. That asymmetry is the point of
-#: the identity, not an omission.
-GATE_SOFTPLUS_BETA = 1.0
-GATE_SOFTPLUS_THRESHOLD = 20.0
-
-
 class GateClampError(ValueError):
-    """Raised for a geometry or a ``beta`` this kernel does not serve.
+    """Raised for a geometry this kernel does not serve.
 
     Inadmissibility raises rather than falling back, because falling back would
     ship a torch path for kernel-class work (P13).
@@ -137,7 +134,12 @@ def reset_gate_clamp_dispatch_counters() -> None:
 
 
 def gate_clamp_dispatch_counters() -> tuple[int, int]:
-    """``(nki_dispatch, torch_fallback)`` since the last reset."""
+    """``(nki_dispatch, torch_fallback)`` since the last reset.
+
+    ``torch_fallback`` can only ever read ``0``, because this module has no torch
+    route to increment it: an inadmissible input raises instead (P13). The counter
+    is kept so that a test can state that reading rather than assume it.
+    """
     return (
         _GATE_CLAMP_COUNTERS.nki_dispatch,
         _GATE_CLAMP_COUNTERS.torch_fallback,
@@ -145,12 +147,12 @@ def gate_clamp_dispatch_counters() -> tuple[int, int]:
 
 
 @nki.jit
-def kda_gate_clamp_kernel(g_hbm, a_hbm, bias_hbm, beta, lower):
-    """``clamp(-exp(A) * softplus_beta(g + bias), min=lower)`` for one tile.
+def kda_gate_clamp_kernel(g_hbm, a_hbm, bias_hbm, lower):
+    """``lower * sigmoid(exp(A_log) * (g + bias))`` for one tile.
 
     Shapes: ``g_hbm`` is ``[T, D]``, ``a_hbm`` is ``[1, 1]`` (one head's ``A_log``),
-    ``bias_hbm`` is ``[D, 1]``. Returns ``[T, D]``. ``beta`` and ``lower`` are
-    compile-time scalars.
+    ``bias_hbm`` is ``[D, 1]``. Returns ``[T, D]``. ``lower`` is a compile-time
+    scalar.
 
     No loop, and no branch. Every step is a single elementwise ISA call over the
     transposed ``[D, T]`` tile.
@@ -169,41 +171,22 @@ def kda_gate_clamp_kernel(g_hbm, a_hbm, bias_hbm, beta, lower):
     nisa.tensor_copy(dst=bias_col, src=nl.load(bias_hbm, dtype=nl.float32))
     nisa.tensor_scalar(dst=biased, data=biased, op0=nl.add, operand0=bias_col)
 
-    # z = beta * (g + bias)
-    scaled = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=scaled, data=biased, op0=nl.multiply, operand0=beta)
-
-    # softplus_beta(z) = (1/beta) * ( max(z, 0) + log(1 + exp(-|z|)) ).
-    # -|z| is min(z, -z), so no absolute-value op is needed and exp never sees a
-    # positive argument.
-    hinge = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=hinge, data=scaled, op0=nl.maximum, operand0=0.0)
-    negated = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=negated, data=scaled, op0=nl.multiply, operand0=-1.0)
-    neg_abs = _sbuf(kdim, tokens)
-    nisa.tensor_tensor(dst=neg_abs, data1=scaled, data2=negated, op=nl.minimum)
-    decayed = _sbuf(kdim, tokens)
-    nisa.activation(dst=decayed, data=neg_abs, op=nl.exp)
-    shifted = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=shifted, data=decayed, op0=nl.add, operand0=1.0)
-    logged = _sbuf(kdim, tokens)
-    nisa.activation(dst=logged, data=shifted, op=nl.log)
-    softplus = _sbuf(kdim, tokens)
-    nisa.tensor_tensor(dst=softplus, data1=hinge, data2=logged, op=nl.add)
-    unbeta = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=unbeta, data=softplus, op0=nl.multiply, operand0=1.0 / beta)
-
-    # y = -exp(A) * softplus, then the lower bound.
+    # z = exp(A_log) * (g + bias). The decay rate scales the pre-activation; it is
+    # NOT a factor on the result, which is what makes this a different function
+    # from the one this file used to hold.
     exp_a = _sbuf(1, 1)
     nisa.activation(dst=exp_a, data=nl.load(a_hbm, dtype=nl.float32), op=nl.exp)
-    flipped = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=flipped, data=unbeta, op0=nl.multiply, operand0=-1.0)
-    gated = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=gated, data=flipped, op0=nl.multiply, operand0=exp_a)
-    bounded = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=bounded, data=gated, op0=nl.maximum, operand0=lower)
+    scaled = _sbuf(kdim, tokens)
+    nisa.tensor_scalar(dst=scaled, data=biased, op0=nl.multiply, operand0=exp_a)
 
-    # Out: [D, T] -> [T, D], back to the layout upstream returns.
+    # gate = lower * sigmoid(z). One activation op, then one scale. The bound is
+    # the factor, so the result lands in (lower, 0) without a clamp.
+    squashed = _sbuf(kdim, tokens)
+    nisa.activation(dst=squashed, data=scaled, op=nl.sigmoid)
+    bounded = _sbuf(kdim, tokens)
+    nisa.tensor_scalar(dst=bounded, data=squashed, op0=nl.multiply, operand0=lower)
+
+    # Out: [D, T] -> [T, D], back to the boundary orientation.
     ps_out = _psum(tokens, kdim)
     nisa.nc_transpose(dst=ps_out, data=bounded)
     out_sb = _sbuf(tokens, kdim)
@@ -213,7 +196,7 @@ def kda_gate_clamp_kernel(g_hbm, a_hbm, bias_hbm, beta, lower):
     return out_hbm
 
 
-def _require_gate_clamp_admissible(tokens: int, kdim: int, beta: float) -> None:
+def _require_gate_clamp_admissible(tokens: int, kdim: int) -> None:
     """Raise unless this kernel serves the geometry, rather than fall back (P13).
 
     BOTH axes are bounded by ``MAX_TILE``, and the reason is structural rather than
@@ -221,6 +204,9 @@ def _require_gate_clamp_admissible(tokens: int, kdim: int, beta: float) -> None:
     serves ``128``. ``MAX_TILE`` is imported from the chunked module rather than
     redeclared because it is the SAME quantity there -- the partition-axis limit of
     this image -- unlike a bound that happens to share a number.
+
+    GEOMETRY IS THE ONLY THING CHECKED HERE. The module docstring says why the gate
+    bound and the input magnitude are each unconstrained.
     """
     if tokens < 1 or kdim < 1:
         raise GateClampError(
@@ -233,31 +219,14 @@ def _require_gate_clamp_admissible(tokens: int, kdim: int, beta: float) -> None:
             f"kdim={kdim} must both be in [1, {MAX_TILE}]; both axes pass through "
             f"a transpose, which serves {MAX_TILE}"
         )
-    if not beta > 0.0:
-        raise GateClampError(
-            f"kda_gate_clamp needs a positive softplus beta; got beta={beta}. "
-            f"The identity divides by beta, so zero or negative is not a value "
-            f"this op has"
-        )
 
 
-def can_run_gate_clamp(
-    reference: Tensor, tokens: int, kdim: int, beta: float = GATE_SOFTPLUS_BETA
-) -> bool:
-    """True when the NKI route is available AND serves this geometry.
-
-    NOTE THAT THIS OP DECLARES NO MAGNITUDE LIMIT, and the absence is deliberate
-    rather than overlooked. The chunked and decode modules bound their gate inputs
-    because they call ``exp`` on a positive quantity, which overflows float32 near
-    ``88``. This kernel calls ``exp`` only on ``-|z|``, which is never positive, so
-    the composition cannot overflow: an enormous positive input saturates into the
-    lower bound instead, which is the correct answer and is measured in the
-    acceptance transcript.
-    """
+def can_run_gate_clamp(reference: Tensor, tokens: int, kdim: int) -> bool:
+    """True when the NKI route is available AND serves this geometry."""
     if not can_run_kernel(reference):
         return False
     try:
-        _require_gate_clamp_admissible(tokens, kdim, beta)
+        _require_gate_clamp_admissible(tokens, kdim)
     except GateClampError:
         return False
     return True
@@ -266,25 +235,38 @@ def can_run_gate_clamp(
 def kda_gate_clamp(
     g: Tensor,
     a_log: Tensor,
+    *,
+    lower: float,
     bias: Tensor | None = None,
-    beta: float = GATE_SOFTPLUS_BETA,
-    lower: float = KDA_GATE_LOWER_BOUND,
 ) -> Tensor:
     """The counted seam. ``g`` is ``[T, D]``; the result is ``[T, D]``, float32.
 
     ``a_log`` is one head's ``A_log`` as a scalar-shaped tensor. ``bias`` is the
-    per-key-channel gate bias, which this checkpoint's loader carries as a bare
-    KDA leaf named ``dt_bias`` (``weight_loaders_fp8.py:470``). THAT MAPPING IS
-    PROVISIONAL: it has not been checked against the checkpoint index, so the
-    name is where the bias is expected to come from, not a confirmed wiring.
-    ``None`` means no bias, and it is passed as an exact zero column rather than
-    by a second kernel path, because adding ``0.0`` is bit-exact -- measured --
-    so the two are the same computation.
+    per-key-channel gate bias, which this checkpoint's loader carries as a bare KDA
+    leaf named ``dt_bias`` (``weight_loaders_fp8.py:470``); that mapping was
+    confirmed against the published checkpoint index at ``evidence-038.md`` §6,
+    which found one ``dt_bias`` key per KDA layer, so it is a checked wiring and no
+    longer a provisional one. ``None`` means no bias, and it is passed as an exact
+    zero column rather than by a second kernel path, because adding ``0.0`` is
+    bit-exact -- measured -- so the two are the same computation.
+
+    ``lower`` IS REQUIRED AND HAS NO DEFAULT. It is the checkpoint's
+    ``gate_lower_bound``, which the caller reads from
+    ``Glm5NextTextConfig.linear_attn_config`` (``model/glm5_next/config.py:157``,
+    value ``-5.0``). This module does not read that config and does not carry a copy
+    of the value, because ``functional/kda/`` imports nothing from
+    ``model/glm5_next/`` -- so a stale second copy of a model constant cannot exist
+    here.
+
+    BOTH ``lower`` AND ``bias`` ARE KEYWORD-ONLY. The landed signature took ``bias``
+    third positionally; making the new required argument positional in that slot
+    would let an old three-argument call bind a bias tensor to ``lower`` and run
+    silently. Keyword-only makes that call a ``TypeError`` instead.
     """
     if g.ndim != 2:
         raise GateClampError(f"g must be [tokens, kdim]; got shape {tuple(g.shape)}")
     tokens, kdim = int(g.shape[0]), int(g.shape[1])
-    _require_gate_clamp_admissible(tokens, kdim, beta)
+    _require_gate_clamp_admissible(tokens, kdim)
 
     if a_log.numel() != 1:
         raise GateClampError(
@@ -306,57 +288,22 @@ def kda_gate_clamp(
         g.to(torch.float32),
         a_log.reshape(1, 1).to(torch.float32),
         bias_col,
-        float(beta),
         float(lower),
     )
 
 
-def kda_gate_clamp_torch_oracle(
-    g: Tensor,
-    a_log: Tensor,
-    bias: Tensor | None = None,
-    beta: float = GATE_SOFTPLUS_BETA,
-    threshold: float = GATE_SOFTPLUS_THRESHOLD,
-    lower: float = KDA_GATE_LOWER_BOUND,
-) -> Tensor:
-    """UPSTREAM'S form, in torch, as the reference. NOT a fallback for the kernel.
-
-    This is ``kda_gate_fwd_kernel``'s arithmetic transcribed line for line
-    (``kda.py:1558-1598``), including the ``threshold`` branch, composed with the
-    port's lower bound. It exists because upstream's own implementation is Triton
-    and is NOT callable on this host -- ``fused_kda_gate`` imports, then raises
-    ``RuntimeError: 0 active drivers ([])`` -- which is the same negative
-    ``invest-035`` §7.1 recorded for the CPU delta rule. The reference therefore
-    has to be built from the quoted source, so the source is quoted exactly.
-
-    P13 note: this function is the acceptance's REFERENCE, and no test item lets
-    the seam reach it. It is not a torch route for kernel-class work.
-    """
-    b_a = -torch.exp(a_log.reshape(()).to(torch.float32))
-    pre = g.to(torch.float32)
-    if bias is not None:
-        pre = pre + bias.reshape(1, -1).to(torch.float32)
-    scaled = pre * beta
-    softplus = torch.where(
-        scaled > threshold,
-        pre,
-        (1.0 / beta) * torch.log(1.0 + torch.exp(scaled)),
-    )
-    return torch.clamp(b_a * softplus, min=lower)
-
-
 def gate_clamp_kernel_identity() -> tuple[str, str]:
-    """``(module, qualname)`` of the gate-clamp kernel this module authors.
+    """``(module, qualname)`` of the gate kernel this module authors.
 
-    Read by the acceptance driver to prove the kernel under test is authored
-    here rather than imported from the substrate.
+    Read by the acceptance driver to prove the kernel under test is authored here
+    rather than imported from the substrate.
 
     THE UNWRAP IS THE WHOLE READING. ``nki.jit`` returns a wrapper whose own
-    ``__module__`` is the substrate's, so reading the attribute off the
-    decorated object reports ``nki.framework.kernel`` for an authored kernel and
-    for an imported one alike -- the same answer either way, which is no reading
-    at all. Unwrapping ``.func`` first is what makes the two cases differ, and it
-    is the form the three landed KDA modules already use. The sibling
+    ``__module__`` is the substrate's, so reading the attribute off the decorated
+    object reports ``nki.framework.kernel`` for an authored kernel and for an
+    imported one alike -- the same answer either way, which is no reading at all.
+    Unwrapping ``.func`` first is what makes the two cases differ, and it is the
+    form the three landed KDA modules already use. The sibling
     ``depthwise_conv1d.kernel_identity`` reads the same way to prove the opposite
     claim, that its seam dispatches to the SUBSTRATE's member.
     """
