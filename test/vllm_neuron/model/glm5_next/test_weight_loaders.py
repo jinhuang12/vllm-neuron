@@ -82,8 +82,10 @@ pins them, the acceptance says 3, and
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -1219,6 +1221,7 @@ from vllm_neuron.model.glm5_next.quantization import (
     QuantScheme,
     QuantizationSpec,
 )
+from vllm_neuron.model.glm5_next import weight_loaders_fp8 as _fp8_module
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MINVAL,
     block_agreement,
@@ -1228,6 +1231,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     dequantise_blockwise,
     downscale_fp8_weight_bytes,
     needs_240_downscale,
+    report_floored_blocks,
     resolved_fp8_clamp_max,
     squeeze_blockwise_fp8,
     wrap_with_blockwise_fp8_downscale,
@@ -1662,6 +1666,121 @@ def test_fp8_downscale_minval_floor_engages_on_a_tiny_block_scale(
 # --------------------------------------------------------------------------- #
 # The checkpoint path -- the same two halves, driven through fake slices.
 # --------------------------------------------------------------------------- #
+
+
+class _Fp8RecordingHandler(logging.Handler):
+    """Collects formatted records off the loader module's own logger object."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _capture_fp8_loader_log():
+    """Attach to ``weight_loaders_fp8.logger`` directly.
+
+    Directly, not through ``caplog``, for the reason
+    ``test_platform_hybrid_config.py:217-220`` already records: ``caplog``'s handler
+    lives on the root logger, so a propagation setting anywhere in vLLM's logging
+    configuration would make this differential read 0 for a reason that has nothing to
+    do with the code under test.
+    """
+    handler = _Fp8RecordingHandler()
+    target = _fp8_module.logger
+    previous_level = target.level
+    target.addHandler(handler)
+    target.setLevel(logging.INFO)
+    try:
+        yield handler
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous_level)
+
+
+FP8_FLOOR_MARKER = "fp8 block-scale floor ENGAGED"
+FP8_LOADER_PARAM_NAME = "model.layers.0.mlp.down_proj.weight_scale_inv"
+
+
+def test_fp8_downscale_scale_loader_records_an_engaged_floor(
+    fp8_downscale_scales,
+) -> None:
+    """A load that floors a tile leaves a record on the load path, not just in a test.
+
+    THE FINDING THIS ANSWERS. ``B08-F1-minval-floor-silent-on-loader-path``: the module
+    said twice that the floor is "reported per block rather than applied silently", but
+    ``blockwise_scale_loader``'s transform returned ``.scale_inv`` and dropped the whole
+    census, so a load that inflated an entire tile of weights by about 5.4x left no
+    trace anywhere outside this file. The review's requirement was that the fix
+    "demonstrate that a load which floors a tile leaves a trace outside the test suite".
+
+    THE READING IS A DIFFERENTIAL, not the presence of one message. The same loader is
+    driven twice through the same fake slice: once with the declared grid, where no tile
+    needs the floor and the record count must be 0, and once with one tile's scale set
+    to ``1e-9``, where it must be 1. A test that only asserted the second half would
+    pass against a loader that warned on every load, which would be its own defect.
+
+    IT ALSO CHECKS WHAT THE MESSAGE SAYS, because the finding asked for a warning that
+    "names the parameter and the floored tiles". A record that fired but named neither
+    would satisfy a count and not the requirement.
+    """
+    # Leg 1 -- the negative half: the declared grid floors nothing, so it says nothing.
+    quiet_loader = blockwise_scale_loader(FP8_LOADER_PARAM_NAME)
+    with _capture_fp8_loader_log() as quiet:
+        quiet_grid = quiet_loader.load([FakeSafeSlice(fp8_downscale_scales)], 0)
+    quiet_records = [m for m in quiet.messages if FP8_FLOOR_MARKER in m]
+    _record_fp8(f1_records_on_an_unfloored_load=len(quiet_records))
+    assert quiet_records == [], (
+        "the loader reported a floor on a grid where no tile needed one, so the "
+        "record does not distinguish a floored load from a clean one"
+    )
+
+    # Leg 2 -- the positive half: one tile below the floor, through the same loader.
+    scales = [list(row) for row in FP8_BLOCK_SCALES]
+    scales[FP8_TINY_BLOCK[0]][FP8_TINY_BLOCK[1]] = FP8_TINY_SCALE
+    tiny_grid = _fp8_scale_grid(tuple(tuple(row) for row in scales))
+
+    loud_loader = blockwise_scale_loader(FP8_LOADER_PARAM_NAME)
+    with _capture_fp8_loader_log() as loud:
+        loaded = loud_loader.load([FakeSafeSlice(tiny_grid)], 0)
+    loud_records = [m for m in loud.messages if FP8_FLOOR_MARKER in m]
+    _record_fp8(
+        f1_records_on_a_floored_load=len(loud_records),
+        f1_message=loud_records[0] if loud_records else None,
+    )
+    assert len(loud_records) == 1, (
+        f"a load that floored tile {FP8_TINY_BLOCK} must leave exactly one record; "
+        f"got {len(loud_records)}"
+    )
+
+    # Leg 3 -- the record says which parameter and which tile, per the finding.
+    message = loud_records[0]
+    assert FP8_LOADER_PARAM_NAME in message, message
+    assert f"({FP8_TINY_BLOCK[0]},{FP8_TINY_BLOCK[1]})" in message, message
+    assert "MINVAL" in message, message
+
+    # Leg 4 -- the returned tensor is unchanged by the reporting. The floor still
+    # floors; the only difference is that it is now audible.
+    assert torch.equal(loaded, compensate_block_scales(tiny_grid).scale_inv)
+    assert torch.equal(loaded[FP8_TINY_BLOCK], _fp8_as_stored(MINVAL))
+    assert torch.equal(quiet_grid, compensate_block_scales(fp8_downscale_scales).scale_inv)
+
+    # Leg 5 -- an unnamed caller gets a record that says so, rather than "None".
+    with _capture_fp8_loader_log() as unnamed:
+        blockwise_scale_loader().load([FakeSafeSlice(tiny_grid)], 0)
+    unnamed_records = [m for m in unnamed.messages if FP8_FLOOR_MARKER in m]
+    _record_fp8(f1_unnamed_message=unnamed_records[0] if unnamed_records else None)
+    assert len(unnamed_records) == 1
+    assert "an unnamed parameter" in unnamed_records[0], unnamed_records[0]
+    assert "None" not in unnamed_records[0], unnamed_records[0]
+
+    # Leg 6 -- the reporter's own return value distinguishes the two cases, so a
+    # caller that wants the fact without the log line can have it.
+    assert report_floored_blocks(compensate_block_scales(tiny_grid)) is True
+    assert report_floored_blocks(compensate_block_scales(fp8_downscale_scales)) is False
 
 
 def test_fp8_downscale_scale_loader_compensates_through_a_fake_slice(

@@ -823,11 +823,21 @@ def scale_keys(keys: Iterable[str]) -> tuple[str, ...]:
 # half's section. The diff for this file is therefore an append, and that is
 # checkable with ``git diff`` rather than asserted.
 
+import logging
+
 import torch
 
 from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
 
 from .quantization import DEFAULT_WEIGHT_BLOCK_SIZE
+
+#: Same convention as ``config.py:34`` in this package.
+logger = logging.getLogger(__name__)
+
+#: How many floored tile coordinates the warning names before it stops listing and
+#: gives the count alone. A pathological grid can floor thousands of tiles, and a
+#: warning that dumps every one of them is its own defect.
+_FLOORED_BLOCKS_NAMED_IN_WARNING = 8
 
 # --------------------------------------------------------------------------- #
 # Blockwise-FP8 range constants
@@ -873,8 +883,11 @@ _FP8_SCALE_COMPENSATION = _FP8_E4M3FN_MAX / _FP8_E4M3_MAX
 #: block whose scale has collapsed towards zero (an all-zero weight tile, or a
 #: quantiser that emitted a denormal) turns that reciprocal into ``inf``/``NaN``
 #: and poisons the whole matmul. Flooring the stored scale keeps the reciprocal
-#: finite. The floor is reported per block rather than applied silently -- see
-#: :class:`BlockScaleCompensation.floored_blocks`.
+#: finite. The floor is reported per block rather than applied silently: the census is
+#: on :class:`BlockScaleCompensation.floored_blocks`, and on the checkpoint load path
+#: :func:`report_floored_blocks` warns when it engaged, naming the parameter and the
+#: tiles. Until ``inc-glm53f-012``'s R2 round that second half was missing and this
+#: sentence was false of the only loader that ships -- finding ``B08-F1``.
 MINVAL = 1e-5
 
 
@@ -1074,6 +1087,55 @@ def compensate_block_scales(scale_inv: torch.Tensor) -> BlockScaleCompensation:
     )
 
 
+def report_floored_blocks(
+    compensation: BlockScaleCompensation, param_name: str | None = None
+) -> bool:
+    """Warn when the ``MINVAL`` floor engaged on a load. Returns whether it did.
+
+    WHY THIS EXISTS. :data:`MINVAL`'s own note says the floor is "reported per block
+    rather than applied silently", and :class:`BlockScaleCompensation` does carry the
+    report -- but until ``inc-glm53f-012``'s R2 round the only loader that ships,
+    :func:`blockwise_scale_loader`, returned ``.scale_inv`` and threw the report away.
+    Nothing outside the test suite could see that a tile had been floored. A floored
+    tile is not a cosmetic event: a stored scale of ``1e-6`` is raised to ``1e-5``, so
+    every weight in that tile dequantises about 5.4x too large. Finding
+    ``B08-F1-minval-floor-silent-on-loader-path`` recorded that as silent corruption on
+    the load path, and this is the trace it asked for.
+
+    IT WARNS AND DOES NOT RAISE. Raising would make a checkpoint that the floor exists
+    to rescue fail to load instead, which is a change to declared behaviour and the
+    lead's call rather than a seat's. The floor still does exactly what it did; the only
+    difference is that a load which engages it now says so.
+
+    The parameter name is optional because ``SafetensorsWeightLoader``'s transform
+    signature is ``(slices, rank)`` and carries no name
+    (``vllm_neuron/utils/weight_loader.py:55``). When a caller knows the name it passes
+    it; when it does not, the message says so rather than printing ``None``.
+    """
+    if not compensation.floored_blocks:
+        return False
+
+    named = compensation.floored_blocks[:_FLOORED_BLOCKS_NAMED_IN_WARNING]
+    tail = len(compensation.floored_blocks) - len(named)
+    where = ", ".join(f"({row},{col})" for row, col in named)
+    if tail > 0:
+        where = f"{where} and {tail} more"
+    logger.warning(
+        "fp8 block-scale floor ENGAGED while loading %s: %d of the grid's tiles had "
+        "a compensated scale below MINVAL=%g and were raised to it, at %s. Weights in "
+        "those tiles dequantise larger than the checkpoint intended, by MINVAL "
+        "divided by the compensated scale. Tiles below the floor before "
+        "compensation: %d; after: %d.",
+        param_name if param_name else "an unnamed parameter",
+        len(compensation.floored_blocks),
+        MINVAL,
+        where,
+        compensation.below_minval_before,
+        compensation.below_minval_after,
+    )
+    return True
+
+
 def downscale_fp8_weight_bytes(weight: torch.Tensor) -> torch.Tensor:
     """Squeeze fp8 weight bytes into the 240 range, or return them unchanged.
 
@@ -1264,7 +1326,7 @@ def wrap_with_blockwise_fp8_downscale(
     return SafetensorsWeightLoader(transform=transform)
 
 
-def blockwise_scale_loader() -> SafetensorsWeightLoader:
+def blockwise_scale_loader(param_name: str | None = None) -> SafetensorsWeightLoader:
     """Load a ``weight_scale_inv`` grid, compensated and floored.
 
     The grid is loaded whole -- one fp32 value per weight tile, so it is four
@@ -1272,6 +1334,14 @@ def blockwise_scale_loader() -> SafetensorsWeightLoader:
     at this increment. A sharded scale grid follows the weight's own shard
     geometry and lands with the module that declares that geometry
     (``model_fp8.py``, ``inc-glm53f-013``).
+
+    An engaged floor is REPORTED, not discarded (:func:`report_floored_blocks`), which
+    is finding ``B08-F1``'s repair. This transform used to return
+    ``compensate_block_scales(...).scale_inv`` and drop ``applied``,
+    ``below_minval_before``, ``below_minval_after`` and ``floored_blocks`` on the floor,
+    so a load that silently inflated a whole tile of weights left no trace outside the
+    test suite. Pass ``param_name`` when the caller knows which parameter this grid
+    belongs to, so the warning can name it; the returned tensor is unchanged either way.
     """
 
     def transform(slices, rank):
@@ -1279,6 +1349,8 @@ def blockwise_scale_loader() -> SafetensorsWeightLoader:
             raise Glm5NextWeightMapError(
                 f"blockwise_scale_loader expects 1 slice, got {len(slices)}"
             )
-        return compensate_block_scales(slices[0][:]).scale_inv
+        compensation = compensate_block_scales(slices[0][:])
+        report_floored_blocks(compensation, param_name)
+        return compensation.scale_inv
 
     return SafetensorsWeightLoader(transform=transform)
