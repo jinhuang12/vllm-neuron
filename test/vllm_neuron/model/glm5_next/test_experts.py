@@ -1118,7 +1118,7 @@ def _shared_pow2_scales(exponents, rows: int, cols: int):
     F1, AND WHY IT IS HERE RATHER THAN INHERITED. ``-026``'s kernel accumulates
     the two ``128``-wide contraction tiles of one ``256`` block in PSUM and
     applies the block scale AFTER that accumulation
-    (``blockwise_fp8_mm.py:206-223``, and its module docstring states the order
+    (``blockwise_fp8_mm.py:203-220``, and its module docstring states the order
     is deliberate). ``increments/evidence-071.md`` F1 measured **720 fp32 ulp**
     of remapping error under a non-pow2 block scale against **0** under a pow2
     one. So a non-pow2 fixture would make ``rtol=3e-2`` certify remapping error
@@ -1817,7 +1817,7 @@ def test_shared_expert_section_imports_neither_scale_layout_helper():
     """This increment's section imports no ``to_kernel_scale_layout`` at all.
 
     The campaign carries two helpers of that name at different arities
-    (``functional/blockwise_fp8_mm.py:312`` takes ``(weight_scale, rows, cols)``;
+    (``functional/blockwise_fp8_mm.py:309`` takes ``(weight_scale, rows, cols)``;
     ``functional/moe/moe_blockwise_fp8.py:170`` takes ``(consumer_scales,
     num_experts, rows, cols, projection)``), and they are deliberately not
     flat-exported. This section removes the hazard instead of navigating it: it

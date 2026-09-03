@@ -960,7 +960,7 @@ class Glm5NextRoutedExperts(nn.Module):
     # ``-032`` precedent in this file: the module import block is ``-013``'s D14
     # section. The two ``to_kernel_scale_layout`` helpers in this campaign have
     # THE SAME NAME AND DIFFERENT SIGNATURES
-    # (``functional/blockwise_fp8_mm.py:312`` takes ``(weight_scale, rows,
+    # (``functional/blockwise_fp8_mm.py:309`` takes ``(weight_scale, rows,
     # cols)``; ``functional/moe/moe_blockwise_fp8.py:170`` takes
     # ``(consumer_scales, num_experts, rows, cols, projection)``), so the one
     # this site needs is imported from its own module UNDER AN ALIAS that names
@@ -1358,7 +1358,7 @@ class Glm5NextSharedExperts(nn.Module):
     #
     # THE SCALE OPERAND IS THE PUBLIC GRID, SO NEITHER ``to_kernel_scale_layout``
     # IS IMPORTED HERE. The campaign carries two helpers of that name at
-    # different arities (``functional/blockwise_fp8_mm.py:312`` takes
+    # different arities (``functional/blockwise_fp8_mm.py:309`` takes
     # ``(weight_scale, rows, cols)``; ``functional/moe/moe_blockwise_fp8.py:170``
     # takes ``(consumer_scales, num_experts, rows, cols, projection)``).
     # ``blockwise_fp8_mm`` applies the dense one ITSELF at ``:436``, so this site
@@ -1397,7 +1397,7 @@ class Glm5NextSharedExperts(nn.Module):
             hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
                 whole number of ``TILE_SIZE`` rows -- the seam tiles ``M`` over
                 the PSUM partition axis and does not pad
-                (``blockwise_fp8_mm.py:242-248``), so padding is the caller's.
+                (``blockwise_fp8_mm.py:239-245``), so padding is the caller's.
             gate_proj_weight: ``[H, I]`` fp8-e4m3, expressed against
                 ``gate_proj_scale``.
             up_proj_weight: ``[H, I]`` fp8-e4m3.
