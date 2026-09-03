@@ -2189,6 +2189,14 @@ class Glm5NextMLAAttention(nn.Module):
         self.qk_rope_head_dim = int(text_config.qk_rope_head_dim)
         self.v_head_dim = int(text_config.v_head_dim)
         self.mla_use_nope = bool(text_config.mla_use_nope)
+        # ``inc-glm53f-039b`` adds these two scalars, because the projections
+        # section below needs them and neither existed on the skeleton. The
+        # hidden size is the input width of two of the five sites and the output
+        # width of a third; the epsilon is the checkpoint's, read through the
+        # config on the same ground stated at line 889 rather than defaulted
+        # locally.
+        self.hidden_size = int(text_config.hidden_size)
+        self.rms_norm_eps = float(text_config.rms_norm_eps)
 
         self.num_kv_heads_per_rank = self.NUM_LATENT_KV_HEADS
         self.head_size = _resolve_mla_head_size(text_config)
@@ -2206,6 +2214,208 @@ class Glm5NextMLAAttention(nn.Module):
             "kv_a_layernorm_weight",
         )
         self.indexer = Glm5NextDSAIndexer()
+
+    # -- the PROJECTIONS section -- D14 owner: ``inc-glm53f-039b`` (M3) -------
+    #
+    # WHAT THIS SECTION IS FOR. The five low-rank projections had no substrate
+    # member left to call: ``inc-glm53f-072`` measured both candidates and both
+    # REFUSE this checkpoint's widths. ``inc-glm53f-039a`` therefore wrote the
+    # projection as a NKI kernel, and this section is the call site that reaches
+    # it. Every number below is computed from the config; not one is read from a
+    # weight's shape, so a mis-shaped checkpoint is caught rather than adopted.
+    #
+    # WHY THERE IS NO TORCH MATMUL ANYWHERE BELOW. The sibling linear-attention
+    # class projects with ``x @ w.t()`` and is right to: its widths are small and
+    # no kernel refuses them. Here a torch matmul would be a fallback for work a
+    # kernel now does, so this section's acceptance counts occurrences of the
+    # torch matmul forms in this class and requires ZERO. That is also why the
+    # weights are transposed once, below, rather than per call.
+    #
+    # WHAT THIS SECTION DOES NOT DO, deliberately:
+    #   * it does NOT implement ``forward`` -- D14 gives the forward stubs to
+    #     ``inc-glm53f-013`` and then to ``inc-glm53f-054``, and the decode path
+    #     that would call these methods to ``inc-glm53f-042``. Both methods below
+    #     are entry points those increments call; neither runs on its own.
+    #   * it allocates NO rotary parameter and computes no rotary slice, because
+    #     ``qk_rope_head_dim`` is 0 on this checkpoint and that 0 is a value
+    #     rather than a placeholder. The absence is counted by the acceptance.
+
+    #: Attribute the transposed projection weights are cached on. A plain
+    #: attribute and NOT a buffer on purpose: a buffer enters ``state_dict()``,
+    #: which would double every projection weight in a saved checkpoint.
+    PREPARED_WEIGHTS_ATTR = "_prepared_projection_weights"
+
+    def projection_widths(self) -> tuple[tuple[str, int, int], ...]:
+        """The five sites as ``(name, in_features, out_features)``, closed form.
+
+        Each width is derived from the config and named where it comes from, so
+        the expectation a test compares against is not a transcription of the
+        same literal the code used.
+
+        On this checkpoint the rotary head width is 0, so the query head width
+        is the nope width alone and the latent width is the rank alone. Both
+        sums are written out anyway: on a config that had a rotary slice the
+        bare value would be short by exactly that slice, which is the same
+        reason ``_resolve_mla_head_size`` sums rather than takes the rank.
+        """
+        heads = self.num_attention_heads
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        return (
+            ("q_a_proj", self.hidden_size, self.q_lora_rank),
+            ("q_b_proj", self.q_lora_rank, heads * qk_head_dim),
+            (
+                "kv_a_proj_with_mqa",
+                self.hidden_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            (
+                "kv_b_proj",
+                self.kv_lora_rank,
+                heads * (self.qk_nope_head_dim + self.v_head_dim),
+            ),
+            ("o_proj", heads * self.v_head_dim, self.hidden_size),
+        )
+
+    def prepare_projection_weights(self) -> int:
+        """Transpose the five projection weights ONCE. Returns how many.
+
+        THE ONE-TIME TRANSPOSE IS THIS INCREMENT'S OWED WORK, and it is owed
+        because of a hardware fact on the other side of the seam. A matmul
+        contracts the partition axis, so the kernel needs each weight
+        contraction-major, ``[in_features, out_features]``. A checkpoint stores
+        the torch orientation, ``[out_features, in_features]``. Transposing per
+        call would copy up to 64 MB every time; a projection weight never
+        changes, so it is transposed here, once, when the weights are loaded.
+        The kernel's own record states the same division of labour
+        (``../../../artifacts/campaigns/glm-5.3-flash-port/increments/evidence-039a.md``).
+
+        Each weight is checked against the closed-form widths before it is
+        transposed. A checkpoint whose projection is the wrong shape fails here,
+        with the site named, instead of reaching the kernel as a geometry it
+        would accept and quietly compute the wrong thing with.
+        """
+        prepared: dict[str, torch.Tensor] = {}
+        for name, idim, odim in self.projection_widths():
+            weight = getattr(self, f"{name}_weight", None)
+            if weight is None:
+                raise ValueError(
+                    f"{name}_weight is declared but not materialised; load the "
+                    f"checkpoint before preparing the projection weights"
+                )
+            if tuple(weight.shape) != (odim, idim):
+                raise ValueError(
+                    f"{name}_weight is {tuple(weight.shape)}; this config's "
+                    f"closed form is [out_features, in_features] = "
+                    f"{(odim, idim)}"
+                )
+            # ``.t()`` alone is a view, and the kernel loads from memory, so the
+            # copy is forced here -- once -- rather than left for the seam.
+            prepared[name] = weight.to(torch.float32).t().contiguous()
+        setattr(self, self.PREPARED_WEIGHTS_ATTR, prepared)
+        return len(prepared)
+
+    def _prepared_weight(self, name: str) -> torch.Tensor:
+        """One prepared weight, or a refusal naming what was not done.
+
+        Refusing is what makes "never per call" checkable. If this fell back to
+        transposing on demand, the per-call copy the section exists to avoid
+        would come back silently and nothing would report it.
+        """
+        prepared = getattr(self, self.PREPARED_WEIGHTS_ATTR, None)
+        if not prepared:
+            raise ValueError(
+                "prepare_projection_weights() has not run; the projection "
+                "weights are transposed once at load time, never per call"
+            )
+        return prepared[name]
+
+    def _latent_norm(self, x: torch.Tensor, gain: torch.Tensor) -> torch.Tensor:
+        """RMSNorm on a low-rank latent: ``x / sqrt(mean(x**2) + eps) * gain``.
+
+        A method rather than a module-level helper, because this file's
+        module-level region is another increment's D14 section -- the same
+        reason the sibling layer's own norm gives.
+
+        The two latent norms sit BETWEEN the projections, so they belong to this
+        section and to no other. They are applied here rather than left for a
+        later increment: a projection chain that emitted un-normalised latents
+        would be numerically wrong, and correcting it later would put a second
+        writer inside this section.
+        """
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        normed = x * torch.rsqrt(variance + self.rms_norm_eps)
+        return normed * gain.to(torch.float32)
+
+    def project_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Query, no-rotary key and value from hidden states. FOUR dispatches.
+
+        ``hidden_states`` is ``[tokens, hidden_size]``. The three returns are
+        ``[tokens, heads, qk_nope_head_dim]``, ``[tokens, heads,
+        qk_nope_head_dim]`` and ``[tokens, heads, v_head_dim]``.
+
+        The chain is the low-rank one this checkpoint declares: compress to a
+        rank, normalise the latent, expand to the head width. The key and value
+        come out of ONE expansion and are split, which is why this is four
+        dispatches and not five.
+        """
+        from vllm_neuron.functional.attention.mla_projections import mla_projection
+
+        widths = {name: (idim, odim) for name, idim, odim in self.projection_widths()}
+        x = hidden_states.to(torch.float32)
+        if x.ndim != 2 or int(x.shape[1]) != self.hidden_size:
+            raise ValueError(
+                f"hidden_states must be [tokens, {self.hidden_size}]; got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        tokens = int(x.shape[0])
+        heads = self.num_attention_heads
+
+        q_latent = mla_projection(x, self._prepared_weight("q_a_proj"))
+        q_latent = self._latent_norm(q_latent, self.q_a_layernorm_weight)
+        query = mla_projection(q_latent, self._prepared_weight("q_b_proj"))
+        query = query.reshape(tokens, heads, widths["q_b_proj"][1] // heads)
+
+        kv_latent = mla_projection(x, self._prepared_weight("kv_a_proj_with_mqa"))
+        kv_latent = self._latent_norm(kv_latent, self.kv_a_layernorm_weight)
+        key_value = mla_projection(kv_latent, self._prepared_weight("kv_b_proj"))
+        key_value = key_value.reshape(
+            tokens, heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        key_nope = key_value[..., : self.qk_nope_head_dim]
+        value = key_value[..., self.qk_nope_head_dim :]
+
+        out_dtype = hidden_states.dtype
+        return (
+            query.to(out_dtype),
+            key_nope.contiguous().to(out_dtype),
+            value.contiguous().to(out_dtype),
+        )
+
+    def project_output(self, attn_out: torch.Tensor) -> torch.Tensor:
+        """The output projection. ONE dispatch.
+
+        ``attn_out`` is ``[tokens, heads, v_head_dim]`` or the same flattened to
+        ``[tokens, heads * v_head_dim]``; the return is ``[tokens,
+        hidden_size]``. Both input forms are accepted because the decode path
+        that calls this is another increment's and its layout is its own choice,
+        not something this section should dictate.
+        """
+        from vllm_neuron.functional.attention.mla_projections import mla_projection
+
+        expected_width = self.num_attention_heads * self.v_head_dim
+        x = attn_out.to(torch.float32)
+        if x.ndim == 3:
+            x = x.reshape(int(x.shape[0]), -1)
+        if x.ndim != 2 or int(x.shape[1]) != expected_width:
+            raise ValueError(
+                f"attn_out must be [tokens, {self.num_attention_heads}, "
+                f"{self.v_head_dim}] or [tokens, {expected_width}]; got "
+                f"{tuple(attn_out.shape)}"
+            )
+        projected = mla_projection(x.contiguous(), self._prepared_weight("o_proj"))
+        return projected.to(attn_out.dtype)
 
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(
