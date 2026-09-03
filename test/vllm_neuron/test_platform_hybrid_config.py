@@ -50,6 +50,14 @@ keeps messages without their level and ``(d3)`` counts records BY LEVEL.
 moves no registered value, no guard, no message and no derivation, and it adds
 no ``parametrize``.
 
+**THE ``inc-glm53f-081`` REPAIR (finding ``F-B29-01``) ADDS A TENTH ITEM at the
+end, so the derivable collected count for this file is now TEN.** ``(d3)`` above
+reads the page out of the landed method, but every config in this file supplied
+no block size, so it only ever read the unlatched half of the domain -- and the
+warning named ``32`` unconditionally, which is wrong for an operator who passed
+``--block-size``. The tenth item builds the latched half and reads the same
+agreement there. It adds one input constant of its own and no registered value.
+
 **Conjunct 3 (the vision limb) is DEFERRED to M5 at plan revision 28, and this
 file adds NO item for the retired number.** The deferral rests on measurements,
 not on preference, and they are recorded once rather than twice: the ground is
@@ -255,6 +263,7 @@ def _build_config(
     model_dtype: torch.dtype = REGISTERED_KV_DTYPE,
     cache_dtype: str = "auto",
     max_model_len: int = 8192,
+    block_size: int | None = None,
 ):
     """A config carrying REAL vLLM ``CacheConfig``/``ParallelConfig``.
 
@@ -264,6 +273,12 @@ def _build_config(
     measured against the real field rather than against a stand-in attribute.
     ``model_config`` stays a stand-in: a real ``ModelConfig`` needs a
     checkpoint, and no item here may reach a network or a device.
+
+    ``block_size`` left as ``None`` is the operator supplying none, which is the
+    state every item in this file used to build. Passing a value is how the
+    operator's own ``--block-size`` is reproduced: the vendor's ``CacheConfig``
+    latches ``user_specified_block_size`` on an explicit value, which is the
+    half of the domain ``F-B29-01`` found unmeasured.
     """
     from vllm.config.cache import CacheConfig
     from vllm.config.parallel import ParallelConfig
@@ -290,7 +305,10 @@ def _build_config(
         scheduler_config=SchedulerConfig(
             max_model_len=max_model_len, is_encoder_decoder=False
         ),
-        cache_config=CacheConfig(cache_dtype=cache_dtype),
+        cache_config=CacheConfig(
+            cache_dtype=cache_dtype,
+            **({} if block_size is None else {"block_size": block_size}),
+        ),
         kv_transfer_config=None,
     )
 
@@ -971,3 +989,88 @@ def test_default_run_at_off_value_tp_warns_exactly_once() -> None:
         explicit_off = _marker_records(handler, OFF_MARKER)
     _record("d3_explicit_false_off_records", len(explicit_off))
     assert len(explicit_off) == 0
+
+
+#: The operator's own page, for the latched half of the domain. Distinct from
+#: every page any other item here uses, so a match on the rendered
+#: ``64-token page`` cannot be satisfied by a number the code did not read.
+OPERATOR_LATCHED_BLOCK_SIZE = 64
+
+
+def test_off_warning_reports_the_page_a_latched_run_actually_gets() -> None:
+    """The declined engagement names the OPERATOR's page, not the default.
+
+    ADDED BY THE `inc-glm53f-081` REPAIR, for finding `F-B29-01`. The item above
+    establishes that the sentence matches the delivered page, and it does so in
+    one half of the domain: every config it builds supplies no block size, so
+    ``user_specified_block_size`` is ``False`` throughout and the delivered page
+    is always 32. The sentence used to say 32 unconditionally, so that item
+    passed while the claim was false for the other half.
+
+    THIS IS THE OTHER HALF. The operator passes a block size, the vendor latches
+    it, ``update_block_size_for_backend`` returns without touching the page, and
+    the run allocates the operator's value. A sentence that still said 32 would
+    be telling someone sizing KV memory the wrong number.
+
+    Widening the item above was not enough and the finding says so: it passes
+    today on a message that names 32 unconditionally, so only a new reading in
+    the latched state can move.
+    """
+    cfg = _build_config(
+        tp=OFF_VALUE_TP_DEGREE, block_size=OPERATOR_LATCHED_BLOCK_SIZE
+    )
+    # The premise, asserted rather than assumed: the vendor really did latch.
+    assert cfg.cache_config.user_specified_block_size is True
+    assert cfg.cache_config.block_size == OPERATOR_LATCHED_BLOCK_SIZE
+    _record("repair_latched_block_size", cfg.cache_config.block_size)
+    _record("repair_latch", cfg.cache_config.user_specified_block_size)
+
+    with _isolated_platform_class_state(), _capture_platform_records() as handler:
+        NeuronPlatform.check_and_update_config(cfg)
+        at_warning = _marker_records(handler, OFF_MARKER, level="WARNING")
+
+    assert len(at_warning) == 1, f"expected exactly 1 record, got {at_warning}"
+    message = at_warning[0]
+    _record("repair_latched_message", message)
+
+    # The delivered page, from the landed method itself rather than from a
+    # literal. Called AFTER the decision, which is the order a real run has.
+    NeuronPlatform.update_block_size_for_backend(cfg)
+    delivered = cfg.cache_config.block_size
+    _record("repair_delivered_block_size", delivered)
+    assert delivered == OPERATOR_LATCHED_BLOCK_SIZE, (
+        f"the operator's page did not survive: delivered {delivered}"
+    )
+
+    # THE READING THIS ITEM EXISTS FOR: the sentence names the delivered page.
+    assert f"{delivered}-token page" in message
+    # ... and does NOT name the default, which is what it used to say here.
+    # This is the assertion that reddens on the unrepaired code.
+    assert f"{NeuronPlatform.UNIFORM_NEURON_PAGE}-token page" not in message
+    # ... and says where the number came from, so the operator can tell the two
+    # cases apart without reading this file.
+    assert "supplied on the command line" in message
+
+    # The two readers of one number are pinned against each other, in BOTH latch
+    # states, so neither can drift alone. This is the part that keeps the fix
+    # honest: `resolved_uniform_page` is what the warning reads and
+    # `update_block_size_for_backend` is what the run allocates.
+    latched = _build_config(
+        tp=OFF_VALUE_TP_DEGREE, block_size=OPERATOR_LATCHED_BLOCK_SIZE
+    )
+    predicted_latched = NeuronPlatform.resolved_uniform_page(latched)
+    NeuronPlatform.update_block_size_for_backend(latched)
+    unlatched = _build_config(tp=OFF_VALUE_TP_DEGREE)
+    predicted_unlatched = NeuronPlatform.resolved_uniform_page(unlatched)
+    NeuronPlatform.update_block_size_for_backend(unlatched)
+    _record("repair_predicted_latched", predicted_latched)
+    _record("repair_predicted_unlatched", predicted_unlatched)
+    assert predicted_latched == latched.cache_config.block_size
+    assert predicted_unlatched == unlatched.cache_config.block_size
+    # And the prediction MOVES with the latch, so agreement is not two constants
+    # that happen to match.
+    assert predicted_latched != predicted_unlatched, (
+        f"both latch states predicted {predicted_latched}; the reader is not "
+        f"reading the latch"
+    )
+    assert predicted_unlatched == NeuronPlatform.UNIFORM_NEURON_PAGE

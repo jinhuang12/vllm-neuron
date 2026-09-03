@@ -178,13 +178,38 @@ class NeuronPlatform(Platform):
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
             )
 
+    #: The page this platform defaults to when the operator supplies none.
+    #: Named so the two readers below share one number instead of each carrying
+    #: its own literal.
+    UNIFORM_NEURON_PAGE = 32
+
+    @classmethod
+    def resolved_uniform_page(cls, vllm_config: "VllmConfig") -> int:
+        """The page ``update_block_size_for_backend`` will leave in place.
+
+        READ THIS RATHER THAN ASSUMING 32. The default only applies when the
+        operator supplied no block size; ``--block-size 64`` latches
+        ``user_specified_block_size`` and the default is skipped, so a caller
+        that hard-codes 32 is right only for the unlatched half of the domain.
+        The non-engagement warning in :meth:`check_and_update_config` used to be
+        such a caller.
+
+        Safe to call before ``update_block_size_for_backend`` has run, which is
+        why it exists: the warning fires earlier in ``check_and_update_config``
+        than the block-size resolution below it.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config.user_specified_block_size:
+            return int(cache_config.block_size)
+        return cls.UNIFORM_NEURON_PAGE
+
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         """Default block_size to 32 for Neuron when the user didn't override."""
         cache_config = vllm_config.cache_config
         if cache_config.user_specified_block_size:
             return
-        cache_config.block_size = 32
+        cache_config.block_size = cls.UNIFORM_NEURON_PAGE
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
@@ -385,23 +410,39 @@ class NeuronPlatform(Platform):
                 vllm_config.additional_config["neuron_config"] = neuron_config
             else:
                 # The case that must not be silent. No section 6 guard is
-                # reached, the run keeps the uniform page
-                # update_block_size_for_backend hard-sets in this file, and the
-                # operator is TOLD once. The marker below is deliberately not a
-                # substring of the engagement record the limb logs, so a
-                # differential that counts engagements cannot be inflated here.
+                # reached, the run keeps whatever uniform page it would have
+                # had, and the operator is TOLD once. The marker below is
+                # deliberately not a substring of the engagement record the limb
+                # logs, so a differential that counts engagements cannot be
+                # inflated here.
+                #
+                # THE PAGE IS READ, NOT ASSUMED. This sentence used to name the
+                # literal 32 unconditionally, which is wrong whenever the
+                # operator passed a block size of their own: that latches
+                # user_specified_block_size, update_block_size_for_backend
+                # returns without touching the page, and the run allocates the
+                # operator's value. An operator sizing KV memory was being told
+                # the wrong number by the one line that went out of its way to
+                # name it. Both the page and where it came from are read here.
+                uniform_page = cls.resolved_uniform_page(vllm_config)
+                page_origin = (
+                    "the block size supplied on the command line"
+                    if vllm_config.cache_config.user_specified_block_size
+                    else "the default update_block_size_for_backend sets"
+                )
                 logger.warning(
                     "Hybrid KDA/DSA KV cache left OFF for "
                     "Glm5NextForConditionalGeneration: the registered block "
                     "size is valid only at tensor_parallel_size=%d and this "
                     "run resolved tensor_parallel_size=%d, so the KV cache "
-                    "keeps the uniform 32-token page "
-                    "update_block_size_for_backend sets. To enable it at this "
-                    "degree, re-derive the block size for that degree "
+                    "keeps the uniform %d-token page -- %s. To enable it at "
+                    "this degree, re-derive the block size for that degree "
                     "(approvals/DECISIONS.md section 6) and set "
                     "enable_hybrid_kv_cache explicitly.",
                     HYBRID_KV_REGISTERED_TP_DEGREE,
                     resolved_tp_size,
+                    uniform_page,
+                    page_origin,
                 )
 
         # ---- Hybrid KDA/DSA KV-cache block size -----------------------------
