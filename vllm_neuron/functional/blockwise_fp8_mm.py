@@ -70,8 +70,9 @@ the counters below are acceptance criteria, not diagnostics.
 from __future__ import annotations
 
 import logging
+import weakref
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import Tensor
@@ -115,7 +116,9 @@ __all__ = [
     "kernel_identity",
     "kernel_scale_shape",
     "reset_dispatch_counters",
+    "reset_scale_layout_cache",
     "scale_grid_shape",
+    "scale_layout_counters",
     "to_kernel_scale_layout",
 ]
 
@@ -315,8 +318,16 @@ def to_kernel_scale_layout(weight_scale: Tensor, rows: int, cols: int) -> Tensor
     ``operand0`` only along the **free** dimension, from a tile of shape
     ``(data.shape[0], 1)``.
 
+    BUILT ONCE PER WEIGHT, not once per forward (`inc-glm53f-076`, `B26-M2`).
+    The operand is a function of the weight scale alone, so it is memoised on
+    the scale tensor's identity; see :func:`scale_layout_counters` for the
+    reading and the block below it for what keys the cache.
+
     Returns:
-        ``[TILE_SIZE, (K//256) * (N//256)]`` fp32, contiguous.
+        ``[TILE_SIZE, (K//256) * (N//256)]`` fp32, contiguous. Treat it as
+        READ-ONLY. Repeated calls for the same weight scale return the SAME
+        tensor, so a caller that writes into the result changes what every later
+        call returns.
 
     Raises:
         BlockwiseFp8MmError: if ``weight_scale`` is not the declared grid shape
@@ -336,7 +347,27 @@ def to_kernel_scale_layout(weight_scale: Tensor, rows: int, cols: int) -> Tensor
         raise BlockwiseFp8MmError(
             f"weight_scale must be fp32, got {weight_scale.dtype}"
         )
-    n_k_blocks, n_n_blocks = want
+    # BOTH REFUSALS RUN BEFORE THE LOOKUP, so a cache hit can never skip a
+    # check. Memoising in front of the validation would let a bad grid through
+    # on its second call, which is a worse defect than the one being repaired.
+    cached = _cached_scale_layout(weight_scale, rows, cols)
+    if cached is not None:
+        _LAYOUT_COUNTERS.reuses += 1
+        return cached
+    operand = _build_scale_layout(weight_scale, want)
+    _LAYOUT_COUNTERS.builds += 1
+    _remember_scale_layout(weight_scale, rows, cols, operand)
+    return operand
+
+
+def _build_scale_layout(weight_scale: Tensor, grid: tuple[int, int]) -> Tensor:
+    """The bridge's arithmetic, unchanged from `inc-glm53f-026`.
+
+    Split out of :func:`to_kernel_scale_layout` so the memoisation added by
+    `inc-glm53f-076` sits beside it rather than inside it, and so "the operand
+    was built" is one countable event.
+    """
+    n_k_blocks, n_n_blocks = grid
     flat = torch.empty(
         n_k_blocks * n_n_blocks, dtype=torch.float32, device=weight_scale.device
     )
@@ -346,6 +377,115 @@ def to_kernel_scale_layout(weight_scale: Tensor, rows: int, cols: int) -> Tensor
                 k_block, n_block
             ]
     return flat.unsqueeze(0).expand(TILE_SIZE, flat.numel()).contiguous()
+
+
+# --------------------------------------------------------------------------- #
+# The operand cache and its reading. `inc-glm53f-076`, repairing `B26-M2`.      #
+# --------------------------------------------------------------------------- #
+# WHAT WAS WRONG. :func:`_build_scale_layout` writes one element at a time in a
+# Python double loop, then broadcasts across ``TILE_SIZE``. Since `-076` landed
+# it does that ON THE DEVICE, and it ran once per entry into
+# :func:`blockwise_fp8_mm` -- which is three entries per shared-expert call, per
+# layer, per decode step -- for a quantity that depends on the WEIGHT SCALE
+# ALONE. Nothing about it changes between forwards, so every rebuild after the
+# first was the same work done again.
+#
+# WHAT KEYS THE CACHE, and what does NOT. The key is the scale tensor's
+# IDENTITY and VERSION -- ``(id, _version, rows, cols)`` -- never its values.
+# Hashing values would put a full read of the scale grid back on the per-forward
+# path and defeat the repair.
+#
+#   * ``id``       -- which tensor object this is.
+#   * ``_version`` -- torch's own in-place-write counter, so a scale tensor
+#                     written in place MISSES instead of serving a stale operand.
+#   * ``rows``, ``cols`` -- the same grid may legally serve two extents, and the
+#                     operand's width follows the extents.
+#
+# ``id`` ALONE WOULD BE UNSOUND, because CPython reuses the address of a
+# collected object. Each entry therefore also holds a WEAK reference to the
+# scale tensor it was built from, and a hit is only a hit when that reference
+# still resolves to the very same object. A tensor that died takes its entry out
+# of use even if a new tensor lands on its address.
+#
+# WHY THE OPERAND IS HELD STRONGLY BUT THE KEY WEAKLY. The cache must not be
+# what keeps a weight scale alive, so the key side is weak. The operand has no
+# other owner, so it is held strongly and dropped when its entry is purged --
+# which happens on the next miss, bounding the cache to live weights.
+#
+# WHAT THIS DOES NOT CHANGE. The operand is byte-identical to a freshly built
+# one; only the number of times it is built moves. `-076` therefore stays
+# NON-KERNEL-CLASS (P13): after this repair the buffer is assembled off the
+# per-forward path, and it was never the arithmetic -- it is host-side layout
+# plumbing that feeds the NKI kernel, whose own numerics are untouched.
+@dataclass
+class _LayoutCounters:
+    """How many operands were BUILT and how many were REUSED.
+
+    Two counters rather than a ratio, so "it was built once" and "the later
+    forwards reused it" are independent readings. Both are counts reported as
+    readings; neither is a threshold.
+    """
+
+    builds: int = 0
+    reuses: int = 0
+
+
+_LAYOUT_COUNTERS = _LayoutCounters()
+
+#: ``(id, version, rows, cols) -> (weak reference to the scale tensor, operand)``.
+#: Module-level for the same reason ``_COUNTERS`` is: the reading has to be
+#: available to a test in another module.
+_LAYOUT_CACHE: dict[tuple[int, int, int, int], tuple[Any, Tensor]] = {}
+
+
+def _layout_key(
+    weight_scale: Tensor, rows: int, cols: int
+) -> tuple[int, int, int, int]:
+    """The cache key. Identity and version, never values."""
+    return (id(weight_scale), getattr(weight_scale, "_version", 0), rows, cols)
+
+
+def _cached_scale_layout(
+    weight_scale: Tensor, rows: int, cols: int
+) -> Optional[Tensor]:
+    """The stored operand for this exact scale tensor, or ``None``."""
+    entry = _LAYOUT_CACHE.get(_layout_key(weight_scale, rows, cols))
+    if entry is None:
+        return None
+    keyed_on, operand = entry
+    # The identity re-check is what makes a recycled ``id`` unable to hit.
+    return operand if keyed_on() is weight_scale else None
+
+
+def _remember_scale_layout(
+    weight_scale: Tensor, rows: int, cols: int, operand: Tensor
+) -> None:
+    """Store ``operand``, and drop entries whose scale tensor has died."""
+    for dead in [key for key, (ref, _) in _LAYOUT_CACHE.items() if ref() is None]:
+        del _LAYOUT_CACHE[dead]
+    try:
+        reference = weakref.ref(weight_scale)
+    except TypeError:
+        # Not weak-referenceable: correct, just never memoised.
+        return
+    _LAYOUT_CACHE[_layout_key(weight_scale, rows, cols)] = (reference, operand)
+
+
+def reset_scale_layout_cache() -> None:
+    """Empty the cache AND zero the counters, as one action.
+
+    One function rather than two on purpose: zeroing the counters while leaving
+    the cache warm would read ``builds=0`` for a weight already memoised, which
+    looks like the repair working when it is only the instrument lying.
+    """
+    _LAYOUT_CACHE.clear()
+    _LAYOUT_COUNTERS.builds = 0
+    _LAYOUT_COUNTERS.reuses = 0
+
+
+def scale_layout_counters() -> tuple[int, int]:
+    """``(builds, reuses)`` since the last :func:`reset_scale_layout_cache`."""
+    return _LAYOUT_COUNTERS.builds, _LAYOUT_COUNTERS.reuses
 
 
 # --------------------------------------------------------------------------- #
