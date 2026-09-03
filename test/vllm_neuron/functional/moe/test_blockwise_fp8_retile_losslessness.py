@@ -20,6 +20,14 @@ Two dequantisations are built independently and compared:
   consumer's *own* block-index arithmetic, transcribed below with its
   ``file:line`` provenance, and applied to the retiled fp8 weights.
 
+Path K reproduces the consumer's INDEXING and its scale VALUES. It applies each
+scale elementwise before any reduction, which is not the consumer kernel's
+reduction order -- the kernel accumulates the two 128-tiles of a block first and
+applies one scale after. Finding ``B10-F2`` found that difference measured
+nowhere in the repository, so ``test_m2b_consumer_accumulate_then_scale_order``
+now measures it directly: 0 fp32 ulp when the retained block scale is a power of
+two, and nonzero when it is not.
+
 Comparing a round trip through the producer's own layout would be invariant to
 the claim: any invertible re-layout passes it. Comparing against the original
 ``[128, 128]`` semantics is the comparison that can fail.
@@ -471,6 +479,28 @@ def accumulate(
     return out
 
 
+def accumulate_then_scale(
+    activations: torch.Tensor,
+    retiled: torch.Tensor,
+    retained: float,
+    low: int,
+    high: int,
+) -> torch.Tensor:
+    """The CONSUMER's order: accumulate first, apply the block scale once after.
+
+    The kernel contracts the two 128-wide tiles of a 256-block into one fp32 PSUM
+    accumulator and applies the retained block scale to the accumulated result
+    (``vllm_neuron/functional/blockwise_fp8_mm.py``: the two contraction tiles
+    accumulate in PSUM and the block scale is applied after). Every other path in
+    this file scales each element first and sums afterwards, which is a different
+    rounding unless the scale is a power of two -- and that difference is what
+    :func:`test_m2b_consumer_accumulate_then_scale_order` measures.
+
+    Added by ``inc-glm53f-071``'s repair for finding ``B10-F2`` (repair batch R4).
+    """
+    return accumulate(activations, retiled, low, high) * fp32(retained)
+
+
 # --------------------------------------------------------------------------- #
 # Instrument guards. These do not measure the retile; they pin the             #
 # instruments that measure it, so a silent instrument cannot read as a pass.   #
@@ -583,7 +613,17 @@ def test_m1_bit_exact_over_128_blocks(side: int, expected_blocks: int) -> None:
 # --------------------------------------------------------------------------- #
 def test_m2_split_halves_and_summed_ulp_distance() -> None:
     """Two partials over the reduction axis, each bit-exact, and the summed
-    result within 1 fp32 ulp of path O -- with the measured distance reported."""
+    result within 1 fp32 ulp of path O -- with the measured distance reported.
+
+    WHAT THIS ARM DOES NOT MEASURE, stated because finding ``B10-F2`` found the
+    omission load-bearing. Both paths here are already dequantised elementwise
+    before any reduction, so this arm compares two reductions of two
+    bit-identical tensors in the same order, and its ulp distance can only ever
+    read 0. It measures the ELEMENTWISE order. The consumer kernel's own order --
+    accumulate the two 128-tiles first, apply one block scale after -- is
+    measured by :func:`test_m2b_consumer_accumulate_then_scale_order` below, and
+    that arm does read nonzero.
+    """
     reduction = BLOCK_QUANT_SIZE  # I, split 2/2 into the consumer's 128-tiles
     weights, scales, dims = build_checkpoint(reduction, BLOCK_QUANT_SIZE)
     flat, supplied, retiled, inexact = retile(weights, scales, dims)
@@ -608,6 +648,124 @@ def test_m2_split_halves_and_summed_ulp_distance() -> None:
     print(f"[M-2] partials bit-exact = {exact}/2  summed max ulp distance = {measured_ulp}")
     assert exact == 2, f"partials bit-exact over {exact}/2 split halves, required 2/2"
     assert measured_ulp <= 1, f"summed result is {measured_ulp} fp32 ulp from path O, bound is 1"
+
+
+# --------------------------------------------------------------------------- #
+# M-2b -- the CONSUMER's reduction order, which M-2 does not reach.            #
+# --------------------------------------------------------------------------- #
+#: A retained block scale that IS a power of two. ``2**-6`` exactly, so the base
+#: itself is the scale of the single 256-block this arm builds and multiplying by
+#: it only moves the fp32 exponent.
+CONSUMER_ORDER_POW2_BASE = 0.015625
+
+#: A retained block scale that is NOT a power of two. This is the module's own
+#: default base, so the non-power-of-two leg runs on the same scale every other
+#: arm in this file runs on rather than on a value chosen to make a point.
+CONSUMER_ORDER_NONPOW2_BASE = 0.017772
+
+
+def test_m2b_consumer_accumulate_then_scale_order() -> None:
+    """Scale once after accumulating two 128-tiles, at a pow2 and a non-pow2 scale.
+
+    WHY THIS ARM EXISTS. Finding ``B10-F2``: the kernel accumulates the two
+    128-wide contraction tiles of a 256-block in one fp32 PSUM accumulator and
+    applies the retained block scale afterwards, while every path in this file
+    applied each scale first and reduced second. Those are the same arithmetic
+    only when the scale is a power of two. The difference had been measured once,
+    in a ``/tmp`` probe that is in no commit, at 720 fp32 ulp with a
+    non-power-of-two scale and 0 with a power-of-two one -- and a plan
+    precondition then rested on a number no later reader could reproduce. This
+    arm makes it reproducible from a committed file.
+
+    THE READING IS A DIFFERENTIAL, and both halves are counted. A power-of-two
+    retained scale must give 0 ulp: if it does not, the claim that the
+    power-of-two condition protects the consumer is false. A non-power-of-two
+    retained scale must give MORE than 0: if it does not, this arm is measuring
+    nothing and is a broken instrument, which is why the count goes through
+    :func:`require_nonzero` rather than through an inequality that zero satisfies.
+
+    ONE 256-BLOCK, on purpose. ``build_checkpoint`` derives each block's base as
+    ``base * (1 + 0.25 * k)``, so only the first block's base survives unchanged.
+    A single ``[256, 256]`` checkpoint therefore lets the retained scale be
+    exactly the base, and the arm asserts which side of the power-of-two
+    predicate each base landed on rather than trusting the arithmetic.
+
+    NO BAR AND NO TOLERANCE MOVES HERE. The arm adds two readings; it changes
+    nothing M-1, M-2 or M-3 assert.
+    """
+    reduction = BLOCK_QUANT_SIZE  # H, split 2/2 into the consumer's 128-tiles
+    low, high = 0, 2 * TILE_SIZE
+    readings: dict[str, dict] = {}
+
+    for label, base in (
+        ("pow2", CONSUMER_ORDER_POW2_BASE),
+        ("non-pow2", CONSUMER_ORDER_NONPOW2_BASE),
+    ):
+        weights, scales, dims = build_checkpoint(
+            reduction, BLOCK_QUANT_SIZE, base=base
+        )
+        flat, supplied, retiled, inexact = retile(weights, scales, dims)
+        assert inexact == 0, (
+            f"[{label}] the fp8 rescale was inexact on {inexact} blocks, so this "
+            "arm would be reading rescale error and not reduction order"
+        )
+        assert dims["h_256"] == 1 and dims["i_256"] == 1, dims
+        retained = float(flat[scale_flat_index_down(0, 0, dims["h_256"])])
+
+        path_k = dequant_path_k(retiled, flat, dims)
+        generator = torch.Generator().manual_seed(SEED + 1)
+        activations = (
+            torch.randint(-32, 33, (4, reduction), generator=generator).to(FP32) / 8.0
+        )
+
+        per_term = accumulate(activations, path_k, low, high)
+        consumer = accumulate_then_scale(activations, retiled, retained, low, high)
+        measured_ulp = max(
+            ulp_distance(a, b)
+            for a, b in zip(per_term.flatten().tolist(), consumer.flatten().tolist())
+        )
+        differing = int((per_term != consumer).sum())
+        readings[label] = {
+            "retained": retained,
+            "is_pow2": is_pow2_exact(retained),
+            "ulp": measured_ulp,
+            "max_abs": float((per_term - consumer).abs().max()),
+            "differing": differing,
+            "elements": per_term.numel(),
+            "worst_magnitude": float(per_term.abs().max()),
+        }
+        print(
+            f"[M-2b] {label}: retained scale = {retained!r}  is_pow2_exact = "
+            f"{readings[label]['is_pow2']}  consumer-order ulp distance = "
+            f"{measured_ulp}  max abs diff = {readings[label]['max_abs']!r}  "
+            f"differing = {differing}/{readings[label]['elements']}"
+        )
+
+    # The two legs really are on opposite sides of the predicate. Without this a
+    # base that quietly became a power of two would make both legs agree and the
+    # arm would report a difference of 0 for the wrong reason.
+    assert readings["pow2"]["is_pow2"] is True, readings["pow2"]
+    assert readings["non-pow2"]["is_pow2"] is False, readings["non-pow2"]
+
+    # A power-of-two scale: the two orders agree bit for bit.
+    assert readings["pow2"]["ulp"] == 0, (
+        f"a power-of-two retained scale still moved the result by "
+        f"{readings['pow2']['ulp']} fp32 ulp between the two reduction orders; the "
+        "power-of-two condition does not protect the consumer as declared"
+    )
+    assert readings["pow2"]["differing"] == 0, readings["pow2"]
+
+    # A non-power-of-two scale: they do not, and a zero here is a broken
+    # instrument rather than good news.
+    require_nonzero(
+        readings["non-pow2"]["ulp"],
+        "the consumer-order ulp distance at a non-power-of-two retained block scale",
+    )
+    require_nonzero(
+        readings["non-pow2"]["differing"],
+        "the count of elements the two reduction orders disagree on at a "
+        "non-power-of-two retained block scale",
+    )
 
 
 # --------------------------------------------------------------------------- #
