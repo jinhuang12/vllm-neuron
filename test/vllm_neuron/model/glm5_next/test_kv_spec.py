@@ -630,16 +630,24 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     forward here would change that declaration and this test would fail.
     """
     impl = _impl()
-    with pytest.raises(NotImplementedError):
-        model.forward()
-    with pytest.raises(NotImplementedError):
-        model.model.forward()
+    # Counted, not asserted against a literal: two retirements landed here for
+    # ``inc-glm53f-038a`` and the number this census still guards belongs in the
+    # transcript, where a later retirement that quietly emptied the walk would
+    # show up as a smaller reading rather than as a still-green test.
+    asserted = 0
+    for model_level in (model, model.model):
+        with pytest.raises(NotImplementedError):
+            model_level.forward()
+        asserted += 1
 
-    modules = [model.model.layers[index] for index in (0, 3)]
+    # NOT ``(0, 3)`` any more: ``layers[0]`` is retired below, so only the DSA
+    # layer is walked at the layer level.
+    modules = [model.model.layers[3]]
     # ``.attention`` rather than a family attribute name: ``inc-glm53f-082``
     # moved the KDA module onto the map's ``self_attn`` path, and the property
-    # is the access that survives such a move.
-    modules += [model.model.layers[0].attention, model.model.layers[0].mlp]
+    # is the access that survives such a move. ``layers[0].attention`` itself is
+    # retired below; the ``.mlp`` beside it is not.
+    modules += [model.model.layers[0].mlp]
     modules += [
         model.model.layers[3].self_attn,
         model.model.layers[3].self_attn.indexer,
@@ -650,18 +658,66 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     for module in modules:
         with pytest.raises(NotImplementedError):
             module.forward()
+        asserted += 1
 
-    # NO reserved-name arm is left in this census, and both retirements were
-    # declared handovers rather than losses of coverage. `Glm5NextQuantConfig()`
+    assert len(modules) == 7, f"module arms drifted to {len(modules)}"
+    _record(stub_forwards_asserted=asserted)
+    assert asserted == 9
+
+    # THE RETIREMENT IS MEASURED, NOT ANNOUNCED. The two retired forwards must
+    # really be implemented, or this retirement would be hiding a stub instead of
+    # handing one over. The property checked is the one being handed over and
+    # nothing more: calling it no longer says NotImplementedError. Deliberately
+    # NOT a match on the new signature -- a later increment that gives
+    # ``hidden_states`` a default would then redden this census for a reason that
+    # has nothing to do with a quiet stub, and a working forward must be allowed
+    # to simply succeed.
+    retired = [model.model.layers[0], model.model.layers[0].attention]
+    still_stubbed = []
+    for module in retired:
+        try:
+            module.forward()
+        except NotImplementedError:
+            still_stubbed.append(type(module).__name__)
+        except Exception:
+            pass  # implemented; it merely wants its arguments
+    _record(retired_forwards_still_stubbed=still_stubbed)
+    assert still_stubbed == [], (
+        f"retired as handed over to inc-glm53f-038a, but still a stub: "
+        f"{still_stubbed}"
+    )
+    assert len(retired) == 2
+
+    # NO reserved-name arm is left in this census, and every retirement was a
+    # declared handover rather than a loss of coverage. `Glm5NextQuantConfig()`
     # was retired by `inc-glm53f-023` and `Glm5NextHyperConnection().forward()`
     # by `inc-glm53f-030`, each the DECLARED lander of that D14 section -- this
     # census is a tripwire against a QUIET implementation, and a declared lander
     # is the opposite of quiet. `-030` implements the mHC wiring its section
     # reserved, so the constructor now takes the config the layer is sized from
     # and `forward` computes instead of raising.
-    # `-013`'s four declared counts (45 / 11 / 34 / 0) are untouched, as is
-    # every arm above. The class NAME still exists and is still pinned, by
-    # `test_kv_spec_the_tree_carries_every_d14_section_name` below, unchanged.
+    #
+    # THIRD AND FOURTH RETIREMENT, `inc-glm53f-038a`, same form and same reason.
+    # `layers[0].forward()` (`Glm5NextKDALayer`) and `layers[0].attention.forward()`
+    # (`Glm5NextKDAAttention`) are gone from the walk above. `-038a` is the
+    # DECLARED lander of both, and both now take `hidden_states` positionally plus
+    # three keyword-only carriers -- so a zero-argument call raises `TypeError`,
+    # which `pytest.raises(NotImplementedError)` does not catch. Keeping the arms
+    # would have made this census fail on the very implementation it exists to
+    # announce. Retiring them costs no coverage that matters here: the census
+    # guards against a QUIET forward, and `-038a` declared both.
+    #
+    # WHAT STILL HOLDS EACH RETIRED MODULE IN THIS FILE, so neither disappears
+    # from the file's reach along with its arm:
+    #   * `layers[0]` -- `test_kv_spec_the_tree_carries_every_d14_section_name`
+    #     asserts it is a `Glm5NextKDALayer`, and five other arms read it.
+    #   * `layers[0].attention` -- the `.attention` property access is exercised
+    #     on a KDA layer at line 805 of this file, which is the access
+    #     `inc-glm53f-082`'s move made load-bearing.
+    #
+    # `-013`'s four declared counts (45 / 11 / 34 / 0) are untouched, as is every
+    # other arm. The two model-level arms and the seven remaining module arms
+    # stand, so this census still asserts NINE stub forwards.
 
 
 def test_kv_spec_the_tree_carries_every_d14_section_name(model) -> None:
