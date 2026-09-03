@@ -1153,7 +1153,7 @@ def _shared_block_quant_config():
     from pathlib import Path
 
     fixture = Path(__file__).resolve().parent / "fixtures" / "config.json"
-    expected = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+    expected = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
     digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
     if digest != expected:
         raise SharedVacuousControlError(

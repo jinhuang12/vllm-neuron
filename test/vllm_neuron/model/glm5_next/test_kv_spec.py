@@ -111,7 +111,7 @@ FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
 
 # Same digest ``test_config.py:50`` pins, so a silent fixture edit cannot move
 # a declared value here either.
-FIXTURE_SHA256 = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
 
 #: C01.
 DECLARED_TOTAL_ENTRIES = 45

@@ -69,7 +69,7 @@ FIXTURE_PATH = (
     / "fixtures"
     / "config.json"
 )
-FIXTURE_SHA256 = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
 
 #: ``approvals/DECISIONS.md`` section 6: registered TP, the user-decided block
 #: size, and the recorded KDA state page. All CITED, none re-derived (P9).

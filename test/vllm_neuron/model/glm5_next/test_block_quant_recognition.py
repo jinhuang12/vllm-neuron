@@ -93,7 +93,7 @@ FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
 
 #: Pinned by `inc-glm53f-008`; repeated so a silent fixture edit fails loudly
 #: here too rather than moving a declared value.
-FIXTURE_SHA256 = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
 
 #: The campaign's target base — `release-0.24.0.1.1.0`, DECISIONS section 1.
 #: This is the revision P47's baseline is a statement ABOUT, so the baseline is

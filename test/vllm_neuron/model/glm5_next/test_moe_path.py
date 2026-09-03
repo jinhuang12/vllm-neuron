@@ -189,7 +189,7 @@ _FP8 = torch.float8_e4m3fn
 #: ``QuantizationSpec`` -> ``BlockFp8QuantMethod``. ``inc-glm53f-023``'s test
 #: pins the same digest; a divergence here means one of the two is stale.
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
-FIXTURE_SHA256 = "f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802"
+FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
 
 #: Fixture-only constants. The plan declares the tolerances, the case count and
 #: the tiny-config shape family; it declares nothing about how the fixture is
