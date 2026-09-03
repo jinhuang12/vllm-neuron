@@ -111,7 +111,23 @@ def argmax(
 
     # Find global argmax and extract final indices
     global_argmax = torch.argmax(global_values, dim=dim, keepdim=True)
-    final_indices = torch.gather(global_indices, dim, global_argmax)
+
+    # ep18/FP-70 tail-gather index sanitize (k=1 case) -- same
+    # clamp-plus-collapse idiom as functional/topk.py (aws-neuron-sdk#1335
+    # family; the gathered global_indices are kernel-derived on the NKI
+    # path). The gather is keyed ONLY by the sanitized index; invalid slots
+    # collapse to index 0. No value output at this site. MASKS DEFECT
+    # EXPRESSION ONLY (F-224): no health claim; parity v3r1 remains the
+    # untouched arbiter.
+    W = global_indices.shape[dim]
+    valid = (global_argmax >= 0) & (global_argmax < W)
+    safe_index = torch.clamp(
+        torch.where(valid, global_argmax, torch.zeros_like(global_argmax)),
+        0,
+        W - 1,
+    )
+    final_indices = torch.gather(global_indices, dim, safe_index)
+    final_indices = torch.where(valid, final_indices, torch.zeros_like(final_indices))
 
     if not keepdim:
         return final_indices.squeeze(dim)

@@ -35,6 +35,8 @@ except Exception:
 # Maximum head dimension supported by the NKI kernel (SBUF partition constraint).
 _MAX_HEAD_DIM = 128
 
+_INT32_MAX = 2**31 - 1
+
 
 def _decode_packed_to_segmented_packed(k_cache: Tensor) -> Tensor:
     """Convert a decode-packed K cache to the segmented kernel's packed layout.
@@ -164,7 +166,7 @@ def _torch_segmented_attention_impl(
     # Unused slots (0 in production, -1 in tests) are clamped to index 0; the
     # in-sequence position mask below zeroes out their softmax contribution.
     bt = block_tables[0]  # [max_blocks_per_seq]
-    bt_clamped = bt.clamp_min(0).to(torch.int64)
+    bt_clamped = bt.clamp(0, _INT32_MAX).to(torch.int64)
 
     # k_cache[bt_clamped]: [max_blocks_per_seq, num_kv_heads, block_size, D]
     k_blocks = k_cache[bt_clamped]
@@ -290,7 +292,7 @@ def _torch_segmented_attention_cp_impl(
         v_local_exp = v_local
 
     # ── Gather prior KV from cache (static padded shape) ──
-    bt = block_tables[0].clamp_min(0).to(torch.int64)
+    bt = block_tables[0].clamp(0, _INT32_MAX).to(torch.int64)
     k_blocks = k_cache[bt]
     v_blocks = v_cache[bt]
     k_prior = k_blocks.permute(1, 0, 2, 3).reshape(num_kv_heads, padded_kv_len, D)

@@ -7,10 +7,10 @@ Registers custom XLA backend implementations.
 import logging
 import os
 
-import torch.distributed as dist
 import torch_xla.core.xla_model as xm
-from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.library import impl
+
+from vllm_neuron.parallel.replica_groups import resolve_full_partition
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -37,14 +37,26 @@ def _get_reduce_type(reduceOp: str) -> str:
 
 
 def _get_replica_groups_from_group_name(group_name):
-    """Extract replica groups from group name."""
-    try:
-        group = _resolve_process_group(group_name)
-        ranks = dist.get_process_group_ranks(group)
-        return [ranks]  # xm APIs expect list of lists
-    except Exception as e:
-        logger.error(f"Could not resolve process group '{group_name}': {e}")
-        raise RuntimeError(f"Failed to resolve process group '{group_name}'") from e
+    """Resolve a group name to the COMPLETE rank partition (S0).
+
+    This used to return ``[dist.get_process_group_ranks(group)]`` -- this
+    rank's OWN TILE. Every rank therefore emitted a different
+    ``replica_groups`` for the same logical collective, which is one half of
+    the 8-way compile-key split (the other half is the group NAME rendered
+    into the hashed graph text; see ``compile/cache.py``).
+
+    The partition now comes from the ONE shared resolver in
+    ``vllm_neuron.parallel.replica_groups``, which the cache-key path imports
+    too, so the two can no longer disagree. Arm 3 raises a dedicated
+    ``ReplicaGroupResolutionError`` rather than guessing.
+
+    NOTE for ``reduce_scatter``/``all_to_all_single`` below: ``replica_groups[0]``
+    is now the FIRST TILE OF THE PARTITION, not this rank's own tile. The two
+    coincide in value only because every tile has the same width, and
+    ``assert_is_full_partition`` (S0-INV-1) enforces exactly that inside the
+    resolver.
+    """
+    return resolve_full_partition(group_name)
 
 
 @impl("_c10d_functional::all_reduce", "XLA")

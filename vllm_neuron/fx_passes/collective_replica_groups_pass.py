@@ -5,8 +5,8 @@ import logging
 from typing import Dict, List, Tuple
 
 import torch
-import torch.distributed as dist
-from torch.distributed.distributed_c10d import _resolve_process_group
+
+from vllm_neuron.parallel.replica_groups import resolve_full_partition
 
 from .base import FXPass
 
@@ -40,7 +40,8 @@ class CollectiveReplicaGroupsPass(FXPass):
         self, gm: torch.fx.GraphModule, **kwargs
     ) -> Tuple[torch.fx.GraphModule, Dict]:
         resolved_count = 0
-        group_cache: Dict[str, List[int]] = {}
+        # S0: one full PARTITION per group name, not one tile.
+        group_cache: Dict[str, List[List[int]]] = {}
 
         for node in gm.graph.nodes:
             if node.op != "call_function" or node.target not in COLLECTIVE_OPS:
@@ -53,11 +54,15 @@ class CollectiveReplicaGroupsPass(FXPass):
             if group_name not in group_cache:
                 group_cache[group_name] = self._resolve_ranks(group_name)
 
-            ranks = group_cache[group_name]
-            node.meta["replica_groups"] = [ranks]
+            partition = group_cache[group_name]
+            # S0: the COMPLETE partition, already wrapped as a list of tiles.
+            # Previously this wrapped a single tile as ``[ranks]``, which made
+            # the value rank-dependent and split one compilation into eight.
+            node.meta["replica_groups"] = [list(tile) for tile in partition]
             resolved_count += 1
             logger.debug(
-                f"Wrote replica_groups={ranks} for {node.target} (group={group_name})"
+                f"Wrote replica_groups={partition} for {node.target} "
+                f"(group={group_name})"
             )
 
         return gm, {"resolved_count": resolved_count}
@@ -71,7 +76,19 @@ class CollectiveReplicaGroupsPass(FXPass):
         return None
 
     @staticmethod
-    def _resolve_ranks(group_name: str) -> List[int]:
-        """Resolve a process group name to its list of ranks."""
-        group = _resolve_process_group(group_name)
-        return dist.get_process_group_ranks(group)
+    def _resolve_ranks(group_name: str) -> List[List[int]]:
+        """Resolve a process group name to its COMPLETE rank partition (S0).
+
+        Delegates to the ONE shared resolver that
+        ``overrides/xla_collectives.py`` also uses, so the cache-key path and
+        the HLO-emission path cannot drift. Returns a LIST OF TILES, not one
+        tile: the old ``[dist.get_process_group_ranks(group)]`` was this rank's
+        own subgroup, so the same graph hashed once per rank-tile.
+
+        Raises:
+            ReplicaGroupResolutionError: an unregistered partial group (arm 3),
+                or an S0-INV-1 violation. Deliberately NOT swallowed here --
+                see ``compile/cache.py``, where returning ``None`` on this
+                failure would silently SHORTEN the cache key.
+        """
+        return resolve_full_partition(group_name)

@@ -48,8 +48,29 @@ run jobs sequentially in the parent process. Setting
 ``VLLM_NEURON_PARALLEL_TRACE_WORKERS=1`` is also honored — a
 single forked child runs all jobs, useful for matching the fork code
 path while disabling parallelism.
+
+Host-RAM admission gate
+-----------------------
+
+Every rank calls ``parallel_trace`` independently and nothing in this
+file or its callers knows about the other ranks' children, so
+``VLLM_NEURON_PARALLEL_TRACE_WORKERS`` bounds *one* rank's fan-out while
+host RAM is consumed by the **sum over ranks**. On a large-TP host the
+sum can exceed physical RAM even though every individual rank is
+configured conservatively, and the failure mode is an OOM kill of an
+arbitrary child.
+
+Set ``VLLM_NEURON_MAX_CONCURRENT_TRACERS`` to a positive value to cap the
+number of trace children alive at once *across every rank on the host*,
+and ``VLLM_NEURON_TRACER_ADMIT_TIMEOUT`` to bound how long a rank waits
+for a slot. **Both default to 0, which is OFF**: at the default the gate
+object is never constructed, no lock path is created or touched, no log
+line is emitted and the fork ordering is unchanged, so the pool behaves
+exactly as it does with no gate in the code at all. See
+``_TracerAdmissionGate``.
 """
 
+import fcntl
 import logging
 import os
 import shutil
@@ -92,8 +113,18 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
     ``VLLM_NEURON_DISABLE_PARALLEL_TRACE=1`` to bypass the pool entirely
     and run jobs in the parent process.
 
+    That pool size is **per rank**. To bound the host-wide total, set
+    ``VLLM_NEURON_MAX_CONCURRENT_TRACERS`` (plus
+    ``VLLM_NEURON_TRACER_ADMIT_TIMEOUT``); both default to ``0`` = off, and
+    at the default this function behaves exactly as it did before the gate
+    existed.
+
     Raises:
-        ValueError: if any job's kwargs include a non-meta tensor.
+        ValueError: if any job's kwargs include a non-meta tensor, or if
+            ``VLLM_NEURON_MAX_CONCURRENT_TRACERS`` is set without
+            ``VLLM_NEURON_TRACER_ADMIT_TIMEOUT``.
+        TracerAdmissionTimeout: if the admission gate is enabled and no
+            slot came free within the configured wait.
         RuntimeError: if any forked child fails. Other children are
             still waited on first so we don't leak processes.
     """
@@ -132,52 +163,44 @@ def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
 
     Forking once per lane (rather than once per job) amortizes the
     meta-swap cost across the lane's jobs.
+
+    When ``VLLM_NEURON_MAX_CONCURRENT_TRACERS`` is set, each fork is gated on
+    a host-wide admission slot taken immediately before it. With the key unset
+    the gate is ``None`` and every gate call site below is skipped.
     """
     if not jobs:
         return
 
     lanes = _partition_round_robin(jobs, num_workers)
+    # None unless VLLM_NEURON_MAX_CONCURRENT_TRACERS is positive. At the
+    # default this constructs nothing, touches no path and logs nothing.
+    # Built BEFORE the workdir so a refused configuration fails without
+    # leaving a temp directory behind: nothing between mkdtemp and the try
+    # below may raise.
+    gate = _TracerAdmissionGate.from_env(parent_rank)
     workdir = tempfile.mkdtemp(prefix=f"trace_pool_rank{parent_rank}_")
     try:
         child_pids: dict[int, int] = {}
         result_paths: dict[int, str] = {}
-        for lane_idx, lane_jobs in enumerate(lanes):
-            if not lane_jobs:
-                continue
-            rp = os.path.join(workdir, f"lane{lane_idx}.status")
-            result_paths[lane_idx] = rp
-            pid = os.fork()
-            if pid == 0:
-                # Child: run target and exit. Use os._exit to skip
-                # atexit handlers (which would otherwise try to clean
-                # up parent state we still want).
-                try:
-                    _fork_child_main(lane_idx, parent_rank, lane_jobs, rp)
-                    os._exit(0)
-                except BaseException:
-                    try:
-                        with open(rp, "w") as f:
-                            f.write("ERROR\n" + traceback.format_exc())
-                    except Exception:
-                        pass
-                    os._exit(1)
-            else:
-                child_pids[lane_idx] = pid
-
-        # Poll our own lane PIDs so we can early-abort surviving lanes
-        # the moment one fails.
-        pending = dict(child_pids)  # lane_idx -> pid
         completed: dict[int, tuple[int, int]] = {}  # lane_idx -> (pid, exit_code)
         first_failure: str | None = None
+        # Lanes this pool signalled itself, so that our own teardown SIGKILL
+        # is never reported as a probable OOM kill.
+        aborted_lanes: set[int] = set()
 
         def _reap(lane_idx: int, pid: int, status_word: int) -> None:
             nonlocal first_failure
-            exit_code = os.WEXITSTATUS(status_word) if os.WIFEXITED(status_word) else -1
+            pool_initiated = lane_idx in aborted_lanes
+            exit_code, death = _describe_child_death(status_word, pool_initiated)
             completed[lane_idx] = (pid, exit_code)
+            if gate is not None:
+                gate.note_release(lane_idx)
             child_status, child_err = _read_status_file(result_paths[lane_idx])
             if exit_code != 0 or child_status != "OK":
+                _warn_on_fatal_signal(lane_idx, pid, status_word, pool_initiated)
                 msg = (
                     f"lane={lane_idx} pid={pid} exit_code={exit_code} "
+                    f"death={death} "
                     f"status={child_status} err={child_err}"
                 )
                 if first_failure is None:
@@ -185,6 +208,57 @@ def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
                     logger.error(
                         "Parallel trace lane failed; aborting siblings: %s", msg
                     )
+
+        try:
+            for lane_idx, lane_jobs in enumerate(lanes):
+                if not lane_jobs:
+                    continue
+                rp = os.path.join(workdir, f"lane{lane_idx}.status")
+                result_paths[lane_idx] = rp
+                # Admission goes here, immediately before the fork, because
+                # the fork is what spends the memory being rationed.
+                slot_fd = gate.acquire(lane_idx) if gate is not None else None
+                pid = os.fork()
+                if pid == 0:
+                    # Child: run target and exit. Use os._exit to skip
+                    # atexit handlers (which would otherwise try to clean
+                    # up parent state we still want). Any inherited
+                    # admission descriptor is deliberately left open and
+                    # untouched: the kernel closes it at exit however the
+                    # child dies, and that close IS the slot release.
+                    try:
+                        _fork_child_main(lane_idx, parent_rank, lane_jobs, rp)
+                        os._exit(0)
+                    except BaseException:
+                        try:
+                            with open(rp, "w") as f:
+                                f.write("ERROR\n" + traceback.format_exc())
+                        except Exception:
+                            pass
+                        os._exit(1)
+                else:
+                    child_pids[lane_idx] = pid
+                    if gate is not None:
+                        gate.hand_to_child(slot_fd, lane_idx, pid)
+        except BaseException:
+            # A refused admission or a failed fork must not strand the lanes
+            # already started: unreaped children would become zombies and
+            # would hold their slots until this process itself died.
+            if child_pids:
+                logger.error(
+                    "Parallel trace aborting %d already-forked lane(s) after a "
+                    "fan-out failure (rank=%d)",
+                    len(child_pids),
+                    parent_rank,
+                )
+                _abort_remaining(
+                    dict(child_pids), completed, _reap, aborted_lanes
+                )
+            raise
+
+        # Poll our own lane PIDs so we can early-abort surviving lanes
+        # the moment one fails.
+        pending = dict(child_pids)  # lane_idx -> pid
 
         while pending:
             for lane_idx in list(pending):
@@ -196,6 +270,8 @@ def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
                     # but treat as exit_code=-1 so we still surface it).
                     pending.pop(lane_idx, None)
                     completed[lane_idx] = (pid, -1)
+                    if gate is not None:
+                        gate.note_release(lane_idx)
                     continue
                 if result_pid == 0:
                     continue  # still running
@@ -205,7 +281,7 @@ def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
                 # Early abort: SIGTERM remaining children, give them a
                 # short grace period to flush their status files, then
                 # SIGKILL stragglers so the workdir cleanup can run.
-                _abort_remaining(pending, completed, _reap)
+                _abort_remaining(pending, completed, _reap, aborted_lanes)
                 break
             if pending:
                 time.sleep(0.1)
@@ -215,6 +291,8 @@ def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
                 f"Parallel trace fork failed (rank={parent_rank}): {first_failure}"
             )
     finally:
+        if gate is not None:
+            gate.close()
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -231,6 +309,7 @@ def _abort_remaining(
     pending: dict[int, int],
     completed: dict[int, tuple[int, int]],
     reap: Callable[[int, int, int], None],
+    aborted_lanes: set[int],
 ) -> None:
     """Kill the still-running lane children after another lane failed.
 
@@ -238,8 +317,18 @@ def _abort_remaining(
     their status files, then SIGKILLs stragglers. Reaps every PID
     via the supplied ``reap`` callback so the parent doesn't leave
     zombies behind. Mutates ``pending`` in place.
+
+    Every lane it signals is recorded in ``aborted_lanes`` **before** the
+    signal is sent, so the reaper can tell our own teardown apart from an
+    external kill. Recording after signalling would leave a window in which
+    a child we just SIGKILLed is reaped and mis-reported as an OOM victim.
+
+    Admission slots need no explicit release here: each is owned by the
+    child's inherited descriptor and the kernel drops it when the child
+    dies, which is exactly what SIGTERM and SIGKILL cause.
     """
     for lane_idx, pid in list(pending.items()):
+        aborted_lanes.add(lane_idx)
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -285,6 +374,427 @@ def _partition_round_robin(items: list, n: int) -> list[list]:
     for i, item in enumerate(items):
         lanes[i % n].append(item)
     return lanes
+
+
+# ---------------------------------------------------------------------------
+# Cross-process admission gate
+# ---------------------------------------------------------------------------
+
+_ADMIT_POLL_INTERVAL_S = 0.25
+"""How often a waiting rank re-scans the slot table. Each scan is at most
+``cap`` non-blocking ``flock`` calls on already-created files, so this is
+cheap; it is short relative to a trace so a freed slot is picked up
+promptly."""
+
+_ADMIT_HEARTBEAT_S = 30.0
+"""How often a waiting rank logs that it is *waiting* rather than hung.
+Without this line a staged trace and a deadlocked one look identical in the
+log, which is the whole hazard the bounded wait exists to remove."""
+
+
+class TracerAdmissionTimeout(RuntimeError):
+    """A rank could not obtain a tracer slot before its deadline.
+
+    Raised instead of waiting forever. An unbounded wait is not a safe
+    default here: it converts a loud, well-attributed host-RAM OOM into a
+    silent hang, and neither of the two timeouts that look like they would
+    catch it actually does. ``VLLM_NEURON_BARRIER_TIMEOUT`` bounds the
+    *post*-trace rendezvous, which is downstream of ``parallel_trace``
+    returning, and a ``MemAvailable`` watchdog sees a **healthy** host during
+    a staging stall precisely because everybody is waiting instead of
+    tracing.
+    """
+
+
+class _TracerAdmissionGate:
+    """Caps concurrently live trace children across all ranks on a host.
+
+    Mechanism: a directory of ``cap`` zero-length lock files, one per slot,
+    each guarded by an exclusive non-blocking ``flock``. A rank acquires a
+    slot immediately before it forks a lane child, and the child inherits the
+    descriptor. Admission is therefore taken *before* the memory is spent,
+    which is the only ordering that bounds peak host demand.
+
+    Why ``flock`` and not a semaphore — this is requirement R-41(a).
+    A POSIX named semaphore, a ``multiprocessing`` semaphore, or any
+    counter the holder must decrement itself is **not** crash-safe: a
+    ``SIGKILL``\\ ed holder runs no handler, posts nothing, and its slot is
+    lost forever. Losing slots is strictly worse than the OOM this gate
+    prevents, because the pool then *deadlocks* instead of failing loudly.
+    ``flock`` locks are owned by the **open file description**, so the kernel
+    drops them when the last descriptor closes — including on ``SIGKILL``,
+    ``os._exit``, an OOM kill, or a segfault. No handler, no cleanup pass and
+    no stale-lock reclamation is involved, so there is no code path that can
+    fail to release.
+
+    Who holds a slot, and why the parent lets go. The parent acquires, forks,
+    and then **closes its own descriptor** (``hand_to_child``), leaving the
+    child as sole owner. Two things follow, and both matter:
+
+    * A child's slot is released by the kernel the instant the child dies,
+      whether or not the parent has reaped it yet.
+    * A parent blocked in ``acquire`` for a later lane does not pin the slots
+      of its earlier lanes. If the parent held them, a rank that got 3 of the
+      4 slots it needs would sit in ``acquire`` — never reaching its reap
+      loop, never releasing — and with every rank in that state the pool
+      would deadlock at any cap below the total demand. Handing ownership to
+      the child removes that failure mode by construction rather than by
+      adding opportunistic reaping to the wait loop.
+
+    Releasing uses ``os.close`` and **never** ``flock(LOCK_UN)``: an explicit
+    unlock on *any* descriptor sharing the open file description releases the
+    lock for the forked child too, which would readmit a tracer while the
+    killed-or-still-running one still holds its RAM. Closing one duplicate
+    only drops that one reference.
+
+    Slot files are safe to reuse across runs. A stale file carries no stale
+    lock, because the lock died with the process that held it.
+
+    Known limitation, stated rather than assumed: ``flock`` is reliable on
+    local filesystems and is **not** dependable over NFS, so the slot
+    directory is rooted on the same local storage the compile cache uses.
+    The resolved directory is logged on every admission so a configuration
+    that accidentally partitions ranks into two gates is visible in the log
+    rather than silently doubling the cap.
+    """
+
+    def __init__(self, cap: int, timeout_s: int, parent_rank: int) -> None:
+        self._cap = cap
+        self._timeout_s = timeout_s
+        self._parent_rank = parent_rank
+        self._dir = _admit_slots_dir(cap)
+        os.makedirs(self._dir, exist_ok=True)
+        self._held: dict[int, int] = {}  # fd -> slot index
+        self._child_slots: dict[int, int] = {}  # lane_idx -> slot index
+        self._open_failed: set[int] = set()  # slots already warned about
+
+    @classmethod
+    def from_env(cls, parent_rank: int) -> "_TracerAdmissionGate | None":
+        """Build a gate, or return ``None`` when the feature is off.
+
+        ``None`` is the default and it is a *total* no-op: this function
+        returns before reading the timeout key, before touching the
+        filesystem and before logging anything, so with the keys unset
+        nothing in this class is reachable.
+        """
+        cap = envs.VLLM_NEURON_MAX_CONCURRENT_TRACERS
+        if cap <= 0:
+            return None
+        timeout_s = envs.VLLM_NEURON_TRACER_ADMIT_TIMEOUT
+        if timeout_s <= 0:
+            raise ValueError(
+                "VLLM_NEURON_MAX_CONCURRENT_TRACERS is set to "
+                f"{cap} but VLLM_NEURON_TRACER_ADMIT_TIMEOUT is "
+                f"{timeout_s}. The admission gate refuses to run with an "
+                "unbounded wait: a lost slot would hang the trace silently "
+                "instead of failing, and no other timeout in this stack "
+                "covers it (VLLM_NEURON_BARRIER_TIMEOUT applies only after "
+                "trace completes). Set both keys, or neither."
+            )
+        return cls(cap, timeout_s, parent_rank)
+
+    def acquire(self, lane_idx: int) -> int:
+        """Block until a slot is free; return the descriptor that owns it.
+
+        Raises:
+            TracerAdmissionTimeout: if no slot came free within
+                ``VLLM_NEURON_TRACER_ADMIT_TIMEOUT`` seconds. The message
+                carries the configured numbers and a census of the slot
+                table so the stall is attributable without a second run.
+        """
+        t0 = time.monotonic()
+        deadline = t0 + self._timeout_s
+        next_heartbeat = t0 + _ADMIT_HEARTBEAT_S
+        sweeps = 0
+        # Stagger where each (rank, lane) starts scanning so N ranks don't
+        # all contend on slot 0 and serialize their syscalls behind it.
+        start = (self._parent_rank + lane_idx) % self._cap
+        while True:
+            for offset in range(self._cap):
+                slot = (start + offset) % self._cap
+                fd = self._try_slot(slot, lane_idx)
+                if fd is not None:
+                    logger.info(
+                        "Tracer admission granted: rank=%d lane=%d "
+                        "slot=%d/%d waited=%.1fs sweeps=%d dir=%s",
+                        self._parent_rank,
+                        lane_idx,
+                        slot,
+                        self._cap,
+                        time.monotonic() - t0,
+                        sweeps,
+                        self._dir,
+                    )
+                    return fd
+            sweeps += 1
+            now = time.monotonic()
+            if now >= deadline:
+                census = "\n".join(self.census())
+                raise TracerAdmissionTimeout(
+                    f"Tracer admission timed out after "
+                    f"{now - t0:.1f}s (VLLM_NEURON_TRACER_ADMIT_TIMEOUT="
+                    f"{self._timeout_s}) waiting for 1 of "
+                    f"{self._cap} slots (VLLM_NEURON_MAX_CONCURRENT_TRACERS="
+                    f"{self._cap}); rank={self._parent_rank} "
+                    f"lane={lane_idx} sweeps={sweeps} dir={self._dir}\n"
+                    f"slot census (best-effort, sampled after the "
+                    f"deadline):\n{census}"
+                )
+            if now >= next_heartbeat:
+                # R-41(c): make "waiting" distinguishable from "hung".
+                logger.info(
+                    "Tracer admission WAITING (this is staging, not a hang): "
+                    "rank=%d lane=%d waited=%.0fs of %ds cap=%d sweeps=%d "
+                    "dir=%s",
+                    self._parent_rank,
+                    lane_idx,
+                    now - t0,
+                    self._timeout_s,
+                    self._cap,
+                    sweeps,
+                    self._dir,
+                )
+                next_heartbeat = now + _ADMIT_HEARTBEAT_S
+            time.sleep(_ADMIT_POLL_INTERVAL_S)
+
+    def _try_slot(self, slot: int, lane_idx: int) -> int | None:
+        """Try to take ``slot``. Return its fd, or None if already held."""
+        path = os.path.join(self._dir, f"slot{slot}.lock")
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as e:
+            # Warn once per slot, not once per sweep: the wait loop re-scans
+            # every _ADMIT_POLL_INTERVAL_S, so an unopenable slot would
+            # otherwise emit hundreds of identical lines per second and bury
+            # the heartbeat that makes waiting legible. The timeout's census
+            # reports the condition again, once, as `open-failed`.
+            if slot not in self._open_failed:
+                self._open_failed.add(slot)
+                logger.warning(
+                    "Tracer admission cannot open slot file %s: %s. This slot "
+                    "is unusable, so the effective cap is below the configured "
+                    "%d.",
+                    path,
+                    e,
+                    self._cap,
+                )
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        self._held[fd] = slot
+        # Diagnostic breadcrumb only — the flock is the authority. Written
+        # with pwrite so it does not disturb the file offset the forked child
+        # shares with us.
+        self._stamp(fd, lane_idx, os.getpid(), slot, "pre-fork")
+        return fd
+
+    def _stamp(self, fd: int, lane_idx: int, pid: int, slot: int, what: str) -> None:
+        """Overwrite the slot file's diagnostic breadcrumb.
+
+        Truncates first: the post-fork record is shorter than the pre-fork one,
+        and ``pwrite`` alone would leave the tail of the longer record behind,
+        so the census would report a spliced line. ``pwrite`` rather than
+        ``write`` because the forked child shares this descriptor's file
+        offset. A census that samples between the truncate and the write sees a
+        short record, which is why the census is documented as best-effort.
+        """
+        rec = (
+            f"slot={slot} rank={self._parent_rank} lane={lane_idx} "
+            f"{what}_pid={pid} t={time.strftime('%Y-%m-%dT%H:%M:%S')}"
+        )
+        try:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, rec.encode(), 0)
+        except OSError:
+            pass
+
+    def hand_to_child(self, fd: int, lane_idx: int, child_pid: int) -> None:
+        """Make the forked child the sole owner of ``fd``'s slot.
+
+        Records the child pid for the census, then closes the parent's
+        duplicate. After this the slot is released exactly when the child
+        dies, by the kernel, on every death path including ``SIGKILL`` and
+        an OOM kill — see the class docstring for why the parent must not
+        keep holding it.
+        """
+        slot = self._held.pop(fd, -1)
+        self._stamp(fd, lane_idx, child_pid, slot, "child")
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        self._child_slots[lane_idx] = slot
+
+    def note_release(self, lane_idx: int) -> None:
+        """Log that a reaped child's slot is gone. Bookkeeping only.
+
+        The release itself already happened in the kernel when the child
+        died; there is deliberately nothing to undo here, which is what
+        makes the release path impossible to skip.
+        """
+        slot = self._child_slots.pop(lane_idx, None)
+        if slot is not None:
+            logger.info(
+                "Tracer admission slot released by child exit: rank=%d "
+                "lane=%d slot=%d/%d",
+                self._parent_rank,
+                lane_idx,
+                slot,
+                self._cap,
+            )
+
+    def close(self) -> None:
+        """Drop any descriptor this parent still owns (e.g. a failed fork).
+
+        ``os.close`` and never ``flock(LOCK_UN)`` — see the class docstring.
+        """
+        for fd in list(self._held):
+            self._held.pop(fd, None)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def census(self) -> list[str]:
+        """Best-effort snapshot of the slot table, for the abort message.
+
+        Probing whether a slot is free means trying to lock it, so a free
+        slot is briefly locked by this call. That is why the census runs only
+        on the already-failing timeout path and never in the heartbeat: on a
+        healthy poll it would race real acquirers for no benefit. Held slots
+        are never disturbed — the probe simply fails to lock them.
+        """
+        rows: list[str] = []
+        for slot in range(self._cap):
+            path = os.path.join(self._dir, f"slot{slot}.lock")
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            except OSError as e:
+                rows.append(f"  slot{slot}: open-failed ({e})")
+                continue
+            try:
+                note = os.pread(fd, 256, 0).decode("utf-8", "replace").strip()
+            except OSError:
+                note = ""
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                state = "FREE"
+            except OSError:
+                state = "HELD"
+            finally:
+                os.close(fd)
+            rows.append(
+                f"  slot{slot}: {state} last_writer=[{note or '(never taken)'}]"
+            )
+        return rows
+
+
+def _admit_slots_dir(cap: int) -> str:
+    """Directory holding the ``cap`` slot lock files.
+
+    Every rank on the host must resolve the same path or the gate silently
+    partitions into independent gates, so this is derived rather than
+    configured — no third env key. ``VLLM_CACHE_ROOT`` is the natural root:
+    it is already run-scoped and already shared by every rank of one engine,
+    which also keeps concurrent runs and other tenants in separate gates.
+    The uid and the cap are in the name so a different user or a re-run at a
+    different cap cannot inherit a slot table of the wrong size.
+    """
+    root = os.environ.get("VLLM_CACHE_ROOT") or tempfile.gettempdir()
+    return os.path.join(root, f"vllm_neuron_tracer_admit_uid{os.getuid()}_c{cap}")
+
+
+# ---------------------------------------------------------------------------
+# Child death decoding
+# ---------------------------------------------------------------------------
+
+
+def _describe_child_death(status_word: int, pool_initiated: bool) -> tuple[int, str]:
+    """Return ``(exit_code, description)`` for a ``waitpid`` status word.
+
+    ``exit_code`` keeps its historical meaning **exactly** — ``WEXITSTATUS``
+    on a normal exit, ``-1`` on anything else — so the ``exit_code=`` field
+    in the failure message means what it has always meant. The description is
+    purely additive, and it recovers what a ``WIFEXITED``-only decode throws
+    away: the signal number. Without it an OOM kill, a segfault, an abort and
+    this pool's own SIGTERM/SIGKILL of a sibling after a *different* lane
+    failed all render as ``exit_code=-1 status=ERROR err=no status file
+    written``, one message for four unrelated causes.
+
+    ``pool_initiated`` marks the deaths this pool caused itself. Labelling
+    those matters: reporting a self-inflicted SIGKILL as a probable OOM kill
+    would manufacture memory-pressure evidence out of our own teardown, which
+    is worse than the ambiguity being fixed.
+    """
+    if os.WIFEXITED(status_word):
+        code = os.WEXITSTATUS(status_word)
+        return code, f"exited({code})"
+    if os.WIFSIGNALED(status_word):
+        sig = os.WTERMSIG(status_word)
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"SIG{sig}"
+        desc = f"killed by signal {sig} ({name})"
+        if pool_initiated:
+            desc += " [sent by this pool's sibling abort, not an external kill]"
+        if os.WCOREDUMP(status_word):
+            desc += " [core dumped]"
+        return -1, desc
+    if os.WIFSTOPPED(status_word):
+        return -1, f"stopped by signal {os.WSTOPSIG(status_word)} (not reaped)"
+    return -1, f"unrecognized wait status 0x{status_word:04x}"
+
+
+def _warn_on_fatal_signal(
+    lane_idx: int, pid: int, status_word: int, pool_initiated: bool
+) -> None:
+    """Explain a signalled child death, mirroring the compiler path.
+
+    Same shape and the same three signals the shipped ``neuronx-cc`` wrapper
+    already explains in ``compile/backend.py`` (``-9`` SIGKILL/OOM, ``-6``
+    SIGABRT, ``-11`` SEGFAULT). Suppressed for pool-initiated kills, which
+    carry no information about the host.
+    """
+    if pool_initiated or not os.WIFSIGNALED(status_word):
+        return
+    sig = os.WTERMSIG(status_word)
+    if sig == signal.SIGKILL:
+        logger.warning(
+            "Trace lane=%d pid=%d was killed (SIG_KILL) and this pool did not "
+            "send it. An external SIGKILL to a tracing child is "
+            "characteristically the Linux Out Of Memory (OOM) killer "
+            "reclaiming host RAM. Each child carries its own Dynamo / "
+            "torch_xla state, and every rank on this host runs its own pool, "
+            "so peak host demand is the SUM over ranks and not one rank's "
+            "lane count. Consider capping concurrent children across ranks "
+            "with VLLM_NEURON_MAX_CONCURRENT_TRACERS (which requires "
+            "VLLM_NEURON_TRACER_ADMIT_TIMEOUT), lowering "
+            "VLLM_NEURON_PARALLEL_TRACE_WORKERS, or tracing on an instance "
+            "with more memory.",
+            lane_idx,
+            pid,
+        )
+    elif sig == signal.SIGABRT:
+        logger.warning(
+            "Trace lane=%d pid=%d aborted (SIG_ABORT). This is likely an "
+            "unexpected internal condition (a bug) in a native extension "
+            "reached during trace rather than host memory pressure.",
+            lane_idx,
+            pid,
+        )
+    elif sig == signal.SIGSEGV:
+        logger.warning(
+            "Trace lane=%d pid=%d crashed (SEGFAULT). Note that the child "
+            "runs after os.fork() from a fully initialized worker; a "
+            "segfault here is often an inherited native handle being used "
+            "in the child rather than a fault in trace itself.",
+            lane_idx,
+            pid,
+        )
 
 
 # ---------------------------------------------------------------------------

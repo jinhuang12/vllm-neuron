@@ -393,11 +393,29 @@ def moe_cte(
             MoECTEImplementation.shard_on_i_mx_hybrid,
         ]:
             output = output[0, ...]
-        elif is_tensor_update_accumulating:
+        elif (
+            is_tensor_update_accumulating
+            and implementation == MoECTEImplementation.shard_on_block
+        ):
             # Non-MX shard-on-block kernel allocates output as [T, 2, H+E] where E is
             # the number of experts. The extra E columns hold fused expert affinities
             # in shared HBM (compiler cannot return a partial shared_hbm tensor).
             # Trim back to the original hidden dim H.
+            #
+            # F-302: this branch used to key on THE FLAG ALONE (`elif
+            # is_tensor_update_accumulating:`) while its own comment says it is
+            # for the "Non-MX shard-on-block kernel". ``shard_on_i`` is ALSO
+            # non-MX, so it fell in here and `output[:, 0, :H]` was applied to
+            # the plain ``[T, H]`` that kernel returns, raising
+            # ``IndexError: too many indices for tensor of dimension 2``.
+            # Callers dodged the crash by passing
+            # ``is_tensor_update_accumulating=False`` -- which ALSO disabled
+            # accumulation AND the kernel's zero-init, so a token routed to two
+            # experts on one rank kept only the last expert's contribution and
+            # unwritten rows kept the previous execution's data. Keying on the
+            # IMPLEMENTATION, as the ``:390-395`` branch above and ``:342-344``
+            # already do, is what lets ``shard_on_i`` pass ``True`` and
+            # accumulate. ``shard_on_i`` returns ``[T, H]`` and is NOT trimmed.
             H = hidden_states.shape[-1]
             output = output[:, 0, :H]
 

@@ -1,0 +1,106 @@
+{
+  "op": "ld68_witness",
+  "timeout_seconds": 300,
+  "reference": {
+    "expr": "inputs[0].clone()"
+  },
+  "_reference_rationale": "The witness op's numerical contract is IDENTITY PASS-THROUGH of the b2e stream (plan section 15.3 item 1c: 'returns b2e pass-through'). The reference is torch clone \u2014 outside the port package. The instrument value (device_print emission) is deliberately NOT a graded numerics quantity: prints are side effects the comparison venues cannot observe; their proof venue is P-B (transport) and the production leg's FAL-2/W-readings (in-graph delivery). What numerics MUST grade is that wiring the witness cannot perturb the value stream it witnesses: output bitwise-equal to input.",
+  "_tolerance_rationale": "rtol=0, atol=0: identity on int32 is exact by construction; any nonzero tolerance would let a sanitizing witness pass, and a witness that sanitizes (clamps/rounds) the very values it exists to observe is the one defect class this declaration must kill. NEVER widened.",
+  "cases": [
+    {
+      "name": "in_domain_b2e_shape",
+      "simulator": true,
+      "inputs": [
+        {
+          "shape": [
+            11
+          ],
+          "dtype": "int32",
+          "kind": "randint",
+          "low": 0,
+          "high": 4,
+          "seed": 0
+        }
+      ],
+      "kwargs": {
+        "layer_idx": 7,
+        "sentinel_only": false
+      },
+      "tolerances": {
+        "rtol": 0.0,
+        "atol": 0.0
+      }
+    },
+    {
+      "name": "out_of_domain_values_pass_through_unsanitized",
+      "simulator": true,
+      "inputs": [
+        {
+          "shape": [
+            11
+          ],
+          "dtype": "int32",
+          "kind": "randint",
+          "low": -2147483648,
+          "high": 2147483647,
+          "seed": 1
+        }
+      ],
+      "kwargs": {
+        "layer_idx": 0,
+        "sentinel_only": false
+      },
+      "tolerances": {
+        "rtol": 0.0,
+        "atol": 0.0
+      }
+    },
+    {
+      "name": "sentinel_only_variant",
+      "simulator": true,
+      "inputs": [
+        {
+          "shape": [
+            11
+          ],
+          "dtype": "int32",
+          "kind": "randint",
+          "low": 0,
+          "high": 4,
+          "seed": 2
+        }
+      ],
+      "kwargs": {
+        "layer_idx": 42,
+        "sentinel_only": true
+      },
+      "tolerances": {
+        "rtol": 0.0,
+        "atol": 0.0
+      }
+    },
+    {
+      "name": "boundary_all_max_expert",
+      "simulator": true,
+      "inputs": [
+        {
+          "shape": [
+            11
+          ],
+          "dtype": "int32",
+          "kind": "ones",
+          "seed": 3
+        }
+      ],
+      "kwargs": {
+        "layer_idx": 21,
+        "sentinel_only": false
+      },
+      "tolerances": {
+        "rtol": 0.0,
+        "atol": 0.0
+      }
+    }
+  ],
+  "_case_rationale": "in_domain: the production shape s32[11] with values in [0,3]. out_of_domain: the witness must pass through ARBITRARY int32 bit patterns unmodified \u2014 this is the boundary case that matters for THIS op (a garbled device-side stream is exactly what W2 would observe; the witness must never launder it). sentinel_only: the fallback-budget variant (plan section 15.3 item 3) is a distinct traced form and gets its own case. boundary_all_max_expert: constant-valued stream (ones), the degenerate routing case. The out-of-envelope-input->fallback leg is exercised by the gate check (int64 input refuses the kernel), covered in the triad's gate tests, not a numerics case: dtype mismatch is a dispatch fact, not a tolerance fact."
+}

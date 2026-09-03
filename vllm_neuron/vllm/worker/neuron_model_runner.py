@@ -10,6 +10,7 @@ state management.
 import logging
 import math
 import os
+import sys
 import threading
 import time
 from copy import copy, deepcopy
@@ -735,6 +736,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "mtp":
+                # DeepSeek-V4's DSpark block-parallel drafter. It is NOT Eagle3
+                # and NOT upstream's one-extra-layer MTP, but it rides the
+                # Eagle3 aux-hidden-state transport, so ``is_eagle3_spec`` is
+                # set: every one of that flag's consumers -- the aux-layer
+                # handshake, the aux-hidden return handling, the async-schedule
+                # gate and the two drafting paths -- is behavior DSpark needs.
+                # ``DSparkProposer`` subclasses ``EagleProposer`` precisely so
+                # the three ``isinstance`` guards downstream keep holding
+                # unwidened.
+                from vllm_neuron.vllm.spec_decode.dspark import DSparkProposer
+
+                self.is_eagle3_spec = True
+                self.drafter = DSparkProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.rejection_sampler = RejectionSampler()
             else:
                 raise ValueError(
                     f"Unsupported speculative decoding method: {self.speculative_config.method}"
@@ -1274,6 +1292,42 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
         hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+        # LD-43/LD-44 (plan §4 Phase 3, §6): cap the partitioner's per-module
+        # LAYER count, which is the only surface that reaches per-module
+        # INSTRUCTION count — the quantity NCC_ELUR015 rejects on the decode
+        # graph. A SOURCE edit, and it has to be: there is no configuration route
+        # to a compiler flag on this platform. ``compile_options["compiler_args"]``
+        # below is a hardcoded literal list, written once and never mutated; only
+        # ``-O{level}`` varies; ``envs.py`` has no entry and no ``additional_config``
+        # path reaches it. The earlier claim of a "proven" injection point via
+        # ``_apply_platform_compiler_args`` / ``_inject_hlo2tensorizer_opt`` is
+        # REFUTED — those symbols do not carry the flag. Shape copied from the
+        # ``+=`` precedent nine lines below.
+        #
+        # Measured basis, not projected: the partitioner splits BY LAYER COUNT at
+        # the model's own per-layer collectives, and cut the 43-layer decode graph
+        # 3/12/12/16. Per-layer cost is uniform over layers 3-42 (345,628 insts);
+        # layers 0-2 are dense/SWA-only and 5x cheaper. A 12-layer module is
+        # MEASURED to pass at 82.95% of the limit; sg03 holds 16 plus a
+        # 78,320-instruction epilogue, and that is the sole reason it breaches.
+        # ``estimateLayersPerModule: ... cliFlag? 0`` is the firing control that
+        # proves the flag is currently UNSET, and the ``cl`` parser is measured to
+        # ACCEPT it (sibling spellings are measured to be REJECTED).
+        #
+        # N=11 IS A STARTING VALUE, NOT A SETTLED ONE. Re-size it here — 11 -> 8
+        # -> 6 (43/6 ~ 8 modules of 5-6 layers) — against a measurement of the
+        # SPECULATED decode graph, never against 5,608,368. That figure and its
+        # 10.85% reduction come from a plain greedy ``LLM(...)`` smoke with NO
+        # speculative config, and ``decode_token_threshold = 1 +
+        # max_num_draft_tokens`` classifies a 6-token verify step as DECODE at
+        # T = 6 * batch. So 5,608,368 is a LOWER BOUND on the graph this port
+        # ships, not a target. Tunability through this one line is why this rung
+        # was chosen. Fallback through the same line, if N underdelivers:
+        # ``--modular-flow-mac-target`` (the compiler injects 200000000000; a
+        # probe measured 1000000000 accepted). Do NOT conflate that with
+        # ``--modular-flow-mac-threshold`` above, which is a different flag and is
+        # already saturated at 10.
+        hlo2tensorizer_opts += " --layers-per-module=11"
         # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
         # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
         from vllm_neuron.compile.platform import get_platform_target
@@ -1285,13 +1339,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
         if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
             hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+        # Backend (walrus) options, space-separated in ONE list element exactly as
+        # the hlo2tensorizer element below it. neuronx-cc joins this value and
+        # re-splits it on spaces before walrus sees it, and appends it LAST so its
+        # flags override earlier ones (WalrusDriver.py:926-927).
+        #
+        # ``--enable-neff-debug-info=false`` is a DEVIATION from the compiler
+        # default: walrus declares the switch ``cl::init(true), cl::Hidden``
+        # (codegen.cpp:35), so every NEFF carries per-instruction debug protobuf
+        # unless suppressed. On this decode graph that was 12
+        # ``debug_info_backend_*`` members = 1,439,356,142 B, which libnrt
+        # deserializes into a host object graph on load. MEASURED on the preserved
+        # graph.hlo, same input sha, same compiler: the single-process load peak
+        # fell 35.636 GiB -> 22.109 GiB (-37.96%), and 64 ranks of the former needs
+        # 1.25x this host while the latter fits at 22.3% margin. The compressed NEFF
+        # fell 614,947,873 -> 228,613,320 B with the ``.bin`` instruction stream
+        # byte-identical, so nothing but debug info was removed.
+        #
+        # NOT a complete removal, and deliberately recorded as such: the 10
+        # ``debug_info_asm_*`` members (249,911,071 B) come from a second producer
+        # this switch does not gate and they survive. See F-331.
+        #
+        # Set VLLM_NEURON_NEFF_DEBUG_INFO=1 to keep debug info for neuron-profile
+        # instruction-to-source mapping; production serving does not need it.
+        backend_opts = "--enable-verifier=false"
+        if not envs.VLLM_NEURON_NEFF_DEBUG_INFO:
+            backend_opts += " --enable-neff-debug-info=false"
         # vLLM optimization levels map 1:1 onto neuronx-cc optlevels (CHRS-721).
         self.compile_options["compiler_args"] = [
             "--auto-cast=none",
             "--verbose=35",
             f"-O{self.vllm_config.optimization_level.value}",
             f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
-            "--internal-backend-options=--enable-verifier=false",
+            f"--internal-backend-options={backend_opts}",
         ]
         logger.info(
             "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
@@ -4152,10 +4232,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     num_reqs, dtype=torch.int32, device=device
                 )
 
+            # Block IDs the KV cache actually owns. The block-table seq dims
+            # above are sized from a *token* budget (``max_model_len`` or a ctx
+            # bucket) and are unrelated to how many blocks were allocated: at
+            # ``max_model_len=65536`` with ``block_size=32`` the table is 2048
+            # wide while the cache holds ``num_blocks=1024``, so unwrapped
+            # sequential IDs 1024..2047 address past the end of the cache. The
+            # consumer gather in
+            # ``functional/attention/attention_segmented_cte.py``
+            # (``bt = block_tables[0].clamp_min(0)`` then ``k_cache[bt]``)
+            # bounds only the LOWER end, so nothing downstream catches it and
+            # the device raises "scatter/gather (indirect memory copy via
+            # vector DGE) out-of-bound access". At runtime the IDs come from the
+            # allocator and are in range by construction; only warmup fabricates
+            # IDs it does not own, so the bound belongs here at the producer.
+            # Wrapping changes VALUES ONLY - every traced shape, and therefore
+            # every compile-cache key, is unchanged.
+            num_kv_blocks = self.kv_cache_config.num_blocks
             # Dummy block_table_tensor: [num_reqs, max_num_blocks_per_req]
             # Use sequential block IDs starting from 0
             block_table_tensor = (
-                torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                (
+                    torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                    % num_kv_blocks
+                )
                 .unsqueeze(0)
                 .expand(num_reqs, -1)
                 .contiguous()
@@ -4166,7 +4266,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # (which needs to compute slot indices into the full KV cache)
             # traces a shape consistent with runtime.
             full_block_table_tensor = (
-                torch.arange(full_max_blocks_per_req, dtype=torch.int32)
+                (
+                    torch.arange(full_max_blocks_per_req, dtype=torch.int32)
+                    % num_kv_blocks
+                )
                 .unsqueeze(0)
                 .expand(num_reqs, -1)
                 .contiguous()
@@ -4429,8 +4532,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
         model_output = self.model(**warmup_kwargs)
-        if self.use_async_scheduling:
-            self._materialize_warmup_output(model_output)
+        # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
+        self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
@@ -4790,8 +4893,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 )
             )
         model_output = self.model(**kwargs)
-        if self.use_async_scheduling:
-            self._materialize_warmup_output(model_output)
+        # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
+        self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
@@ -4833,8 +4936,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     )
                 )
             model_output = self.model(**kwargs)
-            if self.use_async_scheduling:
-                self._materialize_warmup_output(model_output)
+            # ep18/iter13 NON-CURATIVE attribution instrument: readback always runs.
+            self._materialize_warmup_output(model_output)
             if self._tensor_replacer is not None:
                 set_active_context(None)
             compile_elapsed = time.perf_counter() - compile_start

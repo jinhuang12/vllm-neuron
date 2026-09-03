@@ -1,0 +1,32 @@
+{
+  "op": "mla_decode_tkg",
+  "_triad": "LD-75 (port-plan §19.2 Amendment 11; port-assessment §17.4). Committed BEFORE the kernel per the node contract; prereg TRIADS-Z0-PREREGISTRATION.md §D5/§D6 sha 5f5006b9b104fe7729c6482aef7e0124c1d59d7706403c29deec7dfdcd3fbdae (sealed 2026-08-31 before any edit).",
+  "timeout_seconds": 1800,
+  "reference": {
+    "callable": "numerics.mla_decode_tkg_reference:mla_decode_tkg_reference",
+    "_why": "Plain torch, outside the port package (the harness refuses a reference resolving inside vllm_neuron). Written directly against dsv4_ref/kernel.py:328-350 math (explicit max/exp/sum/divide, sink in the denominator only) while the triad's fallback goes through the family-19 gather-helper composition — two independent spellings of the declared math."
+  },
+  "_tolerance_derivation": "Out dtype bf16 (8-bit mantissa): faithful rounding contributes <=2^-8 relative per leg; the two legs (kernel-simulator vs torch fallback) round independently on top of fp32 accumulation-order differences (<= O(eps_f32*S) ~ 2^-18 relative at S<=16 here, S<=640 at family shapes) -> combined bound < 2^-7 relative. rtol = 2^-7 = 0.0078125 (block_fp8_linear precedent). Attention outputs are convex combinations and can sit near zero where a relative test is meaningless: for |out| < 2^-2 one bf16 ULP is <= 2^-2 * 2^-8 = 2^-10 absolute -> atol = 2^-10 = 0.0009765625 admits <=1-ULP flips there and nothing more. Fixed in the sealed prereg BEFORE any measurement; never widened (a post-hoc widening would turn the fallback into a lying discriminator for the accuracy loop).",
+  "_domain_notes": "positions/context_lens omitted -> the op's warm-cache branch (mla_decode.py:289-298 at 88b34e7): plain arange addresses the whole window, all valid. topk_indices omitted with compress_ratio=0 -> dense pool scan (mla_decode.py:503-512): comp_idx = arange(span), all valid, no causal cap. 3-D contiguous caches [B, slots, 512]; no scale caches (plain bf16 storage branch); no current-row operands -> no cache write.",
+  "_uncovered_by_harness": "The harness passes tensors positionally and scalars via kwargs only; tensor keyword args are inexpressible. Therefore NOT covered here and graded instead by the committed probe numerics/probe_mla_decode_tkg_supplementary.py (which reads rtol/atol FROM this declaration): 4-D paged fp8 caches with block tables, ue8m0 scale caches, current-row provenance merge, the in-kernel must-alias cache write (bitwise byte compare), sink (a tensor in positional slot 5, unreachable past the scalar slot 4), ratio>0 causal caps incl. the ratio-128 in-flight compressed case (C128 F-240 bound carried to this rung), swa_pos_offset, and the [B,1]-PAD-topk SWA-only decode form. A recorded harness-vocabulary limit, never an absorbed one (block_fp8 precedent).",
+  "cases": [
+    {
+      "name": "d1-swa-warm",
+      "_role": "Core gather + one-softmax math over [window ++ dense-pool], warm-cache window branch, sink-less denominator, bf16 no-dequant storage branch, 3-D contiguous addressing.",
+      "simulator": true,
+      "_simulator_note": "Small dims (B=4, H=2, 16 gathered rows/token): the numpy simulator should complete well inside the timeout. If the deployed simulator rejects an ISA op used by the kernel, the harness records UNCOVERED loudly - never a pass - and the same comparison is carried by the probe legs plus the compile_nki venue (prereg P3/P4).",
+      "inputs": [
+        {"shape": [4, 2, 512], "dtype": "bfloat16", "kind": "randn", "seed": 101},
+        {"shape": [4, 8, 512], "dtype": "bfloat16", "kind": "randn", "seed": 102},
+        {"shape": [4, 8, 512], "dtype": "bfloat16", "kind": "randn", "seed": 103}
+      ],
+      "kwargs": {
+        "scale": 0.044194173824159216,
+        "sink": null,
+        "window": 8,
+        "compress_ratio": 0
+      },
+      "tolerances": {"rtol": 0.0078125, "atol": 0.0009765625}
+    }
+  ]
+}

@@ -122,7 +122,28 @@ def topk(
 
     # Convert indices to match global_indices dtype for gather
     global_max_local_index = global_max_local_index.to(dtype=global_indices.dtype)
-    final_indices = torch.gather(global_indices, dim, global_max_local_index)
+
+    # --- ep18/FP-70 tail-gather index sanitize (LD-73/FP-69 clamp-plus-collapse
+    # idiom at the distributed-topk/sampling tail; aws-neuron-sdk#1335 family).
+    # The step-3 index can be kernel-derived (rotational_topk emits raw u32,
+    # sentinel-capable) and previously fed torch.gather unsanitized ->
+    # vector-DGE out-of-bound access on device. The gather is keyed ONLY by
+    # the sanitized index; invalid slots collapse to -inf values (so
+    # downstream sampling never selects a fabricated candidate) and index 0.
+    # MASKS DEFECT EXPRESSION ONLY (F-224): no health claim; parity v3r1
+    # remains the untouched arbiter. ---
+    W = global_indices.shape[dim]
+    valid = (global_max_local_index >= 0) & (global_max_local_index < W)
+    safe_index = torch.clamp(
+        torch.where(
+            valid, global_max_local_index, torch.zeros_like(global_max_local_index)
+        ),
+        0,
+        W - 1,
+    )
+    final_indices = torch.gather(global_indices, dim, safe_index)
+    values = torch.where(valid, values, torch.full_like(values, float("-inf")))
+    final_indices = torch.where(valid, final_indices, torch.zeros_like(final_indices))
 
     return values, final_indices
 
@@ -224,7 +245,21 @@ def batch_sharded_topk(
         values, final_local_idx = _topk_nki(global_values, k, dim)
     else:
         values, final_local_idx = _topk_torch(global_values, k, dim)
-    final_indices = torch.gather(global_indices, dim, final_local_idx.to(torch.int32))
+    # ep18/FP-70 tail-gather index sanitize -- same clamp-plus-collapse idiom
+    # as the sharded ``topk()`` step-3 gather above (see the comment there;
+    # F-224 honesty bound applies: masks defect expression only, no health
+    # claim; parity v3r1 remains the arbiter).
+    final_local_idx = final_local_idx.to(torch.int32)
+    W = global_indices.shape[dim]
+    valid = (final_local_idx >= 0) & (final_local_idx < W)
+    safe_index = torch.clamp(
+        torch.where(valid, final_local_idx, torch.zeros_like(final_local_idx)),
+        0,
+        W - 1,
+    )
+    final_indices = torch.gather(global_indices, dim, safe_index)
+    values = torch.where(valid, values, torch.full_like(values, float("-inf")))
+    final_indices = torch.where(valid, final_indices, torch.zeros_like(final_indices))
 
     return values, final_indices
 
@@ -374,6 +409,25 @@ def _topk_nki(tensor: Tensor, k: int, dim: int) -> tuple[Tensor, Tensor]:
     leading_shape = tensor.shape[:-1]
     inp2d = tensor.reshape(-1, vocab_size)
     n_rows = inp2d.shape[0]
+
+    # --- ep18/LD-71 single-row dispatch gate (F-223, F-227) ----------------
+    # At BxS == 1 the vendor config factory silently downgrades to a
+    # single-program plan (``rotational_topk_utils.py:209-212``) while the
+    # kernel body asserts the two-program shape, and at the deployed compiler
+    # pin the LNC-2 lowering then silently ERASES the kernel on core 1
+    # ("skip lowering", TranslateNKIASTToBIR), leaving producer-less
+    # consumers whose never-written indices feed ``oob_is_err`` DMA and
+    # present as an all-core NRT_TIMEOUT (F-223, ep18 ITER-63..67).
+    # Dispatch the single-row case to the numerically matched torch
+    # composition instead of launching ``topk_kernel[config.n_prgs]``.
+    # DEPLOYED-PIN WORKAROUND, NOT A FIX (F-227): the vendor defect class is
+    # unchanged, and mitigating it claims at most servability — parity
+    # against the recorded standard stays the arbiter of health (F-224).
+    # Both single-row sampling stages ([1, 2020] and [1, 16384]) take this
+    # branch; the multi-row (router) path below is untouched.
+    if n_rows == 1:
+        return _topk_torch(tensor, k, dim)
+    # --- end ep18/LD-71 gate ------------------------------------------------
 
     nki_dtype = getattr(nl, torch_to_nki_dtype(inp2d.dtype))
     config = _get_rotational_topk_config(n_rows, vocab_size, k, nki_dtype)

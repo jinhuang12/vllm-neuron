@@ -36,9 +36,17 @@ def _can_use_kernel(
     if not can_run_kernel(inp):
         return False
 
-    # TODO: validate MXFP8 with MoE kernel, then auto-enable
     if expert_down_weights.dtype == torch.uint16:
         return True  # MXFP4 does not have a torch flow currently, always try kernel.
+
+    # MXFP8 (uint32) needs NO widening here: it is not rejected above, so it
+    # falls through to the shape checks below and this gate already returns
+    # True for it. The removed "TODO: validate MXFP8 with MoE kernel, then
+    # auto-enable" comment implied otherwise and was misleading. What DOES
+    # limit MXFP8 is the kernel, not the gate, and it differs per op --
+    # ``nkilib.core.moe.moe_tkg`` asserts MX requires gen4+ (Trn3+) while
+    # ``nkilib.core.moe_block.moe_block_tkg``, which this op dispatches into,
+    # carries no such assertion.
 
     if inp.dim() == 3:
         B, S, H = inp.shape
