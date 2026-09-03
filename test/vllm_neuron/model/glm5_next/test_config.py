@@ -342,13 +342,20 @@ def test_no_weights_are_referenced_by_the_fixture(raw):
 # `inc-glm53f-080` acceptance -- WP1/WP7 repair.
 #
 # THE DEFECT, in one sentence: the real text config carries 58 keys, the fork's
-# dataclass modelled 30 of them, and the adapter dropped the other 28 without a
-# word -- one of the dropped keys was the model's own RMSNorm epsilon.
+# dataclass modelled only some of them, and the adapter dropped every other key
+# without a word -- one of the dropped keys was the model's own RMSNorm epsilon.
+#
+# THE MODELLED AND DROPPED COUNTS ARE NOT WRITTEN IN THIS PROSE, since
+# `inc-glm53f-033` repair round 2. They used to be, as "modelled 30 ... dropped
+# the other 28", which cannot be right about both halves at once next to a pinned
+# count of 26: 58 minus 30 is 28. Conjunct (c) below DERIVES the dropped set from
+# the vendor config and the dataclass, so the count has one home and this prose
+# is not a second one.
 #
 # FOUR counted conjuncts, ONE item each, no `parametrize` (plan section 6 rule
 # 6). Every expected value is DERIVED here from the two pinned fixtures; the
-# plan's own figures are pinned as constants beside the derivation, so the two
-# cannot drift apart silently.
+# figures pinned as constants beside the derivation are named for what they are,
+# so the two cannot drift apart silently.
 # ===========================================================================
 
 # `inc-glm53f-078` lands this byte-identical copy of the vendor config and pins
@@ -357,12 +364,29 @@ def test_no_weights_are_referenced_by_the_fixture(raw):
 REAL_CONFIG_PATH = FIXTURE_PATH.parent / "hf-config.json"
 REAL_CONFIG_SHA256 = "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f"
 
-# The plan's declared figures for this block.
+# Four of the five figures below are READINGS OF THE VENDOR CONFIG: the key
+# count, the two layer-list lengths and the quantisation-config key count are
+# facts about `hf-config.json` and move only if the checkpoint does.
 C080_REAL_TEXT_KEYS = 58
-C080_DROPPED_KEYS = 26
 C080_KDA_LAYERS = 34
 C080_FULL_ATTN_LAYERS = 11
 C080_QUANT_CONFIG_KEYS = 4
+
+# THE FIFTH IS DIFFERENT, AND THE COMMENT SAYING OTHERWISE WAS WRONG. This is
+# THIS FILE's reading of the COMPLEMENT -- the vendor's keys that
+# `Glm5NextTextConfig` does not declare -- so it moves whenever the dataclass
+# models one more of the checkpoint's keys. It is NOT a figure the plan declares:
+# the plan's `-080` row registers that the adapter "lifts the checkpoint's
+# `rms_norm_eps` and names every key it drops", and carries no dropped-key count
+# at all. Conjunct (c) derives the set and this constant pins the count beside the
+# derivation, which is the only reason to keep it.
+#
+# 26 -> 25 AT `inc-glm53f-033` REPAIR ROUND 2, BECAUSE THAT ROUND MODELLED ONE
+# MORE KEY: it added `swiglu_limit` to `Glm5NextTextConfig`, the bound the
+# checkpoint clamps both shared-expert projections with. 58 real keys, 33 modelled
+# after the lift, 25 dropped -- and `swiglu_limit` is now absent from the log,
+# which conjunct (c) asserts BY NAME.
+C080_DROPPED_KEYS = 25
 
 # The checkpoint's two epsilons. They are DIFFERENT numbers, which is the whole
 # point of the repair: one field cannot carry both.
@@ -517,6 +541,14 @@ def test_c080_c_the_filter_names_every_key_it_drops():
 
     Non-vacuity (D1.5): the set must be NON-EMPTY, so a log that named nothing
     fails this item.
+
+    TWO KEYS ARE ASSERTED BY NAME, one per repair that modelled them:
+    `rms_norm_eps` (`inc-glm53f-080`, this block's own) and `swiglu_limit`
+    (`inc-glm53f-033` repair round 2, the SwiGLU bound the shared expert clamps
+    with). Both must be declared fields and neither may appear in the log. The
+    by-name half matters because the count alone cannot say WHICH key left: a
+    dataclass that dropped one field and added another would keep the count and
+    break the model.
     """
     real = _real_text_config()
     field_names = {f.name for f in fields(Glm5NextTextConfig)}
@@ -535,11 +567,23 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     assert len(warnings) == 1, f"expected one drop-log record, got {len(warnings)}"
     logged = sorted(warnings[0].args[-1].split(", "))
 
+    # The two keys asserted by name, printed as a set difference against the
+    # vendor's own key list so a reader sees the population each claim is made
+    # over, not just the verdict.
+    lifted = ("rms_norm_eps", "swiglu_limit")
+    in_vendor = sorted(k for k in lifted if k in real)
+    in_fields = sorted(k for k in lifted if k in field_names)
+    in_log = sorted(k for k in lifted if k in logged)
+
     print(f"\n[C080-c] logged {len(logged)} dropped keys={logged}")
     print(f"[C080-c] expected {len(expected)} dropped keys={expected}")
     print(f"[C080-c] message={warnings[0].getMessage()}")
     print(f"[C080-c] remap consumed={sorted(remapped)}")
     print(f"[C080-c] built torch_dtype={built.torch_dtype}")
+    print(f"[C080-c] vendor text_config keys={len(real)}")
+    print(f"[C080-c] lifted keys the vendor declares={in_vendor}")
+    print(f"[C080-c] lifted keys the dataclass models={in_fields}")
+    print(f"[C080-c] lifted keys still in the drop log={in_log}")
 
     assert logged == expected
     assert len(logged) == C080_DROPPED_KEYS
@@ -548,9 +592,23 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     # the log: the value landed on the dataclass field.
     assert str(built.torch_dtype) == "torch.bfloat16"
     assert "dtype" not in logged
-    # And the key this block adds is no longer dropped.
+    # The two lifted keys: the vendor declares both, the dataclass models both,
+    # and neither is dropped. `rms_norm_eps` is this block's own repair;
+    # `swiglu_limit` is `inc-glm53f-033` repair round 2's, and it is the reason
+    # the count above reads 25 rather than 26.
+    assert in_vendor == sorted(lifted), (
+        f"the vendor config does not declare {sorted(set(lifted) - set(in_vendor))}, "
+        f"so this claim would be about a key the checkpoint never had"
+    )
+    assert in_fields == sorted(lifted)
+    assert in_log == []
     assert "rms_norm_eps" not in logged
     assert "rms_norm_eps" in field_names
+    assert "swiglu_limit" not in logged
+    assert "swiglu_limit" in field_names
+    # And the count really is the complement's size, recomputed from the two
+    # sides rather than trusted from the constant.
+    assert len(logged) == len(real) - len(set(real) & (field_names | remapped))
 
 
 def test_c080_d_the_seam_receives_the_config_epsilon(raw, cfg, monkeypatch):

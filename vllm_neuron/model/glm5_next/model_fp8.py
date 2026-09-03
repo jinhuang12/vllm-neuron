@@ -1284,19 +1284,39 @@ class Glm5NextSharedExperts(nn.Module):
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
         self.num_shared_experts = int(text_config.n_shared_experts)
+        # The checkpoint's SwiGLU bound, resolved HERE and not at the call.
+        # ``inc-glm53f-033`` repair round 2. The reference clamps both MLP
+        # projections with this value before their product
+        # (``modeling_glm5_next.py:102-104``), so the bound is a model value like
+        # any other and belongs on the object the config builds. This is the same
+        # construction-time read ``inc-glm53f-080`` made for the decoder's
+        # epsilon in ``Glm5NextKDAAttention.__init__``, on the same kind of
+        # scalar, one line below the read this method already made for
+        # ``n_shared_experts``.
+        self.swiglu_limit = float(text_config.swiglu_limit)
         _declare_parameters(
             self, "gate_proj_weight", "up_proj_weight", "down_proj_weight"
         )
 
     # ── shared-expert path -- D14 owner: ``inc-glm53f-033`` ───────────────
     #
-    # SCOPE. This section adds ONE method and edits no line above or below it.
-    # ``__init__`` above is ``inc-glm53f-013``'s landed code and ``forward``
-    # below is ``-013``'s stub; both stay byte-identical, so nothing any landed
-    # acceptance asserts can move. The residual add lives on
-    # ``Glm5NextMoEBlock`` -- this increment's second section -- because adding
-    # the routed and shared halves needs both children and neither child owns
-    # the other.
+    # SCOPE. This section adds ONE method, and ``forward`` below is ``-013``'s
+    # stub and stays byte-identical.
+    #
+    # ``__init__`` ABOVE IS NO LONGER BYTE-IDENTICAL, and the reason is recorded
+    # rather than left to a diff. Round 1 of this increment's repair made the
+    # SwiGLU bound a required argument of the two methods below, because
+    # ``Glm5NextTextConfig`` did not model ``swiglu_limit`` at all and there was
+    # no config value to read. Round 2 lifted the field
+    # (``config.py``'s ``swiglu_limit``), so the bound now has a home on the
+    # config, and the lead's round-2 bound directs it to be read where the object
+    # is built. One line was added to ``__init__`` and nothing in it was changed,
+    # so no landed reading of the three declared parameters or of
+    # ``num_shared_experts`` can move.
+    #
+    # The residual add lives on ``Glm5NextMoEBlock`` -- this increment's second
+    # section -- because adding the routed and shared halves needs both children
+    # and neither child owns the other.
     #
     # THE COUNT IS 3, AND IT IS WHY THE STRUCTURE BELOW IS THREE CALLS. The
     # route predicate (plan L934-935, revision 33) reads ``-026``'s dispatch
@@ -1320,13 +1340,21 @@ class Glm5NextSharedExperts(nn.Module):
     # scale-grid concatenation this increment may not author, and it would read
     # 2 rather than the declared 3.
     #
-    # WHY THE WEIGHTS, SCALES AND CONFIG ARE ARGUMENTS -- ``-027``'s measured
-    # shape contract (``increments/evidence-027.md`` §2.3), inherited rather
-    # than re-litigated. ``-013``'s ``__init__`` declares the three projections
-    # by ``register_parameter(name, None)`` and NO scale parameter, and retains
-    # no config. Producing the block scales is the weight loader's step, not
-    # this section's, so everything this site consumes is threaded in at the
-    # call -- ``-032``'s and ``-027``'s precedent for the config argument.
+    # WHY THE WEIGHTS AND SCALES ARE ARGUMENTS -- ``-027``'s measured shape
+    # contract (``increments/evidence-027.md`` §2.3), inherited rather than
+    # re-litigated. ``-013``'s ``__init__`` declares the three projections by
+    # ``register_parameter(name, None)`` and NO scale parameter. Producing the
+    # block scales is the weight loader's step, not this section's, so every
+    # WEIGHT-LOADER PRODUCT this site consumes is threaded in at the call --
+    # ``-032``'s and ``-027``'s precedent for the quant-config argument.
+    #
+    # THE SWIGLU BOUND IS NOT ONE OF THOSE, and the distinction is the whole
+    # reason it moved in round 2. A block scale is produced per checkpoint load
+    # by the weight loader; ``swiglu_limit`` is a scalar the checkpoint declares
+    # and the config models, exactly like ``n_shared_experts`` one line up and
+    # like ``rms_norm_eps`` on the KDA attention. Model scalars resolve at
+    # construction, weight-loader products arrive at the call, and the two rules
+    # do not compete.
     #
     # THE SCALE OPERAND IS THE PUBLIC GRID, SO NEITHER ``to_kernel_scale_layout``
     # IS IMPORTED HERE. The campaign carries two helpers of that name at
@@ -1351,13 +1379,13 @@ class Glm5NextSharedExperts(nn.Module):
         up_proj_scale: torch.Tensor,
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
-        swiglu_limit: float,
     ) -> torch.Tensor:
         """Run the always-on shared expert through ``-026``'s dense block GEMM.
 
         The SwiGLU the checkpoint stores, **and it clamps both projections before
         the product**: ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where
-        ``L`` is the checkpoint's ``swiglu_limit``. Each of the three projections
+        ``L`` is ``self.swiglu_limit``, the checkpoint's own bound resolved from
+        the config when this object was built. Each of the three projections
         is a separate entry into
         :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`.
 
@@ -1381,15 +1409,15 @@ class Glm5NextSharedExperts(nn.Module):
             down_proj_scale: ``[I//256, H//256]`` fp32, for ``down_proj_weight``.
             quant_config: the resolved per-model quantisation policy, and the
                 route selector; see the section note above.
-            swiglu_limit: the checkpoint's ``swiglu_limit`` -- the bound the
-                reference applies to BOTH projections before the product. **It
-                carries no default on purpose.** A default here would be a
-                literal in the fork governing a checkpoint value, which is half
-                of the defect ``B22-M1-shared-expert-swiglu-clamp-omitted``
-                names, so a caller that has not resolved the checkpoint's value
-                fails at the call instead of computing a plausible wrong number.
-                Threaded in at the call for the same reason every other operand
-                is; see the section note above and the repair note below.
+
+        The SwiGLU bound is NOT an argument. It is ``self.swiglu_limit``,
+        resolved from ``text_config.swiglu_limit`` in ``__init__``, so this method
+        cannot be called with a bound that is not the one the checkpoint declared
+        for this model. Round 1 of the ``B22-M1`` repair did pass it in, because
+        the config did not model the key yet; round 2 lifted the field and moved
+        the read to construction. **No literal bound appears on this path**, which
+        is the half of ``B22-M1-shared-expert-swiglu-clamp-omitted`` that asked
+        for the value to come from the checkpoint.
 
         Returns:
             ``[T, H]`` **fp32** -- the seam's own return dtype, not re-cast here.
@@ -1470,7 +1498,7 @@ class Glm5NextSharedExperts(nn.Module):
         # ENTRY 2 of 3 -- up.
         up = blockwise_fp8_mm(hidden_states, up_proj_weight, up_proj_scale)
 
-        # ---- THE CHECKPOINT'S TWO CLAMPS. `B22-M1`, repair round 1. -------- #
+        # ---- THE CHECKPOINT'S TWO CLAMPS. `B22-M1`, rounds 1 and 2. -------- #
         # WHAT WAS WRONG. This step read `activated = silu(gate) * up`, with no
         # clamp, so it computed a DIFFERENT FUNCTION from the one the checkpoint
         # stores. The correctness reference this campaign declares -- transformers
@@ -1497,25 +1525,17 @@ class Glm5NextSharedExperts(nn.Module):
         # layers, silently: no shape moves, nothing raises, and the route counter
         # still reads `nki_dispatch=3, torch_fallback=0`.
         #
-        # WHY THE BOUND IS AN ARGUMENT AND NOT READ OFF `self`. `-013`'s
-        # `__init__` retains no config (the section note above states this and
-        # `-027` measured it), so everything this site consumes is threaded in at
-        # the call. The bound is the checkpoint's `text_config.swiglu_limit`,
-        # published as `10.0`.
-        #
-        # AND THE CONFIG LIFT THAT WOULD LET A PRODUCTION CALLER RESOLVE IT IS
-        # BLOCKED, which is stated here rather than left for the next reader to
-        # rediscover. `Glm5NextTextConfig` does not model the key, so the
-        # adapter's counting filter drops it; adding the field moves `-080`'s
-        # landed dropped-key count from 26 to 25, and that 26 is a DECLARED value
-        # pinned in a landed test (`test_config.py:362`, asserted at `:545`) and
-        # recorded as a declared conjunct (`increments/evidence-080.md:128`).
-        # Editing a declared count is not this seat's, so the lift is reported as
-        # `evidence_contradicts_design` and `inc-glm53f-054`, which assembles the
-        # forward, will find this parameter waiting and no config field to fill
-        # it from. See `increments/evidence-033-r1.md`.
-        gate = gate.clamp(min=None, max=swiglu_limit)
-        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        # WHERE THE BOUND COMES FROM. `self.swiglu_limit`, resolved from
+        # `text_config.swiglu_limit` in `__init__`. Round 1 passed it in as a
+        # required argument because `Glm5NextTextConfig` did not model the key at
+        # all; round 2 lifted the field (`config.py`'s `swiglu_limit`, defaulting
+        # to the checkpoint's own `10.0`) and moved the read to construction, so a
+        # production caller resolves nothing and `inc-glm53f-054` will find this
+        # method needing only its operands. Reading it off `self` also removes the
+        # last way a caller could hand this path a bound the checkpoint never
+        # declared. See `increments/evidence-033-r2.md`.
+        gate = gate.clamp(min=None, max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
 
         # The SwiGLU wiring. This is call-site plumbing, not authored numerics:
         # ``silu`` is torch's own, the product is elementwise, and both run in
@@ -1617,7 +1637,6 @@ class Glm5NextMoEBlock(nn.Module):
         up_proj_scale: torch.Tensor,
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
-        swiglu_limit: float,
     ) -> torch.Tensor:
         """``routed_output + shared_expert(hidden_states)`` -- the layer output.
 
@@ -1636,8 +1655,13 @@ class Glm5NextMoEBlock(nn.Module):
             up_proj_scale: as above.
             down_proj_scale: as above.
             quant_config: as above.
-            swiglu_limit: as above -- forwarded verbatim, with no default here
-                either, so the bound cannot enter the layer from this file.
+
+        The SwiGLU bound is not an argument here either, and it is not forwarded.
+        The shared expert this block built holds it
+        (:meth:`Glm5NextSharedExperts.__init__`), so the bound reaches the clamp
+        without passing through this method at all. ``inc-glm53f-033`` repair
+        round 2; round 1 forwarded a required argument because the config did not
+        model the key yet.
 
         Returns:
             ``[T, H]`` fp32 -- the sum, in the shared half's fp32 seam dtype.
@@ -1674,7 +1698,6 @@ class Glm5NextMoEBlock(nn.Module):
             up_proj_scale,
             down_proj_scale,
             quant_config,
-            swiglu_limit,
         )
 
         # Extents compared EXACTLY, before the add. ``torch`` would broadcast a

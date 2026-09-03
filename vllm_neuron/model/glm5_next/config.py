@@ -74,11 +74,23 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
 
     EVERY DROPPED KEY IS NAMED AT ``WARNING`` (``inc-glm53f-080``). The filter
     below keeps only declared fields, and it used to drop the rest without a
-    word: the real checkpoint's ``text_config`` carries 58 keys and this
-    dataclass family models 30 of them, so 26 real keys reached nothing and a
-    reader had no way to learn which. One of them was the model's own
-    ``rms_norm_eps``. The log is the repair, so the next missing field is found
-    by reading a warning rather than by counting fields by hand.
+    word: the real checkpoint's ``text_config`` carries 58 keys, so every key
+    this dataclass family does not declare reached nothing and a reader had no
+    way to learn which. One of them was the model's own ``rms_norm_eps``. The
+    log is the repair, so the next missing field is found by reading a warning
+    rather than by counting fields by hand.
+
+    THE COUNT IS NOT WRITTEN HERE ANY MORE, and that is deliberate. This
+    docstring used to say the family "models 30 of them, so 26 real keys reached
+    nothing", which cannot be right about both halves at once: 58 minus 30 is
+    28. The measured decomposition at ``inc-glm53f-033`` repair round 2 was 33
+    declared fields, 31 of them keys the vendor config also carries, plus the one
+    key the ``dtype`` remap consumes, so the log read 32 modelled and 26 dropped.
+    That round then added ``swiglu_limit`` and the log reads 33 modelled and 25
+    dropped. A count in this prose is a second place to keep the same number, so
+    the number now lives only where it is measured -- the log itself, and
+    ``test_config.py``'s conjunct (c), which derives it from the vendor config
+    and this dataclass rather than restating it.
     """
     if isinstance(hf_sub_config, PretrainedConfig):
         config_dict = hf_sub_config.to_dict()
@@ -108,8 +120,9 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
 
     dropped = sorted(set(config_dict) - field_names - remapped)
     if dropped:
-        # One record, every name in it: a per-key record would put 26 lines in
-        # the log for one config and get filtered out as noise.
+        # One record, every name in it: a per-key record would put one line per
+        # dropped key in the log for one config -- 25 of them for this
+        # checkpoint's text config -- and get filtered out as noise.
         logger.warning(
             "%s models %d of the %d keys in this HF config and DROPS the "
             "other %d: %s",
@@ -177,6 +190,26 @@ class Glm5NextTextConfig:
     scoring_func: str = "sigmoid"
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 2.5
+
+    # -- The SwiGLU bound the checkpoint clamps with ------------------------
+    # ``swiglu_limit`` is the bound the reference applies to BOTH MLP
+    # projections before their product: it clamps ``gate`` from above and
+    # ``up`` on both sides, and only then multiplies
+    # (``modeling_glm5_next.py:102-104``). The checkpoint declares it in
+    # ``text_config`` AND in ``vision_config``, both at ``10.0``, and
+    # ``Glm5NextVisionConfig`` below has carried the field since
+    # ``inc-glm53f-032``; the text config did not, so the counting pass dropped
+    # the key and the shared expert had no checkpoint value to clamp with. That
+    # is the second surface of ``B22-M1-shared-expert-swiglu-clamp-omitted``,
+    # lifted by ``inc-glm53f-033`` repair round 2.
+    #
+    # THE DEFAULT IS THE CHECKPOINT'S OWN, for the same reason
+    # ``rms_norm_eps``'s is: a config that omits the key then resolves to the
+    # target's number instead of to whatever a compute path happens to pick.
+    # The literal lives here, in the one place that models the checkpoint's
+    # declared values, and NOT on the compute path -- the shared expert reads
+    # this field and carries no bound of its own.
+    swiglu_limit: float = 10.0
 
     # -- Normalisation epsilons, TWO of them and not one -------------------
     # ``rms_norm_eps`` is the decoder's RMSNorm epsilon and ``hc_eps`` is the

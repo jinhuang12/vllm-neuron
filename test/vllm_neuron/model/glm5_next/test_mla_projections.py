@@ -52,16 +52,31 @@ DECLARED_SITES = (
 #: anchored to an earlier commit and are ~31 lines early here, which is exactly
 #: why this file asserts the line number as well as the value: a citation that
 #: silently drifts is how the plan's went stale.
+#:
+#: THE TWO COLUMNS HAVE DIFFERENT OWNERS, and only one of them is the plan's.
+#: The VALUE is the plan's geometry and never moves here. The LINE is this
+#: file's own reading of `config.py` at the campaign head, so it moves whenever
+#: that file grows above the field -- and this assertion firing is the drift
+#: being noticed on time, which is the whole point of pinning it.
+#:
+#: RE-PINNED AT `inc-glm53f-033` REPAIR ROUND 2. Not one value moved: all nine
+#: were re-read from the AST and all nine matched. Every line moved, in two
+#: groups with two different causes. The first eight moved `+13`, because that
+#: round rewrote prose above the class declaration (`Glm5NextTextConfig` went
+#: from line 130 to line 143). `rms_norm_eps` moved `+33`, because the same
+#: round also added the 20-line `swiglu_limit` block between `mla_use_nope` and
+#: it. `13 + 20 = 33`, and the file grew by exactly 33 lines, so the two causes
+#: account for the whole drift with nothing left over.
 DECLARED_CONFIG_FIELDS = (
-    ("hidden_size", 4096, 138),
-    ("num_attention_heads", 64, 140),
-    ("kv_lora_rank", 512, 162),
-    ("q_lora_rank", 1536, 163),
-    ("qk_nope_head_dim", 256, 164),
-    ("qk_rope_head_dim", 0, 167),
-    ("v_head_dim", 256, 168),
-    ("mla_use_nope", True, 169),
-    ("rms_norm_eps", 1e-05, 188),
+    ("hidden_size", 4096, 151),
+    ("num_attention_heads", 64, 153),
+    ("kv_lora_rank", 512, 175),
+    ("q_lora_rank", 1536, 176),
+    ("qk_nope_head_dim", 256, 177),
+    ("qk_rope_head_dim", 0, 180),
+    ("v_head_dim", 256, 181),
+    ("mla_use_nope", True, 182),
+    ("rms_norm_eps", 1e-05, 221),
 )
 
 #: The sequence length every case runs at. Above the sub-kernel-selection

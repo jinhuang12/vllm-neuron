@@ -938,6 +938,17 @@ SHARED_DOWN_EXPONENTS = ((0, 2), (-1, 1))
 #: typing `10.0` is what makes the clamp the CHECKPOINT'S bound: the finding asks
 #: for the value to be sourced from the checkpoint, and a literal in this file
 #: would fail that half of it just as a literal in the shipped path would.
+#: R01's provenance probe value, and the ONE reason it is not ``10.0``. The
+#: checkpoint declares ``swiglu_limit = 10.0`` and ``Glm5NextTextConfig``'s field
+#: defaults to the same number on purpose (``config.py``, following
+#: ``rms_norm_eps``), so a reading of ``10.0`` on a built object cannot tell a
+#: config read apart from a default. ``7.5`` is a value the checkpoint does NOT
+#: carry, which is what makes the read path falsifiable. It is not a comparator
+#: and nothing is measured against it: it is an input pushed through the adapter.
+#: The same device ``inc-glm53f-080`` uses for its epsilon
+#: (``test_config.py``'s ``C080_NON_DEFAULT_RMS_NORM_EPS = 3e-05``).
+R01_NON_DEFAULT_BOUND = 7.5
+
 SHARED_VENDOR_CONFIG_SHA256 = (
     "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f"
 )
@@ -1220,6 +1231,14 @@ def _shared_build_block():
     ``world_size=1`` keeps ``-031``'s uniformity gate satisfied at this tiny
     expert count; the routed bank is built but never driven here, because the
     routed path is ``-027``'s landed and separately-accepted surface.
+
+    THE SWIGLU BOUND IS PASSED EXPLICITLY, since ``B22-M1`` repair round 2. The
+    shared expert now reads ``text_config.swiglu_limit`` at construction, and the
+    dataclass default happens to be the checkpoint's own ``10.0`` -- so a config
+    that said nothing would still produce the right number and no arm below could
+    tell a config read from a default. Passing the digest-checked vendor value
+    removes that accidental agreement: the bound every numeric arm drives the
+    shipped path with is the checkpoint's, from the file, by construction.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 
@@ -1230,6 +1249,7 @@ def _shared_build_block():
         n_routed_experts=4,
         num_experts_per_tok=2,
         n_shared_experts=1,
+        swiglu_limit=_shared_swiglu_limit(),
     )
     return model_fp8.Glm5NextMoEBlock(text_config, world_size=1)
 
@@ -1374,9 +1394,11 @@ def _shared_max_rel_error(got, want) -> float:
 def _shared_call_layer(block, case: dict, quant_config, routed):
     """Drive the increment's own call site once, under all four instruments.
 
-    The clamp bound is the last argument and comes from the checkpoint
-    (:func:`_shared_swiglu_limit`), so every numeric arm below drives the shipped
-    path with the checkpoint's own value rather than one this file chose.
+    THE BOUND IS NO LONGER AN ARGUMENT, since ``B22-M1`` repair round 2. It is
+    read from ``text_config.swiglu_limit`` when the block is built, so the value
+    reaching the clamp is the one :func:`_shared_build_block` resolved from the
+    checkpoint -- see that helper, which passes the digest-checked vendor value
+    rather than letting a dataclass default stand in for it.
     """
     seam = _shared_seam()
     seam.reset_dispatch_counters()
@@ -1391,7 +1413,6 @@ def _shared_call_layer(block, case: dict, quant_config, routed):
             case["up_s"],
             case["down_s"],
             quant_config,
-            _shared_swiglu_limit(),
         )
     return got, sim
 
@@ -1637,7 +1658,6 @@ def test_shared_expert_seam_entries_are_one_per_projection_site():
                 case["up_s"],
                 case["down_s"],
                 quant_config,
-                _shared_swiglu_limit(),
             )
             readings.append(seam.dispatch_counters())
             print(
@@ -1936,7 +1956,6 @@ def test_shared_expert_refuses_a_non_block_quant_config_by_name():
             case["up_s"],
             case["down_s"],
             unquantised,
-            _shared_swiglu_limit(),
         )
     refused_counters = seam.dispatch_counters()
     print(f"[refusal] counters_after_refusal={refused_counters}")
@@ -2061,10 +2080,18 @@ def test_shared_expert_signed_fixture_agrees_in_norm_under_cancellation():
 
 
 # ---------------------------------------------------------------------------
-# `B22-M1` REPAIR ROUND 1 -- four added arms.
+# `B22-M1` REPAIR -- four added arms. Rounds 1 and 2.
 #
-# R01 the bound is the checkpoint's and no literal governs it, and the shipped
-#     clamps keep the reference's asymmetry.
+# ROUND 2 REWROTE R01 AND LEFT THE OTHER THREE ALONE. Round 1 passed the SwiGLU
+# bound into the two shipped methods as a required argument, because
+# `Glm5NextTextConfig` did not model `swiglu_limit`; round 2 lifted the field and
+# moved the read to `Glm5NextSharedExperts.__init__`, so R01 now asks whether the
+# value on the object came from the config rather than whether an argument has a
+# default. R02, R03 and R04 are numeric arms over the shipped path and do not
+# name the parameter, so none of their readings moves.
+#
+# R01 the bound is READ FROM THE CONFIG and no literal governs it, and the
+#     shipped clamps keep the reference's asymmetry.
 # R02 the shipped path matches the CLAMPED formula and NOT the unclamped one --
 #     the arm the finding asks for, and the one that goes red if either clamp is
 #     dropped from the shipped path.
@@ -2079,32 +2106,123 @@ def test_shared_expert_signed_fixture_agrees_in_norm_under_cancellation():
 
 
 def test_shared_expert_swiglu_bound_is_the_checkpoints_and_no_literal_governs_it():
-    """R01. The bound comes from the checkpoint, and the clamps stay asymmetric.
+    """R01. The bound is READ FROM THE CONFIG, and the clamps stay asymmetric.
 
-    THREE READINGS, because "sourced from the checkpoint" has three ways to fail
-    and a value check alone catches only one of them.
+    REWRITTEN AT REPAIR ROUND 2, because the thing it checks changed. Round 1
+    passed the bound in as a required argument, because `Glm5NextTextConfig` did
+    not model `swiglu_limit` at all; round 2 added the field and moved the read to
+    `Glm5NextSharedExperts.__init__`. So this arm no longer asks whether an
+    argument has a default -- there is no argument -- it asks whether the value on
+    the object came from the config.
+
+    FOUR READINGS, because "sourced from the checkpoint" has four ways to fail and
+    a value check alone catches only one of them.
 
     Reading 1 -- the value in the published config is `10.0`, read from the
-    digest-checked vendor copy.
+    digest-checked vendor copy, and the block the section builds resolves that
+    same number. Equality here is necessary but weak on its own, which is what
+    reading 2 exists for.
 
-    Reading 2 -- neither shipped method gives `swiglu_limit` a DEFAULT. A default
-    would be a literal in the fork standing in for a checkpoint value, which is
-    the half of the finding a numeric comparison cannot see: every arm would pass
-    while the model quietly used the fork's number.
+    Reading 2 -- THE PROVENANCE READING, on a value the checkpoint does not carry.
+    `10.0` is also any natural default, so a `10.0` on the object proves nothing
+    about where it came from. This reading pushes a NON-DEFAULT `7.5` through the
+    real adapter (`Glm5NextTextConfig.from_hf_config`, the same path production
+    uses) and asserts the built block resolved `7.5` -- and that the shipped
+    clamp then computes a different answer, so the field governs the arithmetic
+    and is not just an attribute nobody reads.
 
-    Reading 3 -- the shipped clamps keep the reference's ASYMMETRY. The gate is
+    Reading 3 -- neither shipped method takes `swiglu_limit` as a parameter any
+    more, and no numeric literal equal to the bound appears in either. Together
+    those say the bound cannot enter the clamp from anywhere except the config.
+
+    Reading 4 -- the shipped clamps keep the reference's ASYMMETRY. The gate is
     bounded above only (`min=None`) and the up operand on both sides, read off
     the shipped AST rather than off a docstring. A symmetric gate clamp computes
     a different function and no numeric arm at this fixture would notice, because
     every pre-activation here is positive.
     """
     import ast
+    import copy
+    import hashlib
     import inspect
+    import json
+    from pathlib import Path
+
+    import torch
+
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 
     model_fp8 = _impl()
     limit = _shared_swiglu_limit()
     print(f"\n[swiglu-provenance] checkpoint_swiglu_limit={limit}")
 
+    # Reading 1: what the block this section builds actually resolved.
+    block = _shared_build_block()
+    resolved = block.shared_experts.swiglu_limit
+    print(f"[swiglu-provenance] block_resolved_swiglu_limit={resolved}")
+
+    # Reading 2: the read path, on a value the checkpoint does not carry. The
+    # vendor dict is digest-checked by `_shared_swiglu_limit` above; it is read
+    # again here because this reading needs the whole sub-config, not one value.
+    vendor_path = Path(__file__).resolve().parent / "fixtures" / "hf-config.json"
+    assert (
+        hashlib.sha256(vendor_path.read_bytes()).hexdigest()
+        == SHARED_VENDOR_CONFIG_SHA256
+    )
+    vendor_text = json.loads(vendor_path.read_text())["text_config"]
+    probe_bound = R01_NON_DEFAULT_BOUND
+    mutated = copy.deepcopy(vendor_text)
+    mutated["swiglu_limit"] = probe_bound
+    # The tiny shape this section builds at, so the block stays buildable; only
+    # the bound differs between the two configs below.
+    tiny = {
+        "hidden_size": SHARED_H,
+        "moe_intermediate_size": SHARED_I,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+    }
+    mutated.update(tiny)
+    at_checkpoint = copy.deepcopy(vendor_text)
+    at_checkpoint.update(tiny)
+    non_default_cfg = Glm5NextTextConfig.from_hf_config(mutated)
+    checkpoint_cfg = Glm5NextTextConfig.from_hf_config(at_checkpoint)
+    non_default_block = model_fp8.Glm5NextMoEBlock(non_default_cfg, world_size=1)
+    checkpoint_block = model_fp8.Glm5NextMoEBlock(checkpoint_cfg, world_size=1)
+    read_through_adapter = non_default_block.shared_experts.swiglu_limit
+    print(
+        f"[swiglu-provenance] dataclass_default={Glm5NextTextConfig().swiglu_limit} "
+        f"probe_bound={probe_bound} read_through_the_adapter={read_through_adapter}"
+    )
+
+    # ... and the bound governs the arithmetic, not just the attribute. The same
+    # case is run through both blocks, through this section's own call site, and
+    # the two answers are compared. Both runs go through all four route
+    # instruments, so neither reading can come from a torch fallback.
+    case = _shared_build_case()
+    quant_config = _shared_block_quant_config()
+    routed = torch.zeros(
+        case["hidden_states"].shape[0], SHARED_H, dtype=torch.float32
+    )
+    at_probe, sim_probe = _shared_call_layer(
+        non_default_block, case, quant_config, routed
+    )
+    reading_probe = _assert_shared_route(
+        sim_probe, SHARED_DECLARED_SEAM_ENTRIES, "swiglu-provenance-probe"
+    )
+    at_ten, sim_ten = _shared_call_layer(
+        checkpoint_block, case, quant_config, routed
+    )
+    reading_ten = _assert_shared_route(
+        sim_ten, SHARED_DECLARED_SEAM_ENTRIES, "swiglu-provenance-checkpoint"
+    )
+    bound_response = _shared_max_rel_error(at_ten, at_probe)
+    print(
+        f"[swiglu-provenance] output_response_to_the_bound={bound_response:.6e} "
+        f"rtol={SHARED_RTOL}"
+    )
+
+    # Reading 3: the parameter is gone from both methods.
     signatures = {}
     for owner, method in (
         (model_fp8.Glm5NextSharedExperts, "shared_expert_mm"),
@@ -2115,11 +2233,11 @@ def test_shared_expert_swiglu_bound_is_the_checkpoints_and_no_literal_governs_it
         )
         signatures[method] = parameter
         print(
-            f"[swiglu-provenance] {method}: present={parameter is not None} "
-            f"default={'NONE' if parameter is None else parameter.default!r}"
+            f"[swiglu-provenance] {method}: swiglu_limit_parameter="
+            f"{'ABSENT' if parameter is None else parameter!r}"
         )
 
-    # The clamp calls, read off the shipped source.
+    # Reading 4: the clamp calls, read off the shipped source.
     method_ast = _shared_source_method("Glm5NextSharedExperts", "shared_expert_mm")
     clamps = {}
     for node in ast.walk(method_ast):
@@ -2132,55 +2250,95 @@ def test_shared_expert_swiglu_bound_is_the_checkpoints_and_no_literal_governs_it
     print(f"[swiglu-provenance] shipped_clamp_calls={clamps}")
 
     # A literal equal to the bound anywhere in the shipped method would mean the
-    # parameter is decoration. Counted over the whole method, and the count is
-    # printed beside the population so a zero is not read as an empty search.
-    constants = [
-        node.value
-        for node in ast.walk(method_ast)
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
-        and not isinstance(node.value, bool)
-    ]
-    print(
-        f"[swiglu-provenance] numeric_constants_in_shared_expert_mm={constants} "
-        f"equal_to_the_bound={[c for c in constants if float(c) == limit]}"
-    )
+    # config read is decoration. Counted over BOTH methods, and each count is
+    # printed beside its population so a zero is not read as an empty search.
+    literals = {}
+    for class_name, method_name in (
+        ("Glm5NextSharedExperts", "shared_expert_mm"),
+        ("Glm5NextMoEBlock", "combine_routed_and_shared"),
+    ):
+        node_ast = _shared_source_method(class_name, method_name)
+        constants = [
+            node.value
+            for node in ast.walk(node_ast)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+            and not isinstance(node.value, bool)
+        ]
+        literals[method_name] = constants
+        print(
+            f"[swiglu-provenance] numeric_constants_in_{method_name}={constants} "
+            f"equal_to_the_bound="
+            f"{[c for c in constants if float(c) in (limit, probe_bound)]}"
+        )
 
     assert limit == 10.0, (
         f"the published checkpoint carries swiglu_limit={limit}; every reading "
         f"in this section is taken against the checkpoint's own value"
     )
-    for method, parameter in signatures.items():
-        assert parameter is not None, f"{method} declares no swiglu_limit parameter"
-        assert parameter.default is inspect.Parameter.empty, (
-            f"{method} gives swiglu_limit the default {parameter.default!r}. A "
-            f"default is a literal in the fork governing a checkpoint value, "
-            f"which is what B22-M1 forbids."
-        )
-    assert clamps.get("gate") == {"min": "None", "max": "swiglu_limit"}, (
-        f"the shipped gate clamp reads {clamps.get('gate')}; the reference bounds "
-        f"the gate ABOVE ONLY (modeling_glm5_next.py:102)"
+    # Reading 1.
+    assert resolved == limit, (
+        f"the block this section builds resolved swiglu_limit={resolved}, but the "
+        f"checkpoint declares {limit}"
     )
-    assert clamps.get("up") == {"min": "-swiglu_limit", "max": "swiglu_limit"}, (
+    # Reading 2 -- the one that proves provenance rather than agreement.
+    assert probe_bound != Glm5NextTextConfig().swiglu_limit, (
+        "the probe bound equals the dataclass default, so it could not tell a "
+        "config read apart from a default and this reading would be vacuous"
+    )
+    assert read_through_adapter == probe_bound, (
+        f"a config carrying swiglu_limit={probe_bound} built a shared expert "
+        f"holding {read_through_adapter}; the value is not coming from the config"
+    )
+    assert bound_response > SHARED_RTOL, (
+        f"changing the checkpoint's bound from {limit} to {probe_bound} moved the "
+        f"shipped output by {bound_response:.6e}, which is inside the declared "
+        f"rtol={SHARED_RTOL}. The field would then be an attribute nobody reads."
+    )
+    assert torch.isfinite(at_probe).all() and torch.isfinite(at_ten).all()
+    # Reading 3.
+    for method, parameter in signatures.items():
+        assert parameter is None, (
+            f"{method} still declares a swiglu_limit parameter ({parameter!r}). "
+            f"Round 2 retires it: the bound is read from the config at "
+            f"construction, so a caller cannot supply a different one."
+        )
+    # Reading 4.
+    assert clamps.get("gate") == {"min": "None", "max": "self.swiglu_limit"}, (
+        f"the shipped gate clamp reads {clamps.get('gate')}; the reference bounds "
+        f"the gate ABOVE ONLY (modeling_glm5_next.py:102) with the config's bound"
+    )
+    assert clamps.get("up") == {
+        "min": "-self.swiglu_limit",
+        "max": "self.swiglu_limit",
+    }, (
         f"the shipped up clamp reads {clamps.get('up')}; the reference bounds the "
         f"up operand on BOTH sides (modeling_glm5_next.py:103)"
     )
-    assert [c for c in constants if float(c) == limit] == [], (
-        "the shipped method carries a numeric literal equal to the checkpoint's "
-        "bound, so the parameter may be decoration"
-    )
-    assert constants, (
+    for method_name, constants in literals.items():
+        assert [c for c in constants if float(c) in (limit, probe_bound)] == [], (
+            f"{method_name} carries a numeric literal equal to the bound, so the "
+            f"config read may be decoration"
+        )
+    assert literals["shared_expert_mm"], (
         "no numeric constant at all was found in the shipped method, so the "
         "search above proves nothing -- the AST read is broken, not the code"
     )
 
     _shared_record(
         r01_checkpoint_swiglu_limit=limit,
-        r01_shared_expert_mm_default="EMPTY",
-        r01_combine_default="EMPTY",
+        r01_block_resolved_swiglu_limit=resolved,
+        r01_dataclass_default=Glm5NextTextConfig().swiglu_limit,
+        r01_probe_bound=probe_bound,
+        r01_read_through_the_adapter=read_through_adapter,
+        r01_output_response_to_the_bound=f"{bound_response:.6e}",
+        r01_route_reading_at_the_probe_bound=reading_probe,
+        r01_route_reading_at_the_checkpoint_bound=reading_ten,
+        r01_shared_expert_mm_parameter="ABSENT",
+        r01_combine_parameter="ABSENT",
         r01_gate_clamp=str(clamps.get("gate")),
         r01_up_clamp=str(clamps.get("up")),
         r01_literals_equal_to_the_bound=0,
-        r01_numeric_constants_examined=len(constants),
+        r01_numeric_constants_examined=len(literals["shared_expert_mm"]),
     )
 
 
