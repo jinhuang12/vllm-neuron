@@ -55,6 +55,7 @@ from vllm_neuron.functional.kda.gate_clamp import (
     KDA_GATE_LOWER_BOUND,
     can_run_gate_clamp,
     gate_clamp_dispatch_counters,
+    gate_clamp_kernel_identity,
     kda_gate_clamp,
     kda_gate_clamp_torch_oracle,
     reset_gate_clamp_dispatch_counters,
@@ -114,7 +115,20 @@ def _one_call(g, a_log, bias, beta):
 
 
 def _report(item: str, certifies: str) -> None:
-    print(f"\nGATE|{item}|certifies={certifies}", flush=True)
+    """Name what this item certifies, and name the kernel it actually ran.
+
+    THE IDENTITY IS PRINTED, NOT ASSERTED, because the block declares three items
+    and a fourth would change the declared count. Printing it inside each item
+    still puts the reading in the transcript of the declared acceptance command,
+    which is where a reviewer looks, and the landed ``test_chunked_recurrence``
+    prints its own kernel identity the same way.
+    """
+    module, qualname = gate_clamp_kernel_identity()
+    print(
+        f"\nGATE|{item}|certifies={certifies}"
+        f"|kernel_identity=({module}, {qualname})",
+        flush=True,
+    )
 
 
 def _run_boundary_case(case: str, gate_value: float) -> None:

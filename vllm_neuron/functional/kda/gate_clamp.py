@@ -31,10 +31,11 @@ the output is float32 (``:1627``). Since ``-exp(A) < 0`` and ``softplus >= 0``, 
 gate is never positive, so a LOWER bound is the only bound that can bite.
 
 THE BOUND IS THIS CAMPAIGN'S OWN LANDED VALUE, NOT AN UPSTREAM ONE. It is
-``"gate_lower_bound": -5.0`` in ``vllm_neuron/model/glm5_next/config.py:115``,
-inside ``linear_attn_config`` (``:110-117``). Upstream's KDA carries no ``-5.0``
-anywhere -- searched, and the search came back empty -- so the composition this
-module implements is the port's, and only the activation half is upstream's.
+``"gate_lower_bound": -5.0`` at ``vllm_neuron/model/glm5_next/config.py:157``,
+inside the ``linear_attn_config`` field of ``Glm5NextTextConfig``
+(``:152-159``). Upstream's KDA carries no ``-5.0`` anywhere -- searched, and the
+search came back empty -- so the composition this module implements is the
+port's, and only the activation half is upstream's.
 
 THIS KERNEL COMPUTES SOFTPLUS BY THE BRANCH-FREE IDENTITY, NOT BY UPSTREAM'S
 THRESHOLD FORM::
@@ -91,9 +92,10 @@ logger = logging.getLogger(__name__)
 
 
 #: The gate's lower bound, read from this campaign's landed model config rather
-#: than chosen here: ``vllm_neuron/model/glm5_next/config.py:115`` declares
-#: ``"gate_lower_bound": -5.0`` inside ``linear_attn_config``. A LOWER bound is the
-#: only bound that can bite, because the activation is never positive.
+#: than chosen here: ``vllm_neuron/model/glm5_next/config.py:157`` declares
+#: ``"gate_lower_bound": -5.0`` inside the ``linear_attn_config`` field of
+#: ``Glm5NextTextConfig``. A LOWER bound is the only bound that can bite,
+#: because the activation is never positive.
 KDA_GATE_LOWER_BOUND = -5.0
 
 #: ``fused_kda_gate``'s own defaults, at ``kda.py:1608-1609``. ``beta`` reaches the
@@ -271,10 +273,13 @@ def kda_gate_clamp(
     """The counted seam. ``g`` is ``[T, D]``; the result is ``[T, D]``, float32.
 
     ``a_log`` is one head's ``A_log`` as a scalar-shaped tensor. ``bias`` is the
-    per-key-channel gate bias (``dt_bias``, mapped for this checkpoint at
-    ``weight_loaders_fp8.py:417``); ``None`` means no bias, and it is passed as an
-    exact zero column rather than by a second kernel path, because adding ``0.0``
-    is bit-exact -- measured -- so the two are the same computation.
+    per-key-channel gate bias, which this checkpoint's loader carries as a bare
+    KDA leaf named ``dt_bias`` (``weight_loaders_fp8.py:470``). THAT MAPPING IS
+    PROVISIONAL: it has not been checked against the checkpoint index, so the
+    name is where the bias is expected to come from, not a confirmed wiring.
+    ``None`` means no bias, and it is passed as an exact zero column rather than
+    by a second kernel path, because adding ``0.0`` is bit-exact -- measured --
+    so the two are the same computation.
     """
     if g.ndim != 2:
         raise GateClampError(f"g must be [tokens, kdim]; got shape {tuple(g.shape)}")
@@ -341,5 +346,20 @@ def kda_gate_clamp_torch_oracle(
 
 
 def gate_clamp_kernel_identity() -> tuple[str, str]:
-    """``(module, kernel name)`` of the jit entry this module authors."""
-    return (kda_gate_clamp_kernel.__module__, kda_gate_clamp_kernel.__name__)
+    """``(module, qualname)`` of the gate-clamp kernel this module authors.
+
+    Read by the acceptance driver to prove the kernel under test is authored
+    here rather than imported from the substrate.
+
+    THE UNWRAP IS THE WHOLE READING. ``nki.jit`` returns a wrapper whose own
+    ``__module__`` is the substrate's, so reading the attribute off the
+    decorated object reports ``nki.framework.kernel`` for an authored kernel and
+    for an imported one alike -- the same answer either way, which is no reading
+    at all. Unwrapping ``.func`` first is what makes the two cases differ, and it
+    is the form the three landed KDA modules already use. The sibling
+    ``depthwise_conv1d.kernel_identity`` reads the same way to prove the opposite
+    claim, that its seam dispatches to the SUBSTRATE's member.
+    """
+    func = getattr(kda_gate_clamp_kernel, "func", None)
+    target = func if func is not None else kda_gate_clamp_kernel
+    return target.__module__, target.__qualname__
