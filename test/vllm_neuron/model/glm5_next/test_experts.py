@@ -913,6 +913,50 @@ SHARED_GATE_EXPONENTS = ((-2, 1), (0, -1))
 SHARED_UP_EXPONENTS = ((1, -1), (-2, 0))
 SHARED_DOWN_EXPONENTS = ((0, 2), (-1, 1))
 
+# --------------------------------------------------------------------------- #
+# `B22-M1-shared-expert-swiglu-clamp-omitted`, repair round 1.                  #
+#                                                                              #
+# THE FINDING, in one sentence: this section computed `silu(gate) * up` where    #
+# the checkpoint's shared expert CLAMPS both projections first, and the oracle   #
+# below repeated the same omission, so no bar in this file could see it.         #
+#                                                                              #
+# The reference, read first-hand: transformers v5.16.1                          #
+# `models/glm5_next/modeling_glm5_next.py:98-104` (`Glm5NextTextMLP.forward`),   #
+# whose two clamp lines are `:102` and `:103`, and `:196-197`, where            #
+# `Glm5NextTextMoE.__init__` builds `shared_experts` as that same MLP.           #
+#                                                                              #
+# NOT TOUCHED HERE: no tolerance, extent, seed, exponent or comparator moves.    #
+# `SHARED_RTOL`, `SHARED_ATOL`, `SHARED_T`, `SHARED_H`, `SHARED_I`, the three    #
+# exponent matrices and `SHARED_DECLARED_SEAM_ENTRIES` are byte-identical to     #
+# their landed values, and every new arm is an addition.                         #
+# --------------------------------------------------------------------------- #
+
+#: `-078` lands `fixtures/hf-config.json` as a byte-identical copy of the
+#: published GLM-5.3-Flash config and pins it by this digest in its own conjunct;
+#: `-080`'s landed `test_config.py` reads the same file the same way. This
+#: section READS it and never writes it. Reading the bound from here rather than
+#: typing `10.0` is what makes the clamp the CHECKPOINT'S bound: the finding asks
+#: for the value to be sourced from the checkpoint, and a literal in this file
+#: would fail that half of it just as a literal in the shipped path would.
+SHARED_VENDOR_CONFIG_SHA256 = (
+    "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f"
+)
+
+#: The power-of-two divisor that puts the gate operand ASTRIDE the clamp.
+#: MEASURED, not chosen: at the landed fixture every element of both operands is
+#: outside `[-10, 10]`, so `silu(clamp(gate))` is the constant `silu(10)` and the
+#: landed arms stop responding to the gate projection altogether -- halving the
+#: gate weights moves the clamped output by `0.000000e+00` where it moves the
+#: unclamped output by `5.000000e-01`. Dividing the hidden states by 8 leaves
+#: 49,474 of 65,536 gate elements above the bound and 16,062 below it, restores a
+#: `3.667817e-01` response to that same perturbation, and still reads
+#: `0.000000e+00` between kernel and oracle. Both readings and the full scan over
+#: divisors 1 to 32 are in `increments/probe-R7-straddle-and-sensitivity.out`.
+#: A POWER OF TWO, so every bf16 hidden value stays exactly representable and
+#: `-026`'s F1 losslessness precondition is untouched -- the weights, the block
+#: scales and every extent stay the landed fixture's own.
+SHARED_STRADDLE_DIVISOR = 8
+
 
 class SharedRouteInstrumentError(AssertionError):
     """A route reading that is not what the plan declares."""
@@ -1190,6 +1234,84 @@ def _shared_build_block():
     return model_fp8.Glm5NextMoEBlock(text_config, world_size=1)
 
 
+def _shared_swiglu_limit() -> float:
+    """The checkpoint's ``text_config.swiglu_limit``, digest-checked first.
+
+    NOT A LITERAL, and that is the point of the function existing at all. The
+    finding asks for the bound to come from the checkpoint; a `10.0` typed into
+    this file would satisfy the arithmetic and fail the requirement. The digest
+    is checked before the file is parsed, so a moved fixture raises instead of
+    quietly supplying a different bound.
+    """
+    import hashlib
+    import json
+    from pathlib import Path
+
+    vendor = Path(__file__).resolve().parent / "fixtures" / "hf-config.json"
+    digest = hashlib.sha256(vendor.read_bytes()).hexdigest()
+    if digest != SHARED_VENDOR_CONFIG_SHA256:
+        raise SharedVacuousControlError(
+            f"the vendor config moved: sha256={digest} != "
+            f"{SHARED_VENDOR_CONFIG_SHA256}. The clamp bound every arm below "
+            f"uses would no longer be the checkpoint's."
+        )
+    return float(json.loads(vendor.read_text())["text_config"]["swiglu_limit"])
+
+
+def _shared_apply_reference_clamps(gate, up, limit: float):
+    """The reference's two clamps, transliterated (``:102`` and ``:103``).
+
+    ONE-SIDED ON THE GATE and two-sided on the up operand, because that is what
+    the reference does. ``min=None`` is written out rather than dropped so the
+    asymmetry is visible at the call site and cannot be "tidied" into a
+    symmetric clamp, which would be a different function.
+    """
+    return gate.clamp(min=None, max=limit), up.clamp(min=-limit, max=limit)
+
+
+def _shared_swiglu_formula(case: dict, gate, up, *, clamp: bool, limit: float):
+    """``down(silu(gate) * up)`` with the clamps switched IN or OUT.
+
+    Both formulas in one function, selected by an argument, so the two arms that
+    need to tell them apart cannot drift into comparing two different things by
+    accident. The projections are handed in rather than computed here, which is
+    what lets one caller pass the ORACLE's projections and another pass the
+    KERNEL's.
+    """
+    from torch.nn.functional import silu
+
+    from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm_torch_oracle
+
+    if clamp:
+        gate, up = _shared_apply_reference_clamps(gate, up, limit)
+    activated = silu(gate) * up
+    return blockwise_fp8_mm_torch_oracle(
+        activated.to(case["hidden_states"].dtype), case["down_w"], case["down_s"]
+    )
+
+
+def _shared_oracle_projections(case: dict):
+    """``gate`` and ``up`` as ``-026``'s torch oracle computes them, pre-clamp."""
+    from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm_torch_oracle
+
+    hidden = case["hidden_states"]
+    return (
+        blockwise_fp8_mm_torch_oracle(hidden, case["gate_w"], case["gate_s"]),
+        blockwise_fp8_mm_torch_oracle(hidden, case["up_w"], case["up_s"]),
+    )
+
+
+def _shared_straddling_case(base: dict) -> dict:
+    """The landed case with its hidden states divided by a power of two.
+
+    See ``SHARED_STRADDLE_DIVISOR`` for why this fixture exists and why the
+    divisor is the one it is. Nothing else about the case moves.
+    """
+    case = dict(base)
+    case["hidden_states"] = base["hidden_states"] / SHARED_STRADDLE_DIVISOR
+    return case
+
+
 def _shared_expert_torch_reference(case: dict):
     """The independent torch formulation of ``down(silu(gate(x)) * up(x))``.
 
@@ -1206,17 +1328,16 @@ def _shared_expert_torch_reference(case: dict):
     implementation applies, because that cast is a real precision step and a
     reference that skipped it would make this comparison measure a dtype
     mismatch this test invented rather than the plumbing under acceptance.
+
+    AND IT CLAMPS, as of `B22-M1` repair round 1. This oracle used to compute the
+    unclamped product, which is exactly why the landed acceptance read
+    ``max_rel_error=0.000000e+00`` while the shipped path computed a different
+    function from the checkpoint's: both sides shared one omission. The bound is
+    the checkpoint's own, read through :func:`_shared_swiglu_limit`.
     """
-    from torch.nn.functional import silu
-
-    from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm_torch_oracle
-
-    hidden = case["hidden_states"]
-    gate = blockwise_fp8_mm_torch_oracle(hidden, case["gate_w"], case["gate_s"])
-    up = blockwise_fp8_mm_torch_oracle(hidden, case["up_w"], case["up_s"])
-    activated = silu(gate) * up
-    return blockwise_fp8_mm_torch_oracle(
-        activated.to(hidden.dtype), case["down_w"], case["down_s"]
+    gate, up = _shared_oracle_projections(case)
+    return _shared_swiglu_formula(
+        case, gate, up, clamp=True, limit=_shared_swiglu_limit()
     )
 
 
@@ -1251,7 +1372,12 @@ def _shared_max_rel_error(got, want) -> float:
 
 
 def _shared_call_layer(block, case: dict, quant_config, routed):
-    """Drive the increment's own call site once, under all four instruments."""
+    """Drive the increment's own call site once, under all four instruments.
+
+    The clamp bound is the last argument and comes from the checkpoint
+    (:func:`_shared_swiglu_limit`), so every numeric arm below drives the shipped
+    path with the checkpoint's own value rather than one this file chose.
+    """
     seam = _shared_seam()
     seam.reset_dispatch_counters()
     with _SharedSimulatorCounter() as sim:
@@ -1265,6 +1391,7 @@ def _shared_call_layer(block, case: dict, quant_config, routed):
             case["up_s"],
             case["down_s"],
             quant_config,
+            _shared_swiglu_limit(),
         )
     return got, sim
 
@@ -1510,6 +1637,7 @@ def test_shared_expert_seam_entries_are_one_per_projection_site():
                 case["up_s"],
                 case["down_s"],
                 quant_config,
+                _shared_swiglu_limit(),
             )
             readings.append(seam.dispatch_counters())
             print(
@@ -1808,6 +1936,7 @@ def test_shared_expert_refuses_a_non_block_quant_config_by_name():
             case["up_s"],
             case["down_s"],
             unquantised,
+            _shared_swiglu_limit(),
         )
     refused_counters = seam.dispatch_counters()
     print(f"[refusal] counters_after_refusal={refused_counters}")
@@ -1928,6 +2057,385 @@ def test_shared_expert_signed_fixture_agrees_in_norm_under_cancellation():
         h10_signed_relative_frobenius=f"{relative_norm:.6e}",
         h10_signed_pointwise_max_rel_error=f"{pointwise:.6e}",
         h10_signed_route_reading=reading,
+    )
+
+
+# ---------------------------------------------------------------------------
+# `B22-M1` REPAIR ROUND 1 -- four added arms.
+#
+# R01 the bound is the checkpoint's and no literal governs it, and the shipped
+#     clamps keep the reference's asymmetry.
+# R02 the shipped path matches the CLAMPED formula and NOT the unclamped one --
+#     the arm the finding asks for, and the one that goes red if either clamp is
+#     dropped from the shipped path.
+# R03 a straddling fixture keeps the gate projection visible, which is the
+#     coverage the clamp removes from the landed fixture.
+# R04 the two-sided lower bound is reached by the landed signed fixture, and
+#     dropping it changes the answer.
+#
+# Every one is an addition. No landed item, tolerance, extent, seed, exponent or
+# comparator moves.
+# ---------------------------------------------------------------------------
+
+
+def test_shared_expert_swiglu_bound_is_the_checkpoints_and_no_literal_governs_it():
+    """R01. The bound comes from the checkpoint, and the clamps stay asymmetric.
+
+    THREE READINGS, because "sourced from the checkpoint" has three ways to fail
+    and a value check alone catches only one of them.
+
+    Reading 1 -- the value in the published config is `10.0`, read from the
+    digest-checked vendor copy.
+
+    Reading 2 -- neither shipped method gives `swiglu_limit` a DEFAULT. A default
+    would be a literal in the fork standing in for a checkpoint value, which is
+    the half of the finding a numeric comparison cannot see: every arm would pass
+    while the model quietly used the fork's number.
+
+    Reading 3 -- the shipped clamps keep the reference's ASYMMETRY. The gate is
+    bounded above only (`min=None`) and the up operand on both sides, read off
+    the shipped AST rather than off a docstring. A symmetric gate clamp computes
+    a different function and no numeric arm at this fixture would notice, because
+    every pre-activation here is positive.
+    """
+    import ast
+    import inspect
+
+    model_fp8 = _impl()
+    limit = _shared_swiglu_limit()
+    print(f"\n[swiglu-provenance] checkpoint_swiglu_limit={limit}")
+
+    signatures = {}
+    for owner, method in (
+        (model_fp8.Glm5NextSharedExperts, "shared_expert_mm"),
+        (model_fp8.Glm5NextMoEBlock, "combine_routed_and_shared"),
+    ):
+        parameter = inspect.signature(getattr(owner, method)).parameters.get(
+            "swiglu_limit"
+        )
+        signatures[method] = parameter
+        print(
+            f"[swiglu-provenance] {method}: present={parameter is not None} "
+            f"default={'NONE' if parameter is None else parameter.default!r}"
+        )
+
+    # The clamp calls, read off the shipped source.
+    method_ast = _shared_source_method("Glm5NextSharedExperts", "shared_expert_mm")
+    clamps = {}
+    for node in ast.walk(method_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Attribute) and node.func.attr == "clamp"):
+            continue
+        target = getattr(node.func.value, "id", "?")
+        clamps[target] = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+    print(f"[swiglu-provenance] shipped_clamp_calls={clamps}")
+
+    # A literal equal to the bound anywhere in the shipped method would mean the
+    # parameter is decoration. Counted over the whole method, and the count is
+    # printed beside the population so a zero is not read as an empty search.
+    constants = [
+        node.value
+        for node in ast.walk(method_ast)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    ]
+    print(
+        f"[swiglu-provenance] numeric_constants_in_shared_expert_mm={constants} "
+        f"equal_to_the_bound={[c for c in constants if float(c) == limit]}"
+    )
+
+    assert limit == 10.0, (
+        f"the published checkpoint carries swiglu_limit={limit}; every reading "
+        f"in this section is taken against the checkpoint's own value"
+    )
+    for method, parameter in signatures.items():
+        assert parameter is not None, f"{method} declares no swiglu_limit parameter"
+        assert parameter.default is inspect.Parameter.empty, (
+            f"{method} gives swiglu_limit the default {parameter.default!r}. A "
+            f"default is a literal in the fork governing a checkpoint value, "
+            f"which is what B22-M1 forbids."
+        )
+    assert clamps.get("gate") == {"min": "None", "max": "swiglu_limit"}, (
+        f"the shipped gate clamp reads {clamps.get('gate')}; the reference bounds "
+        f"the gate ABOVE ONLY (modeling_glm5_next.py:102)"
+    )
+    assert clamps.get("up") == {"min": "-swiglu_limit", "max": "swiglu_limit"}, (
+        f"the shipped up clamp reads {clamps.get('up')}; the reference bounds the "
+        f"up operand on BOTH sides (modeling_glm5_next.py:103)"
+    )
+    assert [c for c in constants if float(c) == limit] == [], (
+        "the shipped method carries a numeric literal equal to the checkpoint's "
+        "bound, so the parameter may be decoration"
+    )
+    assert constants, (
+        "no numeric constant at all was found in the shipped method, so the "
+        "search above proves nothing -- the AST read is broken, not the code"
+    )
+
+    _shared_record(
+        r01_checkpoint_swiglu_limit=limit,
+        r01_shared_expert_mm_default="EMPTY",
+        r01_combine_default="EMPTY",
+        r01_gate_clamp=str(clamps.get("gate")),
+        r01_up_clamp=str(clamps.get("up")),
+        r01_literals_equal_to_the_bound=0,
+        r01_numeric_constants_examined=len(constants),
+    )
+
+
+def test_shared_expert_matches_the_clamped_formula_and_not_the_unclamped_one():
+    """R02. The arm the finding asks for: red on the unclamped form, green on the
+    clamped one.
+
+    WHY THIS IS NOT A RESTATEMENT OF H01. H01 compares the shipped path against
+    ``_shared_expert_torch_reference``. Before this repair BOTH of those computed
+    the unclamped product, so H01 read an exact zero and said nothing -- that is
+    the finding. This arm builds BOTH formulas itself, through
+    :func:`_shared_swiglu_formula`, and asserts the shipped path agrees with one
+    and disagrees with the other. Deleting the clamp from the oracle does not
+    reach this arm's reference, so the pre-repair state cannot make it green.
+
+    THE NON-VACUITY READING COMES FIRST. If the two formulas agreed at this
+    fixture, the second assertion would be unfalsifiable. They differ here by
+    more than four thousand times the declared ``rtol``, and the pre-activation
+    ranges printed beside it are the reason: every element of both operands sits
+    outside the checkpoint's box.
+    """
+    import torch
+
+    limit = _shared_swiglu_limit()
+    case = _shared_build_case()
+    gate, up = _shared_oracle_projections(case)
+
+    above = int((gate > limit).sum())
+    outside = int(((up > limit) | (up < -limit)).sum())
+    ranges = (
+        f"gate=[{float(gate.min()):.4f}, {float(gate.max()):.4f}] "
+        f"up=[{float(up.min()):.4f}, {float(up.max()):.4f}]"
+    )
+    print(f"\n[clamped-vs-unclamped] pre_activation_ranges {ranges}")
+    print(
+        f"[clamped-vs-unclamped] gate_above_limit={above}/{gate.numel()} "
+        f"up_outside_limit={outside}/{up.numel()} limit={limit}"
+    )
+
+    clamped = _shared_swiglu_formula(case, gate, up, clamp=True, limit=limit)
+    unclamped = _shared_swiglu_formula(case, gate, up, clamp=False, limit=limit)
+    separation = _shared_max_rel_error(unclamped, clamped)
+    print(
+        f"[clamped-vs-unclamped] the_two_formulas_differ_by={separation:.6e} "
+        f"rtol={SHARED_RTOL} clamped_absmax={float(clamped.abs().max()):.6e} "
+        f"unclamped_absmax={float(unclamped.abs().max()):.6e}"
+    )
+    if separation <= SHARED_RTOL:
+        raise SharedVacuousControlError(
+            f"the clamped and unclamped formulas differ by only {separation:.6e} "
+            f"at this fixture, inside rtol={SHARED_RTOL}, so this arm could not "
+            f"tell them apart and would report a pass it had not earned"
+        )
+
+    block = _shared_build_block()
+    quant_config = _shared_block_quant_config()
+    routed = torch.zeros_like(clamped)
+    got, sim = _shared_call_layer(block, case, quant_config, routed)
+    reading = _assert_shared_route(sim, SHARED_DECLARED_SEAM_ENTRIES, "clamped-path")
+
+    against_clamped = _shared_max_rel_error(got, clamped)
+    against_unclamped = _shared_max_rel_error(got, unclamped)
+    print(
+        f"[clamped-vs-unclamped] shipped_vs_clamped={against_clamped:.6e} "
+        f"shipped_vs_unclamped={against_unclamped:.6e} "
+        f"rtol={SHARED_RTOL} atol={SHARED_ATOL}"
+    )
+
+    torch.testing.assert_close(got, clamped, rtol=SHARED_RTOL, atol=SHARED_ATOL)
+    assert against_unclamped > SHARED_RTOL, (
+        f"the shipped path is within rtol={SHARED_RTOL} of the UNCLAMPED formula "
+        f"({against_unclamped:.6e}), so a clamp is missing from it. This is the "
+        f"reading B22-M1 is about."
+    )
+
+    _shared_record(
+        r02_pre_activation_ranges=ranges,
+        r02_gate_above_limit=f"{above}/{gate.numel()}",
+        r02_up_outside_limit=f"{outside}/{up.numel()}",
+        r02_formula_separation=f"{separation:.6e}",
+        r02_shipped_vs_clamped=f"{against_clamped:.6e}",
+        r02_shipped_vs_unclamped=f"{against_unclamped:.6e}",
+        r02_route_reading=reading,
+    )
+
+
+def _shared_landed_fixture_gate_response(base, limit, block, quant_config) -> float:
+    """The landed fixture's response to the same gate perturbation R03 applies.
+
+    Recorded beside R03's own reading so the disclosure is a measurement in the
+    transcript rather than a sentence in a record. Not a bar: R03 asserts on its
+    OWN fixture and only prints this one.
+    """
+    import torch
+
+    gate, up = _shared_oracle_projections(base)
+    reference = _shared_swiglu_formula(base, gate, up, clamp=True, limit=limit)
+    routed = torch.zeros_like(reference)
+    got, _ = _shared_call_layer(block, base, quant_config, routed)
+    perturbed = dict(base)
+    perturbed["gate_w"] = (base["gate_w"].to(torch.float32) * 0.5).to(
+        base["gate_w"].dtype
+    )
+    perturbed_got, _ = _shared_call_layer(block, perturbed, quant_config, routed)
+    return _shared_max_rel_error(perturbed_got, got)
+
+
+def test_shared_expert_straddling_fixture_keeps_the_gate_projection_visible():
+    """R03. A fixture astride the clamp, so the gate projection stays measured.
+
+    WHY THIS ARM EXISTS, and it is a consequence of the repair rather than a
+    complaint about it. At the landed fixture every pre-activation is outside the
+    checkpoint's box, so ``silu(clamp(gate))`` is the constant ``silu(10)`` and
+    the landed numeric arms no longer respond to the gate projection at all:
+    halving the gate weights moves the clamped output by ``0.000000e+00`` where
+    it moves the unclamped output by ``5.000000e-01``
+    (``increments/probe-R7-straddle-and-sensitivity.out``). The clamp is the
+    checkpoint's and does not move; what moves is where this file measures it.
+
+    THREE CONJUNCTS. Both clamp regimes present in the gate operand; the shipped
+    path still agrees with the clamped reference at the declared tolerances; and
+    the shipped output RESPONDS to a change in the gate weights, which is the
+    falsifiable form of "the gate projection is still measured".
+    """
+    import torch
+
+    limit = _shared_swiglu_limit()
+    base = _shared_build_case()
+    case = _shared_straddling_case(base)
+    gate, up = _shared_oracle_projections(case)
+
+    above = int((gate > limit).sum())
+    below = int((gate <= limit).sum())
+    print(
+        f"\n[straddle] divisor={SHARED_STRADDLE_DIVISOR} limit={limit} "
+        f"gate=[{float(gate.min()):.4f}, {float(gate.max()):.4f}] "
+        f"gate_above={above}/{gate.numel()} gate_at_or_below={below}/{gate.numel()}"
+    )
+    if not (above > 0 and below > 0):
+        raise SharedVacuousControlError(
+            f"the straddling fixture puts {above} gate elements above the bound "
+            f"and {below} at or below it; this arm needs BOTH regimes or it is "
+            f"just another saturated case"
+        )
+
+    clamped = _shared_swiglu_formula(case, gate, up, clamp=True, limit=limit)
+    block = _shared_build_block()
+    quant_config = _shared_block_quant_config()
+    routed = torch.zeros_like(clamped)
+    got, sim = _shared_call_layer(block, case, quant_config, routed)
+    reading = _assert_shared_route(sim, SHARED_DECLARED_SEAM_ENTRIES, "straddle")
+    agreement = _shared_max_rel_error(got, clamped)
+
+    # The sensitivity conjunct, measured on the SHIPPED path both times.
+    perturbed = dict(case)
+    perturbed["gate_w"] = (case["gate_w"].to(torch.float32) * 0.5).to(
+        case["gate_w"].dtype
+    )
+    perturbed_got, perturbed_sim = _shared_call_layer(
+        block, perturbed, quant_config, routed
+    )
+    _assert_shared_route(
+        perturbed_sim, SHARED_DECLARED_SEAM_ENTRIES, "straddle-perturbed"
+    )
+    response = _shared_max_rel_error(perturbed_got, got)
+
+    saturated_response = _shared_landed_fixture_gate_response(base, limit, block,
+                                                              quant_config)
+    print(
+        f"[straddle] shipped_vs_clamped_reference={agreement:.6e} "
+        f"rtol={SHARED_RTOL} atol={SHARED_ATOL}"
+    )
+    print(
+        f"[straddle] gate_halved_response_here={response:.6e} "
+        f"gate_halved_response_at_the_landed_fixture={saturated_response:.6e}"
+    )
+
+    torch.testing.assert_close(got, clamped, rtol=SHARED_RTOL, atol=SHARED_ATOL)
+    assert response > SHARED_RTOL, (
+        f"halving the gate weights moved the shipped output by only "
+        f"{response:.6e}, inside rtol={SHARED_RTOL}, so this fixture does not "
+        f"measure the gate projection either and the arm earns nothing"
+    )
+
+    _shared_record(
+        r03_straddle_divisor=SHARED_STRADDLE_DIVISOR,
+        r03_gate_above_limit=f"{above}/{gate.numel()}",
+        r03_gate_at_or_below_limit=f"{below}/{gate.numel()}",
+        r03_shipped_vs_clamped=f"{agreement:.6e}",
+        r03_gate_halved_response=f"{response:.6e}",
+        r03_gate_halved_response_at_the_landed_fixture=f"{saturated_response:.6e}",
+        r03_route_reading=reading,
+    )
+
+
+def test_shared_expert_two_sided_lower_bound_is_reached_and_changes_the_answer():
+    """R04. ``min=-swiglu_limit`` is exercised, and dropping it is visible.
+
+    The unsigned fixtures are entirely positive, so the up operand's LOWER bound
+    never fires on any of them: an arm that only ran those would leave half of
+    the reference's two-sided clamp untested. The landed SIGNED fixture does
+    reach it -- 5,753 of 65,536 up elements sit below ``-10``
+    (``increments/probe-R7-straddle-and-sensitivity.out``) -- so this arm uses
+    that landed case and adds no fixture of its own.
+
+    The conjunct is not "the branch ran". It is that a ONE-SIDED up clamp
+    computes a different answer, which is what makes the lower bound load-bearing
+    rather than decorative.
+    """
+    limit = _shared_swiglu_limit()
+    signed = _shared_build_case(signed=True)
+    gate, up = _shared_oracle_projections(signed)
+
+    up_below = int((up < -limit).sum())
+    gate_below = int((gate < -limit).sum())
+    print(
+        f"\n[lower-bound] limit={limit} "
+        f"up=[{float(up.min()):.4f}, {float(up.max()):.4f}] "
+        f"up_below_negative_limit={up_below}/{up.numel()} "
+        f"gate_below_negative_limit={gate_below}/{gate.numel()}"
+    )
+    if up_below == 0:
+        raise SharedVacuousControlError(
+            f"no up element of the landed signed fixture is below -{limit}, so "
+            f"this arm cannot say anything about the lower bound"
+        )
+
+    two_sided = _shared_swiglu_formula(signed, gate, up, clamp=True, limit=limit)
+    upper_only = _shared_swiglu_formula(
+        signed,
+        gate.clamp(min=None, max=limit),
+        up.clamp(min=None, max=limit),
+        clamp=False,
+        limit=limit,
+    )
+    difference = _shared_max_rel_error(upper_only, two_sided)
+    frobenius = float(
+        (upper_only - two_sided).norm() / two_sided.norm().clamp_min(1e-12)
+    )
+    print(
+        f"[lower-bound] upper_only_vs_two_sided max_rel_error={difference:.6e} "
+        f"relative_frobenius={frobenius:.6e} rtol={SHARED_RTOL}"
+    )
+
+    assert difference > SHARED_RTOL, (
+        f"dropping the lower bound changed the answer by only {difference:.6e}, "
+        f"inside rtol={SHARED_RTOL}, so this arm does not show the lower bound "
+        f"matters"
+    )
+
+    _shared_record(
+        r04_signed_up_below_negative_limit=f"{up_below}/{up.numel()}",
+        r04_signed_gate_below_negative_limit=f"{gate_below}/{gate.numel()}",
+        r04_upper_only_vs_two_sided=f"{difference:.6e}",
+        r04_upper_only_relative_frobenius=f"{frobenius:.6e}",
     )
 
 

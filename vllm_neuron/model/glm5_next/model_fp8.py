@@ -1351,12 +1351,19 @@ class Glm5NextSharedExperts(nn.Module):
         up_proj_scale: torch.Tensor,
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
+        swiglu_limit: float,
     ) -> torch.Tensor:
         """Run the always-on shared expert through ``-026``'s dense block GEMM.
 
-        The SwiGLU the checkpoint stores: ``down(silu(gate(x)) * up(x))``, with
-        each of the three projections a separate entry into
+        The SwiGLU the checkpoint stores, **and it clamps both projections before
+        the product**: ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where
+        ``L`` is the checkpoint's ``swiglu_limit``. Each of the three projections
+        is a separate entry into
         :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`.
+
+        The clamp is the checkpoint's, not a guard this code invented; the repair
+        note at the activation step below cites the reference line for line and
+        says what the omission cost.
 
         Args:
             hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
@@ -1374,6 +1381,15 @@ class Glm5NextSharedExperts(nn.Module):
             down_proj_scale: ``[I//256, H//256]`` fp32, for ``down_proj_weight``.
             quant_config: the resolved per-model quantisation policy, and the
                 route selector; see the section note above.
+            swiglu_limit: the checkpoint's ``swiglu_limit`` -- the bound the
+                reference applies to BOTH projections before the product. **It
+                carries no default on purpose.** A default here would be a
+                literal in the fork governing a checkpoint value, which is half
+                of the defect ``B22-M1-shared-expert-swiglu-clamp-omitted``
+                names, so a caller that has not resolved the checkpoint's value
+                fails at the call instead of computing a plausible wrong number.
+                Threaded in at the call for the same reason every other operand
+                is; see the section note above and the repair note below.
 
         Returns:
             ``[T, H]`` **fp32** -- the seam's own return dtype, not re-cast here.
@@ -1453,6 +1469,53 @@ class Glm5NextSharedExperts(nn.Module):
         gate = blockwise_fp8_mm(hidden_states, gate_proj_weight, gate_proj_scale)
         # ENTRY 2 of 3 -- up.
         up = blockwise_fp8_mm(hidden_states, up_proj_weight, up_proj_scale)
+
+        # ---- THE CHECKPOINT'S TWO CLAMPS. `B22-M1`, repair round 1. -------- #
+        # WHAT WAS WRONG. This step read `activated = silu(gate) * up`, with no
+        # clamp, so it computed a DIFFERENT FUNCTION from the one the checkpoint
+        # stores. The correctness reference this campaign declares -- transformers
+        # v5.16.1, `Glm5NextTextMLP.forward`
+        # (`models/glm5_next/modeling_glm5_next.py:98-104`, and `:196-197` builds
+        # `Glm5NextTextMoE.shared_experts` as that same MLP) -- bounds the gate
+        # ABOVE and the up operand on BOTH sides before multiplying:
+        #
+        #     gate = gate.clamp(min=None, max=self.swiglu_limit)   # `:102`
+        #     up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)  # `:103`
+        #
+        # The two lines below are that transliteration, `min=None` on the gate
+        # included: the gate's bound is ONE-SIDED in the reference and copying it
+        # as a two-sided clamp would be a second wrong function, not a tidier
+        # one.
+        #
+        # WHAT THE OMISSION COST, measured rather than argued. At this section's
+        # own declared fixture the pre-activations are gate `[67.94, 184.89]` and
+        # up `[84.30, 166.43]`, so every element of both operands sits outside
+        # the checkpoint's `[-10, 10]` box, and the clamped and unclamped results
+        # differ by `max_rel_error=1.437580e+02` against a declared `rtol=3e-2`
+        # (`increments/probe-R7-clamp-and-config-lift.out`). On the real
+        # checkpoint that error entered the residual stream on each of the 42 MoE
+        # layers, silently: no shape moves, nothing raises, and the route counter
+        # still reads `nki_dispatch=3, torch_fallback=0`.
+        #
+        # WHY THE BOUND IS AN ARGUMENT AND NOT READ OFF `self`. `-013`'s
+        # `__init__` retains no config (the section note above states this and
+        # `-027` measured it), so everything this site consumes is threaded in at
+        # the call. The bound is the checkpoint's `text_config.swiglu_limit`,
+        # published as `10.0`.
+        #
+        # AND THE CONFIG LIFT THAT WOULD LET A PRODUCTION CALLER RESOLVE IT IS
+        # BLOCKED, which is stated here rather than left for the next reader to
+        # rediscover. `Glm5NextTextConfig` does not model the key, so the
+        # adapter's counting filter drops it; adding the field moves `-080`'s
+        # landed dropped-key count from 26 to 25, and that 26 is a DECLARED value
+        # pinned in a landed test (`test_config.py:362`, asserted at `:545`) and
+        # recorded as a declared conjunct (`increments/evidence-080.md:128`).
+        # Editing a declared count is not this seat's, so the lift is reported as
+        # `evidence_contradicts_design` and `inc-glm53f-054`, which assembles the
+        # forward, will find this parameter waiting and no config field to fill
+        # it from. See `increments/evidence-033-r1.md`.
+        gate = gate.clamp(min=None, max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
 
         # The SwiGLU wiring. This is call-site plumbing, not authored numerics:
         # ``silu`` is torch's own, the product is elementwise, and both run in
@@ -1554,6 +1617,7 @@ class Glm5NextMoEBlock(nn.Module):
         up_proj_scale: torch.Tensor,
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
+        swiglu_limit: float,
     ) -> torch.Tensor:
         """``routed_output + shared_expert(hidden_states)`` -- the layer output.
 
@@ -1572,6 +1636,8 @@ class Glm5NextMoEBlock(nn.Module):
             up_proj_scale: as above.
             down_proj_scale: as above.
             quant_config: as above.
+            swiglu_limit: as above -- forwarded verbatim, with no default here
+                either, so the bound cannot enter the layer from this file.
 
         Returns:
             ``[T, H]`` fp32 -- the sum, in the shared half's fp32 seam dtype.
@@ -1608,6 +1674,7 @@ class Glm5NextMoEBlock(nn.Module):
             up_proj_scale,
             down_proj_scale,
             quant_config,
+            swiglu_limit,
         )
 
         # Extents compared EXACTLY, before the add. ``torch`` would broadcast a
