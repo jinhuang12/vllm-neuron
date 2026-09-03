@@ -1149,24 +1149,26 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"(bwmm_shard_on_I.py:667)"
             )
 
-        # ---- The padding-token slot. Appended here, once. ---------------- #
-        # The kernel reads a ``-1`` token position as the LAST row of
-        # ``hidden_states`` (``bwmm_shard_on_I.py:157``), so both the hidden
-        # tensor and the affinity tensor grow one zero row and the mapping is
-        # built over ``T + 1`` tokens. Slicing it back off is the last step.
-        pad_hidden = torch.zeros(
-            1, hidden, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        padded_hidden = torch.cat([hidden_states, pad_hidden], dim=0)
-        pad_affinities = torch.zeros(
-            1,
-            num_experts,
-            dtype=expert_affinities.dtype,
-            device=expert_affinities.device,
-        )
-        padded_affinities = torch.cat([expert_affinities, pad_affinities], dim=0)
-
-        # ---- The token-block mapping. REUSED (F9), not authored. --------- #
+        # ---- The token-block mapping, over the REAL token count. --------- #
+        # REUSED (F9), not authored.
+        #
+        # THE ORDER HERE IS LOAD-BEARING, and until repair batch R5 round 2 it
+        # was the wrong way round. The kernel needs a padding-token slot, and
+        # this site used to append it to the affinities BEFORE building the
+        # mapping. That made the mapping see ``T + 1`` tokens, which is odd for
+        # every even real token count, and the mapping's two NKI subkernels
+        # need ``chunk_size % 128 == 0`` and ``total_tokens % f_len == 0``
+        # (``moe_blockwise.py:520, 536``). Both fail on an odd count, so the
+        # mapping fell to ``_build_blockwise_mapping_torch`` on EVERY call at
+        # EVERY shape the plan declares -- a silent torch fallback for per-token
+        # device work the fork already ships NKI subkernels for
+        # (``moe_blockwise.py:10-11``). Finding ``B21-027``, P13.
+        #
+        # The mapping is now built over the real ``T`` and the padding slot is
+        # appended afterwards. The fork's own MoE call site is the precedent:
+        # ``gpt_oss/model_mxfp4.py:1518-1536`` never appends a row before the
+        # mapping.
+        #
         # ``conditions`` is deliberately unconsumed: it feeds the
         # ``*_hybrid`` dynamic-while variant of the vendor kernel, and D5(b)
         # calls the non-hybrid inner member, whose signature has no such
@@ -1178,12 +1180,39 @@ class Glm5NextRoutedExperts(nn.Module):
             block_to_expert,
             _conditions,
         ) = build_blockwise_mapping(
-            expert_affinities=padded_affinities,
+            expert_affinities=expert_affinities,
             num_local_experts=num_experts,
             num_experts_per_token=int(self.num_experts_per_tok),
             block_size=block,
             moe_group=moe_group,
             tp_degree=tp_degree,
+        )
+
+        # ---- The padding-token slot, appended AFTER the mapping. --------- #
+        # The kernel reads a ``-1`` token position as the LAST row of
+        # ``hidden_states`` (``bwmm_shard_on_I.py:157``), so the hidden tensor
+        # grows one zero row and the result is sliced back at the end.
+        #
+        # The affinities grow the same slot in their FLAT form, because that is
+        # what the mapping returns: ``expert_affinities_masked`` is
+        # ``[T * E_local, 1]`` and the layout is token-major
+        # (``moe_blockwise.py:103-105``, a ``view(-1, 1)`` of ``[T, E]``).
+        # Appending ``E_local`` zero entries to the flat tensor is therefore the
+        # same tensor as appending one zero ROW before the view -- measured
+        # byte-identical, not assumed (``probe-R5r2-pad-order-equivalence.py``,
+        # reading ``Q2``). Only this order keeps ``total_tokens`` even.
+        pad_hidden = torch.zeros(
+            1, hidden, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        padded_hidden = torch.cat([hidden_states, pad_hidden], dim=0)
+        pad_masked = torch.zeros(
+            num_experts,
+            1,
+            dtype=expert_affinities_masked.dtype,
+            device=expert_affinities_masked.device,
+        )
+        expert_affinities_masked = torch.cat(
+            [expert_affinities_masked, pad_masked], dim=0
         )
 
         # ---- The scale bridge. ``-025``'s helper, at its own arity. ------ #

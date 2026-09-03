@@ -44,11 +44,12 @@ WHY THE ATTRIBUTION LEG EXISTS AND WHAT IT IS NOT. ``-026``'s dense seam
 dense half, counted downstream by ``inc-glm53f-033`` (plan L933) -- and this
 test adds no dense-half dispatch conjunct. The attribution leg is here because
 the call site also calls ``build_blockwise_mapping``, which HAS a NKI flow, and
-a total-only count could not say which component produced the one dispatch.
-That the mapping contributes zero on this configuration is MEASURED, not
-assumed, in :func:`test_moe_path_mapping_contributes_zero_dispatches`, and the
-attribution instrument's discrimination is armed against a REAL foreign
-dispatch in
+a total-only count could not say which component produced the dispatches.
+The mapping's OWN share is therefore MEASURED, not assumed, in the same run --
+:func:`_measure_mapping_count` runs the mapping alone under the same instrument
+and :func:`_assert_route` then requires the identity
+``total == through_seam + mapping_count`` -- and the attribution instrument's
+discrimination is armed against a REAL foreign dispatch in
 :func:`test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere`.
 
 F1: WHY THE NUMERIC ARM ALONE IS A FALSE GREEN WAITING TO HAPPEN. ``-025``'s
@@ -156,10 +157,15 @@ E = 4
 #: block per expert.
 K = 2
 
-#: Real tokens the call site is handed. ``256`` so that ``T + 1 = 257`` is the
-#: extent ``build_blockwise_mapping`` sees; see
-#: :func:`test_moe_path_mapping_contributes_zero_dispatches` for why that
-#: matters and how it is measured.
+#: Real tokens the call site is handed. ``256`` is the extent
+#: ``build_blockwise_mapping`` sees, because the call site builds the mapping over
+#: the real token count and appends the kernel's padding slot AFTERWARDS. Both of
+#: the mapping's kernel gates turn on that extent being even, so the order is
+#: load-bearing; see
+#: :func:`test_moe_path_call_site_maps_before_padding_and_dispatches_nki`, which
+#: measures it, and
+#: :func:`test_moe_path_mapping_order_moves_no_numbers`, which measures that the
+#: two orders produce the same tensors.
 T = 256
 
 #: Tokens per block. ``256`` is the vendor kernel's ``B % 256 == 0`` assert
@@ -179,6 +185,17 @@ ATOL = 1e-5
 DECLARED_CASES = 1
 
 #: The plan's declared dispatch count for the route arm: ``1/1`` calls.
+#:
+#: WHAT THE PLAN ACTUALLY DECLARES, AND WHAT IT DOES NOT. The plan declares the
+#: SEAM reading and only the seam reading: ``-025``'s ``seam_nki_dispatch == 1``,
+#: ``seam_torch_fallback == 0``, and the attributed ``through_seam == 1``, in
+#: ``1/1`` calls. It declares NO total simulator-entry count and NO mapping
+#: dispatch count anywhere. So the total clause inside :func:`_assert_route` is
+#: THIS FILE's own instrument against the F1 false green, not a plan-declared
+#: value: it requires at least one entry and then ATTRIBUTES every entry to a
+#: measured source. Repair round 2 of ``inc-glm53f-027`` corrected this comment,
+#: which had read the total as plan-backed, and replaced the equality with the
+#: attribution identity.
 DECLARED_DISPATCHES = 1
 
 _FP8 = torch.float8_e4m3fn
@@ -306,14 +323,32 @@ class _AttributedSimulatorCounter:
 
 
 def _assert_route(
-    sim: _AttributedSimulatorCounter, expected: int, label: str
+    sim: _AttributedSimulatorCounter,
+    expected: int,
+    label: str,
+    *,
+    mapping_count: int,
 ) -> str:
     """Read all four route instruments and return the reading for the transcript.
 
     The certifying component of each conjunct is named in the message (D1.4):
     conjuncts 1 and 2 are ``-025``'s module-level counters, conjunct 3 is
-    ``vllm_neuron.utils.neuron_utils.can_run_kernel``, conjunct 4 is
-    ``nki.simulator.simulate_kernel`` itself.
+    ``vllm_neuron.utils.neuron_utils.can_run_kernel``, conjuncts 4 and 5 are
+    ``nki.simulator.simulate_kernel`` itself, conjunct 6 is the frame walk.
+
+    ``expected`` is the PLAN-DECLARED seam count (``1/1``); it governs conjuncts
+    1 and 6. ``mapping_count`` is a READING, never a literal: the caller measures
+    the token-block mapping alone with :func:`_measure_mapping_count`, under the
+    same instrument and in the same run, and passes what the instrument said.
+
+    Conjuncts 4 and 5 are this file's F1 guard, not a plan-declared count (see
+    :data:`DECLARED_DISPATCHES`). Conjunct 4 refuses a numeric pass with no
+    simulator entry at all. Conjunct 5 then requires every entry to be
+    ATTRIBUTED: the total must equal the seam's attributed share plus the
+    mapping's measured share, with nothing left over. That identity is what
+    catches an unattributed third dispatcher AND -- because the mapping's share
+    is nonzero only when the call site builds the mapping over the real token
+    count -- a call site that pads before it maps.
     """
     nki_dispatch, torch_fallback = dispatch_counters()
     gate = can_run_kernel(torch.zeros(1))
@@ -322,7 +357,9 @@ def _assert_route(
         f"seam_torch_fallback={torch_fallback} can_run_kernel={gate} "
         f"simulate_kernel_total={sim.total} "
         f"simulate_kernel_through_025_seam={sim.through_seam} "
-        f"simulate_kernel_elsewhere={sim.elsewhere}"
+        f"simulate_kernel_elsewhere={sim.elsewhere} "
+        f"measured_mapping_count={mapping_count} "
+        f"attribution_sum={sim.through_seam + mapping_count}"
     )
     print(reading)
     if nki_dispatch != expected:
@@ -341,11 +378,21 @@ def _assert_route(
         raise RouteInstrumentError(
             f"{label}: can_run_kernel() read {gate!r}, declared True. {reading}"
         )
-    if sim.total != expected:
+    if sim.total < 1:
         raise RouteInstrumentError(
-            f"{label}: nki.simulator.simulate_kernel ran {sim.total} times, "
-            f"declared {expected}. A numeric pass without a simulator entry is "
-            f"the F1 false green. {reading}"
+            f"{label}: nki.simulator.simulate_kernel ran {sim.total} times, so "
+            f"no kernel was simulated at all. A numeric pass without a simulator "
+            f"entry is the F1 false green. {reading}"
+        )
+    if sim.total != sim.through_seam + mapping_count:
+        raise RouteInstrumentError(
+            f"{label}: {sim.total} simulator entries do not add up. "
+            f"{sim.through_seam} attributed to -025's seam plus "
+            f"{mapping_count} measured for the token-block mapping alone is "
+            f"{sim.through_seam + mapping_count}. Either some component nobody "
+            f"measured dispatched, or the call site handed the mapping an extent "
+            f"whose NKI gates refuse -- which is what padding before mapping "
+            f"does, finding B21-027. {reading}"
         )
     if sim.through_seam != expected:
         raise RouteInstrumentError(
@@ -355,6 +402,84 @@ def _assert_route(
             f"which is not what R-2 counts. {reading}"
         )
     return reading
+
+
+def _run_mapping(expert_affinities: torch.Tensor, label: str) -> dict:
+    """Run the token-block mapping ALONE under the file's own counter.
+
+    Returns the mapping's four outputs and its measured simulator entry count.
+    The call site calls exactly two components that can dispatch -- ``-025``'s
+    seam and ``build_blockwise_mapping`` -- so the mapping's own share, measured
+    on its own, is what makes :func:`_assert_route`'s attribution identity
+    complete rather than a subtraction.
+
+    The mapping's entries must land in ``elsewhere``, never in ``through_seam``:
+    the mapping lives in ``functional/moe/moe_blockwise.py`` and ``-025``'s seam
+    is a different file. That is asserted here, so adding ``mapping_count`` to
+    ``through_seam`` provably double-counts nothing.
+    """
+    from vllm_neuron.functional import build_blockwise_mapping
+
+    with _AttributedSimulatorCounter() as mapping_sim:
+        masked, token_position_to_id, block_to_expert, conditions = (
+            build_blockwise_mapping(
+                expert_affinities=expert_affinities,
+                num_local_experts=E,
+                num_experts_per_token=K,
+                block_size=B,
+                moe_group=None,
+                tp_degree=1,
+            )
+        )
+    print(
+        f"[mapping-{label}] total_tokens={expert_affinities.shape[0]} "
+        f"simulate_kernel_total={mapping_sim.total} "
+        f"through_025_seam={mapping_sim.through_seam} "
+        f"elsewhere={mapping_sim.elsewhere} "
+        f"masked_shape={tuple(masked.shape)} "
+        f"num_blocks={block_to_expert.numel()} "
+        f"conditions={conditions.tolist()} "
+        f"occupied_positions={int((token_position_to_id >= 0).sum())} "
+        f"masked_nonzeros={int((masked != 0).sum())}"
+    )
+    if mapping_sim.through_seam != 0:
+        raise RouteInstrumentError(
+            f"mapping-{label}: {mapping_sim.through_seam} of "
+            f"{mapping_sim.total} entries produced by the token-block mapping "
+            f"were attributed to -025's seam ({_SEAM_FILE}). The mapping is a "
+            f"different file, so this reading would make the attribution "
+            f"identity double-count."
+        )
+    return {
+        "masked": masked,
+        "token_position_to_id": token_position_to_id,
+        "block_to_expert": block_to_expert,
+        "conditions": conditions,
+        "total": mapping_sim.total,
+    }
+
+
+def _measure_mapping_count(expert_affinities: torch.Tensor, label: str) -> int:
+    """The mapping's measured simulator entry count, for the attribution identity."""
+    return _run_mapping(expert_affinities, label)["total"]
+
+
+def _envelope_affinities(tokens: int) -> torch.Tensor:
+    """This file's fixture scatter pattern, at an arbitrary token count.
+
+    ``K`` experts per token, rotating through the experts and through
+    :data:`AFFINITY_VALUES`, which is exactly what :func:`_build_case` does at
+    ``T``. It exists so the envelope arm can read the mapping's route at token
+    counts the fixture does not build. The plan declares nothing about extents
+    above ``T``, so this pattern is labelled as this file's own choice.
+    """
+    out = torch.zeros(tokens, E, dtype=torch.float32)
+    for token in range(tokens):
+        for slot in range(K):
+            out[token, (token + slot) % E] = AFFINITY_VALUES[
+                (token + slot) % len(AFFINITY_VALUES)
+            ]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +806,15 @@ def test_moe_path_output_matches_pure_torch_reference() -> None:
         got = bank.block_quant_expert_mm(
             quant_config=quant_config, block_size=B, **case["call_site_inputs"]
         )
-    reading = _assert_route(sim, DECLARED_DISPATCHES, "acceptance")
+    # The mapping's own share, measured on the SAME inputs the call site hands it
+    # (the real token count -- the padding slot is appended after the mapping),
+    # under the same instrument, in this same run. A reading, never a literal.
+    mapping_count = _measure_mapping_count(
+        case["call_site_inputs"]["expert_affinities"], "acceptance"
+    )
+    reading = _assert_route(
+        sim, DECLARED_DISPATCHES, "acceptance", mapping_count=mapping_count
+    )
 
     if tuple(got.shape) != (T, H):
         raise ReferenceShapeError(
@@ -865,8 +998,15 @@ def test_moe_path_route_control_fallback_counter_discriminates(
         f"simulate_kernel_total={sim.total} "
         f"through_025_seam={sim.through_seam}"
     )
+    # Measured in the SAME monkeypatched world, so the mapping's share is read
+    # off the fallback path too rather than carried over from the real one.
+    mapping_count = _measure_mapping_count(
+        case["call_site_inputs"]["expert_affinities"], "route-control"
+    )
     with pytest.raises(RouteInstrumentError):
-        _assert_route(sim, DECLARED_DISPATCHES, "route-control")
+        _assert_route(
+            sim, DECLARED_DISPATCHES, "route-control", mapping_count=mapping_count
+        )
 
 
 def test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere() -> None:
@@ -913,85 +1053,220 @@ def test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere() -> Non
     assert sim.elsewhere == sim.total
 
 
-def test_moe_path_mapping_contributes_zero_dispatches() -> None:
-    """MEASURED: ``build_blockwise_mapping`` dispatches nothing at ``T + 1 = 257``.
+def test_moe_path_call_site_maps_before_padding_and_dispatches_nki() -> None:
+    """MEASURED THROUGH THE CALL SITE: the mapping runs its NKI flow, not torch.
 
-    The call site calls two components that CAN dispatch: ``-025``'s seam and
-    ``build_blockwise_mapping``. This arm measures the mapping's contribution in
-    isolation, so the acceptance's ``total == 1`` is attributable without
-    relying on the frame walk alone.
+    This is finding ``B21-027``'s repair-round-2 demonstration. Two readings,
+    both taken inside ONE real call-site call:
 
-    Both of the mapping's kernel gates refuse at this extent -- ``chunk_size =
-    min(257, 16384) = 257`` fails ``chunk_size % 128 == 0``
-    (``moe_blockwise.py:520``) and ``f_len = min(128, 257 // 16) = 16`` fails
-    ``257 % 16 == 0`` (``:536``) -- but the reading below is the count, not the
-    argument.
+    1. The tensor the call site hands ``build_blockwise_mapping`` has ``T`` rows,
+       not ``T + 1``. The padding slot is appended AFTER the mapping.
+    2. During that mapping call the simulator was entered a NONZERO number of
+       times, and none of those entries were attributed to ``-025``'s seam.
 
-    D1.5: the same counter is then armed on a real seam call in the same test,
-    so the zero is a measurement rather than an unwired instrument.
+    Reading 2 is the point. Both of the mapping's kernel gates turn on the extent
+    being even -- ``chunk_size % 128 == 0`` (``moe_blockwise.py:520``) and
+    ``T % f_len == 0`` with ``f_len = min(128, T // 16)`` (``:536``) -- so with
+    the padding row appended FIRST the extent was ``257``, both gates refused,
+    and the mapping fell to ``_build_blockwise_mapping_torch`` on every call at
+    every declared shape. That is a silent torch fallback for per-token device
+    work the fork already ships NKI subkernels for (``moe_blockwise.py:10-11``),
+    which P13 forbids. The reading below is the count, not the argument.
+
+    The nested counter also completes the attribution
+    :func:`_assert_route` requires: the outer total must equal the seam's
+    attributed share plus the mapping's nested share, with nothing left over.
+
+    D1.5: nothing here is a zero. The seam dispatches, the mapping dispatches,
+    and both counts are printed, so no reading is a silent unwired instrument.
     """
-    from vllm_neuron.functional import build_blockwise_mapping
-
+    bank, _text_config = _build_bank()
+    quant_config = _block_quant_config()
     case = _build_case()
-    inputs = case["call_site_inputs"]
-    padded_affinities = torch.cat(
-        [
-            inputs["expert_affinities"],
-            torch.zeros(1, E, dtype=inputs["expert_affinities"].dtype),
-        ],
-        dim=0,
-    )
-    with _AttributedSimulatorCounter() as mapping_sim:
-        masked, token_position_to_id, block_to_expert, conditions = (
-            build_blockwise_mapping(
-                expert_affinities=padded_affinities,
-                num_local_experts=E,
-                num_experts_per_token=K,
-                block_size=B,
-                moe_group=None,
-                tp_degree=1,
+
+    seen: list[torch.Tensor] = []
+    nested: list[_AttributedSimulatorCounter] = []
+
+    import vllm_neuron.functional as NF
+
+    real_mapping = NF.build_blockwise_mapping
+
+    def spy(expert_affinities, *args, **kwargs):
+        seen.append(expert_affinities.detach().clone())
+        # A NESTED counter, so the mapping's own share is read inside the real
+        # call-site call rather than reconstructed from a separate run. Nesting
+        # composes: this counter's "real" is the outer counter's wrapper, so the
+        # outer total still sees every entry.
+        with _AttributedSimulatorCounter() as inner:
+            result = real_mapping(expert_affinities, *args, **kwargs)
+        nested.append(inner)
+        return result
+
+    reset_dispatch_counters()
+    NF.build_blockwise_mapping = spy
+    try:
+        with _AttributedSimulatorCounter() as outer:
+            out = bank.block_quant_expert_mm(
+                quant_config=quant_config, block_size=B, **case["call_site_inputs"]
             )
+    finally:
+        NF.build_blockwise_mapping = real_mapping
+
+    if len(seen) != 1 or len(nested) != 1:
+        raise VacuousControlError(
+            f"the call site entered the mapping {len(seen)} times, not once; "
+            f"every reading here assumes exactly one entry"
         )
+    handed, inner = seen[0], nested[0]
+    counters = dispatch_counters()
     print(
-        f"[mapping] total_tokens={padded_affinities.shape[0]} "
-        f"simulate_kernel_total={mapping_sim.total} "
-        f"num_blocks={block_to_expert.numel()} "
-        f"conditions={conditions.tolist()} "
-        f"occupied_positions={int((token_position_to_id >= 0).sum())} "
-        f"masked_nonzeros={int((masked != 0).sum())}"
-    )
-    assert mapping_sim.total == 0, (
-        f"the mapping produced {mapping_sim.total} simulator entries, so the "
-        f"acceptance's total of {DECLARED_DISPATCHES} is not attributable to "
-        f"-025's seam by count alone"
+        f"[call-site-mapping] handed_shape={tuple(handed.shape)} "
+        f"real_tokens={T} padded_tokens={T + 1} "
+        f"mapping_simulate_kernel_total={inner.total} "
+        f"mapping_through_025_seam={inner.through_seam} "
+        f"mapping_elsewhere={inner.elsewhere} "
+        f"outer_total={outer.total} outer_through_025_seam={outer.through_seam} "
+        f"attribution_sum={outer.through_seam + inner.total} "
+        f"seam_counters={counters} out_shape={tuple(out.shape)} "
+        f"out_absmax={float(out.abs().max()):.6e}"
     )
 
-    # ARM the same instrument on a real dispatch, so the zero above is a reading.
-    reset_dispatch_counters()
-    padded_hidden = torch.cat(
-        [inputs["hidden_states"], torch.zeros(1, H, dtype=torch.bfloat16)], dim=0
+    assert tuple(handed.shape) == (T, E), (
+        f"the call site handed the mapping {tuple(handed.shape)}; it must hand "
+        f"the REAL token count ({T}, {E}) and append the kernel's padding slot "
+        f"afterwards. ({T + 1}, {E}) is the pad-first order finding B21-027 "
+        f"reports, and it turns both of the mapping's NKI gates off."
     )
-    with _AttributedSimulatorCounter() as seam_sim:
-        blockwise_fp8_moe(
-            hidden_states=padded_hidden,
-            expert_affinities_masked=masked.to(torch.bfloat16),
-            gate_up_proj_weight=inputs["gate_up_proj_weight"],
-            down_proj_weight=inputs["down_proj_weight"],
-            block_size=B,
-            token_position_to_id=token_position_to_id,
-            block_to_expert=block_to_expert.reshape(-1, 1),
-            gate_up_proj_scale=case["gup_logical"],
-            down_proj_scale=case["down_logical"],
-        )
+    assert inner.total > 0, (
+        f"the mapping dispatched {inner.total} kernels inside a real call-site "
+        f"call, so it took the torch fallback for per-token device work the "
+        f"fork ships NKI subkernels for -- finding B21-027, P13"
+    )
+    assert inner.through_seam == 0, (
+        f"{inner.through_seam} of the mapping's {inner.total} entries were "
+        f"attributed to -025's seam, so the attribution sum double-counts"
+    )
+    assert outer.through_seam == DECLARED_DISPATCHES, (
+        f"the seam was entered {outer.through_seam} times, declared "
+        f"{DECLARED_DISPATCHES}"
+    )
+    assert outer.total == outer.through_seam + inner.total, (
+        f"{outer.total} entries in the whole call do not add up: "
+        f"{outer.through_seam} through the seam plus {inner.total} in the "
+        f"mapping is {outer.through_seam + inner.total}. Some component nobody "
+        f"measured dispatched."
+    )
+    assert counters == (1, 0), (
+        f"seam counters {counters}: the mapping's route must not change how many "
+        f"times the block-quant kernel is entered, nor take a fallback"
+    )
+    assert tuple(out.shape) == (T, H)
+    assert bool(torch.isfinite(out).all())
+    assert float(out.abs().max()) > 0.0
+
+
+def test_moe_path_mapping_order_moves_no_numbers() -> None:
+    """The two pad orders give the SAME tensors, so no declared value moves.
+
+    Turning the mapping's NKI flow on would be a real contradiction if it changed
+    what the seam consumes -- the numeric arm's declared
+    ``assert_close(rtol=3e-2, atol=1e-5)`` is frozen and this increment has no
+    authority over it. So the equality is MEASURED here, four readings:
+
+    * ``token_position_to_id``, ``block_to_expert`` and ``conditions`` are
+      element-wise equal between the pad-first (``T + 1``) and pad-after (``T``)
+      orders.
+    * appending ``E`` zero entries to the FLAT masked tensor the pad-after order
+      returns is byte-identical to the pad-first order's masked tensor. The flat
+      layout is token-major -- a ``view(-1, 1)`` of ``[T, E]``
+      (``moe_blockwise.py:103-105``) -- so appending at the end of the flat form
+      is the same tensor as appending a row before the view. Measured, not
+      assumed.
+    * the pad-first order dispatches ZERO kernels and the pad-after order
+      dispatches a nonzero count. That contrast is the mechanism behind finding
+      ``B21-027``, and it arms the zero: the same instrument reads nonzero in the
+      same test.
+    """
+    case = _build_case()
+    affinities = case["call_site_inputs"]["expert_affinities"]
+    padded = torch.cat(
+        [affinities, torch.zeros(1, E, dtype=affinities.dtype)], dim=0
+    )
+
+    pad_first = _run_mapping(padded, "pad-first-257")
+    pad_after = _run_mapping(affinities, "pad-after-256")
+
+    assert pad_first["total"] == 0, (
+        f"the pad-first order dispatched {pad_first['total']} kernels; finding "
+        f"B21-027's mechanism is that both NKI gates refuse at T + 1 = {T + 1}"
+    )
+    assert pad_after["total"] > 0, (
+        f"the pad-after order dispatched {pad_after['total']} kernels, so the "
+        f"repair did not turn the mapping's NKI flow on"
+    )
+
+    pad_flat = torch.zeros(E, 1, dtype=pad_after["masked"].dtype)
+    repaired_masked = torch.cat([pad_after["masked"], pad_flat], dim=0)
     print(
-        f"[mapping-arming] seam_simulate_kernel_total={seam_sim.total} "
-        f"through_025_seam={seam_sim.through_seam}"
+        f"[mapping-order] flat_append_shape={tuple(repaired_masked.shape)} "
+        f"row_append_shape={tuple(pad_first['masked'].shape)} "
+        f"masked_byte_identical="
+        f"{bool(torch.equal(repaired_masked, pad_first['masked']))}"
     )
-    if seam_sim.total == 0:
-        raise VacuousControlError(
-            "the instrument read 0 on a real seam dispatch too, so the "
-            "mapping's 0 above measured nothing"
+    assert tuple(repaired_masked.shape) == tuple(pad_first["masked"].shape)
+    assert torch.equal(repaired_masked, pad_first["masked"]), (
+        "appending E zero entries to the flat masked tensor is not the same "
+        "tensor as appending a zero row before the view, so the pad-order "
+        "change would move what the seam consumes"
+    )
+
+    for key in ("token_position_to_id", "block_to_expert", "conditions"):
+        left, right = pad_first[key], pad_after[key]
+        equal = tuple(left.shape) == tuple(right.shape) and bool(
+            torch.equal(left, right)
         )
+        print(
+            f"[mapping-order-{key}] pad_first_shape={tuple(left.shape)} "
+            f"pad_after_shape={tuple(right.shape)} element_wise_equal={equal}"
+        )
+        assert equal, (
+            f"{key} differs between the two pad orders, so turning the NKI flow "
+            f"on changes what the seam consumes and the declared tolerance is "
+            f"no longer the same measurement"
+        )
+
+
+@pytest.mark.parametrize("tokens", [T, 512, 1024, 2048])
+def test_moe_path_mapping_dispatches_nki_across_the_token_envelope(
+    tokens: int,
+) -> None:
+    """The mapping's NKI flow is on at every token count in the review's bar.
+
+    ``T`` is the fixture's own count; ``512``, ``1024`` and ``2048`` are the bar
+    the implementation review set, so a nonzero reading at one convenient extent
+    cannot stand in for the envelope. Each count is read twice -- the real count
+    and the same count plus the padding row -- so the reading is a CONTRAST and
+    not one number in isolation.
+
+    The affinity pattern is this file's own fixture scatter at a different token
+    count, not a plan-declared shape; the plan declares nothing about extents
+    above ``T``.
+    """
+    real = _envelope_affinities(tokens)
+    padded = torch.cat([real, torch.zeros(1, E, dtype=real.dtype)], dim=0)
+
+    after = _run_mapping(real, f"envelope-{tokens}-real")
+    first = _run_mapping(padded, f"envelope-{tokens}-padded")
+
+    assert after["total"] > 0, (
+        f"at {tokens} real tokens the mapping dispatched {after['total']} "
+        f"kernels, so its NKI flow is off at this extent"
+    )
+    assert first["total"] == 0, (
+        f"at {tokens} + 1 tokens the mapping dispatched {first['total']} "
+        f"kernels; the contrast that makes the reading above meaningful is that "
+        f"the pad-first extent refuses both gates"
+    )
 
 
 # ===========================================================================
@@ -1755,30 +2030,30 @@ def test_moe_path_dispatch_maps_global_router_output_at_degree_above_one() -> No
         # DIFFERENT mechanism from the ``torch.gather`` the call site uses, so
         # this is a comparison and not a restatement.
         want = affinities[:, columns]
-        got = seam_affinities[:T]
-        pad_row = seam_affinities[T:]
+        got = seam_affinities
         print(
             f"[dispatch-rank] rank={rank} columns={tuple(columns.tolist())} "
             f"seam_affinity_shape={tuple(seam_affinities.shape)} "
             f"gathered_equals_columns={bool(torch.equal(got, want))} "
             f"gathered_nonzeros={int((got != 0).sum())} "
-            f"pad_row_all_zero="
-            f"{bool(torch.equal(pad_row, torch.zeros_like(pad_row)))} "
             f"out_shape={tuple(out.shape)} "
             f"out_absmax={float(out.abs().max()):.6e} "
             f"seam_counters={counters}"
         )
-        assert tuple(seam_affinities.shape) == (T + 1, EP_LOCAL_EXPERTS), (
+        # ``[T, E_local]`` with NO padding row: repair round 2 moved the padding
+        # slot to AFTER the mapping, because both of the mapping's NKI gates
+        # refuse an odd extent (finding ``B21-027``). So this reading is also the
+        # pad-order reading, at degree ``{degree}`` rather than at degree 1 --
+        # revert the order in the call site and this assertion reads ``T + 1``.
+        assert tuple(seam_affinities.shape) == (T, EP_LOCAL_EXPERTS), (
             f"the mapping was handed {tuple(seam_affinities.shape)}; the whole "
             f"point of the dispatch step is that it sees "
-            f"[T+1={T + 1}, E_local={EP_LOCAL_EXPERTS}]"
+            f"[T={T}, E_local={EP_LOCAL_EXPERTS}], and the padding slot is "
+            f"appended after the mapping, not before it"
         )
         assert torch.equal(got, want), (
             f"rank {rank}'s gathered slice is not its own global columns "
             f"{tuple(columns.tolist())}"
-        )
-        assert torch.equal(pad_row, torch.zeros_like(pad_row)), (
-            "the appended padding row must stay zero through the gather"
         )
         assert tuple(out.shape) == (T, H)
         assert bool(torch.isfinite(out).all())
