@@ -1641,6 +1641,16 @@ class Glm5NextKDAAttention(nn.Module):
         self.num_kv_heads_per_rank = _per_rank(self.num_heads, world_size)
         self.head_size = self.head_dim
         self.cache_dtype = _resolve_kda_state_dtype(text_config)
+        # The gate's lower bound is the checkpoint's, read through the same
+        # checked accessor as the rest of ``linear_attn_config`` so a missing key
+        # raises here instead of reaching the gate seam as a default. The seam
+        # requires it and holds no copy of it (``gate_clamp.py:253-259``).
+        self.gate_lower_bound = float(
+            _linear_attn_field(text_config, "gate_lower_bound")
+        )
+        # The decoder's RMSNorm epsilon, from the config rather than from a local
+        # default, on ``inc-glm53f-080``'s precedent at line 889 of this file.
+        self.rms_norm_eps = float(text_config.rms_norm_eps)
         # ``NeuronConfig.kda_state_chunk_size`` is declared a tuning dial with
         # "None = let the layer choose" (``neuron_config.py:185-188``), and
         # ``LayerSpec.chunk_size`` already exists at the pin, so the dial is
@@ -1648,6 +1658,61 @@ class Glm5NextKDAAttention(nn.Module):
         self.cache_chunk_size = getattr(
             text_config.neuron_config, "kda_state_chunk_size", None
         )
+
+        # The four recurrent-state values ``get_kv_spec`` reports for this
+        # family. ``inc-glm53f-015`` declared the four field names and
+        # ``inc-glm53f-016`` certified the runner's translation of them; D14
+        # gives the VALUES to ``inc-glm53f-038``, because they come from this
+        # layer's own state geometry.
+        #
+        # BOTH PAIRS ARE DERIVED FROM vLLM's OWN CALCULATORS AND NEITHER IS
+        # WRITTEN AS A LITERAL. The conv state's extent ORDER is chosen by the
+        # environment (``VLLM_SSM_CONV_STATE_LAYOUT``), so a hand-written pair
+        # would be right under one layout and silently transposed under the
+        # other -- and a transposition survives a byte reconciliation, which is
+        # why ``test_kv_cache_spec.py:31-40`` records the orientation term as
+        # load-bearing. The import is function-local because this module holds
+        # no vLLM import at module level.
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+            MambaStateShapeCalculator,
+            get_conv_state_layout,
+            is_conv_state_dim_first,
+        )
+
+        conv_state_shape, recurrent_state_shape = (
+            MambaStateShapeCalculator.kda_state_shape(
+                tp_world_size=world_size,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                conv_kernel_size=self.short_conv_kernel_size,
+            )
+        )
+        self.kda_conv_state_shape = tuple(conv_state_shape)
+        self.kda_recurrent_state_shape = tuple(recurrent_state_shape)
+        # ``kda_state_dtype(model_dtype, "auto")`` returns
+        # ``(state_dtype, torch.float32)`` and resolves ``"auto"`` to the dtype
+        # passed in (``vllm/utils/torch_utils.py:291-295``), so passing
+        # ``self.cache_dtype`` keeps ``NeuronConfig.kda_state_dtype``'s override
+        # honoured on the conv carrier while the recurrent carrier's float32
+        # still comes from the vendor rather than from a local constant.
+        (
+            self.kda_conv_state_dtype,
+            self.kda_recurrent_state_dtype,
+        ) = MambaStateDtypeCalculator.kda_state_dtype(self.cache_dtype, "auto")
+
+        # Which axis of ``kda_conv_state_shape`` is the channel axis, read from
+        # the same authority that ordered it. The forward slices the conv
+        # carrier, so it must not infer the order from the extents.
+        # ``is_conv_state_dim_first`` IS the predicate ``_orient_conv_shape``
+        # branched on (``vllm/model_executor/layers/mamba/mamba_utils.py:46-48``
+        # -- path-qualified because this tree carries a second ``mamba_utils.py``
+        # at ``vllm/v1/worker/``), so this is the same reading and
+        # not a second inference from the extents. The layout string is kept
+        # beside it because a transcript naming ``"SD"`` is checkable and a bare
+        # bool is not.
+        self.kda_conv_state_layout = get_conv_state_layout()
+        self.kda_conv_state_dim_first = is_conv_state_dim_first()
 
         # The map's fifteen, in the map's own order: ``KDA_PROJECTIONS`` as
         # ``<leaf>_weight``, then ``KDA_BARE_LEAVES`` with no suffix at all.
@@ -1670,11 +1735,276 @@ class Glm5NextKDAAttention(nn.Module):
             "dt_bias",
         )
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextKDAAttention.forward is a stub created by "
-            "inc-glm53f-013; the KDA path lands with inc-glm53f-034..-038"
+    # ----------------------------------------------------------------- #
+    # The conv carrier's extent order, handled in one place.             #
+    # ----------------------------------------------------------------- #
+    def _conv_history(self, conv_state: torch.Tensor) -> torch.Tensor:
+        """The carried conv rows as ``[kernel_size - 1, channels]``, float32.
+
+        The stored order is the environment's, so it is converted here once
+        rather than assumed at the call site.
+        """
+        rows = conv_state.t() if self.kda_conv_state_dim_first else conv_state
+        return rows.to(torch.float32)
+
+    def _store_conv_history(
+        self, conv_state: torch.Tensor, rows: torch.Tensor
+    ) -> None:
+        """Write ``rows`` (``[kernel_size - 1, channels]``) back in stored order."""
+        value = rows.t() if self.kda_conv_state_dim_first else rows
+        conv_state.copy_(value.to(conv_state.dtype))
+
+    def _resolve_chunk_size(self, chunk_size: int | None) -> int:
+        """The chunk width the chunked seams are entered with.
+
+        ``NeuronConfig.kda_state_chunk_size`` is declared a dial whose ``None``
+        means "let the layer choose", so this is where the layer chooses. The
+        choice is DERIVED from the two declared bounds it has to satisfy rather
+        than picked: the intra-chunk seam needs a power of two in ``[2, 128]``,
+        and both chunked seams refuse a chunk-local cumulative gate above
+        ``GATE_CUMSUM_ABS_LIMIT``. The gate this layer produces lies in
+        ``[gate_lower_bound, 0]``, so one chunk's cumulative gate cannot exceed
+        ``chunk * |gate_lower_bound|`` -- and the largest power of two that keeps
+        that product inside the limit is the widest chunk that cannot be refused
+        for gate range at any input.
+        """
+        from vllm_neuron.functional.kda.chunked_recurrence import (
+            GATE_CUMSUM_ABS_LIMIT,
+            MAX_TILE,
         )
+
+        requested = chunk_size if chunk_size is not None else self.cache_chunk_size
+        if requested is not None:
+            return int(requested)
+
+        bound = abs(self.gate_lower_bound)
+        widest = 2
+        candidate = 2
+        while candidate <= MAX_TILE:
+            if bound * candidate <= GATE_CUMSUM_ABS_LIMIT:
+                widest = candidate
+            candidate *= 2
+        return widest
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        is_prefill: bool,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
+        """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
+
+        The five landed seams are entered in this order, and each entry is one
+        counted dispatch: the short convolution (``inc-glm53f-034``), the gate
+        clamp (``inc-glm53f-084``'s re-authored form), then either the two
+        chunked seams (``inc-glm53f-035a`` and ``-035b``) or the single-token
+        decode seam (``inc-glm53f-036``). This function composes them; it
+        implements none of their arithmetic, which is why its substrate class is
+        non-kernel-class.
+
+        Args:
+            hidden_states: ``[T, hidden]``. One rank's slice of one step's
+                tokens.
+            conv_state: this layer's conv carrier from the runner bank, shaped
+                as ``get_kv_spec`` reports it. READ for the left context of the
+                convolution and WRITTEN IN PLACE with the new tail.
+            recurrent_state: this layer's recurrent carrier from the runner
+                bank, ``[heads, V, K]``. Index 1 is the VALUE extent and index 2
+                the KEY extent -- the orientation ``-035b``'s ``final_state``
+                and ``-036``'s ``state`` both use. ``V == K == head_dim`` here,
+                so that choice cannot be read off the shape and is stated rather
+                than implied. Written in place.
+            is_prefill: whether this call is a prefill. It selects the
+                recurrence route and nothing else.
+            chunk_size: overrides the resolved chunk width, for a test that
+                needs to name it.
+
+        Returns:
+            ``[T, hidden]`` at the input dtype.
+
+        THE PREFILL ARM ENTERS THE CHUNKED SEAMS WITH A ZERO STATE, BY
+        CONSTRUCTION. Neither chunked seam accepts an entering state, so a
+        prefill starts the recurrence at zero and ``recurrent_state`` is
+        OVERWRITTEN by this call rather than read by it. That is this block's
+        declared NON-GOAL held as code, not an oversight: carrying a state into
+        a chunked prefill is what chunked prefill, prefix caching or
+        multi-token prediction would need, and none of the three exists at the
+        pin.
+
+        WHOLE CHUNKS GO THROUGH THE CHUNKED PAIR AND THE REMAINDER WALKS. A
+        prefill of ``T = n * chunk + r`` tokens takes one intra-chunk and one
+        inter-chunk dispatch for the ``n`` whole chunks together -- their inputs
+        carry the chunk axis, so ``n`` chunks cost one dispatch each -- and then
+        ``r`` single-token decode dispatches for the remainder. A decode call
+        takes no chunked dispatch at any token count.
+
+        The imports are function-local because this module's import block is
+        another increment's section (D14).
+        """
+        from vllm_neuron.functional.kda.chunked_recurrence import (
+            kda_inter_chunk,
+            kda_intra_chunk,
+        )
+        from vllm_neuron.functional.kda.decode_state import kda_decode_step
+        from vllm_neuron.functional.kda.depthwise_conv1d import depthwise_conv1d
+        from vllm_neuron.functional.kda.gate_clamp import kda_gate_clamp
+
+        if hidden_states.dim() != 2:
+            raise ValueError(
+                f"hidden_states must be [tokens, hidden]; got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        tokens = int(hidden_states.shape[0])
+        heads = int(self.num_kv_heads_per_rank)
+        kdim = int(self.head_dim)
+        width = heads * kdim
+        state_rows = int(self.short_conv_kernel_size) - 1
+
+        expected_recurrent = (heads, kdim, kdim)
+        if tuple(recurrent_state.shape) != expected_recurrent:
+            raise ValueError(
+                f"recurrent_state {tuple(recurrent_state.shape)} must be "
+                f"{expected_recurrent} for this rank's geometry"
+            )
+        if tuple(conv_state.shape) != tuple(self.kda_conv_state_shape):
+            raise ValueError(
+                f"conv_state {tuple(conv_state.shape)} must be the shape "
+                f"get_kv_spec reports, {tuple(self.kda_conv_state_shape)}"
+            )
+
+        x = hidden_states.to(torch.float32)
+
+        def project(weight: torch.Tensor) -> torch.Tensor:
+            return x @ weight.to(torch.float32).t()
+
+        q_in = project(self.q_proj_weight)
+        k_in = project(self.k_proj_weight)
+        v_in = project(self.v_proj_weight)
+        raw_beta = project(self.b_proj_weight)
+        # Both gates are low-rank: a bottleneck projection, then an expansion
+        # back to the head width. The bottleneck width is read from the weights
+        # rather than from the config, because the config declares no such field.
+        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
+            self.f_b_proj_weight.to(torch.float32).t()
+        )
+        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
+            self.g_b_proj_weight.to(torch.float32).t()
+        )
+
+        # --- seam 1: the short convolution, ONE dispatch for q, k and v ------
+        # The three streams are convolved together as one channel block, which
+        # is the same channel extent the state calculator reports
+        # (``conv_dim = proj + 2 * proj_k``). Padding is carried by the state
+        # rather than by the seam, which refuses non-zero width padding.
+        conv_in = torch.cat((q_in, k_in, v_in), dim=-1)
+        padded = torch.cat((self._conv_history(conv_state), conv_in), dim=0)
+        channels = 3 * width
+        img = (
+            padded.t().contiguous().reshape(1, channels, 1, state_rows + tokens)
+        )
+        filt = torch.cat(
+            (
+                self.q_conv1d_weight.to(torch.float32).reshape(width, 1, 1, -1),
+                self.k_conv1d_weight.to(torch.float32).reshape(width, 1, 1, -1),
+                self.v_conv1d_weight.to(torch.float32).reshape(width, 1, 1, -1),
+            ),
+            dim=0,
+        ).contiguous()
+        conv_out = depthwise_conv1d(img, filt)
+        conv_out = conv_out.reshape(channels, tokens).t()
+        conv_out = torch.nn.functional.silu(conv_out)
+        q_conv, k_conv, v_conv = conv_out.split(width, dim=-1)
+        self._store_conv_history(conv_state, padded[padded.shape[0] - state_rows :])
+
+        # --- seam 2: the gate clamp, one dispatch per head -------------------
+        # The seam takes ONE head per call: it refuses an ``a_log`` holding more
+        # than one value, because the decay rate is per head while the bias and
+        # the gate are per key channel.
+        a_log = self.A_log.to(torch.float32).reshape(-1)
+        dt_bias = self.dt_bias.to(torch.float32).reshape(-1)
+        gate_parts = [
+            kda_gate_clamp(
+                raw_gate[:, h * kdim : (h + 1) * kdim].contiguous(),
+                a_log[h],
+                bias=dt_bias[h * kdim : (h + 1) * kdim],
+                lower=self.gate_lower_bound,
+            )
+            for h in range(heads)
+        ]
+        beta = torch.sigmoid(raw_beta)
+
+        # --- seams 3 to 5: the recurrence, per head --------------------------
+        chunk = self._resolve_chunk_size(chunk_size)
+        n_chunks = tokens // chunk if is_prefill else 0
+        chunked = n_chunks * chunk
+        core = torch.empty(tokens, width, dtype=torch.float32)
+        for h in range(heads):
+            span = slice(h * kdim, (h + 1) * kdim)
+            q_h = q_conv[:, span].contiguous()
+            k_h = k_conv[:, span].contiguous()
+            v_h = v_conv[:, span].contiguous()
+            gk_h = gate_parts[h]
+            beta_h = beta[:, h].contiguous()
+
+            if is_prefill:
+                state = torch.zeros(kdim, kdim, dtype=torch.float32)
+            else:
+                state = recurrent_state[h].to(torch.float32)
+
+            if chunked:
+                shape = (n_chunks, chunk, kdim)
+                intra = kda_intra_chunk(
+                    q_h[:chunked].reshape(shape).contiguous(),
+                    k_h[:chunked].reshape(shape).contiguous(),
+                    v_h[:chunked].reshape(shape).contiguous(),
+                    beta_h[:chunked].reshape(n_chunks, chunk).contiguous(),
+                    gk_h[:chunked].reshape(shape).contiguous(),
+                )
+                inter = kda_inter_chunk(
+                    intra.kg,
+                    intra.w,
+                    intra.u,
+                    gk_h[:chunked].reshape(shape).contiguous(),
+                    q_h[:chunked].reshape(shape).contiguous(),
+                    intra.aqk,
+                )
+                core[:chunked, span] = inter.o.reshape(chunked, kdim)
+                state = inter.final_state
+
+            for t in range(chunked, tokens):
+                step = kda_decode_step(
+                    state,
+                    q_h[t : t + 1],
+                    k_h[t : t + 1],
+                    v_h[t : t + 1],
+                    beta_h[t].reshape(1, 1),
+                    gk_h[t : t + 1],
+                )
+                core[t, span] = step.o.reshape(-1)
+                state = step.state
+
+            recurrent_state[h] = state.to(recurrent_state.dtype)
+
+        # --- gated output norm, then the output projection -------------------
+        # ``rmsnorm(core) * sigmoid(out_gate)``, normalised over the head extent
+        # because the norm gain is one value per key channel. The reference
+        # builds this half as a gated RMSNorm whose activation is sigmoid
+        # (``kimi_gdn_linear_attn.py:219``), which is why the raw gate is passed
+        # through a sigmoid here and not through a silu.
+        shaped = core.reshape(tokens, heads, kdim)
+        variance = shaped.pow(2).mean(dim=-1, keepdim=True)
+        shaped = shaped * torch.rsqrt(variance + self.rms_norm_eps)
+        shaped = shaped * self.o_norm_weight.to(torch.float32).reshape(1, 1, kdim)
+        shaped = shaped * torch.sigmoid(
+            out_gate.reshape(tokens, heads, kdim)
+        )
+        attn_out = shaped.reshape(tokens, width) @ (
+            self.o_proj_weight.to(torch.float32).t()
+        )
+        return attn_out.to(hidden_states.dtype)
 
 
 class Glm5NextKDALayer(nn.Module):
@@ -1720,17 +2050,68 @@ class Glm5NextKDALayer(nn.Module):
         )
         self.self_attn = Glm5NextKDAAttention(text_config, world_size)
         self.mlp = _build_mlp(text_config, layer_idx)
+        self.rms_norm_eps = float(text_config.rms_norm_eps)
 
     @property
     def attention(self) -> nn.Module:
         return getattr(self, self.ATTENTION_ATTR)
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextKDALayer.forward is a stub created by inc-glm53f-013; "
-            "the KDA layer lands with inc-glm53f-038 and the full 45-layer "
-            "forward with inc-glm53f-054"
+    def _input_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Pre-attention RMSNorm: ``x / sqrt(mean(x**2) + eps) * gain``.
+
+        A method rather than a module-level helper, because this file's
+        module-level region is another increment's D14 section. The epsilon is
+        the checkpoint's ``rms_norm_eps``, resolved at construction on the same
+        ground ``inc-glm53f-080`` states at line 889.
+        """
+        x = hidden_states.to(torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        normed = x * torch.rsqrt(variance + self.rms_norm_eps)
+        normed = normed * self.input_layernorm_weight.to(torch.float32)
+        return normed.to(hidden_states.dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        is_prefill: bool,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
+        """Pre-norm, then the linear-attention half, then the residual add.
+
+        WHAT THIS FORWARD DELIBERATELY DOES NOT DO, AND WHY IT IS NOT A GAP.
+        A finished decoder layer also runs its feed-forward half and its
+        hyper-connection mixing. Neither is reachable at this milestone and
+        neither is this increment's to write:
+
+        * ``self.mlp`` raises whichever branch ``_build_mlp`` chose --
+          ``Glm5NextDenseMLP.forward`` and ``Glm5NextMoEBlock.forward`` are both
+          still stubs -- and those sections belong to ``inc-glm53f-031`` through
+          ``inc-glm53f-033``.
+        * the six mHC weights sit flat on this layer but no
+          ``Glm5NextHyperConnection`` instance is bound to it yet, and that
+          wiring is ``inc-glm53f-030``'s section.
+
+        D14 tells an implementer whose increment would have to touch a class
+        outside its own section to raise that rather than widen its surface, so
+        this forward stops at the attention half and ``inc-glm53f-054`` joins the
+        halves when it writes the 45-layer forward.
+
+        Args and returns are the attention module's, passed through unchanged;
+        see :meth:`Glm5NextKDAAttention.forward` for what the two carriers mean.
+        """
+        residual = hidden_states
+        normed = self._input_norm(hidden_states)
+        attn_out = self.attention(
+            normed,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            is_prefill=is_prefill,
+            chunk_size=chunk_size,
         )
+        return residual + attn_out
 
 
 # ---------------------------------------------------------------------------
@@ -2025,6 +2406,26 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ``num_kv_heads_per_rank``, ``head_size``, ``cache_dtype`` and
         ``cache_chunk_size``. ``sliding_window_size`` is ``None`` on every
         entry -- this arch declares no sliding window on either half.
+
+        THE FOUR RECURRENT-STATE FIELDS ARE FILLED BY THE SAME UNIFORM READ.
+        A linear-attention layer holds a short-convolution state and a
+        recurrent state instead of a key/value history, and reports the two on
+        ``LayerSpec``'s four ``kda_*`` fields (``inc-glm53f-015``'s declared
+        interface). ``Glm5NextKDAAttention`` derives all four from vLLM's own
+        state calculators at its own rank geometry; ``Glm5NextMLAAttention``
+        declares none of them. So the read is a DEFAULTING one -- a family that
+        carries no recurrent state reports ``None`` on all four by carrying no
+        attribute, rather than by this method testing which family it is
+        looking at. That keeps the one loop family-blind, which is the property
+        ``inc-glm53f-013`` built it for, and it is why the runner recognises the
+        two halves BY THE FIELDS THEY CARRY (``neuron_model_runner.py``
+        ``:8720-8726``) rather than by a layer name.
+
+        All four move together or not at all. The runner refuses a layer that
+        declares part of the geometry (``neuron_model_runner.py:8727-8733``),
+        because the conv and recurrent carriers are paired positionally, so a
+        partial set would shorten the reported page. One ``getattr`` per field
+        against one attribute-carrying class satisfies that by construction.
         """
         layers: list[LayerSpec] = []
         for layer_idx, layer in enumerate(self.model.layers):
@@ -2037,6 +2438,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     dtype=attention.cache_dtype,
                     sliding_window_size=None,
                     chunk_size=attention.cache_chunk_size,
+                    kda_conv_state_shape=getattr(
+                        attention, "kda_conv_state_shape", None
+                    ),
+                    kda_recurrent_state_shape=getattr(
+                        attention, "kda_recurrent_state_shape", None
+                    ),
+                    kda_conv_state_dtype=getattr(
+                        attention, "kda_conv_state_dtype", None
+                    ),
+                    kda_recurrent_state_dtype=getattr(
+                        attention, "kda_recurrent_state_dtype", None
+                    ),
                 )
             )
         return KVSpec(layers=layers)
