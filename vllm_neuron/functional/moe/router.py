@@ -25,7 +25,7 @@ from nkilib.core.router_topk.router_topk import router_topk as _substrate_router
 from nkilib.core.subkernels.rmsnorm_tkg import _rmsnorm_tkg_dloc
 from nkilib.core.utils.common_types import QuantizationType
 # The substrate's OWN sharding query -- the same call the vendor router uses to
-# decide its `T_local`/`T_offset` (`router_topk.py:361`). Imported rather than
+# decide its `T_local`/`T_offset` (`router_topk.py:217`). Imported rather than
 # reimplemented so the authored stage below and the vendor producer cannot
 # disagree about which core owns which tokens. Repair round 1 of
 # `inc-glm53f-032`, finding `M-B20-1`.
@@ -1073,10 +1073,22 @@ def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
     """This core's token range, by the substrate's own formula. Plain python.
 
     Returns ``(t_offset, t_local)``: the first global token row this core owns
-    and how many it owns. Transliterated from the vendor router's two lines,
-    ``T_local = T // 2`` and ``T_offset = T_local * prg_id``
-    (``router_topk.py:371-372``), generalised from its literal ``2`` to
-    ``n_prgs`` so the two readings cannot drift if the launch grid changes.
+    and how many it owns. Transliterated line for line from the vendor router's
+    own split (``router_topk.py:221-224``)::
+
+        T_first_shard = T // n_prgs
+        T_second_shard = T - T_first_shard
+        T_local = T_first_shard if prg_id == 0 else T_second_shard
+        T_offset = 0 if prg_id == 0 else T_first_shard
+
+    The remainder goes to the SECOND core, and that detail is copied rather than
+    simplified. An even split written as ``T // n_prgs`` for both cores agrees
+    with the vendor on every extent this stage can receive, because the
+    admission clause forces a multiple of 256 -- but it would silently drop the
+    tail on any other extent, and a private helper that disagrees with the
+    producer on an unreachable input is the same defect ``M-B20-1`` is about, one
+    input away. The vendor's split is only defined for two programs, which is all
+    ``get_verified_program_sharding_info(..., (0, 1), 2)`` admits.
 
     Factored OUT of the kernel body on purpose: the arithmetic that decides
     which core writes which rows is the whole content of finding ``M-B20-1``,
@@ -1090,8 +1102,10 @@ def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
     substrate needs ``T // 2 % 128 == 0``. The same clause that admits the
     extent therefore guarantees this loop covers it.
     """
-    t_local = num_tokens // n_prgs
-    return t_local * prg_id, t_local
+    t_first = num_tokens // n_prgs
+    if prg_id == 0:
+        return 0, t_first
+    return t_first, num_tokens - t_first
 
 
 def _noaux_tc_stage(
@@ -1154,9 +1168,10 @@ def _noaux_tc_stage(
     # `M-B20-1`.
     #
     # The fix is the producer's own shard, not a new one. The vendor router
-    # computes `T_local = T // 2` and `T_offset = T_local * prg_id` and then
-    # writes the logits, the affinities and the indices only at that offset
-    # (`router_topk.py:371-372`, and its three stores at `:588`, `:649`, `:706`).
+    # computes its `T_local` and `T_offset` at `router_topk.py:221-224` and then
+    # writes the logits, the affinities and the indices only at that offset --
+    # each through `_hbm_tiled_store_view(..., T_offset, ...)`, at `:486` for the
+    # logits, `:562` for the affinities and `:713` for the indices.
     # This stage asks the SAME question through the SAME call and covers only its
     # own rows, so each core reads exactly the logits it produced and writes
     # exactly the rows it read. No barrier is needed because no cross-core read

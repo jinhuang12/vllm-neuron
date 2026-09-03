@@ -1147,6 +1147,24 @@ def test_shard_range_partitions_the_declared_token_extent() -> None:
     assert _noaux_tc_shard_range(DECLARED_T, 2, 1) == (DECLARED_T // 2,
                                                        DECLARED_T // 2)
 
+    # THE VENDOR'S TAIL RULE, read rather than trusted. The producer gives the
+    # remainder of an uneven split to the SECOND core (`router_topk.py:221-224`).
+    # No extent this stage can receive is uneven -- the admission clause forces a
+    # multiple of 256 -- so this reading guards the helper against agreeing with
+    # the producer only by luck of the admitted extents.
+    uneven = [(_noaux_tc_shard_range(7, 2, prg), prg) for prg in (0, 1)]
+    print(f"[shard-range] uneven_extent_7_ranges={uneven}")
+    assert _noaux_tc_shard_range(7, 2, 0) == (0, 3)
+    assert _noaux_tc_shard_range(7, 2, 1) == (3, 4), (
+        "the odd token goes to the second core in the vendor's split, so it must "
+        "go there here too; a floor split on both cores would drop it"
+    )
+    covered_uneven: list[int] = []
+    for prg in (0, 1):
+        offset, local = _noaux_tc_shard_range(7, 2, prg)
+        covered_uneven.extend(range(offset, offset + local))
+    assert sorted(covered_uneven) == list(range(7))
+
 
 def test_fused_seam_stage_takes_a_distinct_token_range_per_core(monkeypatch) -> None:
     """THE M-B20-1 DEMONSTRATION: a per-core token range, read from the kernel.
