@@ -1295,28 +1295,71 @@ def _record_fp8(**values: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _fp8_full_range_tile(variant: int) -> torch.Tensor:
-    """One `[128,128]` fp32 tile sweeping the whole OCP e4m3fn magnitude range.
+def _fp8_representable_magnitudes() -> torch.Tensor:
+    """Every finite positive magnitude of ``float8_e4m3fn``, enumerated not derived.
 
-    A linspace from `-448` to `+448` hits both endpoints exactly (both are
-    representable), and casting to fp8 collapses the 16384 samples onto the
-    grid -- so the tile contains essentially every representable magnitude,
-    including `256.0`, the byte whose re-quantisation error is the worst in the
-    range. The four variants are range-preserving rearrangements: every tile's
-    absolute maximum is `448`, which is what a per-block quantiser produces and
-    what C1's normalisation leans on.
+    Read off the format itself: all 256 byte values are viewed as the dtype, the
+    non-finite ones are dropped, and the absolute values are de-duplicated. That is a
+    measurement of the grid rather than a restatement of the spec, so a torch build
+    with a different grid would move this fixture instead of silently disagreeing with
+    it.
+
+    Measured on the campaign venv (torch 2.11.0): **254** finite bytes, **126**
+    positive magnitudes, smallest ``0.001953125``, largest ``448.0``, and **seven**
+    subnormals below ``2**-6``.
+    """
+    every_byte = (
+        torch.arange(256, dtype=torch.uint8)
+        .view(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    finite = every_byte[torch.isfinite(every_byte)]
+    magnitudes = torch.unique(finite.abs())
+    return magnitudes[magnitudes > 0]
+
+
+def _fp8_full_range_tile(variant: int) -> torch.Tensor:
+    """One `[128,128]` fp32 tile holding EVERY representable OCP e4m3fn magnitude.
+
+    REBUILT BY ``inc-glm53f-012``'s R2 ROUND, for finding
+    ``B08-F2-fixture-misses-low-end-grid-understates-disclosed-error``. It used to be
+    `torch.linspace(-448, +448, 16384)` cast to fp8, and its docstring claimed the
+    cast collapsed those samples onto "essentially every representable magnitude".
+    That is false, and the review measured why: the ramp's sample spacing is about
+    0.0547, so no sample lands below it, and the cast reaches **88 of the 126**
+    positive magnitudes. The 38 it misses are the entire low end, including all seven
+    subnormals. The consequence was not cosmetic -- the per-element figure this
+    fixture produces was routed to the lead as "the measured per-element worst", and
+    over the missing low end the real worst is thirteen times larger.
+
+    The tile is now built from the enumerated grid itself
+    (:func:`_fp8_representable_magnitudes`): the 126 positive magnitudes, their
+    negatives and zero, which is 253 values, repeated to fill 16384 elements. 16384 is
+    64 whole cycles of 253 plus 192, so coverage does not depend on where the
+    truncation falls. Measured: the tile covers **126 of 126** magnitudes, against 88
+    for the old ramp, and its absolute maximum is still exactly ``448``.
+
+    Two properties the conjuncts lean on are preserved on purpose. Every tile's
+    absolute maximum is ``448``, which is what a per-block quantiser produces and what
+    C1's normalisation leans on. And ``256.0`` is still present -- the byte whose
+    re-quantisation gives the worst *absolute* error, 12.8, which is what C1 actually
+    measures. C1's block-normalised worst is unchanged at ``0.0285714`` under both
+    fixtures, so this rebuild moves the disclosed per-element figure and no tolerance.
+
+    The four variants are range-preserving rearrangements, as before.
     """
     rows, cols = FP8_BLOCK_SIZE
-    ramp = torch.linspace(
-        -FP8_OCP_MAX, FP8_OCP_MAX, rows * cols, dtype=torch.float32
-    ).reshape(rows, cols)
+    positive = _fp8_representable_magnitudes()
+    signed = torch.cat([-positive.flip(0), torch.zeros(1), positive])
+    repeats = (rows * cols) // int(signed.numel()) + 1
+    grid = signed.repeat(repeats)[: rows * cols].reshape(rows, cols)
     if variant == 0:
-        return ramp
+        return grid
     if variant == 1:
-        return torch.flip(ramp, dims=(1,))
+        return torch.flip(grid, dims=(1,))
     if variant == 2:
-        return ramp.t().contiguous()
-    return -ramp
+        return grid.t().contiguous()
+    return -grid
 
 
 def _fp8_synthetic_weight() -> torch.Tensor:
@@ -1416,6 +1459,15 @@ def test_fp8_downscale_fixture_is_full_range_and_block_shaped(
     measures 0.0308 against a 0.0300 tolerance -- so it is asserted rather than
     assumed. Property 2 (C2's): the pre-squeeze bytes are NOT already inside the
     240 range, or "100% within 240" afterwards would certify nothing.
+
+    PROPERTY 3 IS NEW, from finding ``B08-F2``: the fixture's magnitude COVERAGE. The
+    old fixture's docstring claimed it held essentially every representable magnitude
+    and, as the review put it, that claim "is also asserted by no test" -- this test
+    checked the maxima and the 240 fraction and said nothing about coverage, so the
+    claim could be false for as long as nobody recomputed it. It is now a reading:
+    every one of the 126 positive magnitudes must be present, the seven subnormals
+    among them, and the count is recorded so a future fixture change shows up as a
+    number rather than as a still-green test.
     """
     assert tuple(fp8_downscale_weight.shape) == FP8_WEIGHT_SHAPE
     assert fp8_downscale_weight.dtype is torch.float8_e4m3fn
@@ -1446,6 +1498,34 @@ def test_fp8_downscale_fixture_is_full_range_and_block_shaped(
     )
     # Every declared scale is above the floor, so C3's zero is not the floor's doing.
     assert bool((fp8_downscale_scales >= MINVAL).all())
+
+    # Property 3 -- coverage, per finding B08-F2. Compared against the grid this
+    # fixture is built from, not against a literal count, so the assertion states the
+    # property ("all of them") rather than a number that would need editing if a torch
+    # build ever changed the grid.
+    representable = _fp8_representable_magnitudes()
+    present = torch.unique(dense.abs())
+    present = present[present > 0]
+    missing = representable[~torch.isin(representable, present)]
+    subnormals = representable[representable < 2.0 ** -6]
+    subnormals_present = int(torch.isin(subnormals, present).sum())
+    _record_fp8(
+        fixture_representable_magnitudes=int(representable.numel()),
+        fixture_magnitudes_present=int(present.numel()),
+        fixture_magnitudes_missing=[float(x) for x in missing],
+        fixture_subnormals_total=int(subnormals.numel()),
+        fixture_subnormals_present=subnormals_present,
+        fixture_smallest_magnitude_present=float(present.min()),
+    )
+    assert missing.numel() == 0, (
+        f"the fixture misses {missing.numel()} of {representable.numel()} "
+        f"representable magnitudes, smallest missing {float(missing.min())}; the "
+        f"per-element figure this fixture discloses would be taken over a subset"
+    )
+    assert subnormals_present == subnormals.numel(), (
+        f"only {subnormals_present} of {subnormals.numel()} subnormals are present; "
+        f"the smallest subnormal is where the 240/448 squeeze is worst per element"
+    )
     _record_fp8(
         fixture_tile_maxima=tile_maxima,
         fixture_fraction_within_240_before=fraction_within,
@@ -1518,9 +1598,24 @@ def test_fp8_downscale_c1_dequantisation_agrees_per_block(
         # Disclosed, gated on nothing: the worst per-element relative difference
         # across all four blocks. It exceeds rtol, which is exactly why the
         # criterion's own clause names a normalised comparison.
+        #
+        # RE-REPORTED BY THE R2 ROUND, for finding B08-F2. This figure was 0.0667 and
+        # was routed to the lead as "the measured per-element worst". It was the worst
+        # over the OLD fixture's 88-magnitude subset, not over the grid: the ramp
+        # reached no magnitude below 0.0273, and the squeeze is at its worst on the
+        # smallest subnormal. On the rebuilt fixture the same code measures 0.8667 --
+        # thirteen times larger, and now over all 126 magnitudes. NO TOLERANCE MOVED:
+        # this value gates nothing, and C1's block-normalised worst is 0.0285714 under
+        # both fixtures.
         c1_worst_element_relative_disclosed=max(
             r.worst_element_relative for r in reports
         ),
+        # The population the figure was taken over, recorded beside it so the number
+        # cannot be quoted again without its denominator.
+        c1_worst_element_population_magnitudes=int(
+            _fp8_representable_magnitudes().numel()
+        ),
+        c1_worst_element_population_is_the_full_grid=True,
     )
 
 
