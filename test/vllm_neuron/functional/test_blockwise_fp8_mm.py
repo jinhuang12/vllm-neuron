@@ -15,12 +15,30 @@ The two DECLARED arms, and why there are two
    atol=1e-5)`` per output tile, all tiles passing, worst tile error reported as
    a number;
 2. the **exact arm** -- the same comparison with every block scale ``1.0``,
-   which isolates the dequantisation arithmetic from the quantisation error.
+   which isolates the dequantisation arithmetic from the quantisation error, and
+   which the plan requires to pass at **single-op tolerance, 1e-5**.
 
-Both arms run at the SAME declared tolerance pair. No tolerance number is
-invented, widened or narrowed anywhere in this file: ``RTOL`` and ``ATOL`` below
-are the plan's, and widening one to absorb remapping error is the user's
-election (§11.B.7 option (b)), never this test's.
+The two arms run at DIFFERENT gates, and that difference is the point
+------------------------------------------------------------------------
+Arm 1 gates at the declared pair ``rtol=3e-2, atol=1e-5``. Arm 2 gates at
+``1e-5`` on both terms (``SINGLE_OP_TOL`` below), because that is the figure its
+own bullet declares.
+
+Until repair batch R4 both arms called the same helper with the same pair, and
+the module said so here. Finding ``B19-026`` found that this made arm 2 certify
+nothing arm 1 did not already certify: ``assert_close`` allows
+``|got - want| <= atol + rtol * |want|``, and on this fixture ``|want|`` reaches
+about ``1.45e+02``, so ``rtol=3e-2`` alone allowed about ``4.3`` of absolute
+error and the ``atol`` term was swallowed whole. A bf16 accumulator inside the
+kernel moves the result by roughly ``4e-3`` relative -- inside ``3e-2``, so both
+arms stayed green, and outside ``1e-5``, so the arm the plan created to catch it
+would have caught it. ``test_exact_arm_gate_is_armed_at_single_op_tolerance``
+now measures both of those readings directly.
+
+No tolerance number is invented, widened or narrowed anywhere in this file:
+``RTOL`` and ``ATOL`` below are the plan's, ``SINGLE_OP_TOL`` is bound to
+``ATOL`` rather than written again, and widening one to absorb remapping error
+is the user's election (§11.B.7 option (b)), never this test's.
 
 Why the route predicate is an acceptance criterion and not a diagnostic (F1)
 ---------------------------------------------------------------------------
@@ -103,6 +121,14 @@ OUTPUT_TILES = M_TILES * N_BLOCKS   # 4 -- the "per output tile" population
 #: The declared tolerance pair, from the plan block. Not moved anywhere below.
 RTOL = 3e-2
 ATOL = 1e-5
+
+#: The exact arm's own declared gate: the plan's "a 1e-5 exact-scale case ...
+#: which must pass at single-op tolerance". It is BOUND to ``ATOL`` rather than
+#: written as a second literal, because ``ATOL`` already IS the plan's 1e-5.
+#: Nothing new is introduced here and nothing existing moves: this name only
+#: routes the plan's own figure to the arm whose bullet declares it.
+#: Added by ``inc-glm53f-026``'s repair for finding ``B19-026`` (repair batch R4).
+SINGLE_OP_TOL = ATOL
 
 _FP8 = torch.float8_e4m3fn
 _MODULE = "vllm_neuron.functional.blockwise_fp8_mm"
@@ -316,11 +342,24 @@ def _max_rel_error(got: torch.Tensor, want: torch.Tensor) -> float:
     return float(((got - want).abs() / (want.abs() + ATOL)).max())
 
 
-def _compare_per_output_tile(got: torch.Tensor, want: torch.Tensor, label: str) -> float:
-    """Assert the declared tolerance per output tile; return the worst error.
+def _compare_per_output_tile(
+    got: torch.Tensor,
+    want: torch.Tensor,
+    label: str,
+    *,
+    rtol: float = RTOL,
+    atol: float = ATOL,
+) -> float:
+    """Assert a declared tolerance per output tile; return the worst error.
 
     Reports every tile's error as a number and the worst one, which is the
     plan's declared expected result for both arms.
+
+    ``rtol`` and ``atol`` default to the declared pair, which is arm 1's gate.
+    The exact arm passes ``SINGLE_OP_TOL`` for both, which is the gate ITS own
+    bullet declares. The gate in force is printed on every line below, so a
+    reader never has to infer which arm ran at which numbers -- that inference
+    is what finding ``B19-026`` had to make by hand.
     """
     nonzero = int((want.abs().sum(-1) > 0).sum())
     if nonzero == 0:
@@ -346,14 +385,15 @@ def _compare_per_output_tile(got: torch.Tensor, want: torch.Tensor, label: str) 
         if rel > worst:
             worst, worst_tile = rel, index
         torch.testing.assert_close(
-            got[rows, cols], want[rows, cols], rtol=RTOL, atol=ATOL
+            got[rows, cols], want[rows, cols], rtol=rtol, atol=atol
         )
         passed += 1
 
     print(
         f"[{label}] tiles_passing={passed}/{OUTPUT_TILES} "
         f"worst_max_rel_error={worst:.6e} worst_tile={worst_tile} "
-        f"rtol={RTOL} atol={ATOL}"
+        f"rtol={rtol} atol={atol} "
+        f"worst_max_abs_error={float((got - want).abs().max()):.6e}"
     )
     assert passed == OUTPUT_TILES, f"{passed}/{OUTPUT_TILES} tiles passed"
     return worst
@@ -386,6 +426,15 @@ def test_output_matches_torch_oracle_per_output_tile() -> None:
 def test_exact_scale_arm_all_block_scales_one() -> None:
     """Every block scale ``1.0``: isolates dequant arithmetic from quant error.
 
+    THE GATE HERE IS ``1e-5`` ON BOTH TERMS, NOT THE DECLARED PAIR. The plan's
+    bullet for this arm says "a 1e-5 exact-scale case where all block scales are
+    1.0, which must pass at single-op tolerance". Running it at ``rtol=3e-2``
+    would let about ``4.3`` of absolute error through on this fixture, which is
+    more than arm 1 already allows, so the arm would isolate nothing. Finding
+    ``B19-026`` found exactly that. The measured error on this arm is
+    ``0.000000e+00`` on all four tiles, so the tighter gate is passable as it
+    stands and no number had to move to reach it.
+
     The route count matters MOST here. With unit scales the dequantisation is a
     no-op, so this is the arm a silent torch fallback would satisfy most easily
     -- which is why the plan requires ``1`` dispatch on this arm too and not only
@@ -406,7 +455,116 @@ def test_exact_scale_arm_all_block_scales_one() -> None:
     _assert_route(sim, 1, "exact-arm")
 
     want = blockwise_fp8_mm_torch_oracle(case["x"], case["weight"], scale)
-    _compare_per_output_tile(got.to(torch.float32), want, "exact-arm")
+    _compare_per_output_tile(
+        got.to(torch.float32),
+        want,
+        "exact-arm",
+        rtol=SINGLE_OP_TOL,
+        atol=SINGLE_OP_TOL,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# NON-VACUITY of the EXACT ARM'S gate specifically (finding B19-026).           #
+# --------------------------------------------------------------------------- #
+#: The precision the kernel module names as load-bearing at
+#: ``blockwise_fp8_mm.py:42-44`` -- "the PSUM tile and the SBUF accumulator are
+#: fp32, and the kernel returns fp32". This control degrades a REAL kernel result
+#: to bf16 and back, which is the observable consequence of that choice being
+#: reversed, without editing the kernel.
+DEGRADED_ACCUMULATOR_DTYPE = torch.bfloat16
+
+
+def test_exact_arm_gate_is_armed_at_single_op_tolerance() -> None:
+    """A bf16-degraded result must pass the declared pair and FAIL ``1e-5``.
+
+    WHY THIS ARM EXISTS. The exact arm's own error is ``0.000000e+00``, and a
+    zero is indistinguishable from an unwired gate. Finding ``B19-026`` found
+    that the gate really was unwired: both arms ran at ``rtol=3e-2``, which on
+    this fixture allows about ``4.3`` of absolute error, so the exact arm could
+    not fail on anything arm 1 would not already have failed on.
+
+    WHAT IT MEASURES, AS TWO COUNTED READINGS. It takes the exact arm's real
+    simulated-NKI output and rounds it through bf16 and back. bf16 keeps 8
+    significand bits, so this is about ``2e-3`` of relative error -- the same
+    order as reversing the kernel's fp32 accumulator, which is the failure the
+    finding named. Then:
+
+    1. that degraded result PASSES at ``rtol=RTOL, atol=ATOL``. This is the
+       reading that proves the old gate was blind; if it ever fails, the fixture
+       has changed and this control's premise is gone.
+    2. that same degraded result FAILS at ``rtol=atol=SINGLE_OP_TOL``. This is
+       the reading that proves the new gate bites.
+
+    NO NUMBER MOVES HERE. Both gates are the file's existing constants. The
+    control changes the OUTPUT it feeds them, never a tolerance.
+
+    A SOURCE MUTATION IS STILL THE SHARPER CONTROL, and the repair's host
+    transcript carries one: ``acc`` and ``out`` in the kernel switched to bf16,
+    the exact arm red, restored, green. That cannot live in the suite, because it
+    edits shipped source. This arm is the part that can.
+    """
+    case = _build_case(uniform_one=True)
+    scale = case["weight_scale"]
+    reset_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = blockwise_fp8_mm(case["x"], case["weight"], scale)
+    _assert_route(sim, 1, "exact-arm-armed-control")
+
+    want = blockwise_fp8_mm_torch_oracle(case["x"], case["weight"], scale)
+    exact = got.to(torch.float32)
+    degraded = exact.to(DEGRADED_ACCUMULATOR_DTYPE).to(torch.float32)
+
+    changed = int((degraded != exact).sum())
+    if changed == 0:
+        raise VacuousControlError(
+            "rounding the kernel result through "
+            f"{DEGRADED_ACCUMULATOR_DTYPE} changed no element, so this control "
+            "degrades nothing and its two readings below would be vacuous"
+        )
+
+    degraded_rel = _max_rel_error(degraded, want)
+    degraded_abs = float((degraded - want).abs().max())
+    print(
+        f"[exact-arm-armed] elements_changed={changed}/{exact.numel()} "
+        f"degraded_max_rel_error={degraded_rel:.6e} "
+        f"degraded_max_abs_error={degraded_abs:.6e} "
+        f"want_absmax={float(want.abs().max()):.6e}"
+    )
+
+    passes_declared_pair = True
+    try:
+        torch.testing.assert_close(degraded, want, rtol=RTOL, atol=ATOL)
+    except AssertionError:
+        passes_declared_pair = False
+
+    passes_single_op = True
+    try:
+        torch.testing.assert_close(
+            degraded, want, rtol=SINGLE_OP_TOL, atol=SINGLE_OP_TOL
+        )
+    except AssertionError:
+        passes_single_op = False
+
+    print(
+        f"[exact-arm-armed] passes_at_declared_pair={passes_declared_pair} "
+        f"(rtol={RTOL} atol={ATOL}) "
+        f"passes_at_single_op={passes_single_op} "
+        f"(rtol=atol={SINGLE_OP_TOL})"
+    )
+
+    assert passes_declared_pair, (
+        f"a {DEGRADED_ACCUMULATOR_DTYPE} result was rejected by the declared "
+        f"pair rtol={RTOL} atol={ATOL} (max rel error {degraded_rel:.6e}). That "
+        f"contradicts finding B19-026's premise, so the reading below no longer "
+        f"shows what the repair claims it shows"
+    )
+    assert not passes_single_op, (
+        f"a {DEGRADED_ACCUMULATOR_DTYPE} result PASSED at single-op tolerance "
+        f"{SINGLE_OP_TOL} (max rel error {degraded_rel:.6e}, max abs error "
+        f"{degraded_abs:.6e}). The exact arm's gate is therefore still not "
+        f"armed against the precision loss the plan created it to catch"
+    )
 
 
 # --------------------------------------------------------------------------- #
