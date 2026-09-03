@@ -24,6 +24,12 @@ from nkilib.core.router_topk.router_topk import XSBLayout_tp102__0
 from nkilib.core.router_topk.router_topk import router_topk as _substrate_router_topk
 from nkilib.core.subkernels.rmsnorm_tkg import _rmsnorm_tkg_dloc
 from nkilib.core.utils.common_types import QuantizationType
+# The substrate's OWN sharding query -- the same call the vendor router uses to
+# decide its `T_local`/`T_offset` (`router_topk.py:361`). Imported rather than
+# reimplemented so the authored stage below and the vendor producer cannot
+# disagree about which core owns which tokens. Repair round 1 of
+# `inc-glm53f-032`, finding `M-B20-1`.
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe.rmsnorm_router_topk_tkg import (
     _can_use_kernel as _substrate_can_use_kernel,
@@ -1063,6 +1069,31 @@ def can_run_noaux_tc_router(
 
 
 
+def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
+    """This core's token range, by the substrate's own formula. Plain python.
+
+    Returns ``(t_offset, t_local)``: the first global token row this core owns
+    and how many it owns. Transliterated from the vendor router's two lines,
+    ``T_local = T // 2`` and ``T_offset = T_local * prg_id``
+    (``router_topk.py:371-372``), generalised from its literal ``2`` to
+    ``n_prgs`` so the two readings cannot drift if the launch grid changes.
+
+    Factored OUT of the kernel body on purpose: the arithmetic that decides
+    which core writes which rows is the whole content of finding ``M-B20-1``,
+    and a plain function can be read exactly by a test as well as by the kernel.
+    ``n_prgs == 1`` returns the whole range at offset 0, which is the unsharded
+    case and the only case the standalone entry point ever sees.
+
+    ``t_local`` is always a whole number of ``NOAUX_TC_TILE`` rows here, and that
+    is not an assumption: ``_require_noaux_tc_extents`` already refuses any ``T``
+    that is not a multiple of ``_NOAUX_TC_T_MULTIPLE`` precisely because the
+    substrate needs ``T // 2 % 128 == 0``. The same clause that admits the
+    extent therefore guarantees this loop covers it.
+    """
+    t_local = num_tokens // n_prgs
+    return t_local * prg_id, t_local
+
+
 def _noaux_tc_stage(
     router_logits_hbm,
     correction_bias_hbm,
@@ -1072,6 +1103,7 @@ def _noaux_tc_stage(
     num_experts: int,
     norm_topk_prob: bool,
     routed_scaling_factor: float,
+    shard_on_tokens: bool,
 ):
     """The AUTHORED `noaux_tc` numerics, in NKI. A plain subkernel, not a jit.
 
@@ -1102,11 +1134,48 @@ def _noaux_tc_stage(
     score would make a value-equality mask select nine columns while the
     reported index set held eight, and the two readings must not be able to
     disagree.
+
+    THIS STAGE IS GRID-AWARE. `shard_on_tokens` says whether the caller split the
+    tokens across the logical cores. When it is true, the stage asks the substrate
+    which program it is and covers only that program's token rows, which are the
+    rows whose logits the producer wrote. When it is false the launch has one
+    program and the stage covers the whole extent. The long comment below the
+    signature records why this is the producer's own shard and not a new one; it
+    is the repair for finding `M-B20-1`.
     """
     bias_sb = nl.load(correction_bias_hbm)  # [1, E]
 
-    for t_tile in range(num_tokens // NOAUX_TC_TILE):
-        t0 = t_tile * NOAUX_TC_TILE
+    # ---- WHICH TOKENS THIS CORE OWNS. ------------------------------------- #
+    # Until repair round 1 this loop ran over ALL the tokens on EVERY core,
+    # while the producer wrote only its own half. On a `[2]` launch each core
+    # then loaded router-logit rows the OTHER core was still writing, with
+    # nothing ordering the two, and both cores stored the whole `[T, E]` and
+    # `[T, K]` buffers -- so which core's values survived was undefined. Finding
+    # `M-B20-1`.
+    #
+    # The fix is the producer's own shard, not a new one. The vendor router
+    # computes `T_local = T // 2` and `T_offset = T_local * prg_id` and then
+    # writes the logits, the affinities and the indices only at that offset
+    # (`router_topk.py:371-372`, and its three stores at `:588`, `:649`, `:706`).
+    # This stage asks the SAME question through the SAME call and covers only its
+    # own rows, so each core reads exactly the logits it produced and writes
+    # exactly the rows it read. No barrier is needed because no cross-core read
+    # remains.
+    #
+    # `shard_on_tokens` is passed in rather than inferred: the vendor shards only
+    # when its caller asks it to, so a stage that inferred sharding from the grid
+    # alone would shard at `T == 1` where the producer did not. The fused caller
+    # passes the SAME variable it hands the vendor.
+    if shard_on_tokens:
+        _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+            "noaux_tc_stage", (0, 1), 2
+        )
+    else:
+        n_prgs, prg_id = 1, 0
+    t_offset, t_local = _noaux_tc_shard_range(num_tokens, n_prgs, prg_id)
+
+    for t_tile in range(t_local // NOAUX_TC_TILE):
+        t0 = t_offset + t_tile * NOAUX_TC_TILE
         rows = NOAUX_TC_TILE
 
         logits_sb = nl.load(
@@ -1219,6 +1288,11 @@ def _noaux_tc_correct_nki(
         num_experts=e_extent,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=routed_scaling_factor,
+        # This entry point is launched with NO grid (`noaux_tc_correct` below
+        # calls `wrap_nki(...)` without a `[n]`), so there is one program, it owns
+        # every token, and there is no other core to race. Stated rather than
+        # left to the default, because the stage now has no default.
+        shard_on_tokens=False,
     )
     return expert_index, expert_affinities
 
@@ -1256,11 +1330,23 @@ def _noaux_tc_rmsnorm_router_topk_nki(
     `noaux_tc` differs from the substrate's routing exactly by the correction, so
     an implementation that ignored the bias would return the two selections
     EQUAL, and the test measures how many rows they differ on.
+
+    THE TOKEN SPLIT IS DECIDED ONCE, HERE. `shard_on_tokens` is bound below and
+    handed BOTH to the vendor router, which writes the logits only at its own
+    token offset, and to the authored stage, which now reads only at that same
+    offset. Two separate expressions could drift apart, and that drift is
+    precisely finding `M-B20-1`.
     """
     b_extent, s_extent, h_extent = hidden_states.shape
     t_extent = b_extent * s_extent
     _, e_extent = router_weights.shape
     h_free = h_extent // _pmax
+
+    # ONE shard decision for the producer and the authored consumer. It is bound
+    # here, handed to the vendor router below, and handed to the authored stage
+    # below that -- so the two cannot disagree about whether the tokens were
+    # split. Splitting this expression in two is the defect `M-B20-1` reports.
+    shard_on_tokens = t_extent > 1
 
     router_logits = nl.ndarray((t_extent, e_extent), dtype=nl.float32,
                                buffer=nl.shared_hbm)
@@ -1312,7 +1398,7 @@ def _noaux_tc_rmsnorm_router_topk_nki(
         use_column_tiling=True,
         use_indirect_dma_scatter=True,
         use_PE_broadcast_w_bias=True,
-        shard_on_tokens=t_extent > 1,
+        shard_on_tokens=shard_on_tokens,
         skip_store_expert_index=False,
         skip_store_router_logits=False,
     )
@@ -1327,6 +1413,9 @@ def _noaux_tc_rmsnorm_router_topk_nki(
         num_experts=e_extent,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=routed_scaling_factor,
+        # The SAME variable the vendor router was handed above. Each core now
+        # corrects only the tokens whose logits it produced.
+        shard_on_tokens=shard_on_tokens,
     )
 
     return router_logits, expert_index, expert_affinities, substrate_index

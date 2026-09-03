@@ -88,6 +88,7 @@ correct.
 """
 
 import importlib
+import inspect
 import os
 import sys
 
@@ -96,18 +97,32 @@ import torch
 import torch.nn as nn
 
 import nki
+import nki.isa as nisa
+import nki.language as nl
 import nki.simulator
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+# The substrate's own sharding query -- the same call the vendor router and the
+# repaired `noaux_tc` stage both use. Imported here so the in-kernel reading
+# below asks the question the shipped code asks.
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe.router import (
     NOAUX_TC_DENOM_EPS,
     NOAUX_TC_K,
+    NOAUX_TC_TILE,
     NoauxTcRouterError,
     _noaux_tc_correct_nki,
+    _noaux_tc_shard_range,
     noaux_tc_correct,
     noaux_tc_correct_torch_oracle,
     noaux_tc_dispatch_counters,
     noaux_tc_rmsnorm_router_topk,
+    # The module's fused torch reference. Repair round 1 of `inc-glm53f-032`
+    # imports it, because finding `M-B20-3` is that NO test did: it is the only
+    # reference here that computes the normalisation and the router matmul
+    # INDEPENDENTLY of the kernel, and it shipped with no execution coverage.
+    noaux_tc_rmsnorm_router_topk_torch_oracle,
     reset_noaux_tc_counters,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -1062,4 +1077,543 @@ def test_pin_router_gate_is_untouched() -> None:
     assert isinstance(first.value, ast.Constant) and first.value.value is False, (
         "the pin's unconditional `return False` was changed under this "
         "increment's name; that is a design decision for the lead"
+    )
+
+
+# ===========================================================================
+# REPAIR ROUND 1 (batch R6). Two findings, five arms.
+#
+# M-B20-1 -- the authored `noaux_tc` stage looped over ALL tokens on BOTH
+# logical cores while the vendor router had written only its own half, with
+# nothing ordering the two. The repair shards the stage's token loop by program
+# identifier, through the vendor's OWN sharding call. The arms below read the
+# per-core token range the SHIPPED stage asked for, which is the demonstration
+# the finding requires; a numeric arm cannot supply it, because the CPU simulator
+# serialises the two programs and so hides the hazard entirely.
+#
+# M-B20-3 -- every arm that ran the fused seam built its reference from the
+# logits the kernel itself returned, so the normalisation and the router matmul
+# were never compared with anything, and the module's own fused torch reference
+# was imported by no test. The arms below compare against that reference, built
+# independently from the same inputs, and execute the fallback path.
+#
+# NOT touched here: the multiple-of-256 refusal (`M-B20-2`) is the `-088`
+# token-policy question and belongs to the lead. No tolerance, extent or
+# comparator moves in this round.
+# ===========================================================================
+
+
+def test_shard_range_partitions_the_declared_token_extent() -> None:
+    """The shard arithmetic, read as plain python at the declared extent.
+
+    ``_noaux_tc_shard_range`` is the function the authored stage uses to decide
+    which token rows this core owns. Here it is exercised directly, so the
+    per-core reading in the next arm has an exact expectation rather than a
+    self-consistent one.
+
+    The property that matters is a PARTITION: the cores' ranges must cover every
+    token exactly once, with no overlap and no gap. Overlap would put two cores'
+    writes on the same rows -- the defect in a different shape -- and a gap would
+    leave rows nobody computed.
+    """
+    for n_prgs in (1, 2):
+        covered: list[int] = []
+        ranges = []
+        for prg_id in range(n_prgs):
+            t_offset, t_local = _noaux_tc_shard_range(DECLARED_T, n_prgs, prg_id)
+            ranges.append((t_offset, t_local))
+            covered.extend(range(t_offset, t_offset + t_local))
+        print(
+            f"[shard-range] n_prgs={n_prgs} ranges={ranges} "
+            f"covered={len(covered)} distinct={len(set(covered))} "
+            f"tiles_per_core={[t // NOAUX_TC_TILE for _o, t in ranges]}"
+        )
+        assert sorted(covered) == list(range(DECLARED_T)), (
+            f"at n_prgs={n_prgs} the cores' ranges {ranges} do not cover "
+            f"0..{DECLARED_T - 1} exactly once"
+        )
+        assert len(covered) == len(set(covered)), (
+            f"at n_prgs={n_prgs} two cores own the same token rows"
+        )
+        for _offset, t_local in ranges:
+            assert t_local % NOAUX_TC_TILE == 0, (
+                f"a core owns {t_local} tokens, which is not a whole number of "
+                f"{NOAUX_TC_TILE}-row tiles, so its loop would drop rows. The "
+                f"multiple-of-256 admission clause is what rules this out."
+            )
+    # And the two-core split is not the one-core split: the reading discriminates.
+    assert _noaux_tc_shard_range(DECLARED_T, 1, 0) == (0, DECLARED_T)
+    assert _noaux_tc_shard_range(DECLARED_T, 2, 0) == (0, DECLARED_T // 2)
+    assert _noaux_tc_shard_range(DECLARED_T, 2, 1) == (DECLARED_T // 2,
+                                                       DECLARED_T // 2)
+
+
+def test_fused_seam_stage_takes_a_distinct_token_range_per_core(monkeypatch) -> None:
+    """THE M-B20-1 DEMONSTRATION: a per-core token range, read from the kernel.
+
+    The finding's evidence bar is "a per-core token range recorded from inside
+    the kernel, or a hardware run", and it rules out a repeat of a numeric arm
+    because the simulator serialises the two programs and hides the hazard. This
+    arm takes the first route: it records every call the SHIPPED stage makes to
+    its own shard function while a real two-core launch runs, and reads the
+    ranges back.
+
+    Two opposite readings from one instrument, so neither is a constant:
+
+    * the FUSED seam, launched on the ``[2]`` grid, must call the shard function
+      once per program, with distinct program identifiers, and receive two
+      distinct ranges that partition the token extent;
+    * the STANDALONE entry point, launched with no grid, must call it once and
+      receive the whole extent at offset 0.
+
+    What this does NOT claim: it is not a hardware run, and it does not observe
+    the two cores executing at the same time. It settles the question the finding
+    actually raises -- whether the authored stage is grid-aware, and whether each
+    core confines itself to the rows whose logits it produced.
+    """
+    import vllm_neuron.functional.moe.router as router_module
+
+    seen: list[tuple[int, int, int, int, int]] = []
+    real_shard_range = router_module._noaux_tc_shard_range
+
+    def recording(num_tokens, n_prgs, prg_id):
+        t_offset, t_local = real_shard_range(num_tokens, n_prgs, prg_id)
+        seen.append(
+            (int(num_tokens), int(n_prgs), int(prg_id), int(t_offset), int(t_local))
+        )
+        return t_offset, t_local
+
+    monkeypatch.setattr(router_module, "_noaux_tc_shard_range", recording)
+
+    hidden_states, gamma, router_weights, bias = build_hidden_states()
+    reset_noaux_tc_counters()
+    with _SimulatorCounter() as sim:
+        _logits, expert_index, expert_affinities, _substrate_index = (
+            noaux_tc_rmsnorm_router_topk(
+                hidden_states=hidden_states,
+                gamma=gamma,
+                router_weights=router_weights,
+                correction_bias=bias,
+                top_k=DECLARED_TOP_K,
+                norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+                routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+            )
+        )
+    _assert_route(sim, 1, "grid-aware-fused")
+    fused_calls = sorted(seen)
+    print(f"[grid-aware-fused] shard_calls={fused_calls}")
+
+    if not fused_calls:
+        raise RouteInstrumentError(
+            "the authored stage never asked which tokens this core owns, so it "
+            "is not grid-aware and finding M-B20-1 is unrepaired"
+        )
+    program_ids = sorted({c[2] for c in fused_calls})
+    ranges = sorted({(c[3], c[4]) for c in fused_calls})
+    n_prgs_seen = sorted({c[1] for c in fused_calls})
+    print(
+        f"[grid-aware-fused] program_ids={program_ids} n_prgs={n_prgs_seen} "
+        f"per_core_ranges={ranges}"
+    )
+    assert n_prgs_seen == [2], (
+        f"the stage read n_prgs={n_prgs_seen}, but the fused seam is launched on "
+        f"a [2] grid, so each program must see 2"
+    )
+    assert program_ids == [0, 1], (
+        f"the stage saw program ids {program_ids}; a two-core launch must give "
+        f"one call per core with distinct identifiers"
+    )
+    assert ranges == [(0, DECLARED_T // 2), (DECLARED_T // 2, DECLARED_T // 2)], (
+        f"the per-core ranges were {ranges}, not the two halves of the token "
+        f"extent; a core that reads outside its own half is reading logits the "
+        f"other core wrote"
+    )
+    covered: list[int] = []
+    for _t, _n, _p, offset, local in fused_calls:
+        covered.extend(range(offset, offset + local))
+    assert sorted(covered) == list(range(DECLARED_T)), (
+        "the two cores' ranges do not partition the token extent"
+    )
+
+    # THE OPPOSITE READING, same instrument: no grid, one program, whole extent.
+    seen.clear()
+    logits, standalone_bias = build_designed_logits()
+    reset_noaux_tc_counters()
+    noaux_tc_correct(
+        logits,
+        standalone_bias,
+        top_k=DECLARED_TOP_K,
+        norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+        routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+    )
+    standalone_calls = sorted(seen)
+    print(f"[grid-aware-standalone] shard_calls={standalone_calls}")
+    assert standalone_calls == [(DECLARED_T, 1, 0, 0, DECLARED_T)], (
+        f"the standalone entry point is launched with no grid, so it must own "
+        f"the whole extent at offset 0; it read {standalone_calls}"
+    )
+    assert standalone_calls != fused_calls, (
+        "the sharded and unsharded readings are identical, so this instrument "
+        "is reporting a constant rather than measuring the launch"
+    )
+
+    # The union of the two cores' writes is still the complete output.
+    assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(expert_affinities.shape) == (DECLARED_T, DECLARED_E)
+    nonzero_per_row = (expert_affinities != 0).sum(dim=-1)
+    print(
+        f"[grid-aware-union] nonzero_per_row_min={int(nonzero_per_row.min())} "
+        f"max={int(nonzero_per_row.max())} rows={int(nonzero_per_row.numel())}"
+    )
+    assert int(nonzero_per_row.min()) == NOAUX_TC_K, (
+        "some token row carries fewer than K gate weights, so no core wrote it "
+        "-- the shard leaves a gap"
+    )
+    assert int(nonzero_per_row.max()) == NOAUX_TC_K
+
+
+@nki.jit
+def _read_per_core_token_range(src):
+    """Write this program's id, program count and token range into its own row.
+
+    The row INDEX is the program id, so two programs writing this buffer leave
+    two distinct rows and the reading cannot be one program counted twice. The
+    token range comes from the SHIPPED ``_noaux_tc_shard_range``, so this kernel
+    measures the shipped arithmetic rather than a copy of it.
+    """
+    t_total, _ = src.shape
+    out = nl.ndarray((4, 4), dtype=nl.float32, buffer=nl.shared_hbm)
+    _ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "test_read_per_core_token_range", (0, 1), 2
+    )
+    t_offset, t_local = _noaux_tc_shard_range(t_total, n_prgs, prg_id)
+    row = nl.ndarray((1, 4), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=row, value=0.0)
+    row[0, 0] = prg_id
+    row[0, 1] = n_prgs
+    row[0, 2] = t_offset
+    row[0, 3] = t_local
+    nl.store(out[prg_id : prg_id + 1, :], value=row)
+    return out
+
+
+@nki.jit
+def _write_only_this_cores_tokens(src):
+    """Write ``program_id + 1`` into this program's OWN token rows and no others.
+
+    A shard is only correct if the two cores' writes still cover every row. This
+    kernel makes the coverage readable: any element left at 0 is a row no core
+    wrote, and a row carrying both marker values would be a row two cores wrote.
+    """
+    t_total, e_total = src.shape
+    out = nl.ndarray((t_total, e_total), dtype=nl.float32, buffer=nl.shared_hbm)
+    _ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "test_write_only_this_cores_tokens", (0, 1), 2
+    )
+    t_offset, t_local = _noaux_tc_shard_range(t_total, n_prgs, prg_id)
+    for t_tile in range(t_local // NOAUX_TC_TILE):
+        lo = t_offset + t_tile * NOAUX_TC_TILE
+        val = nl.ndarray((NOAUX_TC_TILE, e_total), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=val, value=0.0)
+        nisa.tensor_scalar(dst=val, data=val, op0=nl.add, operand0=prg_id + 1)
+        nl.store(out[lo : lo + NOAUX_TC_TILE, :], value=val)
+    return out
+
+
+def test_per_core_token_range_is_read_from_inside_a_two_program_kernel() -> None:
+    """The finding's evidence bar, taken literally: the range, read in-kernel.
+
+    The arm above reads the shard decision from the host side, by watching the
+    shipped stage ask for it. This arm reads it from INSIDE a kernel body on a
+    real ``[2]`` launch: each program stores its own id, the program count and
+    its token range into its own row of an output buffer, and the rows come back
+    to the host as numbers.
+
+    The second half then reads the CONSEQUENCE rather than the decision. Each
+    program marks only its own token rows, and the union must leave no row
+    unwritten and no row marked by both -- which is what makes the landed
+    declared readings survive a shard that halves each core's work.
+
+    What this does NOT settle: the simulator runs the two programs one after the
+    other, so nothing here observes them overlapping in time. The finding is
+    about which rows each core touches, and that is what is measured.
+    """
+    src = torch.zeros(DECLARED_T, 8, dtype=torch.float32)
+    rows = wrap_nki(_read_per_core_token_range)[2](src=src).to(torch.float32).tolist()
+    print("[in-kernel-range] raw rows (prg_id, n_prgs, t_offset, t_local):")
+    for slot, row in enumerate(rows):
+        print(f"[in-kernel-range]   slot {slot}: {row}")
+    # The buffer has four slots and the launch has two programs, so the two
+    # unused slots stay at their zero fill. `n_prgs` can never be 0 in a row a
+    # program actually wrote, which is what makes it the liveness marker.
+    live = [row for row in rows if row[1] != 0.0]
+    program_ids = sorted({int(row[0]) for row in live})
+    n_prgs_seen = sorted({int(row[1]) for row in live})
+    ranges = sorted({(int(row[2]), int(row[3])) for row in live})
+    print(
+        f"[in-kernel-range] live_rows={len(live)} program_ids={program_ids} "
+        f"n_prgs={n_prgs_seen} per_core_ranges={ranges}"
+    )
+    assert len(live) == 2, (
+        f"{len(live)} programs wrote a row on a [2] launch; the identity is not "
+        f"readable, so this instrument cannot answer the finding"
+    )
+    assert program_ids == [0, 1]
+    assert n_prgs_seen == [2]
+    assert ranges == [(0, DECLARED_T // 2), (DECLARED_T // 2, DECLARED_T // 2)], (
+        f"the two programs read token ranges {ranges}, not the two halves"
+    )
+
+    union = wrap_nki(_write_only_this_cores_tokens)[2](src=src).to(torch.float32)
+    half = DECLARED_T // 2
+    top = sorted({float(v) for v in union[:half].flatten().tolist()})
+    bottom = sorted({float(v) for v in union[half:].flatten().tolist()})
+    unwritten = int((union == 0).sum())
+    print(
+        f"[in-kernel-union] top_half_values={top} bottom_half_values={bottom} "
+        f"unwritten_elements={unwritten}/{union.numel()}"
+    )
+    assert top == [1.0], (
+        f"the first half carries {top}; program 0 must own it alone"
+    )
+    assert bottom == [2.0], (
+        f"the second half carries {bottom}; program 1 must own it alone"
+    )
+    assert unwritten == 0, (
+        f"{unwritten} elements were left unwritten, so the two shards do not "
+        f"cover the token extent"
+    )
+
+
+def test_fused_seam_logits_match_an_independent_torch_reference() -> None:
+    """THE M-B20-3 DEMONSTRATION: the normalisation and the matmul, compared.
+
+    Every landed fused-seam arm builds its reference from the logits the kernel
+    returned, which isolates the authored correction but leaves the two substrate
+    stages measured against nothing. This arm builds the whole reference from the
+    SAME hidden states, gamma and router weights the kernel was given, using the
+    module's own fused torch reference, and compares the logits.
+
+    The tolerances are the landed declared ones, taken from this file's own
+    constants and not restated. Nothing here moves a declared value.
+    """
+    hidden_states, gamma, router_weights, bias = build_hidden_states()
+    seam_eps = inspect.signature(
+        noaux_tc_rmsnorm_router_topk
+    ).parameters["eps"].default
+
+    reset_noaux_tc_counters()
+    with _SimulatorCounter() as sim:
+        logits, expert_index, expert_affinities, _substrate_index = (
+            noaux_tc_rmsnorm_router_topk(
+                hidden_states=hidden_states,
+                gamma=gamma,
+                router_weights=router_weights,
+                correction_bias=bias,
+                top_k=DECLARED_TOP_K,
+                eps=seam_eps,
+                norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+                routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+            )
+        )
+    _assert_route(sim, 1, "independent-reference")
+
+    # INDEPENDENT: built from the inputs, never from the kernel's own output.
+    want_logits, want_index, want_affinities, _want_sub = (
+        noaux_tc_rmsnorm_router_topk_torch_oracle(
+            hidden_states,
+            gamma,
+            router_weights,
+            bias,
+            seam_eps,
+            DECLARED_NORM_TOPK_PROB,
+            DECLARED_ROUTED_SCALING_FACTOR,
+        )
+    )
+    got = logits.to(torch.float32)
+    want = want_logits.to(torch.float32)
+    allowed = ATOL + RTOL * want.abs()
+    outside = int(((got - want).abs() > allowed).sum())
+    equal_rows = set_equal_rows(expert_index, want_index)
+    print(
+        f"[independent-reference] eps={seam_eps} "
+        f"logits_max_abs_error={float((got - want).abs().max()):.6e} "
+        f"elements_outside_tolerance={outside}/{got.numel()} "
+        f"set_equal_rows={equal_rows}/{DECLARED_T} "
+        f"affinities_max_abs_error="
+        f"{float((expert_affinities.to(torch.float32) - want_affinities.to(torch.float32)).abs().max()):.6e} "
+        f"declared rtol={RTOL} atol={ATOL}"
+    )
+    # The reference must not be vacuous: an all-zero reference would pass.
+    assert float(want.abs().max()) > 0.0
+    assert equal_rows == DECLARED_ROWS, (
+        "the kernel's selection differs from a reference built independently "
+        "from the same inputs, so a substrate stage is wrong"
+    )
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(
+        expert_affinities.to(torch.float32),
+        want_affinities.to(torch.float32),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+
+@pytest.mark.parametrize(
+    "perturbation",
+    ["eps", "gamma"],
+)
+def test_independent_reference_arm_fails_when_the_normalisation_moves(
+    perturbation: str,
+) -> None:
+    """The non-vacuity control for the arm above, on the two inputs it guards.
+
+    The previous arm is only worth having if it can FAIL. The defect that
+    motivated the finding was a wrong normalisation epsilon that every landed arm
+    read as green, because both sides consumed the same wrong logits. Here the
+    reference is rebuilt with a perturbed epsilon, and separately with a perturbed
+    gamma, and the comparison must go outside the declared tolerance.
+
+    The perturbations are this file's own choices, not declared values: the
+    epsilon moves from the seam's default to the value the pinned config actually
+    carries, and gamma is scaled by 5 per cent.
+    """
+    hidden_states, gamma, router_weights, bias = build_hidden_states()
+    seam_eps = inspect.signature(
+        noaux_tc_rmsnorm_router_topk
+    ).parameters["eps"].default
+
+    reset_noaux_tc_counters()
+    logits, _index, _affinities, _sub = noaux_tc_rmsnorm_router_topk(
+        hidden_states=hidden_states,
+        gamma=gamma,
+        router_weights=router_weights,
+        correction_bias=bias,
+        top_k=DECLARED_TOP_K,
+        eps=seam_eps,
+        norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+        routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+    )
+
+    if perturbation == "eps":
+        ref_eps, ref_gamma = 1e-5, gamma
+    else:
+        ref_eps = seam_eps
+        ref_gamma = (gamma.to(torch.float32) * 1.05).to(gamma.dtype)
+
+    want_logits = noaux_tc_rmsnorm_router_topk_torch_oracle(
+        hidden_states,
+        ref_gamma,
+        router_weights,
+        bias,
+        ref_eps,
+        DECLARED_NORM_TOPK_PROB,
+        DECLARED_ROUTED_SCALING_FACTOR,
+    )[0]
+    got = logits.to(torch.float32)
+    want = want_logits.to(torch.float32)
+    allowed = ATOL + RTOL * want.abs()
+    outside = int(((got - want).abs() > allowed).sum())
+    print(
+        f"[non-vacuity-{perturbation}] perturbed_eps={ref_eps} "
+        f"gamma_absmax={float(ref_gamma.to(torch.float32).abs().max()):.6f} "
+        f"max_abs_error={float((got - want).abs().max()):.6e} "
+        f"elements_outside_tolerance={outside}/{got.numel()} "
+        f"declared rtol={RTOL} atol={ATOL}"
+    )
+    assert outside > 0, (
+        f"perturbing the {perturbation} left every element inside the declared "
+        f"tolerance, so the independent-reference arm above cannot see a wrong "
+        f"normalisation and is vacuous"
+    )
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+def test_fused_torch_fallback_executes_and_is_the_cpu_oracle(monkeypatch) -> None:
+    """The fused seam's torch fallback runs, and agrees with the kernel.
+
+    Finding ``M-B20-3`` records that ``noaux_tc_rmsnorm_router_topk_torch_oracle``
+    shipped with no execution coverage at all -- nothing imported it. It is the
+    fallback the seam takes when ``can_run_kernel`` is false, so this arm flips
+    that live gate, checks the fallback counter moved and the simulator did not
+    run, and then checks the fallback is the CORRECT function by comparing it
+    against the kernel's own result at the declared tolerances.
+
+    Same discipline as ``test_route_control_fallback_counter_discriminates``,
+    one level up: that arm covers the standalone entry point, this one the fused
+    seam.
+    """
+    hidden_states, gamma, router_weights, bias = build_hidden_states()
+    seam_eps = inspect.signature(
+        noaux_tc_rmsnorm_router_topk
+    ).parameters["eps"].default
+
+    # The kernel result first, with the gate ON.
+    reset_noaux_tc_counters()
+    with _SimulatorCounter() as sim_on:
+        kernel_logits, kernel_index, kernel_affinities, _sub = (
+            noaux_tc_rmsnorm_router_topk(
+                hidden_states=hidden_states,
+                gamma=gamma,
+                router_weights=router_weights,
+                correction_bias=bias,
+                top_k=DECLARED_TOP_K,
+                eps=seam_eps,
+                norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+                routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+            )
+        )
+    _assert_route(sim_on, 1, "fallback-arm-kernel-half")
+
+    # Now the same call with the gate OFF, which must take the fused fallback.
+    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
+    assert can_run_kernel(torch.zeros(1)) is False, (
+        "the gate did not move, so this control is unarmed"
+    )
+    reset_noaux_tc_counters()
+    with _SimulatorCounter() as sim_off:
+        fb_logits, fb_index, fb_affinities, fb_sub = noaux_tc_rmsnorm_router_topk(
+            hidden_states=hidden_states,
+            gamma=gamma,
+            router_weights=router_weights,
+            correction_bias=bias,
+            top_k=DECLARED_TOP_K,
+            eps=seam_eps,
+            norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+            routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+        )
+    readings = noaux_tc_dispatch_counters()
+    print(
+        f"[fused-fallback] counters={readings} "
+        f"simulate_kernel_calls={sim_off.calls} "
+        f"logits_shape={tuple(fb_logits.shape)} "
+        f"index_shape={tuple(fb_index.shape)} "
+        f"affinities_shape={tuple(fb_affinities.shape)} "
+        f"substrate_index_shape={tuple(fb_sub.shape)} "
+        f"logits_max_abs_error_vs_kernel="
+        f"{float((fb_logits.to(torch.float32) - kernel_logits.to(torch.float32)).abs().max()):.6e}"
+    )
+    assert readings == (0, 1), (
+        f"the fused seam read {readings}; with the gate off it must take the "
+        f"torch fallback exactly once and dispatch no kernel"
+    )
+    assert sim_off.calls == 0
+    assert tuple(fb_logits.shape) == (DECLARED_T, DECLARED_E)
+    assert tuple(fb_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(fb_affinities.shape) == (DECLARED_T, DECLARED_E)
+    assert tuple(fb_sub.shape) == (DECLARED_T, NOAUX_TC_K)
+    # The fallback is the CPU oracle, so it must agree with the kernel.
+    assert set_equal_rows(fb_index, kernel_index) == DECLARED_ROWS
+    torch.testing.assert_close(
+        fb_logits.to(torch.float32),
+        kernel_logits.to(torch.float32),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+    torch.testing.assert_close(
+        fb_affinities.to(torch.float32),
+        kernel_affinities.to(torch.float32),
+        rtol=RTOL,
+        atol=ATOL,
     )
