@@ -55,6 +55,67 @@ DECLARED_SITES = (
     ("o_proj", 16384, 4096),
 )
 
+
+#: Shapes that are RAGGED against the tile extents, so the `min` bounds in the
+#: kernel's three tiling loops are load-bearing instead of inert.
+#:
+#: WHY THEY EXIST. Every one of the five sites above divides exactly on all three
+#: axes -- S is one whole sequence tile, every I is a multiple of the contraction
+#: tile, every O is a multiple of the output tile. So the five cases cannot fail if
+#: the ragged path is broken, and the ragged path is the one production takes at
+#: every prefill length and at every decode step, where S is 1. Dropping a ragged
+#: tail returned never-written memory and the suite still read five green
+#: (`B37-M1-ragged-tail-uncovered-by-acceptance`).
+#:
+#: WHY THEY LIVE IN CONJUNCT 1 AND NOT IN A SIXTH TEST. The plan pins this file at
+#: exactly five collected items, so a sixth item would move a plan-declared count.
+#: These fold into conjunct 1's existing numeric reading -- the same oracle, the
+#: same tolerance, the same comparison -- and they are counted SEPARATELY from the
+#: five declared sites, so conjunct 1's `5/5` reading does not move either.
+#:
+#: The extents are DERIVED from the module's own tile constants and never retyped,
+#: so if a tile width changes these cases stay ragged instead of silently becoming
+#: exact. Each axis is covered both below its tile and past it, because the two
+#: fail differently: below the tile the loop runs once with a short bound, past it
+#: the loop runs again with a short final bound. Conjunct 1 asserts that all three
+#: axes are covered, so deleting a case reddens the test rather than shrinking it
+#: quietly.
+#:
+#: No case here reproduces TRACE_FORCING_SHAPE's triple, which stays conjunct 3's.
+def _ragged_cases() -> tuple[tuple[str, int, int, int], ...]:
+    s, i, o = MP.SEQUENCE_TILE, MP.CONTRACTION_TILE, MP.OUTPUT_TILE
+    return (
+        #  name                    S         I         O
+        ("s_single_row",           1,        i,        o),
+        ("s_below_tile",           63,       i,        o),
+        ("s_one_past_tile",        s + 1,    i,        o),
+        ("s_two_tiles_ragged",     s + 37,   i,        o),
+        ("i_below_tile",           s,        63,       o),
+        ("i_one_past_tile",        s,        i + 1,    o),
+        ("i_ragged_wide",          s,        i + 72,   o),
+        ("o_below_tile",           s,        i,        300),
+        ("o_one_past_tile",        s,        i,        o + 1),
+        ("o_ragged_wide",          s,        i,        o + 88),
+        ("all_three_ragged",       s + 1,    i + 72,   o + 88),
+        ("all_three_below_tile",   7,        13,       29),
+    )
+
+
+RAGGED_CASES = _ragged_cases()
+
+
+def ragged_axes(seq: int, idim: int, odim: int) -> tuple[str, ...]:
+    """Which of the three tiled axes this shape leaves a short final tile on."""
+    return tuple(
+        axis
+        for axis, extent, tile in (
+            ("S", seq, MP.SEQUENCE_TILE),
+            ("I", idim, MP.CONTRACTION_TILE),
+            ("O", odim, MP.OUTPUT_TILE),
+        )
+        if extent % tile != 0
+    )
+
 #: §3's bf16 module-comparison threshold. READ FROM THE PLAN, NOT AUTHORED HERE:
 #: this increment's boundary bullet states it authors no criterion, tolerance or
 #: threshold, so these two numbers are quoted and never adjusted to reach green.
@@ -168,6 +229,15 @@ def test_conjunct_1_numeric_agreement_at_the_five_refused_widths() -> None:
     torch operator: for the two widest sites that loop is 16,384 and 32,768
     iterations of vector work, which is slower than one matmul but shares nothing
     with it.
+
+    TWO READINGS, COUNTED SEPARATELY. The five declared widths come first and their
+    `5/5` reading is the plan's; then the SAME comparison runs again over
+    `RAGGED_CASES`, which leave a short final tile on each of the three tiled axes.
+    The five declared widths divide exactly on every axis, so they cannot fail when
+    the ragged path is broken -- a tail-dropping kernel returns memory it never
+    wrote and the five still agree. The ragged reading is what closes that, and it
+    is counted on its own so the declared reading does not move. `RAGGED_CASES`
+    records why they are here rather than in a sixth test item.
     """
     say("C1_CERTIFYING_COMPONENT=mla_projection_kernel in "
         "vllm_neuron/functional/attention/mla_projections.py")
@@ -192,6 +262,50 @@ def test_conjunct_1_numeric_agreement_at_the_five_refused_widths() -> None:
     say(f"C1_WORST_MAXABS_OVER_ALL_SITES={worst:.3e}")
     say(f"C1_SITES_AGREED={agreed}/5")
     assert agreed == 5, f"expected agreement at all 5 declared widths, got {agreed}"
+
+    # The same numeric reading, taken again at shapes that leave a short final
+    # tile. Counted on its own so the five-site reading above cannot move.
+    ragged_worst = 0.0
+    ragged_agreed = 0
+    axes_covered: set[str] = set()
+    for name, seq, idim, odim in RAGGED_CASES:
+        axes = ragged_axes(seq, idim, odim)
+        # A case that divides exactly would pass here while measuring nothing, so
+        # being ragged is checked before the comparison is trusted.
+        assert axes, (
+            f"{name}: S={seq} I={idim} O={odim} divides exactly on every axis, so "
+            f"it exercises no ragged tail and does not belong in this set"
+        )
+        axes_covered.update(axes)
+
+        x, w = make_case(seq, idim, odim)
+        got = MP.mla_projection(x, w)
+        ref = torch_projection_oracle(x, w)
+        assert got.shape == (seq, odim), (
+            f"{name}: kernel returned {tuple(got.shape)}, expected {(seq, odim)}"
+        )
+        assert bool(torch.isfinite(got).all()), (
+            f"{name}: the result holds a non-finite value, which is what a tile "
+            f"the kernel never wrote looks like"
+        )
+        err = float((got - ref).abs().max())
+        ragged_worst = max(ragged_worst, err)
+        torch.testing.assert_close(got, ref, rtol=RTOL, atol=ATOL)
+        ragged_agreed += 1
+        say(f"C1_RAGGED {name} S={seq} I={idim} O={odim} "
+            f"RAGGED_ON={'+'.join(axes)} MAXABS={err:.3e} AGREED=1")
+
+    say(f"C1_RAGGED_WORST_MAXABS={ragged_worst:.3e}")
+    say(f"C1_RAGGED_AGREED={ragged_agreed}/{len(RAGGED_CASES)}")
+    say(f"C1_RAGGED_AXES_COVERED={''.join(sorted(axes_covered))}")
+    assert ragged_agreed == len(RAGGED_CASES), (
+        f"expected agreement at every ragged shape, got "
+        f"{ragged_agreed}/{len(RAGGED_CASES)}"
+    )
+    assert axes_covered == {"S", "I", "O"}, (
+        f"the ragged set covers only {sorted(axes_covered)}; each of the three "
+        f"tiled axes needs a short final tile or that axis's bound stays inert"
+    )
 
 
 def test_conjunct_2_every_declared_case_forces_the_cte_regime() -> None:
