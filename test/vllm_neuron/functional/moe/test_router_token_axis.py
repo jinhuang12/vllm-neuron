@@ -9,12 +9,14 @@ outputs back.
 Six declared conjuncts, six collected items, one item each and no
 ``parametrize`` (plan D1.2). Every item names the component it certifies (D1.4).
 
-    1. tiny extents      -- T = 1 and T = 8, BOTH entry points, against the
-                            shipped torch oracle at the declared comparator.
+    1. tiny extents      -- T = 1 and T = 8, BOTH entry points, against each
+                            entry's own shipped torch oracle, built from the
+                            INPUTS, at the declared comparator.
     2. each own target   -- one non-multiple T above 256, with each entry's pad
                             target read from ITS OWN tiling constant.
     3. the pad is unseen -- the first T rows are BIT-IDENTICAL between
-                            pad-to-own-multiple and pad-to-next-higher-multiple.
+                            pad-to-own-multiple and pad-to-next-higher-multiple,
+                            on BOTH entries and at every declared extent.
     4. counted zero      -- 0 authored stages reduce across the token axis.
                             Item 3 is this zero's control (plan D1.5).
     5. route predicate   -- the seam's own counters, read from this module.
@@ -31,6 +33,19 @@ load-bearing:
 THE COMPARATOR IS NOT NEW (P9). ``assert_close(rtol=1e-2, atol=1e-5)`` and index
 SET equality are the ``inc-glm53f-032`` seam's own declared readings, restated
 here at new extents. Nothing is widened and no new tolerance is introduced.
+
+REPAIR ROUND 2 (2026-09-04), and what it changed and did not. Review B56 found one
+material defect: the fused arm compared the seam's output against an oracle fed the
+seam's OWN returned logits, which is blind to which rows the fused entry hands back,
+and the differential ran on the correct-only entry at a single extent, so the fused
+pad-and-slice had no independent reading at all. The repair is test-only -- no source
+line, no new numeric value, still six collected items. The fused arm now builds its
+reference from the same hidden states, gamma, router weights and bias the kernel
+received (``noaux_tc_rmsnorm_router_topk_torch_oracle``, the M-B20-3 independent
+form), and the differential now runs on both entries across the declared extents.
+Two readings were added because they say WHY a comparison holds rather than only
+that it did: ``selection_margin``, the 8/9 boundary gap in the corrected scores, and
+``elements_outside_tolerance`` over the logits.
 
 WHY THE FIXTURE IS REBUILT HERE rather than imported. The conditioned ladder is
 ``test/vllm_neuron/model/glm5_next/test_router.py``'s
@@ -62,6 +77,7 @@ from vllm_neuron.functional.moe.router import (
     noaux_tc_correct_torch_oracle,
     noaux_tc_dispatch_counters,
     noaux_tc_rmsnorm_router_topk,
+    noaux_tc_rmsnorm_router_topk_torch_oracle,
     reset_noaux_tc_counters,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -267,15 +283,50 @@ def _correct_arm(tokens: int, label: str) -> None:
     torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
 
 
-def _fused_arm(tokens: int, label: str) -> None:
-    """Entry 2 -- the fused seam at ``tokens``, against its shipped oracle.
+def _selection_margin(logits: torch.Tensor, bias: torch.Tensor) -> float:
+    """The smallest 8/9 boundary gap in the CORRECTED scores, over all rows.
 
-    The reference reads the logits the KERNEL returned, the form
-    ``test_router.py::test_fused_seam_matches_the_reference_on_its_own_logits``
-    established: it isolates the authored correction from the substrate's bf16
-    matmul, whose near-tie flips would otherwise be charged to this increment.
+    Why this is measured rather than argued. ``noaux_tc`` selects on
+    ``sigmoid(logits) + bias``, so whether the kernel and an independently built
+    reference agree on the index SET depends on how far the 8th-placed score sits
+    above the 9th. ``build_logits`` engineers that gap for the correct-only entry,
+    but the fused entry's logits come from a random hidden-state fixture through a
+    random router projection, so nothing about its gap is engineered and it has to
+    be READ. Printed beside the logits error, this number says whether the set
+    equality below holds with room to spare or by luck: a gap far larger than the
+    error means no round-off could flip a selection.
+    """
+    scores = logits.to(torch.float32).sigmoid() + bias.to(torch.float32).reshape(1, -1)
+    ordered = torch.sort(scores, dim=-1, descending=True)[0]
+    return float((ordered[:, NOAUX_TC_K - 1] - ordered[:, NOAUX_TC_K]).min())
+
+
+def _fused_arm(tokens: int, label: str) -> None:
+    """Entry 2 -- the fused seam at ``tokens``, against the INDEPENDENT oracle.
+
+    THE REFERENCE IS BUILT FROM THE INPUTS, NEVER FROM THE KERNEL'S OWN OUTPUT,
+    and round 1 of this increment got that wrong. It fed the kernel's returned
+    ``logits`` back into ``noaux_tc_correct_torch_oracle``, and review B56-M1
+    found the reading blind to WHICH rows the fused entry hands back: the pad
+    repeats the last real row, so an entry returning ``logits[-T:]`` and the
+    matching tail slices of the other three outputs would return T copies of the
+    last row, pass every shape and finiteness assert here, count exactly one
+    dispatch, and match an oracle recomputed from those same rows exactly. An
+    independent oracle cannot be fooled that way, because it knows what row 0
+    holds.
+
+    This is the form ``test_router.py::
+    test_fused_seam_logits_match_an_independent_torch_reference`` established
+    (the M-B20-3 arm), with the token count as an argument. No new numeric value:
+    ``RTOL``/``ATOL`` are this module's landed constants and ``eps`` is read off
+    the seam's own signature rather than restated.
     """
     hidden_states, gamma, router_weights, bias = build_hidden(tokens)
+    # The seam's OWN default, read rather than copied, so the oracle normalises
+    # with exactly the epsilon the kernel used.
+    seam_eps = inspect.signature(
+        noaux_tc_rmsnorm_router_topk
+    ).parameters["eps"].default
 
     reset_noaux_tc_counters()
     with _SimulatorCounter() as sim:
@@ -286,13 +337,14 @@ def _fused_arm(tokens: int, label: str) -> None:
                 router_weights=router_weights,
                 correction_bias=bias,
                 top_k=DECLARED_TOP_K,
+                eps=seam_eps,
                 norm_topk_prob=DECLARED_NORM_TOPK_PROB,
                 routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
             )
         )
     _assert_route(sim, 1, label)
 
-    # ALL FOUR outputs are sliced back, so all four are asserted at the caller's
+    # ALL FOUR outputs are sliced back, so all four are read at the caller's
     # extent. `substrate_index` included: it is the non-vacuity control, and a
     # control left at the padded length would be compared row-for-row against a
     # shorter selection.
@@ -302,20 +354,50 @@ def _fused_arm(tokens: int, label: str) -> None:
     assert tuple(substrate_index.shape) == (tokens, NOAUX_TC_K)
     assert bool(torch.isfinite(logits).all())
 
-    want_index, want_affinities = noaux_tc_correct_torch_oracle(
-        logits, bias, DECLARED_NORM_TOPK_PROB, DECLARED_ROUTED_SCALING_FACTOR
+    want_logits, want_index, want_affinities, want_substrate = (
+        noaux_tc_rmsnorm_router_topk_torch_oracle(
+            hidden_states,
+            gamma,
+            router_weights,
+            bias,
+            seam_eps,
+            DECLARED_NORM_TOPK_PROB,
+            DECLARED_ROUTED_SCALING_FACTOR,
+        )
     )
+    got_logits = logits.to(torch.float32)
+    want_l = want_logits.to(torch.float32)
     got = got_affinities.to(torch.float32)
     want = want_affinities.to(torch.float32)
+    allowed = ATOL + RTOL * want_l.abs()
+    outside = int(((got_logits - want_l).abs() > allowed).sum())
     equal_rows = set_equal_rows(got_index, want_index)
     print(
         f"[{label}] T={tokens} pad_target="
         f"{seam._noaux_tc_pad_target(tokens, FUSED_MULTIPLE)} "
+        f"logits_max_abs_error={float((got_logits - want_l).abs().max()):.6e} "
+        f"elements_outside_tolerance={outside}/{got_logits.numel()} "
         f"set_equal_rows={equal_rows}/{tokens} "
-        f"max_abs_error={float((got - want).abs().max()):.6e}"
+        f"max_abs_error={float((got - want).abs().max()):.6e} "
+        f"selection_margin={_selection_margin(want_l, bias):.6e} "
+        f"substrate_index_equal_rows="
+        f"{set_equal_rows(substrate_index, want_substrate)}/{tokens} "
+        f"declared rtol={RTOL} atol={ATOL}"
     )
+    # The reference must not be vacuous: an all-zero reference would pass every
+    # comparison below.
+    assert float(want_l.abs().max()) > 0.0
+    # ROW IDENTITY. This is the assertion B56-M1 asked for: the oracle knows what
+    # row 0 should hold, so a tail slice -- or any other permutation of the token
+    # axis -- fails here instead of passing green.
     assert equal_rows == tokens
+    torch.testing.assert_close(got_logits, want_l, rtol=RTOL, atol=ATOL)
     torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+    # `substrate_index` is READ and printed, never asserted, and the reason is a
+    # comparator one and not laziness. It is top-K on the RAW logits, where this
+    # fixture engineers no gap at all, so an equality there would register a
+    # tie-freeness claim this block never declared (P9). The number is on the
+    # record; the pass does not turn on it.
 
 
 # ===========================================================================
@@ -384,63 +466,127 @@ def test_a_non_multiple_extent_above_256_pads_to_each_entrys_own_target() -> Non
 # ===========================================================================
 
 
+def _pad_differential(monkeypatch, entry: str, tokens: int) -> None:
+    """One differential: one entry, one ``T``, two pad lengths, first ``T`` rows equal.
+
+    The same run is made twice with nothing changed but the pad length -- same
+    fixture, same entry point, the second forced one whole multiple higher by
+    patching the seam's pad-target helper. If any stage reduced across the token
+    axis, a different number of pad rows would move the real rows.
+
+    Bit-identical is the reading, not "within tolerance": max abs diff exactly 0.0
+    on every float output and exact equality on every index output. A tolerance
+    here would let a real coupling hide under it.
+
+    EVERY sliced output is compared, not just one. The fused entry returns four,
+    and comparing only the affinities would leave a coupling in the logits or in
+    the substrate control unread.
+    """
+    multiple = NOAUX_TC_TILE if entry == "correct" else FUSED_MULTIPLE
+    real_target = seam._noaux_tc_pad_target
+    own = real_target(tokens, multiple)
+    higher = own + multiple
+
+    if entry == "correct":
+        logits, bias = build_logits(tokens)
+
+        def once():
+            reset_noaux_tc_counters()
+            with _SimulatorCounter() as sim:
+                index, aff = noaux_tc_correct(
+                    logits,
+                    bias,
+                    top_k=DECLARED_TOP_K,
+                    norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+                    routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+                )
+            return sim, (index,), (aff,)
+    else:
+        hidden_states, gamma, router_weights, bias = build_hidden(tokens)
+        seam_eps = inspect.signature(
+            noaux_tc_rmsnorm_router_topk
+        ).parameters["eps"].default
+
+        def once():
+            reset_noaux_tc_counters()
+            with _SimulatorCounter() as sim:
+                lg, index, aff, sub = noaux_tc_rmsnorm_router_topk(
+                    hidden_states=hidden_states,
+                    gamma=gamma,
+                    router_weights=router_weights,
+                    correction_bias=bias,
+                    top_k=DECLARED_TOP_K,
+                    eps=seam_eps,
+                    norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+                    routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+                )
+            return sim, (index, sub), (lg, aff)
+
+    sim, ints_own, floats_own = once()
+    _assert_route(sim, 1, f"pad-own-{entry}-T{tokens}-{own}")
+
+    def one_multiple_higher(num_tokens: int, mult: int) -> int:
+        return real_target(num_tokens, mult) + mult
+
+    monkeypatch.setattr(seam, "_noaux_tc_pad_target", one_multiple_higher)
+    try:
+        sim, ints_hi, floats_hi = once()
+    finally:
+        # Undone HERE rather than at teardown, so the next extent in the loop
+        # measures its own pad target and not a doubly-patched one.
+        monkeypatch.undo()
+    _assert_route(sim, 1, f"pad-higher-{entry}-T{tokens}-{higher}")
+
+    max_abs = max(
+        float((a.to(torch.float32) - b.to(torch.float32)).abs().max())
+        for a, b in zip(floats_own, floats_hi)
+    )
+    index_equal = min(
+        int((a == b).all(dim=-1).sum()) for a, b in zip(ints_own, ints_hi)
+    )
+    print(
+        f"[pad-invisible] entry={entry} T={tokens} own_pad={own} "
+        f"higher_pad={higher} pad_rows={own - tokens} vs {higher - tokens} "
+        f"float_outputs={len(floats_own)} index_outputs={len(ints_own)} "
+        f"max_abs_diff={max_abs} identical_index_rows={index_equal}/{tokens}"
+    )
+    assert higher == own + multiple
+    assert one_multiple_higher(tokens, multiple) == higher
+    for a, b in zip(floats_own + ints_own, floats_hi + ints_hi):
+        assert tuple(a.shape) == tuple(b.shape)
+        assert a.shape[0] == tokens, (
+            f"{entry} at T={tokens} returned {a.shape[0]} rows, not the caller's "
+            f"extent, so the slice back is wrong"
+        )
+    assert max_abs == 0.0
+    assert index_equal == tokens
+
+
 def test_the_pad_is_invisible_to_the_real_rows(monkeypatch) -> None:
     """The first ``T`` rows are BIT-IDENTICAL under two different pad lengths.
 
-    ``T = 100`` pads to 128 on its own multiple. The second run is forced one
-    whole multiple higher, to 256, by patching the pad target -- nothing else
-    changes, same fixture, same entry point. If any stage reduced across the
-    token axis, 156 pad rows instead of 28 would move the real rows.
+    BOTH ENTRIES AND EVERY DECLARED EXTENT, which round 1 did not do. It ran the
+    differential once -- correct-only entry, ``T = 100`` -- so the fused entry's
+    pad-and-slice, the half of this increment that touches a ``[2]``-grid kernel
+    where the shard boundary MOVES with the pad length, had no differential at all
+    (B56-M1), and conjunct 4's counted zero had no control over the fused stage
+    (B56-N4 for the extents). Now:
 
-    Bit-identical is the reading, not "within tolerance": max abs diff exactly
-    0.0 on the weights and exact equality on the indices. A tolerance here would
-    let a real coupling hide under it.
+        correct entry   T = 1, 8, 300 (the declared extents of conjuncts 1 and 2)
+                        and T = 100, round 1's own landed reading, kept
+        fused entry     T = 300, the declared non-multiple above the old 256,
+                        padding to 512 against 768 -- 256 rows per core against
+                        384, so the two runs shard the real rows differently
+
+    That last point is what makes the fused differential worth its runtime: the
+    correct entry has no grid, so a longer pad only appends rows, while the fused
+    entry splits the padded extent across two cores and a longer pad moves the
+    boundary through the real tokens. Bit-identity there is a much stronger
+    statement than bit-identity here.
     """
-    tokens = 100
-    own = seam._noaux_tc_pad_target(tokens, NOAUX_TC_TILE)
-    logits, bias = build_logits(tokens)
-
-    reset_noaux_tc_counters()
-    with _SimulatorCounter() as sim:
-        index_own, aff_own = noaux_tc_correct(
-            logits,
-            bias,
-            top_k=DECLARED_TOP_K,
-            norm_topk_prob=DECLARED_NORM_TOPK_PROB,
-            routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
-        )
-    _assert_route(sim, 1, f"pad-own-{own}")
-
-    real_target = seam._noaux_tc_pad_target
-
-    def one_multiple_higher(num_tokens: int, multiple: int) -> int:
-        return real_target(num_tokens, multiple) + multiple
-
-    monkeypatch.setattr(seam, "_noaux_tc_pad_target", one_multiple_higher)
-    higher = one_multiple_higher(tokens, NOAUX_TC_TILE)
-
-    reset_noaux_tc_counters()
-    with _SimulatorCounter() as sim:
-        index_hi, aff_hi = noaux_tc_correct(
-            logits,
-            bias,
-            top_k=DECLARED_TOP_K,
-            norm_topk_prob=DECLARED_NORM_TOPK_PROB,
-            routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
-        )
-    _assert_route(sim, 1, f"pad-higher-{higher}")
-
-    max_abs = float((aff_own.to(torch.float32) - aff_hi.to(torch.float32)).abs().max())
-    index_equal = int((index_own == index_hi).all(dim=-1).sum())
-    print(
-        f"[pad-invisible] T={tokens} own_pad={own} higher_pad={higher} "
-        f"pad_rows={own - tokens} vs {higher - tokens} "
-        f"max_abs_diff={max_abs} identical_index_rows={index_equal}/{tokens}"
-    )
-    assert higher == own + NOAUX_TC_TILE
-    assert tuple(aff_own.shape) == tuple(aff_hi.shape) == (tokens, DECLARED_E)
-    assert max_abs == 0.0
-    assert index_equal == tokens
+    for tokens in (1, 8, 100, 300):
+        _pad_differential(monkeypatch, "correct", tokens)
+    _pad_differential(monkeypatch, "fused", 300)
 
 
 # ===========================================================================
@@ -491,6 +637,12 @@ def test_no_authored_stage_reduces_across_the_token_axis() -> None:
     axis_reducers: list[str] = []
     token_axis: list[str] = []
     per_partition: list[str] = []
+    # Tracked separately ONLY so the census can print a derived count for it.
+    # Round 1 printed `partition_contractors_in_authored_source=0` as a string
+    # literal (B56-N3): the assertion behind it was sound, because contractors go
+    # into `token_axis` and that length IS computed, but a printed literal is not a
+    # reading and cannot move when the source does.
+    contractors: list[str] = []
     for name, node in bodies.items():
         for call in (n for n in ast.walk(node) if isinstance(n, ast.Call)):
             member = getattr(call.func, "attr", getattr(call.func, "id", ""))
@@ -502,6 +654,7 @@ def test_no_authored_stage_reduces_across_the_token_axis() -> None:
             if member in _PER_PARTITION:
                 per_partition.append(f"{name}:{member}")
             elif member in _PARTITION_CONTRACTORS:
+                contractors.append(where)
                 token_axis.append(where)
             elif member in _AXIS_REDUCERS:
                 axis_reducers.append(where)
@@ -512,7 +665,8 @@ def test_no_authored_stage_reduces_across_the_token_axis() -> None:
         f"[token-axis-census] stages={len(bodies)} "
         f"axis_reducers={len(axis_reducers)} {axis_reducers} "
         f"per_partition_members={len(per_partition)} {per_partition} "
-        f"partition_contractors_in_authored_source=0 "
+        f"partition_contractors_in_authored_source={len(contractors)} "
+        f"{contractors} "
         f"TOKEN_AXIS_REDUCTIONS={len(token_axis)} {token_axis}"
     )
     # Population first: a zero over an empty population is not a measurement.
