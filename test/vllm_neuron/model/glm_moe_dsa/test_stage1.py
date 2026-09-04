@@ -16,6 +16,7 @@ from vllm_neuron.model.glm_moe_dsa import (
     GlmMoeDsaForCausalLM,
 )
 from vllm_neuron.model.registry import get_models
+from vllm_neuron.vllm.platform import NeuronPlatform
 
 MODEL_PATH_VALUE = os.environ.get("GLM52_MODEL_PATH")
 MODEL_PATH = Path(MODEL_PATH_VALUE or ".")
@@ -64,6 +65,19 @@ def test_model_registry_resolution():
 
     assert resolved_cls is GlmMoeDsaForCausalLM
     assert resolved_arch == "GlmMoeDsaForCausalLM"
+
+
+def test_platform_keeps_upstream_glm_registration_until_worker_start(monkeypatch):
+    """ModelConfig must inspect vLLM's generate-capable GLM class first."""
+
+    monkeypatch.delenv("VLLM_NEURON_SYNTHETIC_MODEL", raising=False)
+    with patch(
+        "vllm.model_executor.models.registry.ModelRegistry.register_model"
+    ) as register_model:
+        NeuronPlatform.pre_register_and_update()
+
+    register_model.assert_not_called()
+    assert dict(get_models())["GlmMoeDsaForCausalLM"] is GlmMoeDsaForCausalLM
 
 
 def test_meta_factory_builds_only_main_layers(hf_config):

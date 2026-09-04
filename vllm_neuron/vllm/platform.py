@@ -160,15 +160,16 @@ class NeuronPlatform(Platform):
 
     @classmethod
     def pre_register_and_update(cls, parser=None) -> None:
-        """Register Neuron model architectures before ModelConfig validation."""
+        """Register test-only architectures needed before ModelConfig validation.
+
+        Production architectures that vLLM already knows must stay registered to
+        their upstream implementations during ModelConfig validation.  Each
+        Neuron worker replaces those registrations with the Neuron factories
+        after validation, in ``NeuronWorker.__init__``.
+        """
         import os
 
         from vllm.model_executor.models.registry import ModelRegistry
-
-        ModelRegistry.register_model(
-            "GlmMoeDsaForCausalLM",
-            "vllm_neuron.model.glm_moe_dsa:GlmMoeDsaForCausalLM",
-        )
 
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
