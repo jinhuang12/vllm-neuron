@@ -333,7 +333,7 @@ def build_weight_mappings(
 
     The attention family per layer is chosen off ``text_config.layer_types``
     by **equality**, never substring: ``"attention"`` is a substring of both
-    family names (``config.py:33-37``).
+    family names (``config.py:36-40``).
 
     **TWO PREFIXES, NOT ONE** (``inc-glm53f-078``). Each layer builds a
     ``ckpt_prefix`` in the checkpoint's namespace and a ``param_prefix`` in the
@@ -886,8 +886,8 @@ _FP8_SCALE_COMPENSATION = _FP8_E4M3FN_MAX / _FP8_E4M3_MAX
 #: finite. The floor is reported per block rather than applied silently: the census is
 #: on :class:`BlockScaleCompensation.floored_blocks`, and on the checkpoint load path
 #: :func:`report_floored_blocks` warns when it engaged, naming the parameter and the
-#: tiles. Until ``inc-glm53f-012``'s R2 round that second half was missing and this
-#: sentence was false of the only loader that ships -- finding ``B08-F1``.
+#: tiles. Until ``inc-glm53f-012``'s r1 round (batch R3) that second half was
+#: missing and this sentence was false of the loader that ships -- ``B08-F1``.
 MINVAL = 1e-5
 
 
@@ -1094,8 +1094,8 @@ def report_floored_blocks(
 
     WHY THIS EXISTS. :data:`MINVAL`'s own note says the floor is "reported per block
     rather than applied silently", and :class:`BlockScaleCompensation` does carry the
-    report -- but until ``inc-glm53f-012``'s R2 round the only loader that ships,
-    :func:`blockwise_scale_loader`, returned ``.scale_inv`` and threw the report away.
+    report -- but until ``inc-glm53f-012``'s r1 round (batch R3) the loader that
+    ships, :func:`blockwise_scale_loader`, returned ``.scale_inv`` and dropped it.
     Nothing outside the test suite could see that a tile had been floored. A floored
     tile is not a cosmetic event: a stored scale of ``1e-6`` is raised to ``1e-5``, so
     every weight in that tile dequantises about 5.4x too large. Finding

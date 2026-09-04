@@ -326,9 +326,9 @@ class Glm5NextQuantConfig:
 # shaped as the seam they will call.
 #
 # NO WEIGHT-MAP FAMILY IS ADDED, and that is a lead ruling rather than an
-# omission. ``weight_loaders_fp8.py:82-86`` declares ``multi_hyper_connections``
-# deliberately absent -- "no settled checkpoint leaf names; mapping them here
-# would be invention, not porting". This increment's acceptance is a synthetic
+# omission. ``weight_loaders_fp8.py:88-89`` declared ``multi_hyper_connections``
+# absent here -- no settled leaf names -- until ``inc-glm53f-078`` read the real
+# shard index and grounded it. This increment's acceptance is a synthetic
 # tiny case that builds these parameters in-test, so the map is not on its
 # route, and the checkpoint-leaf question stays a lead-owned open question for a
 # later design revision. ``weight_loaders_fp8.py`` is untouched.
@@ -434,7 +434,7 @@ class Glm5NextHyperConnection(nn.Module):
 
         Args:
             text_config: carries ``hc_mult``, ``hc_sinkhorn_iters`` and
-                ``hc_eps`` (``config.py:151-154``).
+                ``hc_eps`` (``config.py:225-227``).
             neuron_config: framework overrides. ``mhc_sinkhorn_iters`` and
                 ``mhc_eps`` (``neuron_config.py:194,197``) win when not
                 ``None``, which is the override contract ``-013``'s section note
@@ -749,10 +749,10 @@ class Glm5NextRoutedExperts(nn.Module):
     One parameter per projection covers **all** ``n_routed_experts`` experts:
     the landed map sends ``mlp.experts.<leaf>_weight`` to a *list* of
     ``n_routed_experts`` checkpoint keys
-    (``weight_loaders_fp8.py:471-479``), because this checkpoint stores one
+    (``weight_loaders_fp8.py:652-661``), because this checkpoint stores one
     tensor per expert while the fork's parameter side is per-projection. The
     router lives here too, and carries a bias because
-    ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:458-459``).
+    ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:644-647``).
     """
 
     # ── expert partitioning -- D14 owner: ``inc-glm53f-031`` ─────────────
@@ -875,7 +875,7 @@ class Glm5NextRoutedExperts(nn.Module):
 
         The seam is entered with ``correction_bias=self.router_bias``, and that
         parameter is ``mlp.gate.e_score_correction_bias``
-        (``weight_loaders_fp8.py:463-467``) -- the ``noaux_tc`` correction bias,
+        (``weight_loaders_fp8.py:644-647``) -- the ``noaux_tc`` correction bias,
         NOT a router projection bias. The seam's own signature keeps the two
         apart by name, because adding this tensor to the logits instead of to
         the sigmoid scores would compute a different router that no shape check
@@ -1546,7 +1546,7 @@ class Glm5NextSharedExperts(nn.Module):
         activated = silu(gate) * up
 
         # The down projection re-enters the seam, whose declared input dtype is
-        # ``bfloat16`` (``blockwise_fp8_mm.py:408``), so the fp32 intermediate is
+        # ``bfloat16`` (``blockwise_fp8_mm.py:410``), so the fp32 intermediate is
         # cast back to the activation dtype. The cast is named rather than
         # implicit because it is a real precision step and the acceptance's torch
         # reference mirrors it at the same point.
@@ -2318,11 +2318,11 @@ class Glm5NextKDALayer(nn.Module):
 class Glm5NextDSAIndexer(nn.Module):
     """The DSA sparse indexer at ``self_attn.indexer``.
 
-    PROVISIONAL leaf names, flagged as such on the landed side too
-    (``weight_loaders_fp8.py:376``): ``index_n_heads`` / ``index_head_dim``
-    are in the checkpoint config but the indexer's leaf names are unconfirmed
-    against the shard index. Carried here exactly as the map declares them so
-    the two sides move together if they move at all.
+    LEAF NAMES PROVISIONAL AT THIS INCREMENT, and not any more: the map now
+    records ``dsa_indexer`` as GROUNDED (``weight_loaders_fp8.py:84-86``) because
+    ``inc-glm53f-078`` read the real shard index. The two dials this class was
+    sized from, ``index_n_heads`` / ``index_head_dim``, appear nowhere in the tree
+    now. Carried exactly as the map declares them so the two sides move together.
     """
 
     def __init__(self) -> None:
@@ -2672,7 +2672,7 @@ def _build_layer(
     """One decoder layer, family chosen by EQUALITY on ``layer_types``.
 
     Never by substring: ``"attention"`` is a substring of both family names
-    (``config.py:33-37``), so a substring test would silently mis-partition
+    (``config.py:36-40``), so a substring test would silently mis-partition
     the stack -- and mis-partitioning it is exactly what the 34/11 split
     would then fail to detect.
     """
@@ -2729,11 +2729,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 GLM-5.3-Flash implementation.
 
     The module path, this class name and the ``from_configs`` signature are
-    **pinned by landed code**: ``factory.py:68`` already reads ``from
+    **pinned by landed code**: ``factory.py:291`` already reads ``from
     .model_fp8 import Glm5NextForConditionalGeneration as Model`` and
-    ``factory.py:70-74`` calls
+    ``factory.py:293`` calls
     ``Model.from_configs(hf_config, text_neuron_config=..., vision_neuron_config=...)``.
-    The name is duplicated with ``factory.py:21`` on purpose -- that is the
+    The name is duplicated with ``factory.py:219`` on purpose -- that is the
     plugin's selector-to-implementation convention, the same pair
     ``llama3/factory.py:42`` uses -- so neither side is renamed here.
     """
@@ -2753,7 +2753,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model = Glm5NextModel(config, self.world_size)
         # Mirrors the map's own condition: a tied head has no separate
         # checkpoint key and therefore no separate parameter
-        # (``weight_loaders_fp8.py:318-319``).
+        # (``weight_loaders_fp8.py:382-383``).
         if not self.text_config.tie_word_embeddings:
             _declare_parameters(self, "lm_head_weight")
 
@@ -2766,7 +2766,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_neuron_config: NeuronConfig | None = None,
         vision_neuron_config: VisionNeuronConfig | None = None,
     ) -> Glm5NextForConditionalGeneration:
-        """Build from an HF config, the signature ``factory.py:70-74`` calls."""
+        """Build from an HF config, the signature ``factory.py:293`` calls."""
         config = Glm5NextConfig.from_configs(
             hf_config,
             text_neuron_config=text_neuron_config,

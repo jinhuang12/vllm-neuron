@@ -18,7 +18,7 @@ NOT exported, and this is the point rather than an omission: every helper whose
 NAME IS SHARED BY TWO MODULES OF THIS CAMPAIGN AT DIFFERENT SIGNATURES.
 Measured over the three landed WP6 modules:
 
-* ``to_kernel_scale_layout`` -- ``moe/moe_blockwise_fp8.py:170``
+* ``to_kernel_scale_layout`` -- ``moe/moe_blockwise_fp8.py:181``
   ``(consumer_scales, num_experts, rows, cols, projection)`` versus
   ``blockwise_fp8_mm.py:309`` ``(weight_scale, rows, cols)``;
 * ``flat_scale_index`` -- ``moe/blockwise_fp8_retile.py:194``

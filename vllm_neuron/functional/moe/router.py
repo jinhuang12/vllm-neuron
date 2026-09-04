@@ -944,7 +944,7 @@ NOAUX_TC_TILE = 128
 #: `nisa.max8` emits exactly 8 values per partition and `nisa.nc_find_index8`
 #: consumes exactly 8 -- both are fixed by the instructions, not by a choice
 #: here (see their docstrings, and `router_topk.py:582-583` which refuses k > 8).
-#: This checkpoint's `num_experts_per_tok` is 8 (`glm5_next/config.py:143`), so
+#: This checkpoint's `num_experts_per_tok` is 8 (`glm5_next/config.py:187`), so
 #: the model sits exactly on the instruction width and no masking pass is owed.
 NOAUX_TC_K = 8
 

@@ -107,7 +107,7 @@ read functions **on purpose**: `inc-glm53f-030`'s route predicate is form R-2
 over *this* seam together with `inc-glm53f-029`'s, so a later increment's own
 test must be able to zero and read these counters from another module. A
 test-local counter would satisfy this increment and break that one. This mirrors
-`inc-glm53f-026`'s landed placement (``functional/blockwise_fp8_mm.py:366-369``)
+`inc-glm53f-026`'s landed placement (``functional/blockwise_fp8_mm.py:368-372``)
 deliberately, so the two seams `inc-glm53f-030` reads present one shape.
 
 Under F1 a numeric comparison alone cannot prove a kernel ran -- a torch

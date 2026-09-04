@@ -252,7 +252,7 @@ def kda_gate_clamp(
 
     ``lower`` IS REQUIRED AND HAS NO DEFAULT. It is the checkpoint's
     ``gate_lower_bound``, which the caller reads from
-    ``Glm5NextTextConfig.linear_attn_config`` (``model/glm5_next/config.py:157``,
+    ``Glm5NextTextConfig.linear_attn_config`` (``model/glm5_next/config.py:170``,
     value ``-5.0``). This module does not read that config and does not carry a copy
     of the value, because ``functional/kda/`` imports nothing from
     ``model/glm5_next/`` -- so a stale second copy of a model constant cannot exist

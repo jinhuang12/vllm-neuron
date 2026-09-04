@@ -48,7 +48,7 @@ DispatchKey.CPU -> nki.simulator.simulate_kernel``), on the harness form
 `inc-glm53f-025` landed. The seam counts its dispatches, and the counters are
 module-level state with module-level reset and read functions, mirroring
 `inc-glm53f-026`'s landed placement
-(``functional/blockwise_fp8_mm.py:366-369``) and `inc-glm53f-028`'s
+(``functional/blockwise_fp8_mm.py:368-372``) and `inc-glm53f-028`'s
 (``functional/mhc/sinkhorn.py``) so that every seam a later route predicate
 reads presents one shape.
 

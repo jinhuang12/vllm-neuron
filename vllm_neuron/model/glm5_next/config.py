@@ -86,9 +86,9 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     28. The measured decomposition at ``inc-glm53f-033`` repair round 2 was 33
     declared fields, 31 of them keys the vendor config also carries, plus the one
     key the ``dtype`` remap consumes, so the log read 32 modelled and 26 dropped.
-    That round then added ``swiglu_limit`` and the log reads 33 modelled and 25
-    dropped. A count in this prose is a second place to keep the same number, so
-    the number now lives only where it is measured -- the log itself, and
+    That round then added ``swiglu_limit``, which moved both figures again. A
+    count in this prose is a second place to keep the same number, so the
+    number now lives only where it is measured -- the log itself, and
     ``test_config.py``'s conjunct (c), which derives it from the vendor config
     and this dataclass rather than restating it.
     """
@@ -121,8 +121,8 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     dropped = sorted(set(config_dict) - field_names - remapped)
     if dropped:
         # One record, every name in it: a per-key record would put one line per
-        # dropped key in the log for one config -- 25 of them for this
-        # checkpoint's text config -- and get filtered out as noise.
+        # dropped key for one config -- enough to get filtered out as noise. The
+        # count is the log's own reading, not a number kept here.
         logger.warning(
             "%s models %d of the %d keys in this HF config and DROPS the "
             "other %d: %s",
