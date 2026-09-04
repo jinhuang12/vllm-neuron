@@ -52,7 +52,11 @@ _FP8 = torch.float8_e4m3fn
 #: written as a literal, so a torch build with a different range moves it.
 _FP8_MAX = float(torch.finfo(_FP8).max)
 
-#: The checkpoint's declared block shape (``quantization.py:114``).
+#: The checkpoint's declared block shape
+#: (``vllm_neuron/model/glm5_next/quantization.py:114``). Cited by full path
+#: because a bare ``quantization.py`` has two in-repo candidates -- the
+#: ``llama3`` module carries one too -- and an ambiguous basename is a
+#: mechanical drift hit.
 BLOCK = (128, 128)
 
 #: Token count, the same value `-039b`'s landed acceptance uses.
