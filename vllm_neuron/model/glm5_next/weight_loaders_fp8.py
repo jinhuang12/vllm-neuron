@@ -633,7 +633,7 @@ def _add_moe_mlp(
     expert parameter maps to a **list** of ``n_routed_experts`` checkpoint keys
     -- the list-valued branch of the mapping shape -- rather than to one key.
 
-    ``topk_method = "noaux_tc"`` (``config.py:134``) is why the router carries
+    ``topk_method = "noaux_tc"`` (``glm5_next/config.py:189``) is why the router carries
     ``e_score_correction_bias`` alongside its weight.
     """
     ckpt_mlp = f"{ckpt_prefix}.mlp"

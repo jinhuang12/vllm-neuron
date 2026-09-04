@@ -149,7 +149,7 @@ H = 64
 RTOL = 1e-2
 ATOL = 1e-5
 
-#: The checkpoint's own mHC dials (``config.py:151-154``).
+#: The checkpoint's own mHC dials (``glm5_next/config.py:226-227``).
 HC_SINKHORN_ITERS = 20
 HC_EPS = 1e-06
 #: ``hc_post_mult_value``. The base's own kernel test sets

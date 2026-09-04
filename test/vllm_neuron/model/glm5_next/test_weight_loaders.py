@@ -510,9 +510,9 @@ def test_skeleton_duplicate_is_certified_by_the_loader_not_the_fixture(
     other = next(name for name in shard_names if name != home)
     shards[other] = [*shards[other], duplicated]  # now in TWO shard files
 
-    # Leg 1 -- the helper is not the certifier. Rebuilding the slice map runs
-    # the helper's own within-layer duplicate guard (utils.py:137-138) and it
-    # stays silent, because a cross-shard duplicate is invisible to it.
+    # Leg 1 -- the helper is not the certifier. Rebuilding the slice map runs the
+    # helper's own within-layer duplicate guard (test/vllm_neuron/model/utils.py:137-138)
+    # and it stays silent, because a cross-shard duplicate is invisible to it.
     rebuilt = _build_slice_map(mini_config)
     assert set(rebuilt) == set(slice_map)
 

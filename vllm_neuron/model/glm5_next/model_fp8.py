@@ -752,7 +752,7 @@ class Glm5NextRoutedExperts(nn.Module):
     (``weight_loaders_fp8.py:652-661``), because this checkpoint stores one
     tensor per expert while the fork's parameter side is per-projection. The
     router lives here too, and carries a bias because
-    ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:644-647``).
+    ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:636-637``).
     """
 
     # ── expert partitioning -- D14 owner: ``inc-glm53f-031`` ─────────────
@@ -2320,9 +2320,9 @@ class Glm5NextDSAIndexer(nn.Module):
 
     LEAF NAMES PROVISIONAL AT THIS INCREMENT, and not any more: the map now
     records ``dsa_indexer`` as GROUNDED (``weight_loaders_fp8.py:84-86``) because
-    ``inc-glm53f-078`` read the real shard index. The two dials this class was
-    sized from, ``index_n_heads`` / ``index_head_dim``, appear nowhere in the tree
-    now. Carried exactly as the map declares them so the two sides move together.
+    ``inc-glm53f-078`` read the real shard index. The two dials it was sized from,
+    ``index_n_heads`` / ``index_head_dim``, live only in ``fixtures/config.json:195-196``,
+    not in the fork's Python. Carried as the map declares them so both sides move together.
     """
 
     def __init__(self) -> None:

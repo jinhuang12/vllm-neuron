@@ -17,7 +17,7 @@ WHY EVERY IMPORT OF THE MODULE UNDER TEST IS DEFERRED
 -----------------------------------------------------
 ``test_factory.py:318-319`` is a **landed passing assertion** that
 ``vllm_neuron.model.glm5_next.model_fp8`` is *not* in ``sys.modules`` -- it is
-what proves ``factory.py:291``'s lazy import stays lazy. pytest imports **every
+what proves ``glm5_next/factory.py:291``'s lazy import stays lazy. pytest imports **every
 collected test module during collection, before it runs any test**, so a
 module-level ``import model_fp8`` in this file would put the module in
 ``sys.modules`` before ``test_factory.py``'s test body ever runs and would
@@ -132,11 +132,11 @@ INTAKE_RECORDED_DSA_INDICES = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43]
 #: The landed split ``test_config.py:57`` pins, as ``(num_kda, num_dsa)``.
 EXPECTED_LAYER_SPLIT = (34, 11)
 
-#: KDA geometry from ``linear_attn_config`` (``config.py:110-117``).
+#: KDA geometry from ``linear_attn_config`` (``glm5_next/config.py:165-171``).
 DECLARED_KDA_HEAD_SIZE = 128
 DECLARED_KDA_NUM_HEADS = 64
 
-#: The pin's ``LayerSpec`` field set, in order (``kv_cache.py:16-21``).
+#: The pin's ``LayerSpec`` field set, in order (``model/kv_cache.py:16-21``).
 PIN_LAYER_SPEC_FIELDS = (
     "name",
     "num_kv_heads",
@@ -212,7 +212,7 @@ def raw() -> dict:
 def model(raw: dict):
     """The skeleton built from the landed 45-layer fixture.
 
-    Built through the classmethod ``factory.py:293`` actually calls, so the
+    Built through the classmethod ``glm5_next/factory.py:293`` actually calls, so the
     acceptance exercises the pinned construction signature rather than a
     convenience path.
     """

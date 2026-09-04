@@ -1450,8 +1450,8 @@ def noaux_tc_correct(
         correction_bias: `[1, E]` or `[E]` `e_score_correction_bias`.
         top_k: must be `NOAUX_TC_K`; present so a caller's intent is explicit
             and a mismatch is a named refusal rather than a silent reshape.
-        norm_topk_prob: L1-normalise the selected weights (`config.py:147`).
-        routed_scaling_factor: final multiplier (`config.py:148`).
+        norm_topk_prob: L1-normalise the selected weights (`glm5_next/config.py:191`).
+        routed_scaling_factor: final multiplier (`glm5_next/config.py:192`).
 
     Returns:
         `(expert_index [T, K] int32, expert_affinities [T, E] float32)`.

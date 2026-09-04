@@ -22,7 +22,7 @@ WHY THE SHAPES ARE DERIVED AND NOT HAND-WRITTEN
 C03 does not write ``(3, 384)`` into a fixture and read it back. It CALLS
 ``MambaStateShapeCalculator.kda_state_shape`` -- vLLM's own calculator, the
 authority the campaign's design cites for this geometry -- at the geometry the
-fork's landed ``linear_attn_config`` carries (``config.py:110-117``) and at the
+fork's landed ``linear_attn_config`` carries (``glm5_next/config.py:165-171``) and at the
 registered tensor-parallel degree, then asserts the returned value against the
 expected literals. A vendor change to that calculator, a wrong geometry
 argument or a wrong orientation therefore FAILS the arm instead of being
@@ -72,7 +72,7 @@ DECLARED_KDA_FIELDS = (
     "kda_recurrent_state_dtype",
 )
 
-#: The pin's ``LayerSpec`` field set, in order (``kv_cache.py:16-21``). The
+#: The pin's ``LayerSpec`` field set, in order (``model/kv_cache.py:16-21``). The
 #: widening must leave these six as an in-order PREFIX.
 PIN_LAYER_SPEC_FIELDS = (
     "name",

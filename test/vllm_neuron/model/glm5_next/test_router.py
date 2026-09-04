@@ -650,7 +650,7 @@ def test_declared_gate_weights_match_within_declared_tolerances() -> None:
 
     Both sides are DENSE ``[T, E]`` tensors and are compared as they stand.
     ``noaux_tc_correct_torch_oracle`` returns an already-scattered affinity
-    tensor (``router.py:1535-1537``); passing it through a second scatter is what
+    tensor (``moe/router.py:1639-1641``); passing it through a second scatter is what
     broke attempt 1 (``increments/investigation-032.md`` §4).
     """
     logits, bias = build_designed_logits()

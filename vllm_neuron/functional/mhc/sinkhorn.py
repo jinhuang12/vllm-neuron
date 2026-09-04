@@ -60,7 +60,7 @@ different things. Each pass is therefore taken with the primitive that suits it:
   ``functional/moe/topk_reduce.py:337-348``'s own "column-sum via a ones-moving
   matmul". Scattering the ``[1, N]`` scale back over ``M`` partitions is the
   mirror-image problem, and ``nl.broadcast_to`` is the member that does it:
-  ``router.py:1121-1124`` records that a ``[1, E]`` row's broadcast "is on the
+  ``moe/router.py:1205-1206`` records that a ``[1, E]`` row's broadcast "is on the
   PARTITION axis, which ``nl.broadcast_to`` does and ``tensor_scalar`` does
   not."
 
@@ -270,7 +270,7 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS):
             dst=row_den, data=row_sum, op0=nl.add, operand0=SINKHORN_DENOM_EPS
         )
         # reciprocal then multiply, rather than a divide: `nisa.reciprocal` is
-        # the member router.py:1165 uses for exactly this shape, and the
+        # the member moe/router.py:1249 uses for exactly this shape, and the
         # multiply below broadcasts an [M, 1] operand along the free axis.
         nisa.reciprocal(dst=row_scale, data=row_den)
         nisa.tensor_scalar(
@@ -296,7 +296,7 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS):
             dst=col_scale, data=col_scale, op0=nl.multiply, operand0=float(col_goal)
         )
         # The [1, N] scale has to reach M partitions. `nl.broadcast_to` is the
-        # member that broadcasts on the PARTITION axis (router.py:1121-1124).
+        # member that broadcasts on the PARTITION axis (moe/router.py:1205-1206).
         col_scale_b = nl.broadcast_to(col_scale, (m_extent, n_extent))
         nisa.tensor_tensor(
             dst=working, data1=working, data2=col_scale_b, op=nl.multiply
