@@ -1372,3 +1372,167 @@ def blockwise_scale_loader(param_name: str | None = None) -> SafetensorsWeightLo
         return compensation.scale_inv
 
     return SafetensorsWeightLoader(transform=transform)
+
+
+# --------------------------------------------------------------------------- #
+# SEAM -- inc-glm53f-091 (which loader serves which mapped key) lands below
+# this line.
+#
+# This increment's WHOLE hand on this file: given one map entry's checkpoint
+# key or keys, say which of the two loaders above serves it. It writes no map
+# entry, no numeric and no family adder, and it changes nothing above this
+# line. The parameter materialisation that consumes the answer lives in
+# ``model_fp8.py``, which is this increment's other surface.
+# --------------------------------------------------------------------------- #
+
+#: A map entry naming one scale grid on its own.
+MAPPED_KEY_SCALE_GRID = "scale_grid"
+
+#: A map entry naming a quantised weight together with its scale companion.
+MAPPED_KEY_QUANTISED_WEIGHT = "quantised_weight"
+
+#: A map entry naming ordinary unquantised tensors.
+MAPPED_KEY_PLAIN = "plain"
+
+
+class Glm5NextExpertBankNotLoadableError(Glm5NextWeightMapError):
+    """One map entry names a whole expert bank, which no loader here can stack.
+
+    ``inc-glm53f-091a``, raised on the increment's own measured finding rather
+    than on a review comment. Subclassing :class:`Glm5NextWeightMapError` is
+    this file's shipped form for a named map refusal --
+    :class:`DuplicateShardKeyError` (``:117``) is the other one -- so a caller
+    that already handles a map error handles this one too, and it stays a
+    ``ValueError`` like ``model_fp8.py``'s ``Glm5NextWeightLoadError``.
+
+    Declared BELOW the seam rather than beside its siblings at the top of the
+    file, for one reason worth stating: every byte above the seam is frozen at
+    this increment and proved unchanged as a digest, so moving a class up there
+    would cost that proof and buy nothing.
+    """
+
+
+def _as_key_list(checkpoint_keys: str | Sequence[str]) -> list[str]:
+    """One map entry's checkpoint keys as a list, whether it named one or many.
+
+    :func:`build_weight_mappings` stores a lone key as a bare string and a fused
+    family as a list, so every consumer has to normalise before counting.
+    Extracted so the two consumers below normalise the same way -- the same
+    reason there is one classifier here and not two.
+    """
+    if isinstance(checkpoint_keys, str):
+        return [checkpoint_keys]
+    return list(checkpoint_keys)
+
+
+def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
+    """Which of the three kinds one map entry's checkpoint key(s) describe.
+
+    ``inc-glm53f-091``. **ONE classifier with two consumers** -- the loader
+    :func:`loader_for_mapped_keys` picks below, and the placeholder dtype
+    ``model_fp8.py`` gives the parameter before the load. Deliberately one
+    function rather than two: the pipelined loader reads its target dtype off
+    the placeholder and warns whenever the tensor it built differs
+    (``utils/checkpoints.py:437`` and ``:570-575``), so a placeholder typed
+    against a different case than its own loader would make every load emit
+    that warning. Two classifiers of the same three cases can drift apart; one
+    cannot.
+
+    **"Is this key a scale?" is not re-decided here.** :func:`scale_keys` above
+    is the landed authority for that question -- its own docstring says so --
+    and it is called rather than copied, so the dot-qualified suffix
+    convention lives in exactly one place.
+
+    The three cases are exhaustive by construction: a key list either holds no
+    scale key, or holds one alongside something else, or is a lone scale key.
+
+    AN EXPERT BANK IS NOT A FOURTH CASE HERE, AND THAT IS DELIBERATE. An entry
+    carrying MORE THAN ONE scale key is a whole bank of quantised weights, and
+    it classifies as ``MAPPED_KEY_QUANTISED_WEIGHT`` like any other -- because
+    the classification is still true, and because the placeholder dtype that
+    reads this function needs exactly that answer. What such an entry cannot
+    have is a loader, so :func:`loader_for_mapped_keys` REFUSES it by name.
+    ``inc-glm53f-095`` adds the stacked kind here and the loader to go with it;
+    until then the refusal is the only correct answer, and a third consumer of
+    this function would be the way that stops being true.
+    """
+    keys = _as_key_list(checkpoint_keys)
+    scales = scale_keys(keys)
+    if len(keys) == 1 and len(scales) == 1:
+        return MAPPED_KEY_SCALE_GRID
+    if scales:
+        return MAPPED_KEY_QUANTISED_WEIGHT
+    return MAPPED_KEY_PLAIN
+
+
+def loader_for_mapped_keys(
+    checkpoint_keys: str | Sequence[str], *, param_name: str | None = None
+) -> SafetensorsWeightLoader | None:
+    """The loader that serves one mapped parameter, or ``None`` for the default.
+
+    ``inc-glm53f-091``. Three cases, one per :func:`classify_mapped_keys` kind,
+    and one REFUSAL that cuts across the second of them:
+
+    * a lone scale grid gets :func:`blockwise_scale_loader`, which compensates
+      the grid for the trn2 range and reports a floored block by name. Passing
+      ``param_name`` is what lets that report say which parameter floored.
+    * a quantised weight with ONE scale companion gets
+      :func:`wrap_with_blockwise_fp8_downscale` over the default loader. That
+      wrapper's base transform is ``slices[0][:]`` (``:1332``), so it keeps the
+      weight slice and DROPS the scale companion -- the measured reason the
+      scales are read out of band rather than through this map.
+    * a quantised weight with MORE THAN ONE scale companion is an EXPERT BANK,
+      and it is REFUSED by name. See the block below for the measurement that
+      put the refusal here.
+    * anything else gets ``None``, meaning "attach nothing".
+      :func:`~vllm_neuron.utils.weight_loader.get_weight_loader` already falls
+      back to the identity loader when a parameter carries none
+      (``utils/weight_loader.py:102``), so attaching one here would be a second
+      way of saying the same thing, and two ways is one too many.
+
+    ``rank`` is not consulted and no loader returned here shards. That is the
+    landed position of this file, not a choice made now:
+    :func:`blockwise_scale_loader`'s own docstring records that a sharded grid
+    "follows the weight's own shard geometry and lands with the module that
+    declares that geometry". :func:`wrap_with_blockwise_fp8_downscale` forwards
+    ``rank`` to whatever loader it wraps, so it composes with a shard loader
+    unchanged when one lands.
+
+    WHY AN EXPERT BANK IS REFUSED HERE RATHER THAN SERVED BADLY. The key map
+    hands ONE parameter every key of a routed expert bank, interleaved weight
+    then scale per expert -- on the real configuration 126 of the map's 1,416
+    entries carry 576 keys each, 288 experts times weight and scale. Every
+    loader reachable from this function takes the FIRST slice and no other:
+    :func:`wrap_with_blockwise_fp8_downscale`'s base transform is ``slices[0][:]``
+    (``:1332``), and on a platform needing no squeeze it returns the bare loader,
+    whose own documented behaviour with no transform is "loads the first slice
+    as-is" (``utils/weight_loader.py:41``). So handing a bank to either of them
+    loads expert 0 and silently drops the rest, and NOTHING downstream notices:
+    ``utils/checkpoints.py`` validates no shape at all, and the lazy placeholder
+    the caller registers makes torch's own shape check skip the parameter -- the
+    very property that placeholder was chosen for. Measured rather than
+    reasoned: ``increments/evidence-091.md`` records a four-expert miniature bank
+    loading ``LOADED_NUMEL=16384`` where its own slices imply ``65536``, while
+    the acceptance read 125 of 125 parameters loaded and exit ``0``. A refusal is
+    the only answer here a reader can trust, and ``inc-glm53f-095`` is where the
+    bank becomes loadable.
+    """
+    keys = _as_key_list(checkpoint_keys)
+    kind = classify_mapped_keys(keys)
+    if kind == MAPPED_KEY_SCALE_GRID:
+        return blockwise_scale_loader(param_name)
+    if kind == MAPPED_KEY_QUANTISED_WEIGHT:
+        scales = scale_keys(keys)
+        if len(scales) > 1:
+            raise Glm5NextExpertBankNotLoadableError(
+                f"{param_name or '<unnamed parameter>'} maps to {len(keys)} "
+                f"checkpoint keys carrying {len(scales)} scale keys, so it is a "
+                f"bank of {len(scales)} quantised experts rather than one "
+                f"quantised weight. No loader in this module stacks experts -- "
+                f"each one keeps the first slice and would drop the other "
+                f"{len(scales) - 1} silently -- so this entry is refused instead "
+                f"of loaded wrongly. Stacked expert banks land in "
+                f"inc-glm53f-095."
+            )
+        return wrap_with_blockwise_fp8_downscale(SafetensorsWeightLoader())
+    return None

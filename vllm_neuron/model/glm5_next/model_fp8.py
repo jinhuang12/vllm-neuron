@@ -78,10 +78,17 @@ from vllm_neuron.model.glm5_next.config import (
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     DSA_SCALED_PROJECTIONS,
     FP8_SCALE_SUFFIX,
+    MAPPED_KEY_QUANTISED_WEIGHT,
+    MAPPED_KEY_SCALE_GRID,
+    build_weight_mappings,
+    classify_mapped_keys,
     dequantise_blockwise,
+    loader_for_mapped_keys,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
+from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.weight_loader import set_weight_loader
 
 # ---------------------------------------------------------------------------
 # Parameter declaration -- the mechanism that makes a name exist without
@@ -137,6 +144,34 @@ def _resolve_world_size() -> int:
         return torch.distributed.get_world_size()
     except (RuntimeError, ValueError):
         return 1
+
+
+def _resolve_rank() -> int:
+    """This process's rank in the tensor-parallel group, or 0 when not distributed.
+
+    ``inc-glm53f-091``. The twin of :func:`_resolve_world_size` above, and
+    deliberately the same shape -- same source, same two exception types, same
+    "absence is not an error" reading -- because the two values are read together
+    and a pair that disagreed about what "not distributed" means would shard
+    against a rank the world size does not contain.
+
+    ``load_sharded_pipelined`` requires a rank to shard by
+    (``utils/checkpoints.py:273-282``). The shipped ``qwen3`` path takes it from
+    ``self.tp_group.rank_in_group`` (``qwen3/model.py:974``), which is not
+    available here: ``Glm5NextForConditionalGeneration`` declares no ``tp_group``
+    member, only ``world_size`` (``:3031``). Reading the process group directly is
+    what ``-013`` already chose for the world size, so this keeps one convention
+    in the file rather than importing a second one.
+
+    D14 BOUNDARY, recorded because this is a new module-level helper: it sits in
+    the module-level helper block that ``inc-glm53f-013`` owns, immediately after
+    its twin and before ``_per_rank``. It adds no import -- ``torch`` is already
+    the module's own -- and no ``-013`` helper is edited.
+    """
+    try:
+        return torch.distributed.get_rank()
+    except (RuntimeError, ValueError):
+        return 0
 
 
 def _per_rank(count: int, world_size: int) -> int:
@@ -3005,6 +3040,44 @@ class Glm5NextModel(nn.Module):
         )
 
 
+# ---------------------------------------------------------------------------
+# ``inc-glm53f-091`` -- weight loading support.
+#
+# D14: this constant and ``load_weights`` plus its two private helpers on the
+# class below are ``inc-glm53f-091``'s. ``inc-glm53f-054`` owns the 45-layer
+# forward and every stub it replaces; nothing here touches one.
+# ---------------------------------------------------------------------------
+
+#: The dtype a quantised weight's checkpoint bytes are stored in. OCP
+#: ``float8_e4m3fn``.
+#:
+#: **Declared here rather than imported, which is the fork's own convention for
+#: this constant:** three shipped modules each declare their own
+#: (``llama3/model_mx_fp8.py:101``, ``llama3/model_static_fp8.py:119``,
+#: ``llama3/weight_pack_mx_fp8.py:21``). The sibling ``weight_loaders_fp8.py``
+#: holds a private ``_FP8_DTYPE`` of this same value, and importing a private
+#: name across modules is not that convention -- nor is it available under this
+#: increment's partition of that file, which is the loader wiring only.
+_FP8_DTYPE = torch.float8_e4m3fn
+
+
+class Glm5NextWeightLoadError(ValueError):
+    """A checkpoint could not be read onto this model tree.
+
+    ``inc-glm53f-091``. A ``ValueError`` subclass to match the three named
+    errors this file already raises (``Glm5NextHyperConnectionError``,
+    ``Glm5NextBlockQuantRouteError``, ``Glm5NextSharedExpertRouteError``) rather
+    than to make a claim about the failure being a file-system one -- the
+    checkpoint argument may name a local directory or a remote repository, and
+    :meth:`Glm5NextForConditionalGeneration.load_weights` must refuse both the
+    same way.
+
+    Every message this class carries names the checkpoint path, because the
+    argument is passed straight through from the runner and a refusal that did
+    not name it would send a reader to the wrong place.
+    """
+
+
 class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 GLM-5.3-Flash implementation.
 
@@ -3071,6 +3144,211 @@ class Glm5NextForConditionalGeneration(nn.Module):
             for leaf in getattr(module, "declared_param_names", ()):
                 names.append(f"{module_path}.{leaf}" if module_path else leaf)
         return tuple(names)
+
+    # ── weight loading (``inc-glm53f-091``) ──────────────────────────────
+
+    def _placeholder_dtype(self, checkpoint_keys: str | list[str]) -> torch.dtype:
+        """The dtype the loader will hand back for one mapped parameter.
+
+        Load-bearing rather than cosmetic. The checkpoint reader takes its
+        target dtype OFF THE PLACEHOLDER (``utils/checkpoints.py:437``) and
+        warns whenever the tensor it built differs (``:570-575``), so a
+        placeholder typed by guess would make every load emit that warning for
+        every parameter.
+
+        The three cases come from
+        :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.classify_mapped_keys`,
+        which is the one classifier this and the loader choice share, so the
+        dtype and the loader cannot disagree about what a key is.
+        """
+        kind = classify_mapped_keys(checkpoint_keys)
+        if kind == MAPPED_KEY_SCALE_GRID:
+            return torch.float32
+        if kind == MAPPED_KEY_QUANTISED_WEIGHT:
+            return _FP8_DTYPE
+        return self.text_config.torch_dtype
+
+    def _materialise_declared_parameters(
+        self, mappings: dict, device: torch.device
+    ) -> int:
+        """Give every declared parameter a shape-free placeholder and its loader.
+
+        Returns how many were materialised.
+
+        WHY THIS STEP EXISTS AT ALL, measured rather than assumed. The
+        checkpoint reader decides what to load by iterating
+        ``list(model.named_parameters())`` (``utils/checkpoints.py:348``,
+        consumed at ``:402``), and torch omits a ``register_parameter(name,
+        None)`` declaration from that list. This tree is every parameter
+        declared and none materialised, so before this step the list is EMPTY
+        and a load that skipped it would read no weight at all and report
+        success. Measured on the host's torch:
+        ``increments/probe-091-assign-shape.out``,
+        ``NAMED_PARAMS_COUNT_ON_NONE_TREE=0``.
+
+        WHY THE PLACEHOLDER CLAIMS NO SHAPE. A shaped placeholder would have to
+        carry the per-rank sharded shape, which the modules in this file already
+        know and which would become a second place to get it wrong. It does not
+        have to: ``UninitializedParameter`` is torch's own
+        parameter-without-a-shape-yet, and torch's shape check when the tensors
+        arrive is guarded by exactly that case -- ``if not is_param_lazy and
+        input_param.shape != param.shape``, with no ``assign`` term in it. An
+        ordinary zero-size placeholder is REFUSED there; the lazy one is
+        accepted and filled from the checkpoint. Both readings are in the probe
+        named above, and it also records that ``assign=False`` raises on a lazy
+        parameter, which is why the load below must pass ``assign=True``.
+
+        The placeholder still carries the only two things the reader takes off
+        it: the dtype, and the weight loader attached to it.
+
+        The walk is the same one :meth:`declared_parameter_names` does, and is
+        repeated here only because registering a parameter needs the module and
+        the leaf name rather than the dotted path. The two cannot drift apart
+        unnoticed: the acceptance counts this method's result against
+        :meth:`declared_parameter_names`, so a walk that visited a different set
+        reddens.
+
+        WHY IT IS TWO PASSES AND NOT ONE. Choosing a loader can REFUSE -- an
+        expert bank has no loader in this package yet
+        (:class:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.Glm5NextExpertBankNotLoadableError`),
+        and ``inc-glm53f-095`` is where it gains one. A single pass that
+        registered as it went would leave every parameter before the refusing one
+        registered and every one after it declared, which is a tree no later load
+        can tell apart from a fresh one. So nothing is registered until every
+        placeholder and every loader has been built: a refusal leaves the tree
+        byte-for-byte as it arrived, and ``named_parameters()`` still reads
+        EXACTLY ZERO. The acceptance reads that zero.
+        """
+        planned: list[tuple[nn.Module, str, nn.Parameter]] = []
+        for module_path, module in self.named_modules():
+            for leaf in getattr(module, "declared_param_names", ()):
+                name = f"{module_path}.{leaf}" if module_path else leaf
+                checkpoint_keys = mappings.get(name, name)
+                placeholder = nn.parameter.UninitializedParameter(
+                    dtype=self._placeholder_dtype(checkpoint_keys),
+                    device=device,
+                    requires_grad=False,
+                )
+                # May RAISE. Deliberately before the first registration below.
+                loader = loader_for_mapped_keys(checkpoint_keys, param_name=name)
+                if loader is not None:
+                    set_weight_loader(placeholder, loader)
+                planned.append((module, leaf, placeholder))
+
+        for module, leaf, placeholder in planned:
+            module.register_parameter(leaf, placeholder)
+        return len(planned)
+
+    def load_weights(
+        self,
+        checkpoint_path: str,
+        device: torch.device,
+        cache_dir: str | None = None,
+    ) -> None:
+        """Read the checkpoint's weights onto ``device``.
+
+        ``inc-glm53f-091``. This method is what the runner already calls:
+        ``neuron_model_runner.py:1299`` invokes ``self.model.load_weights(...)``
+        with these three arguments and nothing guards it, so before this
+        increment any non-CPU-compile run of this architecture raised
+        ``AttributeError`` before a single weight was read. The signature is the
+        shipped one, ``qwen3/model.py:966-968``, so no runner file changes.
+
+        Four steps, in an order two of them force:
+
+        1. Open the checkpoint. This is first so that a checkpoint that cannot
+           be opened leaves the tree exactly as it was -- every parameter still
+           declared and none materialised.
+        2. Build the key map at the checkpoint's own quantisation setting with
+           the checkpoint's own skip list. The map is what the reader is told to
+           look for, so a family missing here is a family never read.
+        3. Materialise a placeholder per declared parameter and attach its
+           loader. Forced to come before step 4, for the reason
+           :meth:`_materialise_declared_parameters` records.
+        4. Read the tensors and assign them. ``assign=True`` is required, not
+           stylistic: it is what replaces each placeholder with the tensor the
+           reader built, and the probe records that ``assign=False`` raises on a
+           lazy placeholder.
+
+        SHARDING LANDS WITH ``inc-glm53f-094``, named here rather than left as a
+        surprise. The rank resolved here reaches no loader that uses it: neither
+        loader this package defines shards, and ``blockwise_scale_loader``'s own
+        docstring records that a sharded scale grid "follows the weight's own
+        shard geometry and lands with the module that declares that geometry".
+        So at a world size above one every rank reads the WHOLE tensor, while
+        this file's modules already describe per-rank geometry (``_per_rank``
+        above). That gap is the landed position of this package, inherited here
+        rather than introduced, and ``inc-glm53f-094`` closes it by attaching the
+        per-module shard loaders the pin already ships
+        (``utils/weight_loader.py:139-146`` and ``:105-130``, which is how
+        ``qwen3`` shards). The rank is resolved and passed now because the
+        reader's contract takes one and hands it to every loader transform, so
+        that increment needs no change here.
+
+        A ROUTED EXPERT BANK REFUSES THIS LOAD, BY NAME, AND ``inc-glm53f-095``
+        IS WHERE IT STOPS DOING SO. Step 3 raises
+        :class:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.Glm5NextExpertBankNotLoadableError`
+        on a map entry carrying more than one scale key, naming the parameter and
+        its key count. That refusal is NOT caught and re-wrapped here, which is a
+        choice: its message already names the parameter and the increment that
+        answers it, and wrapping it in this method's own error would bury both
+        behind a sentence about checkpoints. It is a ``ValueError`` either way,
+        like ``Glm5NextWeightLoadError``. The measurement behind it -- expert 0
+        arriving and 287 experts dropped in silence, with a green acceptance over
+        it -- is recorded on the raising function.
+        """
+        try:
+            checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
+            num_files = checkpoint.get_num_files()
+        except Exception as exc:
+            raise Glm5NextWeightLoadError(
+                f"no safetensors checkpoint could be opened at "
+                f"{checkpoint_path!r} (cache_dir={cache_dir!r}); no parameter "
+                f"was materialised, so the model tree is unchanged"
+            ) from exc
+        if num_files < 1:
+            raise Glm5NextWeightLoadError(
+                f"the checkpoint at {checkpoint_path!r} holds no .safetensors "
+                f"file; no parameter was materialised, so the model tree is "
+                f"unchanged"
+            )
+
+        # The two quantisation settings sit on the TOP-LEVEL config, not on the
+        # text config: ``config.py:400`` and ``:408`` are members of
+        # ``Glm5NextConfig`` because ``inc-glm53f-079`` lifted them from the
+        # checkpoint's top-level ``quantization_config``. ``torch_dtype`` is the
+        # text config's own (``:159``). Reading either off the wrong object
+        # raises ``AttributeError`` rather than defaulting, which is why this
+        # comment names the line for each.
+        mappings = build_weight_mappings(
+            self.text_config,
+            quantised=self.config.is_block_quantized,
+            modules_to_not_convert=tuple(self.config.modules_to_not_convert or ()),
+        )
+
+        rank = _resolve_rank()
+        if rank >= self.world_size:
+            raise Glm5NextWeightLoadError(
+                f"rank {rank} is not inside the world size {self.world_size} "
+                f"this model was built for; the world size is read once at "
+                f"construction and the rank is read here, so a process group "
+                f"that appeared between the two would shard against a rank the "
+                f"model does not know about"
+            )
+
+        materialised = self._materialise_declared_parameters(mappings, device)
+        if materialised == 0:
+            raise Glm5NextWeightLoadError(
+                "no declared parameter was materialised, so the checkpoint "
+                "reader would iterate an empty parameter list and load nothing "
+                f"while reporting success; declared_parameter_names() reports "
+                f"{len(self.declared_parameter_names())} names"
+            )
+
+        rank_sharded = checkpoint.load_sharded_pipelined(
+            rank, self.world_size, self, mappings, device
+        ).state_dict
+        self.load_state_dict(rank_sharded, strict=False, assign=True)
 
     # ── KV cache management ──────────────────────────────────────────────
     # >>> PARALLELISM: KV spec uses per-rank head counts (TP-sharded) <<<
