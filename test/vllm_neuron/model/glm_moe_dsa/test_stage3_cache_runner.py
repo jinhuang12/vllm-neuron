@@ -466,7 +466,7 @@ def _runner_for_bucket_contract() -> NeuronModelRunner:
     runner.max_model_len = 8192
     runner._dcp_size = 1
     runner.cp_world_size = 1
-    runner.cp_rank = 0
+    runner._cp_rank = 0
     runner.neuron_config = SimpleNamespace(
         decode_context_length_buckets=[2048, 4096, 8192],
         kv_segment_size_buckets=None,
