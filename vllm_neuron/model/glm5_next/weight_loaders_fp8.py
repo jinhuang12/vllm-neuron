@@ -514,12 +514,30 @@ def _add_dsa_attention(
     ckpt_attn = f"{ckpt_prefix}.self_attn"
     param_attn = f"{param_prefix}.self_attn"
 
+    # inc-glm53f-085 (WP5 repair) owns ONLY which parameter each of these four
+    # scale keys lands on. As landed, BOTH of a scaled projection's checkpoint
+    # keys were bound to the single parameter ``{leaf}_weight``, and the default
+    # loader -- no ``transform``, more than one slice -- refuses that with
+    # "should only take in a single slice but got N"
+    # (``vllm_neuron/utils/weight_loader.py:71-73``, an ``assert``, so under
+    # ``python -O`` it instead keeps slice 0 and drops the scale silently). Either
+    # way the scale slice reached no arithmetic. Splitting the keys gives the
+    # scale a parameter of its own, which is what ``model_fp8.py`` dequantises
+    # from. The checkpoint keys themselves are unchanged -- redistributed, never
+    # added to -- which is what ``c078g_dsa_keys`` 198 and
+    # ``c078g_dsa_scale_keys`` 44 hold fixed.
     for leaf in DSA_SCALED_PROJECTIONS:
-        _add(
-            mappings,
-            f"{param_attn}.{leaf}_weight",
-            _quantised(ckpt_attn, leaf, quantised=quantised, skip=skip),
-        )
+        keys = _quantised(ckpt_attn, leaf, quantised=quantised, skip=skip)
+        _add(mappings, f"{param_attn}.{leaf}_weight", keys[:1])
+        # Zero or one scale key: ``_quantised`` returns the companion only when
+        # this leaf really carries one, so a leaf the checkpoint keeps in BF16
+        # maps no scale parameter and asks the checkpoint for nothing new.
+        for scale_key in keys[1:]:
+            _add(
+                mappings,
+                f"{param_attn}.{leaf}_{FP8_SCALE_SUFFIX}",
+                [scale_key],
+            )
     # kv_b_proj is a real projection with no scale in this checkpoint, so it sits
     # here rather than in the loop above. Not an oversight -- a reading.
     for leaf in ("kv_b_proj", "q_a_layernorm", "kv_a_layernorm"):

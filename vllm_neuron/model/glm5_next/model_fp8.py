@@ -75,6 +75,11 @@ from vllm_neuron.model.glm5_next.config import (
     Glm5NextConfig,
     Glm5NextTextConfig,
 )
+from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
+    DSA_SCALED_PROJECTIONS,
+    FP8_SCALE_SUFFIX,
+    dequantise_blockwise,
+)
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 
@@ -82,6 +87,19 @@ from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 # Parameter declaration -- the mechanism that makes a name exist without
 # allocating the tensor behind it.
 # ---------------------------------------------------------------------------
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    """True for any fp8 dtype the installed ``torch`` has.
+
+    CLASSIFIED, NEVER NAME-MATCHED, and the rule is the fork's own rather than
+    this increment's: a one-byte floating dtype whose ``str()`` names ``float8``
+    (``vllm_neuron/accuracy/testing.py:86``, and its test-side twin
+    ``test/vllm_neuron/accuracy/test_glm5next_tolerance_registry.py:142``).
+    Classified rather than hard-coded because which fp8 dtypes exist is a
+    property of the installed ``torch``, not of this file.
+    """
+    return dtype.itemsize == 1 and "float8" in str(dtype)
 
 
 def _declare_parameters(module: nn.Module, *names: str) -> None:
@@ -2405,6 +2423,23 @@ class Glm5NextMLAAttention(nn.Module):
             "q_a_layernorm_weight",
             "kv_a_layernorm_weight",
         )
+        # -- inc-glm53f-085 (WP5 repair) declares the four blockwise-FP8 scale
+        #    parameters, in its OWN call so the seven names above stay exactly as
+        #    ``inc-glm53f-039b`` and ``inc-glm53f-013`` landed them.
+        #
+        #    DERIVED FROM THE MAP'S OWN LIST, never a second literal: the four
+        #    leaves come from ``DSA_SCALED_PROJECTIONS`` and the suffix from
+        #    ``FP8_SCALE_SUFFIX``, both in ``weight_loaders_fp8.py``. That is what
+        #    makes the declared-name set and the weight map's parameter set unable
+        #    to drift apart -- the bijection ``test_kv_spec.py`` asserts.
+        #
+        #    ``kv_b_proj`` is absent BECAUSE it is absent from that list: this
+        #    checkpoint keeps it in BF16 (``inc-glm53f-078``), so it carries no
+        #    scale companion and takes no dequant.
+        _declare_parameters(
+            self,
+            *(f"{leaf}_{FP8_SCALE_SUFFIX}" for leaf in DSA_SCALED_PROJECTIONS),
+        )
         self.indexer = Glm5NextDSAIndexer()
 
     # -- the PROJECTIONS section -- D14 owner: ``inc-glm53f-039b`` (M3) -------
@@ -2500,11 +2535,65 @@ class Glm5NextMLAAttention(nn.Module):
                     f"closed form is [out_features, in_features] = "
                     f"{(odim, idim)}"
                 )
+            # -- inc-glm53f-085 owns THIS ONE STEP and nothing else here. The
+            #    dequant runs in the checkpoint's own [out_features, in_features]
+            #    orientation, where the scale grid matches by construction, and
+            #    only THEN is the weight transposed by the line below -- so
+            #    ``inc-glm53f-039b``'s one-time transpose keeps both its position
+            #    and its ground.
+            weight = self._dequantised_projection_weight(name, weight)
             # ``.t()`` alone is a view, and the kernel loads from memory, so the
             # copy is forced here -- once -- rather than left for the seam.
             prepared[name] = weight.to(torch.float32).t().contiguous()
         setattr(self, self.PREPARED_WEIGHTS_ATTR, prepared)
         return len(prepared)
+
+    def _dequantised_projection_weight(
+        self, name: str, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """One projection weight in a real dtype, dequantised if it arrived as fp8.
+
+        WHY THIS EXISTS. The published checkpoint stores four of the five MLA
+        projections as blockwise-FP8 bytes with a ``weight_scale_inv`` companion
+        per 128x128 tile. Before this method the bytes were transposed and used
+        as if they were real numbers, so those four projections computed the
+        wrong function at exactly the right shapes -- a defect no shape check
+        can see. ``inc-glm53f-085`` repairs it.
+
+        THE TEST IS THE DTYPE, NEVER A CONFIG FLAG. A quantisation flag can be
+        wrong, absent, or stale, and a weight that is fp8 bytes is fp8 bytes
+        whatever a flag says. So the three cases are decided by what actually
+        arrived:
+
+        * a real dtype is returned UNCHANGED, exactly as ``inc-glm53f-039b``
+          landed it -- this method adds nothing to that path;
+        * fp8 bytes with their scale materialised are dequantised;
+        * fp8 bytes with NO scale materialised RAISE, naming the site and the
+          parameter that is missing.
+
+        THE THIRD CASE IS THE POINT. Silently treating unscaled fp8 bytes as
+        numbers is the defect being repaired, so the one thing this method must
+        never do is continue quietly when the scale is absent. A refusal that
+        names the site is also distinguishable from a skipped test, which is
+        what makes it checkable.
+
+        The dequant itself is the fork's own ``dequantise_blockwise``; this
+        method chooses no arithmetic of its own. It returns fp32, so the
+        caller's following ``.to(torch.float32)`` is already satisfied and
+        stays a no-op rather than a second conversion.
+        """
+        if not _is_fp8_dtype(weight.dtype):
+            return weight
+        scale_name = f"{name}_{FP8_SCALE_SUFFIX}"
+        scale = getattr(self, scale_name, None)
+        if scale is None:
+            raise ValueError(
+                f"{name}_weight arrived as {weight.dtype} blockwise-FP8 bytes "
+                f"but {scale_name} is not materialised, so the bytes cannot be "
+                f"dequantised; load the checkpoint's {FP8_SCALE_SUFFIX} "
+                f"companion for {name} before preparing the projection weights"
+            )
+        return dequantise_blockwise(weight, scale)
 
     def _prepared_weight(self, name: str) -> torch.Tensor:
         """One prepared weight, or a refusal naming what was not done.

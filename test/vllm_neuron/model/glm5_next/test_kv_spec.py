@@ -805,16 +805,78 @@ def test_kv_spec_the_map_comparison_is_proved_live(model) -> None:
 
 
 def test_kv_spec_the_quantised_flag_does_not_move_the_param_name_side(model) -> None:
-    """The map's ``quantised`` switch changes checkpoint keys, not param names.
+    """AMENDED by ``inc-glm53f-085``: the flag ADDS exactly the 44 scale names.
 
-    So the derivation above is a statement about the skeleton and the map's
-    parameter side only, and cannot be satisfied by accident on one setting
-    of a flag this increment does not own.
+    THE NAME IS KEPT BYTE-UNCHANGED because it is the item id this file's landed
+    acceptance collects -- the same reason
+    :func:`test_kv_spec_the_pin_dataclass_is_not_widened` keeps a name that now
+    measures the opposite of itself.
+
+    WHY IT CHANGED, measured rather than to reach green. The landed assertion
+    ``quantised == plain`` held only because both checkpoint keys of a scaled
+    projection were bound to ONE weight parameter, so 44 DSA weight parameters
+    carried a two-key list and the parameter side could not move with the flag.
+    The loader's default refuses more than one slice, so as landed the scale
+    reached no arithmetic -- that binding is the defect ``inc-glm53f-085``
+    repairs, and once each scale key has its own parameter the flag necessarily
+    ADDS exactly the 44 scale-parameter names.
+
+    CERTIFYING COMPONENT (D1.4): ``_add_dsa_attention``'s
+    ``DSA_SCALED_PROJECTIONS`` loop and ``_quantised``.
     """
+    from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
+        DSA_SCALED_PROJECTIONS,
+        FP8_SCALE_SUFFIX,
+    )
+
     quantised = set(build_weight_mappings(model.text_config, quantised=True))
     plain = set(build_weight_mappings(model.text_config, quantised=False))
-    assert quantised == plain
+    dsa_indices = _layer_indices(model, DSA_LAYER_TYPE)
+
+    # (i) The flag only ever ADDS parameter names.
+    assert plain <= quantised, f"names only in plain: {sorted(plain - quantised)}"
+
+    # (ii) And what it adds is exactly the scale names, derived here.
+    expected = {
+        f"model.layers.{index}.self_attn.{leaf}_{FP8_SCALE_SUFFIX}"
+        for index in dsa_indices
+        for leaf in DSA_SCALED_PROJECTIONS
+    }
+    assert quantised - plain == expected, (
+        f"symmetric difference: {sorted((quantised - plain) ^ expected)}"
+    )
+    assert len(expected) == 4 * DECLARED_MLA_ENTRIES == 44
+
+    # (iii) A counted zero, with its control on the mutation-arm form above:
+    #       dropping one shared name from the superset makes it read 1.
+    assert len(plain - quantised) == 0
+    mutated = quantised - {sorted(plain)[0]}
+    assert len(plain - mutated) == 1, "the zero above is vacuous"
+
+    # (iv) The landed second assertion, kept.
     assert set(model.declared_parameter_names()) == quantised
+
+    # (v) Each scaled leaf's WEIGHT parameter maps to a SCALAR target, so the
+    #     scale key no longer shares it. On the base tree all 44 were lists.
+    mappings = build_weight_mappings(model.text_config, quantised=True)
+    weight_names = [
+        f"model.layers.{index}.self_attn.{leaf}_weight"
+        for index in dsa_indices
+        for leaf in DSA_SCALED_PROJECTIONS
+    ]
+    assert len(weight_names) == 44
+    list_valued = [n for n in weight_names if isinstance(mappings[n], list)]
+    assert not list_valued, (
+        f"{len(list_valued)} scaled-leaf weight parameters still carry a "
+        f"multi-key list: {sorted(list_valued)[:4]}"
+    )
+
+    _record(
+        c085_quantised_only_param_names=len(quantised - plain),
+        c085_plain_only_param_names=len(plain - quantised),
+        c085_dsa_layers=len(dsa_indices),
+        c085_dsa_weight_list_valued_count=len(list_valued),
+    )
 
 
 def test_kv_spec_the_tied_head_condition_mirrors_the_map(raw: dict) -> None:
