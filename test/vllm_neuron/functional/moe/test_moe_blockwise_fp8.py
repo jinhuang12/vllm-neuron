@@ -809,6 +809,54 @@ def test_cte_identity_readings_are_derived_through_the_seam() -> None:
     assert "not bound in" in str(unbound.value)
 
 
+def test_cte_kernel_identity_has_no_fall_back_to_the_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`B46 N1`, `inc-glm53f-077`: the reading is BOUND to the derivation.
+
+    The arm above binds both helpers to their objects, but checks
+    ``kernel_identity()`` itself only against two name strings -- and in a healthy
+    tree the derivation and this module's own import of the kernel name the SAME
+    object, so a ``kernel_identity()`` that went back to reading the import would
+    satisfy those strings unchanged. That is the silence `B26-M1` found, and the
+    arm above cannot see it.
+
+    What a unit test CAN settle is that no such fall back exists: break the
+    derivation and the reading must RAISE rather than answer. An implementation
+    that read the import would return the real identity here, and this arm would
+    then fail on the missing exception. Discriminating the repair from its
+    predecessor on an INTACT tree still needs the call site itself edited, which
+    stays the acceptance harness's graded mutation arms.
+    """
+    import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
+
+    # POPULATION BEFORE PROPERTY: the reading works before the break, so the
+    # exception below belongs to the break and not to a tree that was already red.
+    intact_module, intact_qualname = kernel_identity()
+    assert intact_module == "nkilib.core.moe.moe_cte.bwmm_shard_on_I", intact_module
+
+    sentinel = "the derivation was broken by this arm, on purpose"
+
+    def _refuse() -> None:
+        raise MoeBlockwiseFp8Error(sentinel)
+
+    monkeypatch.setattr(moe, "_shim_forward_target", _refuse)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as broken:
+        moe.kernel_identity()
+    assert sentinel in str(broken.value), str(broken.value)
+
+    # NON-VACUITY CONTROL, and the reason this arm is not a test of an absent
+    # name. The module-level import is still bound, and unwrapping it yields the
+    # very identity the intact reading returned -- so there really was something
+    # to fall back TO, and the refusal above is a choice rather than an accident.
+    fallback = moe._unwrap_nki(moe.blockwise_mm_baseline_shard_intermediate)
+    assert (fallback.__module__, fallback.__qualname__) == (
+        intact_module,
+        intact_qualname,
+    )
+
+
 @pytest.mark.parametrize(
     "rows,cols,needle",
     [
