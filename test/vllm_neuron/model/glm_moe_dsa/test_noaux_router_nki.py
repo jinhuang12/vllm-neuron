@@ -13,6 +13,7 @@ from vllm_neuron.model.glm_moe_dsa.moe import GlmMoeDsaNoAuxRouter
 from vllm_neuron.model.glm_moe_dsa.noaux_router import (
     NOAUX_TC_DENOM_EPS,
     NOAUX_TC_K,
+    _pad_target,
     exact_noaux_tc,
     exact_noaux_tc_torch_reference,
 )
@@ -174,6 +175,7 @@ def test_tied_scores_select_eight_distinct_experts_with_equal_weights() -> None:
 
     for row in selected:
         assert len(set(row.tolist())) == NOAUX_TC_K
+        assert row.tolist() == list(range(NOAUX_TC_K))
     assert torch.all(torch.count_nonzero(affinities, dim=-1) == NOAUX_TC_K)
     nonzero = affinities[affinities != 0]
     torch.testing.assert_close(
@@ -195,6 +197,11 @@ def test_zero_denominator_is_finite_and_stays_zero() -> None:
     assert selected.shape == (32, 8)
     assert torch.isfinite(affinities).all()
     assert torch.count_nonzero(affinities) == 0
+
+
+@pytest.mark.parametrize("num_tokens", [1, 32, 128])
+def test_lnc2_padding_gives_each_program_one_whole_tile(num_tokens: int) -> None:
+    assert _pad_target(num_tokens) == 2 * 128
 
 
 @pytest.mark.skipif(
@@ -243,6 +250,11 @@ def test_nki_simulator_edge_cases(case: str) -> None:
     logits = torch.zeros(32, 256)
     if case == "zero_denominator":
         logits.fill_(float("-inf"))
+    expected_selected, expected_affinities = exact_noaux_tc_torch_reference(
+        logits,
+        torch.zeros(256),
+        routed_scaling_factor=2.5,
+    )
 
     with patch(
         "vllm_neuron.model.glm_moe_dsa.noaux_router.can_run_kernel",
@@ -258,13 +270,13 @@ def test_nki_simulator_edge_cases(case: str) -> None:
     assert torch.isfinite(affinities).all()
     for row in selected:
         assert len(set(row.tolist())) == NOAUX_TC_K
-    if case == "ties":
-        assert torch.all(torch.count_nonzero(affinities, dim=-1) == NOAUX_TC_K)
-        torch.testing.assert_close(
-            affinities.sum(dim=-1),
-            torch.full((32,), 2.5),
-            rtol=1e-5,
-            atol=1e-6,
-        )
-    else:
-        assert torch.count_nonzero(affinities) == 0
+    assert torch.equal(
+        torch.sort(selected, dim=-1).values,
+        torch.sort(expected_selected, dim=-1).values,
+    )
+    torch.testing.assert_close(
+        affinities,
+        expected_affinities,
+        rtol=1e-5,
+        atol=1e-6,
+    )

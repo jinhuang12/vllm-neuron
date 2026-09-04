@@ -15,6 +15,7 @@ import nki.language as nl
 import torch
 from torch import Tensor
 
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -52,7 +53,10 @@ def _legalize_bias(correction_bias: Tensor, num_experts: int) -> Tensor:
 def _pad_target(num_tokens: int) -> int:
     if num_tokens < 1:
         raise NoauxTcRouterError("the router requires at least one token")
-    return -(-num_tokens // NOAUX_TC_TILE) * NOAUX_TC_TILE
+    # The [2] launch splits tokens between two logical Neuron cores. Give each
+    # core whole 128-row tiles, including the T=32 decode bucket.
+    lnc2_tile = 2 * NOAUX_TC_TILE
+    return -(-num_tokens // lnc2_tile) * lnc2_tile
 
 
 def _pad_tokens(x: Tensor, padded_tokens: int) -> Tensor:
@@ -78,8 +82,15 @@ def _noaux_tc_stage(
     """Apply the GLM-5.2 selection/weight split to fp32 router logits."""
     bias_sb = nl.load(correction_bias_hbm)
 
-    for token_tile in range(num_tokens // NOAUX_TC_TILE):
-        token_start = token_tile * NOAUX_TC_TILE
+    _, num_programs, program_id = get_verified_program_sharding_info(
+        "glm52_noaux_tc", (0, 1), 2
+    )
+    first_shard = num_tokens // num_programs
+    token_offset = 0 if program_id == 0 else first_shard
+    local_tokens = first_shard if program_id == 0 else num_tokens - first_shard
+
+    for token_tile in range(local_tokens // NOAUX_TC_TILE):
+        token_start = token_offset + token_tile * NOAUX_TC_TILE
         rows = NOAUX_TC_TILE
         logits = nl.load(
             router_logits_hbm[token_start : token_start + rows, :],
@@ -94,7 +105,19 @@ def _noaux_tc_stage(
         top_values = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.float32, buffer=nl.sbuf)
         nisa.max8(dst=top_values, src=choice)
         top_indices = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.uint32, buffer=nl.sbuf)
-        nisa.nc_find_index8(dst=top_indices, data=choice, vals=top_values)
+        # nc_find_index8 maps duplicate values to the same first position on
+        # older SDKs. Match-and-replace consumes each hit. Exact ties therefore
+        # select eight distinct global expert IDs in first-position order.
+        consumed_choice = nl.ndarray(
+            (rows, num_experts), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.nc_match_replace8(
+            dst=consumed_choice,
+            dst_idx=top_indices,
+            data=choice,
+            vals=top_values,
+            imm=float("-inf"),
+        )
 
         indices_fp32 = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=indices_fp32, src=top_indices)
@@ -210,7 +233,11 @@ def exact_noaux_tc_torch_reference(
     _require_extents(num_experts, top_k)
     bias = _legalize_bias(correction_bias, num_experts).reshape(-1)
     scores = torch.sigmoid(router_logits.to(torch.float32))
-    selected_experts = torch.topk(scores + bias, top_k, dim=-1, sorted=False).indices
+    # State the tie rule explicitly instead of inheriting torch.topk's unstable
+    # equal-value order. This is the CPU oracle for nc_match_replace8.
+    selected_experts = torch.argsort(
+        scores + bias, dim=-1, descending=True, stable=True
+    )[:, :top_k]
     selected_weights = torch.gather(scores, 1, selected_experts)
     if norm_topk_prob:
         selected_weights = selected_weights / (
@@ -248,7 +275,7 @@ def exact_noaux_tc(
         )
 
     padded_tokens = _pad_target(num_tokens)
-    expert_index, affinities = wrap_nki(_exact_noaux_tc_nki)(
+    expert_index, affinities = wrap_nki(_exact_noaux_tc_nki)[2](
         router_logits=_pad_tokens(router_logits.to(torch.float32), padded_tokens),
         correction_bias=bias,
         norm_topk_prob=norm_topk_prob,
