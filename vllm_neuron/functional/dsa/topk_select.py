@@ -17,17 +17,19 @@ being written here -- the substrate already provides the primitive, so re-derivi
 add a second implementation of a tested kernel rather than close a gap.
 
 WHY A SECOND SEAM ONTO A KERNEL ``functional/topk.py`` ALREADY WRAPS, stated plainly
-because a reader will ask. ``functional/topk.py`` is the SAMPLING top-k: it exists to do a
-distributed top-k over a vocabulary sharded across tensor-parallel ranks, and its public
-entry points take a process group, a gather dimension and a rank tensor
-(``topk``, ``batch_sharded_topk``). The DSA indexer needs none of that -- one device, one
-tensor, no collective -- and it needs one thing that module does not have: a per-call
-dispatch count its own tests can read, which is the route predicate this increment's
-acceptance is built on. Adding that counter to ``functional/topk.py`` would make this
-increment a second writer on a file that ships at the pin, widening its declared surface
-from one new file to a shared pin surface it carries no registration for. So the seam is
-authored here and the KERNEL is shared, which is the part that matters: there is exactly
-one top-k kernel in this tree and this module adds none.
+because a reader will ask. It is NOT that the existing entry points are unable to do this
+selection: ``topk`` takes ``process_group=None`` and carries a single-device fast path, so
+``topk(scores, k, -1, -1)`` would return the same answer. An earlier version of this
+docstring claimed those entry points require a process group; that was wrong, and B58-N1
+records the correction.
+
+THE GROUND IS OWNERSHIP, and it is the one that holds. This increment's route predicate is
+D13 form R-1 -- a per-call dispatch count read from a seam THIS increment authors -- and
+``functional/topk.py`` ships at the pin. Putting the counter there would make this
+increment a second writer on a shared pin surface it carries no registration for, widening
+its declared surface from one new file to that file. So the seam is authored here and the
+KERNEL is shared, which is the part that matters: there is exactly one top-k kernel in this
+tree and this module adds none.
 
 WHAT IS SHARED WITH THAT MODULE IS THE KERNEL'S OWN CONFIG FACTORIES, NOT A COPY OF ITS
 LOGIC. ``create_topk_config`` and ``create_rotational_topk_config`` are the kernel's own
@@ -219,6 +221,45 @@ def _config_builds(n_rows: int, width: int, k: int, nki_dtype) -> bool:
         return False
 
 
+@torch._dynamo.assume_constant_result
+def _record_nki_dispatch(kernel, n_rows: int, width: int, k: int) -> None:
+    """Record WHICH kernel the seam dispatched, and log it, OFF the compiled graph.
+
+    B58-M1. Two host-side calls belong to the dispatch branch and neither one can be
+    traced: ``logger.info`` emits a log record, and reading a kernel's identity is a
+    ``getattr`` on the ``@nki.jit`` object. The runner compiles the model with
+    ``fullgraph=True`` unless ``VLLM_NEURON_DEBUG_MODE`` is set
+    (``vllm_neuron/vllm/worker/neuron_model_runner.py:1433-1460``), so on the shipped path
+    Dynamo would refuse both. ``vllm_neuron/functional/topk.py:90-101`` folds its own dispatch
+    log exactly this way, for the reason it states at
+    ``vllm_neuron/functional/topk.py:380-384``; this module already folds its config factories
+    at ``_nki_config`` and ``_config_builds`` and states the rule in their docstrings -- so
+    this is that same rule applied to the one branch that had escaped it.
+
+    EVERY LINE REFERENCE ABOVE IS WRITTEN AS ``path:line``, ON PURPOSE. The campaign's
+    citation checker reads that form and only that form, so a reference written as ``L90-101``
+    is invisible to it and rots without anyone being told. These four claims are the whole
+    ground of this fix, so they are written in the form that gets checked at every commit.
+
+    THE IDENTITY IS STILL DERIVED THROUGH THE SEAM (D13.1). The object recorded here is the
+    same object handed to ``wrap_nki`` at the call site, and it is passed in as an argument
+    rather than re-imported here so that sameness stays visible in the source.
+
+    WHAT THIS FIX DOES NOT MEASURE, named rather than implied. No Tier N round can exercise
+    it: the runner skips compilation in CPU mode
+    (``vllm_neuron/vllm/worker/neuron_model_runner.py:1446-1448`` -- ``cpu_mode`` is one of the
+    disjuncts on the ``if``, and the branch sets ``capture_backend_model = None``), which is
+    the mode every Tier N acceptance runs in. The repair rests on the fork's own
+    recorded ground and on matching the precedent's shape. A captured-graph reading
+    (Tier C form C-2 step 1) is what would settle it by measurement, and that instrument
+    belongs to ``-022``/``-052``, not to this repair.
+    """
+    _COUNTERS.last_kernel = _kernel_identity_of(kernel)
+    logger.info(
+        "[dsa-topk] kernel=rotational-nki rows=%d width=%d k=%d", n_rows, width, k
+    )
+
+
 def can_run_dsa_topk_select(scores: Tensor, k: int) -> bool:
     """True when the NKI route is available AND the kernel serves this geometry.
 
@@ -280,10 +321,13 @@ def dsa_topk_select(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
     config = _nki_config(n_rows, width, k, _nki_dtype_of(scores))
 
     _COUNTERS.nki_dispatch += 1
-    _COUNTERS.last_kernel = _kernel_identity_of(rotational_topk)
-    logger.info(
-        "[dsa-topk] kernel=rotational-nki rows=%d width=%d k=%d", n_rows, width, k
-    )
+    # B58-M1. The log and the identity read are FOLDED off the traced graph, the way
+    # ``vllm_neuron/functional/topk.py:90-101`` folds ``_log_topk_choice``. NO bare logging,
+    # identity read or other untraceable host call belongs on this branch: it is the one
+    # branch the runner traces under ``fullgraph=True``. The counter increment stays -- it is a
+    # plain int attribute store, and it is the landed seam pattern (``kda/gate_clamp.py``
+    # increments on its dispatch branch and logs on neither).
+    _record_nki_dispatch(rotational_topk, n_rows, width, k)
     values, indices = wrap_nki(rotational_topk)[config.n_prgs](flat, config)
 
     out_shape = (*leading, k)
