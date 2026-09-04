@@ -399,10 +399,46 @@ def can_run_blockwise_fp8_mm(x: Tensor, rows: int, cols: int, tokens: int) -> bo
     return can_run_kernel(x)
 
 
+def _checked_prebuilt_scale(prebuilt: Tensor, rows: int, cols: int) -> Tensor:
+    """A caller-supplied kernel scale operand, or a refusal naming the shape.
+
+    `inc-glm53f-090`. When the operand is built once at load time the bridge
+    does not run, so the bridge's own checks do not run either. This is the net
+    that replaces them at the seam.
+
+    WHAT THIS CHECK CANNOT SEE, recorded because the gap is real and is covered
+    elsewhere rather than ignored: :func:`kernel_scale_shape` pins ``TILE_SIZE``
+    and the PRODUCT ``n_k_blocks * n_n_blocks``, so a transposed public grid --
+    ``[16, 8]`` where ``[8, 16]`` was meant -- flattens to the same element count
+    and passes here. That is the very defect :func:`flat_scale_index` warns
+    about. It is caught at BUILD time instead: the builder calls
+    :func:`to_kernel_scale_layout`, whose grid check compares the public grid
+    against ``(rows, cols)`` before flattening. The two checks are complements,
+    and the strong one still runs -- once, where the operand is made.
+    """
+    want = kernel_scale_shape(rows, cols)
+    if tuple(prebuilt.shape) != want:
+        raise BlockwiseFp8MmError(
+            f"prebuilt_scale_t has shape {tuple(prebuilt.shape)}, expected "
+            f"{want} = kernel_scale_shape(rows={rows}, cols={cols}). Refusing "
+            f"to reshape or rebuild: an operand of the wrong extent means the "
+            f"caller prepared it for a different weight."
+        )
+    if prebuilt.dtype != torch.float32:
+        raise BlockwiseFp8MmError(
+            f"prebuilt_scale_t must be fp32, got {prebuilt.dtype}; the kernel "
+            f"reads block scales as fp32 and a narrower dtype computes a "
+            f"different function without changing any shape"
+        )
+    return prebuilt
+
+
 def blockwise_fp8_mm(
     x: Tensor,
     weight: Tensor,
     weight_scale: Tensor,
+    *,
+    prebuilt_scale_t: Tensor | None = None,
 ) -> Tensor:
     """Dense blockwise-fp8 GEMM. The seam the route predicate counts.
 
@@ -410,13 +446,22 @@ def blockwise_fp8_mm(
         x: ``[M, K]`` activations, bf16.
         weight: ``[K, N]`` fp8-e4m3, expressed against ``weight_scale``.
         weight_scale: ``[K//256, N//256]`` fp32, one scale per weight block.
+        prebuilt_scale_t: OPTIONAL, keyword-only. The kernel operand
+            :func:`to_kernel_scale_layout` would have built, already built --
+            shape :func:`kernel_scale_shape`, fp32. Supply it and the bridge is
+            not entered on this call; omit it and this function behaves exactly
+            as it did before `inc-glm53f-090`, which is why `-026`'s landed
+            acceptance needs no edit. ``weight_scale`` is still required either
+            way: the torch-oracle fallback consumes the PUBLIC grid, so a
+            prebuilt operand cannot stand in for it.
 
     Returns:
         ``[M, N]`` fp32.
 
     Raises:
-        BlockwiseFp8MmError: on an inadmissible geometry or a mis-shaped scale
-            grid.
+        BlockwiseFp8MmError: on an inadmissible geometry, a mis-shaped scale
+            grid, or a prebuilt operand that is not
+            ``kernel_scale_shape(rows, cols)`` fp32.
     """
     tokens, rows = x.shape[-2], x.shape[-1]
     if weight.shape[-2] != rows:
@@ -435,7 +480,17 @@ def blockwise_fp8_mm(
         return blockwise_fp8_mm_torch_oracle(x, weight, weight_scale)
 
     _COUNTERS.nki_dispatch += 1
-    scale_t = to_kernel_scale_layout(weight_scale, rows, cols)
+    # `inc-glm53f-090`: the operand's ARRIVAL FORM, and the one build site.
+    # The counter increments only on the branch that actually builds, so a
+    # reading of 0 over a forward step means the bridge did not run on it --
+    # which is the whole claim. The attribute store is the form already proven
+    # graph-safe at capture: ``_COUNTERS.nki_dispatch += 1`` one line above sits
+    # in this same function and `-022` part 1 captured 2/2 shapes with it there.
+    if prebuilt_scale_t is None:
+        _BUILD_COUNTERS.scale_layout_builds += 1
+        scale_t = to_kernel_scale_layout(weight_scale, rows, cols)
+    else:
+        scale_t = _checked_prebuilt_scale(prebuilt_scale_t, rows, cols)
     return wrap_nki(blockwise_fp8_mm_kernel)(
         x=x, weight=weight, weight_scale_t=scale_t
     )
@@ -485,3 +540,56 @@ def kernel_identity() -> tuple[str, str]:
     func = getattr(blockwise_fp8_mm_kernel, "func", None)
     target = func if func is not None else blockwise_fp8_mm_kernel
     return target.__module__, target.__qualname__
+
+
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-090` OWNS EVERYTHING BELOW THIS LINE, AND IT SITS AT THE END OF   #
+# THE FILE ON PURPOSE. Six other files cite this module by line -- eleven cites #
+# in all -- and every one of them targets a line above `blockwise_fp8_mm`.      #
+# Defining these three names further up would have shifted all of them by the   #
+# height of this block, so a re-anchor sweep across five files outside this      #
+# block's surface would have been owed for nothing. Python resolves module       #
+# globals at CALL time, so the seam above reads them without a forward           #
+# declaration. The names are absent from `__all__` for the same reason: adding   #
+# two entries there shifts the whole file, and `__all__` gates only `import *`,  #
+# which nothing in this campaign uses.                                          #
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# The scale-operand BUILD counter. `inc-glm53f-090` owns this and the operand's #
+# arrival form below, and nothing else in this file.                            #
+# --------------------------------------------------------------------------- #
+@dataclass
+class _BuildCounters:
+    """How many kernel scale operands the seam built itself.
+
+    SEPARATE from ``_DispatchCounters`` deliberately. That dataclass, its reset
+    and its two-tuple reader are `inc-glm53f-026`'s, and `-026`'s landed
+    acceptance reads ``dispatch_counters()`` as a two-tuple -- a third field
+    would either change that shape or force an edit inside `-026`'s reset. A
+    separate counter leaves `-026`'s surface untouched.
+
+    WHAT IT COUNTS, stated so a reading cannot be over-read: builds THE SEAM
+    performs, at the one site in :func:`blockwise_fp8_mm`. A direct call to
+    :func:`to_kernel_scale_layout` from anywhere else is not counted. That is
+    the right population for the claim it settles -- whether the per-forward
+    path rebuilds the operand -- because the dense shared-expert path reaches
+    the bridge only through this seam and imports the helper nowhere.
+    """
+
+    scale_layout_builds: int = 0
+
+
+#: MODULE-LEVEL for the same reason ``_COUNTERS`` is, and it is the same
+#: contract: `inc-glm53f-090` reads this counter from its OWN test module, so it
+#: must be resettable and readable from outside this module.
+_BUILD_COUNTERS = _BuildCounters()
+
+
+def reset_scale_layout_builds() -> None:
+    """Zero the build counter. Called at the start of each declared case."""
+    _BUILD_COUNTERS.scale_layout_builds = 0
+
+
+def scale_layout_builds() -> int:
+    """How many operands the seam has built since the last reset."""
+    return _BUILD_COUNTERS.scale_layout_builds

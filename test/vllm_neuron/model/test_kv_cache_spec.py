@@ -339,7 +339,7 @@ def test_kv_cache_spec_c04_state_page_bytes_reconcile_with_zero_discrepancy() ->
 # collected item each, selected by ``-k unification``, no ``parametrize`` added.
 #
 # APPENDED BELOW EVERY EXISTING ITEM ON PURPOSE. Three live citations pin lines
-# of this file BY NUMBER: ``model_fp8.py:1882`` pins ``:31-40``, the increment
+# of this file BY NUMBER: ``model_fp8.py:2047`` pins ``:31-40``, the increment
 # plan pins ``:98`` and ``:322-327``, and ``test_kda_layer.py:99`` pins ``:94``.
 # An insertion above any of them would move bytes another file names, which is
 # the drift ``inc-glm53f-085`` had to repair. Every constant this section needs

@@ -1383,6 +1383,10 @@ class Glm5NextSharedExperts(nn.Module):
     # block scales is the weight loader's step, not this section's, so every
     # WEIGHT-LOADER PRODUCT this site consumes is threaded in at the call --
     # ``-032``'s and ``-027``'s precedent for the quant-config argument.
+    # **`inc-glm53f-090` NARROWS THE SENTENCE ABOVE and does not delete it: the
+    # public grids are still threaded in at a call, but the DERIVED KERNEL
+    # OPERAND is built from them once and held on this module. See the
+    # `-090` paragraph below, which states the new rule in full.**
     #
     # THE SWIGLU BOUND IS NOT ONE OF THOSE, and the distinction is the whole
     # reason it moved in round 2. A block scale is produced per checkpoint load
@@ -1397,13 +1401,145 @@ class Glm5NextSharedExperts(nn.Module):
     # different arities (``functional/blockwise_fp8_mm.py:309`` takes
     # ``(weight_scale, rows, cols)``; ``functional/moe/moe_blockwise_fp8.py:170``
     # takes ``(consumer_scales, num_experts, rows, cols, projection)``).
-    # ``blockwise_fp8_mm`` applies the dense one ITSELF at ``:436``, so this site
-    # passes the public ``[K//256, N//256]`` grid and imports neither -- the
-    # disambiguation hazard is removed rather than navigated.
+    # ``blockwise_fp8_mm`` applies the dense one ITSELF at
+    # ``blockwise_fp8_mm.py:491``, so this site passes the public
+    # ``[K//256, N//256]`` grid and imports neither -- the disambiguation
+    # hazard is removed rather than navigated.
+    # **`inc-glm53f-090` REVERSES THE PARAGRAPH ABOVE. The dense helper IS now
+    # imported here, by ``prepare_scale_operands`` below, and the seam applies it
+    # itself ONLY when no prebuilt operand arrives. The disambiguation hazard is
+    # therefore navigated rather than removed, and it is navigated explicitly:
+    # the import names its module in full and sits next to this note.**
+    #
+    # ── `inc-glm53f-090`: WHERE THE SCALE OPERAND IS BUILT ────────────────────
+    #
+    # WHY IT MOVED, measured rather than preferred. ``to_kernel_scale_layout``
+    # allocates and then scatters ONE ELEMENT AT A TIME
+    # (``blockwise_fp8_mm.py:340-342`` and ``:343-347``). At this campaign's dense
+    # geometry that is 128 scatters per projection and 384 per shared-expert
+    # call, on every layer that takes the route, every forward step -- review
+    # finding B26-M2. The operand is a pure function of a weight-loader product,
+    # so it is built ONCE, by ``prepare_scale_operands`` below, and held on this
+    # module; the three sites pass it to the seam by keyword.
+    #
+    # THE RULE THAT REPLACES THE TWO ABOVE, stated as one sentence: model scalars
+    # resolve at construction, PUBLIC weight-loader products arrive at the call,
+    # and an operand DERIVED from a weight-loader product that never changes is
+    # built once at load time and held. The public grids are still arguments --
+    # ``shared_expert_mm``'s signature does not move -- because the seam's
+    # torch-oracle fallback consumes the public grid and a prebuilt kernel
+    # operand cannot stand in for it.
+    #
+    # WHY A CACHE INSIDE THE BRIDGE WAS NOT THE REMEDY, and this is measured too:
+    # ``-076`` r1 tried exactly that and the capture route refused it -- a dict
+    # keyed on a traced tensor is not expressible on the traced path, and the
+    # capture route feeds ``meta`` tensors, which carry no values to key on
+    # (``increments/evidence-076-r1.md`` §3). The operand has to arrive as a graph
+    # INPUT, which is what building it before capture makes it.
+    #
+    # WHAT THIS DOES NOT WEAKEN. Skipping the bridge also skips the bridge's own
+    # grid check, and the seam's replacement check is weaker: it pins the element
+    # COUNT, so a transposed grid would pass it. The strong check still runs, at
+    # build time, because ``prepare_scale_operands`` builds THROUGH
+    # ``to_kernel_scale_layout`` rather than around it -- so the public grid is
+    # still compared against ``(rows, cols)`` before it is ever flattened, once
+    # per load instead of once per forward step.
     #
     # Imports are FUNCTION-LOCAL, following the landed ``-023``, ``-031``,
     # ``-032`` and ``-027`` precedent in this file: the module import block is
     # ``-013``'s D14 section.
+
+    #: Where :meth:`prepare_scale_operands` leaves its three operands. A class
+    #: attribute for the same reason ``PREPARED_WEIGHTS_ATTR`` is one on the
+    #: projections section: the name is part of the contract between the builder
+    #: and the reader, and neither should spell it twice.
+    PREPARED_SCALE_OPERANDS_ATTR = "_prepared_scale_operands"
+
+    def prepare_scale_operands(
+        self,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        gate_proj_scale: torch.Tensor,
+        up_proj_scale: torch.Tensor,
+        down_proj_scale: torch.Tensor,
+    ) -> int:
+        """Build the three kernel scale operands ONCE. Returns how many.
+
+        `inc-glm53f-090`. The seam's bridge scatters one element at a time, so
+        building the operand inside the per-forward path costs 128 device writes
+        per projection at this campaign's dense geometry. A block scale is a
+        weight-loader product that never changes after a load, so the operand it
+        implies is built here, once, and held on this module.
+
+        The argument list mirrors :meth:`shared_expert_mm`'s own -- same operands,
+        same order -- because the two methods consume the same things and a
+        divergent order at one of them is a mis-wiring no shape check would see.
+
+        Args:
+            gate_proj_weight: ``[H, I]`` fp8-e4m3. Read for its extents only.
+            up_proj_weight: ``[H, I]`` fp8-e4m3.
+            down_proj_weight: ``[I, H]`` fp8-e4m3.
+            gate_proj_scale: ``[H//256, I//256]`` fp32, the PUBLIC grid.
+            up_proj_scale: the same, for ``up_proj_weight``.
+            down_proj_scale: ``[I//256, H//256]`` fp32, for ``down_proj_weight``.
+
+        Returns:
+            How many operands were built -- ``3`` on every successful call.
+
+        Raises:
+            Glm5NextSharedExpertRouteError: if an operand is missing or a weight
+                is not 2-D. The grid's own agreement with the weight extents is
+                checked by ``to_kernel_scale_layout`` below rather than here, so
+                there is one authority for it and not two that can drift.
+
+        THE EXTENTS COME FROM THE WEIGHTS, and that is the load-bearing choice.
+        Deriving them from the grid's own shape instead would make this method
+        unable to detect a transposed grid, because the seam's replacement check
+        pins only the element count. Building THROUGH
+        ``to_kernel_scale_layout`` keeps the landed grid check -- public grid
+        against ``(rows, cols)``, before any flattening -- and simply moves it
+        from once per forward step to once per load.
+        """
+        from vllm_neuron.functional.blockwise_fp8_mm import to_kernel_scale_layout
+
+        prepared: dict[str, torch.Tensor] = {}
+        for name, weight, scale in (
+            ("gate_proj", gate_proj_weight, gate_proj_scale),
+            ("up_proj", up_proj_weight, up_proj_scale),
+            ("down_proj", down_proj_weight, down_proj_scale),
+        ):
+            if weight is None or scale is None:
+                raise Glm5NextSharedExpertRouteError(
+                    f"prepare_scale_operands needs both {name}_weight and "
+                    f"{name}_scale; load the checkpoint before preparing the "
+                    f"scale operands"
+                )
+            if weight.dim() != 2:
+                raise Glm5NextSharedExpertRouteError(
+                    f"{name}_weight must be 2-D to give the scale operand its "
+                    f"extents, got shape {tuple(weight.shape)}"
+                )
+            rows, cols = int(weight.shape[0]), int(weight.shape[1])
+            prepared[name] = to_kernel_scale_layout(scale, rows, cols)
+        setattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, prepared)
+        return len(prepared)
+
+    def _prepared_scale_operand(self, name: str) -> torch.Tensor:
+        """One prebuilt scale operand, or a refusal naming what was not done.
+
+        The same form the projections section uses for its prepared weights, and
+        for the same reason: refusing is what makes "never per forward step"
+        checkable. Falling back to building on demand would put the per-call
+        scatter back silently and nothing would report it.
+        """
+        prepared = getattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, None)
+        if not prepared:
+            raise Glm5NextSharedExpertRouteError(
+                "prepare_scale_operands() has not run; the kernel scale "
+                "operands are built once at load time, never per forward step"
+            )
+        return prepared[name]
 
     def shared_expert_mm(
         self,
@@ -1499,10 +1635,21 @@ class Glm5NextSharedExperts(nn.Module):
 
         # ---- Extents, read off the operands rather than off the config. -- #
         # Only the cross-operand agreements the seam cannot see are checked
-        # here. ``blockwise_fp8_mm`` already refuses a K mismatch (``:420``), a
-        # mis-sized or non-fp32 scale grid (``:328``, ``:335``) and every
-        # blocking condition (``_require_blocked``), and repeating those would
-        # create a second authority that can drift from the first.
+        # here. ``blockwise_fp8_mm`` already refuses a K mismatch
+        # (``blockwise_fp8_mm.py:467-471``), a mis-sized or non-fp32 scale grid
+        # (``:328``, ``:335``) and every blocking condition
+        # (``_require_blocked``), and repeating those would create a second
+        # authority that can drift from the first.
+        #
+        # `inc-glm53f-090` CORRECTED THE K-MISMATCH CITE, and it was already
+        # wrong before this increment: it read line 420, which at `0880c8f` was
+        # the docstring's closing quotes and not a refusal at all -- the check
+        # has always been two lines below. This increment's insert then moved
+        # the real check down, so the span above is the live one. The historical
+        # numbers in this note are deliberately NOT backticked: a backticked
+        # number is a cite to the checker, and a quoted dead one would read as
+        # drift for good. Naming the file also stops the checker inheriting the
+        # wrong module for the two bare cites above, which it did at `0880c8f`.
         if hidden_states.dim() != 2:
             raise Glm5NextSharedExpertRouteError(
                 f"hidden_states must be [T, H], got shape "
@@ -1529,10 +1676,25 @@ class Glm5NextSharedExperts(nn.Module):
             )
 
         # ---- The three projection sites. The counted seam entries. ------- #
+        # Each passes the operand ``prepare_scale_operands`` built at load time,
+        # by keyword (`inc-glm53f-090`). The public grid is still passed too: the
+        # seam's torch-oracle fallback consumes it, and the prebuilt operand
+        # cannot stand in for it. The dispatch count is untouched at 3 -- this
+        # changes what each entry CARRIES, not how many entries there are.
         # ENTRY 1 of 3 -- gate.
-        gate = blockwise_fp8_mm(hidden_states, gate_proj_weight, gate_proj_scale)
+        gate = blockwise_fp8_mm(
+            hidden_states,
+            gate_proj_weight,
+            gate_proj_scale,
+            prebuilt_scale_t=self._prepared_scale_operand("gate_proj"),
+        )
         # ENTRY 2 of 3 -- up.
-        up = blockwise_fp8_mm(hidden_states, up_proj_weight, up_proj_scale)
+        up = blockwise_fp8_mm(
+            hidden_states,
+            up_proj_weight,
+            up_proj_scale,
+            prebuilt_scale_t=self._prepared_scale_operand("up_proj"),
+        )
 
         # ---- THE CHECKPOINT'S TWO CLAMPS. `B22-M1`, rounds 1 and 2. -------- #
         # WHAT WAS WRONG. This step read `activated = silu(gate) * up`, with no
@@ -1582,13 +1744,16 @@ class Glm5NextSharedExperts(nn.Module):
         activated = silu(gate) * up
 
         # The down projection re-enters the seam, whose declared input dtype is
-        # ``bfloat16`` (``blockwise_fp8_mm.py:410``), so the fp32 intermediate is
+        # ``bfloat16`` (``blockwise_fp8_mm.py:446``), so the fp32 intermediate is
         # cast back to the activation dtype. The cast is named rather than
         # implicit because it is a real precision step and the acceptance's torch
         # reference mirrors it at the same point.
         # ENTRY 3 of 3 -- down.
         return blockwise_fp8_mm(
-            activated.to(hidden_states.dtype), down_proj_weight, down_proj_scale
+            activated.to(hidden_states.dtype),
+            down_proj_weight,
+            down_proj_scale,
+            prebuilt_scale_t=self._prepared_scale_operand("down_proj"),
         )
 
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
