@@ -2,8 +2,8 @@
 """Acceptance for `inc-glm53f-040` and `inc-glm53f-041` -- the sparse MLA latent
 attention kernel and its tiling path.
 
-THIRTEEN tests and NO `parametrize` decorator in this file. Four carry `geometry` in
-their name and are `-040`'s DECLARED acceptance selection; seven carry `width` and are
+FOURTEEN tests and NO `parametrize` decorator in this file. Four carry `geometry` in
+their name and are `-040`'s DECLARED acceptance selection; eight carry `width` and are
 `-041`'s; two carry neither, and screen the module rather than measure the kernel. Each
 test prints its counted value and names the component whose behaviour it certifies.
 
@@ -738,7 +738,7 @@ def test_the_kernel_entry_points_are_authored_here_and_not_imported() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-041` -- the seven `width` items. THE SELECTION IS PARTITIONED BY NAME:
+# `inc-glm53f-041` -- the eight `width` items. THE SELECTION IS PARTITIONED BY NAME:
 # every item below carries `width` and none carries `geometry`, so `-k width` runs
 # this increment's acceptance and `-k geometry` still runs `-040`'s four unchanged.
 # The constants live here rather than beside `-040`'s so this increment reads as one
@@ -767,6 +767,13 @@ EXACT_FIT_CONTROL_CASE = dict(seq=2, heads=64, latent=512, topk=512, s_kv=1024, 
 #: width is `LATENT_TILE + 1`, which is the EXACT value `-040`'s G4 table used to
 #: assert was refused -- so its serving is the evidence for that row's deletion.
 MINIMAL_TILED_CASE = dict(seq=1, heads=8, latent=129, topk=128, s_kv=256, rope=0)
+
+#: The floor W8's own non-vacuity guard must clear: how much the 3-wide tail tile has to
+#: move the FLOAT64 REFERENCE before the item is entitled to claim it tests the tail.
+#: Set three orders above the plan's `ATOL` so a tail whose signal was quietly weakened
+#: fails the guard long before it could pass the numeric compare vacuously. Not a
+#: comparator: it bounds this item's own inputs, not the kernel's agreement.
+TAIL_SIGNAL_FLOOR = 1e-2
 
 
 def case_scale(case: dict) -> float:
@@ -798,7 +805,7 @@ def reset_both_counters() -> None:
 
 
 def test_width_the_ragged_latent_matches_the_torch_oracle() -> None:
-    """WIDTH 1 of 7 -- the tiled kernel computes sparse latent attention at 2,051.
+    """WIDTH 1 of 8 -- the tiled kernel computes sparse latent attention at 2,051.
 
     CERTIFYING COMPONENT: `MS._attention_body_tiled`, reached through the seam's
     width branch.
@@ -858,7 +865,7 @@ def test_width_the_ragged_latent_matches_the_torch_oracle() -> None:
 
 
 def test_width_the_zero_extended_reference_is_bit_identical() -> None:
-    """WIDTH 2 of 7 -- 2,051 columns agree EXACTLY with the same data padded to 2,176.
+    """WIDTH 2 of 8 -- 2,051 columns agree EXACTLY with the same data padded to 2,176.
 
     CERTIFYING COMPONENT: `MS._attention_body_tiled`'s ragged tail tiles, on both the
     partition axis and MM2's moving axis.
@@ -978,7 +985,7 @@ def test_width_the_zero_extended_reference_is_bit_identical() -> None:
 
 
 def test_width_the_tiled_seam_counts_its_own_dispatch() -> None:
-    """WIDTH 3 of 7 -- the route predicate, D13 form R-1, on the tiled path.
+    """WIDTH 3 of 8 -- the route predicate, D13 form R-1, on the tiled path.
 
     CERTIFYING COMPONENT: the width branch in `MS.mla_sparse_attention` and
     `MS._MLA_SPARSE_TILED_COUNTERS`.
@@ -1021,7 +1028,7 @@ def test_width_the_tiled_seam_counts_its_own_dispatch() -> None:
 
 
 def test_width_the_tile_arithmetic_comes_from_the_image() -> None:
-    """WIDTH 4 of 7 -- the two tilings are derived from `nl.tile_size`, not typed.
+    """WIDTH 4 of 8 -- the two tilings are derived from `nl.tile_size`, not typed.
 
     CERTIFYING COMPONENT: `MS._latent_tiles` and `MS._output_tiles`.
 
@@ -1073,7 +1080,7 @@ def test_width_the_tile_arithmetic_comes_from_the_image() -> None:
 
 
 def test_width_an_exact_fit_call_leaves_the_tiled_counter_at_zero() -> None:
-    """WIDTH 5 of 7 -- the exact-fit control: the tiled counter stays 0, the seam's reads 1.
+    """WIDTH 5 of 8 -- the exact-fit control: the tiled counter stays 0, the seam's reads 1.
 
     CERTIFYING COMPONENT: the width branch's FALSE arm -- an exact-fit latent must keep
     `-040`'s untiled body.
@@ -1124,7 +1131,7 @@ def test_width_an_exact_fit_call_leaves_the_tiled_counter_at_zero() -> None:
 
 
 def test_width_the_shipped_oracle_agrees_with_the_independent_reference() -> None:
-    """WIDTH 6 of 7 -- the module's own torch oracle agrees with this file's reference.
+    """WIDTH 6 of 8 -- the module's own torch oracle agrees with this file's reference.
 
     CERTIFYING COMPONENT: `MS.mla_sparse_attention_torch_oracle`.
 
@@ -1158,7 +1165,7 @@ def test_width_the_shipped_oracle_agrees_with_the_independent_reference() -> Non
 
 
 def test_width_the_two_widths_g4_used_to_refuse_are_now_served() -> None:
-    """WIDTH 7 of 7 -- the gate this increment removes is removed, and its floor is kept.
+    """WIDTH 7 of 8 -- the gate this increment removes is removed, and its floor is kept.
 
     CERTIFYING COMPONENT: the two relaxed latent bounds in `MS._require_admissible`.
 
@@ -1196,3 +1203,129 @@ def test_width_the_two_widths_g4_used_to_refuse_are_now_served() -> None:
     say(f"W7_CONTROL_LATENT_ZERO_STILL_REFUSES_VERBATIM={message}")
     assert "latent rank must be positive" in message
     say("W7_CONTROL_FIRES=1")
+
+
+def test_width_the_ragged_tail_tile_carries_signal_the_output_depends_on() -> None:
+    """WIDTH 8 of 8 -- at the declared width, the 3-wide tail tile changes the answer.
+
+    CERTIFYING COMPONENT: `MS._attention_body_tiled`'s tail tile on BOTH axes, at the
+    declared width 2,051.
+
+    WHY THIS ITEM EXISTS, and it is a measured gap rather than an idea. Round 1's
+    mutation row F deleted the ragged tail tile from MM1 -- a real defect in exactly the
+    arithmetic this increment adds -- and W1 PASSED: with `-040`'s random inputs the 3
+    tail components move the output by 8.996e-06, under the plan's registered `atol` of
+    1e-5. Only W2 caught it, and only by its control going inert. An acceptance that
+    catches a deleted tail tile solely through an inert control is not certifying this
+    arithmetic, so this item makes the tail LOAD-BEARING in the inputs instead. The
+    tolerance is untouched -- it is the plan's; what changes is the data.
+
+    HOW THE SIGNAL IS PLACED, and it is in BOTH operands deliberately. The tail's
+    contribution to key `k`'s logit is `scale * sum_over_tail(q[h, l] * c[k, l])`. A ramp
+    on the cache alone leaves that sum proportional to `sum_over_tail(q[h, l])`, which is
+    a random near-zero number per HEAD, so the signal would vanish for whichever heads
+    happen to cancel and the failure margin would be data-dependent. Fixing the query's
+    tail to 1.0 makes the sum equal to the ramp for every head, so the margin is
+    predictable and the same for all 64 heads. The ramp varies per cache ROW because
+    softmax is invariant to a constant shift of a row's logits -- the defect this
+    campaign has now hit twice.
+
+    WHAT THIS ITEM ALSO CATCHES, disclosed because it widens a mutation row. The ramp
+    leaves the softmax denominator at about 3.5 rather than about 1 (the derivation is at
+    the ramp below), so this item ALSO fails when the tiled body drops that denominator --
+    the round's mutation G. It is not a tail-only item. G's signature therefore blames two
+    items rather than one, and F and G are still told apart because they blame DIFFERENT
+    SETS: F blames this item and the exactness item, G blames this item and the oracle
+    item.
+
+    THE NON-VACUITY GUARD IS INTERNAL TO THE ITEM. Before any kernel runs, the item
+    measures how much the tail contributes to the FLOAT64 REFERENCE by zeroing the tail
+    in a copy of the inputs, and requires that to clear a named floor. That reading uses
+    no kernel at all, so if a future edit weakened the scaling this item would fail on
+    its own guard rather than pass vacuously.
+    """
+    say("W8_CERTIFYING_COMPONENT=MS._attention_body_tiled tail tile at the declared width")
+    case = dict(WIDTH_CASE)
+    scale = case_scale(case)
+    latent = case["latent"]
+    tail = latent - (latent % MS.LATENT_TILE)          # 2048: where the tail tile starts
+    tail_width = latent - tail                        # 3
+    say(f"W8_TAIL_TILE_STARTS_AT={tail} W8_TAIL_WIDTH={tail_width}")
+    assert tail_width == 3, "the declared width's tail tile is 3 wide"
+
+    q_lift, c_kv, idx, _, _ = make_case(**case, seed=41)
+    # The signal: a per-row ramp on the cache's tail columns, and a fixed 1.0 on the
+    # query's, so every head sees it. STEP is chosen so the TAIL DECIDES THE SELECTION.
+    # Two different spans matter here and confusing them gives the wrong answer:
+    #   * ACROSS the whole cache the tail spreads the logits by scale*3*step*255 = 42
+    #     nats, against a base spread of about 2.5e-3 -- so the tail, not the random
+    #     part, orders the keys.
+    #   * BETWEEN ADJACENT SELECTED rows the gap is only scale*3*step = 0.166 nats per
+    #     row index, and the 128 selected rows are a random half of 256, so adjacent
+    #     selected logits differ by about 0.33 nats.
+    # The weights are therefore a GEOMETRIC ramp of ratio about e**-0.33 = 0.72, not a
+    # one-hot pick: the effective support is 1/(1-0.72) = about 3.5 rows and the softmax
+    # denominator is about 3.5, not about 1. So this item still exercises a graded
+    # weighted sum, and it is NOT blind to the denominator. Delete the tail tile and the
+    # weights collapse to a near-uniform average of all 128 rows, a change of order 1e-1
+    # in every real column. A gentler ramp moves only the weights' shape and lands near
+    # 5e-3, close enough to the band to make the item's margin a matter of luck.
+    step = 2.5
+    ramp = torch.arange(case["s_kv"], dtype=torch.float32).unsqueeze(1) * step
+    c_kv = c_kv.clone()
+    c_kv[:, tail:] = ramp
+    q_lift = q_lift.clone()
+    q_lift[:, :, tail:] = 1.0
+    say(f"W8_RAMP_STEP={step} W8_MAX_TAIL_LOGIT_TERM="
+        f"{scale * tail_width * step * (case['s_kv'] - 1):.3f}")
+
+    # THE GUARD, computed from the inputs and the float64 reference only, no kernel.
+    want = sparse_mla_torch_reference(q_lift, c_kv, idx, scale)
+    c_no_tail = c_kv.clone()
+    c_no_tail[:, tail:] = 0.0
+    q_no_tail = q_lift.clone()
+    q_no_tail[:, :, tail:] = 0.0
+    want_no_tail = sparse_mla_torch_reference(q_no_tail, c_no_tail, idx, scale)
+    # MEASURED OVER THE REAL COLUMNS ONLY, and that restriction is the whole guard.
+    # Zeroing the cache's tail trivially zeroes the output's tail columns, so a maximum
+    # taken over the full width would be satisfied by arithmetic that never changed a
+    # single weight. Restricted to columns [0, 2048) the reading can only move if the
+    # tail changed the SOFTMAX -- which is exactly what mutation F destroys.
+    contribution = float((want[:, :, :tail] - want_no_tail[:, :, :tail]).abs().max())
+    trivial = float((want[:, :, tail:] - want_no_tail[:, :, tail:]).abs().max())
+    say(f"W8_TAIL_CONTRIBUTION_OVER_THE_REAL_COLUMNS={contribution:.3e}  "
+        f"FLOOR={TAIL_SIGNAL_FLOOR}")
+    say(f"W8_TAIL_COLUMNS_MOVE_TRIVIALLY_BY={trivial:.3e}  (not the guard; excluded)")
+    assert contribution > TAIL_SIGNAL_FLOOR, (
+        f"the tail moves the reference's REAL columns by only {contribution}, at or "
+        f"below the {TAIL_SIGNAL_FLOOR} floor, so this item could pass without the tail "
+        f"tile ever being computed -- the inputs no longer put signal where it claims"
+    )
+
+    reset_both_counters()
+    got = MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    seam_nki, seam_fallback, tiled_nki, tiled_fallback = both_counters()
+    say(f"W8_SEAM_NKI_DISPATCH={seam_nki}/1 W8_TILED_NKI_DISPATCH={tiled_nki}/1")
+    say(f"W8_SEAM_TORCH_FALLBACK={seam_fallback} W8_TILED_TORCH_FALLBACK={tiled_fallback}")
+    assert seam_nki == 1 and tiled_nki == 1
+    assert seam_fallback == 0 and tiled_fallback == 0
+
+    # THREE READINGS, because one absolute maximum would misreport this item. The ramp
+    # makes the output's TAIL columns about 6e2 in magnitude while its real columns stay
+    # about 1e-1, and `assert_close` is elementwise -- it allows `atol + rtol*|want|`,
+    # which is about 6 on a tail column and about 1e-3 on a real one. A single absolute
+    # maximum is dominated by float32 error on the big numbers and would read like a
+    # near-miss against `ATOL` when the assert is nowhere near its limit. So the item
+    # reports the two absolute errors on their own scales AND the SLACK RATIO, which is
+    # the quantity the assert actually tests: below 1.0 passes, at or above 1.0 fails.
+    err = float((got - want).abs().max())
+    err_real = float((got[:, :, :tail] - want[:, :, :tail]).abs().max())
+    slack = float(((got - want).abs() / (ATOL + RTOL * want.abs())).max())
+    say(f"W8_MAXABS_VS_INDEPENDENT_ORACLE={err:.3e}  RTOL={RTOL} ATOL={ATOL}")
+    say(f"W8_MAXABS_OVER_THE_REAL_COLUMNS={err_real:.3e}")
+    say(f"W8_SLACK_RATIO_AGAINST_THE_REGISTERED_BAND={slack:.3e}  (1.0 is the limit)")
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+    say("W8_CASES_AGREED=1/1")
+    # The margin a tail-tile defect must clear, both readings taken over the REAL columns
+    # so the ratio compares like with like. Quoted by the mutation rows.
+    say(f"W8_MARGIN_A_TAIL_DEFECT_MUST_CLEAR={contribution / max(err_real, 1e-12):.3e}x")
