@@ -972,12 +972,18 @@ class NoauxTcRouterError(ValueError):
 
     Raised in preference to a silent `False`. The distinction is the whole
     reason this class exists: the substrate's own admission gate answers the
-    `T % 256` question by RETURNING FALSE
-    (`rmsnorm_router_topk_tkg.py:209`, inside `_can_use_kernel`), and its caller
+    `E > 512` question by RETURNING FALSE
+    (`rmsnorm_router_topk_tkg.py:206`, inside `_can_use_kernel`), and its caller
     then computes the torch reference (`:94`, `:117-124`). A test whose oracle
     is also torch would pass green with no kernel executed -- the false green
     plan section 4b exists to block. On this seam the same rule is a NAMED
     RAISE, so that outcome is unreachable rather than merely unlikely.
+
+    THE EXAMPLE USED TO BE `T % 256`, and it is `E > 512` now because the token
+    extent is no longer refused here at all: `inc-glm53f-088` pads the token axis
+    at each entry point instead (`_noaux_tc_pad_target` below). The argument is
+    unchanged and the substrate still returns a silent `False` on `E`, so the
+    class keeps its warrant with a clause that is still live.
     """
 
 
@@ -1013,12 +1019,20 @@ def noaux_tc_dispatch_counters() -> Tuple[int, int]:
     return _NOAUX_TC_COUNTERS.nki_dispatch, _NOAUX_TC_COUNTERS.torch_fallback
 
 
-def _require_noaux_tc_extents(num_tokens: int, num_experts: int, top_k: int) -> None:
+def _require_noaux_tc_extents(num_experts: int, top_k: int) -> None:
     """Refuse, by name, every extent the reused members cannot serve.
 
     Each clause cites the line that imposes it, so a refusal message is
     actionable and a future extent change can be checked against its source
     rather than against this function's memory of it.
+
+    THE TOKEN EXTENT IS NOT ONE OF THEM, since `inc-glm53f-088`. It used to be:
+    a fourth clause refused any `T` that was not a multiple of 256. The two
+    public entry points now pad the token axis to their own tile multiple and
+    slice the outputs back, so every `T >= 1` is servable and there is nothing
+    left to refuse. `num_tokens` is gone from this signature rather than kept and
+    ignored -- a parameter named for a screen this function no longer performs
+    would make the signature claim more than the body does.
     """
     if top_k != NOAUX_TC_K:
         raise NoauxTcRouterError(
@@ -1037,20 +1051,9 @@ def _require_noaux_tc_extents(num_tokens: int, num_experts: int, top_k: int) -> 
             f"substrate applies at rmsnorm_router_topk_tkg.py:201,206. "
             f"got E={num_experts}"
         )
-    if num_tokens % _NOAUX_TC_T_MULTIPLE != 0:
-        raise NoauxTcRouterError(
-            f"T must be a multiple of {_NOAUX_TC_T_MULTIPLE}: the unquantized "
-            f"norm path tiles T as T//2 across the two PE partitions and "
-            f"requires T//2 % 128 == 0 (NCC_INKI016), which the substrate "
-            f"enforces at rmsnorm_router_topk_tkg.py:209. That gate RETURNS "
-            f"FALSE and falls back to torch; this one raises, so a fixture that "
-            f"violates it cannot pass green against a torch oracle. "
-            f"got T={num_tokens}"
-        )
-
 
 def can_run_noaux_tc_router(
-    reference: Tensor, num_tokens: int, num_experts: int, top_k: int
+    reference: Tensor, num_experts: int, top_k: int
 ) -> bool:
     """Two independent conditions, deliberately not merged.
 
@@ -1063,10 +1066,65 @@ def can_run_noaux_tc_router(
 
     This function does NOT consult the pin's ``_can_use_kernel`` above, whose
     first statement is an unconditional ``return False``.
+
+    ``num_tokens`` left this signature with `inc-glm53f-088`, for the reason
+    given in ``_require_noaux_tc_extents``: the token extent no longer bears on
+    the answer, and an argument that does not bear on the answer would advertise
+    a screen that is not here.
     """
-    _require_noaux_tc_extents(num_tokens, num_experts, top_k)
+    _require_noaux_tc_extents(num_experts, top_k)
     return can_run_kernel(reference)
 
+
+def _noaux_tc_pad_target(num_tokens: int, multiple: int) -> int:
+    """Round ``num_tokens`` UP to a whole ``multiple``. Returns it unchanged when
+    it already is one.
+
+    ``multiple`` IS AN ARGUMENT ON PURPOSE. The two public entry points have
+    different pad targets and each must read its own from the constant that
+    imposes it:
+
+      * ``noaux_tc_correct`` launches with NO grid, so one program owns every
+        token and the stage's tile loop needs whole ``NOAUX_TC_TILE`` (128) rows.
+      * ``noaux_tc_rmsnorm_router_topk`` launches ``[2]`` and the stage binds
+        ``shard_on_tokens = t_extent > 1``, so the extent splits in two and EACH
+        HALF must be a whole tile -- ``_NOAUX_TC_T_MULTIPLE`` (256).
+
+    A helper that picked the multiple itself would have to know which caller it
+    served. Copying one entry's target to the other is the specific defect this
+    signature makes visible rather than possible: at 128 the fused entry would
+    hand each core 64 rows, ``64 // 128`` is 0 tiles, the loop body would never
+    run, and the kernel would return its uninitialised output buffers while the
+    seam counted a successful NKI dispatch. A silent all-zero result behind a
+    green route reading is exactly the false green this campaign counts.
+    """
+    return -(-num_tokens // multiple) * multiple
+
+
+def _noaux_tc_pad_tokens(x: Tensor, t_pad: int) -> Tensor:
+    """Extend ``x``'s token axis (``dim=-2``) to ``t_pad`` rows, contiguous.
+
+    THE PAD REPEATS THE LAST REAL ROW rather than writing zeros, and that is a
+    choice with a reason. The pad rows cannot affect the real ones -- nothing in
+    ``_noaux_tc_stage`` reduces across the token axis, every load and store there
+    is ``[t0 : t0 + rows, :]``, and the only reduction is ``nl.sum(..., axis=1)``
+    over EXPERTS -- so this is not a correctness argument. It is about not
+    inventing an input class: ``sigmoid(0)`` is 0.5 at every expert, so an
+    all-zero row hands ``nisa.max8`` and ``nisa.nc_find_index8`` an exact 8-way
+    tie, and ``nc_find_index8`` documents "the first occurrence of each value".
+    Repeating a real row keeps the padded region inside the value distribution
+    the measured rows come from.
+
+    Always contiguous, including on the no-pad path: the kernel reads this buffer
+    from HBM, and a caller's non-contiguous view is not the same bytes.
+    """
+    t_real = x.shape[-2]
+    if t_pad == t_real:
+        return x.contiguous()
+    last = x.narrow(-2, t_real - 1, 1)
+    reps = [1] * x.dim()
+    reps[-2] = t_pad - t_real
+    return torch.cat([x, last.repeat(*reps)], dim=-2).contiguous()
 
 
 def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
@@ -1083,11 +1141,12 @@ def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
 
     The remainder goes to the SECOND core, and that detail is copied rather than
     simplified. An even split written as ``T // n_prgs`` for both cores agrees
-    with the vendor on every extent this stage can receive, because the
-    admission clause forces a multiple of 256 -- but it would silently drop the
-    tail on any other extent, and a private helper that disagrees with the
-    producer on an unreachable input is the same defect ``M-B20-1`` is about, one
-    input away. The vendor's split is only defined for two programs, which is all
+    with the vendor on every extent this stage can receive, because the fused
+    entry pads the extent to a multiple of 256 before it launches -- but it would
+    silently drop the tail on any other extent, and a private helper that
+    disagrees with the producer on an unreachable input is the same defect
+    ``M-B20-1`` is about, one input away. The vendor's split is only defined for
+    two programs, which is all
     ``get_verified_program_sharding_info(..., (0, 1), 2)`` admits.
 
     Factored OUT of the kernel body on purpose: the arithmetic that decides
@@ -1097,10 +1156,14 @@ def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
     case and the only case the standalone entry point ever sees.
 
     ``t_local`` is always a whole number of ``NOAUX_TC_TILE`` rows here, and that
-    is not an assumption: ``_require_noaux_tc_extents`` already refuses any ``T``
-    that is not a multiple of ``_NOAUX_TC_T_MULTIPLE`` precisely because the
-    substrate needs ``T // 2 % 128 == 0``. The same clause that admits the
-    extent therefore guarantees this loop covers it.
+    is not an assumption -- but since `inc-glm53f-088` the guarantee comes from
+    the CALLER rather than from a refusal. Each public entry point pads
+    ``num_tokens`` up to its own multiple before it launches
+    (``_noaux_tc_pad_target``): 128 for the unsharded correct-only entry, 256 for
+    the fused ``[2]`` entry so that ``T // 2`` is still a whole tile. Whoever
+    calls this with an unpadded extent gets a floor-divided loop that covers less
+    than ``t_local``, which is why the pad and the launch grid are chosen together
+    at each entry and never separately.
     """
     t_first = num_tokens // n_prgs
     if prg_id == 0:
@@ -1446,7 +1509,9 @@ def noaux_tc_correct(
     """`noaux_tc` selection and gate weights from precomputed router logits.
 
     Args:
-        router_logits: `[T, E]` raw router logits.
+        router_logits: `[T, E]` raw router logits, any `T >= 1`. The token axis
+            is padded up to this entry's own tile multiple before the launch and
+            the outputs are sliced back, so `T` carries no divisibility rule.
         correction_bias: `[1, E]` or `[E]` `e_score_correction_bias`.
         top_k: must be `NOAUX_TC_K`; present so a caller's intent is explicit
             and a mismatch is a named refusal rather than a silent reshape.
@@ -1468,20 +1533,28 @@ def noaux_tc_correct(
     num_tokens, num_experts = router_logits.shape
     bias = _legalize_correction_bias(correction_bias, num_experts)
 
-    if not can_run_noaux_tc_router(router_logits, num_tokens, num_experts, top_k):
+    if not can_run_noaux_tc_router(router_logits, num_experts, top_k):
         _NOAUX_TC_COUNTERS.torch_fallback += 1
         return noaux_tc_correct_torch_oracle(
             router_logits, bias, norm_topk_prob, routed_scaling_factor
         )
 
+    # THIS ENTRY'S OWN PAD TARGET, read from the constant that imposes it. The
+    # launch below has no grid, so one program owns every token and the stage's
+    # loop consumes whole `NOAUX_TC_TILE` rows. 128, not the fused entry's 256.
+    t_pad = _noaux_tc_pad_target(num_tokens, NOAUX_TC_TILE)
+
     _NOAUX_TC_COUNTERS.nki_dispatch += 1
     index, affinities = wrap_nki(_noaux_tc_correct_nki)(
-        router_logits=router_logits.to(torch.float32).contiguous(),
+        router_logits=_noaux_tc_pad_tokens(router_logits.to(torch.float32), t_pad),
         correction_bias=bias,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=float(routed_scaling_factor),
     )
-    return index.to(torch.int32), affinities
+    # SLICE BACK to the caller's extent. The pad rows were computed and are
+    # discarded; nothing in the stage reduces across tokens, so they cannot have
+    # reached these rows.
+    return index[:num_tokens].to(torch.int32), affinities[:num_tokens]
 
 
 def noaux_tc_rmsnorm_router_topk(
@@ -1537,21 +1610,44 @@ def noaux_tc_rmsnorm_router_topk(
         RouterActFnType.SIGMOID,
     )
 
-    b_extent, s_extent, _ = hidden_states.shape
+    b_extent, s_extent, h_extent = hidden_states.shape
     num_tokens = b_extent * s_extent
     num_experts = router_weights.shape[1]
     bias = _legalize_correction_bias(correction_bias, num_experts)
 
+    # THIS ENTRY'S OWN PAD TARGET, and WHERE it is applied is as load-bearing as
+    # the value. It is 256, read from `_NOAUX_TC_T_MULTIPLE` rather than copied
+    # from the correct-only entry above: the launch below is `[2]`, the stage
+    # binds `shard_on_tokens = t_extent > 1` and splits the tokens, so each core
+    # must receive a whole 128-row tile and the full extent must be twice that.
+    #
+    # It runs AFTER `_substrate_validate_inputs` above, so that validation still
+    # sees the caller's real extents and a wrong `H` raises on the shape the
+    # caller passed. It runs BEFORE the substrate's admission gate below, which
+    # reads `hidden_states.shape` and returns False on a token extent that is not
+    # a multiple of 256 (`rmsnorm_router_topk_tkg.py:209`) -- padding after that
+    # gate would leave the seam falling back to torch on exactly the extents this
+    # increment exists to serve.
+    #
+    # The reshape to `[1, T, H]` flattens `B` and `S` into the single token axis
+    # the kernel already computes (`t_extent = b_extent * s_extent`), so the pad
+    # rows land after ALL the real tokens and one slice recovers them. Padding
+    # `S` per batch instead would interleave pad rows between batches.
+    t_pad = _noaux_tc_pad_target(num_tokens, _NOAUX_TC_T_MULTIPLE)
+    hidden_padded = _noaux_tc_pad_tokens(
+        hidden_states.reshape(1, num_tokens, h_extent), t_pad
+    )
+
     # BOTH gates, and the order matters. The substrate's own admission gate is
     # consulted so this seam cannot admit a case the substrate would refuse;
     # this seam's gate then RAISES on the same extents rather than returning
-    # False, so no admitted-here / refused-there gap can exist.
+    # False, so no admitted-here / refused-there gap can exist. Both read the
+    # PADDED tensor, so neither can disagree with the other about the extent the
+    # kernel will actually receive.
     substrate_admits = _substrate_can_use_kernel(
-        hidden_states, router_weights, router_mm_dtype, quantization_type
+        hidden_padded, router_weights, router_mm_dtype, quantization_type
     )
-    seam_admits = can_run_noaux_tc_router(
-        hidden_states, num_tokens, num_experts, top_k
-    )
+    seam_admits = can_run_noaux_tc_router(hidden_padded, num_experts, top_k)
     if not (substrate_admits and seam_admits):
         _NOAUX_TC_COUNTERS.torch_fallback += 1
         return noaux_tc_rmsnorm_router_topk_torch_oracle(
@@ -1572,7 +1668,7 @@ def noaux_tc_rmsnorm_router_topk(
     # "Requires LNC=2 sharding").
     wrapped = wrap_nki(_noaux_tc_rmsnorm_router_topk_nki)
     logits, index, affinities, substrate_index = wrapped[2](
-        hidden_states=hidden_states,
+        hidden_states=hidden_padded,
         gamma=gamma,
         router_weights=router_weights,
         correction_bias=bias,
@@ -1581,7 +1677,17 @@ def noaux_tc_rmsnorm_router_topk(
         routed_scaling_factor=float(routed_scaling_factor),
         router_mm_dtype=_NOAUX_TC_TORCH_TO_NKI_DTYPE[router_mm_dtype],
     )
-    return logits, index.to(torch.int32), affinities, substrate_index.to(torch.int32)
+    # SLICE ALL FOUR back to the caller's extent. Every output the kernel
+    # allocates is `[t_extent, ...]` with `t_extent = b_extent * s_extent` of the
+    # tensor it received, so all four are `[t_pad, ...]` and all four are sliced
+    # -- including `substrate_index`, the non-vacuity control, which would
+    # otherwise be compared row-for-row against a shorter corrected selection.
+    return (
+        logits[:num_tokens],
+        index[:num_tokens].to(torch.int32),
+        affinities[:num_tokens],
+        substrate_index[:num_tokens].to(torch.int32),
+    )
 
 
 

@@ -52,7 +52,7 @@ different things. Each pass is therefore taken with the primitive that suits it:
 * **row sums reduce along the FREE axis** -- ``nl.sum(..., axis=1)``, and the
   reciprocal broadcasts back along the free axis from an ``[M, 1]`` tile, which
   is exactly what ``nisa.tensor_scalar`` does with ``operand0``. This is
-  ``functional/moe/router.py:1159-1173``'s idiom, reused rather than reinvented.
+  ``functional/moe/router.py:1222-1236``'s idiom, reused rather than reinvented.
 * **column sums reduce along the PARTITION axis**, which no elementwise engine
   does. The canonical NKI form is a matmul against a ones vector:
   ``nisa.nc_matmul(stationary=ones[M, 1], moving=A[M, N])`` contracts over the
@@ -60,7 +60,7 @@ different things. Each pass is therefore taken with the primitive that suits it:
   ``functional/moe/topk_reduce.py:337-348``'s own "column-sum via a ones-moving
   matmul". Scattering the ``[1, N]`` scale back over ``M`` partitions is the
   mirror-image problem, and ``nl.broadcast_to`` is the member that does it:
-  ``moe/router.py:1205-1206`` records that a ``[1, E]`` row's broadcast "is on the
+  ``moe/router.py:1268-1269`` records that a ``[1, E]`` row's broadcast "is on the
   PARTITION axis, which ``nl.broadcast_to`` does and ``tensor_scalar`` does
   not."
 
@@ -237,7 +237,7 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS):
     The loop is ``nl.sequential_range`` because every iteration reads the tile
     the previous one wrote. The working tile is rewritten in place, which
     ``nisa`` admits and this repository already relies on
-    (``functional/moe/router.py:1149``, ``functional/argsort_unstable.py:216``).
+    (``functional/moe/router.py:1212``, ``functional/argsort_unstable.py:216``).
     """
     m_extent, n_extent = affinity.shape
     col_goal = m_extent / n_extent
@@ -270,7 +270,7 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS):
             dst=row_den, data=row_sum, op0=nl.add, operand0=SINKHORN_DENOM_EPS
         )
         # reciprocal then multiply, rather than a divide: `nisa.reciprocal` is
-        # the member moe/router.py:1249 uses for exactly this shape, and the
+        # the member moe/router.py:1312 uses for exactly this shape, and the
         # multiply below broadcasts an [M, 1] operand along the free axis.
         nisa.reciprocal(dst=row_scale, data=row_den)
         nisa.tensor_scalar(
@@ -296,7 +296,7 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS):
             dst=col_scale, data=col_scale, op0=nl.multiply, operand0=float(col_goal)
         )
         # The [1, N] scale has to reach M partitions. `nl.broadcast_to` is the
-        # member that broadcasts on the PARTITION axis (moe/router.py:1205-1206).
+        # member that broadcasts on the PARTITION axis (moe/router.py:1268-1269).
         col_scale_b = nl.broadcast_to(col_scale, (m_extent, n_extent))
         nisa.tensor_tensor(
             dst=working, data1=working, data2=col_scale_b, op=nl.multiply

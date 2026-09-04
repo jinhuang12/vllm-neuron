@@ -650,7 +650,7 @@ def test_declared_gate_weights_match_within_declared_tolerances() -> None:
 
     Both sides are DENSE ``[T, E]`` tensors and are compared as they stand.
     ``noaux_tc_correct_torch_oracle`` returns an already-scattered affinity
-    tensor (``moe/router.py:1639-1641``); passing it through a second scatter is what
+    tensor (``moe/router.py:1745-1747``); passing it through a second scatter is what
     broke attempt 1 (``increments/investigation-032.md`` §4).
     """
     logits, bias = build_designed_logits()
@@ -803,8 +803,6 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
 @pytest.mark.parametrize(
     "tokens, experts, top_k, needle",
     [
-        (128, DECLARED_E, DECLARED_TOP_K, "T must be a multiple of 256"),
-        (384, DECLARED_E, DECLARED_TOP_K, "T must be a multiple of 256"),
         (DECLARED_T, 513, DECLARED_TOP_K, "E must be <= 512"),
         (DECLARED_T, 4, DECLARED_TOP_K, "E must be >= 8"),
         (DECLARED_T, DECLARED_E, 4, "top_k must be exactly 8"),
@@ -814,11 +812,18 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
 def test_refused_extents_raise_by_name(tokens, experts, top_k, needle) -> None:
     """Each refusal is a named error carrying the extent, never a silent False.
 
-    The ``T % 256`` row is the load-bearing one. The substrate answers that same
-    question by RETURNING FALSE (``rmsnorm_router_topk_tkg.py:209``) and its
-    caller then computes torch -- so a ``T = 128`` fixture would have run torch
-    against a torch oracle and passed green with zero kernel dispatches. On this
-    seam it raises, so that outcome is unreachable.
+    ``E > 512`` is the load-bearing row. The substrate answers that same question
+    by RETURNING FALSE (``rmsnorm_router_topk_tkg.py:206``) and its caller then
+    computes torch -- so an ``E = 513`` fixture would have run torch against a
+    torch oracle and passed green with zero kernel dispatches. On this seam it
+    raises, so that outcome is unreachable.
+
+    THIS LIST LOST TWO ROWS AT ``inc-glm53f-088``, and where they went matters.
+    ``T = 128`` and ``T = 384`` were refused here for ``T % 256 != 0``; that
+    clause is gone and the seam now pads the token axis instead. The two extents
+    are not dropped -- they are re-pinned as the two admitted readings below,
+    each its own named test, so the file collects the same number of items and
+    every assertion in this body is the one it always was.
     """
     logits = torch.zeros(tokens, experts, dtype=torch.float32)
     bias = torch.zeros(1, experts, dtype=torch.float32)
@@ -830,6 +835,93 @@ def test_refused_extents_raise_by_name(tokens, experts, top_k, needle) -> None:
     assert needle in message
     # A refusal is not a fallback: neither counter moves.
     assert noaux_tc_dispatch_counters() == (0, 0)
+
+
+def logits_at_token_extent(tokens: int):
+    """The conditioned fixture, re-indexed to ``tokens`` rows.
+
+    ``build_designed_logits`` hardcodes ``DECLARED_T`` and takes no token count,
+    and it is a LANDED fixture ``inc-glm53f-088`` does not touch. Re-indexing it
+    is sound because its conditioning is a per-ROW property: each row is its own
+    ``randperm`` of one ladder (``:216-219``), so the 8/9 boundary gap holds row
+    by row and a repeated row is a repeated CONDITIONED row. ``% DECLARED_T``
+    rather than a slice, so a ``tokens`` above 256 is served too.
+    """
+    logits, bias = build_designed_logits()
+    return logits[torch.arange(tokens) % DECLARED_T].contiguous(), bias
+
+
+def _assert_admitted_token_extent(tokens: int) -> None:
+    """The whole reading for a token extent this seam used to refuse.
+
+    A plain helper called from two named tests rather than a ``parametrize``
+    (plan D1.2: counted items), so each extent is its own collected item and
+    names itself in the transcript.
+
+    A row that merely stopped raising would be satisfied by deleting the clause,
+    so the reading is the module's FULL declared comparison at the new extent:
+    all four route instruments, index SET equality on every row against the
+    shipped torch oracle, and the dense gate weights at the module's declared
+    tolerances. No comparator is introduced here and no tolerance moves (P9).
+    """
+    logits, bias = logits_at_token_extent(tokens)
+    want_index, want_affinities = noaux_tc_correct_torch_oracle(
+        logits, bias, DECLARED_NORM_TOPK_PROB, DECLARED_ROUTED_SCALING_FACTOR
+    )
+
+    reset_noaux_tc_counters()
+    with _SimulatorCounter() as sim:
+        got_index, got_affinities = noaux_tc_correct(
+            logits,
+            bias,
+            top_k=DECLARED_TOP_K,
+            norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+            routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+        )
+    _assert_route(sim, 1, f"admitted-T{tokens}")
+
+    got = got_affinities.to(torch.float32)
+    want = want_affinities.to(torch.float32)
+    assert tuple(got_index.shape) == (tokens, NOAUX_TC_K)
+    assert got.shape == want.shape == (tokens, DECLARED_E)
+
+    equal_rows = set_equal_rows(got_index, want_index)
+    distinct = rows_with_k_distinct(got_index)
+    print(
+        f"[admitted-T{tokens}] set_equal_rows={equal_rows}/{tokens} "
+        f"rows_with_{NOAUX_TC_K}_distinct={distinct}/{tokens} "
+        f"max_abs_error={float((got - want).abs().max()):.6e} "
+        f"declared rtol={RTOL} atol={ATOL}"
+    )
+    assert equal_rows == tokens
+    assert distinct == tokens
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+def test_token_extent_128_is_admitted_and_matches_the_reference() -> None:
+    """``inc-glm53f-088``: ``T = 128`` was a named refusal here and now runs.
+
+    Re-pin 1 of the two rows removed from ``test_refused_extents_raise_by_name``
+    above. 128 is BELOW the old multiple of 256, which is the half of that clause
+    a caller hits with a short decode batch.
+    """
+    _assert_admitted_token_extent(128)
+
+
+def test_token_extent_384_is_admitted_and_matches_the_reference() -> None:
+    """``inc-glm53f-088``: ``T = 384`` -- re-pin 2, ABOVE the old multiple.
+
+    128 sits below 256 and 384 above it without being a multiple, so the two
+    re-pins cover both ways the removed clause could refuse.
+
+    NEITHER OF THESE TWO EXTENTS ACTUALLY PADS, and saying so is the honest
+    reading: this entry point pads to ``NOAUX_TC_TILE`` (128) and both 128 and
+    384 already are whole multiples of it, so ``_noaux_tc_pad_tokens`` takes its
+    identity path here. What these two items measure is exactly the removal of
+    the refusal. The PAD itself is measured at the extents that need one, in
+    ``test/vllm_neuron/functional/moe/test_router_token_axis.py``.
+    """
+    _assert_admitted_token_extent(384)
 
 
 def test_correction_bias_shape_is_refused_by_name() -> None:

@@ -55,7 +55,7 @@ expressing this as one matmul would need a block-diagonal ``[T*S, T*S]`` matrix
 built out of ``T`` different ``4 x 4`` blocks. What the operation actually is, in
 that layout, is ``S * S`` per-token scalar broadcasts along the free axis -- which
 is precisely ``nisa.tensor_scalar`` with an ``[T, 1]`` ``operand0``, the member
-``functional/moe/router.py:1159-1173`` uses and `-028` reuses at
+``functional/moe/router.py:1222-1236`` uses and `-028` reuses at
 ``sinkhorn.py:276-281``. So the kernel is 16 scalar-engine multiplies, 16 adds
 and 4 post terms, all on ``[T, H]`` tiles, and every primitive is attested at a
 landed line.
