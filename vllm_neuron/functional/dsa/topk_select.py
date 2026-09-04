@@ -222,39 +222,55 @@ def _config_builds(n_rows: int, width: int, k: int, nki_dtype) -> bool:
 
 
 @torch._dynamo.assume_constant_result
-def _record_nki_dispatch(kernel, n_rows: int, width: int, k: int) -> None:
+def _record_nki_dispatch(n_rows: int, width: int, k: int) -> None:
     """Record WHICH kernel the seam dispatched, and log it, OFF the compiled graph.
 
-    B58-M1. Two host-side calls belong to the dispatch branch and neither one can be
-    traced: ``logger.info`` emits a log record, and reading a kernel's identity is a
-    ``getattr`` on the ``@nki.jit`` object. The runner compiles the model with
-    ``fullgraph=True`` unless ``VLLM_NEURON_DEBUG_MODE`` is set
-    (``vllm_neuron/vllm/worker/neuron_model_runner.py:1433-1460``), so on the shipped path
-    Dynamo would refuse both. ``vllm_neuron/functional/topk.py:90-101`` folds its own dispatch
-    log exactly this way, for the reason it states at
-    ``vllm_neuron/functional/topk.py:380-384``; this module already folds its config factories
-    at ``_nki_config`` and ``_config_builds`` and states the rule in their docstrings -- so
-    this is that same rule applied to the one branch that had escaped it.
+    B58-M1, SECOND REPAIR. This branch is traced on the shipped path, so a host call Dynamo
+    refuses would break it. The runner compiles the model with ``fullgraph=True``
+    unconditionally (``vllm_neuron/vllm/worker/neuron_model_runner.py:1457-1462``); CPU mode
+    disables only the graph-capture backend
+    (``vllm_neuron/vllm/worker/neuron_model_runner.py:1446-1448``) and only ``enforce_eager``
+    forces eager (``vllm_neuron/vllm/worker/neuron_model_runner.py:1246-1247``).
+    ``vllm_neuron/functional/topk.py:90-101`` folds its own dispatch log this way, for the
+    reason it states at ``vllm_neuron/functional/topk.py:380-384``.
 
-    EVERY LINE REFERENCE ABOVE IS WRITTEN AS ``path:line``, ON PURPOSE. The campaign's
-    citation checker reads that form and only that form, so a reference written as ``L90-101``
-    is invisible to it and rots without anyone being told. These four claims are the whole
-    ground of this fix, so they are written in the form that gets checked at every commit.
+    ARGUMENT DISCIPLINE, WHICH IS THE WHOLE POINT OF THIS SECOND REPAIR: a folded helper takes
+    ints, strings and dtypes ONLY, never an object. Dynamo runs a folded call at trace time and
+    first converts every non-tensor argument into a Python constant. An ``@nki.jit`` kernel is
+    an ``nki.framework.kernel.Kernel``, a FROZEN DATACLASS, and Dynamo refuses to reconstruct
+    one. The first repair passed the kernel object and the trace died on that argument. The
+    fork's own fold obeys the same discipline in its signature:
+    ``vllm_neuron/functional/topk.py:90-92`` declares ``kernel: str``.
 
-    THE IDENTITY IS STILL DERIVED THROUGH THE SEAM (D13.1). The object recorded here is the
-    same object handed to ``wrap_nki`` at the call site, and it is passed in as an argument
-    rather than re-imported here so that sameness stays visible in the source.
+    MEASURED, NOT REASONED. The campaign's captured-graph probe compiled this seam with the
+    vendor capture backend under ``fullgraph=True`` and read both halves:
+      * kernel passed as an argument -- ``NotImplementedError: currently can't reconstruct
+        arbitrary frozen dataclass instances``, raised in the installed
+        ``torch/_dynamo/variables/user_defined.py`` at line 2096 and reached through
+        ``torch/_dynamo/variables/functions.py`` line 1592, ``x.as_python_constant()``;
+      * a bare ``logger.info`` on this branch -- ``Unsupported: logging.Logger method not
+        supported for non-export cases``.
+    The transcript is ``probe-043-capture-host.out``, arms A and C. The repaired reading, this
+    seam capturing a whole graph, is ``probe-043-capture-r2-host.out``, arm A.
 
-    WHAT THIS FIX DOES NOT MEASURE, named rather than implied. No Tier N round can exercise
-    it: the runner skips compilation in CPU mode
-    (``vllm_neuron/vllm/worker/neuron_model_runner.py:1446-1448`` -- ``cpu_mode`` is one of the
-    disjuncts on the ``if``, and the branch sets ``capture_backend_model = None``), which is
-    the mode every Tier N acceptance runs in. The repair rests on the fork's own
-    recorded ground and on matching the precedent's shape. A captured-graph reading
-    (Tier C form C-2 step 1) is what would settle it by measurement, and that instrument
-    belongs to ``-022``/``-052``, not to this repair.
+    THE IDENTITY READ IS TRACEABLE, and saying so withdraws an earlier claim of mine. The same
+    probe traced past the identity read and broke on the line after it, so
+    ``_kernel_identity_of`` was never the problem: only the log was. It is folded here as a
+    choice, to keep host-only work off the graph, not because Dynamo refuses it.
+
+    D13.1 STILL HOLDS. The kernel is read here as the module global ``rotational_topk``, the
+    same object the call site hands to ``wrap_nki`` on the line after this call, and this body
+    runs only when the dispatch branch runs -- so the recorded identity is derived by taking the
+    branch rather than read off an import.
+
+    REFERENCES INSIDE THIS REPOSITORY ARE WRITTEN ``path:line`` ON PURPOSE, because the
+    campaign's citation checker reads that form and only that form; a reference written as
+    ``L90-101`` is invisible to it and rots without anyone being told. References to files
+    OUTSIDE this repository -- installed torch, campaign transcripts -- deliberately omit the
+    colon, because the checker can never resolve them and a permanently unresolvable cite is
+    noise rather than a check.
     """
-    _COUNTERS.last_kernel = _kernel_identity_of(kernel)
+    _COUNTERS.last_kernel = _kernel_identity_of(rotational_topk)
     logger.info(
         "[dsa-topk] kernel=rotational-nki rows=%d width=%d k=%d", n_rows, width, k
     )
@@ -321,13 +337,15 @@ def dsa_topk_select(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
     config = _nki_config(n_rows, width, k, _nki_dtype_of(scores))
 
     _COUNTERS.nki_dispatch += 1
-    # B58-M1. The log and the identity read are FOLDED off the traced graph, the way
-    # ``vllm_neuron/functional/topk.py:90-101`` folds ``_log_topk_choice``. NO bare logging,
-    # identity read or other untraceable host call belongs on this branch: it is the one
-    # branch the runner traces under ``fullgraph=True``. The counter increment stays -- it is a
-    # plain int attribute store, and it is the landed seam pattern (``kda/gate_clamp.py``
+    # B58-M1, second repair. The log and the identity read are FOLDED off the traced graph, the
+    # way ``vllm_neuron/functional/topk.py:90-101`` folds ``_log_topk_choice``. The helper takes
+    # INTS ONLY and reads ``rotational_topk`` itself: passing the kernel object was the first
+    # repair's measured defect, because Dynamo will not reconstruct a frozen dataclass as a fold
+    # argument. NO bare logging or other host call Dynamo refuses belongs on this branch -- it is
+    # the one branch the runner traces under ``fullgraph=True``. The counter increment stays: it
+    # is a plain int attribute store, and it is the landed seam pattern (``kda/gate_clamp.py``
     # increments on its dispatch branch and logs on neither).
-    _record_nki_dispatch(rotational_topk, n_rows, width, k)
+    _record_nki_dispatch(n_rows, width, k)
     values, indices = wrap_nki(rotational_topk)[config.n_prgs](flat, config)
 
     out_shape = (*leading, k)
