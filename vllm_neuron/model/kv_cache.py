@@ -31,3 +31,18 @@ class KVSpec:
     """
 
     layers: list[LayerSpec]
+
+
+def resolve_layer_cache_dtype(
+    layer_dtype: torch.dtype, requested_dtype: torch.dtype
+) -> torch.dtype:
+    """Apply a global KV dtype only to floating-point cache entries.
+
+    Model-declared nonfloating entries carry encoded bytes or bookkeeping
+    values. Reinterpreting those entries as a floating cache dtype changes
+    their storage contract.
+    """
+
+    if not layer_dtype.is_floating_point:
+        return layer_dtype
+    return requested_dtype
