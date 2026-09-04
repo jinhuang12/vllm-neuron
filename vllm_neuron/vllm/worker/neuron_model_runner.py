@@ -453,6 +453,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "max_logprobs", getattr(vllm_config.model_config, "max_logprobs", 0)
         )
         self.neuron_config = NeuronConfig.from_dict(neuron_config_dict)
+        # Model-specific graph construction can use the vLLM-validated limit.
+        # Do not source this value from additional_config.
+        self.neuron_config.max_model_len = self.max_model_len
 
         # Vision neuron config for multimodal models (None for text-only)
         vision_config_dict = vllm_config.additional_config.get("vision_neuron_config")

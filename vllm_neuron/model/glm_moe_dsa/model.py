@@ -36,7 +36,13 @@ from .cache import (
     write_paged_cache_pair,
 )
 from .config import GlmMoeDsaConfig
-from .indexer import GlmMoeDsaIndexer, pack_indexer_keys, unpack_indexer_keys
+from .indexer import (
+    GlmMoeDsaIndexer,
+    causal_position_only_indices,
+    pack_indexer_keys,
+    paged_key_positions,
+    unpack_indexer_keys,
+)
 from .mlp import GlmMoeDsaSwiGLUMLP
 from .moe import GlmMoeDsaMoE
 from .quantization import PINNED_FP8
@@ -78,6 +84,17 @@ def _is_decode_from_metadata(
         return False
     first = next(iter(attn_metadata.values()))
     return int(first["max_query_len"]) <= int(first["decode_token_threshold"])
+
+
+def _short_context_indexer_bypass(config: GlmMoeDsaConfig) -> bool:
+    """Use the exact position-only DSA path for a validated short context."""
+
+    runtime_max_model_len = getattr(config.neuron_config, "max_model_len", None)
+    return (
+        isinstance(runtime_max_model_len, int)
+        and runtime_max_model_len > 0
+        and runtime_max_model_len <= config.index_topk
+    )
 
 
 def _resolve_tp_groups(tp_group: Any, tensor_parallel_size: int) -> tuple[Any, Any]:
@@ -154,6 +171,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             device=device,
         )
         self.self_attn.indexer = None
+        self.short_context_indexer_bypass = _short_context_indexer_bypass(config)
         if layer_idx in MAIN_INDEXER_LAYER_INDICES:
             self.self_attn.indexer = GlmMoeDsaIndexer(
                 hidden_size=config.hidden_size,
@@ -217,7 +235,44 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         else:
             attention_latents = projection.latent_cache
 
-        if indexer is not None:
+        if indexer is not None and self.short_context_indexer_bypass:
+            # Every key is selected when the validated deployment limit fits
+            # in index_topk. The result is the same at each scheduled indexer
+            # layer, so build it once and reuse it through the decoder.
+            key_positions = None
+            if mla_meta is not None:
+                assert attn_metadata is not None
+                indexer_name = (
+                    f"model.layers.{self.layer_idx}.self_attn.indexer.k_cache"
+                )
+                indexer_meta = attn_metadata[indexer_name]
+                block_table = indexer_meta["block_table_tensor"]
+                block_size = int(indexer_meta["block_size"])
+                logical_token_count = block_table.shape[1] * block_size
+                assert logical_token_count <= indexer.topk, (
+                    "short-context indexer bypass requires paged capacity "
+                    f"<= index_topk; got {logical_token_count} > {indexer.topk}"
+                )
+                assert self.indexer_k_cache is not None, (
+                    "short-context indexer bypass requires the allocated "
+                    "indexer cache contract"
+                )
+                if selected_indices is None:
+                    key_positions = paged_key_positions(
+                        block_table,
+                        block_size=block_size,
+                        physical_block_count=self.indexer_k_cache.shape[0],
+                        dtype=positions.dtype,
+                    )
+            if selected_indices is None:
+                if key_positions is None:
+                    key_positions = positions
+                selected_indices = causal_position_only_indices(
+                    positions,
+                    key_positions,
+                    topk=indexer.topk,
+                )
+        elif indexer is not None:
             index_projection = indexer.project(normalized, projection.q_lora, positions)
             if mla_meta is not None:
                 assert attn_metadata is not None

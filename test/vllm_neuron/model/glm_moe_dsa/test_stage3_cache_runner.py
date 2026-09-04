@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import vllm_neuron.model.glm_moe_dsa.cache as cache_module
+import vllm_neuron.model.glm_moe_dsa.model as model_module
 import vllm_neuron.vllm.worker.neuron_model_runner as runner_module
 from vllm_neuron.model.glm_moe_dsa.cache import (
     INDEXER_CACHE_PART_BYTES,
@@ -22,13 +23,21 @@ from vllm_neuron.model.glm_moe_dsa.cache import (
     gather_paged_cache_pair,
     write_paged_cache_pair,
 )
+from vllm_neuron.model.glm_moe_dsa.config import GlmMoeDsaConfig
 from vllm_neuron.model.glm_moe_dsa.indexer import (
     GlmMoeDsaIndexer,
     IndexerProjection,
+    causal_position_only_indices,
+    causal_topk_indices,
     pack_indexer_keys,
+    paged_key_positions,
     unpack_indexer_keys,
 )
-from vllm_neuron.model.glm_moe_dsa.model import GlmMoeDsaDecoderLayer
+from vllm_neuron.model.glm_moe_dsa.model import (
+    GlmMoeDsaDecoderLayer,
+    _short_context_indexer_bypass,
+)
+from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
 
@@ -60,6 +69,7 @@ class _RecordingIndexer(torch.nn.Module):
         )
         self.paged_calls: list[dict[str, object]] = []
         self.nonpaged_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.project_calls = 0
 
     def project(
         self,
@@ -68,6 +78,7 @@ class _RecordingIndexer(torch.nn.Module):
         positions: torch.Tensor,
     ) -> IndexerProjection:
         del hidden_states, q_lora, positions
+        self.project_calls += 1
         return self.projection
 
     def select(
@@ -173,6 +184,7 @@ def _decoder_layer_for_cache_test(
     *,
     physical_block_count: int,
     block_size: int,
+    short_context_indexer_bypass: bool = False,
 ) -> GlmMoeDsaDecoderLayer:
     layer = object.__new__(GlmMoeDsaDecoderLayer)
     torch.nn.Module.__init__(layer)
@@ -181,6 +193,7 @@ def _decoder_layer_for_cache_test(
     layer.is_moe = False
     layer.world_size = 1
     layer.tp_group = None
+    layer.short_context_indexer_bypass = short_context_indexer_bypass
     layer.input_layernorm = torch.nn.Identity()
     layer.post_attention_layernorm = torch.nn.Identity()
     layer.self_attn = _DecoderAttentionStub(indexer, attention_projection)
@@ -202,6 +215,296 @@ def _decoder_layer_for_cache_test(
     )
     layer.indexer_v_cache = torch.zeros_like(layer.indexer_k_cache)
     return layer
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "expected"),
+    ((None, False), (0, False), (2048, True), (2049, False)),
+)
+def test_short_context_bypass_boundary_uses_runtime_model_limit_only(
+    max_model_len: int | None,
+    expected: bool,
+) -> None:
+    neuron_config = NeuronConfig()
+    neuron_config.max_model_len = max_model_len
+    config = GlmMoeDsaConfig(neuron_config=neuron_config)
+    assert _short_context_indexer_bypass(config) is expected
+
+
+def test_user_neuron_config_cannot_spoof_runtime_model_limit() -> None:
+    config = NeuronConfig.from_dict({"max_model_len": 1})
+    assert config.max_model_len is None
+    runner_source = inspect.getsource(NeuronModelRunner.__init__)
+    assert "self.neuron_config.max_model_len = self.max_model_len" in runner_source
+
+
+def test_position_only_selection_is_exact_for_short_context() -> None:
+    torch.manual_seed(2055)
+    queries = torch.randn(2, 3, 2, 8)
+    keys = torch.randn(2, 5, 8)
+    head_weights = torch.randn(2, 3, 2)
+    query_positions = torch.tensor([[5, 7, 9], [101, 102, 104]])
+    key_positions = torch.tensor([[3, 5, 7, 9, 11], [99, 101, 103, 105, 107]])
+
+    position_only = causal_position_only_indices(
+        query_positions,
+        key_positions,
+        topk=8,
+    )
+    legacy_short_path = causal_topk_indices(
+        queries,
+        keys,
+        head_weights,
+        query_positions,
+        key_positions,
+        topk=8,
+    )
+    key_indices = torch.arange(5).view(1, 1, 5)
+    expected = torch.where(
+        key_positions.unsqueeze(1) <= query_positions.unsqueeze(-1),
+        key_indices,
+        -torch.ones_like(key_indices),
+    )
+    expected = torch.nn.functional.pad(expected, (0, 3), value=-1)
+
+    assert torch.equal(position_only, expected)
+    assert torch.equal(position_only, legacy_short_path)
+
+
+def _short_context_attention_projection(
+    batch: int,
+    query_count: int,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        q_lora=torch.zeros(batch, query_count, 4),
+        queries=torch.zeros(batch, query_count, 1, 4),
+        latent_cache=torch.zeros(batch, query_count, MLA_CACHE_PART_SIZE * 2),
+    )
+
+
+def _short_context_metadata(
+    positions: torch.Tensor,
+    *,
+    block_table: torch.Tensor,
+    block_size: int,
+) -> dict[str, dict[str, torch.Tensor | int]]:
+    cache_metadata: dict[str, torch.Tensor | int] = {
+        "slot_mapping": positions.reshape(-1).to(torch.int32),
+        "block_size": block_size,
+        "block_table_tensor": block_table,
+    }
+    return {
+        "model.layers.0.self_attn.mla_cache": dict(cache_metadata),
+        "model.layers.0.self_attn.indexer.k_cache": dict(cache_metadata),
+    }
+
+
+def test_short_context_bypass_does_no_indexer_projection_or_cache_work(
+    monkeypatch,
+) -> None:
+    block_size = 32
+    physical_block_count = 64
+    positions = torch.tensor([[511]], dtype=torch.int64)
+    block_table = torch.arange(physical_block_count, dtype=torch.int32).unsqueeze(0)
+    index_projection = IndexerProjection(
+        queries=torch.randn(1, 1, 1, 128),
+        keys=torch.randn(1, 1, 128),
+        head_weights=torch.randn(1, 1, 1),
+    )
+    indexer = _RecordingIndexer(index_projection)
+    layer = _decoder_layer_for_cache_test(
+        indexer,
+        _short_context_attention_projection(1, 1),
+        physical_block_count=physical_block_count,
+        block_size=block_size,
+        short_context_indexer_bypass=True,
+    )
+    layer.indexer_k_cache.fill_(17)
+    layer.indexer_v_cache.fill_(29)
+    before_k = layer.indexer_k_cache.clone()
+    before_v = layer.indexer_v_cache.clone()
+
+    def fail_indexer_transform(*args, **kwargs):
+        raise AssertionError("short-context bypass touched indexer cache data")
+
+    monkeypatch.setattr(model_module, "pack_indexer_keys", fail_indexer_transform)
+    monkeypatch.setattr(model_module, "unpack_indexer_keys", fail_indexer_transform)
+    monkeypatch.setattr(model_module, "gather_paged_cache_pair", fail_indexer_transform)
+
+    _, selected = layer(
+        torch.zeros(1, 1, 4),
+        positions,
+        is_decode=True,
+        attn_metadata=_short_context_metadata(
+            positions,
+            block_table=block_table,
+            block_size=block_size,
+        ),
+    )
+
+    assert indexer.project_calls == 0
+    assert not indexer.paged_calls
+    assert not indexer.nonpaged_calls
+    assert torch.equal(layer.indexer_k_cache, before_k)
+    assert torch.equal(layer.indexer_v_cache, before_v)
+    assert torch.equal(selected[0, 0, :512], torch.arange(512))
+    assert torch.all(selected[0, 0, 512:] == -1)
+
+
+def test_short_context_bypass_reuses_prior_layer_selection() -> None:
+    block_size = 32
+    physical_block_count = 64
+    positions = torch.tensor([[1024]], dtype=torch.int64)
+    block_table = torch.arange(physical_block_count, dtype=torch.int32).unsqueeze(0)
+    indexer = _RecordingIndexer(
+        IndexerProjection(
+            queries=torch.zeros(1, 1, 1, 128),
+            keys=torch.zeros(1, 1, 128),
+            head_weights=torch.ones(1, 1, 1),
+        )
+    )
+    layer = _decoder_layer_for_cache_test(
+        indexer,
+        _short_context_attention_projection(1, 1),
+        physical_block_count=physical_block_count,
+        block_size=block_size,
+        short_context_indexer_bypass=True,
+    )
+    prior_selection = torch.arange(2048).view(1, 1, 2048)
+
+    _, selected = layer(
+        torch.zeros(1, 1, 4),
+        positions,
+        selected_indices=prior_selection,
+        is_decode=True,
+        attn_metadata=_short_context_metadata(
+            positions,
+            block_table=block_table,
+            block_size=block_size,
+        ),
+    )
+
+    assert selected is prior_selection
+    assert indexer.project_calls == 0
+    assert not indexer.paged_calls
+
+
+@pytest.mark.parametrize(
+    ("start", "query_count"),
+    ((0, 512), (512, 512), (1024, 512), (1536, 512), (2047, 1)),
+    ids=("prefill-0", "prefill-1", "prefill-2", "prefill-3", "decode"),
+)
+def test_short_context_bypass_preserves_segmented_prefill_and_decode(
+    start: int,
+    query_count: int,
+) -> None:
+    block_size = 32
+    physical_block_count = 64
+    positions = torch.arange(start, start + query_count).unsqueeze(0)
+    allocated_blocks = (start + query_count + block_size - 1) // block_size
+    block_table = torch.full((1, physical_block_count), -1, dtype=torch.int32)
+    block_table[0, :allocated_blocks] = torch.arange(
+        allocated_blocks, dtype=torch.int32
+    )
+    indexer = _RecordingIndexer(
+        IndexerProjection(
+            queries=torch.zeros(1, query_count, 1, 128),
+            keys=torch.zeros(1, query_count, 128),
+            head_weights=torch.ones(1, query_count, 1),
+        )
+    )
+    layer = _decoder_layer_for_cache_test(
+        indexer,
+        _short_context_attention_projection(1, query_count),
+        physical_block_count=physical_block_count,
+        block_size=block_size,
+        short_context_indexer_bypass=True,
+    )
+
+    _, selected = layer(
+        torch.zeros(1, query_count, 4),
+        positions,
+        is_decode=query_count == 1,
+        attn_metadata=_short_context_metadata(
+            positions,
+            block_table=block_table,
+            block_size=block_size,
+        ),
+    )
+    key_positions = paged_key_positions(
+        block_table,
+        block_size=block_size,
+        physical_block_count=physical_block_count,
+    )
+    expected = causal_position_only_indices(
+        positions,
+        key_positions,
+        topk=2048,
+    )
+    assert torch.equal(selected, expected)
+    assert indexer.project_calls == 0
+    assert torch.count_nonzero(layer.indexer_k_cache) == 0
+    assert torch.count_nonzero(layer.indexer_v_cache) == 0
+
+
+def test_short_context_bypass_fails_closed_when_paged_capacity_exceeds_topk() -> None:
+    block_size = 32
+    physical_block_count = 65
+    positions = torch.tensor([[0]], dtype=torch.int64)
+    block_table = torch.arange(physical_block_count, dtype=torch.int32).unsqueeze(0)
+    indexer = _RecordingIndexer(
+        IndexerProjection(
+            queries=torch.zeros(1, 1, 1, 128),
+            keys=torch.zeros(1, 1, 128),
+            head_weights=torch.ones(1, 1, 1),
+        )
+    )
+    layer = _decoder_layer_for_cache_test(
+        indexer,
+        _short_context_attention_projection(1, 1),
+        physical_block_count=physical_block_count,
+        block_size=block_size,
+        short_context_indexer_bypass=True,
+    )
+
+    with pytest.raises(AssertionError, match="paged capacity"):
+        layer(
+            torch.zeros(1, 1, 4),
+            positions,
+            attn_metadata=_short_context_metadata(
+                positions,
+                block_table=block_table,
+                block_size=block_size,
+            ),
+        )
+
+
+def test_over_2048_context_keeps_scored_indexer_path(monkeypatch) -> None:
+    torch.manual_seed(2056)
+    queries = torch.randn(1, 1, 1, 4)
+    keys = torch.randn(1, 2049, 4)
+    head_weights = torch.ones(1, 1, 1)
+    query_positions = torch.tensor([[2048]])
+    key_positions = torch.arange(2049).unsqueeze(0)
+    direct_matmul = torch.matmul
+    matmul_calls = 0
+
+    def recording_matmul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        nonlocal matmul_calls
+        matmul_calls += 1
+        return direct_matmul(lhs, rhs)
+
+    monkeypatch.setattr(torch, "matmul", recording_matmul)
+    selected = causal_topk_indices(
+        queries,
+        keys,
+        head_weights,
+        query_positions,
+        key_positions,
+        topk=2,
+    )
+    assert selected.shape == (1, 1, 2)
+    assert matmul_calls > 0
 
 
 def test_decoder_routes_b2_paged_cache_metadata_to_streaming_dsa() -> None:

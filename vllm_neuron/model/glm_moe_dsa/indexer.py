@@ -646,14 +646,11 @@ def causal_topk_indices(
     # also handles segmented prefill, whose query positions do not restart at
     # zero for each segment, without materializing the DSA score graph.
     if keys.shape[1] <= topk:
-        key_indices = torch.arange(
-            keys.shape[1], dtype=torch.int64, device=keys.device
-        ).view(1, 1, -1)
-        causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(-1)
-        selected = torch.where(causal, key_indices, -torch.ones_like(key_indices))
-        if keys.shape[1] < topk:
-            selected = F.pad(selected, (0, topk - keys.shape[1]), value=-1)
-        return selected
+        return causal_position_only_indices(
+            query_positions,
+            key_positions,
+            topk=topk,
+        )
 
     if can_run_kernel(queries):
         q_quant = wrap_nki(_unpack_ue8m0_nki)[1](
@@ -741,6 +738,56 @@ def causal_topk_indices(
     available = min(topk, keys.shape[1])
     if available < topk:
         selected = F.pad(selected, (0, topk - available), value=-1)
+    return selected
+
+
+def causal_position_only_indices(
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    *,
+    topk: int,
+) -> torch.Tensor:
+    """Select every causal key when the logical key span fits in ``topk``.
+
+    This is the exact score-independent branch of :func:`causal_topk_indices`.
+    It is separate so a short-context model can omit all DSA projection and
+    indexer-cache work from its compiled graph.
+    """
+
+    if topk <= 0:
+        raise ValueError("topk must be positive")
+    if query_positions.ndim == 1:
+        query_positions = query_positions.unsqueeze(0)
+    if key_positions.ndim == 1:
+        key_positions = key_positions.unsqueeze(0)
+    if query_positions.ndim != 2 or key_positions.ndim != 2:
+        raise ValueError("query_positions and key_positions must be rank one or two")
+
+    query_batch = query_positions.shape[0]
+    key_batch = key_positions.shape[0]
+    batch = max(query_batch, key_batch)
+    if query_batch not in (1, batch) or key_batch not in (1, batch):
+        raise ValueError("query and key position batches must match or broadcast")
+    if query_batch == 1 and batch > 1:
+        query_positions = query_positions.expand(batch, -1)
+    if key_batch == 1 and batch > 1:
+        key_positions = key_positions.expand(batch, -1)
+
+    key_count = key_positions.shape[1]
+    if key_count > topk:
+        raise ValueError(
+            f"position-only selection requires key_count <= topk; got "
+            f"{key_count} > {topk}"
+        )
+    key_indices = torch.arange(
+        key_count,
+        dtype=torch.int64,
+        device=key_positions.device,
+    ).view(1, 1, -1)
+    causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(-1)
+    selected = torch.where(causal, key_indices, -torch.ones_like(key_indices))
+    if key_count < topk:
+        selected = F.pad(selected, (0, topk - key_count), value=-1)
     return selected
 
 
