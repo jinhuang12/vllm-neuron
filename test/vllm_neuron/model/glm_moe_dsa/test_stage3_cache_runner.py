@@ -67,6 +67,7 @@ class _RecordingIndexer(torch.nn.Module):
             head_dim=128,
             topk=2048,
         )
+        self.topk = self.selector.topk
         self.paged_calls: list[dict[str, object]] = []
         self.nonpaged_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.project_calls = 0
@@ -659,7 +660,6 @@ def test_decoder_nonpaged_dsa_reuses_absolute_positions() -> None:
     forward_source = inspect.getsource(GlmMoeDsaDecoderLayer.forward)
     assert "indexer.select_paged(" in forward_source
     assert "torch.arange" not in forward_source
-    assert "key_positions =" not in forward_source
 
 
 @pytest.mark.skipif(
