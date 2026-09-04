@@ -658,10 +658,38 @@ class GlmMoeDsaForCausalLM(nn.Module):
                 keys.extend((weight_key, weight_key + "_scale_inv"))
         return keys
 
+    @staticmethod
+    def _shared_gate_up_checkpoint_keys(layer_idx: int) -> list[str]:
+        """Return gate and up checkpoint pairs in packed projection order."""
+
+        prefix = f"model.layers.{layer_idx}.mlp.shared_experts"
+        keys = []
+        for projection in ("gate_proj", "up_proj"):
+            weight_key = f"{prefix}.{projection}.weight"
+            keys.extend((weight_key, weight_key + "_scale_inv"))
+        return keys
+
     def checkpoint_mappings(self, manifest) -> dict[str, str | list[str]]:
         by_key = manifest.by_key
         mappings: dict[str, str | list[str]] = {}
         for name, _ in self.named_parameters():
+            shared_gate_up_match = re.match(
+                r"^model\.layers\.(\d+)\.mlp\.shared_experts\."
+                r"gate_up_(?:weights|scales)$",
+                name,
+            )
+            if shared_gate_up_match is not None:
+                checkpoint_keys = self._shared_gate_up_checkpoint_keys(
+                    int(shared_gate_up_match.group(1))
+                )
+                missing = [key for key in checkpoint_keys if key not in by_key]
+                if missing:
+                    raise ValueError(
+                        f"Packed shared gate/up parameter {name!r} has missing "
+                        f"sources: {missing}"
+                    )
+                mappings[name] = checkpoint_keys
+                continue
             packed_match = re.match(
                 r"^model\.layers\.(\d+)\.mlp\.experts\.packed_row_fp8\."
                 r"(gate_up_weights|down_weights|gate_up_scales|down_scales)$",
@@ -828,11 +856,70 @@ class GlmMoeDsaForCausalLM(nn.Module):
 
         return SafetensorsWeightLoader(transform=transform)
 
+    def _shared_gate_up_block_fp8_loader(
+        self,
+        checkpoint_keys: list[str],
+        by_key,
+        *,
+        return_scale: bool,
+    ) -> SafetensorsWeightLoader:
+        """Shard then pack shared gate/up weights or independent scale grids."""
+
+        def transform(sources, rank: int) -> torch.Tensor:
+            if len(checkpoint_keys) != 4 or len(sources) != 4:
+                raise ValueError(
+                    "Packed shared gate/up requires gate and up weight/scale pairs"
+                )
+            packed = []
+            for offset in (0, 2):
+                weight_key = checkpoint_keys[offset]
+                scale_key = checkpoint_keys[offset + 1]
+                shape = by_key[weight_key].header.shape
+                if return_scale:
+                    tensor = self._fp8_scale_loader(scale_key, shape, 0).load(
+                        [sources[offset + 1]], rank
+                    )
+                else:
+                    tensor = self._fp8_weight_loader(weight_key, shape, 0).load(
+                        [sources[offset]], rank
+                    )
+                packed.append(tensor)
+            return torch.stack(packed)
+
+        return SafetensorsWeightLoader(transform=transform)
+
     def _install_weight_loaders(self, manifest, mappings) -> None:
         by_key = manifest.by_key
         for name, parameter in self.named_parameters():
             checkpoint_key = mappings[name]
             if isinstance(checkpoint_key, list):
+                shared_gate_up_match = re.match(
+                    r"^model\.layers\.\d+\.mlp\.shared_experts\."
+                    r"gate_up_(weights|scales)$",
+                    name,
+                )
+                if shared_gate_up_match is not None:
+                    for weight_key in checkpoint_key[::2]:
+                        entry = by_key[weight_key]
+                        if entry.header.dtype != "F8_E4M3":
+                            raise ValueError(
+                                f"Shared FP8 weight {weight_key!r} has dtype "
+                                f"{entry.header.dtype}"
+                            )
+                        if self._shard_dim(weight_key, entry.header.shape) != 0:
+                            raise ValueError(
+                                f"Shared gate/up weight {weight_key!r} is not "
+                                "column-sharded"
+                            )
+                    set_weight_loader(
+                        parameter,
+                        self._shared_gate_up_block_fp8_loader(
+                            checkpoint_key,
+                            by_key,
+                            return_scale=shared_gate_up_match.group(1) == "scales",
+                        ),
+                    )
+                    continue
                 packed_match = re.match(
                     r"^model\.layers\.\d+\.mlp\.experts\.packed_row_fp8\."
                     r"(gate_up_weights|down_weights|gate_up_scales|down_scales)$",

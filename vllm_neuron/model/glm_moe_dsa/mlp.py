@@ -3,11 +3,18 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .block_fp8 import BLOCK_COLS, BLOCK_ROWS, BlockFP8Linear
+from .block_fp8 import (
+    BLOCK_COLS,
+    BLOCK_ROWS,
+    BlockFP8Linear,
+    shared_gate_up_block_fp8_linear,
+)
 from .config import GlmMoeDsaConfig
 
 
@@ -26,6 +33,7 @@ class GlmMoeDsaSwiGLUMLP(nn.Module):
         tensor_parallel_size: int = 1,
         tensor_parallel_rank: int = 0,
         fp8_weights: bool = False,
+        fuse_shared_gate_up: bool = False,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str | None = None,
     ) -> None:
@@ -45,19 +53,45 @@ class GlmMoeDsaSwiGLUMLP(nn.Module):
         self.tensor_parallel_rank = tensor_parallel_rank
         self.local_intermediate_size = intermediate_size // tensor_parallel_size
         shard_start = tensor_parallel_rank * self.local_intermediate_size
+        self.fuse_shared_gate_up = fuse_shared_gate_up
+        if fuse_shared_gate_up and not fp8_weights:
+            raise ValueError("shared gate/up fusion requires block-FP8 weights")
         if fp8_weights:
-            self.gate_proj = BlockFP8Linear(
-                hidden_size,
-                self.local_intermediate_size,
-                row_offset=shard_start % BLOCK_ROWS,
-                device=device,
-            )
-            self.up_proj = BlockFP8Linear(
-                hidden_size,
-                self.local_intermediate_size,
-                row_offset=shard_start % BLOCK_ROWS,
-                device=device,
-            )
+            if fuse_shared_gate_up:
+                if (hidden_size, self.local_intermediate_size) != (6144, 32):
+                    raise ValueError(
+                        "shared gate/up fusion requires GLM-5.2 TP64 geometry "
+                        "H=6144, I_local=32"
+                    )
+                self.gate_up_weights = nn.Parameter(
+                    torch.empty(
+                        (2, self.local_intermediate_size, hidden_size),
+                        dtype=torch.float8_e4m3fn,
+                        device=device,
+                    ),
+                    requires_grad=False,
+                )
+                self.gate_up_scales = nn.Parameter(
+                    torch.empty(
+                        (2, 1, (hidden_size + BLOCK_COLS - 1) // BLOCK_COLS),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    requires_grad=False,
+                )
+            else:
+                self.gate_proj = BlockFP8Linear(
+                    hidden_size,
+                    self.local_intermediate_size,
+                    row_offset=shard_start % BLOCK_ROWS,
+                    device=device,
+                )
+                self.up_proj = BlockFP8Linear(
+                    hidden_size,
+                    self.local_intermediate_size,
+                    row_offset=shard_start % BLOCK_ROWS,
+                    device=device,
+                )
             self.down_proj = BlockFP8Linear(
                 self.local_intermediate_size,
                 hidden_size,
@@ -88,7 +122,15 @@ class GlmMoeDsaSwiGLUMLP(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gated = F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        if self.fuse_shared_gate_up:
+            gate_up = shared_gate_up_block_fp8_linear(
+                hidden_states,
+                self.gate_up_weights,
+                self.gate_up_scales,
+            )
+            gated = F.silu(gate_up[0]) * gate_up[1]
+        else:
+            gated = F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
         return self.down_proj(gated)
 
     @classmethod
@@ -125,6 +167,10 @@ class GlmMoeDsaSwiGLUMLP(nn.Module):
             tensor_parallel_size=tensor_parallel_size,
             tensor_parallel_rank=tensor_parallel_rank,
             fp8_weights=bool(config.quantization_config),
+            fuse_shared_gate_up=(
+                bool(config.quantization_config)
+                and os.environ.get("GLM_ENABLE_SHARED_GATE_UP_FUSION") == "1"
+            ),
             dtype=config.torch_dtype,
             device=device,
         )

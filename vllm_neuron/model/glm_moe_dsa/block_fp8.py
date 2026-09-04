@@ -215,6 +215,169 @@ def _block_fp8_linear_nki(
 _wrapped_block_fp8_linear = wrap_nki(_block_fp8_linear_nki)
 
 
+@nki.jit
+def _shared_gate_up_block_fp8_linear_nki(
+    hidden,
+    weight,
+    weight_scale_inv,
+):
+    """Compute the shared gate and up projections in one LNC2 launch."""
+
+    _kernel_assert(len(hidden.shape) == 2, "hidden must be rank 2")
+    _kernel_assert(len(weight.shape) == 3, "packed weight must be rank 3")
+    _kernel_assert(len(weight_scale_inv.shape) == 3, "packed scale must be rank 3")
+    _kernel_assert(weight.shape[0] == 2, "packed weight must contain gate and up")
+    _kernel_assert(
+        weight_scale_inv.shape[0] == 2,
+        "packed scale must contain gate and up",
+    )
+    _kernel_assert(nl.num_programs(axes=0) == 2, "shared gate/up requires LNC2")
+
+    token_count = hidden.shape[0]
+    output_width = weight.shape[1]
+    contraction_width = weight.shape[2]
+    contraction_blocks = (contraction_width + BLOCK_COLS - 1) // BLOCK_COLS
+    _kernel_assert(hidden.shape[1] == contraction_width, "linear K mismatch")
+    _kernel_assert(output_width == 32, "local shared width must be 32")
+    _kernel_assert(contraction_width == 6144, "shared hidden width must be 6144")
+    _kernel_assert(
+        weight_scale_inv.shape == (2, 1, contraction_blocks),
+        "packed scale grid mismatch",
+    )
+
+    # LNC2 ownership is projection ownership. Program 0 computes gate. Program
+    # 1 computes up. Both read the same hidden tile, but each reads only its own
+    # weight and scale grids.
+    projection_id = nl.program_id(axis=0)
+    output = nl.ndarray(
+        (2, token_count, output_width),
+        dtype=hidden.dtype,
+        buffer=nl.shared_hbm,
+    )
+
+    for token_block in nl.affine_range((token_count + BLOCK_ROWS - 1) // BLOCK_ROWS):
+        token_start = token_block * BLOCK_ROWS
+        token_size = min(BLOCK_ROWS, token_count - token_start)
+        accumulated = nl.ndarray(
+            (token_size, output_width), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.memset(dst=accumulated, value=0.0)
+
+        for contraction_block in nl.affine_range(contraction_blocks):
+            contraction_start = contraction_block * BLOCK_COLS
+            contraction_size = min(BLOCK_COLS, contraction_width - contraction_start)
+            hidden_transposed = nl.ndarray(
+                (contraction_size, token_size),
+                dtype=hidden.dtype,
+                buffer=nl.sbuf,
+            )
+            nisa.dma_transpose(
+                dst=hidden_transposed,
+                src=hidden[
+                    token_start : token_start + token_size,
+                    contraction_start : contraction_start + contraction_size,
+                ],
+                axes=(1, 0),
+            )
+            weight_tile = nl.ndarray(
+                (output_width, contraction_size),
+                dtype=weight.dtype,
+                buffer=nl.sbuf,
+            )
+            nisa.dma_copy(
+                dst=weight_tile,
+                src=weight[
+                    projection_id,
+                    :,
+                    contraction_start : contraction_start + contraction_size,
+                ],
+            )
+            weight_bf16 = nl.ndarray(
+                (output_width, contraction_size),
+                dtype=nl.bfloat16,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_copy(dst=weight_bf16, src=weight_tile)
+            weight_transpose_psum = nl.ndarray(
+                (contraction_size, output_width),
+                dtype=nl.bfloat16,
+                buffer=nl.psum,
+            )
+            nisa.nc_transpose(dst=weight_transpose_psum, data=weight_bf16)
+            weight_transposed = nl.ndarray(
+                (contraction_size, output_width),
+                dtype=weight.dtype,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_copy(dst=weight_transposed, src=weight_transpose_psum)
+            partial_psum = nl.ndarray(
+                (token_size, output_width),
+                dtype=nl.float32,
+                buffer=nl.psum,
+            )
+            nisa.nc_matmul(
+                dst=partial_psum,
+                stationary=hidden_transposed,
+                moving=weight_transposed,
+                accumulate=False,
+            )
+            partial = nl.ndarray(
+                (token_size, output_width),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_copy(dst=partial, src=partial_psum)
+            scale = nl.ndarray((token_size, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=scale,
+                src=TensorView(
+                    weight_scale_inv[
+                        projection_id,
+                        :,
+                        contraction_block : contraction_block + 1,
+                    ]
+                )
+                .broadcast(dim=0, size=token_size)
+                .get_view(),
+            )
+            scaled = nl.ndarray(
+                (token_size, output_width),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_scalar(
+                dst=scaled,
+                data=partial,
+                op0=nl.multiply,
+                operand0=scale,
+            )
+            nisa.tensor_tensor(
+                dst=accumulated,
+                data1=accumulated,
+                data2=scaled,
+                op=nl.add,
+            )
+
+        result = nl.ndarray(
+            (token_size, output_width), dtype=hidden.dtype, buffer=nl.sbuf
+        )
+        nisa.tensor_copy(dst=result, src=accumulated)
+        nisa.dma_copy(
+            dst=output[
+                projection_id,
+                token_start : token_start + token_size,
+                :,
+            ],
+            src=result,
+        )
+    return output
+
+
+_wrapped_shared_gate_up_block_fp8_linear = wrap_nki(
+    _shared_gate_up_block_fp8_linear_nki
+)
+
+
 def scale_shape_for_local_weight(
     weight_shape: tuple[int, int], row_offset: int, col_offset: int
 ) -> tuple[int, int]:
@@ -321,6 +484,57 @@ def block_fp8_linear(
             ).to(hidden_2d.dtype),
         )
     return output.reshape(*original_shape, weight.shape[0])
+
+
+def shared_gate_up_block_fp8_linear(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+) -> torch.Tensor:
+    """Execute packed shared gate/up projections with independent scales."""
+
+    if weight.ndim != 3 or weight.shape[0] != 2:
+        raise ValueError("packed shared gate/up weight must have shape [2, I, H]")
+    if weight_scale_inv.ndim != 3 or weight_scale_inv.shape[0] != 2:
+        raise ValueError("packed shared gate/up scale must have shape [2, 1, H/128]")
+    if hidden.shape[-1] != weight.shape[2]:
+        raise ValueError("shared gate/up hidden and weight dimensions do not match")
+    if tuple(weight.shape[1:]) != (32, 6144):
+        raise ValueError(
+            "packed shared gate/up supports only the GLM-5.2 TP64 shape "
+            "[2, 32, 6144]"
+        )
+    expected_scale_shape = (
+        2,
+        1,
+        math.ceil(weight.shape[2] / BLOCK_COLS),
+    )
+    if tuple(weight_scale_inv.shape) != expected_scale_shape:
+        raise ValueError(
+            f"packed shared gate/up scale shape {tuple(weight_scale_inv.shape)} "
+            f"does not match expected {expected_scale_shape}"
+        )
+    original_shape = hidden.shape[:-1]
+    hidden_2d = hidden.reshape(-1, hidden.shape[-1]).contiguous()
+    if can_run_kernel(hidden_2d):
+        output = _wrapped_shared_gate_up_block_fp8_linear[2](
+            hidden_2d,
+            weight,
+            weight_scale_inv,
+        )
+    else:
+        output = torch.stack(
+            tuple(
+                F.linear(
+                    hidden_2d,
+                    dequantize_block_fp8(weight[index], weight_scale_inv[index]).to(
+                        hidden_2d.dtype
+                    ),
+                )
+                for index in range(2)
+            )
+        )
+    return output.reshape(2, *original_shape, weight.shape[1])
 
 
 class _BlockFP8Mixin:
