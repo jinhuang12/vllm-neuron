@@ -606,3 +606,384 @@ def test_inter_chunk_state_responds_to_the_w_and_u_it_is_handed():
         f"INTER|conjunct3|declared_non_matches={non_matches}/{expected}", flush=True
     )
     assert non_matches == expected
+
+
+# =========================================================================== #
+# Acceptance for `inc-glm53f-089` -- the geometry production actually resolves.
+#
+# **Four items under the ``-k production_geometry`` selection, one per declared
+# conjunct, and still no ``parametrize`` decorator in this file** (D1.2). Each
+# item names the component whose behaviour it certifies (D1.4).
+#
+# WHY THIS SECTION EXISTS. `-035a` measures at head width 64 over chunk sizes
+# ``{32, 64, 128}``. The landed KDA layer enters this seam at ``kdim = vdim =
+# 128`` and resolves chunk width **8**, so the one geometry production actually
+# runs was measured by nothing. This section adds that reading and CHANGES NO
+# SOURCE FILE, which is the whole finding: the kernel already admits both
+# production values, so nothing was broken -- only unmeasured.
+#
+# THIS IS THE THIRD SECTION IN THIS FILE, AND THE SELECTION INVARIANT NOW HAS
+# THREE PARTS RATHER THAN TWO. `-035b`'s banner above states the invariant for
+# the two sections that existed when it was written -- "every name below
+# contains ``inter``" -- and a third section appended after it makes that
+# sentence read wider than it was scoped. Its LOAD-BEARING claim is untouched
+# and is restated here for all three: no name in this section contains the
+# substring ``intra`` or the substring ``inter``, so ``-k intra`` still collects
+# exactly `-035a`'s four items, ``-k inter`` still collects exactly `-035b`'s
+# three, and ``-k production_geometry`` collects exactly the four below. That is
+# checked by the acceptance harness, which reads all three counts, rather than
+# by this comment. `-035b`'s landed text is left alone deliberately: the
+# disjointness it protects still holds, and rewriting another block's comment is
+# a wider surface than adding a scoping paragraph to this one.
+#
+# Run on the same Tier N harness with the selection changed::
+#
+#     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
+#     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+#     python -m pytest test/vllm_neuron/functional/kda/test_chunked_recurrence.py \
+#         -k production_geometry -v -s --timeout 60 -p no:cacheprovider
+#
+# What each item is for, in one line each:
+#
+# 1. the three production values are READ from the fork and match the declared
+#    128 / 128 / 8, so nothing below runs at an assumed geometry;
+# 2. the kernel's numbers at that geometry match the chunk-local torch reference
+#    at the frozen comparator, with the route reading taken around the call;
+# 3. the gate bound is MEASURED against the declared limit, and the derivation
+#    that picks 8 is shown to be tight rather than restated;
+# 4. the doubling-stage count at chunk 8 is 3 -- a count no graded run has read.
+#
+# NO COMPARATOR, TOLERANCE OR THRESHOLD IS INTRODUCED HERE (P9). Conjunct 2 uses
+# ``RTOL`` / ``ATOL`` above, which are `-035a`'s own landed pair; conjuncts 1, 3
+# and 4 are exact readings with no tolerance at all.
+# =========================================================================== #
+
+#: The production geometry, as the plan block declares it. These are the values
+#: the READ must produce, not the values the tests run at -- what they run at is
+#: whatever the fork says, and a disagreement fails loudly rather than being
+#: absorbed. A disagreeing reading is ``evidence_contradicts_design`` and goes to
+#: the lead; it is never a silent re-declaration here.
+DECLARED_PRODUCTION_KDIM = 128
+DECLARED_PRODUCTION_VDIM = 128
+DECLARED_PRODUCTION_CHUNK = 8
+
+#: The checkpoint's gate lower bound, and the limit the two chunked seams apply.
+#: Declared here so the derivation below is checked against both ends.
+DECLARED_GATE_LOWER_BOUND = -5.0
+
+#: ``ceil(log2 8)``. The graded runs read 5, 6 and 7 for chunk 32, 64 and 128, so
+#: 3 is a stage count no recorded run in this campaign has exercised.
+DECLARED_DOUBLING_STAGES_AT_PRODUCTION_CHUNK = 3
+
+_PRODUCTION_CACHE: dict[str, object] = {}
+
+
+def _production_fixture_path():
+    """The in-repo config fixture, as a SECOND root beside the config module.
+
+    Read as well as ``config.py`` because the plan block cites ``config.py`` for
+    ``head_dim`` while its conjunct-1 prose says "the in-repo config fixture" --
+    two different files. Reading both costs nothing and turns that ambiguity into
+    a measurement.
+
+    A FUNCTION RATHER THAN A MODULE CONSTANT, and the reason is load-bearing: this
+    module imports no ``pathlib`` and adding one to its header would shift every
+    line below it, drifting the citations two other files pin into this one. A
+    function-local import keeps the header byte-identical.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[4]
+    return (
+        root / "test" / "vllm_neuron" / "model" / "glm5_next"
+        / "fixtures" / "config.json"
+    )
+
+
+def _production_geometry() -> dict:
+    """The production geometry, read from the fork rather than assumed.
+
+    Builds the real ``Glm5NextKDAAttention`` and asks it, because the chunk width
+    is a LAYER decision (``_resolve_chunk_size``) and re-deriving it here would
+    measure this file's arithmetic instead of the layer's. Nothing else in this
+    repository constructs that layer, so this is the first place it is built.
+
+    The imports are function-local on purpose. This module is imported whenever
+    ``-k intra`` or ``-k inter`` runs, and those two selections must not acquire
+    a vLLM dependency they never had -- ``model_fp8.py`` itself holds no vLLM
+    import at module level for the same reason.
+
+    ``world_size=1`` because none of the three values read here shards: the layer
+    binds ``head_size = head_dim``, and the chunk derivation reads only
+    ``gate_lower_bound``.
+    """
+    if "geometry" not in _PRODUCTION_CACHE:
+        import json
+
+        from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+        from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextKDAAttention
+
+        text_config = Glm5NextTextConfig()
+        module_root = text_config.linear_attn_config
+        fixture_path = _production_fixture_path()
+        fixture_root = json.loads(fixture_path.read_text())
+        fixture_root = fixture_root["text_config"]["linear_attn_config"]
+        layer = Glm5NextKDAAttention(text_config, world_size=1)
+        _PRODUCTION_CACHE["geometry"] = {
+            "kdim": int(layer.head_dim),
+            "vdim": int(layer.head_size),
+            "chunk": int(layer._resolve_chunk_size(None)),
+            "gate_lower_bound": float(layer.gate_lower_bound),
+            "cache_chunk_size": layer.cache_chunk_size,
+            "module_head_dim": int(module_root["head_dim"]),
+            "module_gate_lower_bound": float(module_root["gate_lower_bound"]),
+            "fixture_head_dim": int(fixture_root["head_dim"]),
+            "fixture_gate_lower_bound": float(fixture_root["gate_lower_bound"]),
+        }
+    return _PRODUCTION_CACHE["geometry"]
+
+
+def _production_inputs(seed: int = 20260904):
+    """Deterministic inputs at the geometry the fork reports, not at a literal.
+
+    Same construction as :func:`_inputs` above -- the same distributions, the same
+    ``GATE_SCALE`` -- with the widths and the chunk taken from the READ geometry,
+    so this arm cannot drift away from the geometry conjunct 1 certifies.
+    """
+    geo = _production_geometry()
+    chunk, kdim, vdim = geo["chunk"], geo["kdim"], geo["vdim"]
+    gen = torch.Generator().manual_seed(seed + chunk)
+    shape_k = (N_CHUNKS, chunk, kdim)
+    q = torch.randn(shape_k, generator=gen, dtype=torch.float32)
+    k = torch.randn(shape_k, generator=gen, dtype=torch.float32)
+    v = torch.randn((N_CHUNKS, chunk, vdim), generator=gen, dtype=torch.float32)
+    beta = torch.rand((N_CHUNKS, chunk), generator=gen, dtype=torch.float32) * 0.9 + 0.05
+    gk = -torch.rand(shape_k, generator=gen, dtype=torch.float32) * GATE_SCALE
+    return q, k, v, beta, gk
+
+
+def _report_production(item: str, certifies: str) -> None:
+    print(f"\nPRODUCTION|{item}|certifies={certifies}", flush=True)
+
+
+def test_production_geometry_values_are_read_from_the_fork_not_assumed():
+    """Conjunct 1. Certifying component: ``_resolve_chunk_size`` and the layer's width binding.
+
+    Three values, 3/3: ``kdim`` and ``vdim`` from the layer's ``head_dim`` /
+    ``head_size`` (both from ``linear_attn_config["head_dim"]``), and the chunk
+    width from ``_resolve_chunk_size(None)`` on a layer built here.
+
+    BOTH CONFIG ROOTS ARE READ AND COMPARED. The block cites ``config.py`` for
+    ``head_dim`` and its prose says "the in-repo config fixture"; those are two
+    files, so both are read and their agreement is a reading rather than an
+    assumption. The fixture also carries a top-level ``text_config.head_dim`` of
+    ``0`` -- a different field, the MLA one -- so reading the wrong key would give
+    a geometry of zero width, and only ``linear_attn_config``'s entry is the KDA
+    width.
+
+    ``cache_chunk_size`` is printed because the derivation only runs when the dial
+    is ``None``: a config that pinned the dial would return the pinned value and
+    this reading would be about the dial rather than about the derivation.
+    """
+    _report_production(
+        "conjunct1_geometry_is_read", "_resolve_chunk_size and the width binding"
+    )
+    geo = _production_geometry()
+    print(
+        f"PRODUCTION|conjunct1|kdim={geo['kdim']}|vdim={geo['vdim']}|"
+        f"chunk={geo['chunk']}|gate_lower_bound={geo['gate_lower_bound']}|"
+        f"cache_chunk_size={geo['cache_chunk_size']!r}",
+        flush=True,
+    )
+    print(
+        f"PRODUCTION|conjunct1|config_module_head_dim={geo['module_head_dim']}|"
+        f"fixture_head_dim={geo['fixture_head_dim']}|"
+        f"config_module_gate_lower_bound={geo['module_gate_lower_bound']}|"
+        f"fixture_gate_lower_bound={geo['fixture_gate_lower_bound']}",
+        flush=True,
+    )
+    read = (geo["kdim"], geo["vdim"], geo["chunk"])
+    declared = (
+        DECLARED_PRODUCTION_KDIM,
+        DECLARED_PRODUCTION_VDIM,
+        DECLARED_PRODUCTION_CHUNK,
+    )
+    agreed = sum(1 for r, d in zip(read, declared) if r == d)
+    print(
+        f"PRODUCTION|conjunct1|read={read}|declared={declared}|"
+        f"agreed={agreed}/3|two_config_roots_agree="
+        f"{geo['module_head_dim'] == geo['fixture_head_dim']}",
+        flush=True,
+    )
+    assert agreed == 3, (
+        f"the fork reports {read} where this plan block declares {declared}; "
+        f"that is evidence_contradicts_design and goes to the lead, never a "
+        f"silent re-declaration here"
+    )
+    assert geo["cache_chunk_size"] is None
+    assert geo["module_head_dim"] == geo["fixture_head_dim"]
+    assert geo["module_gate_lower_bound"] == geo["fixture_gate_lower_bound"]
+    assert geo["gate_lower_bound"] == DECLARED_GATE_LOWER_BOUND
+
+
+def test_production_geometry_numerics_match_the_chunk_local_reference():
+    """Conjunct 2, and the route predicate (D13 form R-2). Certifying component: the ``wrap_nki`` seam `-035a` authors.
+
+    The seam's five returned values at the READ production geometry against the
+    torch chunk-local reference this file already carries, at `-035a`'s own frozen
+    comparator. No new tolerance (P9).
+
+    THE ROUTE READING IS TAKEN AROUND THE SEAM CALL AND NOWHERE ELSE, on `-035b`'s
+    per-call convention: the reset happens immediately before the call and the read
+    immediately after, before the reference is computed, so the reading belongs to
+    this call. It must read exactly ``1`` dispatch -- :data:`N_CHUNKS` would mean a
+    per-chunk host loop and ``0`` would mean the torch path served this item, which
+    is why a reference-only run cannot satisfy this conjunct.
+    """
+    _report_production(
+        "conjunct2_numeric_agreement_at_production_geometry", "the wrap_nki seam"
+    )
+    geo = _production_geometry()
+    q, k, v, beta, gk = _production_inputs()
+    assert can_run_kernel(q) is True
+    print(
+        f"PRODUCTION|conjunct2|shape_q={tuple(q.shape)}|shape_v={tuple(v.shape)}|"
+        f"n_chunks={N_CHUNKS}|stages={doubling_stages(geo['chunk'])}|"
+        f"kernel_identity={kernel_identity()}",
+        flush=True,
+    )
+
+    reset_dispatch_counters()
+    got = kda_intra_chunk(q, k, v, beta, gk)
+    nki_dispatch, torch_fallback = dispatch_counters()
+
+    want = kda_intra_chunk_torch_oracle(q, k, v, beta, gk)
+    worst = {}
+    for field in ("w", "u", "a_inv", "aqk", "kg"):
+        actual, expected = getattr(got, field), getattr(want, field)
+        worst[field] = _worst(actual, expected)
+        assert_close(
+            _t(actual), _t(expected), rtol=RTOL, atol=ATOL,
+            name=f"production_geometry[chunk={geo['chunk']}].{field}",
+        )
+    worst_field = max(worst, key=worst.get)
+    print(
+        f"PRODUCTION|conjunct2|kdim={geo['kdim']}|chunk={geo['chunk']}|"
+        f"worst_field={worst_field}|worst_abs_error={worst[worst_field]:.3e}|"
+        + "|".join(f"{f}={worst[f]:.3e}" for f in ("w", "u", "a_inv", "aqk", "kg"))
+        + f"|declared_rtol={RTOL}|declared_atol={ATOL}",
+        flush=True,
+    )
+    print(
+        f"PRODUCTION|conjunct2|nki_dispatch={nki_dispatch}|"
+        f"torch_fallback={torch_fallback}|can_run_kernel=True",
+        flush=True,
+    )
+    assert nki_dispatch == 1, (
+        f"expected exactly 1 dispatch at the production geometry; {N_CHUNKS} "
+        f"would mean a per-chunk host loop and 0 would mean the torch path "
+        f"served this item"
+    )
+    assert torch_fallback == 0
+
+
+def test_production_geometry_gate_bound_is_measured_against_the_declared_limit():
+    """Conjunct 3. Certifying component: the seam's gate-range admissibility gate.
+
+    The gate bound is MEASURED and printed beside ``GATE_CUMSUM_ABS_LIMIT``'s
+    ``60.0`` and the derivation's ``5.0 x 8 = 40``, rather than restated. Two
+    readings, and the second is the one that matters:
+
+    * over conjunct 2's own inputs, computed the way the seam computes it
+      (``gk.cumsum(dim=1).abs().max()``), which is small because those inputs use
+      this file's small ``GATE_SCALE``;
+    * over the exact WORST CASE the checkpoint can produce -- every gate entry at
+      ``gate_lower_bound`` -- which is where the derivation's number comes from.
+
+    Landed `-084` changed the gate to ``gate_lower_bound * sigmoid(...)`` and so
+    raised the TYPICAL magnitude without moving the bound, which is exactly why
+    this conjunct measures instead of assuming.
+
+    THE DERIVATION IS ALSO SHOWN TO BE TIGHT, not merely satisfied: one power of
+    two wider is ``5.0 x 16 = 80``, above the limit, which is what makes 8 the
+    widest admissible chunk rather than an arbitrary choice. And the seam itself
+    is asked whether it admits the worst case, so this is a reading about
+    ``_require_admissible`` and not only about arithmetic.
+    """
+    _report_production(
+        "conjunct3_measured_gate_bound", "the seam's gate-range admissibility gate"
+    )
+    from vllm_neuron.functional.kda.chunked_recurrence import (
+        GATE_CUMSUM_ABS_LIMIT,
+        can_run_intra_chunk,
+    )
+
+    geo = _production_geometry()
+    chunk, kdim, vdim = geo["chunk"], geo["kdim"], geo["vdim"]
+    bound = abs(geo["gate_lower_bound"])
+
+    _, _, _, _, gk = _production_inputs()
+    measured = float(gk.float().cumsum(dim=1).abs().max().item())
+
+    worst_gk = torch.full((N_CHUNKS, chunk, kdim), geo["gate_lower_bound"],
+                          dtype=torch.float32)
+    worst_case = float(worst_gk.cumsum(dim=1).abs().max().item())
+    derived = bound * chunk
+    one_wider = bound * (chunk * 2)
+
+    print(
+        f"PRODUCTION|conjunct3|measured_gate_abs_max={measured:.4f}|"
+        f"worst_case_gate_abs_max={worst_case}|derivation={bound} x {chunk} = "
+        f"{derived}|GATE_CUMSUM_ABS_LIMIT={GATE_CUMSUM_ABS_LIMIT}|"
+        f"one_chunk_wider={bound} x {chunk * 2} = {one_wider}",
+        flush=True,
+    )
+
+    reference = torch.zeros((N_CHUNKS, chunk, kdim), dtype=torch.float32)
+    admits_worst_case = can_run_intra_chunk(
+        reference, N_CHUNKS, chunk, kdim, vdim, worst_case
+    )
+    print(
+        f"PRODUCTION|conjunct3|seam_admits_worst_case={admits_worst_case}|"
+        f"headroom={GATE_CUMSUM_ABS_LIMIT - worst_case}",
+        flush=True,
+    )
+
+    # The worst case IS the derivation's number, exactly: eight additions of
+    # -5.0 in fp32 are exact, both being powers of two times a small integer.
+    assert worst_case == derived
+    assert derived <= GATE_CUMSUM_ABS_LIMIT
+    assert one_wider > GATE_CUMSUM_ABS_LIMIT
+    assert measured <= worst_case
+    assert admits_worst_case is True
+
+
+def test_production_geometry_doubling_stage_count_is_three_at_chunk_eight():
+    """Conjunct 4. Certifying component: ``doubling_stages``.
+
+    ``ceil(log2 8) == 3``, read from the fork's own ``doubling_stages`` rather
+    than recomputed here -- the point of the item is that the kernel and this
+    reading agree on one number, and a second implementation of ``log2`` would
+    only agree with itself.
+
+    THE POPULATION IS PRINTED BESIDE IT so the claim "a stage count no recorded
+    run has read" is measured rather than asserted: the three graded sizes read
+    5, 6 and 7, and none of them is 3.
+    """
+    _report_production("conjunct4_doubling_stage_count", "doubling_stages")
+    geo = _production_geometry()
+    chunk = geo["chunk"]
+    stages = doubling_stages(chunk)
+    graded = {c: doubling_stages(c) for c in CHUNK_SIZES}
+    print(
+        f"PRODUCTION|conjunct4|chunk={chunk}|stages={stages}|"
+        f"declared={DECLARED_DOUBLING_STAGES_AT_PRODUCTION_CHUNK}|"
+        f"graded_sizes={graded}|graded_stage_counts={sorted(graded.values())}",
+        flush=True,
+    )
+    assert stages == DECLARED_DOUBLING_STAGES_AT_PRODUCTION_CHUNK
+    assert stages not in graded.values(), (
+        f"chunk={chunk} reads {stages} stages and the graded sizes read "
+        f"{sorted(graded.values())}; if one of them already read {stages} this "
+        f"conjunct would be measuring nothing new"
+    )
