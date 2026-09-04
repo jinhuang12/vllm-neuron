@@ -251,7 +251,7 @@ def test_packed_row_dispatch_passes_banks_directly_once(monkeypatch) -> None:
     monkeypatch.setattr(moe_module.NF, "moe_tkg", fake_moe_tkg)
     actual = experts(hidden, affinities, selected, is_decode=True)
 
-    assert actual.shape == expected.shape
+    assert actual is expected
     assert len(calls) == 1
     packed = experts.packed_row_fp8
     assert packed is not None

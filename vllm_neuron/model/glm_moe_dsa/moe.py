@@ -405,6 +405,8 @@ class GlmMoeDsaRoutedExperts(nn.Module):
                     output_dtype=hidden_states.dtype,
                 )
             )
+        if len(outputs) == 1:
+            return outputs[0]
         return torch.cat(outputs, dim=0)
 
     def _packed_row_fp8_nki(
@@ -438,6 +440,8 @@ class GlmMoeDsaRoutedExperts(nn.Module):
                     output_dtype=hidden_states.dtype,
                 )
             )
+        if len(outputs) == 1:
+            return outputs[0]
         return torch.cat(outputs, dim=0)
 
     def _block_fp8_contract_violations(
