@@ -34,7 +34,7 @@ measured against something the world reports and never against a number this
 file chooses: the page against ``page_size_bytes`` READ OFF the spec objects
 ``get_kv_cache_spec`` constructs; the element counts against the two
 ``LayerSpec`` shape FIELDS; the DSA head size against the model's own reported
-value. The one external literal is ``approvals/DECISIONS.md`` section 6's
+value. The one external literal is ``DECISIONS.md`` section 6's
 recorded KDA state page, CITED and neither restated nor re-derived (P9).
 
 VEHICLE, and why it is shared rather than rebuilt. The 45 ``LayerSpec`` objects,

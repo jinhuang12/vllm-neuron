@@ -73,7 +73,7 @@ from test.vllm_neuron.worker.test_get_kv_cache_spec_hybrid import (
     _raw_fixture,
 )
 
-#: ``approvals/DECISIONS.md`` section 6: the frozen user-decided block size.
+#: ``DECISIONS.md`` section 6: the frozen user-decided block size.
 #: CITED, never re-derived (P9).
 REGISTERED_HYBRID_BLOCK_SIZE = 128
 

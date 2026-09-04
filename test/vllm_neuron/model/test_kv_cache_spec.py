@@ -89,11 +89,11 @@ DECLARED_KDA_NUM_HEADS = 64
 DECLARED_KDA_HEAD_SIZE = 128
 DECLARED_KDA_CONV_KERNEL_SIZE = 4
 
-#: Registered tensor-parallel degree (``approvals/DECISIONS.md`` section 6,
+#: Registered tensor-parallel degree (``DECISIONS.md`` section 6,
 #: whose registered preconditions are TP = 64 and a bf16 KV cache).
 REGISTERED_TP_WORLD_SIZE = 64
 
-#: The KDA state page byte value recorded at ``approvals/DECISIONS.md``
+#: The KDA state page byte value recorded at ``DECISIONS.md``
 #: section 6, inside a user decision. Cited, never re-derived here.
 RECORDED_KDA_STATE_PAGE_BYTES = 67_840
 

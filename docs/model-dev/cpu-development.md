@@ -73,9 +73,9 @@ VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 pytest test/vllm_neuron/functional/ -v --
 alone falls back to PyTorch by design (see the bullet above). Without the flag
 `can_run_kernel` returns False, so every NKI seam takes that fallback, and 41 of
 the 158 items in this tree exist to rule the fallback out. All 41 fail, in three
-ways: most count the dispatch and read zero, some assert the route is available
-before they measure anything, and a few reach the seam's own error, which tells
-you to set this flag. Without it the command reports 41 failed and 117 passed;
+ways: a counted dispatch that reads zero, a route-availability assertion, and the
+seam's own error telling you to set this flag. How many take each way is not
+counted anywhere. Without it the command reports 41 failed and 117 passed;
 with it, 158 passed. If you want the fallback path itself, drop the flag and
 expect those same 41 to be the failures.
 

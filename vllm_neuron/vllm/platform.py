@@ -437,7 +437,7 @@ class NeuronPlatform(Platform):
                     "run resolved tensor_parallel_size=%d, so the KV cache "
                     "keeps the uniform %d-token page -- %s. To enable it at "
                     "this degree, re-derive the block size for that degree "
-                    "(approvals/DECISIONS.md section 6) and set "
+                    "(DECISIONS.md section 6) and set "
                     "enable_hybrid_kv_cache explicitly.",
                     HYBRID_KV_REGISTERED_TP_DEGREE,
                     resolved_tp_size,
@@ -450,7 +450,7 @@ class NeuronPlatform(Platform):
         # block_size for its ownership stride, so a hybrid run validates DCP
         # against the block size it will actually allocate with.
         #
-        # The VALUE is a frozen user decision -- approvals/DECISIONS.md section
+        # The VALUE is a frozen user decision -- DECISIONS.md section
         # 6, verbatim "128 (Recommended)" -- and is valid ONLY under two
         # registered preconditions: tensor-parallel degree 64 and a bfloat16 KV
         # cache. Both are READ here; neither is chosen here, and a seat that
@@ -493,7 +493,7 @@ class NeuronPlatform(Platform):
                         f"size {hybrid_block_size} is below the registered KDA "
                         f"state-page floor of "
                         f"{HYBRID_BLOCK_SIZE_FLOOR_TOKENS} tokens "
-                        f"(approvals/DECISIONS.md section 6). A shorter page "
+                        f"(DECISIONS.md section 6). A shorter page "
                         f"cannot hold the KDA recurrent state, and nothing "
                         f"downstream on Neuron catches an under-sized page. "
                         f"Supply a value at or above the floor, or unset "
@@ -505,7 +505,7 @@ class NeuronPlatform(Platform):
                         f"size {hybrid_block_size} is not a multiple of the "
                         f"registered DSA indexer kernel granularity "
                         f"{HYBRID_BLOCK_SIZE_GRANULARITY} "
-                        f"(approvals/DECISIONS.md section 6). Supply a "
+                        f"(DECISIONS.md section 6). Supply a "
                         f"multiple of that granularity, or unset "
                         f"hybrid_kv_block_size to use the decided value."
                     )

@@ -52,7 +52,7 @@ Why a SUPPORTED SET rather than "any two positive ints"
 each cited rather than re-derived:
 
 * the campaign's target is frozen at ``zai-org/GLM-5.3-Flash`` native blockwise
-  FP8 e4m3 with ``weight_block_size [128, 128]`` (``approvals/DECISIONS.md``
+  FP8 e4m3 with ``weight_block_size [128, 128]`` (``DECISIONS.md``
   section 2);
 * the substrate's block-quantisation granularity is the single constant
   ``BLOCK_QUANT_SIZE = 256`` (``nkilib`` ``core/moe/moe_cte/bwmm_shard_on_I.py``

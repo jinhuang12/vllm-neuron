@@ -28,7 +28,7 @@ mechanical rather than a promise. The reciprocal declaration lives on
 defect is on the lead's revision list rather than this seat's to repair.
 
 TP=64 IS CITED, NEVER RE-DERIVED. The registration is
-``approvals/DECISIONS.md`` section 6 -- *"Preconditions (registered): TP=64,
+``DECISIONS.md`` section 6 -- *"Preconditions (registered): TP=64,
 bf16 KV cache"* -- corroborated by the read-only site
 ``vllm_neuron/functional/process_groups.py:111``. Nothing here recomputes it and
 nothing here makes it configurable.

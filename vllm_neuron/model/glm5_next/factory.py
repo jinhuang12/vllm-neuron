@@ -40,7 +40,7 @@ from .config import Glm5NextExpertConfigError
 
 #: The campaign's tensor-parallel degree. **REGISTERED, CITED, NEVER RE-DERIVED
 #: AND NOT CONFIGURABLE HERE.** The registration is
-#: ``approvals/DECISIONS.md`` section 6 -- *"Preconditions (registered): TP=64,
+#: ``DECISIONS.md`` section 6 -- *"Preconditions (registered): TP=64,
 #: bf16 KV cache"* -- and the corroborating read-only site in this repo is
 #: ``vllm_neuron/functional/process_groups.py:111``, whose TRN2 8x8 mesh branch
 #: is gated on ``group_size == 64``. No environment variable and no config field

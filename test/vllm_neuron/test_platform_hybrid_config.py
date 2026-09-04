@@ -32,7 +32,7 @@ to the criterion it was measured against.
   assignment, and each message names the OPERATIVE value, which is the decided
   ``128`` in both arms because both are declared against the unset knob.
 * item 5 -- conjunct 6: the operator override is HONOURED only within the
-  constraints ``approvals/DECISIONS.md`` section 6 registers -- **2/2** arms,
+  constraints ``DECISIONS.md`` section 6 registers -- **2/2** arms,
   one in each direction, with the D1.5 control that drops the validation and
   moves arm A's raise count to ``0/1``.
 
@@ -98,7 +98,7 @@ latch is codified by the block at revision 28. That method itself is
 byte-unchanged, and nothing here calls ``Platform._align_hybrid_block_size`` or
 sets ``cache_config.mamba_page_size_padded``.
 
-The value **128** is cited to ``approvals/DECISIONS.md`` section 6 (verbatim
+The value **128** is cited to ``DECISIONS.md`` section 6 (verbatim
 user answer "128 (Recommended)"), never to the round-trip sentinel in
 ``test/vllm_neuron/model/test_neuron_config_glm5next.py:42`` -- the numeric
 equality with that sentinel is a disclosed coincidence and is not corroboration.
@@ -128,7 +128,7 @@ import torch
 from vllm_neuron.vllm import platform as platform_module
 from vllm_neuron.vllm.platform import NeuronPlatform
 
-# The user-decided hybrid block size. Authority: approvals/DECISIONS.md section
+# The user-decided hybrid block size. Authority: DECISIONS.md section
 # 6 -- NOT the round-trip sentinel in test_neuron_config_glm5next.py, whose
 # numeric equality with this value is a disclosed coincidence.
 DECIDED_HYBRID_BLOCK_SIZE = 128
