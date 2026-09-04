@@ -5,9 +5,9 @@ Increment ``inc-glm53f-092``, plan revision 94.
 THE QUESTION THIS FILE ANSWERS
 ------------------------------
 Six modules under ``vllm_neuron/functional/`` expose an identity function that reports which
-NKI member the module talks to. Five of them read a **module-level import**, so the value they
-report is what the module imported rather than what the seam dispatched. Those two can differ,
-and until something drives the seam and looks, nobody can tell.
+NKI member the module talks to. Each reads a **module-level name** -- an import in
+``depthwise_conv1d``, a same-file ``@nki.jit def`` in the other four -- so what it reports is
+what the module BOUND, not what the seam dispatched, and those two can differ.
 
 So each test here takes an INDEPENDENT reading -- the first positional argument handed to
 ``nki.simulator.simulate_kernel``, which is the kernel the CPU dispatch actually ran -- and
@@ -292,7 +292,7 @@ def test_moe_blockwise_fp8_first_hop_identity_matches_the_dispatch():
     """
     r = _assert_first_hop_agrees("moe_blockwise_fp8")
     mod = _M["moe_blockwise_fp8"]
-    # Recorded, not asserted: the two hops differ, which is the shape this module ships.
+    # ASSERTED, not merely recorded: the two hops must differ, or this file's premise moved.
     assert tuple(mod.kernel_identity()) != r["claimed"], (
         "moe_blockwise_fp8 no longer has two distinct hops; seam_identity() and "
         "kernel_identity() now report the same symbol, so this file's premise moved"
