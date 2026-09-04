@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-040` -- the sparse MLA latent attention kernel.
+"""Acceptance for `inc-glm53f-040` and `inc-glm53f-041` -- the sparse MLA latent
+attention kernel and its tiling path.
 
-SIX tests and NO `parametrize` decorator in this file. Four carry `geometry` in their
-name and are the increment's DECLARED acceptance selection; two do not, and screen the
-module rather than measure the kernel. Each test prints its counted value and names the
-component whose behaviour it certifies.
+THIRTEEN tests and NO `parametrize` decorator in this file. Four carry `geometry` in
+their name and are `-040`'s DECLARED acceptance selection; seven carry `width` and are
+`-041`'s; two carry neither, and screen the module rather than measure the kernel. Each
+test prints its counted value and names the component whose behaviour it certifies.
 
 The declared command, and the only one whose result the plan block quotes::
 
@@ -22,8 +23,8 @@ RoPE half at all, and the route predicate is read over that one case.
 WHAT THIS FILE ANSWERS AND WHAT IT DOES NOT. It answers "does the kernel compute
 sparse latent attention at a geometry the substrate refuses". Whether the decode path
 is wired to it is `inc-glm53f-042`'s question, in its own file. Whether an arbitrary
-topk width tiles correctly is `inc-glm53f-041`'s, also in this file but as its own
-items -- this file's `width` selection does not exist yet and `-041` adds it.
+latent width tiles correctly is `inc-glm53f-041`'s, also in this file but as its own
+items -- the `width` selection at the end of this file, added by that increment.
 """
 
 from __future__ import annotations
@@ -589,10 +590,8 @@ def test_geometry_every_bound_comes_from_the_image_and_every_refusal_fires() -> 
     inadmissible = (
         ("heads_past_the_stationary_axis",
          dict(heads=MS.HEAD_MAX + 1), "stationary free axis"),
-        ("latent_not_a_multiple_of_the_partition_tile",
-         dict(latent=MS.LATENT_TILE + 1), "multiple of it"),
-        ("latent_past_the_moving_axis",
-         dict(latent=MS.MOVING_MAX + MS.LATENT_TILE), "moving free axis"),
+        ("latent_not_positive",
+         dict(latent=0), "latent rank must be positive"),
         ("topk_not_a_multiple_of_the_key_chunk",
          dict(topk=MS.KEY_CHUNK + 2), "multiple of it"),
         ("non_positive_softmax_scale",
@@ -711,7 +710,7 @@ def test_the_module_carries_no_torch_attention_route_and_no_vendor_symbol() -> N
 def test_the_kernel_entry_points_are_authored_here_and_not_imported() -> None:
     """The kernels under test are this module's, unwrapped before being read.
 
-    CERTIFYING COMPONENT: `MS.mla_sparse_kernel_identity`, and through it the two
+    CERTIFYING COMPONENT: `MS.mla_sparse_kernel_identity`, and through it the four
     `@nki.jit` entry points.
 
     THE UNWRAP IS THE WHOLE READING. `nki.jit` returns a wrapper whose own
@@ -728,10 +727,472 @@ def test_the_kernel_entry_points_are_authored_here_and_not_imported() -> None:
             f"{qualname} reports module {module_name}, not {MS.__name__}: the kernel "
             f"under test is not authored in this module"
         )
-    assert len(identities) == 2, (
-        f"this module authors two entry points, the NoPE one and the RoPE one; the "
-        f"identity reading returned {len(identities)}"
+    assert len(identities) == 4, (
+        f"this module authors four entry points -- the NoPE one, the RoPE one and "
+        f"inc-glm53f-041's tiled pair; the identity reading returned "
+        f"{len(identities)}"
     )
     naive = MS.mla_sparse_attention_nope_kernel.__module__
     say(f"K1_WITHOUT_THE_UNWRAP_IT_WOULD_READ={naive}")
     say(f"K1_THE_UNWRAP_CHANGES_THE_ANSWER={int(naive != MS.__name__)}")
+
+
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-041` -- the seven `width` items. THE SELECTION IS PARTITIONED BY NAME:
+# every item below carries `width` and none carries `geometry`, so `-k width` runs
+# this increment's acceptance and `-k geometry` still runs `-040`'s four unchanged.
+# The constants live here rather than beside `-040`'s so this increment reads as one
+# block, the same reason its kernel code is contiguous in the module.
+# --------------------------------------------------------------------------- #
+
+#: THIS INCREMENT'S DECLARED CASE. The width 2,051 is the plan block's own number,
+#: quoted and not chosen here: it violates `% 128` (2,051 = 16 x 128 + 3) and `% 16`
+#: alike, so it exercises a ragged tail on BOTH axes the kernel now tiles. Every other
+#: field is `-040`'s declared case unchanged, so the only moving part is the width.
+WIDTH_CASE = dict(seq=1, heads=64, latent=2051, topk=128, s_kv=256, rope=0)
+
+#: The exact-fit width the bit-identity claim compares against: 17 x 128 = 2,176, the
+#: next multiple of the partition tile above 2,051. It is NOT a width `-040` can serve
+#: -- its landed seam refuses it for exceeding one MM2 moving tile -- so this is an
+#: internal-consistency claim between two widths on THIS increment's path, and the
+#: item's own docstring says so, in case a reader takes it for a comparison with `-040`.
+REFERENCE_WIDTH = 2176
+
+#: The exact-fit control geometry, declared by the design lap out of `-040`'s review:
+#: `seq=2` and `topk=512` walk the per-query loop and the four-chunk MM2 loop that
+#: `-040`'s own 1/1 case never entered, at a latent that takes the UNTILED body.
+EXACT_FIT_CONTROL_CASE = dict(seq=2, heads=64, latent=512, topk=512, s_kv=1024, rope=0)
+
+#: A minimal tiled geometry, used where an item needs a tiled dispatch cheaply. Its
+#: width is `LATENT_TILE + 1`, which is the EXACT value `-040`'s G4 table used to
+#: assert was refused -- so its serving is the evidence for that row's deletion.
+MINIMAL_TILED_CASE = dict(seq=1, heads=8, latent=129, topk=128, s_kv=256, rope=0)
+
+
+def case_scale(case: dict) -> float:
+    """The softmax scale for a case: its own latent rank's inverse square root.
+
+    Derived per case for `declared_scale`'s reason -- so the scale and the width
+    cannot drift apart. Not a registered comparator value; this increment authors no
+    tolerance and quotes `RTOL`/`ATOL` from the plan like `-040` does.
+    """
+    return float(case["latent"]) ** -0.5
+
+
+def both_counters() -> tuple[int, int, int, int]:
+    """`(seam_nki, seam_fallback, tiled_nki, tiled_fallback)` after a reset of both.
+
+    Read as one tuple because the two counters COMPOSE rather than partition: the
+    seam counter counts every dispatch whichever body ran, and the tiled counter
+    additionally counts the tiled ones. `-042` reads both, so both are stated together.
+    """
+    seam_nki, seam_fallback = MS.mla_sparse_dispatch_counters()
+    tiled_nki, tiled_fallback = MS.mla_sparse_tiled_dispatch_counters()
+    return seam_nki, seam_fallback, tiled_nki, tiled_fallback
+
+
+def reset_both_counters() -> None:
+    """Zero both counter objects. Each increment owns its own reset; a case calls both."""
+    MS.reset_mla_sparse_dispatch_counters()
+    MS.reset_mla_sparse_tiled_dispatch_counters()
+
+
+def test_width_the_ragged_latent_matches_the_torch_oracle() -> None:
+    """WIDTH 1 of 7 -- the tiled kernel computes sparse latent attention at 2,051.
+
+    CERTIFYING COMPONENT: `MS._attention_body_tiled`, reached through the seam's
+    width branch.
+
+    THE ROUTE READINGS ARE PRINTED BEFORE THE NUMERIC COMPARE, because `-040`'s round
+    one learned that the other order loses them on a red run: a failing assertion took
+    the dispatch lines with it and the mutation rows could not tell "the arithmetic
+    broke" from "the kernel was never reached".
+    """
+    say("W1_CERTIFYING_COMPONENT=MS._attention_body_tiled via MS.mla_sparse_attention")
+    case = dict(WIDTH_CASE)
+    scale = case_scale(case)
+    say("W1_CASE=" + " ".join(f"{k}={v}" for k, v in case.items()) + f" scale={scale:.6e}")
+
+    q_lift, c_kv, idx, q_pe, k_pe = make_case(**case, seed=41)
+    assert q_pe is None and k_pe is None, "the declared case carries no RoPE half"
+
+    can_run = MS.can_run_mla_sparse_attention(
+        q_lift, case["seq"], case["heads"], case["latent"], case["rope"],
+        case["topk"], case["s_kv"], scale,
+    )
+    say(f"W1_CAN_RUN_KERNEL={can_run}")
+    assert can_run, "the tiled geometry must be admissible after this increment"
+
+    reset_both_counters()
+    got = MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    seam_nki, seam_fallback, tiled_nki, tiled_fallback = both_counters()
+    say(f"W1_SEAM_NKI_DISPATCH={seam_nki}/1 W1_TILED_NKI_DISPATCH={tiled_nki}/1")
+    say(f"W1_SEAM_TORCH_FALLBACK={seam_fallback} W1_TILED_TORCH_FALLBACK={tiled_fallback}")
+    say(f"W1_OUTPUT_SHAPE={tuple(got.shape)}")
+    assert seam_nki == 1 and tiled_nki == 1
+    assert seam_fallback == 0 and tiled_fallback == 0
+    assert tuple(got.shape) == (case["seq"], case["heads"], case["latent"])
+
+    want = sparse_mla_torch_reference(q_lift, c_kv, idx, scale)
+    err = float((got - want).abs().max())
+    say(f"W1_MAXABS_VS_INDEPENDENT_ORACLE={err:.3e}  RTOL={RTOL} ATOL={ATOL}")
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+    say("W1_CASES_AGREED=1/1")
+
+    # THE CONTROL, and it is `-040`'s -- the one already measured able to fire. One
+    # selected row out of `topk` is replaced by a cache row the selection does not
+    # hold, so the SET changes rather than its order, and the comparison must fail.
+    substituted = idx.clone()
+    for s in range(case["seq"]):
+        selected = {int(v) for v in idx[s].tolist()}
+        unused = [r for r in range(case["s_kv"]) if r not in selected]
+        assert unused, "the selection covers the whole cache; no substitution exists"
+        substituted[s, 0] = unused[0]
+    wrong = sparse_mla_torch_reference(q_lift, c_kv, substituted, scale)
+    control_err = float((got - wrong).abs().max())
+    say(f"W1_CONTROL_MAXABS_AGAINST_A_DIFFERENT_SELECTION={control_err:.3e}")
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(got, wrong, rtol=RTOL, atol=ATOL)
+    say("W1_CONTROL_FIRES=1")
+    assert control_err > ATOL
+
+
+def test_width_the_zero_extended_reference_is_bit_identical() -> None:
+    """WIDTH 2 of 7 -- 2,051 columns agree EXACTLY with the same data padded to 2,176.
+
+    CERTIFYING COMPONENT: `MS._attention_body_tiled`'s ragged tail tiles, on both the
+    partition axis and MM2's moving axis.
+
+    WHAT THE TWO SIDES ARE, because the plan block's wording can be read as a
+    comparison against `-040` and it cannot be one. BOTH sides run on THIS
+    increment's tiled path: `-040`'s landed seam refuses 2,051 (not a multiple of 128)
+    and refuses 2,176 as well (wider than one MM2 moving tile), so no width exists
+    that both bodies serve. The unpadded side is the real 2,051. The padded side is
+    the SAME inputs zero-extended BY THE CALLER to 17 x 128, sliced back to the real
+    columns. So this is an internal-consistency claim on one path, and it is a real one:
+    it is what would break if a ragged tail tile read or wrote outside its extent.
+
+    WHY EXACT AND NOT `assert_close`. The extension contributes only exact zeros to
+    MM1's contraction, and `x + 0.0 == x` in fp32 for finite x. That was measured on
+    the primitive before this was written -- 125 exact zeros added to a 3-deep
+    contraction came back bit-identical (`probe-041-ragged-tiles.out`, reading r5) --
+    so `max abs diff == 0.0` is a claim the arithmetic supports rather than a hope.
+
+    THE SCALE IS HELD FIXED ACROSS BOTH RUNS. It is an input, not something the kernel
+    derives from the width, and deriving it per width would have changed the scores and
+    made the comparison meaningless.
+    """
+    say("W2_CERTIFYING_COMPONENT=MS._attention_body_tiled ragged tail tiles")
+    case = dict(WIDTH_CASE)
+    latent = case["latent"]
+    scale = case_scale(case)
+    say(f"W2_REAL_WIDTH={latent} W2_PADDED_WIDTH={REFERENCE_WIDTH} "
+        f"W2_PAD_COLUMNS={REFERENCE_WIDTH - latent} scale={scale:.6e}  (one scale, both runs)")
+
+    q_lift, c_kv, idx, _, _ = make_case(**case, seed=41)
+
+    q_ext = torch.zeros(case["seq"], case["heads"], REFERENCE_WIDTH,
+                        dtype=torch.float32)
+    q_ext[:, :, :latent] = q_lift
+    c_ext = torch.zeros(case["s_kv"], REFERENCE_WIDTH, dtype=torch.float32)
+    c_ext[:, :latent] = c_kv
+    say(f"W2_THE_EXTENSION_IS_EXACTLY_ZERO="
+        f"{int(bool((q_ext[:, :, latent:] == 0).all() and (c_ext[:, latent:] == 0).all()))}")
+
+    reset_both_counters()
+    got_real = MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    got_pad = MS.mla_sparse_attention(q_ext, c_ext, idx, scale)
+    seam_nki, _, tiled_nki, _ = both_counters()
+    say(f"W2_SEAM_NKI_DISPATCH={seam_nki}/2 W2_TILED_NKI_DISPATCH={tiled_nki}/2  "
+        f"(both widths take the tiled body)")
+    assert seam_nki == 2 and tiled_nki == 2
+
+    compared = got_real.numel()
+    say(f"W2_POPULATION_ELEMENTS_COMPARED={compared}")
+    diff = float((got_real - got_pad[:, :, :latent]).abs().max())
+    say(f"W2_MAXABS_REAL_VS_PADDED_OVER_THE_REAL_COLUMNS={diff:.3e}")
+    say(f"W2_BIT_IDENTICAL={int(diff == 0.0)}")
+    assert compared == case["seq"] * case["heads"] * latent
+    assert diff == 0.0, (
+        f"the padded run disagrees with the ragged run by {diff} over the real "
+        f"{latent} columns; a tail tile is reading or writing outside its extent"
+    )
+
+    tail = got_pad[:, :, latent:]
+    say(f"W2_PADDED_TAIL_OUTPUT_MAXABS={float(tail.abs().max()):.3e}  "
+        f"(weights times zero rows, so exactly zero)")
+    assert float(tail.abs().max()) == 0.0
+
+    # THREE MORE READINGS, IN INCREASING STRENGTH, and every one of them was measured
+    # on the host before this item was written to assert it (`probe-041-tiled-
+    # shakedown.out`, reading s4). The order matters, because the FIRST CONTROL I WROTE
+    # COULD NOT FIRE and the probe is what caught it.
+    #
+    # (a) A nonzero CACHE extension alone cannot move the real columns: MM1 contracts
+    #     it against the exactly-zero half of q, so those products are exact zeros.
+    #     Measured at exactly 0.000e+00, which is a second bit-identity reading by a
+    #     different mechanism from the one above.
+    c_nz = c_ext.clone()
+    c_nz[:, latent:] = 0.7
+    got_cache_only = MS.mla_sparse_attention(q_ext, c_nz, idx, scale)
+    cache_only = float((got_real - got_cache_only[:, :, :latent]).abs().max())
+    say(f"W2_NONZERO_CACHE_EXTENSION_ONLY_MAXABS={cache_only:.3e}  (expected to AGREE)")
+
+    # (b) A CONSTANT nonzero extension on BOTH operands is MATHEMATICALLY INERT, and
+    #     this is the defect the probe found in my first attempt at a control: it adds
+    #     the same 0.3 x 0.7 x 125 to every score in a row, and softmax is invariant to
+    #     a constant shift of all its logits. So the weights cannot move. It is kept as
+    #     a READING rather than deleted, because it is the strongest available proof
+    #     that the tail reaches the arithmetic AT ALL: it comes back near 6e-9 and NOT
+    #     bit-identical, where the zero extension came back exactly 0.0. A comparison
+    #     blind to the extension would have read 0.0 for both.
+    q_nz = q_ext.clone()
+    q_nz[:, :, latent:] = 0.3
+    got_const = MS.mla_sparse_attention(q_nz, c_nz, idx, scale)
+    constant = float((got_real - got_const[:, :, :latent]).abs().max())
+    say(f"W2_CONSTANT_EXTENSION_BOTH_OPERANDS_MAXABS={constant:.3e}  "
+        f"(inert by softmax shift-invariance, so expected to AGREE)")
+    say(f"W2_BUT_IT_IS_NOT_BIT_IDENTICAL={int(constant != 0.0)}  "
+        f"(so the tail does reach the arithmetic)")
+    assert constant <= ATOL, (
+        f"a constant extension moved the answer by {constant}, which softmax's "
+        f"shift-invariance says it cannot; the kernel is not computing a softmax"
+    )
+
+    # (c) THE CONTROL THAT FIRES. The extension is made ROW-VARYING, so each selected
+    #     cache row gains a DIFFERENT amount and the weights genuinely move. This is
+    #     the perturbation the property under test is not invariant to, and finding
+    #     which one that is took a measurement rather than an argument.
+    c_rv = c_ext.clone()
+    c_rv[:, latent:] = (
+        torch.arange(case["s_kv"], dtype=torch.float32).unsqueeze(1) * 0.01
+    )
+    got_rowvarying = MS.mla_sparse_attention(q_nz, c_rv, idx, scale)
+    control = float((got_real - got_rowvarying[:, :, :latent]).abs().max())
+    say(f"W2_CONTROL_MAXABS_WITH_A_ROW_VARYING_EXTENSION={control:.3e}")
+    say(f"W2_CONTROL_FIRES={int(control > ATOL)}")
+    assert control > ATOL, (
+        f"a row-varying extension moved the answer by only {control}, at or below the "
+        f"{ATOL} tolerance, so this item cannot see the tail it asserts is inert"
+    )
+
+
+def test_width_the_tiled_seam_counts_its_own_dispatch() -> None:
+    """WIDTH 3 of 7 -- the route predicate, D13 form R-1, on the tiled path.
+
+    CERTIFYING COMPONENT: the width branch in `MS.mla_sparse_attention` and
+    `MS._MLA_SPARSE_TILED_COUNTERS`.
+
+    THE TWO COUNTERS COMPOSE AND THE ITEM MEASURES BOTH. `-040`'s seam counter counts
+    every dispatch through the seam whichever body runs; this increment's counter
+    additionally counts the tiled ones. So a tiled call reads 1 and 1. That is the
+    reading `-042`'s decode predicate cites, and this block is its authority: it is
+    stated here, per call, rather than inferred there.
+
+    A pure-torch implementation reads 0 on both and cannot pass.
+    """
+    say("W3_CERTIFYING_COMPONENT=MS.mla_sparse_attention width branch + "
+        "MS._MLA_SPARSE_TILED_COUNTERS")
+    case = dict(WIDTH_CASE)
+    scale = case_scale(case)
+    q_lift, c_kv, idx, _, _ = make_case(**case, seed=41)
+
+    reset_both_counters()
+    say("W3_AFTER_RESET=" + str(both_counters()))
+    assert both_counters() == (0, 0, 0, 0)
+
+    MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    seam_nki, seam_fallback, tiled_nki, tiled_fallback = both_counters()
+    say(f"W3_SEAM_NKI_DISPATCH={seam_nki}/1")
+    say(f"W3_TILED_NKI_DISPATCH={tiled_nki}/1")
+    say(f"W3_SEAM_TORCH_FALLBACK={seam_fallback} W3_TILED_TORCH_FALLBACK={tiled_fallback}")
+    say(f"W3_COUNTER_OBJECTS_ARE_DISTINCT="
+        f"{int(MS._MLA_SPARSE_COUNTERS is not MS._MLA_SPARSE_TILED_COUNTERS)}")
+    assert (seam_nki, tiled_nki) == (1, 1)
+    assert (seam_fallback, tiled_fallback) == (0, 0)
+    assert MS._MLA_SPARSE_COUNTERS is not MS._MLA_SPARSE_TILED_COUNTERS
+
+    # Each increment's reset owns its own object, which is the other half of "neither
+    # reads the other's": resetting the tiled counter must not clear the seam counter.
+    MS.reset_mla_sparse_tiled_dispatch_counters()
+    after = both_counters()
+    say(f"W3_THE_TILED_RESET_LEAVES_THE_SEAM_COUNTER_ALONE={after}")
+    assert after == (1, 0, 0, 0)
+
+
+def test_width_the_tile_arithmetic_comes_from_the_image() -> None:
+    """WIDTH 4 of 7 -- the two tilings are derived from `nl.tile_size`, not typed.
+
+    CERTIFYING COMPONENT: `MS._latent_tiles` and `MS._output_tiles`.
+
+    WHY BOTH TILINGS EXIST. The latent rides the PARTITION axis in MM1 and MM2's
+    MOVING free axis, and on this image those two extents differ (128 against 512), so
+    one width needs two different tilings. The expected tile counts are computed from
+    the image's own numbers here rather than written down, so an image change reddens
+    this item instead of silently mis-tiling.
+
+    THE PROPERTY, and it is stronger than the counts: the tiles must PARTITION the
+    width -- contiguous, non-overlapping, summing to it exactly, each within its axis
+    bound. A tiling that dropped or double-counted a column would satisfy a count and
+    fail this.
+    """
+    say("W4_CERTIFYING_COMPONENT=MS._latent_tiles and MS._output_tiles")
+    latent = WIDTH_CASE["latent"]
+    pmax = nl.tile_size.pmax
+    moving = nl.tile_size.gemm_moving_fmax
+    say(f"W4_IMAGE_pmax={pmax} IMAGE_gemm_moving_fmax={moving} WIDTH={latent}")
+
+    checks = 0
+    for label, tiles, bound in (
+        ("PARTITION", MS._latent_tiles(latent), pmax),
+        ("MOVING", MS._output_tiles(latent), moving),
+    ):
+        expected_count = -(-latent // bound)
+        expected_tail = latent - (expected_count - 1) * bound
+        say(f"W4_{label}_TILES={len(tiles)} EXPECTED={expected_count} "
+            f"TAIL={tiles[-1][1]} EXPECTED_TAIL={expected_tail}")
+        assert len(tiles) == expected_count
+        assert tiles[-1][1] == expected_tail
+        assert sum(extent for _, extent in tiles) == latent, (
+            f"the {label} tiling does not sum to the width"
+        )
+        offset = 0
+        for tile_offset, extent in tiles:
+            assert tile_offset == offset, f"the {label} tiling is not contiguous"
+            assert 1 <= extent <= bound, f"a {label} tile exceeds its axis bound"
+            offset += extent
+        assert offset == latent
+        say(f"W4_{label}_TILES_PARTITION_THE_WIDTH=1")
+        checks += 1
+    say(f"W4_TILINGS_CHECKED={checks}/2")
+    assert checks == 2
+
+    # The tail is what the increment is for, so it is stated rather than left implied.
+    say(f"W4_THE_TAIL_IS_RAGGED_ON_BOTH_AXES="
+        f"{int(MS._latent_tiles(latent)[-1][1] % pmax != 0 and MS._output_tiles(latent)[-1][1] % moving != 0)}")
+
+
+def test_width_an_exact_fit_call_leaves_the_tiled_counter_at_zero() -> None:
+    """WIDTH 5 of 7 -- the exact-fit control: the tiled counter stays 0, the seam's reads 1.
+
+    CERTIFYING COMPONENT: the width branch's FALSE arm -- an exact-fit latent must keep
+    `-040`'s untiled body.
+
+    THIS IS THE COUNTED ZERO THAT MAKES "ITS OWN COUNTED VALUE" A MEASUREMENT. Item 3
+    shows both counters read 1 on a tiled call; this one shows the tiled counter reads
+    0 when the width fits, and then fires it to 1 on a minimal tiled call in the same
+    process, so the zero is a discrimination and not a counter that never moves.
+
+    THE GEOMETRY IS THE ONE `-040`'S REVIEW ASKED FOR: `seq=2` walks the per-query
+    loop and `topk=512` walks MM2's four-chunk loop, neither of which `-040`'s single
+    1/1 case entered. So this item also carries `-040`'s body into a corner its own
+    acceptance left unmeasured, at the plan's registered tolerance pair.
+    """
+    say("W5_CERTIFYING_COMPONENT=MS.mla_sparse_attention width branch, FALSE arm")
+    case = dict(EXACT_FIT_CONTROL_CASE)
+    scale = case_scale(case)
+    say("W5_CASE=" + " ".join(f"{k}={v}" for k, v in case.items()))
+    say(f"W5_THIS_WIDTH_FITS_ONE_TILE_SET={int(case['latent'] % MS.LATENT_TILE == 0 and case['latent'] <= MS.MOVING_MAX)}")
+    say(f"W5_MM2_CHUNKS={case['topk'] // MS.KEY_CHUNK} W5_QUERIES={case['seq']}")
+
+    q_lift, c_kv, idx, _, _ = make_case(**case, seed=42)
+    reset_both_counters()
+    got = MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    seam_nki, seam_fallback, tiled_nki, tiled_fallback = both_counters()
+    say(f"W5_SEAM_NKI_DISPATCH={seam_nki}/1")
+    say(f"W5_TILED_NKI_DISPATCH={tiled_nki}  (the counted zero)")
+    say(f"W5_SEAM_TORCH_FALLBACK={seam_fallback} W5_TILED_TORCH_FALLBACK={tiled_fallback}")
+    assert seam_nki == 1 and tiled_nki == 0
+    assert seam_fallback == 0 and tiled_fallback == 0
+
+    want = sparse_mla_torch_reference(q_lift, c_kv, idx, scale)
+    err = float((got - want).abs().max())
+    say(f"W5_MAXABS_VS_INDEPENDENT_ORACLE={err:.3e}  RTOL={RTOL} ATOL={ATOL}")
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+    say(f"W5_CASES_AGREED=1/1 over queries={case['seq']}")
+
+    # THE CONTROL FOR THE ZERO: a minimal tiled call in the same process must move the
+    # tiled counter off 0. Its width is 129, which is exactly the value `-040`'s G4
+    # table used to assert was REFUSED.
+    tiled_case = dict(MINIMAL_TILED_CASE)
+    tq, tc, tidx, _, _ = make_case(**tiled_case, seed=43)
+    MS.mla_sparse_attention(tq, tc, tidx, case_scale(tiled_case))
+    seam_after, _, tiled_after, _ = both_counters()
+    say(f"W5_CONTROL_A_TILED_CALL_MOVES_IT tiled={tiled_after} seam={seam_after}")
+    say(f"W5_CONTROL_FIRES={int(tiled_after == 1)}")
+    assert (seam_after, tiled_after) == (2, 1)
+
+
+def test_width_the_shipped_oracle_agrees_with_the_independent_reference() -> None:
+    """WIDTH 6 of 7 -- the module's own torch oracle agrees with this file's reference.
+
+    CERTIFYING COMPONENT: `MS.mla_sparse_attention_torch_oracle`.
+
+    WHY THIS EXISTS, and it is a review finding on `-040` rather than a new idea. The
+    module ships that oracle as section 4's clause (a) -- the only torch arithmetic the
+    module is allowed -- and its presence is what `-040`'s P13 screen excludes BY NAME.
+    But no test called it, so the exclusion named a function nobody had checked. One
+    agreement assert fixes that: the shipped oracle and this file's independently
+    written float64 reference must agree at the tolerance pair the plan registers.
+
+    IT MEASURES NO KERNEL. Both sides are torch, so this item says nothing about the
+    NKI path and claims nothing about it -- it says the excluded region is correct.
+    """
+    say("W6_CERTIFYING_COMPONENT=MS." + ORACLE_NAME)
+    case = dict(WIDTH_CASE)
+    scale = case_scale(case)
+    q_lift, c_kv, idx, _, _ = make_case(**case, seed=41)
+
+    reset_both_counters()
+    shipped = MS.mla_sparse_attention_torch_oracle(q_lift, c_kv, idx, scale)
+    independent = sparse_mla_torch_reference(q_lift, c_kv, idx, scale)
+    err = float((shipped - independent).abs().max())
+    say(f"W6_MAXABS_SHIPPED_ORACLE_VS_INDEPENDENT_REFERENCE={err:.3e} "
+        f"RTOL={RTOL} ATOL={ATOL}")
+    torch.testing.assert_close(shipped, independent, rtol=RTOL, atol=ATOL)
+    say("W6_ORACLE_AGREED=1/1")
+
+    # And it dispatched nothing: the oracle is not a fallback and nothing routes to it.
+    say(f"W6_NO_DISPATCH_HAPPENED={both_counters()}")
+    assert both_counters() == (0, 0, 0, 0)
+
+
+def test_width_the_two_widths_g4_used_to_refuse_are_now_served() -> None:
+    """WIDTH 7 of 7 -- the gate this increment removes is removed, and its floor is kept.
+
+    CERTIFYING COMPONENT: the two relaxed latent bounds in `MS._require_admissible`.
+
+    THIS ITEM IS THE EVIDENCE FOR AN EDIT IN `-040`'S OWN ACCEPTANCE. `-040`'s G4 table
+    asserted refusals at `LATENT_TILE + 1` and `MOVING_MAX + LATENT_TILE`; this
+    increment serves both widths, so those two rows were removed from G4 under the
+    lead's ruling and their positive counterparts are asserted HERE instead. The two
+    expressions are written exactly as G4 wrote them, so a reader can match them line
+    for line against the deleted rows.
+
+    THE CONTROL: `latent=0` must still refuse, with its own message. Without it this
+    item would pass just as well against a check that had stopped refusing anything.
+    """
+    say("W7_CERTIFYING_COMPONENT=MS._require_admissible, the two relaxed latent bounds")
+    case = dict(WIDTH_CASE)
+    scale = case_scale(case)
+    served = 0
+    for label, latent in (
+        ("latent_not_a_multiple_of_the_partition_tile", MS.LATENT_TILE + 1),
+        ("latent_past_the_moving_axis", MS.MOVING_MAX + MS.LATENT_TILE),
+        ("the_declared_width", case["latent"]),
+        ("the_zero_extended_reference_width", REFERENCE_WIDTH),
+    ):
+        MS._require_admissible(case["seq"], case["heads"], latent, case["rope"],
+                               case["topk"], case["s_kv"], scale)
+        say(f"W7_SERVED {label} latent={latent} REFUSAL=none")
+        served += 1
+    say(f"W7_WIDTHS_NOW_SERVED={served}/4")
+    assert served == 4
+
+    with pytest.raises(MS.MlaSparseAttentionError) as caught:
+        MS._require_admissible(case["seq"], case["heads"], 0, case["rope"],
+                               case["topk"], case["s_kv"], scale)
+    message = " ".join(str(caught.value).split())
+    say(f"W7_CONTROL_LATENT_ZERO_STILL_REFUSES_VERBATIM={message}")
+    assert "latent rank must be positive" in message
+    say("W7_CONTROL_FIRES=1")

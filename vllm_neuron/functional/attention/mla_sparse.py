@@ -377,12 +377,308 @@ def mla_sparse_attention_rope_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
     return out_hbm
 
 
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-041` -- the tiling path for a latent rank that does not fit one tile.
+#
+# EVERYTHING THIS INCREMENT ADDS IS IN THIS ONE CONTIGUOUS BLOCK, on purpose. Two
+# increments write this file and the plan partitions them by concern (§11.A):
+# `-040` owns the kernel above, the seam and the seam's own counter; `-041` owns the
+# tiling path behind that seam and its own counter. Keeping the block contiguous
+# means `-040`'s body is provably untouched -- the acceptance digests
+# `_attention_body`'s own source and requires the value the landed commit had -- and
+# a reviewer can read this increment as one unit instead of hunting for it.
+#
+# WHAT WAS BOUNDED AND IS NOT ANY MORE. `-040` required the latent rank to be a
+# positive multiple of 128 AND to fit one MM2 moving tile of 512, because it tiled
+# neither axis. Both bounds are now tiled instead of asserted:
+#
+#   * the PARTITION axis, in tiles of 128 with a RAGGED LAST TILE. MM1 contracts the
+#     latent, so the latent rides partitions there and 2,051 needs 17 tiles whose
+#     last one is 3 deep.
+#   * the MM2 MOVING free axis, in tiles of 512, again with a ragged last tile: the
+#     latent is the OUTPUT free axis in MM2, so 2,051 needs 5 tiles whose last one is
+#     3 wide.
+#
+# NOTHING IS PADDED, AND THAT IS A MEASUREMENT RATHER THAN A PREFERENCE. Before this
+# was designed, every primitive the tiled path uses was run on a 3-extent tile on the
+# leased host at the landed commit: a 3-partition SBUF tile, a 3-deep `nc_matmul`
+# contraction, a 3-wide `nc_matmul` moving axis, `nc_transpose` in both orientations,
+# `dma_transpose` into a 3-partition tail tile, and `nc_n_gather` on a 3-partition
+# data tile with its index tile sliced to match. All ten readings agreed with torch to
+# 0.000e+00 (`probe-041-ragged-tiles.out`, `RPROBE_OK=10`). So this image accepts
+# ragged extents and a pad would be dead weight. The same probe also measured the one
+# fact the acceptance's exactness claim rests on: adding 125 exact zeros to a 3-deep
+# contraction is BIT-IDENTICAL, not merely close.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _MlaSparseTiledDispatchCounters:
+    """How the TILED path was reached, per process.
+
+    A separate object from `-040`'s, because the plan gives each increment its own
+    counted value and has neither read the other's. This one is ADDITIVE and not
+    exclusive: a tiled call increments `-040`'s seam counter as well, since that
+    counter counts every dispatch through the seam whatever body runs. `-042`'s decode
+    predicate reads both, so the two must compose rather than partition the traffic.
+    """
+
+    nki_dispatch: int = 0
+    torch_fallback: int = 0
+
+
+_MLA_SPARSE_TILED_COUNTERS = _MlaSparseTiledDispatchCounters()
+
+
+def reset_mla_sparse_tiled_dispatch_counters() -> None:
+    """Zero the TILED counters. `-040`'s reset does not touch these and vice versa."""
+    _MLA_SPARSE_TILED_COUNTERS.nki_dispatch = 0
+    _MLA_SPARSE_TILED_COUNTERS.torch_fallback = 0
+
+
+def mla_sparse_tiled_dispatch_counters() -> tuple[int, int]:
+    """``(nki_dispatch, torch_fallback)`` for the TILED path since its last reset.
+
+    ``torch_fallback`` can only read ``0`` for the same reason `-040`'s can: there is
+    no torch attention route in this module to increment it, an inadmissible geometry
+    raises (P13), and the counter exists so a test can STATE the zero rather than
+    assume it.
+    """
+    return (
+        _MLA_SPARSE_TILED_COUNTERS.nki_dispatch,
+        _MLA_SPARSE_TILED_COUNTERS.torch_fallback,
+    )
+
+
+def _latent_tiles(latent: int) -> tuple[tuple[int, int], ...]:
+    """``(offset, extent)`` per PARTITION-axis latent tile. The last one may be ragged.
+
+    Derived from the latent rank rather than assumed uniform, which is the whole
+    difference from `-040`: at 2,051 this returns 17 tiles, the last of extent 3.
+    """
+    tiles = []
+    offset = 0
+    while offset < latent:
+        tiles.append((offset, min(LATENT_TILE, latent - offset)))
+        offset += LATENT_TILE
+    return tuple(tiles)
+
+
+def _output_tiles(latent: int) -> tuple[tuple[int, int], ...]:
+    """``(offset, extent)`` per MM2 MOVING-axis output tile. The last may be ragged.
+
+    A different tiling of the same axis, because the latent rides partitions in MM1
+    and the moving free axis in MM2, and those two axes have different extents on this
+    image. At 2,051 this returns 5 tiles, the last of extent 3.
+    """
+    tiles = []
+    offset = 0
+    while offset < latent:
+        tiles.append((offset, min(MOVING_MAX, latent - offset)))
+        offset += MOVING_MAX
+    return tuple(tiles)
+
+
+def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
+                          q_pe_hbm=None, k_pe_hbm=None):
+    """Trace sparse latent attention with the latent axis TILED on both its axes.
+
+    Same arithmetic as `-040`'s body and the same RoPE elision at trace time; the
+    difference is that every latent-indexed buffer is a LIST of tiles whose last
+    member may be ragged, instead of one uniform 3-D buffer. A ragged tile cannot live
+    in a uniform buffer, which is why the shape changes and not just the loop bound.
+
+    Shapes are `-040`'s, with the latent rank now unconstrained above 1:
+        q_lift_hbm  [S, H, L]      the absorbed Q latent, per head
+        c_kv_hbm    [S_kv, L]      the latent KV cache
+        topk_hbm    [S, K] int32   the selected cache rows, per query
+        q_pe_hbm    [S, H, R]      present only when R > 0
+        k_pe_hbm    [S_kv, R]      present only when R > 0
+        out_hbm     [S, H, L]      written once per query
+    """
+    seq, heads, latent = q_lift_hbm.shape
+    s_kv = c_kv_hbm.shape[0]
+    topk = topk_hbm.shape[1]
+    n_chunks = topk // KEY_CHUNK
+    rope = 0 if q_pe_hbm is None else q_pe_hbm.shape[2]
+    lat_tiles = _latent_tiles(latent)
+    out_tiles = _output_tiles(latent)
+
+    # ---- the cache, transposed onto partitions ONCE for the whole call ----------
+    # One `dma_transpose` per latent tile, exactly as `-040`, except the last tile's
+    # extent is the remainder. The tail transpose was measured on its own before this
+    # was written, because it was the reading least likely to be legal.
+    c_sb = [_sbuf(extent, s_kv) for _, extent in lat_tiles]
+    for li, (offset, extent) in enumerate(lat_tiles):
+        nisa.dma_transpose(
+            dst=c_sb[li],
+            src=c_kv_hbm.ap(pattern=[[latent, s_kv], [1, extent]], offset=offset),
+        )
+    k_pe_sb = None
+    if rope > 0:
+        k_pe_sb = _sbuf(rope, s_kv)
+        nisa.dma_transpose(
+            dst=k_pe_sb,
+            src=k_pe_hbm.ap(pattern=[[rope, s_kv], [1, rope]], offset=0),
+        )
+
+    # ---- per-query working set, allocated once and reused across the loop -------
+    # `c_g_t` and `out_sb` stay single buffers with the latent on their FREE axis,
+    # where a ragged extent needs no special case; only the partition-axis buffers
+    # become lists.
+    idx_sb = _sbuf(LATENT_TILE, topk, dtype=nl.uint32)
+    q_lift_t = [_sbuf(extent, heads) for _, extent in lat_tiles]
+    c_g = [_sbuf(extent, topk) for _, extent in lat_tiles]
+    c_g_t = _sbuf(KEY_CHUNK, n_chunks, latent)
+    p_t = _sbuf(KEY_CHUNK, n_chunks, heads)
+    p = _sbuf(heads, topk)
+    neg_row_max = _sbuf(heads, 1)
+    exp_bias = _sbuf(heads, 1)
+    row_sum = _sbuf(heads, 1)
+    recip = _sbuf(heads, 1)
+    out_sb = _sbuf(heads, latent)
+    q_pe_t = _sbuf(rope, heads) if rope > 0 else None
+    k_pe_g = _sbuf(rope, topk) if rope > 0 else None
+
+    for q_idx in nl.affine_range(seq):
+        # ---- this query's selected rows, replicated to every partition ----------
+        nisa.tensor_copy(
+            dst=idx_sb,
+            src=nl.load(
+                topk_hbm.ap(pattern=[[0, LATENT_TILE], [1, topk]],
+                            offset=q_idx * topk),
+                dtype=nl.uint32,
+            ),
+        )
+
+        # ---- gather the latent cache rows: one instruction per latent tile ------
+        # The index tile is SLICED to the data tile's extent. `nc_n_gather` reads its
+        # offsets from the same partition it writes, so a 3-deep data tile needs a
+        # 3-deep index tile and not the full 128.
+        for li, (_, extent) in enumerate(lat_tiles):
+            nisa.nc_n_gather(dst=c_g[li], data=c_sb[li], indices=idx_sb[0:extent, :])
+
+        # ---- this query's Q latent, transposed onto partitions ------------------
+        for li, (offset, extent) in enumerate(lat_tiles):
+            nisa.dma_transpose(
+                dst=q_lift_t[li],
+                src=q_lift_hbm.ap(pattern=[[latent, heads], [1, extent]],
+                                  offset=q_idx * heads * latent + offset),
+            )
+
+        # ---- MM1: scores[H, K] = sum over latent tiles of q_lift_t.T @ c_g ------
+        # The ragged tail tile contributes a 3-deep contraction to the same
+        # accumulation as the 16 full ones. Nothing is masked and nothing is padded:
+        # a shorter contraction is a shorter contraction.
+        scores_ps = _psum(heads, topk)
+        for li in range(len(lat_tiles)):
+            nisa.nc_matmul(
+                dst=scores_ps,
+                stationary=q_lift_t[li],
+                moving=c_g[li],
+                accumulate=(li > 0),
+            )
+        if rope > 0:
+            nisa.nc_n_gather(dst=k_pe_g, data=k_pe_sb, indices=idx_sb[0:rope, :])
+            nisa.dma_transpose(
+                dst=q_pe_t,
+                src=q_pe_hbm.ap(pattern=[[rope, heads], [1, rope]],
+                                offset=q_idx * heads * rope),
+            )
+            nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t, moving=k_pe_g,
+                           accumulate=True)
+
+        # ---- the gathered cache, transposed for MM2 -----------------------------
+        # Each latent tile transposes into its own slice of the latent free axis, so
+        # the ragged tail lands as a 3-wide slice rather than a padded 128-wide one.
+        for ck in range(n_chunks):
+            ks = ck * KEY_CHUNK
+            for li, (offset, extent) in enumerate(lat_tiles):
+                c_g_t_ps = _psum(KEY_CHUNK, extent)
+                nisa.nc_transpose(dst=c_g_t_ps, data=c_g[li][:, ks:ks + KEY_CHUNK])
+                nisa.tensor_copy(
+                    dst=c_g_t[:, ck, offset:offset + extent],
+                    src=c_g_t_ps,
+                )
+
+        # ---- softmax over K, per head row --------------------------------------
+        # Untouched by the tiling: the scores tile is [H, K] whatever the latent rank
+        # was, so this is `-040`'s chain verbatim.
+        nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_ps, axis=1,
+                           negate=True)
+        nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
+                           operand0=softmax_scale, engine=nisa.engine.vector)
+        nisa.activation(dst=p, op=nl.exp, data=scores_ps, bias=exp_bias,
+                        scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
+                        reduce_cmd=nisa.reduce_cmd.reset_reduce)
+        nisa.reciprocal(dst=recip, data=row_sum)
+
+        # ---- MM2: out[H, L] = p[H, K] @ c_g[K, L], K contracted on partitions ---
+        for ck in range(n_chunks):
+            ks = ck * KEY_CHUNK
+            p_t_ps = _psum(KEY_CHUNK, heads)
+            nisa.nc_transpose(dst=p_t_ps, data=p[:, ks:ks + KEY_CHUNK])
+            nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
+
+        # THE SECOND TILING, and the one `-040`'s bound was really about: the latent
+        # is MM2's moving free axis, so the output is produced 512 columns at a time
+        # and the last tile is 3 wide. The denominator is applied per output tile, for
+        # `-040`'s reason -- one pass over [H, L] rather than one over [H, K].
+        for offset, extent in out_tiles:
+            pv_ps = _psum(heads, extent)
+            for ck in range(n_chunks):
+                nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
+                               moving=c_g_t[:, ck, offset:offset + extent],
+                               accumulate=(ck > 0))
+            nisa.tensor_scalar(dst=out_sb[:, offset:offset + extent], data=pv_ps,
+                               op0=nl.multiply, operand0=recip,
+                               engine=nisa.engine.vector)
+        nl.store(
+            out_hbm.ap(pattern=[[latent, heads], [1, latent]],
+                       offset=q_idx * heads * latent),
+            value=out_sb,
+        )
+
+
+@nki.jit
+def mla_sparse_attention_nope_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
+                                           softmax_scale):
+    """The tiled R == 0 entry point, and the one this increment's acceptance runs."""
+    seq, heads, latent = q_lift_hbm.shape
+    out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
+    _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm)
+    return out_hbm
+
+
+@nki.jit
+def mla_sparse_attention_rope_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
+                                           topk_hbm, softmax_scale):
+    """The tiled R > 0 entry point.
+
+    KEPT FOR `-040`'S REASON, which applies with more force here: this increment
+    removes a latent-width bound, and serving the wide latent only when there is no
+    RoPE half would have swapped one refused geometry for another. The alternative was
+    to refuse the tiled RoPE geometry, which would have minted a refusal message
+    promising a future increment nobody owns -- the defect this file already carries
+    twice on the topk axis and which is under design review. The RoPE limb contracts
+    its own axis into the same score tile, so it is latent-independent and shares
+    every line with the entry point above.
+    """
+    seq, heads, latent = q_lift_hbm.shape
+    out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
+    _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
+                          q_pe_hbm=q_pe_hbm, k_pe_hbm=k_pe_hbm)
+    return out_hbm
+
+
 def _require_admissible(seq: int, heads: int, latent: int, rope: int, topk: int,
                         s_kv: int, softmax_scale: float) -> None:
     """Raise unless this kernel serves the geometry, rather than fall back (P13).
 
-    EVERY BOUND HERE IS AN AXIS THE KERNEL PUTS ON A BOUNDED HARDWARE AXIS, and each
-    names which one. There is deliberately NO bound on the RoPE width being positive
+    EVERY BOUND HERE THAT NAMES A HARDWARE AXIS SAYS WHICH ONE; the remaining bounds
+    are plain positivity, which is all that is left of an axis once it is TILED rather
+    than bounded -- the latent rank is that case, under `inc-glm53f-041`. There is
+    deliberately NO bound on the RoPE width being positive
     -- that absence is the increment. There is deliberately no bound on S or S_kv
     either: the query loop and the cache free axis both walk whatever they are given.
     """
@@ -396,17 +692,14 @@ def _require_admissible(seq: int, heads: int, latent: int, rope: int, topk: int,
             f"heads rides the matmul stationary free axis, bounded at {HEAD_MAX} "
             f"({_TILE_PROVENANCE}); got heads={heads}"
         )
-    if latent < 1 or latent % LATENT_TILE != 0:
+    if latent < 1:
         raise MlaSparseAttentionError(
-            f"the latent rank rides the partition axis in tiles of {LATENT_TILE}, so "
-            f"it must be a positive multiple of it; got latent={latent}"
-        )
-    if latent > MOVING_MAX:
-        raise MlaSparseAttentionError(
-            f"the latent rank rides the matmul moving free axis in MM2, bounded at "
-            f"{MOVING_MAX} ({_TILE_PROVENANCE}); got latent={latent}. This "
-            f"checkpoint's kv_lora_rank is {TARGET_LATENT_RANK}, which fits; "
-            f"widening past it is inc-glm53f-041's tiling increment"
+            f"the latent rank must be positive; got latent={latent}. inc-glm53f-041 "
+            f"TILES both axes this used to be bounded on -- the partition axis in "
+            f"tiles of {LATENT_TILE} with a ragged tail, and MM2's moving free axis in "
+            f"tiles of {MOVING_MAX} ({_TILE_PROVENANCE}) -- so neither a multiple-of "
+            f"nor an upper bound is asserted here any more. This checkpoint's "
+            f"kv_lora_rank is {TARGET_LATENT_RANK} and takes the untiled body"
         )
     if rope < 0 or rope > HEAD_MAX:
         raise MlaSparseAttentionError(
@@ -518,14 +811,34 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
         )
 
     _MLA_SPARSE_COUNTERS.nki_dispatch += 1
+
+    # `inc-glm53f-041`'s branch. The seam decides from the WIDTH ALONE: an exact-fit
+    # latent keeps `-040`'s body and anything ragged or wider than one MM2 moving tile
+    # takes the tiled one. No caller passes a flag, so no caller can pick the wrong
+    # path, and `can_run_mla_sparse_attention` needs no second question.
+    #
+    # THE COUNTER ABOVE IS DELIBERATELY NOT MADE CONDITIONAL. It counts every dispatch
+    # through this seam whichever body runs, which is what `inc-glm53f-042`'s decode
+    # predicate reads. The tiled counter here is ADDITIVE rather than exclusive, so a
+    # tiled call is counted twice over -- once as a seam dispatch and once as a tiled
+    # dispatch -- and an exact-fit call increments only the seam counter. That
+    # difference is what a test can measure, and it is measured.
+    tiled = latent % LATENT_TILE != 0 or latent > MOVING_MAX
+    if tiled:
+        _MLA_SPARSE_TILED_COUNTERS.nki_dispatch += 1
+
     q_lift_f32 = q_lift.contiguous().to(torch.float32)
     c_kv_f32 = c_kv.contiguous().to(torch.float32)
     topk_i32 = topk_indices.contiguous().to(torch.int32)
     if rope == 0:
-        return wrap_nki(mla_sparse_attention_nope_kernel)(
+        nope_entry = (mla_sparse_attention_nope_tiled_kernel if tiled
+                      else mla_sparse_attention_nope_kernel)
+        return wrap_nki(nope_entry)(
             q_lift_f32, c_kv_f32, topk_i32, float(softmax_scale)
         )
-    return wrap_nki(mla_sparse_attention_rope_kernel)(
+    rope_entry = (mla_sparse_attention_rope_tiled_kernel if tiled
+                  else mla_sparse_attention_rope_kernel)
+    return wrap_nki(rope_entry)(
         q_lift_f32,
         q_pe.contiguous().to(torch.float32),
         c_kv_f32,
@@ -572,7 +885,10 @@ def mla_sparse_kernel_identity() -> tuple[tuple[str, str], ...]:
     differ, and it is the form the landed `mla_projections.py` uses.
     """
     identities = []
-    for entry in (mla_sparse_attention_nope_kernel, mla_sparse_attention_rope_kernel):
+    for entry in (mla_sparse_attention_nope_kernel,
+                  mla_sparse_attention_rope_kernel,
+                  mla_sparse_attention_nope_tiled_kernel,
+                  mla_sparse_attention_rope_tiled_kernel):
         func = getattr(entry, "func", None)
         target = func if func is not None else entry
         identities.append((target.__module__, target.__qualname__))
