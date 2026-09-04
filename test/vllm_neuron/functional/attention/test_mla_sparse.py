@@ -727,10 +727,15 @@ def test_the_kernel_entry_points_are_authored_here_and_not_imported() -> None:
             f"{qualname} reports module {module_name}, not {MS.__name__}: the kernel "
             f"under test is not authored in this module"
         )
-    assert len(identities) == 4, (
-        f"this module authors four entry points -- the NoPE one, the RoPE one and "
-        f"inc-glm53f-041's tiled pair; the identity reading returned "
-        f"{len(identities)}"
+    # THE COUNT MOVED, AND `inc-glm53f-093` IS THE WRITER THAT MOVED IT. This is the one
+    # second-writer touch of `-040`'s items that block makes, and its plan block's
+    # Surface bullet authorises it by name: "the enumerator/K1 count if it authors entry
+    # points (disclosed)". `-093` authors the row-tiled pair, so the enumerator returns
+    # six and this number follows it. Nothing else in this item changes.
+    assert len(identities) == 6, (
+        f"this module authors six entry points -- the NoPE one, the RoPE one, "
+        f"inc-glm53f-041's tiled pair and inc-glm53f-093's row-tiled pair; the identity "
+        f"reading returned {len(identities)}"
     )
     naive = MS.mla_sparse_attention_nope_kernel.__module__
     say(f"K1_WITHOUT_THE_UNWRAP_IT_WOULD_READ={naive}")
@@ -1329,3 +1334,469 @@ def test_width_the_ragged_tail_tile_carries_signal_the_output_depends_on() -> No
     # The margin a tail-tile defect must clear, both readings taken over the REAL columns
     # so the ratio compares like with like. Quoted by the mutation rows.
     say(f"W8_MARGIN_A_TAIL_DEFECT_MUST_CLEAR={contribution / max(err_real, 1e-12):.3e}x")
+
+
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-093` -- the four `rows` items. THE SELECTION IS PARTITIONED BY NAME, on
+# `-041`'s form: every item below carries `rows` and no item above does, so `-k rows`
+# runs this increment's acceptance, `-k width` still runs `-041`'s eight and
+# `-k geometry` still runs `-040`'s four. At the parent commit `-k rows` collects NOTHING
+# -- that is the selector's population control and it is read in the driver, not here.
+# --------------------------------------------------------------------------- #
+
+#: THIS INCREMENT'S DECLARED CASE, every field the plan block's own: the production
+#: selected-row count 2,048 (`index_topk` in this checkpoint's config) on the
+#: checkpoint's own latent rank, head count and RoPE width. `s_kv` is twice the row count
+#: so the selection is a real subset.
+ROWS_CASE = dict(seq=2, heads=64, latent=512, topk=2048, s_kv=4096, rope=0)
+
+#: The split-invariance case: ONE score tile, where the row-tiled body must reproduce
+#: `-040`'s body exactly. `topk == MS.MOVING_MAX` is the widest count `-040` serves.
+SPLIT_CASE = dict(seq=2, heads=64, latent=512, topk=512, s_kv=1024, rope=0)
+
+#: A cheap two-tile geometry, for the item that has to move the row-tiled counter off
+#: zero after reading the zero.
+MINIMAL_ROW_TILED_CASE = dict(seq=1, heads=8, latent=128, topk=1024, s_kv=2048, rope=0)
+
+#: The combination D59-N6 keeps refused: a latent that needs `-041`'s tiling AND a row
+#: count that needs this block's. 2,051 is `-041`'s own declared width.
+COMBINATION_LATENT = 2051
+
+#: Where the highest-scoring selected row is placed, and it is placed rather than left to
+#: chance. See `test_rows_the_production_selected_row_count_matches_the_torch_oracle`.
+#: 600 sits inside score tile 1 of 4 (tiles are 512 wide).
+PEAK_POSITION = 600
+
+
+def all_counters() -> tuple[int, int, int, int, int, int]:
+    """`(seam_nki, seam_fb, tiled_nki, tiled_fb, row_nki, row_fb)` for the three seams.
+
+    Read as one tuple because all three COMPOSE rather than partition: the seam counter
+    counts every dispatch whichever body ran, and each tiling counter additionally counts
+    its own. `-042` reads all three per decode step, so all three are stated together.
+    """
+    seam_nki, seam_fb = MS.mla_sparse_dispatch_counters()
+    tiled_nki, tiled_fb = MS.mla_sparse_tiled_dispatch_counters()
+    row_nki, row_fb = MS.mla_sparse_row_tiled_dispatch_counters()
+    return seam_nki, seam_fb, tiled_nki, tiled_fb, row_nki, row_fb
+
+
+def reset_all_counters() -> None:
+    """Zero all three counter objects. Each increment owns its own reset."""
+    MS.reset_mla_sparse_dispatch_counters()
+    MS.reset_mla_sparse_tiled_dispatch_counters()
+    MS.reset_mla_sparse_row_tiled_dispatch_counters()
+
+
+def order_rows_so_the_peak_lands_in_tile_one(q_lift, c_kv, idx):
+    """Reorder each query's selected rows so its highest-scoring row sits at
+    :data:`PEAK_POSITION`, inside score tile 1 of 4.
+
+    WHY THIS EXISTS, and it is a measured requirement rather than tidiness. The kernel
+    exponentiates each score tile against that TILE's row max and then rescales the
+    running denominator and accumulator when a later tile raises the max. Which of the
+    two rescales does any work depends on WHERE the global max sits:
+
+      * global max in the LAST tile  -> the tile rescale is exactly 1.0 every time, and a
+        sign defect in it is INVISIBLE. Measured: on monotone data a flipped tile rescale
+        moved the answer by 0.000e+00 (`probe-093-merge-algebra.out` section 5, and
+        revision 1 of that probe failed its own control on exactly this).
+      * global max in the FIRST tile -> the accumulator rescale is the blind one.
+
+    So the peak is PLACED in a middle tile, which makes both rescales do work. Reordering
+    the selection is legitimate and is the disclosure this docstring exists for: a
+    softmax-weighted sum over a SET does not depend on the order the set is listed in --
+    `-040` measured that when its first control could not fire (`investigation-040.md`,
+    FOUND 1) -- so this changes WHICH arm of the kernel runs and not the expected value.
+    """
+    ordered = idx.clone()
+    for s in range(int(idx.shape[0])):
+        gathered = c_kv[idx[s].to(torch.int64)].to(torch.float64)      # [K, L]
+        row_score = (q_lift[s].to(torch.float64) @ gathered.t()).max(dim=0).values
+        ascending = torch.argsort(row_score)
+        shift = int(ascending.numel()) - 1 - PEAK_POSITION
+        rotated = torch.cat([ascending[shift:], ascending[:shift]])
+        ordered[s] = idx[s][rotated]
+    return ordered
+
+
+def score_tile_diagnostics(q_lift, c_kv, idx, scale):
+    """Per query: the scaled score max of each score tile, and WHICH tile holds each
+    HEAD's max. NO KERNEL IS INVOLVED -- float64 torch over the inputs alone.
+
+    THE PER-HEAD READING IS THE ONE THAT MATTERS, and getting that right took a second
+    pass. The kernel's running max, and therefore both rescale factors, are PER HEAD ROW:
+    head `h`'s accumulator is rescaled only when a later tile raises `h`'s own max. So a
+    table of maxima taken over all heads says less than it looks like it does. What makes
+    this item sensitive to a rescale defect is:
+
+      * at least one head whose max is NOT in tile 0, so the ACCUMULATOR rescale is
+        strictly below 1 for that head; and
+      * at least one head whose max is NOT in the last tile, so the TILE rescale is
+        strictly below 1 for that head.
+
+    Both are asserted from this reading. The deliberate placement of the highest-scoring
+    row in tile 1 guarantees at least the head that owns it satisfies both at once.
+    """
+    tiles = MS._score_tiles(int(idx.shape[1]))
+    per_query_max = []
+    per_query_argmax = []
+    for s in range(int(idx.shape[0])):
+        gathered = c_kv[idx[s].to(torch.int64)].to(torch.float64)
+        scores = (q_lift[s].to(torch.float64) @ gathered.t()) * scale       # [H, K]
+        # [H, T]: each head's max within each score tile.
+        per_tile = torch.stack(
+            [scores[:, lo:lo + extent].max(dim=1).values for lo, extent in tiles], dim=1
+        )
+        per_query_max.append([float(v) for v in per_tile.max(dim=0).values])
+        per_query_argmax.append([int(t) for t in per_tile.argmax(dim=1)])
+    return per_query_max, per_query_argmax
+
+
+def test_rows_the_production_selected_row_count_matches_the_torch_oracle() -> None:
+    """ROWS 1 of 4 -- the kernel serves 2,048 selected rows and matches float64 torch.
+
+    CERTIFYING COMPONENT: `MS._attention_body_row_tiled`, reached through the seam's
+    selected-row branch.
+
+    THIS IS THE READING THE BLOCK EXISTS FOR. `-043` landed the selector at this
+    checkpoint's `index_topk` of 2,048 and `-040`'s gate refused every count past 512, so
+    until this item ran, no test had read the kernel at the width the decode path passes.
+
+    THE ROUTE READINGS ARE PRINTED BEFORE THE NUMERIC COMPARE, `-040`'s and `-041`'s
+    lesson: a failing assertion takes the dispatch lines with it, and then a mutation row
+    cannot tell "the arithmetic broke" from "the kernel was never reached".
+
+    THE COMPARISON'S CONTROL IS `-040`'S, the one already measured able to fire: one
+    selected row is replaced by a cache row the selection does not hold, so the SET
+    changes. A row PERMUTATION is NOT a control here and is not used as one -- the answer
+    is order-invariant, which is the property this item's own row ordering relies on.
+    """
+    say("R1_CERTIFYING_COMPONENT=MS._attention_body_row_tiled via MS.mla_sparse_attention")
+    case = dict(ROWS_CASE)
+    scale = case_scale(case)
+    say("R1_CASE=" + " ".join(f"{k}={v}" for k, v in case.items()) + f" scale={scale:.6e}")
+
+    # THE TILING, read out of the module rather than written down here. The property is
+    # stronger than the count: the tiles must PARTITION the selected-row axis, and every
+    # extent must be a whole number of MM2 key chunks or the body would need a
+    # partial-chunk case it does not have.
+    tiles = MS._score_tiles(case["topk"])
+    say(f"R1_SCORE_TILES={tiles}")
+    say(f"R1_SCORE_TILE_COUNT={len(tiles)} EXPECTED_FROM_THE_IMAGE="
+        f"{-(-case['topk'] // MS.MOVING_MAX)}")
+    assert len(tiles) == -(-case["topk"] // MS.MOVING_MAX)
+    covered = 0
+    for lo, extent in tiles:
+        assert lo == covered, f"the score tiles are not contiguous at offset {lo}"
+        assert extent <= MS.MOVING_MAX, f"tile extent {extent} exceeds the moving axis"
+        assert extent % MS.KEY_CHUNK == 0, (
+            f"tile extent {extent} is not a whole number of {MS.KEY_CHUNK}-key chunks"
+        )
+        covered += extent
+    say(f"R1_TILES_COVER_THE_AXIS_EXACTLY={int(covered == case['topk'])} "
+        f"COVERED={covered} TOPK={case['topk']}")
+    assert covered == case["topk"]
+
+    q_lift, c_kv, idx, q_pe, k_pe = make_case(**case, seed=93)
+    assert q_pe is None and k_pe is None, "the declared case carries no RoPE half"
+    idx = order_rows_so_the_peak_lands_in_tile_one(q_lift, c_kv, idx)
+
+    # THE NON-VACUITY GUARD, and it is internal to the item: unless the global row max
+    # sits in a MIDDLE tile, one of the two rescale factors is exactly 1.0 and this
+    # comparison cannot see a defect in it. Measured from the inputs, no kernel.
+    maxima, argmax_tiles = score_tile_diagnostics(q_lift, c_kv, idx, scale)
+    last = len(tiles) - 1
+    for s, (row, heads_argmax) in enumerate(zip(maxima, argmax_tiles)):
+        histogram = [heads_argmax.count(t) for t in range(len(tiles))]
+        say(f"R1_PER_TILE_SCALED_SCORE_MAX_QUERY_{s}="
+            + " ".join(f"{m:.6f}" for m in row) + f" ARGMAX_TILE={row.index(max(row))}")
+        say(f"R1_HEADS_WHOSE_OWN_MAX_IS_IN_EACH_TILE_QUERY_{s}={histogram} "
+            f"POPULATION_HEADS={len(heads_argmax)}")
+        assert row.index(max(row)) == 1, (
+            f"query {s}'s highest score is in tile {row.index(max(row))}, not tile 1; "
+            f"the deliberate row ordering did not take effect"
+        )
+        # THE TWO CONDITIONS THAT MAKE THIS ITEM SENSITIVE, asserted per head rather than
+        # over all heads at once. Each is a population count over the 64 head rows.
+        raises = sum(histogram[1:])
+        below = sum(histogram[:last])
+        say(f"R1_HEADS_WHOSE_MAX_IS_NOT_IN_TILE_0={raises}  (the accumulator rescale is "
+            f"below 1 for each of them)")
+        say(f"R1_HEADS_WHOSE_MAX_IS_NOT_IN_THE_LAST_TILE={below}  (the tile rescale is "
+            f"below 1 for each of them)")
+        assert raises > 0, (
+            f"query {s}: every head's max is in tile 0, so the accumulator rescale is "
+            f"exactly 1.0 everywhere and this item is blind to a defect in it"
+        )
+        assert below > 0, (
+            f"query {s}: every head's max is in the last tile, so the tile rescale is "
+            f"exactly 1.0 everywhere and this item is blind to a defect in it -- the "
+            f"case measured in probe-093-merge-algebra.out section 5"
+        )
+    say("R1_BOTH_RESCALE_ARMS_ARE_EXERCISED=1")
+
+    can_run = MS.can_run_mla_sparse_attention(
+        q_lift, case["seq"], case["heads"], case["latent"], case["rope"],
+        case["topk"], case["s_kv"], scale,
+    )
+    say(f"R1_CAN_RUN_KERNEL={can_run}")
+    assert can_run, "the production selected-row count must be admissible after this block"
+
+    reset_all_counters()
+    got = MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    counters = all_counters()
+    say(f"R1_COUNTERS_SEAM_TILED_ROW={counters}  EXPECTED=(1, 0, 0, 0, 1, 0)")
+    say(f"R1_OUTPUT_SHAPE={tuple(got.shape)}")
+    assert counters == (1, 0, 0, 0, 1, 0)
+    assert tuple(got.shape) == (case["seq"], case["heads"], case["latent"])
+
+    want = sparse_mla_torch_reference(q_lift, c_kv, idx, scale)
+    err = float((got - want).abs().max())
+    slack = float(((got - want).abs() / (ATOL + RTOL * want.abs())).max())
+    say(f"R1_MAXABS_VS_INDEPENDENT_ORACLE={err:.3e}  RTOL={RTOL} ATOL={ATOL}")
+    say(f"R1_SLACK_RATIO_AGAINST_THE_REGISTERED_BAND={slack:.3e}  (1.0 is the limit)")
+    say(f"R1_POPULATION_ELEMENTS_COMPARED={got.numel()}")
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+    say(f"R1_CASES_AGREED=1/1 over queries={case['seq']} rows={case['topk']}")
+
+    substituted = idx.clone()
+    for s in range(case["seq"]):
+        selected = {int(v) for v in idx[s].tolist()}
+        unused = [r for r in range(case["s_kv"]) if r not in selected]
+        assert unused, "the selection covers the whole cache; no substitution exists"
+        substituted[s, 0] = unused[0]
+    wrong = sparse_mla_torch_reference(q_lift, c_kv, substituted, scale)
+    control_err = float((got - wrong).abs().max())
+    say(f"R1_CONTROL_MAXABS_AGAINST_A_DIFFERENT_SELECTION={control_err:.3e}")
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(got, wrong, rtol=RTOL, atol=ATOL)
+    say("R1_CONTROL_FIRES=1")
+    assert control_err > ATOL
+
+
+def test_rows_one_score_tile_is_bit_identical_to_the_untiled_body() -> None:
+    """ROWS 2 of 4 -- at one score tile the row-tiled body IS `-040`'s body, exactly.
+
+    CERTIFYING COMPONENT: `MS._attention_body_row_tiled`'s single-tile arm, against
+    `MS._attention_body`.
+
+    WHAT THE TWO SIDES ARE. Both entry points are called DIRECTLY rather than through the
+    seam, because the seam routes `topk=512` to `-040`'s body by design -- so the
+    row-tiled path has to be FORCED to be compared at a width `-040` also serves. That
+    is the whole reason this comparison is possible at all: unlike `-041`, which had no
+    width both bodies serve, the selected-row axis has an overlap at exactly
+    `MS.MOVING_MAX`.
+
+    WHY EXACT AND NOT `assert_close`. At one tile the merge emits NOTHING: the rescale
+    block is behind a trace-time branch on the tile count, so the traced instruction
+    sequence is `-040`'s, with the Q transpose hoisted above a single-iteration loop and
+    one fp32 copy of the accumulator added. An fp32 copy does not change a value. The
+    same claim was measured on the algebra before the kernel was written
+    (`probe-093-merge-algebra.out` reading 1, bit-identical in Python floats).
+
+    A NONZERO READING HERE IS `evidence_contradicts_design`. It would mean the single
+    tile arm is not `-040`'s arithmetic, and the answer is to report that, not to loosen
+    this line to a tolerance.
+    """
+    say("R2_CERTIFYING_COMPONENT=MS._attention_body_row_tiled single-tile arm vs "
+        "MS._attention_body")
+    case = dict(SPLIT_CASE)
+    scale = case_scale(case)
+    say("R2_CASE=" + " ".join(f"{k}={v}" for k, v in case.items()) + f" scale={scale:.6e}")
+    tiles = MS._score_tiles(case["topk"])
+    say(f"R2_SCORE_TILES={tiles} R2_TILE_COUNT={len(tiles)}  (one, which is the point)")
+    assert len(tiles) == 1 and tiles[0] == (0, case["topk"])
+
+    q_lift, c_kv, idx, _, _ = make_case(**case, seed=94)
+    q_f32 = q_lift.contiguous().to(torch.float32)
+    c_f32 = c_kv.contiguous().to(torch.float32)
+    i_i32 = idx.contiguous().to(torch.int32)
+
+    reset_all_counters()
+    untiled = wrap_nki(MS.mla_sparse_attention_nope_kernel)(q_f32, c_f32, i_i32, scale)
+    forced = wrap_nki(MS.mla_sparse_attention_nope_row_tiled_kernel)(
+        q_f32, c_f32, i_i32, scale
+    )
+    # A DIRECT CALL BYPASSES THE SEAM, so it counts nothing. Stated rather than assumed,
+    # because it is also the reason the route predicate is item 4's reading and not this
+    # item's: this item measures arithmetic, item 4 measures which body the seam picks.
+    say(f"R2_A_DIRECT_ENTRY_POINT_CALL_COUNTS_NOTHING={all_counters()}")
+    assert all_counters() == (0, 0, 0, 0, 0, 0)
+
+    compared = untiled.numel()
+    diff = float((untiled - forced).abs().max())
+    say(f"R2_POPULATION_ELEMENTS_COMPARED={compared}")
+    say(f"R2_MAXABS_UNTILED_VS_FORCED_ROW_TILED={diff:.3e}")
+    say(f"R2_BIT_IDENTICAL={int(diff == 0.0)}")
+    assert compared == case["seq"] * case["heads"] * case["latent"]
+    assert diff == 0.0, (
+        f"the forced row-tiled body disagrees with -040's body by {diff} at ONE score "
+        f"tile, where it emits no merge at all. That is evidence_contradicts_design: "
+        f"report it, do not widen this line to a tolerance"
+    )
+
+    # THE CONTROL FOR THE ZERO. Without it, a comparison of two calls that both returned
+    # zeros -- or the same cached tensor -- would read 0.0 just as happily. One selected
+    # row is changed on ONE side, and the same comparison must then see a difference.
+    substituted = idx.clone()
+    selected = {int(v) for v in idx[0].tolist()}
+    unused = [r for r in range(case["s_kv"]) if r not in selected]
+    assert unused, "the selection covers the whole cache; no substitution exists"
+    substituted[0, 0] = unused[0]
+    other = wrap_nki(MS.mla_sparse_attention_nope_row_tiled_kernel)(
+        q_f32, c_f32, substituted.contiguous().to(torch.int32), scale
+    )
+    control = float((untiled - other).abs().max())
+    say(f"R2_CONTROL_MAXABS_WITH_ONE_SELECTED_ROW_CHANGED={control:.3e}")
+    say(f"R2_CONTROL_FIRES={int(control > ATOL)}")
+    assert control > ATOL, (
+        f"changing a selected row moved the comparison by only {control}, so this item "
+        f"cannot see a difference and its 0.0 above says nothing"
+    )
+    say(f"R2_AND_THE_OUTPUT_IS_NOT_ALL_ZERO={float(untiled.abs().max()):.3e}")
+    assert float(untiled.abs().max()) > 0.0
+
+
+def test_rows_the_gate_serves_the_production_count_and_still_refuses_by_name() -> None:
+    """ROWS 3 of 4 -- the two `topk` clauses AFTER the relaxation, read at the candidate.
+
+    CERTIFYING COMPONENT: the two relaxed `topk` clauses in `MS._require_admissible`.
+
+    THIS IS THE `AFTER` HALF OF ONE TWO-SIDED READING. The `BEFORE` half cannot be a
+    pytest item, because `-k rows` collects nothing at the parent commit -- so it is
+    taken by a driver-level probe that imports the parent checkout's module and prints
+    both refusal messages verbatim. That is disclosed as an instrument choice in the
+    round's evidence record, and the two transcripts are diffed there. What this item
+    owes is the other side of that diff, printed the same way.
+
+    THE CONTROL: the declared admissible case passes the same check, so "2,048 is served"
+    is not a check that stopped refusing anything. And `-041`'s own tiled width is still
+    served at a narrow row count, so the combination refusal below did not take `-041`'s
+    path with it.
+    """
+    say("R3_CERTIFYING_COMPONENT=MS._require_admissible, the two relaxed topk clauses")
+    case = dict(ROWS_CASE)
+    scale = case_scale(case)
+
+    def admissibility(**overrides):
+        args = dict(seq=case["seq"], heads=case["heads"], latent=case["latent"],
+                    rope=case["rope"], topk=case["topk"], s_kv=case["s_kv"],
+                    softmax_scale=scale)
+        args.update(overrides)
+        return args
+
+    # SERVED: the production row count, which the parent refuses.
+    MS._require_admissible(**admissibility())
+    say(f"R3_SERVED topk={case['topk']} latent={case['latent']} REFUSAL=none")
+
+    # STILL REFUSED, BY NAME: a count that is not a whole number of key chunks.
+    with pytest.raises(MS.MlaSparseAttentionError) as caught:
+        MS._require_admissible(**admissibility(topk=MS.KEY_CHUNK + 2))
+    chunk_message = " ".join(str(caught.value).split())
+    say(f"R3_TOPK_130_MESSAGE_VERBATIM={chunk_message}")
+    say(f"R3_IT_STILL_NAMES_ITS_OWN_AXIS={int('multiple of it' in chunk_message)}")
+    say(f"R3_IT_NO_LONGER_NAMES_041={int('inc-glm53f-041' not in chunk_message)}")
+    assert "multiple of it" in chunk_message
+    assert "inc-glm53f-041" not in chunk_message, (
+        "the chunk refusal still promises inc-glm53f-041's padding increment, which this "
+        "block was to remove"
+    )
+
+    # STILL REFUSED, BY NAME: both tilings in one call (D59-N6). The message names both
+    # axes and promises NO increment -- a refusal that promised one would be the defect
+    # this file already carried twice.
+    with pytest.raises(MS.MlaSparseAttentionError) as caught:
+        MS._require_admissible(**admissibility(latent=COMBINATION_LATENT))
+    both_message = " ".join(str(caught.value).split())
+    say(f"R3_COMBINATION_MESSAGE_VERBATIM={both_message}")
+    for fragment in ("not served", "SAME call", f"topk={case['topk']}",
+                     f"latent={COMBINATION_LATENT}"):
+        assert fragment in both_message, (
+            f"the combination refusal does not name {fragment!r}: {both_message!r}"
+        )
+    promises = [term for term in ("inc-glm53f-041", "inc-glm53f-093", "increment")
+                if term in both_message]
+    say(f"R3_THE_COMBINATION_REFUSAL_PROMISES_NOTHING={int(not promises)} "
+        f"TERMS_FOUND={promises}")
+    assert not promises, (
+        f"the combination refusal names {promises}, so it promises an increment nobody "
+        f"owns -- D59-N6 requires it be refused, not deferred"
+    )
+
+    # THE CONTROLS.
+    MS._require_admissible(**admissibility(topk=MS.KEY_CHUNK))
+    say(f"R3_CONTROL_THE_NARROW_COUNT_IS_STILL_ADMISSIBLE=1 topk={MS.KEY_CHUNK}")
+    MS._require_admissible(**admissibility(latent=COMBINATION_LATENT,
+                                           topk=MS.KEY_CHUNK))
+    say(f"R3_CONTROL_041S_TILED_LATENT_IS_STILL_SERVED_AT_A_NARROW_COUNT=1 "
+        f"latent={COMBINATION_LATENT} topk={MS.KEY_CHUNK}")
+    say("R3_CONTROL_FIRES=2  (the check refuses two geometries and serves three)")
+
+
+def test_rows_the_row_tiled_seam_counts_its_own_dispatch() -> None:
+    """ROWS 4 of 4 -- the route predicate, D13 form R-1, on the row-tiled path.
+
+    CERTIFYING COMPONENT: the selected-row branch in `MS.mla_sparse_attention` and
+    `MS._MLA_SPARSE_ROW_TILED_COUNTERS`.
+
+    THE THREE COUNTERS COMPOSE AND THIS ITEM MEASURES ALL THREE. `-040`'s seam counter
+    counts every dispatch whichever body runs; `-041`'s counts the latent-tiled ones;
+    this block's counts the row-tiled ones. At this checkpoint's geometry -- latent 512,
+    an EXACT FIT, and 2,048 selected rows -- the reading is 1, 0, 1. That is the tuple
+    `-042`'s decode predicate cites per step, and this block is its authority: it is
+    stated here, per call, rather than inferred there.
+
+    A pure-torch implementation reads 0 for the row-tiled counter and cannot pass.
+    """
+    say("R4_CERTIFYING_COMPONENT=MS.mla_sparse_attention selected-row branch + "
+        "MS._MLA_SPARSE_ROW_TILED_COUNTERS")
+    case = dict(ROWS_CASE)
+    scale = case_scale(case)
+    q_lift, c_kv, idx, _, _ = make_case(**case, seed=93)
+    idx = order_rows_so_the_peak_lands_in_tile_one(q_lift, c_kv, idx)
+
+    reset_all_counters()
+    say(f"R4_AFTER_RESET={all_counters()}")
+    assert all_counters() == (0, 0, 0, 0, 0, 0)
+
+    MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    seam_nki, seam_fb, tiled_nki, tiled_fb, row_nki, row_fb = all_counters()
+    say(f"R4_SEAM_NKI_DISPATCH={seam_nki}/1")
+    say(f"R4_TILED_NKI_DISPATCH={tiled_nki}  (a counted zero: latent 512 is an exact fit)")
+    say(f"R4_ROW_TILED_NKI_DISPATCH={row_nki}/1")
+    say(f"R4_TORCH_FALLBACKS_SEAM_TILED_ROW={seam_fb} {tiled_fb} {row_fb}")
+    distinct = len({id(MS._MLA_SPARSE_COUNTERS),
+                    id(MS._MLA_SPARSE_TILED_COUNTERS),
+                    id(MS._MLA_SPARSE_ROW_TILED_COUNTERS)})
+    say(f"R4_DISTINCT_COUNTER_OBJECTS={distinct}/3")
+    assert (seam_nki, tiled_nki, row_nki) == (1, 0, 1)
+    assert (seam_fb, tiled_fb, row_fb) == (0, 0, 0)
+    assert distinct == 3, "two increments are sharing one counter object"
+
+    # THE COUNTED ZERO AND ITS CONTROL. An exact-fit, narrow call must leave the
+    # row-tiled counter alone; a wider call in the SAME process must move it. Without
+    # the second half the zero could be a counter that never moves at all.
+    narrow = dict(SPLIT_CASE)
+    nq, nc, nidx, _, _ = make_case(**narrow, seed=94)
+    reset_all_counters()
+    MS.mla_sparse_attention(nq, nc, nidx, case_scale(narrow))
+    after_narrow = all_counters()
+    say(f"R4_UNFORCED_AT_TOPK_{narrow['topk']}={after_narrow}  "
+        f"(the row-tiled counter is the counted zero)")
+    assert after_narrow == (1, 0, 0, 0, 0, 0)
+
+    wide = dict(MINIMAL_ROW_TILED_CASE)
+    wq, wc, widx, _, _ = make_case(**wide, seed=95)
+    MS.mla_sparse_attention(wq, wc, widx, case_scale(wide))
+    after_wide = all_counters()
+    say(f"R4_CONTROL_A_WIDER_CALL_MOVES_IT topk={wide['topk']} -> {after_wide}")
+    say(f"R4_CONTROL_FIRES={int(after_wide[4] == 1)}")
+    assert after_wide == (2, 0, 0, 0, 1, 0)
+
+    # Each increment's reset owns its own object, which is the other half of "none reads
+    # another's": resetting this block's counter must leave the other two standing.
+    MS.reset_mla_sparse_row_tiled_dispatch_counters()
+    after_reset = all_counters()
+    say(f"R4_THE_ROW_TILED_RESET_LEAVES_THE_OTHER_TWO_ALONE={after_reset}")
+    assert after_reset == (2, 0, 0, 0, 0, 0)
