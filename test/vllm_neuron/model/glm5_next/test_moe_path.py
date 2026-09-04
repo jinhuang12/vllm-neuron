@@ -1834,11 +1834,18 @@ def _ep_partition() -> tuple[int, int, int]:
 def _build_ep_bank():
     """A bank at a degree above 1 whose LOCAL extent is the fixture's ``E``.
 
-    Returns ``(bank, text_config, global_experts, degree)``. The campaign's
-    registered TP freeze of 64 is deliberately not used: 288 experts do not
-    divide 64 ways, so that bank raises during construction. That refusal is
-    campaign gap G4 and the lead's to dispose; this arm needs a degree the
-    partition admits, and derives one.
+    Returns ``(bank, text_config, global_experts, degree)``. The degree is
+    DERIVED as the one that makes this rank own exactly the fixture's local
+    extent, rather than taken from the campaign's registered TP freeze of 64,
+    because 288 experts do not divide 64 ways.
+
+    CORRECTED BY ``inc-glm53f-087``: this docstring used to call that 64-way
+    refusal campaign gap G4 and the lead's to dispose. It is neither. An expert
+    bank divides by the EXPERT-PARALLEL degree, so at the freeze with expert
+    parallelism off the degree is 1, every expert is local and nothing raises.
+    This helper still needs a degree above 1 -- it is exercising the dispatch
+    step -- and now passes it as ``ep_degree`` rather than relying on the world
+    size to become the divisor.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
     from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextRoutedExperts
@@ -1850,7 +1857,7 @@ def _build_ep_bank():
         n_routed_experts=global_experts,
         num_experts_per_tok=top_k,
     )
-    bank = Glm5NextRoutedExperts(text_config, world_size=degree)
+    bank = Glm5NextRoutedExperts(text_config, world_size=degree, ep_degree=degree)
     if int(bank.num_local_experts) != EP_LOCAL_EXPERTS:
         raise VacuousControlError(
             f"the bank reports num_local_experts={bank.num_local_experts} at "
@@ -1917,7 +1924,7 @@ class _MappingAffinitySpy:
     """Captures the affinity tensor ``build_blockwise_mapping`` is handed.
 
     The call site imports the mapping FUNCTION-LOCALLY from
-    ``vllm_neuron.functional`` (``model_fp8.py:1060``), so replacing the
+    ``vllm_neuron.functional`` (``model_fp8.py:1078``), so replacing the
     attribute on that module is what a call actually resolves. The real mapping
     still runs and its result is still used, so the kernel below is measured on
     the real path rather than on a stub.

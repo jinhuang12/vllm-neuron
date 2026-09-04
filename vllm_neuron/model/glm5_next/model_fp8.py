@@ -790,18 +790,29 @@ class Glm5NextRoutedExperts(nn.Module):
     # this file's module import block is ``-013``'s D14 section, and the
     # file family's own idiom is a local import at the consuming member.
     #
-    # THE 288/64 CONSEQUENCE IS DELIBERATE AND VISIBLE. At the registered TP
-    # degree freeze of 64, 288 experts are ragged, so building this bank RAISES
-    # a named error instead of padding or flooring. That is campaign gap G4
-    # surfaced where the model is built, and it is the lead's to dispose.
+    # THE 288/64 REFUSAL IS GONE, AND IT WAS NEVER THE FORK'S RULE --
+    # ``inc-glm53f-087``. This paragraph used to say the refusal at the registered
+    # tensor-parallel degree freeze of 64 was deliberate and visible, and that it
+    # was campaign gap G4 surfaced where the model is built. That was wrong on the
+    # only point that mattered: an expert bank divides by the EXPERT-PARALLEL
+    # degree, never by the tensor-parallel one. The fork's one landed EP-aware
+    # bank divides ``num_local_experts // self.ep_degree``
+    # (``gpt_oss/model_bf16.py:1072``) and shards the INTERMEDIATE dimension by TP
+    # instead (``:986-988``). So with expert parallelism off -- this campaign's
+    # route -- the degree is 1, all 288 experts are local on every rank and
+    # NOTHING RAISES at TP = 64. The raggedness gate is kept, and its subject is
+    # now the expert-parallel degree, which is the one thing the old code got
+    # right: a named error rather than ``gpt_oss``'s silent floor division.
 
     def __init__(
         self,
         text_config: Glm5NextTextConfig,
         world_size: int | None = None,
+        ep_degree: int | None = None,
     ) -> None:
         super().__init__()
         from vllm_neuron.model.glm5_next.factory import (
+            _resolve_ep_degree,
             require_uniform_expert_partition,
         )
 
@@ -811,11 +822,18 @@ class Glm5NextRoutedExperts(nn.Module):
         # edited: an explicit ``world_size`` is what a caller with a degree
         # supplies, and ``None`` means "read the process group", which is 1 when
         # this stack is built undistributed.
+        #
+        # ``tp_degree`` KEEPS ITS NAME AND ITS MEANING and simply stopped being
+        # the divisor (``inc-glm53f-087``): it is the tensor-parallel world size,
+        # which is what shards the intermediate dimension.
         self.tp_degree = (
             _resolve_world_size() if world_size is None else int(world_size)
         )
+        # THE DIVISOR. ``ep_degree`` is a trailing optional addition in the same
+        # shape ``world_size`` already used, so no landed call site moves.
+        self.ep_degree = _resolve_ep_degree(ep_degree)
         self.expert_partition = require_uniform_expert_partition(
-            self.num_routed_experts, self.tp_degree
+            self.num_routed_experts, self.ep_degree
         )
         # Uniform by the gate above, so rank 0's count is every rank's count.
         self.num_local_experts = self.expert_partition.counts[0]
@@ -1605,12 +1623,20 @@ class Glm5NextMoEBlock(nn.Module):
         self,
         text_config: Glm5NextTextConfig,
         world_size: int | None = None,
+        ep_degree: int | None = None,
     ) -> None:
         super().__init__()
         # ``world_size`` is a trailing optional addition by ``inc-glm53f-031``,
         # threaded to the routed bank only. ``_build_mlp``'s call site is
         # unchanged and stays outside this increment's surface.
-        self.experts = Glm5NextRoutedExperts(text_config, world_size=world_size)
+        #
+        # ``ep_degree`` is the same shape, added by ``inc-glm53f-087``: also
+        # trailing, also optional, also threaded to the routed bank only. It is
+        # the EXPERT-PARALLEL degree the bank divides by; ``world_size`` stays the
+        # tensor-parallel one. ``_build_mlp``'s signature still does not move.
+        self.experts = Glm5NextRoutedExperts(
+            text_config, world_size=world_size, ep_degree=ep_degree
+        )
         if text_config.n_shared_experts:
             self.shared_experts = Glm5NextSharedExperts(text_config)
 
@@ -2818,11 +2844,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 GLM-5.3-Flash implementation.
 
     The module path, this class name and the ``from_configs`` signature are
-    **pinned by landed code**: ``factory.py:291`` already reads ``from
+    **pinned by landed code**: ``factory.py:340`` already reads ``from
     .model_fp8 import Glm5NextForConditionalGeneration as Model`` and
-    ``factory.py:293`` calls
+    ``factory.py:342`` calls
     ``Model.from_configs(hf_config, text_neuron_config=..., vision_neuron_config=...)``.
-    The name is duplicated with ``factory.py:219`` on purpose -- that is the
+    The name is duplicated with ``factory.py:268`` on purpose -- that is the
     plugin's selector-to-implementation convention, the same pair
     ``llama3/factory.py:42`` uses -- so neither side is renamed here.
     """
@@ -2855,7 +2881,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_neuron_config: NeuronConfig | None = None,
         vision_neuron_config: VisionNeuronConfig | None = None,
     ) -> Glm5NextForConditionalGeneration:
-        """Build from an HF config, the signature ``factory.py:293`` calls."""
+        """Build from an HF config, the signature ``factory.py:342`` calls."""
         config = Glm5NextConfig.from_configs(
             hf_config,
             text_neuron_config=text_neuron_config,

@@ -50,12 +50,22 @@ TP_DEGREE_FREEZE = 64
 
 
 class RaggedExpertPartitionError(ValueError):
-    """The routed experts do not partition uniformly over the given TP degree.
+    """The routed experts do not divide evenly over the expert-parallel degree.
 
-    This is the campaign's **G4** gap surfaced as a NAMED RAISE. The two silent
-    repairs a partitioner could reach for are both refused here: padding invents
-    experts the checkpoint does not contain, and flooring drops experts it does.
-    The blocker is the plugin's TP degree freeze, not the substrate.
+    The two silent repairs a partitioner could reach for are both refused here:
+    padding invents experts the checkpoint does not contain, and flooring drops
+    experts it does. The fork's own landed precedent floor-divides with no gate
+    at all (``gpt_oss/model_bf16.py:1072``), which is the behaviour this named
+    raise exists to refuse.
+
+    **THE SUBJECT IS THE EXPERT-PARALLEL DEGREE — ``inc-glm53f-087``.** The
+    earlier wording of this docstring named the tensor-parallel degree and the
+    campaign's G4 gap, and that was the premise that produced the defect: it is
+    not the tensor-parallel degree that divides an expert bank. With expert
+    parallelism off the degree is ``1``, every expert is local on every rank and
+    no division happens, so this error is UNREACHABLE at that setting whatever
+    the tensor-parallel degree is. It is reachable only when a caller partitions
+    over a degree that does not divide the bank.
     """
 
 
@@ -70,8 +80,15 @@ class ExpertPartition:
     measurable properties rather than assumed, because the fork's own landed
     expert-partition precedent (``gpt_oss/model_bf16.py:1072``, floor division
     with no raggedness gate) drops **32** of this checkpoint's **288** experts at
-    ``TP_DEGREE_FREEZE`` -- so "0 dropped" is a real distinction between two
-    reachable behaviours, not a tautology.
+    a degree of 64 -- so "0 dropped" is a real distinction between two reachable
+    behaviours, not a tautology.
+
+    **THE ``tp_degree`` FIELD HOLDS WHATEVER DEGREE THE CALLER PARTITIONS OVER,
+    and that is the EXPERT-PARALLEL degree on every path in this module
+    (``inc-glm53f-087``).** The field keeps its landed name deliberately: renaming
+    a frozen-dataclass field cascades through every reader of the returned plan
+    and buys no falsifiability, so this docstring carries the correction instead.
+    Read it as "ranks partitioned over", never as "the tensor-parallel degree".
     """
 
     num_experts: int
@@ -184,8 +201,31 @@ def require_routable_expert_counts(num_experts: int, experts_per_tok: int) -> No
         )
 
 
+def _resolve_ep_degree(ep_degree: int | None) -> int:
+    """The expert-parallel degree to divide the bank by (``inc-glm53f-087``).
+
+    ``None`` means "ask the process group", which answers ``1`` when expert
+    parallelism was never initialised -- the production route for this campaign
+    and the route under which the bank builds whole. An explicit value is how a
+    caller that has a degree supplies one, and it is what every landed test on
+    this surface passes.
+
+    The getter is reached through the MODULE rather than through a name bound at
+    import time, for two reasons that are the same reason: a module attribute is
+    what a test can patch, and a module attribute is what reflects a process
+    group initialised after this module was imported. The import is
+    function-local so that importing this factory still pulls in no parallel
+    state -- the property ``test_factory.py``'s C03 certifies.
+    """
+    if ep_degree is not None:
+        return int(ep_degree)
+    from vllm_neuron.parallel import neuron_parallel_state
+
+    return int(neuron_parallel_state.get_neuron_ep_degree())
+
+
 def require_uniform_expert_partition(
-    num_experts: int, tp_degree: int
+    num_experts: int, ep_degree: int
 ) -> ExpertPartition:
     """The gate: return the partition, or raise :class:`RaggedExpertPartitionError`.
 
@@ -193,26 +233,35 @@ def require_uniform_expert_partition(
     parameter shapes carry it -- one tensor per projection covering every local
     expert. A ragged split has no single shape, and the two ways to manufacture
     one both change the model: padding invents experts, flooring drops them.
+
+    ``ep_degree`` IS THE EXPERT-PARALLEL DEGREE and was named ``tp_degree`` until
+    ``inc-glm53f-087``. The rename is the point rather than tidying: a parameter
+    named for the tensor-parallel degree is the premise that produced the defect
+    this gate had, which was to refuse a bank the fork itself admits. Every one
+    of this function's call sites passes the degree positionally, so the rename
+    moves no caller.
     """
-    partition = partition_experts(num_experts, tp_degree)
+    partition = partition_experts(num_experts, ep_degree)
     if partition.is_uniform:
         return partition
 
     remainder = partition.remainder
-    pad_to = num_experts + (tp_degree - remainder)
+    pad_to = num_experts + (ep_degree - remainder)
     floor_to = num_experts - remainder
     raise RaggedExpertPartitionError(
-        f"{num_experts} routed experts do not partition uniformly over "
-        f"tensor-parallel degree {tp_degree}: {num_experts} % {tp_degree} == "
+        f"{num_experts} routed experts do not divide evenly over "
+        f"expert-parallel degree {ep_degree}: {num_experts} % {ep_degree} == "
         f"{remainder}. A uniform per-rank expert count is required because the "
         f"expert-bank parameter shapes carry it. Neither silent repair is taken: "
         f"padding to {pad_to} would invent {pad_to - num_experts} experts the "
         f"checkpoint does not contain, and flooring to {floor_to} would drop "
         f"{num_experts - floor_to} experts it does contain -- the shape the "
         f"fork's own landed floor-division precedent produces "
-        f"(gpt_oss/model_bf16.py:1072). The blocker is this plugin's registered "
-        f"TP degree freeze of {TP_DEGREE_FREEZE}, not the substrate; it is "
-        f"campaign gap G4 and its disposition is the lead's."
+        f"(gpt_oss/model_bf16.py:1072). What is refused here is the "
+        f"EXPERT-PARALLEL degree: with expert parallelism off that degree is 1, "
+        f"every expert is local on every rank and no division happens at all, so "
+        f"a caller reaching this message is dividing {num_experts} experts by a "
+        f"degree that does not divide them."
     )
 
 
@@ -305,20 +354,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def expert_sharding_plan(
         cls,
         text_config: object,
-        tp_degree: int = TP_DEGREE_FREEZE,
+        ep_degree: int | None = None,
     ) -> ExpertPartition:
-        """The routed-expert shard plan for this arch, at the frozen TP degree.
+        """The routed-expert shard plan for this arch, at the resolved EP degree.
 
         ``text_config`` is read by attribute (``n_routed_experts``) rather than
         typed, so this member adds no import to a co-authored file and cannot
         create an import cycle with the modeling module.
 
-        The default ``tp_degree`` **is** the registered freeze
-        (:data:`TP_DEGREE_FREEZE`); on this checkpoint's 288 routed experts that
-        default RAISES :class:`RaggedExpertPartitionError`, which is the
-        designed, visible consequence of the freeze rather than a defect in this
-        member. An explicit argument is how a caller that has a different degree
-        supplies one; it is not a configuration knob for the freeze.
+        **``inc-glm53f-087`` RENAMED THIS PARAMETER AND RE-DEFAULTED IT.** It was
+        ``tp_degree`` defaulting to :data:`TP_DEGREE_FREEZE`, so the default
+        RAISED on this checkpoint's 288 routed experts -- one member of this
+        module refusing a partition the expert bank beside it builds, which is
+        one question with two answers. The default is now ``None``, resolved by
+        :func:`_resolve_ep_degree` to the live expert-parallel degree, which is
+        ``1`` when expert parallelism was never initialised. At that degree every
+        expert is local on every rank, nothing divides and nothing raises.
+
+        An explicit argument is how a caller that has a degree supplies one, and
+        it is the route every landed assertion on this member now takes.
+        :data:`TP_DEGREE_FREEZE` is UNMOVED and is still the tensor-parallel
+        degree this campaign registered; it simply stopped being this member's
+        divisor.
         """
         num_experts = getattr(text_config, "n_routed_experts", None)
         if num_experts is None:
@@ -329,4 +386,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
         experts_per_tok = getattr(text_config, "num_experts_per_tok", None)
         if experts_per_tok is not None:
             require_routable_expert_counts(num_experts, experts_per_tok)
-        return require_uniform_expert_partition(int(num_experts), int(tp_degree))
+        return require_uniform_expert_partition(
+            int(num_experts), _resolve_ep_degree(ep_degree)
+        )

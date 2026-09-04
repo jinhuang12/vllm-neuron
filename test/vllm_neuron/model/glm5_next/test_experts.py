@@ -250,21 +250,40 @@ def test_sharding_at_288_over_64_raises_a_named_error_rather_than_padding():
     )
 
     message = str(gate.value)
+    # RE-PINNED BY ``inc-glm53f-087``. The five NUMERIC tokens are byte-identical:
+    # they are functions of (288, degree) and this call still passes 64 outright.
+    # ``"G4"`` LEAVES the required set and *"expert-parallel degree"* joins it,
+    # because the raise is no longer evidence of a gap the freeze creates.
     for token in (
         str(TOTAL_ROUTED_EXPERTS),
         str(DECLARED_TP_DEGREE),
         str(RAGGED_REMAINDER),
         str(PAD_TARGET),
         str(FLOOR_TARGET),
-        "G4",
+        "expert-parallel degree",
     ):
         assert token in message, f"{token!r} missing from the named raise"
 
-    # The same raise reaches the arch-level member at its DEFAULT degree, which
-    # is the freeze. 1/1.
+    # AND THE TWO THINGS IT MUST NO LONGER SAY, asserted rather than assumed.
+    for token in ("G4", "tensor-parallel degree"):
+        assert token not in message, f"{token!r} must not appear in the raise"
+
+    # RE-PINNED BY ``inc-glm53f-087``. The arch member's default degree is no
+    # longer the freeze: it resolves the expert-parallel degree, which is 1 when
+    # expert parallelism was never initialised, so the default now BUILDS a
+    # uniform plan. Its 1/1 refusal MOVES to an explicit ragged degree.
+    arch_default = fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(
+        _text_config()
+    )
+    assert arch_default.tp_degree == 1
+    assert arch_default.counts == (TOTAL_ROUTED_EXPERTS,)
+    assert arch_default.is_uniform
+
     arch_raised = 0
     with pytest.raises(fmod.RaggedExpertPartitionError):
-        fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(_text_config())
+        fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(
+            _text_config(), ep_degree=DECLARED_TP_DEGREE
+        )
     arch_raised += 1
     assert arch_raised == 1
 
@@ -293,10 +312,12 @@ def test_sharding_at_288_over_64_raises_a_named_error_rather_than_padding():
         s02_error_type=type(gate.value).__name__,
         s02_error=message,
         s02_arch_member_raised=f"{arch_raised}/1",
+        # RE-PINNED BY ``inc-glm53f-087``: the parameter is renamed and its
+        # default is ``None``, resolved to the live expert-parallel degree.
         s02_arch_member_default_degree=inspect.signature(
             fmod.Glm5NextForConditionalGeneration.expert_sharding_plan
         )
-        .parameters["tp_degree"]
+        .parameters["ep_degree"]
         .default,
         s02_pad_target_never_assigned=True,
         s02_control_raised=control_raised,
@@ -391,7 +412,7 @@ def test_sharding_plan_is_consumed_by_the_routed_expert_bank_in_model_fp8():
     impl = _impl()
     text_config = _text_config()
 
-    bank = impl.Glm5NextRoutedExperts(text_config, world_size=32)
+    bank = impl.Glm5NextRoutedExperts(text_config, world_size=32, ep_degree=32)
     assert bank.tp_degree == 32
     assert bank.num_routed_experts == TOTAL_ROUTED_EXPERTS
     assert bank.num_local_experts == 9
@@ -406,7 +427,7 @@ def test_sharding_plan_is_consumed_by_the_routed_expert_bank_in_model_fp8():
         union.update(bank.local_expert_indices(rank))
     assert union == set(range(TOTAL_ROUTED_EXPERTS))
 
-    block = impl.Glm5NextMoEBlock(text_config, world_size=32)
+    block = impl.Glm5NextMoEBlock(text_config, world_size=32, ep_degree=32)
     assert block.experts.num_local_experts == 9
 
     # The default resolves the process group, which is 1 undistributed -- so the
@@ -415,12 +436,26 @@ def test_sharding_plan_is_consumed_by_the_routed_expert_bank_in_model_fp8():
     assert default_bank.tp_degree == impl._resolve_world_size() == 1
     assert default_bank.num_local_experts == TOTAL_ROUTED_EXPERTS
 
-    # THE FREEZE'S CONSEQUENCE IS VISIBLE WHERE THE MODEL IS BUILT, not only at
-    # the arithmetic. This is G4 reaching the model level.
-    with pytest.raises(fmod.RaggedExpertPartitionError):
-        impl.Glm5NextRoutedExperts(text_config, world_size=DECLARED_TP_DEGREE)
-    with pytest.raises(fmod.RaggedExpertPartitionError):
-        impl.Glm5NextMoEBlock(text_config, world_size=DECLARED_TP_DEGREE)
+    # RE-PINNED BY ``inc-glm53f-087``. These two constructions used to be the
+    # freeze's refusal reaching the model level. The tensor-parallel degree is not
+    # the expert divisor, so at the freeze they now BUILD: the expert-parallel
+    # degree resolves to 1 and all 288 experts are local on every rank.
+    for built in (
+        impl.Glm5NextRoutedExperts(text_config, world_size=DECLARED_TP_DEGREE),
+        impl.Glm5NextMoEBlock(text_config, world_size=DECLARED_TP_DEGREE).experts,
+    ):
+        assert built.tp_degree == DECLARED_TP_DEGREE
+        assert built.ep_degree == 1
+        assert built.num_local_experts == TOTAL_ROUTED_EXPERTS
+
+    # THE REFUSAL MOVES TO ITS TRUE SUBJECT, at both constructors, 2/2. 64 does
+    # not divide 288, so an explicit ragged expert-parallel degree still raises.
+    model_level_raised = 0
+    for construct in (impl.Glm5NextRoutedExperts, impl.Glm5NextMoEBlock):
+        with pytest.raises(fmod.RaggedExpertPartitionError):
+            construct(text_config, ep_degree=DECLARED_TP_DEGREE)
+        model_level_raised += 1
+    assert model_level_raised == 2
 
     # D1.5 CONTROL -- the drop-32 formula is still reachable in this very
     # module, so the bank's 0 dropped is a distinction between two live
@@ -443,7 +478,11 @@ def test_sharding_plan_is_consumed_by_the_routed_expert_bank_in_model_fp8():
         s04_moeblock_num_local_experts=block.experts.num_local_experts,
         s04_default_tp_degree=default_bank.tp_degree,
         s04_default_num_local_experts=default_bank.num_local_experts,
-        s04_raises_at_the_freeze=True,
+        # RE-PINNED BY ``inc-glm53f-087``: the bank no longer refuses at the
+        # tensor-parallel freeze, because that degree was never the expert
+        # divisor. The refusal moved to an explicit ragged expert-parallel degree.
+        s04_raises_at_the_freeze=False,
+        s04_refusal_moved_to_explicit_ep_degree=f"{model_level_raised}/2",
         s04_control_per_rank_helper=impl._per_rank(
             TOTAL_ROUTED_EXPERTS, DECLARED_TP_DEGREE
         ),
@@ -512,7 +551,7 @@ def test_sharding_config_validation_rejects_out_of_range_expert_counts():
     # and it is reached through the arch member, not only callable directly.
     with pytest.raises(cfgmod.Glm5NextExpertConfigError):
         fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(
-            _text_config(n_routed_experts=4, num_experts_per_tok=8), tp_degree=4
+            _text_config(n_routed_experts=4, num_experts_per_tok=8), ep_degree=4
         )
     assert plan_raised == 1
     assert construction_raised + plan_raised == 5
@@ -724,12 +763,16 @@ def test_sharding_tp_degree_freeze_is_the_registered_value_and_not_configurable(
     """
     assert fmod.TP_DEGREE_FREEZE == DECLARED_TP_DEGREE == 64
 
+    # RE-PINNED BY ``inc-glm53f-087``: the member's degree parameter is renamed
+    # and re-defaulted. Its default is no longer the freeze -- it is ``None``,
+    # meaning "resolve the live expert-parallel degree". The freeze itself is
+    # unmoved and is still asserted above as a non-configurable module literal.
     default = (
         inspect.signature(fmod.Glm5NextForConditionalGeneration.expert_sharding_plan)
-        .parameters["tp_degree"]
+        .parameters["ep_degree"]
         .default
     )
-    assert default == fmod.TP_DEGREE_FREEZE
+    assert default is None
 
     # NOT CONFIGURABLE HERE: no environment read and no config field feeds it.
     source = Path(fmod.__file__).read_text()
@@ -766,18 +809,39 @@ def test_sharding_tp_degree_freeze_is_the_registered_value_and_not_configurable(
     )
     assert "group_size == 64" in pg_line
 
-    # D1.5 CONTROL -- the default is what is USED, not merely declared: passing
-    # an explicit degree changes the outcome through the same member.
-    control = fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(
-        _text_config(), tp_degree=32
-    )
-    assert control.tp_degree == 32 and control.is_uniform
-    control_raised = 0
+    # D1.5 CONTROL -- REPLACED BY ``inc-glm53f-087``. The landed control
+    # discriminated by the DEFAULT raising, and the default no longer raises, so
+    # that shape would have become vacuous. This one discriminates on three arms
+    # through the same member and reads 1 / 0 / 0: an explicit ragged degree
+    # raises, an explicit exact degree does not, and the resolved default does not.
+    explicit_ragged_raised = 0
     try:
-        fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(_text_config())
+        fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(
+            _text_config(), ep_degree=DECLARED_TP_DEGREE
+        )
     except fmod.RaggedExpertPartitionError:
-        control_raised += 1
-    assert control_raised == 1
+        explicit_ragged_raised += 1
+    assert explicit_ragged_raised == 1
+
+    explicit_exact_raised = 0
+    try:
+        control = fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(
+            _text_config(), ep_degree=32
+        )
+    except fmod.RaggedExpertPartitionError:  # pragma: no cover - control arm
+        explicit_exact_raised += 1
+    assert explicit_exact_raised == 0
+    assert control.tp_degree == 32 and control.is_uniform
+
+    resolved_default_raised = 0
+    try:
+        resolved = fmod.Glm5NextForConditionalGeneration.expert_sharding_plan(
+            _text_config()
+        )
+    except fmod.RaggedExpertPartitionError:  # pragma: no cover - control arm
+        resolved_default_raised += 1
+    assert resolved_default_raised == 0
+    assert resolved.tp_degree == 1 and resolved.is_uniform
 
     _record(
         s08_TP_DEGREE_FREEZE=fmod.TP_DEGREE_FREEZE,
@@ -786,8 +850,12 @@ def test_sharding_tp_degree_freeze_is_the_registered_value_and_not_configurable(
         s08_literal_assignments=len(assignments),
         s08_process_groups_L111=pg_line.strip(),
         s08_control_explicit_degree=control.tp_degree,
+        s08_resolved_default_degree=resolved.tp_degree,
         s08_control_MOVES=(
-            f"default degree raises ({control_raised}), explicit 32 does not"
+            f"explicit degree {DECLARED_TP_DEGREE} raises "
+            f"({explicit_ragged_raised}), explicit 32 does not, resolved default "
+            f"(EP uninitialised, degree {resolved.tp_degree}) does not "
+            f"({resolved_default_raised})"
         ),
     )
 

@@ -17,7 +17,7 @@ WHY EVERY IMPORT OF THE MODULE UNDER TEST IS DEFERRED
 -----------------------------------------------------
 ``test_factory.py:318-319`` is a **landed passing assertion** that
 ``vllm_neuron.model.glm5_next.model_fp8`` is *not* in ``sys.modules`` -- it is
-what proves ``glm5_next/factory.py:291``'s lazy import stays lazy. pytest imports **every
+what proves ``glm5_next/factory.py:340``'s lazy import stays lazy. pytest imports **every
 collected test module during collection, before it runs any test**, so a
 module-level ``import model_fp8`` in this file would put the module in
 ``sys.modules`` before ``test_factory.py``'s test body ever runs and would
@@ -212,7 +212,7 @@ def raw() -> dict:
 def model(raw: dict):
     """The skeleton built from the landed 45-layer fixture.
 
-    Built through the classmethod ``glm5_next/factory.py:293`` actually calls, so the
+    Built through the classmethod ``glm5_next/factory.py:342`` actually calls, so the
     acceptance exercises the pinned construction signature rather than a
     convenience path.
     """
