@@ -615,30 +615,162 @@ def test_kda_layer_a02_decode_carries_state_and_never_enters_a_chunked_seam(
 # ---------------------------------------------------------------------------
 # A03 -- the four field values, off the real get_kv_spec.
 # ---------------------------------------------------------------------------
-def _drive_runner_translation(model) -> dict:
+#: The block-size granularity this pin admits, and the only number below that is
+#: typed rather than measured. ``impl-batch-B62`` Ruling 3 states it while working
+#: the same arithmetic ("2,176 at the 64 granularity"). It is a rounding step
+#: only: correctness here needs the pages to be ordered, which the strict
+#: comparison below settles, and the granularity just keeps the chosen block size
+#: a shape this pin would actually accept.
+_BLOCK_SIZE_GRANULARITY = 64
+
+
+def _runner_block_size(resolved, cache_dtype) -> SimpleNamespace:
+    """The block size to drive the runner at, DERIVED FROM THIS PROCESS'S DEGREE.
+
+    WHY THIS EXISTS -- ``B62-M1``, a repair under ``inc-glm53f-086``. This arm used
+    to drive the runner at ``REGISTERED_HYBRID_BLOCK_SIZE``, which ``DECISIONS`` §6
+    registers *together with* ``TP=64``. But this file builds the real model in an
+    undistributed process, where the model's own ``_resolve_world_size()`` returns
+    1, so applying that 128 here combined a registered block size with a degree §6
+    rejects. The two pages move differently: the recurrent-state page scales as
+    ``1/tp`` while the attention page does not depend on tp at all. So at world
+    size 1 the state page is the LARGER of the two, and ``inc-glm53f-086``'s
+    refusal arm fires -- correctly, on a geometry that is not the campaign's. The
+    constant is left exactly as it was, for the callers that really are at TP=64.
+
+    NO PAGE SIZE IS TYPED HERE. Both pages come from the vendor's own
+    ``page_size_bytes`` properties, evaluated on probe specs built at
+    ``block_size=1``, so the per-token slope and the state page are the vendor's
+    arithmetic rather than a re-derivation of it that could drift from it.
+
+    THE COMPARISON IS STRICTLY GREATER, AND THAT IS NOT A STYLE CHOICE. The runner
+    pads only when ``attention_page > kda_page`` and refuses only when
+    ``attention_page < kda_page``, so a block size that makes the two pages
+    exactly EQUAL takes neither branch and leaves ``page_size_padded`` at ``None``.
+    At world size 1 the equality point is a whole number of tokens --
+    ``4,341,760 / 2,048 = 2,120`` exactly -- so a block size of "at least 2,120"
+    would land on it and the pad branch would not be taken. One granularity step
+    past it is the smallest admissible value, which is 2,176.
+
+    A PROPERTY WORTH STATING, because it is why this is a re-pin and not a new
+    number: at the registered degree this derivation returns the registered block
+    size. TP=64 gives a 67,840 B state page, ``67,840 // 2,048 + 1 = 34``, rounded
+    up to the granularity is 64, and the floor below raises it to 128. So the
+    campaign's own geometry is a fixed point of this function.
+    """
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    # A PARTIALLY-SET LAYER BELONGS TO NEITHER PROBE SET, and that is what keeps
+    # A04 alive. A04 clears one of the four fields on a deep copy and requires the
+    # runner's pairing guard to refuse it; a layer that is neither wholly set nor
+    # wholly unset must therefore reach that guard untouched, and must not be fed
+    # to a probe here that would raise something else first.
+    kda_layers = [
+        layer
+        for layer in resolved.layers
+        if all(getattr(layer, field) is not None for field in KDA_STATE_FIELDS)
+    ]
+    attention_layers = [
+        layer
+        for layer in resolved.layers
+        if all(getattr(layer, field) is None for field in KDA_STATE_FIELDS)
+    ]
+
+    state_page = max(
+        (
+            MambaSpec(
+                block_size=1,
+                shapes=(
+                    tuple(layer.kda_conv_state_shape),
+                    tuple(layer.kda_recurrent_state_shape),
+                ),
+                dtypes=(
+                    layer.kda_conv_state_dtype,
+                    layer.kda_recurrent_state_dtype,
+                ),
+            ).page_size_bytes
+            for layer in kda_layers
+        ),
+        default=0,
+    )
+    # At ``block_size=1`` the attention page IS the per-token slope, because
+    # ``AttentionSpec.real_page_size_bytes`` is linear in the block size -- in
+    # every one of its three quantisation limbs, so this holds without depending
+    # on which limb the vendor takes.
+    #
+    # ``cache_dtype`` is a PARAMETER and not typed here, because the runner builds
+    # its own attention specs from the dtype the fake config below carries. If the
+    # two ever disagreed, this derivation would compute a slope the runner does not
+    # use; the caller's assertion that the runner's own attention specs report
+    # exactly ``attention_page`` is what closes that loop against the world.
+    bytes_per_token = max(
+        (
+            FullAttentionSpec(
+                block_size=1,
+                num_kv_heads=layer.num_kv_heads,
+                head_size=layer.head_size,
+                dtype=cache_dtype,
+            ).page_size_bytes
+            for layer in attention_layers
+        ),
+        default=0,
+    )
+
+    if state_page and bytes_per_token:
+        smallest_strictly_larger = state_page // bytes_per_token + 1
+        rounded = (
+            -(-smallest_strictly_larger // _BLOCK_SIZE_GRANULARITY)
+            * _BLOCK_SIZE_GRANULARITY
+        )
+        block_size = max(rounded, REGISTERED_HYBRID_BLOCK_SIZE)
+    else:
+        # No pair of pages to order, so there is nothing to derive from and the
+        # registered value is the honest default rather than an invented one.
+        block_size = REGISTERED_HYBRID_BLOCK_SIZE
+
+    return SimpleNamespace(
+        world_size=_impl()._resolve_world_size(),
+        block_size=block_size,
+        state_page=state_page,
+        bytes_per_token=bytes_per_token,
+        attention_page=bytes_per_token * block_size,
+    )
+
+
+def _drive_runner_translation(model) -> tuple[dict, SimpleNamespace]:
     """Drive the runner's UNBOUND ``get_kv_cache_spec`` over a real model.
 
     The fake self carries only what that method reads, which is
     ``inc-glm53f-016``'s landed harness at ``test_get_kv_cache_spec_hybrid.py``
     ``:189-201``. The MODEL is the real one, because this arm's whole subject is
     the real ``get_kv_spec``'s output.
+
+    Returns the spec dict AND the geometry it was driven at, so the caller can
+    report the degree and the block size beside its census instead of leaving them
+    implicit. ``B62-M1``; the derivation is in ``_runner_block_size``.
     """
+    # ONE definition, read by the derivation AND by the config the runner reads its
+    # own dtype from, so the two cannot drift apart in a later edit. The value is
+    # the one this harness already handed the runner before this repair.
+    cache_dtype = torch.bfloat16
+    geometry = _runner_block_size(model.get_kv_spec(), cache_dtype)
     fake_self = SimpleNamespace(
         vllm_config=SimpleNamespace(
             cache_config=SimpleNamespace(
-                block_size=REGISTERED_HYBRID_BLOCK_SIZE, cache_dtype="auto"
+                block_size=geometry.block_size, cache_dtype="auto"
             ),
-            model_config=SimpleNamespace(dtype=torch.bfloat16),
+            model_config=SimpleNamespace(dtype=cache_dtype),
         ),
         speculative_config=None,
         model=model,
     )
-    return _runner_module().NeuronModelRunner.get_kv_cache_spec(fake_self)
+    specs = _runner_module().NeuronModelRunner.get_kv_cache_spec(fake_self)
+    return specs, geometry
 
 
 @pytest.fixture(scope="module")
 def real_spec():
-    """The REAL model at the registered geometry, and its own ``get_kv_spec``."""
+    """The REAL model at THIS PROCESS'S resolved degree, and its own ``get_kv_spec``."""
     model = _impl().Glm5NextForConditionalGeneration.from_configs(
         copy.deepcopy(_raw()),
         text_neuron_config=None,
@@ -714,12 +846,57 @@ def test_kda_layer_a03_the_four_state_fields_are_reported_on_the_kda_half(
         assert layer.kda_recurrent_state_dtype is expected_dtypes[1]
 
     # ...and the runner's landed translation over that real output.
-    specs = _drive_runner_translation(model)
-    mamba = sum(1 for entry in specs.values() if isinstance(entry, MambaSpec))
-    other = len(specs) - mamba
+    specs, geometry = _drive_runner_translation(model)
+    mamba_specs = [
+        entry for entry in specs.values() if isinstance(entry, MambaSpec)
+    ]
+    attention_specs = [
+        entry for entry in specs.values() if not isinstance(entry, MambaSpec)
+    ]
+    mamba = len(mamba_specs)
+    other = len(attention_specs)
+    # The degree and the block size are RECORDED BESIDE THE CENSUS, not asserted.
+    # ``inc-glm53f-022``'s block requires exactly that of a resolved world size --
+    # evidence, never a criterion -- and the reason is that this process's degree is
+    # a property of how the test is run, so pinning it would pin the runner rather
+    # than the code. What IS asserted is the page relation it implies.
+    print(
+        f"A03_RUNNER_GEOMETRY world_size={geometry.world_size} "
+        f"block_size={geometry.block_size} "
+        f"state_page={geometry.state_page} "
+        f"bytes_per_token={geometry.bytes_per_token} "
+        f"attention_page={geometry.attention_page}"
+    )
     print(f"A03_TRANSLATION total={len(specs)} mamba={mamba} non_mamba={other}")
     assert len(specs) == DECLARED_TOTAL_ENTRIES
     assert (mamba, other) == (DECLARED_KDA_ENTRIES, DECLARED_MLA_ENTRIES)
+
+    # THE PAD BRANCH IS THE ONE PRODUCTION TAKES, and this is where that is read.
+    # ``B62-M1``: before this repair the arm drove the runner at a block size whose
+    # attention page was SMALLER than the world-size-1 state page, so
+    # ``inc-glm53f-086``'s refusal fired and the arm went red. The block size is now
+    # derived from this process's own degree, so the ordering is the production one
+    # and these three readings say so.
+    padded = sorted({entry.page_size_padded for entry in mamba_specs})
+    print(
+        f"A03_PADDED_PAGES kda_distinct={padded} "
+        f"attention_distinct="
+        f"{sorted({entry.page_size_padded for entry in attention_specs}, key=str)}"
+    )
+    # 1. Every recurrent-state page was raised to the attention page.
+    assert padded == [geometry.attention_page]
+    # 2. No attention page was padded -- the direction ``inc-glm53f-086``'s re-pin
+    #    at ``test_kv_cache_spec.py`` also requires, and the one ``inc-glm53f-017``'s
+    #    allocation arm depends on, because it sizes its view from the real page.
+    assert all(entry.page_size_padded is None for entry in attention_specs)
+    # 3. The point of the whole exercise: ALL 45 entries now report one page. This
+    #    also closes the loop on the derivation -- ``bytes_per_token`` was computed
+    #    from a probe spec this test built, and this reads it back off the specs the
+    #    RUNNER built, so a probe that modelled the runner wrongly fails here by
+    #    name instead of quietly choosing a block size on the wrong slope.
+    reported = sorted({entry.page_size_bytes for entry in specs.values()})
+    print(f"A03_UNIFIED_PAGE distinct={reported}")
+    assert reported == [geometry.attention_page]
 
 
 # ---------------------------------------------------------------------------
