@@ -212,7 +212,7 @@ def raw() -> dict:
 def model(raw: dict):
     """The skeleton built from the landed 45-layer fixture.
 
-    Built through the classmethod ``factory.py:70-74`` actually calls, so the
+    Built through the classmethod ``factory.py:293`` actually calls, so the
     acceptance exercises the pinned construction signature rather than a
     convenience path.
     """

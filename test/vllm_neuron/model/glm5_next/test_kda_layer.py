@@ -67,7 +67,7 @@ associativity-correct.
 
 CONVENTIONS THIS FILE FOLLOWS, ALL FOUR OF THEM ``inc-glm53f-013``'s
 -------------------------------------------------------------------
-``model_fp8`` is never imported at module level -- ``test_factory.py:280``
+``model_fp8`` is never imported at module level -- ``test_factory.py:318-319``
 is a landed assertion that it stays out of ``sys.modules`` -- so every import of
 it goes through :func:`_impl` inside a test body; the model is built through
 ``from_configs``; the fixture is deep-copied because ``__post_init__`` mutates
