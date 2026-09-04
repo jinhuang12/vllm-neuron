@@ -1917,7 +1917,7 @@ class _MappingAffinitySpy:
     """Captures the affinity tensor ``build_blockwise_mapping`` is handed.
 
     The call site imports the mapping FUNCTION-LOCALLY from
-    ``vllm_neuron.functional`` (``model_fp8.py:1042``), so replacing the
+    ``vllm_neuron.functional`` (``model_fp8.py:1060``), so replacing the
     attribute on that module is what a call actually resolves. The real mapping
     still runs and its result is still used, so the kernel below is measured on
     the real path rather than on a stub.

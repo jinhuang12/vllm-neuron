@@ -306,7 +306,7 @@ def test_conjunct_1_scale_grids_resolve_at_five_sites_above_the_floor() -> None:
     """CONJUNCT 1 of 7 — the four scale parameters exist, and at the shape floor.
 
     CERTIFYING COMPONENT: the module-level ``_declare_parameters``
-    (``model_fp8.py:87-102``, called from ``Glm5NextMLAAttention.__init__``) and
+    (``model_fp8.py:105-120``, called from ``Glm5NextMLAAttention.__init__``) and
     ``DSA_SCALED_PROJECTIONS``.
 
     Five sites are read, not four: the fifth reading is that ``kv_b_proj``

@@ -55,7 +55,7 @@ WHAT IS DELIBERATELY ABSENT
 The quant-method dispatcher is ``inc-glm53f-023``'s (D14, M2) and is **not**
 here: ``quantization.py:33-39`` states that sequencing fact, not an assignment
 to this increment. Sharded scale loading is later work
-(``weight_loaders_fp8.py:1086-1093`` states the same kind of fact).
+(``weight_loaders_fp8.py:1104-1111`` states the same kind of fact).
 ``vllm_neuron/model/kv_cache.py`` is **untouched**: widening ``LayerSpec`` with
 KDA recurrent-state fields is ``inc-glm53f-015``'s declared surface at M1, and
 its acceptance asserts that the pin's 6-field construction still works with
@@ -767,10 +767,10 @@ class Glm5NextRoutedExperts(nn.Module):
     One parameter per projection covers **all** ``n_routed_experts`` experts:
     the landed map sends ``mlp.experts.<leaf>_weight`` to a *list* of
     ``n_routed_experts`` checkpoint keys
-    (``weight_loaders_fp8.py:652-661``), because this checkpoint stores one
+    (``weight_loaders_fp8.py:670-679``), because this checkpoint stores one
     tensor per expert while the fork's parameter side is per-projection. The
     router lives here too, and carries a bias because
-    ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:636-637``).
+    ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:654-655``).
     """
 
     # ── expert partitioning -- D14 owner: ``inc-glm53f-031`` ─────────────
@@ -893,7 +893,7 @@ class Glm5NextRoutedExperts(nn.Module):
 
         The seam is entered with ``correction_bias=self.router_bias``, and that
         parameter is ``mlp.gate.e_score_correction_bias``
-        (``weight_loaders_fp8.py:644-647``) -- the ``noaux_tc`` correction bias,
+        (``weight_loaders_fp8.py:662-665``) -- the ``noaux_tc`` correction bias,
         NOT a router projection bias. The seam's own signature keeps the two
         apart by name, because adding this tensor to the logits instead of to
         the sigmoid scores would compute a different router that no shape check
