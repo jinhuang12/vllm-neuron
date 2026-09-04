@@ -409,19 +409,84 @@ def test_get_kv_cache_spec_c04_kda_page_reconciles_with_zero_discrepancy() -> No
         c04_dtypes=[str(dtype) for dtype in kda_specs[0].dtypes],
     )
     assert len(pages) == 1
-    assert pages.pop() - RECORDED_KDA_STATE_PAGE_BYTES == 0
+    assert sorted(_natural_state_pages(kda_specs)) == [RECORDED_KDA_STATE_PAGE_BYTES]
 
-    # READING (a) -- page_size_padded is None on EVERY constructed object, the 11
-    # attention entries included, so no page is an override returned verbatim.
+    # READING (a) -- page_size_padded now carries the unified page on the 34 KDA
+    # entries and stays None on the 11 attention ones (`inc-glm53f-086`).
     padded = {name: spec.page_size_padded for name, spec in specs.items()}
     _record(
         c04_reading_a_non_none=sorted(n for n, v in padded.items() if v is not None)
     )
     assert len(padded) == DECLARED_TOTAL_ENTRIES
-    assert all(value is None for value in padded.values())
+    assert _non_none(padded) == _padded_page_expected_for_kda(specs)
 
     # READING (b) -- both carriers length 2 on all 34, so the vendor's
     # strict-less pairing cannot truncate the sum in silence.
     arities = {(len(spec.shapes), len(spec.dtypes)) for spec in kda_specs}
     _record(c04_reading_b_arities=sorted(arities))
     assert arities == {(2, 2)}
+
+    # -086's READINGS, recorded and adding no criterion: the two pages side by
+    # side, so the natural-page assert above cannot be read as a tautology.
+    _record(
+        c086_kda_natural_page_bytes=sorted(_natural_state_pages(kda_specs)),
+        c086_kda_page_size_bytes=sorted(pages),
+        c086_padded_field_entries_set=len(_non_none(padded)),
+    )
+
+    # D1.5 CONTROL for the natural-page zero above: the page the spec REPORTS is
+    # a different number now, so that zero discriminates and is no tautology.
+    assert sorted(pages) != sorted(_natural_state_pages(kda_specs))
+
+
+# ===========================================================================
+# `inc-glm53f-086` HELPERS. They sit BELOW the tests on purpose. Every pin
+# into this file cites a line above C04, and a name defined down here still
+# resolves inside a test body, because that body runs after the module is
+# imported. So the two re-pins above cost zero line movement.
+# ===========================================================================
+
+#: The unified page every KDA entry now reports. MEASURED at round 1, read from
+#: `probe-086-r1-landed-diagnostic.out` (`KDA_page_size_padded_DISTINCT`).
+MEASURED_PADDED_PAGE_BYTES = 262_144
+
+
+def _natural_state_pages(kda_specs: list) -> set:
+    """The bytes each recurrent state's OWN geometry occupies.
+
+    ``page_size_bytes`` stopped answering this question at ``-086``, which pads
+    it up to the attention page, so the state's own size is summed from the
+    shapes and dtypes the spec carries. The product is spelt out rather than
+    imported from ``math``, because a new import at the top of this file would
+    move every line below it and four places pin lines in it.
+    """
+    pages = set()
+    for spec in kda_specs:
+        total = 0
+        for shape, dtype in zip(spec.shapes, spec.dtypes):
+            elements = 1
+            for extent in shape:
+                elements *= extent
+            total += elements * dtype.itemsize
+        pages.add(total)
+    return pages
+
+
+def _non_none(mapping: dict) -> dict:
+    """The entries whose value is set, so an empty result reads as ``{}``."""
+    return {name: value for name, value in mapping.items() if value is not None}
+
+
+def _padded_page_expected_for_kda(specs: dict) -> dict:
+    """Every KDA name mapped to the unified page, and no other name present.
+
+    ``MambaSpec`` is read from its OWN module and never off the runner module,
+    whose name C02 above replaces with a factory function.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return {
+        name: MEASURED_PADDED_PAGE_BYTES
+        for name, spec in specs.items()
+        if isinstance(spec, MambaSpec)
+    }

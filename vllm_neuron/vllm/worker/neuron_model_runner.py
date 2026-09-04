@@ -8607,8 +8607,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # THE PAGE COMES FROM THE SPEC, never from a number derived here:
             # `page_size_bytes` is the sum over the declared carriers, so
             # `num_blocks` and every stride below are functions of what the spec
-            # reports. `get_kv_cache_spec` passes no `page_size_padded`, which
-            # the vendor would otherwise return verbatim in place of that sum.
+            # reports. `inc-glm53f-086` now passes `page_size_padded`, so this
+            # reads the padded DSA page, not that sum; strides scale with it.
             elif isinstance(kv_cache_spec, MambaSpec):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -8735,9 +8735,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # recurrent, the order the vendor's page formula pairs them in.
                 # Dtypes come from the MODEL, per state -- the global KV cache
                 # dtype describes a key/value cache and would mistype an fp32
-                # recurrent state. page_size_padded is deliberately NOT passed:
-                # the vendor returns such an override verbatim, reporting a page
-                # the spec's own geometry does not describe.
+                # recurrent state. page_size_padded IS now passed, below the
+                # loop (`inc-glm53f-086`): it reverses this comment's premise so
+                # the KDA page matches the DSA page this same call builds.
                 spec = MambaSpec(
                     block_size=block_size,
                     shapes=(
@@ -8770,6 +8770,70 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        # THE PADDED PAGE IS SET HERE, AFTER THE LOOP, NOT IN THE ARM ABOVE.
+        # `inc-glm53f-086`. The KDA arm builds its `MambaSpec` inside the loop,
+        # before any attention layer has necessarily been seen, so the attention
+        # page is not yet known there. Both pages are known only once every layer
+        # has a spec, which is here.
+        #
+        # WHY THE SPEC AND NOT A PATCH: upstream's own unification refuses a
+        # `MambaSpec` whose page neither divides the largest page nor belongs to
+        # an attention spec it can pad. Setting the field at construction makes
+        # that unification succeed on its own terms, so nothing downstream has to
+        # widen anything. `inc-glm53f-018`'s patch stays in place and goes inert
+        # on this path, because it only ever fills the field when it is None.
+        #
+        # Scoped to the layers this loop built. The drafter's spec set below is
+        # deliberately NOT padded here; the patch still covers it.
+        # The spec classes are RE-IMPORTED here instead of read off this module's
+        # globals. A landed control replaces this module's `MambaSpec` name with a
+        # factory FUNCTION to revert a dtype assignment
+        # (`test_get_kv_cache_spec_hybrid.py`, C02), and `isinstance` against a
+        # function raises TypeError. Reading the classes from their own module
+        # keeps that control measuring the dtype it is about, not this padding.
+        from dataclasses import replace
+
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec as _FullAttnSpec,
+        )
+        from vllm.v1.kv_cache_interface import MambaSpec as _MambaSpec
+        from vllm.v1.kv_cache_interface import (
+            SlidingWindowSpec as _SlidingWindowSpec,
+        )
+
+        kda_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, _MambaSpec)
+        }
+        attention_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, (_FullAttnSpec, _SlidingWindowSpec))
+        }
+        if kda_specs and attention_specs:
+            kda_page = max(spec.page_size_bytes for spec in kda_specs.values())
+            attention_page = max(
+                spec.page_size_bytes for spec in attention_specs.values()
+            )
+            if attention_page < kda_page:
+                # REFUSED BY NAME rather than padded downward. The vendor's own
+                # hook only ever raises the attention page to meet the state
+                # page, never the reverse, because a page smaller than the state
+                # it must hold cannot describe that state.
+                raise ValueError(
+                    "Cannot unify KV cache pages: the attention page is "
+                    f"{attention_page} B and the recurrent-state page is "
+                    f"{kda_page} B. Padding a recurrent state down to a "
+                    "smaller page would report a page its own geometry does "
+                    "not fit, so this refuses instead of narrowing it."
+                )
+            if attention_page > kda_page:
+                for name, spec in kda_specs.items():
+                    all_kv_cache_specs[name] = replace(
+                        spec, page_size_padded=attention_page
+                    )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

@@ -491,8 +491,8 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
     requested = _counting_zeros(monkeypatch)
     caches = _drive(_config(specs, NUM_BLOCKS_FULL), layers, monkeypatch)
 
-    # The referent: page_size_bytes READ OFF the spec objects get_kv_cache_spec
-    # constructs, times the blocks per entry.
+    # The RAW referent: page_size_bytes off the spec objects get_kv_cache_spec
+    # constructs, times the blocks. -086 pads it, so this is the padded span.
     expected_bytes = sum(
         spec.page_size_bytes * NUM_BLOCKS_FULL for spec in specs.values()
     )
@@ -511,16 +511,16 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
         c04_counting_mock_calls=len(requested),
     )
     assert len(caches) == DECLARED_TOTAL_ENTRIES
-    assert allocated - expected_bytes == 0
+    assert allocated - _addressable_bytes(specs, NUM_BLOCKS_FULL) == 0
 
-    # The KDA page's own referent is DECISIONS section 6's recorded page, CITED
-    # and neither restated nor re-derived (P9).
-    assert kda_pages == [RECORDED_KDA_STATE_PAGE_BYTES]
+    # The KDA page's own referent stays DECISIONS section 6's recorded page (P9).
+    # -086 pads page_size_bytes, so the state's own geometry answers this now.
+    assert _kda_natural_pages(specs, kda_names) == [RECORDED_KDA_STATE_PAGE_BYTES]
 
     # Per entry too, so a compensating pair of errors cannot net to zero.
     per_entry = {
         name: sum(b.numel() * b.element_size() for b in buffers)
-        - specs[name].page_size_bytes * NUM_BLOCKS_FULL
+        - _addressable_page_bytes(specs[name]) * NUM_BLOCKS_FULL
         for name, buffers in caches.items()
     }
     _record(
@@ -530,16 +530,16 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
     )
     assert set(per_entry.values()) == {0}
 
-    # The counting instrument's own total, RECORDED as a second reading. It
-    # equals the requested buffer sizes, which this file's config sets from the
-    # same pages, so the LOAD-BEARING reading above is the one taken over the
-    # buffers the allocator RETURNED.
+    # UNMOVED BY -086. Both sides read page_size_bytes: this file's config sizes
+    # each raw tensor from that page, and the counting mock records what was
+    # asked for, so padding raises the two together. The buffers the allocator
+    # RETURNED span less, which is why the addressable zero above re-pinned.
     assert sum(requested) == expected_bytes
 
     # READINGS inherited from inc-glm53f-016's construction, RECORDED here and
-    # adding no criterion: (a) no page is a verbatim override, (b) both carriers
-    # are present, so the vendor's non-strict pairing cannot have truncated the
-    # sum this arm reconciles against.
+    # adding no criterion: (a) which entries now carry page_size_padded, (b) both
+    # carriers are present, so the vendor's non-strict pairing cannot have
+    # truncated the sum this arm reconciles against.
     padded = {name: spec.page_size_padded for name, spec in specs.items()}
     arities = {(len(specs[n].shapes), len(specs[n].dtypes)) for n in kda_names}
     _record(
@@ -550,9 +550,142 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
         ),
         c04_dsa_entries=len(dsa_names),
     )
-    assert all(value is None for value in padded.values())
+    assert _non_none(padded) == _padded_page_expected_for_kda(specs)
     assert arities == {(2, 2)}
 
     # No conv EXTENT is asserted anywhere above, so the layout term is RECORDED
     # and -015's conjunct 3 stays the campaign's orientation guard.
     _record(c04_resolved_conv_state_layout=get_conv_state_layout())
+
+    # ------------------------------------------------------------------
+    # `inc-glm53f-086`: the readings the pad makes measurable, and the two
+    # D1.5 controls for the zeros this increment re-pinned. All of it sits
+    # BELOW every line this file is pinned from, so the re-pins above moved
+    # nothing.
+    # ------------------------------------------------------------------
+    addressable = _addressable_bytes(specs, NUM_BLOCKS_FULL)
+    pad_bytes = sum(requested) - allocated
+    storage_span = sum(
+        max(buffer.untyped_storage().nbytes() for buffer in buffers)
+        for buffers in caches.values()
+    )
+    _record(
+        c04_addressable_bytes=addressable,
+        c04_pad_bytes_allocated_unaddressable=pad_bytes,
+        c04_kda_natural_page_bytes=_kda_natural_pages(specs, kda_names),
+        c04_kda_natural_sum_at_one_block=sum(
+            _addressable_page_bytes(specs[name]) for name in kda_names
+        ),
+        c04_summed_max_storage_span_per_entry=storage_span,
+    )
+
+    # D1.5 CONTROL, re-pinned side. The addressable zero is only worth reading
+    # if the WRONG referent moves it, so the same allocated total is taken
+    # against the PADDED span, and it has to come out non-zero. How far it
+    # misses by is RECORDED above and asserted nowhere.
+    assert allocated - expected_bytes != 0
+
+    # D1.5 CONTROL, raw side. The requested-bytes equality above is a zero that
+    # a config sized off any other page would move, so this re-drives the same
+    # allocator with the KDA tensors at TWICE the padded page and reads how far
+    # the total travels. A natural-page config is NOT usable as this control: it
+    # fails the runner's divisibility guard and never reaches the equality.
+    doubled = _counting_zeros(monkeypatch)
+    _drive(_config_doubled_kda(specs, NUM_BLOCKS_FULL), layers, monkeypatch)
+    control_delta = len(kda_names) * NUM_BLOCKS_FULL * MEASURED_PADDED_PAGE_BYTES
+    _record(
+        c04_control_doubled_requested_bytes=sum(doubled),
+        c04_control_doubled_minus_expected=sum(doubled) - expected_bytes,
+        c04_control_expected_delta=control_delta,
+    )
+    assert sum(doubled) - expected_bytes == control_delta
+
+
+# ===========================================================================
+# `inc-glm53f-086` HELPERS, placed BELOW the tests deliberately. Three places
+# pin the reading block at the tail of C04 by line number, and a name defined
+# down here still resolves inside a test body, because that body runs after
+# this module is imported. So the four re-pins above cost zero line movement.
+# Two short helpers are repeated from `test_get_kv_cache_spec_hybrid.py`
+# rather than imported, because a new name in the import block at the top of
+# this file would move every line below it.
+# ===========================================================================
+
+#: The unified page every KDA entry now reports. MEASURED at round 1, read from
+#: `probe-086-r1-landed-diagnostic.out` (`KDA_page_size_padded_DISTINCT`).
+MEASURED_PADDED_PAGE_BYTES = 262_144
+
+
+def _addressable_page_bytes(spec) -> int:
+    """Bytes of one page that an allocated buffer can actually reach.
+
+    A recurrent state occupies only its own geometry, and ``-086`` pads the page
+    it REPORTS up to the attention page. The allocation arm packs both states at
+    the front of the page and makes the block stride the whole page, so a
+    returned view spans the geometry and never the pad. An attention page has no
+    pad, so ``page_size_bytes`` is already the addressable answer there.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    if not isinstance(spec, MambaSpec):
+        return spec.page_size_bytes
+    total = 0
+    for shape, dtype in zip(spec.shapes, spec.dtypes):
+        elements = 1
+        for extent in shape:
+            elements *= extent
+        total += elements * dtype.itemsize
+    return total
+
+
+def _addressable_bytes(specs: dict, num_blocks: int) -> int:
+    """Every entry's addressable page, times the blocks per entry."""
+    return sum(_addressable_page_bytes(spec) * num_blocks for spec in specs.values())
+
+
+def _kda_natural_pages(specs: dict, kda_names: list) -> list:
+    """The DISTINCT addressable page across the KDA entries, sorted."""
+    return sorted({_addressable_page_bytes(specs[name]) for name in kda_names})
+
+
+def _non_none(mapping: dict) -> dict:
+    """The entries whose value is set, so an empty result reads as ``{}``."""
+    return {name: value for name, value in mapping.items() if value is not None}
+
+
+def _padded_page_expected_for_kda(specs: dict) -> dict:
+    """Every KDA name mapped to the unified page, and no other name present."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return {
+        name: MEASURED_PADDED_PAGE_BYTES
+        for name, spec in specs.items()
+        if isinstance(spec, MambaSpec)
+    }
+
+
+def _config_doubled_kda(specs: dict, num_blocks: int):
+    """``_config``, with every KDA raw tensor sized at TWICE the padded page."""
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        MambaSpec,
+    )
+
+    tensors = []
+    for name, spec in specs.items():
+        factor = 2 if isinstance(spec, MambaSpec) else 1
+        tensors.append(
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks * factor, shared_by=[name]
+            )
+        )
+    groups = [
+        KVCacheGroupSpec(layer_names=names, kv_cache_spec=specs[names[0]])
+        for names in _split(specs)
+        if names
+    ]
+    return KVCacheConfig(
+        num_blocks=num_blocks, kv_cache_tensors=tensors, kv_cache_groups=groups
+    )
