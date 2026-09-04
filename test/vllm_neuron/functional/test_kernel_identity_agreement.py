@@ -5,9 +5,9 @@ Increment ``inc-glm53f-092``, plan revision 94.
 THE QUESTION THIS FILE ANSWERS
 ------------------------------
 Six modules under ``vllm_neuron/functional/`` expose an identity function that reports which
-NKI member the module talks to. Each reads a **module-level name** -- an import in
-``depthwise_conv1d``, a same-file ``@nki.jit def`` in the other four -- so what it reports is
-what the module BOUND, not what the seam dispatched, and those two can differ.
+NKI member the module talks to. Five read a **module-level name** -- an import in
+``depthwise_conv1d``, a same-file ``@nki.jit def`` in four more. ``moe_blockwise_fp8`` reads
+no such name: it takes the name from its seam's source. No claim watches a dispatch.
 
 So each test here takes an INDEPENDENT reading -- the first positional argument handed to
 ``nki.simulator.simulate_kernel``, which is the kernel the CPU dispatch actually ran -- and
