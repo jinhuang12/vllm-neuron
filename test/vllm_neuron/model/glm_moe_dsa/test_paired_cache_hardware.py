@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_neuron.envs import get_compile_backend_name
 from vllm_neuron.model.glm_moe_dsa.cache import (
     INDEXER_CACHE_BYTES,
     INDEXER_CACHE_PART_BYTES,
@@ -182,7 +183,7 @@ def test_paired_cache_probe_is_one_production_fullgraph() -> None:
     assert forward_source.count("write_paged_cache_pair(") == 2
     assert forward_source.count("gather_paged_cache_pair(") == 2
     assert ").to(torch.float8_e4m3fn)" in inspect.getsource(_round_trip_inputs)
-    assert 'backend="vllm_neuron"' in hardware_source
+    assert "backend=get_compile_backend_name()" in hardware_source
     assert "fullgraph=True" in hardware_source
     assert "dynamic=False" in hardware_source
     assert hardware_source.count("torch.compile(") == 1
@@ -203,7 +204,7 @@ def test_paired_cache_round_trip_fullgraph_neuron() -> None:
     compile_root = Path(os.environ["GLM_STAGE5_PAIRED_CACHE_COMPILE_DIR"])
     compiled = torch.compile(
         module,
-        backend="vllm_neuron",
+        backend=get_compile_backend_name(),
         fullgraph=True,
         dynamic=False,
         options={"compiler_workdir": str(compile_root / "paired-cache-round-trip")},
