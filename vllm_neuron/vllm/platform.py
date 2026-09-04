@@ -129,6 +129,7 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        "fp8",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
@@ -162,9 +163,14 @@ class NeuronPlatform(Platform):
         """Register Neuron model architectures before ModelConfig validation."""
         import os
 
-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
+        ModelRegistry.register_model(
+            "GlmMoeDsaForCausalLM",
+            "vllm_neuron.model.glm_moe_dsa:GlmMoeDsaForCausalLM",
+        )
+
+        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
