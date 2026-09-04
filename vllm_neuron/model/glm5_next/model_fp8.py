@@ -2366,7 +2366,7 @@ class Glm5NextDSAIndexer(nn.Module):
     records ``dsa_indexer`` as GROUNDED (``weight_loaders_fp8.py:84-86``) because
     ``inc-glm53f-078`` read the real shard index. The two dials it was sized from,
     ``index_n_heads`` / ``index_head_dim``, live in ``fixtures/config.json:195-196`` and in
-    ``fixtures/hf-config.json:21``/``:25``, never in fork Python -- as the map declares them.
+    ``fixtures/hf-config.json:25``/``:21``, never in fork Python -- as the map declares them.
     """
 
     def __init__(self) -> None:
