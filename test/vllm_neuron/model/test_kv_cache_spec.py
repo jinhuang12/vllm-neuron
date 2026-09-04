@@ -42,7 +42,7 @@ transposition-invariant by construction. C03 is the only orientation guard.
 WHY THIS FILE IMPORTS NO OTHER TEST MODULE
 ------------------------------------------
 The two geometry constants ``-013`` landed
-(``glm5_next/test_kv_spec.py:111-112``) cite ``linear_attn_config`` as their own
+(``glm5_next/test_kv_spec.py:135-137``) cite ``linear_attn_config`` as their own
 origin, so this file reads that origin directly instead of importing them: the
 ``-013`` module truncates a results file at import time, and importing a test
 module for its constants would fire that side effect from a foreign session.

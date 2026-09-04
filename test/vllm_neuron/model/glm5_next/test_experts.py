@@ -478,7 +478,7 @@ def test_sharding_config_validation_rejects_out_of_range_expert_counts():
 
     WHY THE SPLIT IS REAL AND NOT A CONVENIENCE. Asking the router question at
     construction time rejected ``inc-glm53f-011``'s landed ``mini_config``
-    fixture (``test_weight_loaders.py:282``): a 4-expert bank inheriting the
+    fixture (``test_weight_loaders.py:335-336``): a 4-expert bank inheriting the
     checkpoint's top-8 default, i.e. a structural key-mapping fixture that never
     routes a token. That is a latent incoherence in a landed fixture, routed to
     the lead rather than repaired here -- ``test_weight_loaders.py`` is outside

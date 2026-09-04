@@ -15,9 +15,9 @@ as measured.
 
 WHY EVERY IMPORT OF THE MODULE UNDER TEST IS DEFERRED
 -----------------------------------------------------
-``test_factory.py:283-284`` is a **landed passing assertion** that
+``test_factory.py:318-319`` is a **landed passing assertion** that
 ``vllm_neuron.model.glm5_next.model_fp8`` is *not* in ``sys.modules`` -- it is
-what proves ``factory.py:68``'s lazy import stays lazy. pytest imports **every
+what proves ``factory.py:291``'s lazy import stays lazy. pytest imports **every
 collected test module during collection, before it runs any test**, so a
 module-level ``import model_fp8`` in this file would put the module in
 ``sys.modules`` before ``test_factory.py``'s test body ever runs and would
@@ -712,7 +712,7 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     #   * `layers[0]` -- `test_kv_spec_the_tree_carries_every_d14_section_name`
     #     asserts it is a `Glm5NextKDALayer`, and five other arms read it.
     #   * `layers[0].attention` -- the `.attention` property access is exercised
-    #     on a KDA layer at line 805 of this file, which is the access
+    #     on a KDA layer at line 861 of this file, which is the access
     #     `inc-glm53f-082`'s move made load-bearing.
     #
     # `-013`'s four declared counts (45 / 11 / 34 / 0) are untouched, as is every
@@ -812,7 +812,7 @@ def test_kv_spec_the_tied_head_condition_mirrors_the_map(raw: dict) -> None:
     """``lm_head_weight`` is declared iff the map declares it.
 
     The map omits the key when ``tie_word_embeddings`` is set
-    (``weight_loaders_fp8.py:318-319``); the skeleton must omit the parameter
+    (``weight_loaders_fp8.py:382-383``); the skeleton must omit the parameter
     on the same condition or the two sides disagree on that one name.
     """
     tied = copy.deepcopy(raw)

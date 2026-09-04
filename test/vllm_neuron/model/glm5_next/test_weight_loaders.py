@@ -1321,7 +1321,7 @@ def _fp8_representable_magnitudes() -> torch.Tensor:
 def _fp8_full_range_tile(variant: int) -> torch.Tensor:
     """One `[128,128]` fp32 tile holding EVERY representable OCP e4m3fn magnitude.
 
-    REBUILT BY ``inc-glm53f-012``'s R2 ROUND, for finding
+    REBUILT BY ``inc-glm53f-012``'s r1 ROUND (batch R3), for finding
     ``B08-F2-fixture-misses-low-end-grid-understates-disclosed-error``. It used to be
     `torch.linspace(-448, +448, 16384)` cast to fp8, and its docstring claimed the
     cast collapsed those samples onto "essentially every representable magnitude".
@@ -1599,7 +1599,7 @@ def test_fp8_downscale_c1_dequantisation_agrees_per_block(
         # across all four blocks. It exceeds rtol, which is exactly why the
         # criterion's own clause names a normalised comparison.
         #
-        # RE-REPORTED BY THE R2 ROUND, for finding B08-F2. This figure was 0.0667 and
+        # RE-REPORTED BY THE r1 ROUND (batch R3), for B08-F2. This figure was 0.0667 and
         # was routed to the lead as "the measured per-element worst". It was the worst
         # over the OLD fixture's 88-magnitude subset, not over the grid: the ramp
         # reached no magnitude below 0.0273, and the squeeze is at its worst on the

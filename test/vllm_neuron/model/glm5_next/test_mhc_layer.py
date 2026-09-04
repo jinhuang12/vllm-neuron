@@ -35,7 +35,7 @@ as a number:
    is satisfied by two entries into one kernel. The Python frame chain at each
    entry is walked for each seam's own file, so the reading distinguishes "two
    kernels ran" from "one kernel ran twice". This is ``-027``'s attribution
-   instrument (``test_moe_path.py:254-306``) generalised from one seam to two,
+   instrument (``test_moe_path.py:271-311``) generalised from one seam to two,
    which is what having two counted seams requires.
 
 Instruments 1-4's counted values ARE the acceptance bullet's counter clause;

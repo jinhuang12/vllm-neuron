@@ -137,7 +137,7 @@ _ROUTER_MODULE = "vllm_neuron.functional.moe.router"
 #: The plan's declared fixture extents (L924). ``T = 256`` because the
 #: substrate's admission gate refuses ``T % 256 != 0`` and does so SILENTLY
 #: (``rmsnorm_router_topk_tkg.py:209``); ``E = 288`` is the pin's own
-#: ``n_routed_experts`` (``glm5_next/config.py:141``).
+#: ``n_routed_experts`` (``glm5_next/config.py:185``).
 DECLARED_T = 256
 DECLARED_E = 288
 

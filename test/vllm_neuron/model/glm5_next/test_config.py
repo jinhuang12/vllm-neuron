@@ -383,9 +383,9 @@ C080_QUANT_CONFIG_KEYS = 4
 #
 # 26 -> 25 AT `inc-glm53f-033` REPAIR ROUND 2, BECAUSE THAT ROUND MODELLED ONE
 # MORE KEY: it added `swiglu_limit` to `Glm5NextTextConfig`, the bound the
-# checkpoint clamps both shared-expert projections with. 58 real keys, 33 modelled
-# after the lift, 25 dropped -- and `swiglu_limit` is now absent from the log,
-# which conjunct (c) asserts BY NAME.
+# checkpoint clamps both shared-expert projections with. The count is the constant
+# below and conjunct (c)'s derivation, not a third copy in this prose -- and
+# `swiglu_limit` is now absent from the log, which conjunct (c) asserts BY NAME.
 C080_DROPPED_KEYS = 25
 
 # The checkpoint's two epsilons. They are DIFFERENT numbers, which is the whole

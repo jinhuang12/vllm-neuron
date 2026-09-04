@@ -86,7 +86,7 @@ OVERRIDE = "NEURON_PLATFORM_TARGET_OVERRIDE"
 CPU_MODE = "VLLM_NEURON_CPU_MODE"
 
 #: What ``test/conftest.py`` DEFAULTS the override to when the invocation sets none
-#: (``test/conftest.py:41-44``). It is not what the parent necessarily carries: an
+#: (``test/conftest.py:47-49``). It is not what the parent necessarily carries: an
 #: invocation may supply its own, and arm 2 records the parent's value rather than
 #: demanding this one.
 DEFAULTED_OVERRIDE = "trn2"
@@ -107,8 +107,8 @@ PROBE = (
 )
 READING = re.compile(r"^FP8_CLAMP_MAX=(.+)$", re.MULTILINE)
 
-#: The header ``test/conftest.py:107`` prints, and the two notes it tags a resolved
-#: variable with (``:81``, ``:83``). Arm 4 reads these out of a child pytest's own
+#: The header ``test/conftest.py:132`` prints, and the two notes it tags a resolved
+#: variable with (``:101``, ``:104``). Arm 4 reads these out of a child pytest's own
 #: output, so the mechanism is measured where it runs rather than re-implemented here.
 CONFTEST_HEADER = "overlay environment pinned by test/conftest.py:"
 DEFAULTED_NOTE = "(DEFAULTED by test/conftest.py)"
@@ -346,7 +346,7 @@ def test_conftest_defaults_the_two_variables_and_refuses_one_contradiction(
     """The mechanism that pins the parent, exercised in a child pytest.
 
     Nothing in this tree asserted ``test/conftest.py``'s pre-collection check. Three
-    child collections cover the three things it does (``test/conftest.py:63-92``):
+    child collections cover the three things it does (``test/conftest.py:83-105``):
     default an unset variable, keep a supplied one, and refuse ``VLLM_NEURON_CPU_MODE``
     set to anything but ``1``. The middle case is the one the pre-``inc-glm53f-001``
     gate refused outright, so it is asserted to SUCCEED.

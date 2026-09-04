@@ -71,7 +71,7 @@ ATOL = 1e-5
 #: the block forbids ``functional/kda/`` from importing ``model/glm5_next/``, which
 #: this test mirrors so that the test cannot be the thing that creates the
 #: dependency. The source is ``"gate_lower_bound": -5.0`` at
-#: ``vllm_neuron/model/glm5_next/config.py:157``, inside the ``linear_attn_config``
+#: ``vllm_neuron/model/glm5_next/config.py:170``, inside the ``linear_attn_config``
 #: field of ``Glm5NextTextConfig``.
 GATE_LOWER_BOUND = -5.0
 

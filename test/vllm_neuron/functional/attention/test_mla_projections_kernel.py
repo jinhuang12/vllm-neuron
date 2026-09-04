@@ -225,10 +225,10 @@ def test_conjunct_1_numeric_agreement_at_the_five_refused_widths() -> None:
     number and not as a boolean, because a pass whose margin nobody can see is not
     a measurement.
 
-    The independent oracle is a per-column reduction rather than a single fused
-    torch operator: for the two widest sites that loop is 16,384 and 32,768
-    iterations of vector work, which is slower than one matmul but shares nothing
-    with it.
+    The independent oracle goes through `torch.einsum` with the contraction named
+    explicitly, a different torch entry point from the `@` the module's own oracle
+    uses. A per-column reduction would be more independent and was tried first, but
+    16,384 interpreted iterations do not fit the harness timeout -- see its docstring.
 
     TWO READINGS, COUNTED SEPARATELY. The five declared widths come first and their
     `5/5` reading is the plan's; then the SAME comparison runs again over
