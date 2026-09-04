@@ -45,6 +45,10 @@ from .indexer import (
 )
 from .mlp import GlmMoeDsaSwiGLUMLP
 from .moe import GlmMoeDsaMoE
+from .packed_row_fp8 import (
+    pack_down_row_fp8_bank,
+    pack_gate_up_row_fp8_bank,
+)
 from .quantization import PINNED_FP8
 from .weight_loaders import (
     PINNED_EP,
@@ -629,10 +633,52 @@ class GlmMoeDsaForCausalLM(nn.Module):
             )
         return parameter_name
 
+    def _packed_row_fp8_checkpoint_keys(
+        self,
+        layer_idx: int,
+        bank_name: str,
+    ) -> list[str]:
+        """Return ordered block-FP8 sources for one final packed bank."""
+
+        if bank_name in ("gate_up_weights", "gate_up_scales"):
+            projections = ("gate_proj", "up_proj")
+        elif bank_name in ("down_weights", "down_scales"):
+            projections = ("down_proj",)
+        else:
+            raise ValueError(f"Unknown packed row-FP8 bank {bank_name!r}")
+
+        experts = self.model.layers[layer_idx].mlp.experts
+        keys = []
+        for global_expert in experts.global_expert_ids:
+            for projection in projections:
+                weight_key = (
+                    f"model.layers.{layer_idx}.mlp.experts.{global_expert}."
+                    f"{projection}.weight"
+                )
+                keys.extend((weight_key, weight_key + "_scale_inv"))
+        return keys
+
     def checkpoint_mappings(self, manifest) -> dict[str, str | list[str]]:
         by_key = manifest.by_key
         mappings: dict[str, str | list[str]] = {}
         for name, _ in self.named_parameters():
+            packed_match = re.match(
+                r"^model\.layers\.(\d+)\.mlp\.experts\.packed_row_fp8\."
+                r"(gate_up_weights|down_weights|gate_up_scales|down_scales)$",
+                name,
+            )
+            if packed_match is not None:
+                checkpoint_keys = self._packed_row_fp8_checkpoint_keys(
+                    int(packed_match.group(1)), packed_match.group(2)
+                )
+                missing = [key for key in checkpoint_keys if key not in by_key]
+                if missing:
+                    raise ValueError(
+                        f"Packed row-FP8 parameter {name!r} has missing sources: "
+                        f"{missing[:4]}"
+                    )
+                mappings[name] = checkpoint_keys
+                continue
             checkpoint_key = self._checkpoint_key_for_parameter(name)
             if checkpoint_key not in by_key:
                 raise ValueError(
@@ -743,11 +789,76 @@ class GlmMoeDsaForCausalLM(nn.Module):
 
         return SafetensorsWeightLoader(transform=transform)
 
+    def _packed_row_fp8_bank_loader(
+        self,
+        checkpoint_keys: list[str],
+        by_key,
+        bank_name: str,
+    ) -> SafetensorsWeightLoader:
+        """Convert block-FP8 pairs and emit one final ``moe_tkg`` bank."""
+
+        def transform(sources, rank: int) -> torch.Tensor:
+            if len(sources) != len(checkpoint_keys) or len(sources) % 2:
+                raise ValueError(
+                    f"Packed row-FP8 bank {bank_name!r} requires "
+                    f"{len(checkpoint_keys)} ordered sources"
+                )
+            converted = []
+            for offset in range(0, len(sources), 2):
+                weight_key = checkpoint_keys[offset]
+                scale_key = checkpoint_keys[offset + 1]
+                shape = by_key[weight_key].header.shape
+                block_weight = self._fp8_weight_loader(weight_key, shape, None).load(
+                    [sources[offset]], rank
+                )
+                block_scale = self._fp8_scale_loader(scale_key, shape, None).load(
+                    [sources[offset + 1]], rank
+                )
+                converted.append((block_weight, block_scale))
+
+            if bank_name.startswith("gate_up_"):
+                expert_pairs = [
+                    (converted[offset], converted[offset + 1])
+                    for offset in range(0, len(converted), 2)
+                ]
+                weights, scales = pack_gate_up_row_fp8_bank(expert_pairs)
+            else:
+                weights, scales = pack_down_row_fp8_bank(converted)
+            return scales if bank_name.endswith("_scales") else weights
+
+        return SafetensorsWeightLoader(transform=transform)
+
     def _install_weight_loaders(self, manifest, mappings) -> None:
         by_key = manifest.by_key
         for name, parameter in self.named_parameters():
             checkpoint_key = mappings[name]
             if isinstance(checkpoint_key, list):
+                packed_match = re.match(
+                    r"^model\.layers\.\d+\.mlp\.experts\.packed_row_fp8\."
+                    r"(gate_up_weights|down_weights|gate_up_scales|down_scales)$",
+                    name,
+                )
+                if packed_match is not None:
+                    for weight_key in checkpoint_key[::2]:
+                        entry = by_key[weight_key]
+                        if entry.header.dtype != "F8_E4M3":
+                            raise ValueError(
+                                f"Routed FP8 weight {weight_key!r} has dtype "
+                                f"{entry.header.dtype}"
+                            )
+                        if self._shard_dim(weight_key, entry.header.shape) is not None:
+                            raise ValueError(
+                                f"Routed expert weight {weight_key!r} was sharded"
+                            )
+                    set_weight_loader(
+                        parameter,
+                        self._packed_row_fp8_bank_loader(
+                            checkpoint_key,
+                            by_key,
+                            packed_match.group(1),
+                        ),
+                    )
+                    continue
                 if len(checkpoint_key) != 2:
                     raise ValueError(f"Invalid routed FP8 mapping for {name!r}")
                 weight_key, scale_key = checkpoint_key
