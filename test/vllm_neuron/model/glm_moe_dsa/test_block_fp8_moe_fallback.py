@@ -111,7 +111,7 @@ def test_row_fp8_uses_supported_moe_tkg_for_both_phases(
     assert calls[0]["expert_down_weights_scale"].shape == (4, 256)
     assert torch.equal(calls[0]["expert_index"], selected)
     assert calls[0]["rank_id"] is experts.expert_parallel_rank_tensor
-    assert calls[0]["mask_unselected_experts"] is True
+    assert calls[0]["mask_unselected_experts"] is False
 
 
 def test_row_fp8_prefill_is_chunked_to_kernel_token_limit(monkeypatch) -> None:

@@ -262,7 +262,7 @@ def test_packed_row_dispatch_passes_banks_directly_once(monkeypatch) -> None:
     assert calls[0]["expert_affinities"].shape == affinities.shape
     assert calls[0]["expert_index"].shape == selected.shape
     assert calls[0]["is_all_expert"] is True
-    assert calls[0]["mask_unselected_experts"] is True
+    assert calls[0]["mask_unselected_experts"] is False
 
 
 def test_packed_row_prefill_keeps_moe_tkg_128_token_limit(monkeypatch) -> None:

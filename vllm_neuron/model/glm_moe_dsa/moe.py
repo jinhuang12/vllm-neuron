@@ -396,7 +396,10 @@ class GlmMoeDsaRoutedExperts(nn.Module):
                     rank_id=self.expert_parallel_rank_tensor,
                     expert_gate_up_weights_scale=gate_up_scale,
                     expert_down_weights_scale=down_scale,
-                    mask_unselected_experts=True,
+                    # The router already scatters only the selected top-k weights
+                    # into an otherwise zero affinity tensor.  Rebuilding the
+                    # same mask inside moe_tkg adds redundant decode work.
+                    mask_unselected_experts=False,
                     expert_affinities_scaling_mode=(ExpertAffinityScaleMode.POST_SCALE),
                     activation_fn=ActFnType.SiLU,
                     output_dtype=hidden_states.dtype,
@@ -428,7 +431,8 @@ class GlmMoeDsaRoutedExperts(nn.Module):
                     rank_id=self.expert_parallel_rank_tensor,
                     expert_gate_up_weights_scale=packed.gate_up_scales,
                     expert_down_weights_scale=packed.down_scales,
-                    mask_unselected_experts=True,
+                    # The router has already zeroed every unselected affinity.
+                    mask_unselected_experts=False,
                     expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
                     activation_fn=ActFnType.SiLU,
                     output_dtype=hidden_states.dtype,
