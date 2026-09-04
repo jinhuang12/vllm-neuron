@@ -1469,6 +1469,22 @@ def _shared_call_layer(block, case: dict, quant_config, routed):
     rather than letting a dataclass default stand in for it.
     """
     seam = _shared_seam()
+    # `inc-glm53f-090` repair round 6. The three kernel scale operands are built
+    # once at load time now, and ``shared_expert_mm`` REFUSES to build them inside
+    # a forward step -- that refusal is what makes "never per forward step"
+    # checkable, so it is not softened here. A caller that drives the layer has to
+    # prepare them first, and this line is that step for the tests, standing in
+    # for the load. It runs BEFORE the reset below so preparation can never be
+    # counted as a dispatch, even though it builds through
+    # ``to_kernel_scale_layout`` and reaches no seam.
+    block.shared_experts.prepare_scale_operands(
+        case["gate_w"],
+        case["up_w"],
+        case["down_w"],
+        case["gate_s"],
+        case["up_s"],
+        case["down_s"],
+    )
     seam.reset_dispatch_counters()
     with _SharedSimulatorCounter() as sim:
         got = block.combine_routed_and_shared(
@@ -1707,6 +1723,21 @@ def test_shared_expert_seam_entries_are_one_per_projection_site():
     routed = _shared_routed_stand_in(_shared_expert_torch_reference(case))
     seam = _shared_seam()
 
+    # `inc-glm53f-090` repair round 6. This item drives
+    # ``combine_routed_and_shared`` DIRECTLY, twice, rather than through
+    # :func:`_shared_call_layer`, so it needs its own preparation -- the helper's
+    # call cannot reach it. Once, before the reset, for the two calls below: the
+    # operands do not change between them, which is the whole point of building
+    # them at load time, and preparing before the reset keeps this line out of
+    # every counter the item reads.
+    block.shared_experts.prepare_scale_operands(
+        case["gate_w"],
+        case["up_w"],
+        case["down_w"],
+        case["gate_s"],
+        case["up_s"],
+        case["down_s"],
+    )
     seam.reset_dispatch_counters()
     assert seam.dispatch_counters() == (0, 0), (
         "the reset did not zero -026's counters, so every reading below would be "
