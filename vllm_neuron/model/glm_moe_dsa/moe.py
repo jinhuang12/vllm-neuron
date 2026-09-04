@@ -26,10 +26,12 @@ from .block_fp8 import BlockFP8Linear, RowFP8Linear, dequantize_block_fp8
 from .block_fp8_moe import selective_block_fp8_moe_nki
 from .config import GlmMoeDsaConfig
 from .mlp import GlmMoeDsaSwiGLUMLP
+from .noaux_router import exact_noaux_tc
 from .packed_row_fp8 import PackedRowFP8Banks
 
 _SELECTIVE_BLOCK_FP8_ENV = "GLM_ENABLE_EXPERIMENTAL_SELECTIVE_FP8_MOE"
 _PACKED_ROW_FP8_ENV = "GLM_ENABLE_PACKED_ROW_FP8_MOE"
+_EXACT_NOAUX_ROUTER_ENV = "GLM_ENABLE_EXACT_NOAUX_ROUTER"
 
 
 class _SingleRankMoEGroup:
@@ -67,6 +69,7 @@ class GlmMoeDsaNoAuxRouter(nn.Module):
         self.top_k = top_k
         self.routed_scaling_factor = routed_scaling_factor
         self.norm_topk_prob = norm_topk_prob
+        self.use_exact_noaux_router = os.environ.get(_EXACT_NOAUX_ROUTER_ENV) == "1"
         self.gate = nn.Linear(
             hidden_size,
             num_experts,
@@ -88,7 +91,18 @@ class GlmMoeDsaNoAuxRouter(nn.Module):
         return self.gate.e_score_correction_bias
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = torch.sigmoid(self.gate(hidden_states).float())
+        router_logits = self.gate(hidden_states).float()
+        if self.use_exact_noaux_router:
+            selected_experts, affinities = exact_noaux_tc(
+                router_logits,
+                self.correction_bias,
+                top_k=self.top_k,
+                norm_topk_prob=self.norm_topk_prob,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            return affinities, selected_experts
+
+        scores = torch.sigmoid(router_logits)
         selection_scores = scores + self.correction_bias
         if can_run_kernel(scores):
             selected_experts = self._select_nki(scores)
