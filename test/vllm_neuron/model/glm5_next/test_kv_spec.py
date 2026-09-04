@@ -672,6 +672,15 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     # ``hidden_states`` a default would then redden this census for a reason that
     # has nothing to do with a quiet stub, and a working forward must be allowed
     # to simply succeed.
+    #
+    # THE SECOND CLAUSE IS NARROW, and `B40 N7` is why. It used to read
+    # ``except Exception``, which also swallowed a forward that failed for an
+    # unrelated reason -- a shape bug or a typo then read as a retirement. The
+    # class is not guessed: both retired forwards were measured through this
+    # file's own fixture to raise ``TypeError`` for a missing ``hidden_states``
+    # (``probe-R13-retired-forward-classes.out``), which is the outcome the
+    # paragraph above already describes. Success is still allowed, because no
+    # clause catches it, and anything else now propagates instead of passing.
     retired = [model.model.layers[0], model.model.layers[0].attention]
     still_stubbed = []
     for module in retired:
@@ -679,8 +688,8 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
             module.forward()
         except NotImplementedError:
             still_stubbed.append(type(module).__name__)
-        except Exception:
-            pass  # implemented; it merely wants its arguments
+        except TypeError:
+            pass  # implemented; it merely wants its arguments (`B40 N7`)
     _record(retired_forwards_still_stubbed=still_stubbed)
     assert still_stubbed == [], (
         f"retired as handed over to inc-glm53f-038a, but still a stub: "
@@ -712,7 +721,7 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     #   * `layers[0]` -- `test_kv_spec_the_tree_carries_every_d14_section_name`
     #     asserts it is a `Glm5NextKDALayer`, and five other arms read it.
     #   * `layers[0].attention` -- the `.attention` property access is exercised
-    #     on a KDA layer at line 861 of this file, which is the access
+    #     on a KDA layer at line 870 of this file, which is the access
     #     `inc-glm53f-082`'s move made load-bearing.
     #
     # `-013`'s four declared counts (45 / 11 / 34 / 0) are untouched, as is every
