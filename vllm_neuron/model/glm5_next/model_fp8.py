@@ -2609,6 +2609,21 @@ class Glm5NextDSAIndexer(nn.Module):
         )
 
 
+class Glm5NextMLADecodeError(ValueError):
+    """Raised when the MLA decode path is asked for something it cannot serve.
+
+    ``inc-glm53f-042``. Declared beside the class that raises it, the convention
+    the three sibling route errors in this file already follow.
+
+    A DISTINCT TYPE RATHER THAN A BARE ``ValueError``, for one reason the
+    acceptance depends on. The ``B == 1`` serving constraint has to be
+    distinguishable from a shape typo, and a test that caught ``ValueError``
+    would pass on either -- so the constraint would be asserted without being
+    measured. The seams this path calls raise their own named errors for the same
+    reason (``MlaAbsorbError``, ``MlaSparseAttentionError``).
+    """
+
+
 class Glm5NextMLAAttention(nn.Module):
     """Multi-head latent attention at ``self_attn``, NoPE on this checkpoint.
 
@@ -2852,6 +2867,134 @@ class Glm5NextMLAAttention(nn.Module):
             )
         return prepared[name]
 
+    # -- the ABSORB section -- D14 owner: ``inc-glm53f-042`` -------------------
+    #
+    # WHAT THIS SECTION IS FOR. The projections above work in the HEAD width 256;
+    # the sparse attention seam works in the LATENT rank 512. Two per-head
+    # matmuls cross between them, and ``inc-glm53f-097`` authored the NKI seam
+    # that computes them. This section prepares that seam's two weight operands
+    # once, at load time, and does nothing else.
+    #
+    # WHERE THE OPERANDS COME FROM, and why no new weight is read. Both are
+    # halves of ONE weight this class already prepares, ``kv_b_proj``: it expands
+    # a latent into a per-head key and value pair, and ``inc-glm53f-039b``
+    # already splits its OUTPUT on that boundary (``key_value[..., :256]`` and
+    # ``[..., 256:]``). This section splits the WEIGHT on the same boundary
+    # instead, which is what lets the two matmuls be absorbed into the query and
+    # into the attention output. No second projection is read, no new parameter
+    # is declared, and no checkpoint tensor is touched.
+    #
+    # WHY ONCE AND NOT PER CALL. ``inc-glm53f-039b``'s one-time transpose exists
+    # because copying a projection weight per call costs up to 64 MB every call.
+    # The same argument applies with more force here: the split reshapes, slices
+    # and permutes a 512 x 32,768 weight, and it never changes. So it runs at
+    # load time behind the same device pre-flight, and the accessor REFUSES
+    # instead of building on demand -- refusing is what makes "never per call"
+    # checkable, exactly as ``_prepared_weight`` argues just above.
+    #
+    # THE TWO ORIENTATIONS ARE NOT SYMMETRIC, and that asymmetry is the design.
+    # ``nc_matmul`` contracts the partition axis, so each operand must present
+    # its own contraction extent there:
+    #   absorb-in  turns ``query [S, H, 256]`` into ``[S, H, 512]``, contracting
+    #              the HEAD width, so ``W_UK`` is ``[H, 256, 512]``;
+    #   absorb-out turns the seam's ``[S, H, 512]`` into ``[S, H, 256]``,
+    #              contracting the LATENT, so ``W_UV`` is ``[H, 512, 256]``.
+    # ``W_UV`` is therefore the value half as it already sits in the prepared
+    # weight, and ``W_UK`` is the key half TRANSPOSED. Storing ``W_UK`` the other
+    # way round would put a transpose back on the per-forward path, which is the
+    # one cost this section exists to avoid.
+
+    #: Attribute the two absorb operands are cached on. A plain attribute for the
+    #: same reason ``PREPARED_WEIGHTS_ATTR`` is one: a buffer enters
+    #: ``state_dict()``, which would duplicate a 32 MB weight in every saved
+    #: checkpoint.
+    ABSORB_WEIGHTS_ATTR = "_prepared_absorb_weights"
+
+    def absorb_widths(self) -> tuple[tuple[str, int, int, int], ...]:
+        """The two absorb operands as ``(name, heads, contraction, out_features)``.
+
+        Closed form from the config and never read off a weight's shape, so a
+        mis-shaped checkpoint is caught rather than adopted -- the rule
+        ``projection_widths`` states for the five projections, applied here.
+        """
+        heads = self.num_attention_heads
+        latent = self.kv_lora_rank
+        return (
+            ("W_UK", heads, self.qk_nope_head_dim, latent),
+            ("W_UV", heads, latent, self.v_head_dim),
+        )
+
+    def prepare_absorb_weights(self) -> int:
+        """Split the prepared ``kv_b_proj`` into the two absorb operands. ONCE.
+
+        Returns how many operands were built, so a caller can tell this ran from
+        a call that had nothing to do.
+
+        THE INPUT IS THE PREPARED WEIGHT, NOT THE CHECKPOINT PARAMETER, and the
+        difference is load-bearing. ``_prepared_weight`` returns ``kv_b_proj``
+        after ``inc-glm53f-085``'s dequantisation chain and
+        ``inc-glm53f-039b``'s one-time transpose, so it is
+        ``[kv_lora_rank, heads * (nope + v)]`` in a real dtype. Splitting the raw
+        parameter instead would, on a checkpoint that stored this weight as fp8
+        bytes, split bytes rather than numbers and compute the wrong function at
+        exactly the right shapes -- the defect class ``-085`` was raised to fix.
+
+        THE SPLIT IS A REARRANGEMENT AND NOTHING ELSE. Every element of both
+        operands is an element of the prepared weight, in the prepared weight's
+        own dtype: no cast, no scale, no arithmetic. The acceptance asserts that
+        head by head as item (iv-a) per ``../../../artifacts/campaigns/
+        glm-5.3-flash-port/approvals/DECISIONS.md`` §15a.5, which is what makes
+        "the split picks the right bytes for the right head" a measurement
+        instead of a claim.
+        """
+        prepared = self._prepared_weight("kv_b_proj")
+        heads = self.num_attention_heads
+        nope = self.qk_nope_head_dim
+        vdim = self.v_head_dim
+        latent = self.kv_lora_rank
+        closed_form = (latent, heads * (nope + vdim))
+        if tuple(prepared.shape) != closed_form:
+            raise Glm5NextMLADecodeError(
+                f"the prepared kv_b_proj is {tuple(prepared.shape)}; this "
+                f"config's closed form is [kv_lora_rank, heads * (nope + v)] = "
+                f"{closed_form}, so the absorb split would silently mix heads"
+            )
+        per_head = prepared.reshape(latent, heads, nope + vdim)
+        operands = {
+            # [latent, heads, nope] -> [heads, nope, latent]: the key half,
+            # transposed, because absorb-in contracts the HEAD width.
+            "W_UK": per_head[:, :, :nope].permute(1, 2, 0).contiguous(),
+            # [latent, heads, v] -> [heads, latent, v]: the value half as it
+            # already stands, because absorb-out contracts the LATENT.
+            "W_UV": per_head[:, :, nope:].permute(1, 0, 2).contiguous(),
+        }
+        for name, exp_heads, contraction, out_features in self.absorb_widths():
+            got = tuple(operands[name].shape)
+            want = (exp_heads, contraction, out_features)
+            if got != want:
+                raise Glm5NextMLADecodeError(
+                    f"{name} came out {got}; this config's closed form is {want}"
+                )
+        setattr(self, self.ABSORB_WEIGHTS_ATTR, operands)
+        return len(operands)
+
+    def _absorb_weight(self, name: str) -> torch.Tensor:
+        """One absorb operand, or a refusal naming what was not done.
+
+        Refusing instead of building on demand is what makes "once, at load
+        time" checkable -- the argument ``_prepared_weight`` makes, and the
+        failure it prevents is the same one: a silent per-call rebuild that
+        nothing reports.
+        """
+        operands = getattr(self, self.ABSORB_WEIGHTS_ATTR, None)
+        if not operands:
+            raise Glm5NextMLADecodeError(
+                "prepare_absorb_weights() has not run; the absorb operands are "
+                "split from the prepared kv_b_proj once at load time, never per "
+                "call"
+            )
+        return operands[name]
+
     def _latent_norm(self, x: torch.Tensor, gain: torch.Tensor) -> torch.Tensor:
         """RMSNorm on a low-rank latent: ``x / sqrt(mean(x**2) + eps) * gain``.
 
@@ -2916,6 +3059,72 @@ class Glm5NextMLAAttention(nn.Module):
             value.contiguous().to(out_dtype),
         )
 
+    # -- RIDER on the projections section above -- ``inc-glm53f-042``, design
+    #    entry ``design-20260905-p`` ruling (iii). DISCLOSED, not silent.
+    #
+    #    WHAT THE RIDER IS. The absorbed decode path needs the NORMALISED LATENT
+    #    that ``project_qkv`` computes as a local and then consumes. The design
+    #    offered two ways to expose it: a ``return_latent`` keyword on
+    #    ``project_qkv``, or a sibling method reusing its first three dispatches.
+    #
+    #    I CHOSE THE SIBLING, and the reason is not style. ``project_qkv``'s
+    #    FOURTH dispatch is the ``kv_b_proj`` expansion, 512 -> 32,768, and the
+    #    entire point of absorbing ``W_UK`` and ``W_UV`` is that the decode path
+    #    never performs that expansion. A ``return_latent`` keyword would have
+    #    handed back the latent while still paying for the expansion on every
+    #    decode step, making the absorbed path SLOWER than the path it replaces.
+    #    That is not a micro-optimisation; it would defeat the increment.
+    #
+    #    WHAT IT COSTS. The three dispatches below repeat ``project_qkv``'s first
+    #    three lines rather than being factored out of them. Factoring would edit
+    #    a landed method's body, and ``-039b``'s acceptance asserts that body's
+    #    behaviour; a behaviour-identical refactor is still a rewrite of code
+    #    another increment's items stand on. Repetition that is visible beats a
+    #    refactor that is invisible, so ``project_qkv`` above is untouched --
+    #    byte-for-byte, including its three returns.
+
+    def project_query_and_latent(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Query and the NORMALISED KV latent. THREE dispatches, not four.
+
+        ``hidden_states`` is ``[tokens, hidden_size]``. The returns are
+        ``query [tokens, heads, qk_nope_head_dim]`` and
+        ``kv_latent [tokens, kv_lora_rank]``.
+
+        This is the absorbed path's entry into the projections: the query at the
+        head width, and the compressed KV latent BEFORE any expansion. The
+        expansion is what ``W_UK`` and ``W_UV`` absorb, so performing it here
+        would be paying for the work this increment exists to remove.
+
+        The latent is returned NORMALISED because that is what the cache stores
+        and what the seam contracts against; returning the un-normalised
+        compression would put a norm on every reader of the cache instead of one
+        norm on the writer.
+        """
+        from vllm_neuron.functional.attention.mla_projections import mla_projection
+
+        widths = {name: (idim, odim) for name, idim, odim in self.projection_widths()}
+        x = hidden_states.to(torch.float32)
+        if x.ndim != 2 or int(x.shape[1]) != self.hidden_size:
+            raise Glm5NextMLADecodeError(
+                f"hidden_states must be [tokens, {self.hidden_size}]; got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        tokens = int(x.shape[0])
+        heads = self.num_attention_heads
+
+        q_latent = mla_projection(x, self._prepared_weight("q_a_proj"))
+        q_latent = self._latent_norm(q_latent, self.q_a_layernorm_weight)
+        query = mla_projection(q_latent, self._prepared_weight("q_b_proj"))
+        query = query.reshape(tokens, heads, widths["q_b_proj"][1] // heads)
+
+        kv_latent = mla_projection(x, self._prepared_weight("kv_a_proj_with_mqa"))
+        kv_latent = self._latent_norm(kv_latent, self.kv_a_layernorm_weight)
+
+        out_dtype = hidden_states.dtype
+        return query.to(out_dtype), kv_latent.to(out_dtype)
+
     def project_output(self, attn_out: torch.Tensor) -> torch.Tensor:
         """The output projection. ONE dispatch.
 
@@ -2939,6 +3148,134 @@ class Glm5NextMLAAttention(nn.Module):
             )
         projected = mla_projection(x.contiguous(), self._prepared_weight("o_proj"))
         return projected.to(attn_out.dtype)
+
+    # -- the DECODE section -- D14 owner: ``inc-glm53f-042`` -------------------
+    #
+    # WHAT THIS SECTION IS FOR. It is the chain that turns hidden states into
+    # attention output for this layer, and it is ONE method rather than a prefill
+    # method and a decode method. The acceptance compares a decode step against
+    # the matching slice of a prefill run, and that comparison is only worth
+    # taking if BOTH sides are the same code at different token counts. Two
+    # methods would let the comparison pass while the two paths diverged, which
+    # is the failure the item exists to catch.
+    #
+    # THE CHAIN, and every step's owner:
+    #   project_query_and_latent  three dispatches, this increment's rider
+    #   the cache write           this increment
+    #   the cache read            this increment
+    #   absorb-in                 ``inc-glm53f-097``'s seam, W_UK
+    #   sparse attention          ``inc-glm53f-040``/``-041``/``-093``'s seam
+    #   absorb-out                ``inc-glm53f-097``'s seam, W_UV
+    #   project_output            ``inc-glm53f-039b``'s method, called unchanged
+    #
+    # WHY THE EXPANSION NEVER HAPPENS HERE. ``kv_b_proj`` expands a 512 latent to
+    # 32,768 per token. The absorbed chain multiplies the QUERY by ``W_UK``
+    # instead and the attention OUTPUT by ``W_UV``, so the expansion is never
+    # computed on the per-token path at all. That is the whole reason this section
+    # is not simply ``project_qkv`` followed by dense attention.
+    #
+    # WHAT THIS SECTION DOES NOT OWN, and both absences are the design's:
+    #   * TOP-K SELECTION. The sparse seam requires ``topk_indices`` and no block
+    #     on the plan produces them -- the DSA indexer is a ``-013`` stub that
+    #     raises. So the indices are a caller's argument here. Recorded as a plan
+    #     gap by the lead rather than improvised into this method.
+    #   * THE SOFTMAX SCALE. No block registers a value for it, so it is a
+    #     caller's argument too. Deriving one here would mint a registered value
+    #     this increment has no authority to mint.
+
+    def attend(
+        self,
+        hidden_states: torch.Tensor,
+        latent_cache: torch.Tensor,
+        start_position: int,
+        topk_indices: torch.Tensor,
+        softmax_scale: float,
+        batch_size: int = 1,
+    ) -> torch.Tensor:
+        """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
+
+        ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
+        tokens at once and a decode step passes one. ``latent_cache`` is this
+        layer's latent cache in the model's own declared spec layout --
+        ``[slots, NUM_LATENT_KV_HEADS, head_size]``, one latent per token, bf16 --
+        and ``start_position`` is the slot the first of these tokens occupies.
+        The cache is WRITTEN in place for those tokens and then READ from slot 0
+        through the last written slot, which is the context this attention sees.
+
+        WHY ``batch_size`` IS A PARAMETER AND NOT INFERRED. ``latent_cache`` here
+        is ONE sequence's slots, because MLA caches one latent per token per
+        layer and this checkpoint's serving constraint G1 is ``B == 1``. A caller
+        serving more than one sequence would have to loop, and the named refusal
+        below says so rather than letting a second sequence's tokens land in the
+        first one's slots. The parameter exists to make that constraint a
+        measurement: the acceptance asserts the refusal is raised BY NAME and
+        that no seam counter moves, which distinguishes a refusal from a silent
+        skip.
+        """
+        if int(batch_size) != 1:
+            raise Glm5NextMLADecodeError(
+                f"the MLA decode path serves one sequence at a time (constraint "
+                f"G1, batch_size == 1); got batch_size={batch_size}. The latent "
+                f"cache passed here is a single sequence's slots, so a larger "
+                f"batch would write one sequence's latents into another's slots"
+            )
+        if hidden_states.ndim != 2 or int(hidden_states.shape[1]) != self.hidden_size:
+            raise Glm5NextMLADecodeError(
+                f"hidden_states must be [tokens, {self.hidden_size}]; got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        tokens = int(hidden_states.shape[0])
+        latent = self.kv_lora_rank
+        want_cache = (self.NUM_LATENT_KV_HEADS, self.head_size)
+        if latent_cache.ndim != 3 or tuple(latent_cache.shape[1:]) != want_cache:
+            raise Glm5NextMLADecodeError(
+                f"latent_cache must be [slots, {self.NUM_LATENT_KV_HEADS}, "
+                f"{self.head_size}] -- this layer's own declared cache spec; got "
+                f"{tuple(latent_cache.shape)}"
+            )
+        slots = int(latent_cache.shape[0])
+        start = int(start_position)
+        if start < 0 or start + tokens > slots:
+            raise Glm5NextMLADecodeError(
+                f"these {tokens} token(s) at start_position={start} do not fit "
+                f"the cache's {slots} slot(s); a write past the end would "
+                f"silently wrap onto another sequence's rows"
+            )
+
+        query, kv_latent = self.project_query_and_latent(hidden_states)
+
+        # THE CACHE WRITE. One latent per token, into this layer's single KV
+        # head. Done before the read below, so a decode step attends to its own
+        # token as well as its context -- the same set a prefill of the same
+        # tokens would see, which is what makes the two comparable.
+        latent_cache[start : start + tokens, 0, :] = kv_latent.to(latent_cache.dtype)
+
+        # THE CACHE READ. Slot 0 through the last slot written is this sequence's
+        # context. ``[S_kv, latent]`` is the shape the sparse seam contracts.
+        c_kv = latent_cache[: start + tokens, 0, :]
+
+        from vllm_neuron.functional.attention.mla_absorb import mla_absorb
+        from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention
+
+        # ABSORB-IN. ``[S, H, 256] x [H, 256, 512] -> [S, H, 512]``: the query
+        # moves into the latent space the seam works in.
+        q_lift = mla_absorb(query, self._absorb_weight("W_UK"))
+        if int(q_lift.shape[2]) != latent:
+            raise Glm5NextMLADecodeError(
+                f"absorb-in produced a width of {int(q_lift.shape[2])}; the "
+                f"sparse seam contracts {latent}"
+            )
+
+        attended = mla_sparse_attention(q_lift, c_kv, topk_indices, softmax_scale)
+
+        # ABSORB-OUT. ``[S, H, 512] x [H, 512, 256] -> [S, H, 256]``: back to the
+        # head width ``project_output`` consumes. The cast is here rather than
+        # inside the seam because the seam returns float32 by contract and this
+        # layer's chain carries the model dtype.
+        reduced = mla_absorb(
+            attended.to(hidden_states.dtype), self._absorb_weight("W_UV")
+        )
+        return self.project_output(reduced)
 
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(
@@ -3541,6 +3878,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 self._require_prep_operands_on_device(path, module, names, device)
                 module.prepare_projection_weights()
                 projection_calls += 1
+                # ``inc-glm53f-042``. The absorb split reads the PREPARED
+                # ``kv_b_proj``, so it has to run after the prep that builds it
+                # -- here, immediately after, behind the same device pre-flight
+                # and inside the same single production call site. A module that
+                # declares no absorb split is skipped by the same ``hasattr``
+                # test this loop already uses on the two preps, so the shared
+                # expert path is untouched.
+                #
+                # IT ADDS NO RETURN VALUE ON PURPOSE. This method returns
+                # ``(projection calls, scale calls)`` and ``inc-glm53f-091``'s
+                # items read that pair; a third element would change a landed
+                # contract for a count the acceptance can read straight off the
+                # module. So the signature stays exactly as it landed.
+                if hasattr(type(module), "prepare_absorb_weights"):
+                    module.prepare_absorb_weights()
             if hasattr(type(module), "prepare_scale_operands"):
                 # The projection names come off the module's OWN declaration
                 # tuple, so this call cannot ask for a projection the shared
@@ -3577,11 +3929,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         Returns how many operands were checked, so a caller can tell a passing
         check from a check that had nothing to look at.
 
-        This is case B of conjunct 8. A weight or scale that is absent, still a
-        shape-free placeholder, or sitting on another device is named here and
+        This is case B of conjunct 8. A weight or scale that is still a
+        shape-free placeholder, or sitting on another device, is named here and
         the prep is not called -- because after the prep there is nothing left to
         detect: the operands are built and stored, on whatever device they were
-        built on, and no later move touches them.
+        built on, and no later move touches them. An ABSENT operand is skipped
+        here and named by the prep itself (review finding B69-N1: this sentence
+        used to claim absent operands were named here, and the loop below
+        continues past ``None``).
         """
         checked = 0
         for name in names:
