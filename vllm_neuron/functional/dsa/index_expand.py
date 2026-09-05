@@ -9,8 +9,33 @@ TAIL -- have to be appended because no pool covers them yet::
     tail columns     ``topk + t``           ->  ``tail_start + t``  while ``t < seq_len % pool_size``
     everything else                         ->  ``-1``
 
-with ``topk = n_groups * pool_size`` and ``tail_start`` the start of the incomplete final pool. The
-output is ``[rows, topk + pool_size - 1]`` int32, which is upstream's own column order.
+with ``topk = n_groups * pool_size`` and ``tail_start`` the start of the incomplete final pool. Those
+``topk + pool_size - 1`` columns are the RAW width, and they are upstream's own column order.
+
+**THE EMITTED WIDTH IS THE RAW WIDTH ROUNDED UP TO A WHOLE NUMBER OF ``KEY_CHUNK`` COLUMNS, AND THE
+PADDING IS THE SAME ``-1`` SENTINEL.** ``mla_sparse_attention`` refuses any selected-row count that is
+not a positive multiple of ``KEY_CHUNK`` (``mla_sparse.py:1162-1168``), because that count rides the
+partition axis in MM2 in chunks of exactly that size. The raw width is ``pool_size - 1`` mod
+``pool_size`` and so is never a multiple of 128 for any ``pool_size >= 2``, which means every geometry
+this module can produce was refused by the very kernel that consumes it. Two widths, then::
+
+    width_raw        = n_groups * pool_size + pool_size - 1     the meaningful columns
+    width_admissible = ceil(width_raw / KEY_CHUNK) * KEY_CHUNK  what is emitted
+
+and every column in ``[width_raw, width_admissible)`` holds ``-1``. Read them with
+``index_expand_raw_width`` and ``index_expand_width`` rather than recomputing either: that is the
+result's contract, and a caller that needs to know where the meaningful columns stop asks the first.
+
+**THIS MATCHES UPSTREAM, WHICH DOES THE SAME ROUNDING FOR THE SAME REASON.** Upstream allocates its
+``topk_indices_buffer`` at ``round_up(index_topk + index_kpool - 1, 128)``
+(``models/glm5next/nvidia/model.py:594-599``, repeated for the draft layer at ``mtp.py:57-61``) with the
+comment "Sparse MLA tiles top-k in 128 columns; padded slots remain masked", fills the whole width with
+``-1`` (``sparse_attn_indexer_kpool.py:435``), writes its producer's full width back (``:892``) and
+consumes every column (``sparse_mla_attention.py:847``). So the forced tail pool sits OUTSIDE the
+``index_topk`` budget on both sides, and at the production geometry both widths are 2,176 rather than
+2,048. The reading is ``probe-102-readfirst.out``; the ruling adopting it is DECISIONS section 70.
+``KEY_CHUNK`` is IMPORTED from the sparse kernel module below and never re-typed here, because two
+copies of a hardware constant are two chances to disagree.
 
 **A ``-1`` IS A VALUE, NOT AN OUT-OF-BOUNDS INDEX.** It is the sentinel meaning "this column selects no
 token", and it appears for two independent reasons: the selector handed us a ``-1`` pool id (fewer pools
@@ -124,9 +149,16 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.attention.mla_sparse import KEY_CHUNK
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
+
+# KEY_CHUNK IS IMPORTED, NOT DECLARED. It is the sparse attention kernel's MM2 chunk width and the
+# hardware partition extent behind it, and the emitted width here exists only to satisfy that kernel's
+# admissibility gate. A second copy of it in this file would be a second thing to keep in step, so the
+# one definition lives where the constraint lives (``mla_sparse.py:111``). The import runs one way only:
+# that module imports nothing from this package, so there is no cycle.
 
 INDEX_KPOOL = 4
 """The target checkpoint's compress ratio -- how many tokens one pool covers. RECORDED, NOT A LIMIT.
@@ -207,6 +239,34 @@ def is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
 
+def index_expand_raw_width(n_groups: int, pool_size: int) -> int:
+    """How many columns carry MEANING: ``n_groups * pool_size + pool_size - 1``.
+
+    The history region is ``n_groups * pool_size`` columns and the tail region is ``pool_size - 1``,
+    one per token a final incomplete pool can hold. This is upstream's own output width for the same
+    call (``ops/kpool_compress.py:876``, ``out_cols = topk + pool_size - 1``) and the two expressions
+    are one identity rearranged: ``pool_size * (n_groups + 1) - 1 == n_groups * pool_size + pool_size
+    - 1``. A consumer that needs to know where the meaningful columns stop asks this, because the
+    emitted tensor is wider.
+    """
+    return n_groups * pool_size + pool_size - 1
+
+
+def index_expand_width(n_groups: int, pool_size: int) -> int:
+    """How many columns are EMITTED: the raw width rounded up to a whole number of ``KEY_CHUNK``.
+
+    Public, and derived rather than typed anywhere, because three places need the identical number --
+    the kernel that allocates the output, the torch reference that must match it column for column, and
+    the test that asserts the sparse kernel admits it. A width written out by hand in any one of them
+    would be a fourth definition waiting to disagree.
+
+    The rounding is upstream's, spelled the same way for the same stated reason
+    (``models/glm5next/nvidia/model.py:596-599``).
+    """
+    raw = index_expand_raw_width(n_groups, pool_size)
+    return ((raw + KEY_CHUNK - 1) // KEY_CHUNK) * KEY_CHUNK
+
+
 # ---------------------------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------------------------
@@ -227,16 +287,33 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
             arithmetic on an int argument in the one place a wrong value would corrupt quietly.
 
     Returns:
-        ``[rows, n_groups * pool_size + pool_size - 1]`` int32, in upstream's column order.
+        ``[rows, index_expand_width(n_groups, pool_size)]`` int32, in upstream's column order, with
+        every column past ``index_expand_raw_width(n_groups, pool_size)`` holding the ``-1`` sentinel.
 
     THE HISTORY REGION IS WRITTEN ONE OFFSET AT A TIME, STRIDED. Each iteration computes every group's
     value for one offset on a full-width tile and copies it into the columns of stride ``pool_size``
     that own it, so the loop is ``pool_size`` long however many pools were selected.
+
+    THE THREE REGIONS PARTITION THE OUTPUT EXACTLY, WHICH IS WHY NOTHING IS WRITTEN TWICE AND NOTHING IS
+    LEFT UNDEFINED::
+
+        [0, topk)            history, the strided loop below
+        [topk, raw_cols)     tail, one column per iteration, `pool_size - 1` of them
+        [raw_cols, out_cols) padding, one memset, all `-1`
+
+    The padding memset is the whole of this increment's device-side change. It is written HERE, in the
+    kernel body, and not as a torch concatenation after the call: the width is kernel-class work under
+    P13 and a torch pad would be a fallback for it.
     """
     rows = pool_ids_hbm.shape[0]
     n_groups = pool_ids_hbm.shape[1]
     topk = n_groups * pool_size
-    out_cols = topk + pool_size - 1
+    # BOTH WIDTHS COME FROM THE MODULE'S OWN FUNCTIONS, not from arithmetic repeated here. They are
+    # plain python ints resolved at trace time, so the traced graph sees two constants exactly as it did
+    # when this body computed them inline -- and the file now has ONE definition of the ceiling instead
+    # of a second one sitting where a reader would never think to compare it.
+    raw_cols = index_expand_raw_width(n_groups, pool_size)
+    out_cols = index_expand_width(n_groups, pool_size)
 
     out = nl.ndarray((rows, out_cols), dtype=nl.int32, buffer=nl.shared_hbm)
 
@@ -246,6 +323,14 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
     nisa.tensor_copy(dst=seq, src=nl.load(seq_lens_hbm))
 
     acc = nl.ndarray((rows, out_cols), dtype=nl.int32, buffer=nl.sbuf)
+
+    # THE PADDING REGION, FIRST, so the tile's whole extent is accounted for before any real value is
+    # written and a later edit to the tail loop cannot silently leave a gap. `nisa.memset` on a column
+    # slice with a sentinel is the landed form at `argsort_unstable.py:197-199`, which pads to a
+    # multiple of its own pass width for the same reason. The guard matters: an admissible raw width
+    # would make this an empty slice, and `pool_size == 1` is exactly that case.
+    if out_cols > raw_cols:
+        nisa.memset(acc[:, raw_cols:out_cols], -1)
 
     # THE HISTORY REGION. `max(pid * pool_size + o, -1)` is upstream's `where(pid >= 0, ...)` with no
     # compare and no select: the largest value any negative pool id can reach is exactly -1.
@@ -301,11 +386,15 @@ def _record_nki_dispatch(rows: int, n_groups: int, pool_size: int, out_cols: int
     recorded identity is derived by TAKING the branch.
     """
     _COUNTERS.last_kernel = _kernel_identity_of(_index_expand_nki)
+    # BOTH WIDTHS ARE LOGGED. A log line carrying only the emitted width would leave anyone reading a
+    # production transcript unable to tell 2,176 meaningful columns from 2,051 meaningful columns and 125
+    # sentinels, which is the whole distinction this increment introduces.
     logger.info(
-        "[dsa-index-expand] kernel=nki rows=%d n_groups=%d pool_size=%d out_cols=%d",
+        "[dsa-index-expand] kernel=nki rows=%d n_groups=%d pool_size=%d raw_cols=%d out_cols=%d",
         rows,
         n_groups,
         pool_size,
+        index_expand_raw_width(n_groups, pool_size),
         out_cols,
     )
 
@@ -372,16 +461,19 @@ def dsa_index_expand(pool_ids: Tensor, seq_lens: Tensor, pool_size: int = INDEX_
             defaults to this checkpoint's compress ratio.
 
     Returns:
-        ``[rows, n_groups * pool_size + pool_size - 1]`` int32 token indices in upstream's column
+        ``[rows, index_expand_width(n_groups, pool_size)]`` int32 token indices in upstream's column
         order, where ``-1`` is the sentinel for "this column selects no token" and is a VALUE rather
-        than an out-of-bounds index.
+        than an out-of-bounds index. The first ``index_expand_raw_width(n_groups, pool_size)`` columns
+        carry meaning and every column after them is ``-1``; the emitted width is a positive multiple
+        of ``KEY_CHUNK`` so that ``mla_sparse_attention`` admits it. Ask the two width functions rather
+        than recomputing either.
 
     Raises:
         IndexExpandError: for a malformed call -- a non-2-D ``pool_ids``, a ``seq_lens`` that is not
             1-D or does not match the row count, or a non-positive ``pool_size``.
     """
     rows, n_groups = _validate(pool_ids, seq_lens, pool_size)
-    out_cols = n_groups * pool_size + pool_size - 1
+    out_cols = index_expand_width(n_groups, pool_size)
 
     if not can_run_dsa_index_expand(pool_ids, seq_lens, pool_size):
         _COUNTERS.torch_fallback += 1
@@ -416,10 +508,23 @@ def _dsa_index_expand_torch(pool_ids: Tensor, seq_lens: Tensor, pool_size: int) 
     Transcribed from ``kpool_compress.py:818-857`` and kept in UPSTREAM'S OWN ``where`` form rather
     than rewritten into the kernel's closed forms. That is the point: if the two spellings were the
     same spelling, agreeing with this would only prove the kernel agrees with itself.
+
+    THE PADDING COSTS THIS FUNCTION ONE WIDTH AND NO NEW LOGIC, and that asymmetry with the kernel is
+    deliberate rather than a shortcut. The kernel states the sentinel by writing it -- one memset over
+    ``[raw_cols, out_cols)``. Here the same columns come back ``-1`` because the predicate that was
+    already deciding the tail says so: ``tail_offset`` for a padded column is at least ``pool_size -
+    1``, ``tail_count`` is at most ``pool_size - 1``, so ``is_tail`` is False and the ``where`` takes
+    its ``-1`` branch. Two different mechanisms arriving at the same bytes is a real agreement; one
+    mechanism written twice would only prove this file agrees with itself.
+
+    The gather stays in bounds for the padded columns without a guard, and that is worth stating
+    because it looks like it should not: ``group`` is clamped to ``n_groups - 1`` for every column, so
+    the widened ``cols`` reads a valid group and produces a history value that ``is_history`` then
+    discards.
     """
     rows, n_groups = (int(d) for d in pool_ids.shape)
     topk = n_groups * pool_size
-    out_cols = topk + pool_size - 1
+    out_cols = index_expand_width(n_groups, pool_size)
 
     cols = torch.arange(out_cols, dtype=torch.int64, device=pool_ids.device)
     cols = cols[None, :].expand(rows, out_cols)
