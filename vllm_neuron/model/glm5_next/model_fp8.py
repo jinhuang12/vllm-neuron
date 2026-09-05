@@ -80,6 +80,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     FP8_SCALE_SUFFIX,
     MAPPED_KEY_QUANTISED_WEIGHT,
     MAPPED_KEY_SCALE_GRID,
+    MAPPED_KEY_STACKED_BANK,
     build_weight_mappings,
     classify_mapped_keys,
     dequantise_blockwise,
@@ -3521,10 +3522,24 @@ class Glm5NextForConditionalGeneration(nn.Module):
         (``:570-576``), so a placeholder typed one step too wide does not merely
         log -- it changes the values that reach the model.
 
-        The three cases come from
+        The four cases come from
         :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.classify_mapped_keys`,
         which is the one classifier this and the loader choice share, so the
         dtype and the loader cannot disagree about what a key is.
+
+        A STACKED EXPERT BANK IS FP8 FOR THE SAME REASON A LONE QUANTISED WEIGHT
+        IS, and is NAMED in the arm below rather than left to fall through.
+        ``inc-glm53f-095`` made a bank its own classifier kind; a kind this
+        method did not name would fall past the ``quantised_weight`` arm, miss the
+        sibling clause (a bank has no sibling scale ENTRY -- its scales are
+        interleaved inside its own) and reach ``text_config.torch_dtype``. All 126
+        bank placeholders on the real configuration would then be bf16 while
+        their loader delivers fp8, and the reader warns on exactly that mismatch
+        (``utils/checkpoints.py:437``, ``:570-575``). Settled from source before
+        the fourth kind was added, not after:
+        ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/contradiction-095-refusal-collision.md``.
+        This is the second consumer in "one classifier, two consumers", and it
+        moves whenever the classifier gains a kind.
 
         THE SIBLING CLAUSE, AND THE DEFECT IT REPAIRS. A quantised weight whose
         scale travels in the SAME map entry classifies ``quantised_weight`` and
@@ -3554,7 +3569,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         kind = classify_mapped_keys(checkpoint_keys)
         if kind == MAPPED_KEY_SCALE_GRID:
             return torch.float32
-        if kind == MAPPED_KEY_QUANTISED_WEIGHT:
+        if kind in (MAPPED_KEY_QUANTISED_WEIGHT, MAPPED_KEY_STACKED_BANK):
             return _FP8_DTYPE
         if self._sibling_scale_grid_name(param_name) in mappings:
             return _FP8_DTYPE
@@ -3637,7 +3652,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     requires_grad=False,
                 )
                 # May RAISE. Deliberately before the first registration below.
-                loader = loader_for_mapped_keys(checkpoint_keys, param_name=name)
+                #
+                # ``owner`` is the module that DECLARED this parameter, and only
+                # ``inc-glm53f-095``'s expert-bank loader reads it: the expert
+                # geometry lives on ``Glm5NextRoutedExperts`` (``-031``) and
+                # nowhere else, so the loader is handed the declaring module
+                # rather than deriving a second partition from the key count.
+                loader = loader_for_mapped_keys(
+                    checkpoint_keys, param_name=name, owner=module
+                )
                 if loader is not None:
                     set_weight_loader(placeholder, loader)
                 planned.append((module, leaf, placeholder))
@@ -3692,17 +3715,22 @@ class Glm5NextForConditionalGeneration(nn.Module):
         reader's contract takes one and hands it to every loader transform, so
         that increment needs no change here.
 
-        A ROUTED EXPERT BANK REFUSES THIS LOAD, BY NAME, AND ``inc-glm53f-095``
-        IS WHERE IT STOPS DOING SO. Step 3 raises
+        A ROUTED EXPERT BANK NOW LOADS, AND WHAT STILL REFUSES IS NAMED
+        (``inc-glm53f-095``). Step 3 used to raise
         :class:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.Glm5NextExpertBankNotLoadableError`
-        on a map entry carrying more than one scale key, naming the parameter and
-        its key count. That refusal is NOT caught and re-wrapped here, which is a
-        choice: its message already names the parameter and the increment that
-        answers it, and wrapping it in this method's own error would bury both
-        behind a sentence about checkpoints. It is a ``ValueError`` either way,
-        like ``Glm5NextWeightLoadError``. The measurement behind it -- expert 0
-        arriving and 287 experts dropped in silence, with a green acceptance over
-        it -- is recorded on the raising function.
+        on EVERY map entry carrying more than one scale key, because every loader
+        this package defined kept ``slices[0][:]`` and dropped 287 of 288 experts
+        in silence. The stacking loader serves that entry now. The same error,
+        unchanged in class and still NOT caught and re-wrapped here, refuses what
+        this package cannot serve honestly: a malformed entry (odd key count, or a
+        scale key out of alternation), a multi-weight entry carrying no scale key,
+        and a bank whose owning module declares no expert geometry. Leaving it
+        unwrapped is a choice: its message already names the parameter and the
+        defect, and wrapping it in this method's own error would bury both behind
+        a sentence about checkpoints. It is a ``ValueError`` either way, like
+        ``Glm5NextWeightLoadError``. The measurement behind the original refusal
+        -- expert 0 arriving and 287 experts dropped in silence, with a green
+        acceptance over it -- is recorded on the raising function.
         """
         try:
             checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)

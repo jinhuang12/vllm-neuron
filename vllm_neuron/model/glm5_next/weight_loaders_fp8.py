@@ -1391,6 +1391,15 @@ MAPPED_KEY_SCALE_GRID = "scale_grid"
 #: A map entry naming a quantised weight together with its scale companion.
 MAPPED_KEY_QUANTISED_WEIGHT = "quantised_weight"
 
+#: A map entry naming a whole bank of quantised experts -- one weight and one
+#: scale grid per expert, interleaved weight-then-scale in checkpoint order.
+#: ``inc-glm53f-095``'s fourth kind. It is a SEPARATE kind from
+#: :data:`MAPPED_KEY_QUANTISED_WEIGHT` because the two need different loaders,
+#: and both of this classifier's consumers have to know which one they hold --
+#: see :func:`classify_mapped_keys` on why the second consumer is the reason
+#: this is a kind rather than a branch hidden inside the loader chooser.
+MAPPED_KEY_STACKED_BANK = "stacked_bank"
+
 #: A map entry naming ordinary unquantised tensors.
 MAPPED_KEY_PLAIN = "plain"
 
@@ -1426,7 +1435,7 @@ def _as_key_list(checkpoint_keys: str | Sequence[str]) -> list[str]:
 
 
 def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
-    """Which of the three kinds one map entry's checkpoint key(s) describe.
+    """Which of the four kinds one map entry's checkpoint key(s) describe.
 
     ``inc-glm53f-091``. **ONE classifier with two consumers** -- the loader
     :func:`loader_for_mapped_keys` picks below, and the placeholder dtype
@@ -1443,96 +1452,460 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
     and it is called rather than copied, so the dot-qualified suffix
     convention lives in exactly one place.
 
-    The three cases are exhaustive by construction: a key list either holds no
-    scale key, or holds one alongside something else, or is a lone scale key.
+    The four cases are exhaustive by construction on the scale-key count: a key
+    list holds no scale key, or exactly one alongside something else, or is a
+    lone scale key, or holds more than one.
 
-    AN EXPERT BANK IS NOT A FOURTH CASE HERE, AND THAT IS DELIBERATE. An entry
-    carrying MORE THAN ONE scale key is a whole bank of quantised weights, and
-    it classifies as ``MAPPED_KEY_QUANTISED_WEIGHT`` like any other -- because
-    the classification is still true, and because the placeholder dtype that
-    reads this function needs exactly that answer. What such an entry cannot
-    have is a loader, so :func:`loader_for_mapped_keys` REFUSES it by name.
-    ``inc-glm53f-095`` adds the stacked kind here and the loader to go with it;
-    until then the refusal is the only correct answer, and a third consumer of
-    this function would be the way that stops being true.
+    AN EXPERT BANK IS THE FOURTH KIND, AND ``inc-glm53f-095`` IS WHERE IT
+    BECAME ONE. An entry carrying MORE THAN ONE scale key is a whole bank of
+    quantised experts, and it now says so -- :data:`MAPPED_KEY_STACKED_BANK` --
+    because it has its own loader (:func:`stacked_expert_bank_loader`) and
+    because a caller cannot pick between two loaders from one answer. Until
+    this increment there was no second loader to pick, so the honest answer was
+    ``MAPPED_KEY_QUANTISED_WEIGHT`` plus a refusal in the chooser.
+
+    THE SECOND CONSUMER MOVED WITH IT, AND HAD TO. ``model_fp8.py``'s
+    ``_placeholder_dtype`` branches on this answer, so a fourth kind it did not
+    know would have fallen past its ``MAPPED_KEY_QUANTISED_WEIGHT`` arm to the
+    default and typed every bank placeholder ``text_config.torch_dtype``
+    instead of fp8 -- and the pipelined loader would then warn on every bank
+    load, because it reads its target dtype off the placeholder and warns when
+    the tensor differs (``utils/checkpoints.py:437``, ``:570-575``). That is the
+    failure the paragraph above used to predict for a THIRD consumer, and it
+    arrives just as easily through the second. So the two moved together:
+    ``_placeholder_dtype`` returns ``_FP8_DTYPE`` for this kind, and "one
+    classifier, two consumers" stays true rather than becoming "one classifier
+    and one consumer that guesses". Measured from source before the change, not
+    after it: ``increments/contradiction-095-refusal-collision.md``.
     """
     keys = _as_key_list(checkpoint_keys)
     scales = scale_keys(keys)
     if len(keys) == 1 and len(scales) == 1:
         return MAPPED_KEY_SCALE_GRID
+    if len(scales) > 1:
+        return MAPPED_KEY_STACKED_BANK
     if scales:
         return MAPPED_KEY_QUANTISED_WEIGHT
     return MAPPED_KEY_PLAIN
 
 
 def loader_for_mapped_keys(
-    checkpoint_keys: str | Sequence[str], *, param_name: str | None = None
+    checkpoint_keys: str | Sequence[str],
+    *,
+    param_name: str | None = None,
+    owner: object | None = None,
 ) -> SafetensorsWeightLoader | None:
     """The loader that serves one mapped parameter, or ``None`` for the default.
 
-    ``inc-glm53f-091``. Three cases, one per :func:`classify_mapped_keys` kind,
-    and one REFUSAL that cuts across the second of them:
+    ``inc-glm53f-091``, extended by ``inc-glm53f-095``. Four cases, one per
+    :func:`classify_mapped_keys` kind, and one REFUSAL that cuts across the
+    last of them:
 
     * a lone scale grid gets :func:`blockwise_scale_loader`, which compensates
       the grid for the trn2 range and reports a floored block by name. Passing
       ``param_name`` is what lets that report say which parameter floored.
     * a quantised weight with ONE scale companion gets
       :func:`wrap_with_blockwise_fp8_downscale` over the default loader. That
-      wrapper's base transform is ``slices[0][:]`` (``:1332``), so it keeps the
+      wrapper's base transform is ``slices[0][:]`` (``:1339``), so it keeps the
       weight slice and DROPS the scale companion -- the measured reason the
       scales are read out of band rather than through this map.
-    * a quantised weight with MORE THAN ONE scale companion is an EXPERT BANK,
-      and it is REFUSED by name. See the block below for the measurement that
-      put the refusal here.
+    * an EXPERT BANK -- more than one scale key -- gets
+      :func:`stacked_expert_bank_loader`, which is what ``inc-glm53f-095``
+      adds. ``owner`` is the module that declares the parameter, and the bank
+      loader needs it: the expert geometry lives there and nowhere else.
+    * a PLAIN entry naming MORE THAN ONE weight key is refused by name. It is
+      an unquantised bank, and the reason it is refused rather than served is
+      below.
     * anything else gets ``None``, meaning "attach nothing".
       :func:`~vllm_neuron.utils.weight_loader.get_weight_loader` already falls
       back to the identity loader when a parameter carries none
       (``utils/weight_loader.py:102``), so attaching one here would be a second
       way of saying the same thing, and two ways is one too many.
 
-    ``rank`` is not consulted and no loader returned here shards. That is the
-    landed position of this file, not a choice made now:
+    THE BANK LOADER IS THE ONLY ONE HERE THAT CONSULTS ``rank``, and it consults
+    it at load time rather than now. Everything else in this function is
+    rank-blind, which is the landed position of this file:
     :func:`blockwise_scale_loader`'s own docstring records that a sharded grid
     "follows the weight's own shard geometry and lands with the module that
-    declares that geometry". :func:`wrap_with_blockwise_fp8_downscale` forwards
-    ``rank`` to whatever loader it wraps, so it composes with a shard loader
-    unchanged when one lands.
+    declares that geometry" -- and a bank is exactly that case, which is why
+    ``owner`` arrives here and why the geometry is read off the module instead
+    of being recomputed.
 
-    WHY AN EXPERT BANK IS REFUSED HERE RATHER THAN SERVED BADLY. The key map
-    hands ONE parameter every key of a routed expert bank, interleaved weight
-    then scale per expert -- on the real configuration 126 of the map's 1,416
-    entries carry 576 keys each, 288 experts times weight and scale. Every
-    loader reachable from this function takes the FIRST slice and no other:
-    :func:`wrap_with_blockwise_fp8_downscale`'s base transform is ``slices[0][:]``
-    (``:1332``), and on a platform needing no squeeze it returns the bare loader,
-    whose own documented behaviour with no transform is "loads the first slice
-    as-is" (``utils/weight_loader.py:41``). So handing a bank to either of them
-    loads expert 0 and silently drops the rest, and NOTHING downstream notices:
-    ``utils/checkpoints.py`` validates no shape at all, and the lazy placeholder
-    the caller registers makes torch's own shape check skip the parameter -- the
-    very property that placeholder was chosen for. Measured rather than
-    reasoned: ``increments/evidence-091.md`` records a four-expert miniature bank
-    loading ``LOADED_NUMEL=16384`` where its own slices imply ``65536``, while
-    the acceptance read 125 of 125 parameters loaded and exit ``0``. A refusal is
-    the only answer here a reader can trust, and ``inc-glm53f-095`` is where the
-    bank becomes loadable.
+    WHY AN UNQUANTISED BANK IS REFUSED (``B65-N1``). The refusal that used to
+    live here was keyed on the SCALE-key count, which is the wrong count: an
+    entry with several WEIGHT keys and no scale at all classifies
+    ``MAPPED_KEY_PLAIN`` and would reach ``None``, meaning the default loader,
+    which asserts ``len(slices) == 1`` (``utils/weight_loader.py:71-73``). Real
+    failure, but a bare ``AssertionError`` naming no parameter and AFTER
+    registration. No such entry exists on the real FP8 index today; the next
+    quantisation profile that keeps a leaf in bf16 (``keeps_bf16``) produces
+    one, and a named refusal costs one branch.
+
+    WHY A BANK WAS EVER REFUSED, KEPT AS THE MEASUREMENT THAT PAID FOR THIS
+    LOADER. On the real configuration 126 of the map's 1,416 entries carry 576
+    keys each. Before this increment the wrapped loader's base transform was
+    ``slices[0][:]`` (``:1339``), so a bank loaded expert 0 and dropped the
+    rest, and nothing downstream noticed -- ``utils/checkpoints.py`` validates
+    no shape and the lazy placeholder makes torch skip its own check.
+    ``increments/evidence-091.md``: a four-expert miniature bank loaded
+    ``LOADED_NUMEL=16384`` where its slices imply ``65536``, while the
+    acceptance read 125 of 125 loaded and exit ``0``. The ``B65-N2``
+    correction to that story: the BARE loader asserts rather than taking slice 0
+    silently, so the loud path is the unwrapped one and the silent path the
+    wrapped one. :func:`stacked_expert_bank_loader` now prevents it by
+    construction rather than by refusal.
     """
     keys = _as_key_list(checkpoint_keys)
     kind = classify_mapped_keys(keys)
     if kind == MAPPED_KEY_SCALE_GRID:
         return blockwise_scale_loader(param_name)
+    if kind == MAPPED_KEY_STACKED_BANK:
+        return stacked_expert_bank_loader(keys, param_name=param_name, owner=owner)
     if kind == MAPPED_KEY_QUANTISED_WEIGHT:
-        scales = scale_keys(keys)
-        if len(scales) > 1:
-            raise Glm5NextExpertBankNotLoadableError(
-                f"{param_name or '<unnamed parameter>'} maps to {len(keys)} "
-                f"checkpoint keys carrying {len(scales)} scale keys, so it is a "
-                f"bank of {len(scales)} quantised experts rather than one "
-                f"quantised weight. No loader in this module stacks experts -- "
-                f"each one keeps the first slice and would drop the other "
-                f"{len(scales) - 1} silently -- so this entry is refused instead "
-                f"of loaded wrongly. Stacked expert banks land in "
-                f"inc-glm53f-095."
-            )
         return wrap_with_blockwise_fp8_downscale(SafetensorsWeightLoader())
+    if len(keys) > 1:
+        raise Glm5NextExpertBankNotLoadableError(
+            f"{param_name or '<unnamed parameter>'} maps to {len(keys)} "
+            f"checkpoint keys carrying 0 scale keys, so it is a bank of "
+            f"{len(keys)} UNQUANTISED experts rather than one plain tensor. "
+            f"This module stacks a bank of QUANTISED experts (weight and scale "
+            f"per expert); an unquantised bank has no scale to de-interleave "
+            f"and no landed shape to stack into, so it is refused by name here "
+            f"rather than reaching the default loader, whose len(slices) == 1 "
+            f"assertion would fail without naming this parameter and after it "
+            f"was registered."
+        )
     return None
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-095 -- the expert-stacked loader.
+#
+# One map entry holds a routed expert bank: E weights and E scale grids,
+# interleaved weight-then-scale in checkpoint order. This section turns that
+# entry into ONE tensor holding this rank's experts stacked on a new leading
+# axis, and de-interleaves the scales onto the same axis. It writes no map
+# entry and no numeric.
+#
+# THE SUBSET SELECTION IS A CALL, NOT A REWRITE.
+# ``expert_parallel_interleaved_loader`` (``utils/weight_loader.py:719``)
+# already restricts a K-interleaved slice list to a rank's contiguous expert
+# block, and its documented layout at ``K = len(slices) // total_num_experts``
+# is exactly this map's weight-then-scale layout at K = 2. The STACKING is the
+# new part: ``torch.stack`` occurs zero times in ``utils/weight_loader.py``, and
+# those wrappers require an inner loader to do it (``:637-639``). This is that
+# shipped loader's FIRST caller in the tree, so conjunct 3 exercises the rank
+# subset directly rather than trusting its docstring examples.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class BankLayout:
+    """Where one bank entry's weights and scales sit in its own key list.
+
+    Produced by :func:`bank_layout`, which is the only thing that decides it, so
+    a consumer never re-derives "every other key is a scale" for itself.
+    """
+
+    #: Positions of the expert weight keys, ascending.
+    weight_at: tuple[int, ...]
+    #: Positions of the expert scale keys, ascending.
+    scale_at: tuple[int, ...]
+    #: How many experts the entry enumerates.
+    experts: int
+
+
+def _refuse(param_name: str | None, tail: str) -> None:
+    """Raise the bank refusal, always naming the parameter first.
+
+    Every refusal in this section goes through here for one reason: ``B65-N1``
+    and the ``-091a`` measurement both turned on a failure that did not name its
+    parameter, so the name is not left to each call site to remember.
+    """
+    raise Glm5NextExpertBankNotLoadableError(
+        f"{param_name or '<unnamed parameter>'} {tail}"
+    )
+
+
+def bank_layout(
+    checkpoint_keys: str | Sequence[str], *, param_name: str | None = None
+) -> BankLayout:
+    """Read one bank entry's expert layout, or REFUSE it by name.
+
+    ``inc-glm53f-095``. The entry must alternate strictly weight-then-scale, one
+    pair per expert, which is the layout ``_add_moe_mlp`` builds (``:679``,
+    through ``_quantised``) and the layout
+    ``expert_parallel_interleaved_loader`` documents at K = 2.
+
+    THE REFUSALS HERE ARE CONJUNCT (4)'s MALFORMED CASES, and each one names the
+    parameter and the defect rather than a position alone:
+
+    * an ODD key count cannot be pairs at all;
+    * a scale key where a weight belongs, or a weight where a scale belongs,
+      is an entry whose pairing broke -- reported at the FIRST offending
+      position, because the first one is the one a reader can act on.
+
+    "Is this key a scale?" is still :func:`scale_keys`'s question and is asked of
+    it, not re-decided here -- the same discipline
+    :func:`classify_mapped_keys` records.
+    """
+    keys = _as_key_list(checkpoint_keys)
+    scales = set(scale_keys(keys))
+    if len(keys) % 2 != 0:
+        _refuse(
+            param_name,
+            f"maps to {len(keys)} checkpoint keys, which is an ODD count, so it "
+            f"cannot be one weight and one scale grid per expert. A stacked "
+            f"expert bank alternates weight then scale, {len(scales)} of these "
+            f"keys are scales.",
+        )
+    for position, key in enumerate(keys):
+        wants_scale = position % 2 == 1
+        is_scale = key in scales
+        if wants_scale != is_scale:
+            expected = "a scale key" if wants_scale else "a weight key"
+            _refuse(
+                param_name,
+                f"maps to {len(keys)} checkpoint keys that do not alternate "
+                f"weight then scale: position {position} holds "
+                f"{key!r}, where {expected} belongs. A stacked expert bank is "
+                f"read as one weight-and-scale pair per expert, so an entry "
+                f"that breaks the pairing is refused rather than stacked into "
+                f"the wrong order.",
+            )
+    return BankLayout(
+        weight_at=tuple(range(0, len(keys), 2)),
+        scale_at=tuple(range(1, len(keys), 2)),
+        experts=len(keys) // 2,
+    )
+
+
+def _bank_expert_indices(
+    owner: object | None, layout: BankLayout, param_name: str | None
+):
+    """The owning module's local-expert resolver, or REFUSE by name.
+
+    ``inc-glm53f-095``. The expert geometry is declared in exactly one place --
+    ``Glm5NextRoutedExperts`` (``model_fp8.py:816``, geometry set at
+    ``:886-891``), authored by
+    ``inc-glm53f-031`` -- and it is read there rather than derived a second time
+    from the key count, so there is one partition and not two that can disagree.
+
+    A bank whose owner declares no geometry cannot be placed: there is no answer
+    to "which experts are mine", so stacking would be a guess. This refusal is
+    also conjunct (1)'s CONTROL THAT MOVES -- the same bank, in one run, loads
+    E/E experts with the geometry declared and refuses by name without it --
+    which is why reading (ii) of ``-091``'s first item was re-anchored onto it
+    (design entry ``design-20260905-r``).
+    """
+    resolve = getattr(owner, "local_expert_indices", None)
+    if not callable(resolve):
+        _refuse(
+            param_name,
+            f"maps to {layout.experts * 2} checkpoint keys, a bank of "
+            f"{layout.experts} quantised experts, but its owning module "
+            f"({type(owner).__name__}) DECLARES NO EXPERT GEOMETRY: no callable "
+            f"local_expert_indices, so there is no answer to which experts this "
+            f"rank owns. A bank cannot be stacked into a shape nobody declared, "
+            f"so it is refused by name rather than placed by guess.",
+        )
+    declared = getattr(owner, "num_routed_experts", None)
+    if declared is None:
+        _refuse(
+            param_name,
+            f"maps to a bank of {layout.experts} quantised experts, and its "
+            f"owning module ({type(owner).__name__}) declares "
+            f"local_expert_indices but NO num_routed_experts, so the entry's "
+            f"expert count cannot be checked against the module's. Half a "
+            f"geometry declaration is refused like none at all.",
+        )
+    if int(declared) != layout.experts:
+        _refuse(
+            param_name,
+            f"maps to a bank of {layout.experts} quantised experts while its "
+            f"owning module declares {int(declared)}. The checkpoint and the "
+            f"module disagree about how many experts exist, so stacking would "
+            f"silently drop or invent one; refused instead.",
+        )
+    return resolve
+
+
+def _stack_local_expert_weights(local_slices: list, rank: int) -> torch.Tensor:
+    """Stack one rank's expert WEIGHTS on a new leading axis, in expert order.
+
+    The inner loader
+    :func:`~vllm_neuron.utils.weight_loader.expert_parallel_interleaved_loader`
+    hands this the local experts' pairs, still interleaved, so the weights are
+    the even positions. Slicing with ``[:]`` is what materialises a
+    ``PySafeSlice``; the scales in the odd positions are not read here at all,
+    which is the point of restricting the input before stacking rather than
+    after (``utils/weight_loader.py:631-634``).
+    """
+    return torch.stack([local_slices[i][:] for i in range(0, len(local_slices), 2)])
+
+
+def _stack_local_expert_scales(param_name: str | None):
+    """Build the transform that stacks one rank's expert SCALE grids.
+
+    Each grid goes through :func:`compensate_block_scales` and
+    :func:`report_floored_blocks` exactly as :func:`blockwise_scale_loader`
+    sends a lone grid, so a bank's scales are compensated by the same code as
+    every other scale in this file and an engaged floor is still REPORTED rather
+    than discarded (``B08-F1``'s repair, which a second copy of the arithmetic
+    here would have quietly undone).
+    """
+
+    def transform(local_slices: list, rank: int) -> torch.Tensor:
+        rows = []
+        for position in range(1, len(local_slices), 2):
+            compensation = compensate_block_scales(local_slices[position][:])
+            report_floored_blocks(compensation, param_name)
+            rows.append(compensation.scale_inv)
+        return torch.stack(rows)
+
+    return transform
+
+
+def _bank_slice_count(slices: list, layout: BankLayout, param_name: str | None) -> None:
+    """Refuse a load whose slice count is not the key count this entry declared.
+
+    Defensive and cheap. The reader builds ``slices`` from the same key list
+    this loader was constructed for, so a mismatch means the two drifted apart
+    between materialisation and load -- and the EP wrapper's own divisibility
+    error (``_items_per_expert``, ``utils/weight_loader.py:670``, whose
+    divisibility raise is at ``:684-688``) would name
+    ``total_num_experts`` rather than this parameter.
+    """
+    if len(slices) != layout.experts * 2:
+        _refuse(
+            param_name,
+            f"was built for a bank of {layout.experts} experts "
+            f"({layout.experts * 2} checkpoint keys) but the load handed it "
+            f"{len(slices)} slices, so the key list it was constructed for is "
+            f"not the key list it is being asked to read.",
+        )
+
+
+def _stacked_bank_transform(
+    layout: BankLayout,
+    resolve,
+    param_name: str | None,
+    inner_transform,
+):
+    """One bank transform: this rank's experts, selected then stacked.
+
+    WHY THE SHIPPED WRAPPER IS BUILT PER LOAD.
+    :func:`~vllm_neuron.utils.weight_loader.expert_parallel_interleaved_loader`
+    resolves its expert INDICES to a contiguous ``(lo, hi)`` when constructed,
+    while ``rank`` does not arrive until the load calls this transform. So it is
+    built here, which costs one object per load and keeps the partition
+    arithmetic where it is owned; the alternative would put a rank into every
+    loader in this file for the sake of one case.
+
+    The import is FUNCTION-LOCAL, following the landed ``inc-glm53f-023``
+    precedent (``model_fp8.py:865-868``): this file's import blocks are earlier
+    increments' D14 sections.
+    """
+    from vllm_neuron.utils.weight_loader import expert_parallel_interleaved_loader
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        _bank_slice_count(slices, layout, param_name)
+        local = list(resolve(rank))
+        if not local:
+            _refuse(
+                param_name,
+                f"is a bank of {layout.experts} experts, and its owning module "
+                f"reports that rank {rank} owns NONE of them. An empty expert "
+                f"subset has no tensor to stack; the shipped expert-parallel "
+                f"loader refuses it too (utils/weight_loader.py:480-481), and "
+                f"this refusal names the parameter as well.",
+            )
+        wrapper = expert_parallel_interleaved_loader(
+            local,
+            SafetensorsWeightLoader(transform=inner_transform),
+            layout.experts,
+        )
+        return wrapper.transform(slices, rank)
+
+    return transform
+
+
+def stacked_expert_bank_loader(
+    checkpoint_keys: str | Sequence[str],
+    *,
+    param_name: str | None = None,
+    owner: object | None = None,
+) -> SafetensorsWeightLoader:
+    """Load a routed expert bank's WEIGHTS as one stacked tensor.
+
+    ``inc-glm53f-095``, and the answer to ``-091a``'s refusal. Returns a loader
+    whose transform, for the rank it is called with, selects that rank's experts
+    and stacks their weight slices on a new LEADING axis in checkpoint order --
+    so element ``[e]`` of the result is expert ``local[e]``'s weight, and the
+    result's element count is the sum of its own slices' counts rather than one
+    expert's (which is what ``-091a`` measured going wrong:
+    ``LOADED_NUMEL=16384`` of ``65536``).
+
+    IT IS COMPOSED UNDER :func:`wrap_with_blockwise_fp8_downscale`, and that
+    order is safe for a stated reason: :func:`downscale_fp8_weight_bytes` is
+    elementwise -- multiply, clamp, cast (``:1169-1173``) -- so squeezing the
+    stack and stacking the squeezed experts give the same bytes. Wrapping the
+    stack costs one pass instead of E, and on a platform needing no squeeze the
+    wrapper returns this loader untouched.
+
+    EVERY REFUSAL HAPPENS AT CONSTRUCTION, NOT AT LOAD, and ``-091``'s two-pass
+    materialiser depends on it: ``_materialise_declared_parameters`` chooses
+    every loader BEFORE registering any parameter, so a refusal raised now leaves
+    the tree byte-for-byte as it arrived and ``named_parameters()`` still reads
+    exactly zero. Deferring one to transform time would land mid-load with half a
+    tree registered.
+    """
+    layout = bank_layout(checkpoint_keys, param_name=param_name)
+    resolve = _bank_expert_indices(owner, layout, param_name)
+    return wrap_with_blockwise_fp8_downscale(
+        SafetensorsWeightLoader(
+            transform=_stacked_bank_transform(
+                layout, resolve, param_name, _stack_local_expert_weights
+            )
+        )
+    )
+
+
+def stacked_expert_scale_loader(
+    checkpoint_keys: str | Sequence[str],
+    *,
+    param_name: str | None = None,
+    owner: object | None = None,
+) -> SafetensorsWeightLoader:
+    """Load a routed expert bank's SCALE GRIDS as one stacked tensor.
+
+    ``inc-glm53f-095``. The mirror of :func:`stacked_expert_bank_loader` over
+    the odd positions: this rank's experts, their grids compensated one expert at
+    a time by :func:`compensate_block_scales`, stacked on the same leading axis
+    in the same order. So row ``[e]`` of this result belongs to the weight at
+    ``[e]`` of that one, which is what conjunct (2) reads.
+
+    NOT WRAPPED IN THE WEIGHT DOWNSCALE, and the asymmetry is the point: the 240
+    squeeze applies to weight BYTES, while a grid's own compensation is
+    :func:`compensate_block_scales` -- the same split
+    :func:`blockwise_scale_loader` and :func:`wrap_with_blockwise_fp8_downscale`
+    already make for a non-bank weight and its grid.
+
+    WHAT IT IS ATTACHED TO TODAY: NOTHING, DISCLOSED RATHER THAN PAPERED OVER.
+    ``Glm5NextRoutedExperts`` declares five parameters and no bank scale
+    parameter (``model_fp8.py:892-899``), and ``_add_moe_mlp`` writes map entries
+    for exactly two shapes, ``experts.router_weight`` and
+    ``experts.<leaf>_weight`` (``:661``, ``:679``). So a bank's stacked scales
+    have no declared parameter to land in at this increment, and this loader
+    exists to be CALLED -- by conjunct (2), against the checkpoint's own grids --
+    rather than attached. Declaring and mapping that parameter is outside this
+    increment's surface; the kernel-side consumption of E grids is
+    ``inc-glm53f-095b``. Both are recorded in ``increments/evidence-095.md``.
+    """
+    layout = bank_layout(checkpoint_keys, param_name=param_name)
+    resolve = _bank_expert_indices(owner, layout, param_name)
+    return SafetensorsWeightLoader(
+        transform=_stacked_bank_transform(
+            layout, resolve, param_name, _stack_local_expert_scales(param_name)
+        )
+    )

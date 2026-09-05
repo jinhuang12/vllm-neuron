@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """``inc-glm53f-091`` -- the end-to-end weight LOADING entry point.
 
-NINE counted items and no ``parametrize`` anywhere in this file (D1.2). The first
-four are ``inc-glm53f-091a``'s, one per conjunct. The last five are
-``inc-glm53f-091b``'s: the fp32 scale grids, the orphan call-site count, the
+THIRTEEN counted items and no ``parametrize`` decorator anywhere in this file
+(D1.2). The first four are ``inc-glm53f-091a``'s, one per conjunct. The next five
+are ``inc-glm53f-091b``'s: the fp32 scale grids, the orphan call-site count, the
 loader arity contract, the prep ordering, and the placeholder dtype of a scaled
-MLA weight. The halves are kept in the order they landed and every item names the
-conjunct it reads, so neither half's items can be satisfied by the other half's
-work.
+MLA weight. The last four are ``inc-glm53f-095``'s stacked expert bank, one per
+conjunct, and the count moved from NINE to THIRTEEN there. Each group is kept in
+the order it landed and every item names the conjunct it reads, so no group's
+items can be satisfied by another group's work.
 
 WHY THREE OF THE FOUR DRIVE THE REAL ``load_weights``. No landed test calls
 ``load_sharded_pipelined`` and the test tree has no safetensors writer, so a
@@ -65,12 +66,20 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MAPPED_KEY_PLAIN,
     MAPPED_KEY_QUANTISED_WEIGHT,
     MAPPED_KEY_SCALE_GRID,
+    MAPPED_KEY_STACKED_BANK,
     Glm5NextExpertBankNotLoadableError,
     Glm5NextWeightMapError,
+    bank_layout,
     block_grid_shape,
     blockwise_scale_loader,
     build_weight_mappings,
     classify_mapped_keys,
+    compensate_block_scales,
+    downscale_fp8_weight_bytes,
+    loader_for_mapped_keys,
+    scale_keys,
+    stacked_expert_bank_loader,
+    stacked_expert_scale_loader,
 )
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 
@@ -303,7 +312,20 @@ def _write_miniature_checkpoint(
     tensors: dict[str, torch.Tensor] = {}
     for keys in mappings.values():
         key_list = [keys] if isinstance(keys, str) else list(keys)
-        quantised_pair = classify_mapped_keys(keys) == MAPPED_KEY_QUANTISED_WEIGHT
+        # A BANK IS QUANTISED TOO, and saying so here is not a new behaviour --
+        # it is how this writer already behaved before ``inc-glm53f-095`` gave a
+        # bank its own classifier kind. Until then a bank answered
+        # ``MAPPED_KEY_QUANTISED_WEIGHT`` and its weight keys were written as
+        # fp8 at ``MINI_WEIGHT_SHAPE``; with the fourth kind and this line
+        # unchanged they would have fallen to the ``else`` below and been written
+        # as bf16 at ``MINI_PLAIN_SHAPE`` -- a four-element "expert weight" that
+        # no reading in this file would have named. This is the THIRD consumer of
+        # ``classify_mapped_keys`` that ``classify_mapped_keys``'s own docstring
+        # warned about, and the fix is to ask the question it means to ask.
+        quantised_pair = classify_mapped_keys(keys) in (
+            MAPPED_KEY_QUANTISED_WEIGHT,
+            MAPPED_KEY_STACKED_BANK,
+        )
         for key in key_list:
             if key in tensors:
                 continue
@@ -351,6 +373,12 @@ def _implied_numels(
     * an entry that is nothing BUT a scale key is loaded by
       :func:`blockwise_scale_loader`, which compensates the grid and returns it
       at its own shape. So that key is the population.
+    * an EXPERT BANK is loaded by :func:`stacked_expert_bank_loader`
+      (``inc-glm53f-095``), which stacks one rank's expert weights and leaves
+      their scales to their own loader. So the population is again the weight
+      keys, and at expert-parallel degree 1 -- every configuration in this file
+      -- one rank owns every expert, so the sum below is the whole bank. The
+      line needs no bank branch to say that, which is why it has none.
 
     Neither transform reshapes and neither pads, and the reader's only other act
     on the tensor is a dtype cast (``utils/checkpoints.py:571-576``), which
@@ -505,10 +533,24 @@ def test_every_declared_parameter_is_materialised_and_loaded(
     two objects: a ``load_weights`` that materialised the tree and returned early
     reads 0/N.
 
-    (ii) On a configuration with a routed expert bank the load REFUSES, naming
-    the parameter, its key count and ``inc-glm53f-095``, and leaves NOTHING
-    behind -- 0 not-lazy and 0 materialised placeholders. The refusal IS the
-    reading here. A skipped parameter would not be.
+    (ii) On a configuration with a routed expert bank whose owning module
+    declares NO EXPERT GEOMETRY the load REFUSES, naming the parameter, its key
+    count and the missing declaration, and leaves NOTHING behind -- 0 not-lazy
+    and 0 materialised placeholders. The refusal IS the reading here. A skipped
+    parameter would not be.
+
+    RE-ANCHORED BY ``inc-glm53f-095`` (design entry ``design-20260905-r``). This
+    reading used to exercise the refusal on a WELL-FORMED bank, which was correct
+    while no loader in the package could stack one. ``-095`` gives that case a
+    loader, so the old form asserted a refusal the package no longer owes --
+    measured before a line of it was written, in
+    ``increments/probe-095-refusal-collision-host-r2.out``: the nine items here
+    read ``9 passed`` unpatched and ``2 failed, 7 passed`` with the bank refusal
+    monkeypatched away, this item being one of the two. What the reading
+    CERTIFIES is unchanged -- that a refusal on the load path leaves the tree
+    byte-for-byte as it arrived -- so it moved to the bank shape that still
+    refuses rather than being deleted. It doubles as ``-095`` conjunct (1)'s
+    control, where the same bank WITH its geometry declared loads E/E experts.
 
     (iii) On the dense configuration, every mapped parameter's loaded element
     count equals the count its OWN checkpoint slices imply. This exists because
@@ -590,7 +632,7 @@ def test_every_declared_parameter_is_materialised_and_loaded(
         f"(parameter, loaded, implied)"
     )
 
-    # ── (ii) a routed expert bank refuses by name and leaves nothing ─────────
+    # ── (ii) a bank with no declared geometry refuses and leaves nothing ─────
     routed_dir = tmp_path / "routed"
     routed = _routed_model()
     routed_declared = len(routed.declared_parameter_names())
@@ -605,6 +647,24 @@ def test_every_declared_parameter_is_materialised_and_loaded(
     assert banks, (
         "the routed configuration produced no multi-scale-key entry, so this "
         "reading would certify nothing; the refusal it exercises could not fire"
+    )
+
+    # WITHHOLD THE GEOMETRY DECLARATION, on the instance, before the load.
+    # ``local_expert_indices`` is a method on ``Glm5NextRoutedExperts``, so it
+    # cannot be deleted from an instance; assigning ``None`` shadows it in the
+    # instance dict, which is exactly what the loader's own check reads
+    # (``getattr(owner, "local_expert_indices", None)`` then ``callable``). One
+    # attribute is withheld and nothing else about the tree changes, so the
+    # refusal below can only be about the missing declaration.
+    withheld = 0
+    for _, module in routed.named_modules():
+        if callable(getattr(module, "local_expert_indices", None)):
+            module.local_expert_indices = None
+            withheld += 1
+    print(f"CONJUNCT1_MODULES_WITH_GEOMETRY_WITHHELD={withheld}")
+    assert withheld > 0, (
+        "no module in this tree declares local_expert_indices, so withholding it "
+        "changed nothing and the refusal below would be about something else"
     )
 
     with pytest.raises(Glm5NextExpertBankNotLoadableError) as raised:
@@ -625,8 +685,9 @@ def test_every_declared_parameter_is_materialised_and_loaded(
         f"the refusal does not report the key count {key_count} of the "
         f"parameter it named: {message}"
     )
-    assert "inc-glm53f-095" in message, (
-        f"the refusal does not name the increment that answers it: {message}"
+    assert "DECLARES NO EXPERT GEOMETRY" in message, (
+        f"the refusal does not name the missing declaration, so a reader cannot "
+        f"tell this refusal from any other bank refusal: {message}"
     )
     assert _not_lazy_count(routed) == 0, (
         "the refusal left parameters holding real tensors"
@@ -643,8 +704,18 @@ def test_every_declared_parameter_is_materialised_and_loaded(
 # --------------------------------------------------------------------------- #
 
 
+class _MapCaptured(Exception):
+    """Conjunct 2's own stop, raised by its observer once it holds the map.
+
+    RE-ANCHORED by plan revision 182 ruling (b). This class exists so that the
+    item below ends its run on something this file owns, instead of on whatever
+    production code happens to refuse next.
+    """
+
+
 def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
     tmp_path,
+    monkeypatch,
 ) -> None:
     """(2) Zero in-scope index keys unclaimed, and zero mapped keys not in the index.
 
@@ -661,25 +732,35 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
     left this item green. So the map is now taken OUT OF THE RUNNING
     ``load_weights``.
 
-    HOW, AND WHY NOT AT THE HAND-OVER ITSELF. The hand-over
-    (``model_fp8.py:3418``) cannot be reached while a routed expert bank refuses,
-    and this checkpoint's banks each carry 288 experts, so no run observes that
-    line at ``inc-glm53f-091a``. The observer therefore sits on
-    ``_materialise_declared_parameters`` one line earlier (``:3339``) and records
-    its argument before calling the real method, so production code still builds
-    the map and still decides to refuse. ``_mappings_flow_in_load_weights`` then
-    reads the source and reports that ``mappings`` is bound once and that the
-    hand-over passes that same name, which is what makes the observed object the
-    object the hand-over would pass.
+    HOW: THE CAPTURE IS AT THE HAND-OVER ITSELF. RE-ANCHORED by plan revision 182
+    ruling (b) and by the B65r2 rider (revision 161), which said this observer
+    moves to the reader call when ``inc-glm53f-095`` lands. It could not before: a
+    routed expert bank refused inside step 3, so no run reached the reader and the
+    observer sat one step earlier, on ``_materialise_declared_parameters``, with a
+    7-line window after it in which an in-place mutation of ``mappings`` would
+    have moved neither ``ast`` count. The bank loads now, the observer is
+    ``SafetensorsCheckpoint.load_sharded_pipelined``, and the captured object IS
+    the object handed over. ``_mappings_flow_in_load_weights`` stays as a
+    cross-check on the source, no longer as the identity argument.
 
-    THE REFUSAL IS THE MEANS HERE, NOT A SECOND SUBJECT -- conjunct 1 owns it.
-    It is asserted so that a SILENT COMPLETION reddens this item: when
-    ``inc-glm53f-095`` makes stacked banks loadable, this item fails loudly and
-    gets re-read, instead of quietly measuring a path that no longer refuses.
+    THE STOP IS THIS ITEM'S OWN, NOT PRODUCTION'S. The observer raises
+    ``_MapCaptured`` once it holds the map and never calls the real reader, which
+    keeps this run off the process group that reader's default store needs. The
+    earlier form ended on a bank refusal that belongs to conjunct 1 of
+    ``test_every_declared_parameter_is_materialised_and_loaded``, and
+    ``inc-glm53f-095`` was about to remove it.
+
+    TWO READINGS RE-EXPRESSED, NONE LOST. The 576 and 288 key counts came out of
+    the refusal message; they are readings on the captured bank entries now, one
+    weight and one scale key per published routed expert. The zero-parameters
+    reading was about a clean refusal -- conjunct 1's subject, asserted at reading
+    (ii) above -- so its counterpart is asserted here: the parameter list is
+    NON-EMPTY at the hand-over, which is what shows the capture happened after
+    step 3 rather than instead of it.
 
     No process group is initialised, on purpose. The fixture that provides one
     exists for the reader's default-store call inside ``load_sharded_pipelined``,
-    which this run never reaches.
+    which ``_MapCaptured`` guarantees this run never reaches.
 
     The population is ``inc-glm53f-078``'s in-scope partition of the published
     index, re-derived here from the fixture rather than restated: a count over
@@ -713,38 +794,41 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
     print(f"CONJUNCT2_DECLARED_NAMES={len(model.declared_parameter_names())}")
 
     observed: list[dict[str, str | list[str]]] = []
-    real_materialise = model._materialise_declared_parameters
 
-    def observer(handed_over, device):
+    # The reader is a method on the checkpoint object ``load_weights`` builds
+    # locally (``model_fp8.py:3736``), so the patch is on the class and the
+    # fixture restores it. The call site passes all five arguments positionally,
+    # so a signature change there reaches this observer as a loud TypeError.
+    def observer(_checkpoint, rank, world_size, _model, handed_over, _device):
         observed.append(handed_over)
-        return real_materialise(handed_over, device)
+        raise _MapCaptured(
+            f"conjunct 2 holds the handed-over map: {len(handed_over)} entries, "
+            f"rank {rank} of world size {world_size}"
+        )
 
-    model._materialise_declared_parameters = observer
+    monkeypatch.setattr(
+        SafetensorsCheckpoint, "load_sharded_pipelined", observer, raising=True
+    )
 
-    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+    with pytest.raises(_MapCaptured) as capture:
         model.load_weights(
             str(_token_checkpoint_directory(tmp_path)),
             torch.device("cpu"),
             None,
         )
 
-    message = str(refusal.value)
-    print(f"CONJUNCT2_REFUSAL_CLASS={type(refusal.value).__name__}")
+    materialised_at_handover = len(list(model.named_parameters()))
+    print(f"CONJUNCT2_STOP_CLASS={type(capture.value).__name__}")
     print(f"CONJUNCT2_CAPTURED_MAPS={len(observed)}")
-    print(f"CONJUNCT2_NAMED_PARAMETERS_AFTER={len(list(model.named_parameters()))}")
+    print(f"CONJUNCT2_MATERIALISED_AT_HANDOVER={materialised_at_handover}")
 
     assert len(observed) == 1, (
         f"the observer recorded {len(observed)} maps where conjunct 2 needs "
         f"exactly the one load_weights built"
     )
-    assert "576 checkpoint keys" in message and "288 scale keys" in message, (
-        f"the refusal does not name the key counts it refused on: {message!r}"
-    )
-    assert "inc-glm53f-095" in message, (
-        f"the refusal does not name where stacked banks land: {message!r}"
-    )
-    assert list(model.named_parameters()) == [], (
-        "the refusal left parameters registered, so it half built the tree"
+    assert materialised_at_handover > 0, (
+        "the hand-over was reached with an unmaterialised tree, so the capture "
+        "happened instead of step 3 rather than after it"
     )
 
     bindings, handovers = _mappings_flow_in_load_weights()
@@ -762,6 +846,43 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
 
     mappings = observed[0]
     print(f"CONJUNCT2_CAPTURED_MAP_ENTRIES={len(mappings)}")
+
+    # The two key counts, read off the captured map (plan revision 182 ruling
+    # (b)). A routed bank entry is named by ``_add_moe_mlp``
+    # (``weight_loaders_fp8.py:679``); the shared-expert entries are a different
+    # shape and ``.mlp.shared_experts.`` does not contain ``.mlp.experts.``.
+    bank_suffixes = ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
+    banks = {
+        name: keys
+        for name, keys in mappings.items()
+        if ".mlp.experts." in name and name.endswith(bank_suffixes)
+    }
+    experts = real_config.text_config.n_routed_experts
+    bank_key_counts = sorted({len(keys) for keys in banks.values()})
+    bank_scale_counts = sorted({len(scale_keys(keys)) for keys in banks.values()})
+    bank_kinds = sorted({classify_mapped_keys(keys) for keys in banks.values()})
+    print(f"CONJUNCT2_PUBLISHED_ROUTED_EXPERTS={experts}")
+    print(f"CONJUNCT2_BANK_ENTRIES={len(banks)}")
+    print(f"CONJUNCT2_BANK_ENTRY_KEY_COUNTS={bank_key_counts}")
+    print(f"CONJUNCT2_BANK_ENTRY_SCALE_COUNTS={bank_scale_counts}")
+    print(f"CONJUNCT2_BANK_ENTRY_KINDS={bank_kinds}")
+
+    assert banks, (
+        "the captured map holds no routed expert bank entry, so the two key "
+        "counts this conjunct reads have no subject"
+    )
+    assert experts == 288, (
+        f"the published config declares {experts} routed experts, so the 576 and "
+        f"288 this conjunct reads are no longer the counts of record"
+    )
+    assert bank_key_counts == [2 * experts], (
+        f"a bank entry does not carry one weight and one scale key per expert: "
+        f"{bank_key_counts} against {2 * experts}"
+    )
+    assert bank_scale_counts == [experts], (
+        f"a bank entry does not carry one scale key per expert: "
+        f"{bank_scale_counts} against {experts}"
+    )
 
     claimed: set[str] = set()
     for keys in mappings.values():
@@ -867,10 +988,10 @@ def test_an_absent_checkpoint_refuses_by_name_and_leaves_the_tree_alone(
 # ``inc-glm53f-091b`` -- conjuncts 4, 5, 6 and 8, plus the placeholder-dtype
 # item the rev 165 ruling added.
 #
-# FIVE more counted items, one per conjunct and one for the ruling, so this file
-# collects NINE with no ``parametrize`` decorator anywhere in it (D1.2). The
-# helpers below belong to this half and are kept together so a reader can see
-# which half owns what.
+# FIVE more counted items, one per conjunct and one for the ruling, which took
+# this file to NINE with no ``parametrize`` decorator anywhere in it (D1.2).
+# ``inc-glm53f-095``'s four take it to THIRTEEN, below. The helpers below belong to
+# this half and are kept together so a reader can see which half owns what.
 # --------------------------------------------------------------------------- #
 
 
@@ -1011,19 +1132,38 @@ def _statement_positions(method, *, calls: tuple[str, ...], anchor: str):
     A POSITION READ, not a text search. A diff that moves a call above the
     anchor moves a number here, so conjunct 8's ordering fails by arithmetic
     rather than by anyone's judgement.
+
+    EARLIEST FOR A CALL, LATEST FOR THE ANCHOR, with every position found
+    printed. RE-ANCHORED by rider B69r2-N3 (plan revision 180) at
+    ``inc-glm53f-095``, the first increment to touch this file since. An earlier
+    form kept ONE position per callee and overwrote it, so a SECOND, EARLY call to
+    the same callee moved neither of conjunct 8's ordering reads: the misplaced
+    call was invisible to both, and only the miniature's dynamic pre-flight could
+    catch it. ``min`` for a call and ``max`` for the anchor is what the ordering
+    claim actually says -- the EARLIEST prep call comes after the LATEST anchor
+    call. ``ast.walk`` is breadth-first, so "the last one seen" was never reliably
+    the last one in the source either. No caller changes: at the shipped source
+    every callee here has exactly one call site, so ``min`` and ``max`` read the
+    same number the overwriting form read.
     """
     tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
-    positions = {name: -1 for name in calls}
-    anchor_at = -1
+    found: dict[str, list[int]] = {name: [] for name in calls}
+    anchor_found: list[int] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         callee = node.func
         named = callee.attr if isinstance(callee, ast.Attribute) else None
-        if named in positions:
-            positions[named] = node.lineno
+        if named in found:
+            found[named].append(node.lineno)
         if named == anchor:
-            anchor_at = node.lineno
+            anchor_found.append(node.lineno)
+
+    every_position = {name: sorted(lines) for name, lines in found.items()}
+    print(f"STATEMENT_POSITIONS_EVERY_CALL={every_position}")
+    print(f"STATEMENT_POSITIONS_EVERY_ANCHOR={sorted(anchor_found)}")
+    positions = {name: (min(lines) if lines else -1) for name, lines in found.items()}
+    anchor_at = max(anchor_found) if anchor_found else -1
     return positions, anchor_at
 
 
@@ -1713,3 +1853,552 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
     mlp_weight = getattr(model.get_submodule(mlp_path), "gate_proj_weight")
     print(f"RULING_CONTROL_TWO_KEY_ENTRY_DTYPE={mlp_weight.dtype}")
     assert _is_fp8_dtype(mlp_weight.dtype)
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-095 -- the expert-stacked load. Four items, selected by ``-k
+# stacked``, one per conjunct.
+#
+# WHY THESE ITEMS BRING THEIR OWN CONFIGURATION. The landed ``_routed_config``
+# exists to REFUSE ("so the load must refuse by name", ``:186``), and a routed
+# load that completes runs one thing that configuration was never asked to
+# survive: ``Glm5NextSharedExperts.prepare_scale_operands``, which reaches
+# ``scale_grid_shape`` and demands extents divisible by ``BLOCK_QUANT_SIZE`` =
+# 256. The miniature is 128, so the routed load dies in the SHARED-expert prep
+# -- nothing to do with the bank. That is a pre-existing constraint of the
+# miniature the bank refusal has been masking, and it is measured rather than
+# argued: ``increments/probe-095-collateral-host.out`` reads
+# ``BlockwiseFp8MmError: weight extent [128,128] is not a whole number of
+# 256x256 blocks`` from ``blockwise_fp8_mm.py:283-287``, reached through
+# ``model_fp8.py:1576``.
+#
+# The bank does not need that prep. ``Glm5NextRoutedExperts`` defines NEITHER
+# load-time prep -- only ``Glm5NextSharedExperts`` (scale) and
+# ``Glm5NextMLAAttention`` (projection) do -- so ``_run_load_time_preps``'s
+# ``hasattr(type(module), ...)`` gate never visits a bank at all. So these items
+# set ``n_shared_experts=0``, which ``model_fp8.py:1857`` reads as "build no
+# shared-expert module", and the routed load completes on the bank's own path.
+# The landed constants are REUSED rather than copied, so a change to the
+# miniature moves these items with the other nine.
+# --------------------------------------------------------------------------- #
+
+#: The expert-parallel degree conjunct 3 splits the bank across, and the count
+#: it expects on each rank. Two ranks over ``MINI_ROUTED_EXPERTS`` experts.
+STACKED_EP_DEGREE = 2
+STACKED_EXPERTS_PER_RANK = MINI_ROUTED_EXPERTS // STACKED_EP_DEGREE
+
+
+def _stacked_config() -> Glm5NextConfig:
+    """A routed configuration whose load COMPLETES, so the bank can be read.
+
+    ``_routed_config``'s fields with one change, ``n_shared_experts=0``, for the
+    reason the section header records. Everything else -- layer count, expert
+    count, the MLA widths -- is the landed constant, so these items and the other
+    nine move together.
+    """
+    return Glm5NextConfig(
+        text_config=Glm5NextTextConfig(
+            num_hidden_layers=MINI_LAYERS,
+            n_routed_experts=MINI_ROUTED_EXPERTS,
+            n_shared_experts=0,
+            first_k_dense_replace=MINI_FIRST_K_DENSE,
+            tie_word_embeddings=False,
+            **MINI_MLA_WIDTHS,
+        )
+    )
+
+
+def _stacked_model() -> Glm5NextForConditionalGeneration:
+    """The routed model at the fork's own expert-parallel degree, which is 1.
+
+    ``Glm5NextForConditionalGeneration.__init__`` takes a config and nothing else
+    (``model_fp8.py:3454``), so a degree is not something a test can pass in
+    here. Conjunct 3 therefore declares its two-rank geometry on a stand-in owner
+    (:func:`_stacked_bank_geometry`) and calls the loader directly, which is also
+    the honest shape of that reading: the loader's contract is with whatever
+    module declares the partition, not with this constructor.
+    """
+    return Glm5NextForConditionalGeneration(_stacked_config())
+
+
+def _bank_entries(mappings: dict[str, str | list[str]]) -> dict[str, list[str]]:
+    """Every map entry that is an expert bank, by the classifier's own answer.
+
+    Asks ``classify_mapped_keys`` rather than counting scale keys again, so this
+    population is the same one the loader chooser routes and cannot drift from
+    it.
+    """
+    return {
+        name: _keys_of(mappings, name)
+        for name in mappings
+        if classify_mapped_keys(mappings[name]) == MAPPED_KEY_STACKED_BANK
+    }
+
+
+def _checkpoint_tensor(directory: Path, key: str) -> torch.Tensor:
+    """One checkpoint tensor, read through the same call the loaders read with."""
+    with safe_open(str(directory / MINI_CHECKPOINT_FILE), framework="pt") as opened:
+        return opened.get_slice(key)[:]
+
+
+def _slice_pairs(directory: Path, keys: list[str]) -> list[torch.Tensor]:
+    """A bank entry's keys as tensors, in checkpoint order, for a transform.
+
+    A transform takes anything with ``__getitem__`` and ``get_shape``; plain
+    tensors satisfy both, and reading them here rather than inside the item keeps
+    the item's own lines about the reading it makes.
+    """
+    return [_checkpoint_tensor(directory, key) for key in keys]
+
+
+def _distinguish_bank_experts(directory: Path, keys: list[str]) -> dict[str, float]:
+    """Give every expert in one bank entry its OWN bytes, in the written file.
+
+    ``_write_miniature_checkpoint`` writes every quantised weight as ``ones`` and
+    every scale grid as ``0.5``. That is right for the readings that landed with
+    it and useless for conjuncts (2) and (3): experts holding identical bytes
+    cannot be told apart, so a rotation control cannot move and no stacked row can
+    be attributed to an expert. MEASURED, not argued -- the first run of those two
+    items failed on exactly that, the rotation reading ``0.0`` and stacked row 0
+    matching all four references (``accept-095-pre-host.out``).
+
+    So the file is re-written once here: expert ``e`` gets the value ``e + 1``
+    through its whole weight and half that through its scale grid. Every other
+    tensor is carried across unchanged, READ BACK FROM THE FILE rather than
+    rebuilt, so this helper reaches no item that does not call it and no landed
+    reading moves. Values 1 to E are exact in ``float8_e4m3fn`` and far below the
+    240 squeeze ceiling, so the distinction survives both the dtype and the
+    downscale.
+
+    Returns ``{key: the value written}``, so an item can name what it expects
+    rather than recompute the convention.
+    """
+    path = directory / MINI_CHECKPOINT_FILE
+    tensors: dict[str, torch.Tensor] = {}
+    with safe_open(str(path), framework="pt") as opened:
+        for key in opened.keys():
+            tensors[key] = opened.get_tensor(key)
+
+    written: dict[str, float] = {}
+    layout = bank_layout(keys, param_name="the bank entry under test")
+    for expert in range(layout.experts):
+        weight_key = keys[layout.weight_at[expert]]
+        scale_key = keys[layout.scale_at[expert]]
+        value = float(expert + 1)
+        tensors[weight_key] = torch.full(
+            tuple(tensors[weight_key].shape), value, dtype=torch.bfloat16
+        ).to(torch.float8_e4m3fn)
+        tensors[scale_key] = torch.full(
+            tuple(tensors[scale_key].shape), value / 2.0, dtype=torch.float32
+        )
+        written[weight_key] = value
+        written[scale_key] = value / 2.0
+
+    save_file(tensors, str(path))
+    return written
+
+
+def _stacked_bank_geometry(experts: int, per_rank: int):
+    """A stand-in owner declaring a fixed expert partition, for a direct call.
+
+    Conjunct 3 needs a geometry it chose rather than the one the model resolved,
+    and conjunct 4 needs an owner that declares nothing. Both are one object each,
+    so neither reaches for a real model it does not need.
+    """
+
+    class Owner:
+        num_routed_experts = experts
+
+        def local_expert_indices(self, rank: int) -> tuple[int, ...]:
+            return tuple(range(rank * per_rank, (rank + 1) * per_rank))
+
+    return Owner()
+
+
+def test_the_stacked_bank_delivers_every_expert_or_refuses_by_name(
+    tmp_path, single_rank_process_group
+) -> None:
+    """(1) EVERY EXPERT ARRIVES, or the bank refuses and leaves nothing.
+
+    Certifies :func:`stacked_expert_bank_loader` as ``load_weights`` reaches it
+    through ``get_weight_loader``. TWO readings, and the second is the FIRST's
+    CONTROL rather than a separate subject.
+
+    (i) On a miniature checkpoint with a routed bank of E experts, each loaded
+    bank parameter's element count equals the SUM of the element counts its OWN
+    checkpoint weight slices imply -- derived from the file by
+    :func:`_implied_numels`, never from a shape constant -- and its leading axis
+    is E, so E/E experts are present. This is the reading ``-091a`` failed
+    silently: it loaded 16,384 elements where its slices implied 65,536 and
+    reported success, because nothing between the loader and the parameter
+    validates a shape.
+
+    (ii) THE SAME BANK, in the SAME run, REFUSES when its owning module declares
+    no expert geometry -- ``Glm5NextExpertBankNotLoadableError`` naming the
+    parameter, its key count and the missing declaration. That is what makes (i)
+    a measurement instead of an observation: one thing changes, the geometry
+    declaration, and the answer moves from "E/E loaded" to "refused by name". A
+    reading that cannot move is not a reading, which is why ``-091``'s own
+    refusal reading was re-anchored onto this one when this increment made the
+    well-formed bank loadable (design entry ``design-20260905-r``).
+    """
+    directory = tmp_path / "stacked"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+    written = _write_miniature_checkpoint(directory, mappings, model)
+    banks = _bank_entries(mappings)
+
+    print(f"CONJUNCT1_CHECKPOINT_TENSORS={written}")
+    print(f"CONJUNCT1_MAP_ENTRIES={len(mappings)}")
+    print(f"CONJUNCT1_BANK_ENTRIES={len(banks)}")
+    print(f"CONJUNCT1_EXPERTS_DECLARED={MINI_ROUTED_EXPERTS}")
+    assert banks, (
+        "this configuration produced no expert-bank entry, so conjunct (1) would "
+        "certify nothing; the loader it exercises could not be reached"
+    )
+
+    before = _not_lazy_count(model)
+    model.load_weights(str(directory), torch.device("cpu"), None)
+    implied = _implied_numels(directory, mappings)
+    loaded = dict(model.named_parameters())
+
+    mismatches = {}
+    axes = {}
+    for name in sorted(banks):
+        parameter = loaded[name]
+        axes[name] = int(parameter.shape[0])
+        if parameter.numel() != implied[name]:
+            mismatches[name] = (parameter.numel(), implied[name])
+
+    print(f"CONJUNCT1_NOT_LAZY_BEFORE={before}")
+    print(f"CONJUNCT1_NOT_LAZY_AFTER={_not_lazy_count(model)}")
+    print(f"CONJUNCT1_BANK_NUMEL_MISMATCHES={len(mismatches)}")
+    print(f"CONJUNCT1_BANK_LEADING_AXES={sorted(set(axes.values()))}")
+    print(
+        "CONJUNCT1_ONE_BANK="
+        f"{sorted(banks)[0]} numel={loaded[sorted(banks)[0]].numel()} "
+        f"implied={implied[sorted(banks)[0]]}"
+    )
+
+    assert before == 0, (
+        f"{before} parameters already held a real tensor before the load, so "
+        f"this item cannot certify the load"
+    )
+    assert mismatches == {}, (
+        f"{len(mismatches)} bank parameters received a different number of "
+        f"elements than their own checkpoint slices imply, e.g. "
+        f"{[(k, *mismatches[k]) for k in sorted(mismatches)[:3]]} as "
+        f"(parameter, loaded, implied) -- an expert was dropped or invented"
+    )
+    assert set(axes.values()) == {MINI_ROUTED_EXPERTS}, (
+        f"a bank's leading axis is not the expert count: read "
+        f"{sorted(set(axes.values()))}, expected [{MINI_ROUTED_EXPERTS}]. At "
+        f"expert-parallel degree 1 one rank owns every expert, so every bank "
+        f"stacks E of them"
+    )
+
+    # ── (ii) the same bank, with the geometry declaration withheld ───────────
+    name = sorted(banks)[0]
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+        stacked_expert_bank_loader(banks[name], param_name=name, owner=object())
+    message = str(refusal.value)
+    print(f"CONJUNCT1_UNDECLARED_REFUSAL={message[:160]!r}")
+    assert name in message, (
+        f"the refusal does not name the parameter it refused: {message}"
+    )
+    assert str(len(banks[name])) in message, (
+        f"the refusal does not name the entry's key count: {message}"
+    )
+    assert "DECLARES NO EXPERT GEOMETRY" in message, (
+        f"the refusal does not name the missing declaration: {message}"
+    )
+
+
+def test_the_stacked_bank_holds_each_expert_bit_identically(
+    tmp_path, single_rank_process_group
+) -> None:
+    """(2) EACH EXPERT IS THE RIGHT ONE, BIT-IDENTICALLY, weight and scale.
+
+    Certifies the INDEXING of :func:`stacked_expert_bank_loader` and
+    :func:`stacked_expert_scale_loader`. A stack is a permutation of its inputs,
+    so any difference at all is an indexing defect and the threshold is
+    ``max abs diff == 0.0`` rather than a tolerance.
+
+    WHAT EACH EXPERT IS COMPARED AGAINST, and why it is not the raw checkpoint
+    tensor. The bank loader is composed under
+    :func:`wrap_with_blockwise_fp8_downscale`, so on a platform that squeezes
+    into the 240 range the stored bytes are the SQUEEZED ones -- and comparing
+    against unsqueezed bytes would fail for a reason that has nothing to do with
+    indexing. So expert ``e``'s reference is the checkpoint tensor through the
+    SAME elementwise squeeze, :func:`downscale_fp8_weight_bytes`, and the scale
+    row's reference is the grid through the SAME compensation,
+    :func:`compensate_block_scales`. On a platform needing no squeeze both are
+    the identity and the comparison is against the raw bytes, which is why the
+    item states no platform of its own.
+
+    THE CONTROL IS THE ROTATION. The same readings are taken against a reference
+    list rotated by one expert, which must DIFFER -- otherwise a comparison that
+    accidentally compared a tensor with itself, or a checkpoint whose experts all
+    hold the same bytes, would satisfy the equality above and certify nothing.
+    The landed writer gives every expert the SAME bytes, so
+    :func:`_distinguish_bank_experts` re-writes the file first; the first run of
+    this item failed on the rotation for that reason and not for another.
+    """
+    directory = tmp_path / "stacked"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+    _write_miniature_checkpoint(directory, mappings, model)
+    banks = _bank_entries(mappings)
+    name = sorted(banks)[0]
+    keys = banks[name]
+    layout = bank_layout(keys, param_name=name)
+    values = _distinguish_bank_experts(directory, keys)
+    print(f"CONJUNCT2_DISTINGUISHED_KEYS={len(values)}")
+
+    weight_keys = [keys[i] for i in layout.weight_at]
+    scale_key_list = [keys[i] for i in layout.scale_at]
+    print(f"CONJUNCT2_ENTRY={name}")
+    print(f"CONJUNCT2_KEYS={len(keys)} EXPERTS={layout.experts}")
+    print(f"CONJUNCT2_FIRST_WEIGHT_KEY={weight_keys[0]}")
+    print(f"CONJUNCT2_FIRST_SCALE_KEY={scale_key_list[0]}")
+
+    owner = model.get_submodule(name.rsplit(".", 1)[0])
+    slices = _slice_pairs(directory, keys)
+    stacked = stacked_expert_bank_loader(
+        keys, param_name=name, owner=owner
+    ).transform(slices, 0)
+    grids = stacked_expert_scale_loader(
+        keys, param_name=name, owner=owner
+    ).transform(slices, 0)
+
+    weight_refs = [
+        downscale_fp8_weight_bytes(_checkpoint_tensor(directory, key))
+        for key in weight_keys
+    ]
+    scale_refs = [
+        compensate_block_scales(_checkpoint_tensor(directory, key)).scale_inv
+        for key in scale_key_list
+    ]
+
+    def worst(stack, refs) -> float:
+        return max(
+            float((stack[e].to(torch.float32) - refs[e].to(torch.float32)).abs().max())
+            for e in range(len(refs))
+        )
+
+    aligned_weight = worst(stacked, weight_refs)
+    aligned_scale = worst(grids, scale_refs)
+    rotated_weight = worst(stacked, weight_refs[1:] + weight_refs[:1])
+    rotated_scale = worst(grids, scale_refs[1:] + scale_refs[:1])
+
+    print(f"CONJUNCT2_STACKED_SHAPE={tuple(stacked.shape)}")
+    print(f"CONJUNCT2_SCALE_SHAPE={tuple(grids.shape)}")
+    print(f"CONJUNCT2_WORST_ABS_DIFF_WEIGHT={aligned_weight}")
+    print(f"CONJUNCT2_WORST_ABS_DIFF_SCALE={aligned_scale}")
+    print(f"CONJUNCT2_CONTROL_ROTATED_WEIGHT={rotated_weight}")
+    print(f"CONJUNCT2_CONTROL_ROTATED_SCALE={rotated_scale}")
+
+    assert stacked.shape[0] == layout.experts, (
+        f"the stack holds {stacked.shape[0]} experts, not {layout.experts}"
+    )
+    assert grids.shape[0] == layout.experts, (
+        f"the scale stack holds {grids.shape[0]} rows, not {layout.experts}"
+    )
+    assert aligned_weight == 0.0, (
+        f"expert weights are not bit-identical to their own checkpoint tensors "
+        f"through the same squeeze: worst abs diff {aligned_weight}. A stack is "
+        f"a permutation of its inputs, so this is an indexing defect"
+    )
+    assert aligned_scale == 0.0, (
+        f"expert scale rows are not bit-identical to their own grids through the "
+        f"same compensation: worst abs diff {aligned_scale}"
+    )
+    assert rotated_weight > 0.0 and rotated_scale > 0.0, (
+        f"the rotation control did not move (weight {rotated_weight}, scale "
+        f"{rotated_scale}), so the equalities above would hold for a stack in "
+        f"any order and certify nothing about indexing"
+    )
+
+
+def test_the_stacked_bank_gives_each_rank_its_declared_experts(
+    tmp_path, single_rank_process_group
+) -> None:
+    """(3) THE RANK'S SUBSET IS THE DECLARED SUBSET, counted both ways.
+
+    Certifies that :func:`stacked_expert_bank_loader` selects THIS RANK's experts
+    at the declared expert-parallel degree -- and it is the first test in this
+    repository of
+    :func:`~vllm_neuron.utils.weight_loader.expert_parallel_interleaved_loader`,
+    which had ZERO callers before this increment, so its documented layout is
+    exercised here rather than trusted.
+
+    At degree 2 over E experts, rank 0 and rank 1 each hold exactly E/2, the two
+    subsets are DISJOINT, and their union is all E. Both directions are counted
+    because either alone is satisfiable by a defect: equal counts alone allow
+    both ranks to hold expert 0, and a union of E alone allows one rank to hold
+    everything.
+
+    WHICH EXPERTS A RANK ACTUALLY GOT IS IDENTIFIED BY CONTENT, not by trusting
+    the loader's own arithmetic: each stacked row is matched against the
+    per-expert reference tensors, so the answer comes from the bytes. The DEGREE-1
+    load is the control -- one rank owning every expert -- so a selection that
+    silently ignored the degree reads all E on both ranks and reddens.
+    """
+    directory = tmp_path / "stacked"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+    _write_miniature_checkpoint(directory, mappings, model)
+    banks = _bank_entries(mappings)
+    name = sorted(banks)[0]
+    keys = banks[name]
+    layout = bank_layout(keys, param_name=name)
+    values = _distinguish_bank_experts(directory, keys)
+    print(f"CONJUNCT3_DISTINGUISHED_KEYS={len(values)}")
+    slices = _slice_pairs(directory, keys)
+    references = [
+        downscale_fp8_weight_bytes(_checkpoint_tensor(directory, keys[i]))
+        for i in layout.weight_at
+    ]
+
+    def experts_in(stack) -> list[int]:
+        """Which global expert each stacked row IS, decided by its bytes."""
+        found = []
+        for row in range(stack.shape[0]):
+            matches = [
+                e
+                for e in range(layout.experts)
+                if float(
+                    (stack[row].to(torch.float32) - references[e].to(torch.float32))
+                    .abs()
+                    .max()
+                )
+                == 0.0
+            ]
+            assert len(matches) == 1, (
+                f"stacked row {row} matches {len(matches)} of the "
+                f"{layout.experts} expert references, so this reading cannot say "
+                f"which expert it holds; the miniature's experts must be "
+                f"distinguishable for conjunct (3) to mean anything"
+            )
+            found.append(matches[0])
+        return found
+
+    split = _stacked_bank_geometry(layout.experts, STACKED_EXPERTS_PER_RANK)
+    loader = stacked_expert_bank_loader(keys, param_name=name, owner=split)
+    rank0 = experts_in(loader.transform(slices, 0))
+    rank1 = experts_in(loader.transform(slices, 1))
+
+    whole = _stacked_bank_geometry(layout.experts, layout.experts)
+    degree1 = experts_in(
+        stacked_expert_bank_loader(keys, param_name=name, owner=whole).transform(
+            slices, 0
+        )
+    )
+
+    print(f"CONJUNCT3_EP_DEGREE={STACKED_EP_DEGREE}")
+    print(f"CONJUNCT3_EXPERTS_TOTAL={layout.experts}")
+    print(f"CONJUNCT3_RANK0_EXPERTS={rank0}")
+    print(f"CONJUNCT3_RANK1_EXPERTS={rank1}")
+    print(f"CONJUNCT3_OVERLAP={sorted(set(rank0) & set(rank1))}")
+    print(f"CONJUNCT3_UNION_SIZE={len(set(rank0) | set(rank1))}")
+    print(f"CONJUNCT3_CONTROL_DEGREE1_EXPERTS={degree1}")
+
+    assert len(rank0) == STACKED_EXPERTS_PER_RANK, (
+        f"rank 0 holds {len(rank0)} experts at degree {STACKED_EP_DEGREE}, not "
+        f"{STACKED_EXPERTS_PER_RANK}"
+    )
+    assert len(rank1) == STACKED_EXPERTS_PER_RANK, (
+        f"rank 1 holds {len(rank1)} experts at degree {STACKED_EP_DEGREE}, not "
+        f"{STACKED_EXPERTS_PER_RANK}"
+    )
+    assert set(rank0) & set(rank1) == set(), (
+        f"the two ranks share experts {sorted(set(rank0) & set(rank1))}, so the "
+        f"same weight was loaded twice and the partition is not a partition"
+    )
+    assert set(rank0) | set(rank1) == set(range(layout.experts)), (
+        f"the two ranks together hold {sorted(set(rank0) | set(rank1))}, not all "
+        f"{layout.experts} experts, so an expert reached no rank at all"
+    )
+    assert degree1 == list(range(layout.experts)), (
+        f"the degree-1 control holds {degree1} rather than every expert in "
+        f"order, so the selection is not reading the declared geometry"
+    )
+
+
+def test_the_stacked_bank_refusal_is_gone_for_this_case_only(tmp_path) -> None:
+    """(4) THE REFUSAL IS GONE FOR THIS CASE AND ONLY THIS CASE.
+
+    Certifies :func:`loader_for_mapped_keys`'s routing and the refusals that
+    remain. FOUR readings, each naming what it certifies:
+
+    (i) a WELL-FORMED bank now gets a loader instead of a refusal -- the one
+    case this increment retires -- and it classifies
+    :data:`MAPPED_KEY_STACKED_BANK`, with ``_placeholder_dtype`` answering fp8
+    for that kind. The dtype reading is here because the classifier has TWO
+    consumers and a fourth kind the second consumer did not know would type
+    every bank placeholder bf16 while its loader delivered fp8.
+
+    (ii) an ODD key count still REFUSES by name -- it cannot be pairs at all.
+
+    (iii) a NON-ALTERNATING entry (a scale where a weight belongs) still REFUSES
+    by name, naming the offending position.
+
+    (iv) a MULTI-WEIGHT entry with NO scale key still REFUSES by name, naming
+    the parameter and both counts. This is ``B65-N1``: the refusal that used to
+    live here was keyed on the SCALE count, so this shape passed to the default
+    loader, whose ``len(slices) == 1`` assertion failed loudly but named no
+    parameter and fired after registration.
+    """
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+    banks = _bank_entries(mappings)
+    name = sorted(banks)[0]
+    keys = banks[name]
+    owner = model.get_submodule(name.rsplit(".", 1)[0])
+
+    # ── (i) the case this increment retires ─────────────────────────────────
+    kind = classify_mapped_keys(keys)
+    loader = loader_for_mapped_keys(keys, param_name=name, owner=owner)
+    dtype = model._placeholder_dtype(keys, param_name=name, mappings=mappings)
+    print(f"CONJUNCT4_WELL_FORMED_KIND={kind}")
+    print(f"CONJUNCT4_WELL_FORMED_GETS_A_LOADER={loader is not None}")
+    print(f"CONJUNCT4_PLACEHOLDER_DTYPE={dtype}")
+    assert kind == MAPPED_KEY_STACKED_BANK, (
+        f"a well-formed bank classifies {kind!r}, not {MAPPED_KEY_STACKED_BANK!r}"
+    )
+    assert loader is not None and loader.transform is not None, (
+        "a well-formed bank did not get a transforming loader, so the refusal "
+        "this increment retires is still in force"
+    )
+    assert _is_fp8_dtype(dtype), (
+        f"a bank placeholder is typed {dtype}, not fp8. The classifier's second "
+        f"consumer does not know the fourth kind, so every bank load would warn "
+        f"on a dtype mismatch against a loader that delivers fp8"
+    )
+
+    # ── (ii)-(iv) the shapes that still refuse ──────────────────────────────
+    weight, scale = keys[0], keys[1]
+    malformed = {
+        "an odd key count": (keys[:-1], "ODD count"),
+        "a scale where a weight belongs": ([scale] + keys[1:], "do not alternate"),
+        "several weights and no scale": ([weight, weight + ".dup"], "0 scale keys"),
+    }
+    refusals = {}
+    for defect, (entry, expected) in malformed.items():
+        with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+            loader_for_mapped_keys(entry, param_name=name, owner=owner)
+        message = str(refusal.value)
+        refusals[defect] = message
+        print(f"CONJUNCT4_REFUSED[{defect}]={message[:120]!r}")
+        assert name in message, (
+            f"the refusal for {defect} does not name the parameter: {message}"
+        )
+        assert expected in message, (
+            f"the refusal for {defect} does not name the defect "
+            f"({expected!r} absent): {message}"
+        )
+        assert str(len(entry)) in message, (
+            f"the refusal for {defect} does not name the key count: {message}"
+        )
+    print(f"CONJUNCT4_REFUSALS_CHECKED={len(refusals)}")
+    assert len(refusals) == 3, "one of the malformed shapes did not refuse"
