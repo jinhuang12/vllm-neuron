@@ -845,7 +845,10 @@ import logging
 
 import torch
 
-from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
+from vllm_neuron.utils.weight_loader import (
+    SafetensorsWeightLoader,
+    sharding_weight_loader,
+)
 
 from .quantization import DEFAULT_WEIGHT_BLOCK_SIZE
 
@@ -1489,26 +1492,236 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
     return MAPPED_KEY_PLAIN
 
 
+# --------------------------------------------------------------------------- #
+# inc-glm53f-094 -- the tensor-parallel shard geometry, as an INPUT.
+#
+# WHAT THIS SECTION IS FOR. The model declares per-rank geometry
+# (``_per_rank()`` ``model_fp8.py:200-202``, ``num_kv_heads_per_rank``
+# ``:2215``) and until this increment no loader shards anything, so at any world
+# size above one every rank read the WHOLE tensor into a per-rank-shaped
+# consumer. :func:`blockwise_scale_loader`'s own docstring already deferred the
+# answer to "the module that declares that geometry"; this section is the input
+# that carries it here.
+#
+# IT IS AN INPUT AND NOT A SECOND CLASSIFIER, which is the Surface's wording and
+# the reason the shape below is a plain value object. :func:`classify_mapped_keys`
+# still decides WHICH KIND a map entry is, exactly as ``-091`` left it, and the
+# geometry only decides whether that kind's loader shards. A geometry that
+# classified anything would be a second opinion about the same entry, and two
+# opinions is one too many.
+#
+# EVERY NUMBER ARRIVES ALREADY DIVIDED. The per-rank arithmetic happens in
+# ``model_fp8.py``, at the one site that knows the world size, so this file never
+# resolves a world size and never holds a second partition that could disagree
+# with the module's -- the same rule :func:`_bank_expert_indices` states for the
+# expert count.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ShardGeometry:
+    """One parameter family's tensor-parallel shard, fully resolved.
+
+    ``inc-glm53f-094``. Three plain integers, because the caller has already done
+    every division: ``shard_dim`` is the dimension in the FINAL PARAMETER shape
+    (``utils/weight_loader.py:150``), ``shard_size`` is THIS RANK's extent along
+    it, and ``num_shards`` is the world size the extent was divided by.
+
+    WHY PLAIN INTEGERS RATHER THAN A MODULE REFERENCE. ``owner`` already reaches
+    this file for the expert bank, and it would have been shorter to read the
+    widths off the module here too. It is deliberately not done: the world size
+    lives on the root and the widths live on ten different classes, so resolving
+    them here would put half the arithmetic in this file and half in
+    ``model_fp8.py``. Resolved values cross the boundary instead, which is what
+    lets :func:`shard_geometry_for_grid` below be a pure function of numbers.
+    """
+
+    shard_dim: int
+    shard_size: int
+    num_shards: int
+
+    def __post_init__(self) -> None:
+        if self.shard_dim not in (0, 1):
+            raise ValueError(
+                f"shard_dim must be 0 or 1, got {self.shard_dim}; this package's "
+                f"parameter layout is [out_features, in_features] and a shard "
+                f"outside those two dimensions has no declared meaning"
+            )
+        if self.shard_size < 1:
+            raise ValueError(
+                f"shard_size must be >= 1, got {self.shard_size}; a rank with no "
+                f"rows of a sharded family would load an empty tensor"
+            )
+        if self.num_shards < 1:
+            raise ValueError(f"num_shards must be >= 1, got {self.num_shards}")
+
+
+def shard_geometry_for_grid(
+    geometry: ShardGeometry,
+    param_name: str | None = None,
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+) -> ShardGeometry:
+    """The scale grid's geometry for a weight sharded by ``geometry``.
+
+    ``inc-glm53f-094``, and the whole of conjunct (3). A grid holds one fp32
+    value per weight tile, so a weight sharded into ``shard_size`` rows takes
+    ``shard_size // block_rows`` grid rows -- on the SAME dimension, because the
+    grid's axes correspond to the weight's.
+
+    THE BOUNDARY IS CHECKED, NOT ROUNDED. If the weight's shard boundary does not
+    fall on a block boundary, two ranks share one tile and there is no way to
+    split that tile's single scale between them. Rounding would hand one rank a
+    tile scaled for another's rows, which is silent numerical corruption of a
+    whole 128-row band. So it is REFUSED BY NAME, with the parameter and the
+    boundary in the message, and the refusal happens at construction time like
+    every other refusal in this file -- before any parameter is registered.
+    """
+    extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
+    if geometry.shard_size % extent:
+        _refuse(
+            param_name,
+            f"is sharded into {geometry.shard_size} rows along dim "
+            f"{geometry.shard_dim}, which is NOT a multiple of the {extent}-row "
+            f"block extent at block size {block_size}. Its scale grid holds one "
+            f"value per {block_size[0]}x{block_size[1]} tile, so this boundary "
+            f"puts two ranks inside one tile and there is no way to split that "
+            f"tile's single scale between them. The nearest block-aligned shard "
+            f"sizes are {(geometry.shard_size // extent) * extent} and "
+            f"{((geometry.shard_size // extent) + 1) * extent}.",
+        )
+    return ShardGeometry(
+        shard_dim=geometry.shard_dim,
+        shard_size=geometry.shard_size // extent,
+        num_shards=geometry.num_shards,
+    )
+
+
+def _sharding_loader(geometry: ShardGeometry) -> SafetensorsWeightLoader:
+    """The pin's shard loader, built from a resolved geometry.
+
+    ``is_storage_transposed`` is FALSE, and that is a reading rather than a
+    default: in this package the parameter layout IS the checkpoint layout, on
+    two independent readings recorded in
+    ``increments/shard-table-094.md`` Part 1b -- the wrapped loader's base
+    transform is ``slices[0][:]`` with no transpose (``:1342``), and every
+    consumer transposes at compute time instead. The qwen3 precedent passes
+    ``True`` because ITS checkpoint stores those weights transposed; copying that
+    flag here would slice the wrong dimension of every family.
+    """
+    return sharding_weight_loader(
+        shard_dim=geometry.shard_dim,
+        shard_size=geometry.shard_size,
+        num_shards=geometry.num_shards,
+        is_storage_transposed=False,
+    )
+
+
+def _weight_slice_only(
+    loader: SafetensorsWeightLoader, weight_index: int
+) -> SafetensorsWeightLoader:
+    """Give a ONE-SLICE transform the weight slice of a multi-key map entry.
+
+    ``inc-glm53f-094``. The pin's sharding transform asserts ``len(slices) == 1``
+    (``utils/weight_loader.py:195-197``), and a blockwise-FP8 projection is TWO
+    checkpoint keys -- the weight and its scale companion (:func:`_quantised`) --
+    which the reader passes as two slices -- ``_process_param`` builds one slice
+    per key of the entry and hands the whole list over
+    (``utils/checkpoints.py:569``, reached from the pipelined loop at
+    ``:441``). Composing the two without this adapter
+    makes every sharded quantised family fail on a bare assertion that names no
+    parameter, at load time and after registration.
+
+    ``weight_index`` is read off the KEY LIST by the caller rather than assumed to
+    be 0. The order is the map's, and the map is built by callers this function
+    does not see.
+    """
+    inner = loader.transform
+    if inner is None:  # pragma: no cover -- _sharding_loader always sets one
+        raise Glm5NextWeightMapError(
+            "_weight_slice_only wraps a loader that HAS a transform; the "
+            "default loader needs no adapter because it already reads slice 0"
+        )
+
+    def transform(slices, rank):
+        return inner([slices[weight_index]], rank)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def sharded_scale_grid_loader(
+    geometry: ShardGeometry, param_name: str | None = None
+) -> SafetensorsWeightLoader:
+    """This rank's ROWS of a sharded weight's scale grid, and nothing else.
+
+    ``inc-glm53f-094``. Takes the WEIGHT's geometry and converts it to the grid's
+    with :func:`shard_geometry_for_grid`, so the caller never divides by the
+    block extent itself.
+
+    IT DOES NOT COMPENSATE, AND THAT IS THE WHOLE REASON IT EXISTS SEPARATELY.
+    The only route a sharded weight's grid travels at this increment is the
+    out-of-band reader, which stores the grid as it arrives
+    (``model_fp8.py:4154``) and leaves :func:`compensate_block_scales` to the
+    load-time prep that consumes it. A loader that compensated here would make a
+    grid mean one thing at world size 1 and another at world size 2, and
+    conjunct (2) compares those two loads against each other. So this shards and
+    stops, and the value semantics stay the landed ones.
+
+    An earlier round of this increment had a compensating variant on the
+    ``MAPPED_KEY_SCALE_GRID`` branch of :func:`loader_for_mapped_keys`. It was
+    removed as unreachable, for the same reason the bank-shard code was: the only
+    scale grids DECLARED as parameters are ``Glm5NextMLAAttention``'s four, whose
+    geometry is deferred to ``inc-glm53f-100``, so no geometry ever reached that
+    branch. Recorded in ``increments/shard-table-094.md`` Part 7.
+    """
+    return _sharding_loader(shard_geometry_for_grid(geometry, param_name))
+
+
 def loader_for_mapped_keys(
     checkpoint_keys: str | Sequence[str],
     *,
     param_name: str | None = None,
     owner: object | None = None,
+    geometry: ShardGeometry | None = None,
 ) -> SafetensorsWeightLoader | None:
     """The loader that serves one mapped parameter, or ``None`` for the default.
 
-    ``inc-glm53f-091``, extended by ``inc-glm53f-095``. Four cases, one per
+    ``inc-glm53f-091``, extended by ``inc-glm53f-095`` and ``inc-glm53f-094``.
+
+    ``geometry`` IS THIS PARAMETER'S TENSOR-PARALLEL SHARD, ALREADY RESOLVED, or
+    ``None`` for a family the model declares replicated. It is an input to each
+    kind's loader and never a fifth kind: ``-094`` adds no branch to
+    :func:`classify_mapped_keys` and no case below, it only decides whether the
+    case's loader shards. Passing ``None`` reproduces this function's behaviour
+    before ``-094`` byte for byte, which is what keeps every replicated family --
+    the majority of them -- on exactly the path ``-091`` measured.
+
+    Four cases, one per
     :func:`classify_mapped_keys` kind, and one REFUSAL that cuts across the
     last of them:
 
     * a lone scale grid gets :func:`blockwise_scale_loader`, which compensates
       the grid for the trn2 range and reports a floored block by name. Passing
-      ``param_name`` is what lets that report say which parameter floored.
+      ``param_name`` is what lets that report say which parameter floored. A
+      GEOMETRY never arrives here at this increment -- the only declared grid
+      parameters are the MLA four, deferred to ``inc-glm53f-100`` -- so this case
+      is unchanged by ``-094``; a SHARDED weight's grid is sharded by
+      :func:`sharded_scale_grid_loader` in the out-of-band reader instead.
     * a quantised weight with ONE scale companion gets
-      :func:`wrap_with_blockwise_fp8_downscale` over the default loader. That
-      wrapper's base transform is ``slices[0][:]`` (``:1339``), so it keeps the
-      weight slice and DROPS the scale companion -- the measured reason the
-      scales are read out of band rather than through this map.
+      :func:`wrap_with_blockwise_fp8_downscale` over the default loader -- or,
+      with a geometry, over the pin's shard loader behind
+      :func:`_weight_slice_only`. WITHOUT a geometry the wrapper's own base
+      transform is ``slices[0][:]`` (``:1342``), which keeps the weight slice and
+      drops the scale companion -- the measured reason the scales are read out of
+      band rather than through this map. WITH a geometry that default is NOT what
+      runs: the wrapper prefers the inner loader's own transform, and the pin's
+      sharding transform asserts ``len(slices) == 1``
+      (``utils/weight_loader.py:195-197``), so a two-key entry would reach it as
+      two slices and fail on a bare assertion naming no parameter. Selecting the
+      weight slice by INDEX is therefore part of the composition rather than a
+      detail of it, and the index is read off the keys rather than assumed to be
+      0. The squeeze is elementwise (``:1172-1176``), so squeezing this rank's
+      rows and taking this rank's rows of the squeezed tensor give the same
+      bytes, and the wrapper stays outside.
     * an EXPERT BANK -- more than one scale key -- gets
       :func:`stacked_expert_bank_loader`, which is what ``inc-glm53f-095``
       adds. ``owner`` is the module that declares the parameter, and the bank
@@ -1516,11 +1729,16 @@ def loader_for_mapped_keys(
     * a PLAIN entry naming MORE THAN ONE weight key is refused by name. It is
       an unquantised bank, and the reason it is refused rather than served is
       below.
+    * a PLAIN entry naming ONE weight key gets the pin's shard loader when a
+      geometry is given -- this is the unquantised sharded family, an ordinary
+      case rather than an exception.
     * anything else gets ``None``, meaning "attach nothing".
       :func:`~vllm_neuron.utils.weight_loader.get_weight_loader` already falls
       back to the identity loader when a parameter carries none
       (``utils/weight_loader.py:102``), so attaching one here would be a second
-      way of saying the same thing, and two ways is one too many.
+      way of saying the same thing, and two ways is one too many. EVERY
+      REPLICATED FAMILY STILL LANDS HERE, which is why ``-094`` changes nothing
+      for the majority of the surface.
 
     THE BANK LOADER IS THE ONLY ONE HERE THAT CONSULTS ``rank``, and it consults
     it at load time rather than now. Everything else in this function is
@@ -1558,11 +1776,35 @@ def loader_for_mapped_keys(
     keys = _as_key_list(checkpoint_keys)
     kind = classify_mapped_keys(keys)
     if kind == MAPPED_KEY_SCALE_GRID:
+        # NO GEOMETRY REACHES THIS BRANCH AT THIS INCREMENT EITHER, and it is the
+        # same reading as the bank's below rather than a second rule. The only
+        # scale grids this package DECLARES as parameters are
+        # ``Glm5NextMLAAttention``'s four, and their geometry is deferred to
+        # ``inc-glm53f-100``. A sharded weight's grid travels the out-of-band
+        # reader instead, which composes ``sharded_scale_grid_loader`` itself, so
+        # this branch stays byte-for-byte the one ``-091`` measured.
         return blockwise_scale_loader(param_name)
     if kind == MAPPED_KEY_STACKED_BANK:
+        # NO GEOMETRY REACHES THE BANK AT THIS INCREMENT, and that is a ruling
+        # rather than an omission. A bank's intermediate shard needs a width its
+        # owning module does not declare -- ``Glm5NextRoutedExperts`` holds counts
+        # and degrees only -- so it is served by ``inc-glm53f-101``'s load-time
+        # width instead, together with the shared expert's three families. The
+        # table in ``model_fp8.py`` names no bank family, so the argument is not
+        # passed rather than being passed and ignored.
         return stacked_expert_bank_loader(keys, param_name=param_name, owner=owner)
     if kind == MAPPED_KEY_QUANTISED_WEIGHT:
-        return wrap_with_blockwise_fp8_downscale(SafetensorsWeightLoader())
+        if geometry is None:
+            base = SafetensorsWeightLoader()
+        else:
+            scales = scale_keys(keys)
+            weight_index = next(
+                index for index, key in enumerate(keys) if key not in scales
+            )
+            base = _weight_slice_only(_sharding_loader(geometry), weight_index)
+        return wrap_with_blockwise_fp8_downscale(base)
+    if len(keys) == 1 and geometry is not None:
+        return _sharding_loader(geometry)
     if len(keys) > 1:
         raise Glm5NextExpertBankNotLoadableError(
             f"{param_name or '<unnamed parameter>'} maps to {len(keys)} "
@@ -1686,8 +1928,8 @@ def _bank_expert_indices(
     """The owning module's local-expert resolver, or REFUSE by name.
 
     ``inc-glm53f-095``. The expert geometry is declared in exactly one place --
-    ``Glm5NextRoutedExperts`` (``model_fp8.py:816``, geometry set at
-    ``:886-891``), authored by
+    ``Glm5NextRoutedExperts`` (``model_fp8.py:962``, geometry set at
+    ``:1032-1037``), authored by
     ``inc-glm53f-031`` -- and it is read there rather than derived a second time
     from the key count, so there is one partition and not two that can disagree.
 
@@ -1803,7 +2045,7 @@ def _stacked_bank_transform(
     loader in this file for the sake of one case.
 
     The import is FUNCTION-LOCAL, following the landed ``inc-glm53f-023``
-    precedent (``model_fp8.py:865-868``): this file's import blocks are earlier
+    precedent (``model_fp8.py:1011-1014``): this file's import blocks are earlier
     increments' D14 sections.
     """
     from vllm_neuron.utils.weight_loader import expert_parallel_interleaved_loader
@@ -1848,7 +2090,7 @@ def stacked_expert_bank_loader(
 
     IT IS COMPOSED UNDER :func:`wrap_with_blockwise_fp8_downscale`, and that
     order is safe for a stated reason: :func:`downscale_fp8_weight_bytes` is
-    elementwise -- multiply, clamp, cast (``:1169-1173``) -- so squeezing the
+    elementwise -- multiply, clamp, cast (``:1172-1176``) -- so squeezing the
     stack and stacking the squeezed experts give the same bytes. Wrapping the
     stack costs one pass instead of E, and on a platform needing no squeeze the
     wrapper returns this loader untouched.
@@ -1893,7 +2135,7 @@ def stacked_expert_scale_loader(
 
     WHAT IT IS ATTACHED TO TODAY: NOTHING, DISCLOSED RATHER THAN PAPERED OVER.
     ``Glm5NextRoutedExperts`` declares five parameters and no bank scale
-    parameter (``model_fp8.py:892-899``), and ``_add_moe_mlp`` writes map entries
+    parameter (``model_fp8.py:1038-1045``), and ``_add_moe_mlp`` writes map entries
     for exactly two shapes, ``experts.router_weight`` and
     ``experts.<leaf>_weight`` (``:661``, ``:679``). So a bank's stacked scales
     have no declared parameter to land in at this increment, and this loader

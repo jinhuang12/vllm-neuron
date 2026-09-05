@@ -297,6 +297,7 @@ def _write_miniature_checkpoint(
     directory: Path,
     mappings: dict[str, str | list[str]],
     model: Glm5NextForConditionalGeneration,
+    extra_overrides: dict[str, torch.Tensor] | None = None,
 ) -> int:
     """Write a REAL safetensors file holding one tensor per mapped key.
 
@@ -309,6 +310,13 @@ def _write_miniature_checkpoint(
     Shapes are miniature and arbitrary EXCEPT for the MLA family, which
     :func:`_mla_key_overrides` writes at its closed form because
     ``prepare_projection_weights`` checks it. Nothing here asserts a shape.
+
+    ``extra_overrides`` SUPPLIES WHOLE TENSORS, not shapes, and it is
+    ``inc-glm53f-094``'s one change here. Every tensor this writer builds itself is
+    CONSTANT (``torch.ones``, ``torch.full``), which is enough for a reading that
+    counts tensors and wrong for a reading that asks WHICH ROWS a rank got: against
+    a constant, any slice passes for any other. A caller that measures indexing
+    therefore passes its own values. Landed callers pass nothing and are unchanged.
     """
     overrides = _mla_key_overrides(model, mappings)
     tensors: dict[str, torch.Tensor] = {}
@@ -331,7 +339,9 @@ def _write_miniature_checkpoint(
         for key in key_list:
             if key in tensors:
                 continue
-            if key in overrides:
+            if extra_overrides and key in extra_overrides:
+                tensors[key] = extra_overrides[key]
+            elif key in overrides:
                 shape, dtype = overrides[key]
                 tensors[key] = (
                     torch.ones(shape, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
@@ -2904,4 +2914,816 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
     assert handed.get(bank_type.__name__) == expected_operands, (
         f"the planted prep was handed {handed.get(bank_type.__name__)}, not the "
         f"six operands {expected_operands} the three arrived grids imply"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-094 -- the tensor-parallel WEIGHT SHARD geometry.
+#
+# FOUR counted items, one per conjunct, and no ``parametrize`` decorator (D1.2).
+# The file header at ``:4`` still says THIRTEEN: it stopped being updated at
+# ``inc-glm53f-095b``, which added three, and this section adds four, so the file
+# holds TWENTY. Correcting that header is a rider for the owner of the next
+# section here, not this increment's surface.
+#
+# EVERY READING BELOW COMES FROM A REAL LOAD OF A REAL MINIATURE CHECKPOINT at a
+# synthetic world size, because that is what conjunct (1) asks for: "ranks 0 and
+# 1 each load the real miniature checkpoint". Calling the loader transforms
+# directly would be cheaper and would leave the attachment site -- the component
+# this increment adds (D1.4) -- never executed.
+#
+# THE GEOMETRY IS WRITTEN OUT AGAIN HERE, ON PURPOSE. ``SHARD_FAMILIES`` restates
+# the ratified shard table (``increments/shard-table-094.md``, sha256
+# ``3b5bf411cd63e76ca377c9513ec7ff0a5e93fd28f3d11033af32b7de1954ef11``) as this
+# file's own independent statement of which family shards on which dim and how
+# wide it is. It is NOT read from ``_SHARD_GEOMETRY``, so the code under test and
+# this table CAN disagree -- and if they do, these items go red. A test that
+# derived its expectation from the thing it measures would pass whatever either
+# one said.
+# --------------------------------------------------------------------------- #
+
+_MODEL_FP8 = vllm_neuron.model.glm5_next.model_fp8
+_WL_FP8 = vllm_neuron.model.glm5_next.weight_loaders_fp8
+
+#: The shard fixture's linear-attention widths: the config's own four keys
+#: (``config.py:165-172``) with two values shrunk. EIGHT heads of THIRTY-TWO make
+#: a full head width of 256 and a per-rank width of 128 at world size 2 --
+#: exactly one ``DEFAULT_WEIGHT_BLOCK_SIZE`` row block, so the shard boundary
+#: falls ON a block boundary and conjunct (3) has an aligned case to measure. The
+#: config's own 64 x 128 would put 8192 rows in the checkpoint.
+SHARD_LINEAR_ATTN = {
+    "num_heads": 8,
+    "head_dim": 32,
+    "short_conv_kernel_size": 4,
+    "gate_lower_bound": -5.0,
+}
+
+#: The dense MLP's intermediate width, 256 for the same reason: 128 per rank is
+#: one whole block. Shrunk for size, not for correctness.
+SHARD_INTERMEDIATE = 256
+
+SHARD_WORLD = 2
+
+#: The extent no family shards. Deliberately NOT 128 and not equal to any sharded
+#: extent, so a loader that sliced the wrong dimension could not return a shape
+#: that passes for the right one.
+SHARD_NARROW = 8
+
+_KDA_FULL = SHARD_LINEAR_ATTN["num_heads"] * SHARD_LINEAR_ATTN["head_dim"]
+_KDA_HEADS = SHARD_LINEAR_ATTN["num_heads"]
+
+#: ``(declaring class, declared leaf) -> (shard dim, full extent on that dim)``.
+#: The FIFTEEN families the ratified table calls sharded at this increment:
+#: twelve on ``Glm5NextKDAAttention`` and three on ``Glm5NextDenseMLP``. The nine
+#: deferred families -- the MLA head-width three to ``inc-glm53f-100``, the shared
+#: expert's three and the routed bank's three to ``inc-glm53f-101`` -- are absent
+#: here exactly as they are absent from the code's table, which is what conjunct
+#: (4) counts.
+SHARD_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
+    ("Glm5NextKDAAttention", "q_proj_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "k_proj_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "v_proj_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "f_b_proj_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "g_b_proj_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "q_conv1d_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "k_conv1d_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "v_conv1d_weight"): (0, _KDA_FULL),
+    ("Glm5NextKDAAttention", "o_proj_weight"): (1, _KDA_FULL),
+    ("Glm5NextKDAAttention", "b_proj_weight"): (0, _KDA_HEADS),
+    ("Glm5NextKDAAttention", "A_log"): (0, _KDA_HEADS),
+    ("Glm5NextKDAAttention", "dt_bias"): (0, _KDA_HEADS),
+    ("Glm5NextDenseMLP", "gate_proj_weight"): (0, SHARD_INTERMEDIATE),
+    ("Glm5NextDenseMLP", "up_proj_weight"): (0, SHARD_INTERMEDIATE),
+    ("Glm5NextDenseMLP", "down_proj_weight"): (1, SHARD_INTERMEDIATE),
+}
+
+#: The two KDA leaves that are one number per head rather than a matrix.
+SHARD_ONE_DIMENSIONAL = ("A_log", "dt_bias")
+
+#: The dense MLP's three leaves, in the order conjunct (3) reports them.
+SHARD_DENSE_LEAVES = ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
+
+#: RIDER N3. The three grid attribute names as LITERALS, so this file states them
+#: once itself instead of only ever asking the code what it calls them. Conjunct
+#: (3) asserts these against the model's ``_sibling_scale_grid_name`` and against
+#: this file's ``_scale_grid_attribute`` -- which is ONE derivation checked twice,
+#: not two, because that helper asks the model. THE LITERAL IS THE INDEPENDENT
+#: STATEMENT, and it is the whole of what N3 adds: if the naming rule ever changes,
+#: the two derivations move together and only these three strings object.
+SHARD_GRID_ATTRIBUTES = (
+    "gate_proj_weight_scale_inv",
+    "up_proj_weight_scale_inv",
+    "down_proj_weight_scale_inv",
+)
+
+
+def _shard_config(first_k_dense: int) -> Glm5NextConfig:
+    """The shard fixture: :func:`_stacked_config`'s fields with two widths shrunk.
+
+    ``n_shared_experts=0`` is carried over from :func:`_stacked_config` and is not
+    a convenience. No completing load in this file has a shared-expert module,
+    because the landed shared-expert scale prep cannot run on a 128-block
+    miniature (``inc-glm53f-095b``, which hands that fixture to ``-054``). So the
+    shared expert's three deferred families cannot be observed by a real load
+    here at all, and conjunct (4) prints that rather than quietly counting six
+    deferred families where the table names nine.
+
+    ``first_k_dense`` IS THE ONE VARYING FIELD, and the two values it takes are
+    both readings rather than one real case and one convenience -- the same reason
+    :func:`_dense_config` and :func:`_routed_config` differ by one field.
+
+    * ``MINI_ALL_DENSE_FIRST_K`` builds NO routed expert bank, and it is what the
+      items needing a RANK-1 load use. The landed bank refuses any rank at or
+      above its EXPERT-parallel degree (``factory.py:132-136``), and this
+      campaign's production expert-parallel degree is 1 (``factory.py:204-211``),
+      so at tensor-parallel world size 2 the bank is replicated and every rank's
+      expert-parallel rank is 0 -- but the loader passes the GLOBAL rank, so rank
+      1 is refused. That refusal is `inc-glm53f-101`'s to answer, not this
+      increment's, and conjunct (4) measures it rather than describing it.
+    * ``MINI_FIRST_K_DENSE`` keeps the bank, and conjunct (4) needs it: the bank's
+      three families are part of the replicated set that conjunct counts. It loads
+      at rank 0 only, which the bank serves.
+    """
+    return Glm5NextConfig(
+        text_config=Glm5NextTextConfig(
+            num_hidden_layers=MINI_LAYERS,
+            n_routed_experts=MINI_ROUTED_EXPERTS,
+            n_shared_experts=0,
+            first_k_dense_replace=first_k_dense,
+            tie_word_embeddings=False,
+            linear_attn_config=SHARD_LINEAR_ATTN,
+            intermediate_size=SHARD_INTERMEDIATE,
+            **MINI_MLA_WIDTHS,
+        )
+    )
+
+
+def _shard_full_shape(leaf: str, shard_dim: int, full: int) -> tuple[int, ...]:
+    """The FULL (unsharded) shape this family's checkpoint tensor is written at."""
+    if leaf in SHARD_ONE_DIMENSIONAL:
+        return (full,)
+    return (full, SHARD_NARROW) if shard_dim == 0 else (SHARD_NARROW, full)
+
+
+def _shard_pattern(
+    shape: tuple[int, ...], dim: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """A tensor whose value identifies its POSITION ALONG ``dim`` and nothing else.
+
+    A shard selects along one dimension, so a value that is distinct per index
+    along that dimension is what makes "did this rank get the right rows"
+    answerable at all. The landed writer writes a CONSTANT
+    (``torch.ones``/``torch.full``), and against a constant any slice passes for
+    any other -- which is why these items supply their own tensors.
+
+    FP8 IS BUILT FROM ITS OWN BYTES rather than cast from integers. ``e4m3`` has
+    three mantissa bits, so 17 and 19 do not exist in it and a cast would collapse
+    distinct rows onto one value. Reinterpreting the byte ``(i % 119) + 8`` gives a
+    distinct finite value per index with no rounding at all.
+
+    THE BYTE RANGE IS 8 TO 126, AND BOTH ENDS ARE CHOSEN. Bytes 1 to 7 are
+    subnormal, where the 240/448 squeeze rounds several distinct bytes onto one
+    value and weakens what conjunct (2) can detect; bytes 127 and 255 are ``NaN``
+    in ``e4m3fn``, which no equality comparison survives. That leaves 119 values,
+    so index ``i`` and ``i + 119`` share one -- the single aliasing this pattern
+    has, stated rather than left to be discovered. Rank 0's first row (byte 8) and
+    rank 1's first row (byte 17) differ, so a half-tensor indexing error cannot
+    hide inside it.
+    """
+    extent = shape[dim]
+    index = torch.arange(extent, dtype=torch.int64)
+    if dtype is torch.float8_e4m3fn:
+        line = ((index % 119) + 8).to(torch.uint8).view(torch.float8_e4m3fn)
+    else:
+        line = (index + 1).to(dtype)
+    view = [1] * len(shape)
+    view[dim] = extent
+    return line.reshape(view).expand(shape).contiguous()
+
+
+def _shard_key_overrides(
+    model: Glm5NextForConditionalGeneration,
+    mappings: dict[str, str | list[str]],
+) -> dict[str, torch.Tensor]:
+    """The FULL tensors the shard fixture's checkpoint holds, per checkpoint key.
+
+    Nothing here spells a checkpoint key: the key comes from the map, the shape
+    from :data:`SHARD_FAMILIES`, and a grid's shape from ``block_grid_shape`` --
+    the same closed form the loader divides by. The dtype question, "is this
+    family quantised", is answered by asking the map whether the entry carries a
+    scale key, not from a list of family names kept here.
+    """
+    overrides: dict[str, torch.Tensor] = {}
+    for path, module in model.named_modules():
+        cls = type(module).__name__
+        for (family, leaf), (shard_dim, full) in SHARD_FAMILIES.items():
+            if cls != family:
+                continue
+            param = f"{path}.{leaf}"
+            if param not in mappings:
+                continue
+            keys = _keys_of(mappings, param)
+            scales = scale_keys(keys)
+            weight_key = next(key for key in keys if key not in scales)
+            shape = _shard_full_shape(leaf, shard_dim, full)
+            if scales:
+                overrides[weight_key] = _shard_pattern(
+                    shape, shard_dim, torch.float8_e4m3fn
+                )
+                overrides[scales[0]] = _shard_pattern(
+                    block_grid_shape(shape, DEFAULT_WEIGHT_BLOCK_SIZE),
+                    shard_dim,
+                    torch.float32,
+                )
+            else:
+                overrides[weight_key] = _shard_pattern(
+                    shape, shard_dim, torch.bfloat16
+                )
+    return overrides
+
+
+def _seed_page_cache_signal() -> None:
+    """Supply the absent rank's page-cache signal, through the store the ranks use.
+
+    NOT test convenience, and not a patch of anything under test.
+    ``_load_to_page_cache`` splits the checkpoint's FILES across ranks round robin
+    -- ``idx % world_size == rank`` (``utils/checkpoints.py:521``) -- and the
+    reading loop then waits until every file's key appears in the shared store. A
+    ONE-FILE miniature at world size 2 therefore gives rank 1 no file to cache and
+    no key to add, and its load would wait for a key only another PROCESS could
+    set. There is no other process inside a pytest item.
+
+    The transform path -- what these items measure -- is untouched: the reader
+    still opens the file and reads every tensor itself. Adding the key is
+    idempotent, so rank 0 and the repeat loads are unaffected.
+    """
+    store = torch.distributed.distributed_c10d._get_default_store()
+    store.add(MINI_CHECKPOINT_FILE, 1)
+
+
+def _load_at_world(
+    directory: Path,
+    world_size: int,
+    rank: int,
+    monkeypatch,
+    first_k_dense: int,
+) -> Glm5NextForConditionalGeneration:
+    """Build a model AT a synthetic world size and rank, then load the checkpoint.
+
+    The world size is patched at the RESOLVER and the model built afterwards, and
+    that ordering is the point: ``Glm5NextKDAAttention.__init__`` divides its head
+    count by the world size it is given (``model_fp8.py:2215``), so a model built
+    at world size 1 and re-labelled 2 would carry a full-width head count and a
+    sharding loader at once -- the exact defect these items exist to detect,
+    constructed by the test itself.
+    """
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_world_size", lambda: world_size)
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_rank", lambda: rank)
+    model = Glm5NextForConditionalGeneration(_shard_config(first_k_dense))
+    assert model.world_size == world_size, (
+        f"the model resolved world size {model.world_size}, not the patched "
+        f"{world_size}, so this is not the load this item means to measure"
+    )
+    _seed_page_cache_signal()
+    model.load_weights(str(directory), torch.device("cpu"), None)
+    return model
+
+
+def _shard_checkpoint(
+    tmp_path: Path, first_k_dense: int
+) -> tuple[Path, dict[str, torch.Tensor], dict]:
+    """Write ONE checkpoint holding the full tensors; return it and its contents."""
+    config = _shard_config(first_k_dense)
+    mappings = _mappings_for(config)
+    reference = Glm5NextForConditionalGeneration(config)
+    overrides = _shard_key_overrides(reference, mappings)
+    assert len(overrides) >= len(SHARD_FAMILIES), (
+        f"only {len(overrides)} checkpoint keys were given shard tensors, fewer "
+        f"than the {len(SHARD_FAMILIES)} families this file declares sharded, so "
+        f"some family is missing from the map and would be measured against a "
+        f"constant"
+    )
+    directory = tmp_path / f"shard-{first_k_dense}"
+    _write_miniature_checkpoint(
+        directory, mappings, reference, extra_overrides=overrides
+    )
+    return directory, overrides, mappings
+
+
+def _sharded_leaves(
+    model: Glm5NextForConditionalGeneration,
+) -> list[tuple[str, torch.nn.Module, str, int, int]]:
+    """Every ``(path, module, leaf, shard_dim, full)`` THIS FILE calls sharded."""
+    found: list[tuple[str, torch.nn.Module, str, int, int]] = []
+    for path, module in model.named_modules():
+        cls = type(module).__name__
+        declared = getattr(module, "declared_param_names", ())
+        for (family, leaf), (shard_dim, full) in SHARD_FAMILIES.items():
+            if cls == family and leaf in declared:
+                found.append((path, module, leaf, shard_dim, full))
+    return found
+
+
+def _loaded(model: Glm5NextForConditionalGeneration, dotted: str) -> torch.Tensor:
+    loaded = dict(model.named_parameters())
+    assert dotted in loaded, f"{dotted} is not in named_parameters() after the load"
+    return loaded[dotted].data
+
+
+def _max_abs_diff(left: torch.Tensor, right: torch.Tensor) -> float:
+    """Exact difference, taken in fp32 so an fp8 pair can be compared at all."""
+    if left.numel() == 0:
+        return 0.0
+    return (left.to(torch.float32) - right.to(torch.float32)).abs().max().item()
+
+
+# --------------------------------------------------------------------------- #
+# (1) Every sharded family lands at its declared per-rank shape.
+# --------------------------------------------------------------------------- #
+
+
+def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (1), counted N/N, with the world-size-1 load as the moving control.
+
+    THE EXPECTED SHAPE IS NEVER ASKED OF THE CODE. It is the full extent this file
+    declares in :data:`SHARD_FAMILIES` divided by the world size, with the other
+    extent unchanged; ``_shard_geometry_for`` is not called here.
+
+    BOTH RANKS LOAD, because the conjunct says so: "ranks 0 and 1 each load the
+    real miniature checkpoint". Rank 0 alone would leave the second half of every
+    tensor unread, and the second half is where an off-by-one start index lives.
+
+    CERTIFYING COMPONENT (D1.4): the loader attachment, ``load_weights`` reaching
+    the geometry through ``get_weight_loader`` -- not the geometry table alone,
+    which a source reading could have checked.
+    """
+    directory, _, _ = _shard_checkpoint(tmp_path, MINI_ALL_DENSE_FIRST_K)
+
+    whole = _load_at_world(directory, 1, 0, monkeypatch, MINI_ALL_DENSE_FIRST_K)
+    control = {
+        f"{path}.{leaf}": tuple(_loaded(whole, f"{path}.{leaf}").shape)
+        for path, _, leaf, _, _ in _sharded_leaves(whole)
+    }
+    print(f"CONJUNCT1_FAMILIES_AT_WORLD_1={len(control)}")
+
+    per_rank = {
+        rank: _load_at_world(
+            directory, SHARD_WORLD, rank, monkeypatch, MINI_ALL_DENSE_FIRST_K
+        )
+        for rank in range(SHARD_WORLD)
+    }
+    leaves = _sharded_leaves(per_rank[0])
+    assert leaves, "no sharded family is present in the tree, so this item is empty"
+
+    checked = 0
+    families_seen: set[tuple[str, str]] = set()
+    for rank, sharded in sorted(per_rank.items()):
+        for path, module, leaf, shard_dim, full in _sharded_leaves(sharded):
+            dotted = f"{path}.{leaf}"
+            full_shape = _shard_full_shape(leaf, shard_dim, full)
+            expected = list(full_shape)
+            expected[shard_dim] = full // SHARD_WORLD
+            got = tuple(_loaded(sharded, dotted).shape)
+            assert got == tuple(expected), (
+                f"{dotted} loaded {got} at rank {rank} of world size {SHARD_WORLD}; "
+                f"this file declares it sharded on dim {shard_dim} of a full "
+                f"{full_shape}, so its per-rank shape is {tuple(expected)}"
+            )
+            assert control[dotted] == full_shape, (
+                f"{dotted} loaded {control[dotted]} at world size 1 but the "
+                f"checkpoint holds {full_shape}; the control is not reading the "
+                f"whole tensor, so the comparison above means nothing"
+            )
+            families_seen.add((type(module).__name__, leaf))
+            checked += 1
+
+    moved = {
+        rank: sum(
+            1
+            for dotted, shape in control.items()
+            if shape != tuple(_loaded(sharded, dotted).shape)
+        )
+        for rank, sharded in sorted(per_rank.items())
+    }
+    print(f"CONJUNCT1_PER_RANK_SHAPES_AS_DECLARED={checked}/{SHARD_WORLD * len(leaves)}")
+    print(f"CONJUNCT1_DISTINCT_FAMILIES={len(families_seen)}/{len(SHARD_FAMILIES)}")
+    print(f"CONJUNCT1_CONTROL_SHAPES_THAT_MOVED_PER_RANK={moved}/{len(control)}")
+    assert checked == SHARD_WORLD * len(leaves)
+    assert len(families_seen) == len(SHARD_FAMILIES), (
+        f"the load exercised {len(families_seen)} of the {len(SHARD_FAMILIES)} "
+        f"families this file declares sharded; missing "
+        f"{sorted(set(SHARD_FAMILIES) - families_seen)}"
+    )
+    for rank, count in moved.items():
+        assert count == len(control), (
+            f"only {count} of {len(control)} shapes differ between world size 1 and "
+            f"rank {rank} of world size {SHARD_WORLD}; a reading that does not move "
+            f"cannot show that the shard happened (D1.5)"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# (2) The shards re-assemble the tensor bit-identically.
+# --------------------------------------------------------------------------- #
+
+
+def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (2). Rank 0 then rank 1 along the shard dim, max abs diff == 0.0.
+
+    THE COMPARISON IS AGAINST THE WORLD-SIZE-1 LOAD, not against the bytes in the
+    file, and that is deliberate. A quantised weight is squeezed into the trn2
+    range on the way in (``wrap_with_blockwise_fp8_downscale``), so the file's
+    bytes are not what any rank ends up holding. Both sides of this comparison go
+    through the same squeeze, which leaves the INDEXING as the only thing left for
+    it to measure -- and the indexing is what a shard is.
+    """
+    directory, _, _ = _shard_checkpoint(tmp_path, MINI_ALL_DENSE_FIRST_K)
+    dense = MINI_ALL_DENSE_FIRST_K
+
+    whole = _load_at_world(directory, 1, 0, monkeypatch, dense)
+    rank0 = _load_at_world(directory, SHARD_WORLD, 0, monkeypatch, dense)
+    rank1 = _load_at_world(directory, SHARD_WORLD, 1, monkeypatch, dense)
+
+    leaves = _sharded_leaves(whole)
+    assert leaves, "no sharded family is present in the tree, so this item is empty"
+
+    exact = 0
+    rejoined = 0
+    worst = 0.0
+    ranks_differ = 0
+    for path, _, leaf, shard_dim, full in leaves:
+        dotted = f"{path}.{leaf}"
+        reference = _loaded(whole, dotted)
+        per_rank = full // SHARD_WORLD
+        for rank, model in ((0, rank0), (1, rank1)):
+            mine = _loaded(model, dotted)
+            expected = reference.narrow(shard_dim, rank * per_rank, per_rank)
+            assert tuple(mine.shape) == tuple(expected.shape), (
+                f"{dotted} at rank {rank} is {tuple(mine.shape)} and the matching "
+                f"slice of the whole tensor is {tuple(expected.shape)}"
+            )
+            difference = _max_abs_diff(mine, expected)
+            worst = max(worst, difference)
+            assert difference == 0.0, (
+                f"{dotted} at rank {rank} differs from indices "
+                f"[{rank * per_rank}:{(rank + 1) * per_rank}] of dim {shard_dim} of "
+                f"the world-size-1 tensor by {difference}; a shard is a slice, so "
+                f"any difference at all is an indexing defect"
+            )
+            exact += 1
+
+        # THE CONJUNCT'S OWN OPERATION, not just its consequence: "concatenating
+        # rank 0's and rank 1's tensors along the shard dim equals the unsharded
+        # tensor". The two slice comparisons above imply it, and this reads it the
+        # way the criterion is written -- and it also fails if the two halves are
+        # each right but no longer join to the declared full extent.
+        reassembled = torch.cat(
+            [_loaded(rank0, dotted), _loaded(rank1, dotted)], dim=shard_dim
+        )
+        assert tuple(reassembled.shape) == tuple(reference.shape), (
+            f"{dotted}: the two ranks' tensors concatenate to "
+            f"{tuple(reassembled.shape)}, and the world-size-1 tensor is "
+            f"{tuple(reference.shape)}"
+        )
+        joined = _max_abs_diff(reassembled, reference)
+        worst = max(worst, joined)
+        assert joined == 0.0, (
+            f"{dotted}: rank 0 and rank 1 concatenated along dim {shard_dim} differ "
+            f"from the unsharded tensor by {joined}"
+        )
+        rejoined += 1
+
+        if (
+            _max_abs_diff(
+                _loaded(rank0, dotted).narrow(shard_dim, 0, 1),
+                _loaded(rank1, dotted).narrow(shard_dim, 0, 1),
+            )
+            != 0.0
+        ):
+            ranks_differ += 1
+
+    print(f"CONJUNCT2_SLICES_BIT_IDENTICAL={exact}/{2 * len(leaves)}")
+    print(f"CONJUNCT2_REASSEMBLED_EQUALS_WHOLE={rejoined}/{len(leaves)}")
+    print(f"CONJUNCT2_MAX_ABS_DIFF={worst}")
+    print(f"CONJUNCT2_FAMILIES_WHOSE_RANKS_DIFFER={ranks_differ}/{len(leaves)}")
+    assert exact == 2 * len(leaves)
+    assert rejoined == len(leaves)
+    assert worst == 0.0
+    assert ranks_differ == len(leaves), (
+        f"only {ranks_differ} of {len(leaves)} families hold DIFFERENT data on the "
+        f"two ranks; for the rest, rank 1 could be reading rank 0's rows and every "
+        f"assertion above would still pass (D1.5)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (3) The scale grid follows its weight, and a misaligned shard refuses by name.
+# --------------------------------------------------------------------------- #
+
+
+def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (3), and rider N3's three literal attribute names.
+
+    THE DENSE MLPS' THREE GRIDS EACH ARE THE WHOLE POPULATION HERE -- twelve on
+    this fixture, whose four layers are all dense. ``Glm5NextKDAAttention``'s
+    twelve families are UNQUANTISED in this checkpoint, so they have no grid to
+    follow, and every other quantised sharded family is deferred to ``-100`` or
+    ``-101``. The count is read off the tree rather than written down, so the
+    number moves with the fixture instead of going stale beside it.
+
+    THE GRID IS NOT A PARAMETER. It travels in its weight's own map entry and is
+    read by ``_load_out_of_band_scales``, which stores it as a plain attribute --
+    so this item reads attributes, not ``named_parameters()``.
+    """
+    directory, overrides, mappings = _shard_checkpoint(
+        tmp_path, MINI_ALL_DENSE_FIRST_K
+    )
+    layout = MINI_ALL_DENSE_FIRST_K
+
+    whole = _load_at_world(directory, 1, 0, monkeypatch, layout)
+    rank0 = _load_at_world(directory, SHARD_WORLD, 0, monkeypatch, layout)
+    rank1 = _load_at_world(directory, SHARD_WORLD, 1, monkeypatch, layout)
+
+    dense = [
+        path
+        for path, module in whole.named_modules()
+        if type(module).__name__ == "Glm5NextDenseMLP"
+    ]
+    assert dense, "the shard fixture built no dense MLP, so conjunct (3) is empty"
+
+    # RIDER N3: the three names as literals. ``_scale_grid_attribute`` asks the
+    # model, so it is the same derivation read a second way; the LITERAL is what
+    # this file states on its own.
+    for leaf, literal in zip(SHARD_DENSE_LEAVES, SHARD_GRID_ATTRIBUTES, strict=True):
+        from_model = whole._sibling_scale_grid_name(leaf)
+        from_file = _scale_grid_attribute(leaf)
+        assert from_model == literal, (
+            f"the model derives {from_model!r} as {leaf}'s grid attribute; this "
+            f"file names it {literal!r}. One of the two is wrong, and a test that "
+            f"only asked the code could not tell which"
+        )
+        assert from_file == literal, (
+            f"this file's own helper derives {from_file!r}, not {literal!r}"
+        )
+    print(f"CONJUNCT3_N3_LITERAL_GRID_NAMES={len(SHARD_GRID_ATTRIBUTES)}")
+
+    followed = 0
+    grids = 0
+    for path in dense:
+        for leaf, attribute in zip(
+            SHARD_DENSE_LEAVES, SHARD_GRID_ATTRIBUTES, strict=True
+        ):
+            shard_dim, full = SHARD_FAMILIES[("Glm5NextDenseMLP", leaf)]
+            grid_key = scale_keys(_keys_of(mappings, f"{path}.{leaf}"))[0]
+            written = overrides[grid_key]
+            blocks = (full // SHARD_WORLD) // DEFAULT_WEIGHT_BLOCK_SIZE[shard_dim]
+            assert blocks >= 1, (
+                f"{path}.{leaf}'s per-rank extent is narrower than one block, so "
+                f"there is no aligned grid shard for this item to measure"
+            )
+            reference = getattr(whole.get_submodule(path), attribute)
+            assert tuple(reference.shape) == tuple(written.shape), (
+                f"{path}.{attribute} arrived {tuple(reference.shape)} at world size "
+                f"1 but the checkpoint holds {tuple(written.shape)}"
+            )
+            grids += 1
+            for rank, model in ((0, rank0), (1, rank1)):
+                mine = getattr(model.get_submodule(path), attribute, None)
+                assert mine is not None, (
+                    f"{path}.{attribute} does not exist after the rank-{rank} load, "
+                    f"so a sharded weight's grid never arrived at all"
+                )
+                expected = reference.narrow(shard_dim, rank * blocks, blocks)
+                assert tuple(mine.shape) == tuple(expected.shape), (
+                    f"{path}.{attribute} is {tuple(mine.shape)} at rank {rank}; its "
+                    f"weight is sharded on dim {shard_dim}, so its grid must be "
+                    f"{tuple(expected.shape)} -- a full grid here would describe "
+                    f"blocks this rank does not hold, and the dequant would scale "
+                    f"the wrong ones"
+                )
+                difference = _max_abs_diff(mine, expected)
+                assert difference == 0.0, (
+                    f"{path}.{attribute} at rank {rank} differs from the matching "
+                    f"blocks of the whole grid by {difference}"
+                )
+                assert mine.dtype is torch.float32, (
+                    f"{path}.{attribute} arrived {mine.dtype}, not fp32"
+                )
+                followed += 1
+
+    moved = sum(
+        1
+        for path in dense
+        for attribute in SHARD_GRID_ATTRIBUTES
+        if _max_abs_diff(
+            getattr(rank0.get_submodule(path), attribute),
+            getattr(rank1.get_submodule(path), attribute),
+        )
+        != 0.0
+    )
+    print(f"CONJUNCT3_GRIDS_MEASURED={grids}")
+    print(f"CONJUNCT3_GRID_SHARDS_FOLLOWING_THEIR_WEIGHT={followed}/{2 * grids}")
+    print(f"CONJUNCT3_GRIDS_DIFFERING_BETWEEN_RANKS={moved}/{grids}")
+    assert grids == len(dense) * len(SHARD_GRID_ATTRIBUTES)
+    assert followed == 2 * grids
+    assert moved == grids, (
+        f"only {moved} of {grids} grids differ between the two ranks, so a grid "
+        f"that ignored the rank entirely would pass the readings above (D1.5)"
+    )
+
+    # A BLOCK-MISALIGNED SHARD REFUSES BY NAME. The aligned case beside it is what
+    # makes the refusal a boundary rather than a blanket. The exception class is
+    # the one ``_refuse`` raises for every refusal in that section, bank or not.
+    aligned = _WL_FP8.shard_geometry_for_grid(
+        _WL_FP8.ShardGeometry(
+            shard_dim=0,
+            shard_size=DEFAULT_WEIGHT_BLOCK_SIZE[0],
+            num_shards=SHARD_WORLD,
+        ),
+        param_name="probe.gate_proj_weight_scale_inv",
+    )
+    print(f"CONJUNCT3_ALIGNED_GRID_SHARD_SIZE={aligned.shard_size}")
+    assert aligned.shard_size == 1, (
+        f"an aligned shard of exactly one block gave {aligned.shard_size} grid "
+        f"rows, not 1"
+    )
+    misaligned = DEFAULT_WEIGHT_BLOCK_SIZE[0] + 1
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+        _WL_FP8.shard_geometry_for_grid(
+            _WL_FP8.ShardGeometry(
+                shard_dim=0, shard_size=misaligned, num_shards=SHARD_WORLD
+            ),
+            param_name="probe.gate_proj_weight_scale_inv",
+        )
+    message = str(refusal.value)
+    print(f"CONJUNCT3_MISALIGNED_REFUSAL={message}")
+    assert "probe.gate_proj_weight_scale_inv" in message, (
+        f"the refusal does not name the parameter: {message}"
+    )
+    assert str(DEFAULT_WEIGHT_BLOCK_SIZE[0]) in message, (
+        f"the refusal does not name the block boundary it enforced: {message}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (4) The unsharded families are untouched.
+# --------------------------------------------------------------------------- #
+
+
+def test_shard_the_unsharded_families_are_untouched_both_directions(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (4), both directions: the set that MOVED between world sizes is
+    exactly the set this file declares sharded, and the set that stayed identical
+    is exactly its complement.
+
+    THE DEFERRED FAMILIES ARE COUNTED HERE, in the ratified table's own words:
+    "replicated-in-effect, attachment deferred". Whichever of them this
+    configuration builds has to load identically at both world sizes, which is
+    what "attaches nothing to them" means once it is measured instead of asserted.
+    """
+    directory, _, _ = _shard_checkpoint(tmp_path, MINI_FIRST_K_DENSE)
+    # Named for what the configuration CONTAINS rather than for the field, because
+    # ``routed`` is taken further down by the bank's leaf names.
+    with_bank = MINI_FIRST_K_DENSE
+
+    whole = _load_at_world(directory, 1, 0, monkeypatch, with_bank)
+    rank0 = _load_at_world(directory, SHARD_WORLD, 0, monkeypatch, with_bank)
+
+    left = dict(whole.named_parameters())
+    right = dict(rank0.named_parameters())
+    assert set(left) == set(right), (
+        f"the two loads registered different parameter names, so no family can be "
+        f"compared. Only at world 1: {sorted(set(left) - set(right))[:3]}; only at "
+        f"world {SHARD_WORLD}: {sorted(set(right) - set(left))[:3]}"
+    )
+    print(f"CONJUNCT4_PARAMETERS_COMPARED={len(left)}")
+
+    declared = {f"{path}.{leaf}" for path, _, leaf, _, _ in _sharded_leaves(whole)}
+    identical = {
+        name
+        for name in left
+        if tuple(left[name].shape) == tuple(right[name].shape)
+        and _max_abs_diff(left[name].data, right[name].data) == 0.0
+    }
+    moved = set(left) - identical
+
+    print(f"CONJUNCT4_IDENTICAL_AT_BOTH_WORLD_SIZES={len(identical)}")
+    print(f"CONJUNCT4_MOVED={len(moved)}")
+    print(f"CONJUNCT4_DECLARED_SHARDED={len(declared)}")
+    assert moved == declared, (
+        f"the set that MOVED between world sizes is not the set this file declares "
+        f"sharded. Moved but not declared: {sorted(moved - declared)[:5]}. Declared "
+        f"but did not move: {sorted(declared - moved)[:5]}"
+    )
+    assert identical == set(left) - declared, (
+        "the set that stayed identical is not exactly the complement of the sharded "
+        "set, so some parameter is neither replicated nor sharded"
+    )
+
+    # The deferred families, counted by the module that declares them.
+    by_owner: dict[str, set[str]] = {}
+    for name in sorted(identical):
+        owner = type(whole.get_submodule(name.rpartition(".")[0])).__name__
+        by_owner.setdefault(owner, set()).add(name.rpartition(".")[2])
+    mla = sorted(by_owner.get("Glm5NextMLAAttention", ()))
+    routed = sorted(by_owner.get("Glm5NextRoutedExperts", ()))
+    shared = sorted(by_owner.get("Glm5NextSharedExperts", ()))
+    print(f"CONJUNCT4_MLA_LEAVES_REPLICATED_IN_EFFECT={mla}")
+    print(f"CONJUNCT4_ROUTED_LEAVES_REPLICATED_IN_EFFECT={routed}")
+    print(f"CONJUNCT4_SHARED_EXPERT_LEAVES_PRESENT={shared}")
+    assert mla, (
+        "no MLA parameter stayed identical, so the three families deferred to "
+        "inc-glm53f-100 cannot be counted replicated-in-effect here"
+    )
+    assert routed, (
+        "no routed-expert parameter stayed identical, so the families deferred to "
+        "inc-glm53f-101 cannot be counted replicated-in-effect here"
+    )
+    assert shared == [], (
+        "this fixture built a shared-expert module. The load is only known to "
+        "complete without one (inc-glm53f-095b), so if one is present the "
+        "disclosure in _shard_config is stale and the shared expert's three "
+        "deferred families should be counted here rather than named as absent"
+    )
+
+    # ── RIDER N4: the firing control for a counted ZERO, in this item because ──
+    # this item's instrument is the same one. ``inc-glm53f-095b``'s bankscale
+    # scan prints ``BANKSCALE1_GRIDS_IN_NAMED_PARAMETERS`` and asserts the list
+    # is EMPTY (``:2608``), and a membership test against
+    # ``named_parameters()`` that never fires reads empty for two different
+    # reasons: nothing was registered, or the test was asking the wrong
+    # question. D1.5 wants the reading to MOVE, so the same predicate is put to
+    # a module where a grid IS registered and read as 1.
+    #
+    # A THROWAWAY MODULE, NOT THIS MODEL. Registering a grid on a loaded module
+    # would change what the assertions above just measured.
+    probe = torch.nn.Module()
+    grid_name = SHARD_GRID_ATTRIBUTES[0]
+    probe.register_parameter(
+        grid_name, torch.nn.Parameter(torch.zeros(1, 1), requires_grad=False)
+    )
+    setattr(probe, SHARD_GRID_ATTRIBUTES[1], torch.zeros(1, 1))
+    probe_parameters = set(dict(probe.named_parameters()))
+    registered = [n for n in SHARD_GRID_ATTRIBUTES if n in probe_parameters]
+    attached = [
+        n
+        for n in SHARD_GRID_ATTRIBUTES
+        if getattr(probe, n, None) is not None and n not in probe_parameters
+    ]
+    print(f"CONJUNCT4_N4_CONTROL_GRIDS_IN_NAMED_PARAMETERS={registered}")
+    print(f"CONJUNCT4_N4_CONTROL_GRIDS_AS_PLAIN_ATTRIBUTES={attached}")
+    assert registered == [grid_name], (
+        f"the membership predicate read {registered} on a module where "
+        f"{grid_name!r} IS a registered parameter; it cannot detect a registered "
+        f"grid, so the empty list the bankscale scan reads is not evidence of "
+        f"anything"
+    )
+    assert attached == [SHARD_GRID_ATTRIBUTES[1]], (
+        f"the predicate read {attached} as plain attributes; a grid set with "
+        f"setattr must NOT appear in named_parameters(), which is the convention "
+        f"the bankscale zero is asserting"
+    )
+
+    # ── THE ROUTED BANK REFUSES RANK 1, MEASURED RATHER THAN DESCRIBED ────────
+    # This is why the other three items use an all-dense fixture, and recording it
+    # as a passing reading is the point: a finding written only in prose goes stale
+    # without anything failing.
+    #
+    # THE DEFECT IS A RANK CONFUSION, AND IT IS NOT THIS INCREMENT'S.
+    # ``Glm5NextRoutedExperts`` keeps two degrees: ``tp_degree``, the
+    # tensor-parallel world size, and ``ep_degree``, the expert-parallel degree the
+    # partition is actually built from (``model_fp8.py:1029-1037``). This
+    # campaign's production expert-parallel degree is 1
+    # (``factory.py:204-211``), so at tensor-parallel world size 2 the bank is
+    # REPLICATED and every rank's expert-parallel rank is 0. The bank loader passes
+    # the GLOBAL rank instead, and ``local_expert_indices`` refuses anything at or
+    # above the partition's one rank (``factory.py:132-136``). The families this
+    # touches are the routed bank's three, which the ratified shard table defers to
+    # ``inc-glm53f-101`` -- so the repair belongs there, with the rest of the bank's
+    # geometry, and this reading is the handover.
+    with pytest.raises(Exception) as refused:  # noqa: B017 -- see below
+        _load_at_world(directory, SHARD_WORLD, 1, monkeypatch, with_bank)
+    text = str(refused.value)
+    print(f"CONJUNCT4_BANK_RANK1_REFUSAL_CLASS={type(refused.value).__name__}")
+    print(f"CONJUNCT4_BANK_RANK1_REFUSAL={text}")
+    # The class is read rather than asserted: the reader logs and re-raises
+    # (``utils/checkpoints.py:469``), so which class arrives here is the reader's
+    # business. The MESSAGE is the finding, and it is asserted.
+    assert "outside the partition" in text, (
+        f"a rank-1 load of the ROUTED fixture did not refuse with the partition "
+        f"message. It raised: {text}. If it now completes, the bank's rank "
+        f"derivation was fixed and this reading -- and the all-dense fixture the "
+        f"other three items use -- should be revisited together with "
+        f"inc-glm53f-101"
+    )
+    assert "rank 1" in text and "1 ranks" in text, (
+        f"the refusal does not name both the rank it was given and the size of the "
+        f"partition it was checked against: {text}"
     )

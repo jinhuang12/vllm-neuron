@@ -55,7 +55,7 @@ WHAT IS DELIBERATELY ABSENT
 The quant-method dispatcher is ``inc-glm53f-023``'s (D14, M2) and is **not**
 here: ``quantization.py:33-39`` states that sequencing fact, not an assignment
 to this increment. Sharded scale loading is later work
-(``weight_loaders_fp8.py:1104-1111`` states the same kind of fact).
+(``weight_loaders_fp8.py:1107-1114`` states the same kind of fact).
 ``vllm_neuron/model/kv_cache.py`` is **untouched**: widening ``LayerSpec`` with
 KDA recurrent-state fields is ``inc-glm53f-015``'s declared surface at M1, and
 its acceptance asserts that the pin's 6-field construction still works with
@@ -64,6 +64,9 @@ the six fields that exist.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -86,6 +89,8 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     dequantise_blockwise,
     loader_for_mapped_keys,
     scale_keys,
+    sharded_scale_grid_loader,
+    ShardGeometry,
     stacked_expert_scale_loader,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
@@ -195,6 +200,148 @@ def _resolve_rank() -> int:
 def _per_rank(count: int, world_size: int) -> int:
     """Per-rank head count, floored at 1 (``synthetic.py:105-107``)."""
     return max(1, count // max(world_size, 1))
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-094 -- WHICH PARAMETER FAMILIES ARE SHARDED, AND ON WHICH DIM.
+#
+# WHY THIS IS A TABLE AND NOT A LINE IN EACH __init__. The shipped precedent
+# (qwen3 ``model.py:224``) attaches a shard loader to a parameter object inside
+# the constructor using ``self.world_size``. Neither half of that exists here:
+# this package declares parameters as ``register_parameter(name, None)``
+# (``_declare_parameters`` above) and builds the objects only in
+# ``_materialise_declared_parameters``, and of the ten declaring classes only
+# ``Glm5NextKDAAttention`` and ``Glm5NextModel`` are told a world size. So the
+# geometry is declared per CLASS here and consumed at the one attachment site
+# that already exists, which is where the root's world size lives. Ruled at
+# design entry ``design-20260905-ah``.
+#
+# WHAT EACH ENTRY MEANS. ``shard_dim`` is the dimension in the FINAL PARAMETER
+# shape (``utils/weight_loader.py:150``), which in this package is the checkpoint
+# shape ``[out_features, in_features]`` -- the projection weights are transposed
+# once at load time by ``prepare_projection_weights`` (``:2806``), never at load,
+# so what a loader slices is the untransposed tensor. ``width`` returns THIS
+# RANK's extent along that dim. Both readings are recorded with their cites in
+# ``increments/shard-table-094.md`` Part 1b, and the table is the frozen artifact
+# this code is checked against.
+#
+# EVERY FAMILY NOT NAMED HERE IS REPLICATED, and that is a declaration rather
+# than a default: the table's Parts 1 and 4 record the reason per family, and the
+# majority of the surface is in them -- the whole indexer, every norm, the router,
+# the embeddings and the head. A replicated family reaches
+# ``loader_for_mapped_keys`` with ``geometry=None`` and therefore takes exactly
+# the path it took before this increment.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _DeclaredShard:
+    """One family's declared shard: the dim, and this rank's extent along it."""
+
+    shard_dim: int
+    width: Callable[[nn.Module, int], int]
+    #: Why this family is sharded on this dim, in one clause, for the reader who
+    #: finds this table before finding the shard table.
+    because: str
+
+
+def _kda_head_width(module: nn.Module, world_size: int) -> int:
+    """This rank's ``heads * head_dim``, per-rank ALREADY.
+
+    ``Glm5NextKDAAttention`` divides in its own constructor --
+    ``num_kv_heads_per_rank = _per_rank(num_heads, world_size)`` -- so the world
+    size is NOT applied again here. Dividing twice is the defect this function
+    exists to make impossible to write by accident: the argument is accepted and
+    deliberately unused, so the signature stays uniform across the table.
+    """
+    del world_size
+    return int(module.num_kv_heads_per_rank) * int(module.head_dim)
+
+
+def _kda_head_count(module: nn.Module, world_size: int) -> int:
+    """This rank's head count, for the three families whose extent is H, not H*D."""
+    del world_size
+    return int(module.num_kv_heads_per_rank)
+
+
+def _dense_intermediate(module: nn.Module, world_size: int) -> int:
+    """This rank's slice of the dense MLP's intermediate width.
+
+    ``Glm5NextDenseMLP`` holds the FULL width (``intermediate_size``) and receives
+    no world size, so unlike the KDA families this one is divided HERE, at the
+    attachment site, where the root's world size is known. ``_per_rank`` is reused
+    rather than re-derived so both halves of the surface floor identically.
+    """
+    return _per_rank(int(module.intermediate_size), world_size)
+
+
+#: Declaring class name -> declared leaf -> its shard. Keyed by NAME rather than by
+#: the class object so this table can sit above every class it names.
+_SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
+    "Glm5NextKDAAttention": {
+        # Column-parallel: each rank owns whole heads of the projection's output.
+        **{
+            leaf: _DeclaredShard(0, _kda_head_width, "column-parallel over whole heads")
+            for leaf in (
+                "q_proj_weight",
+                "k_proj_weight",
+                "v_proj_weight",
+                "f_b_proj_weight",
+                "g_b_proj_weight",
+                "q_conv1d_weight",
+                "k_conv1d_weight",
+                "v_conv1d_weight",
+            )
+        },
+        # Row-parallel: the head width is o_proj's INPUT, so the partial sum is
+        # per-rank and the reduction is the consumer's business, not the loader's.
+        "o_proj_weight": _DeclaredShard(
+            1, _kda_head_width, "row-parallel -- the head width is its input"
+        ),
+        # One value per head, not per channel.
+        "b_proj_weight": _DeclaredShard(0, _kda_head_count, "one row per head"),
+        "A_log": _DeclaredShard(0, _kda_head_count, "one decay per head"),
+        "dt_bias": _DeclaredShard(0, _kda_head_count, "one bias per head"),
+    },
+    "Glm5NextDenseMLP": {
+        "gate_proj_weight": _DeclaredShard(
+            0, _dense_intermediate, "column-parallel on the intermediate width"
+        ),
+        "up_proj_weight": _DeclaredShard(
+            0, _dense_intermediate, "column-parallel on the intermediate width"
+        ),
+        "down_proj_weight": _DeclaredShard(
+            1, _dense_intermediate, "row-parallel -- the intermediate width is its input"
+        ),
+    },
+}
+
+
+def _shard_geometry_for(
+    module: nn.Module, leaf: str, world_size: int
+) -> ShardGeometry | None:
+    """This parameter's resolved shard, or ``None`` when it is replicated.
+
+    ``inc-glm53f-094``. The single reader of :data:`_SHARD_GEOMETRY`, called from
+    ``_materialise_declared_parameters`` for every declared parameter.
+
+    AT WORLD SIZE 1 IT RETURNS ``None`` FOR EVERYTHING, deliberately. A one-rank
+    shard is the whole tensor, so attaching a loader to say so would put a second
+    code path under every landed single-rank test -- and those tests are the
+    control that the sharded path is what changed. This is also what makes
+    conjunct (1)'s ``world_size=1`` reading a real control rather than a
+    restatement.
+    """
+    if world_size <= 1:
+        return None
+    declared = _SHARD_GEOMETRY.get(type(module).__name__, {}).get(leaf)
+    if declared is None:
+        return None
+    return ShardGeometry(
+        shard_dim=declared.shard_dim,
+        shard_size=declared.width(module, world_size),
+        num_shards=world_size,
+    )
 
 
 def _linear_attn_field(text_config: Glm5NextTextConfig, key: str) -> int:
@@ -3602,7 +3749,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         The clause asks the MAP whether a sibling scale grid exists for this
         weight, which is the same question
-        ``_dequantised_projection_weight`` asks of the module at ``:2813`` --
+        ``_dequantised_projection_weight`` asks of the module at ``:2959`` --
         one question, asked of the two places that have to agree. It adds no
         second classifier of the three cases: ``classify_mapped_keys`` still
         decides, and this only distinguishes the two kinds of ``plain``.
@@ -3699,8 +3846,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # geometry lives on ``Glm5NextRoutedExperts`` (``-031``) and
                 # nowhere else, so the loader is handed the declaring module
                 # rather than deriving a second partition from the key count.
+                #
+                # ``geometry`` is ``inc-glm53f-094``'s addition and is THIS site's
+                # to resolve, because this is the only place that holds both
+                # halves: the declaring module, which knows its own widths, and
+                # ``self.world_size``, which no declaring class but two is told.
+                # It is ``None`` for every replicated family and at world size 1,
+                # so the path every landed test exercises is byte-for-byte the one
+                # ``inc-glm53f-091`` measured.
                 loader = loader_for_mapped_keys(
-                    checkpoint_keys, param_name=name, owner=module
+                    checkpoint_keys,
+                    param_name=name,
+                    owner=module,
+                    geometry=_shard_geometry_for(module, leaf, self.world_size),
                 )
                 if loader is not None:
                     set_weight_loader(placeholder, loader)
@@ -3848,7 +4006,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         preferred. A map entry holding a weight AND its scale is served by
         :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.wrap_with_blockwise_fp8_downscale`,
         whose base transform is ``slices[0][:]``
-        (``weight_loaders_fp8.py:1339``) -- it keeps the WEIGHT slice and drops
+        (``weight_loaders_fp8.py:1342``) -- it keeps the WEIGHT slice and drops
         the companion, so the scale reaches nothing through the reader.
         Widening the map so each of those scales became its own parameter would
         move ``inc-glm53f-085``'s asserted difference set
@@ -3878,7 +4036,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         named the way the consumer already looks it up --
         ``f"{leaf}_{FP8_SCALE_SUFFIX}"``, the name
         :meth:`Glm5NextMLAAttention._dequantised_projection_weight` reads at
-        ``:2813``. Plain, not a registered parameter: registering it would add a
+        ``:2959``. Plain, not a registered parameter: registering it would add a
         name to ``named_parameters()`` that the map does not carry, which is the
         map widening this method exists to avoid.
 
@@ -3946,7 +4104,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # ``compensate_block_scales``, stacked on the leading axis in
                 # expert order, so row ``[e]`` matches the weight bank's row
                 # ``[e]``. It was landed "to be CALLED rather than attached"
-                # (``weight_loaders_fp8.py:1894-1903``) and this is that caller.
+                # (``weight_loaders_fp8.py:2136-2143``) and this is that caller.
                 grid = stacked_expert_scale_loader(
                     key_list, param_name=param_name, owner=module
                 ).load(
@@ -3976,11 +4134,29 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     f"reading a default of 1.0 here would use the bytes as if "
                     f"they were numbers"
                 )
-            grid = checkpoint._get_slice(scales[0])[:].to(
-                dtype=torch.float32, device=device
-            )
             module = self.get_submodule(module_path) if module_path else self
-            setattr(module, attribute, grid)
+            # ``inc-glm53f-094``. A SHARDED WEIGHT'S GRID IS SHARDED WITH IT, and
+            # this is the only route such a grid travels. The grid of a dense-MLP
+            # projection is not a declared parameter -- it arrives in the same map
+            # entry as its weight (``weight_loaders_fp8.py:628-633`` pairs them
+            # through ``_quantised``), so it reaches this reader and never
+            # ``loader_for_mapped_keys``. Left whole it would describe the FULL
+            # weight while the weight itself is this rank's half, and the dequant
+            # would scale the wrong blocks: the shard is not optional here.
+            #
+            # THE GEOMETRY IS THE WEIGHT'S, converted to grid rows by
+            # ``shard_geometry_for_grid``, so the block boundary is checked once
+            # in one place and a misaligned shard refuses by name. ``None`` at
+            # world size 1 and for every replicated family, which is why the
+            # landed reading below is the untouched path.
+            geometry = _shard_geometry_for(module, leaf, self.world_size)
+            if geometry is None:
+                grid = checkpoint._get_slice(scales[0])[:]
+            else:
+                grid = sharded_scale_grid_loader(geometry, param_name).load(
+                    [checkpoint._get_slice(scales[0])], _resolve_rank()
+                )
+            setattr(module, attribute, grid.to(dtype=torch.float32, device=device))
             read += 1
         return read
 
