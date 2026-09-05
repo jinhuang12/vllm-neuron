@@ -157,6 +157,10 @@ class NeuronConfig:
     # (batch_bucket, ctx_bucket) pair plus a max_model_len fallback NEFF.
     # See docs/design/vllm/decode-context-length-bucketing.md.
     decode_context_length_buckets: list[int] | None = None
+    # Runtime-only model length. The runner copies the validated vLLM value
+    # here before model construction. ``from_dict`` deliberately does not
+    # accept this field from user-supplied additional_config.
+    max_model_len: int | None = None
     # Structured outputs are request-level. Keep this disabled by default for
     # SO-off perf mode. Set true for servers that need to accept SO requests.
     enable_structured_outputs: bool = False

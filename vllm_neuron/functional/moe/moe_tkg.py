@@ -46,7 +46,8 @@ def moe_tkg(
 ) -> Tensor:
     """MoE expert MLP token generation kernel API.
 
-    Supports MXFP4 (uint16) and STATIC_MX FP8 (uint32) weights on Trn3, and BF16.
+    Supports BF16 and row/static FP8 weights on Trn2, plus MXFP4 and
+    STATIC_MX FP8 weights on Trn3.
 
     This functional API should be used instead of the moe_block_tkg functional API when different
     sharding schemes are used in the norm/router region of the MoE block and in the expert MLPs region.
@@ -151,7 +152,10 @@ def moe_tkg(
     """
     can_use = _can_use_kernel(
         hidden_input=hidden_input,
+        expert_gate_up_weights=expert_gate_up_weights,
         expert_down_weights=expert_down_weights,
+        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
+        expert_down_weights_scale=expert_down_weights_scale,
     )
 
     if can_use:
@@ -191,14 +195,21 @@ def moe_tkg(
         )
     else:
         raise NotImplementedError(
-            "moe_tkg only supports uint16 (MXFP4), uint32 (STATIC_MX FP8), or "
-            f"bfloat16 weights, but got {expert_down_weights.dtype=}"
+            "moe_tkg requires BF16, MXFP4, STATIC_MX FP8, or FP8 E4M3 "
+            "weights with both weight-scale tensors; got "
+            f"gate_up={expert_gate_up_weights.dtype}, "
+            f"down={expert_down_weights.dtype}, "
+            f"gate_up_scale={expert_gate_up_weights_scale is not None}, "
+            f"down_scale={expert_down_weights_scale is not None}"
         )
 
 
 def _can_use_kernel(
     hidden_input: Tensor,
+    expert_gate_up_weights: Tensor,
     expert_down_weights: Tensor,
+    expert_gate_up_weights_scale: Optional[Tensor],
+    expert_down_weights_scale: Optional[Tensor],
 ) -> bool:
     """
     Check if the moe_tkg NKI kernel can be used.
@@ -208,9 +219,22 @@ def _can_use_kernel(
 
     Kernel constraints checked:
         - Must be running on Neuron device or CPU with NKI simulator
-        - Must use MXFP4 (uint16), STATIC_MX FP8 (uint32), or BF16 weights
+        - Both weight tensors must use the same supported dtype
+        - FP8 E4M3 weights require both weight-scale tensors
     """
     if not can_run_kernel(hidden_input):
         return False
 
-    return expert_down_weights.dtype in (torch.uint16, torch.uint32, torch.bfloat16)
+    if expert_gate_up_weights.dtype != expert_down_weights.dtype:
+        return False
+
+    if expert_down_weights.dtype in (torch.uint16, torch.uint32, torch.bfloat16):
+        return True
+
+    if expert_down_weights.dtype == torch.float8_e4m3fn:
+        return (
+            expert_gate_up_weights_scale is not None
+            and expert_down_weights_scale is not None
+        )
+
+    return False

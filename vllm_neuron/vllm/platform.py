@@ -129,6 +129,7 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        "fp8",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
@@ -159,12 +160,18 @@ class NeuronPlatform(Platform):
 
     @classmethod
     def pre_register_and_update(cls, parser=None) -> None:
-        """Register Neuron model architectures before ModelConfig validation."""
+        """Register test-only architectures needed before ModelConfig validation.
+
+        Production architectures that vLLM already knows must stay registered to
+        their upstream implementations during ModelConfig validation.  Each
+        Neuron worker replaces those registrations with the Neuron factories
+        after validation, in ``NeuronWorker.__init__``.
+        """
         import os
 
-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
+        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
