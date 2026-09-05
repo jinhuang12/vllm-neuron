@@ -1027,6 +1027,110 @@ def _statement_positions(method, *, calls: tuple[str, ...], anchor: str):
     return positions, anchor_at
 
 
+#: The two load-time preps conjunct 8 pins, and the one method allowed to call
+#: them. Named once so the item, its control and the mutation builder cannot
+#: drift apart.
+_LOAD_TIME_PREPS = ("prepare_projection_weights", "prepare_scale_operands")
+_PREP_CALLER = "_run_load_time_preps"
+
+#: What the mutation builder puts where it deletes a call. Named rather than
+#: inlined because a bare keyword inside an f-string trips the linter's tokeniser.
+_NO_OP_STATEMENT = "pass"
+
+
+def _prep_call_homes(source: str) -> dict[str, list[tuple[str, int]]]:
+    """Every load-time prep call site, with the function it actually lives in.
+
+    Takes SOURCE TEXT rather than a module or a live object, and that signature is
+    the point: the same predicate can then be run against a deliberately mutated
+    COPY of the text, which is how conjunct 8's negative control fires without a
+    byte being written to the tree.
+
+    Returns ``{prep name: [(enclosing function, file line), ...]}``. A prep with
+    no call site maps to an empty list rather than vanishing from the mapping, so
+    a missing call reads as a missing call and not as a missing key.
+
+    THE ENCLOSING FUNCTION IS READ FROM THE TREE -- the innermost
+    :class:`ast.FunctionDef` whose line span contains the call -- and never from
+    indentation or from a backwards text search for a ``def``. Call sites are
+    :class:`ast.Call` nodes, so the four mentions inside string literals and the
+    two ``def`` statements of the preps themselves are excluded by construction.
+    """
+    homes: dict[str, list[tuple[str, int]]] = {name: [] for name in _LOAD_TIME_PREPS}
+    tree = ast.parse(source)
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def span(function) -> tuple[int, int]:
+        return function.lineno, function.end_lineno or function.lineno
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = node.func
+        named = callee.attr if isinstance(callee, ast.Attribute) else None
+        if named not in homes:
+            continue
+        containing = [
+            function
+            for function in functions
+            if span(function)[0] <= node.lineno <= span(function)[1]
+        ]
+        innermost = min(containing, key=lambda f: span(f)[1] - span(f)[0])
+        homes[named].append((innermost.name, node.lineno))
+    return homes
+
+
+def _every_prep_call_lives_in_the_caller(source: str) -> tuple[bool, dict]:
+    """Conjunct 8's part two: each prep is called ONCE, and only from the caller.
+
+    Returns ``(verdict, homes)``.
+
+    THE ITEM AND ITS NEGATIVE CONTROL BOTH CALL THIS ONE FUNCTION. A control that
+    re-implements the predicate proves something about the re-implementation and
+    nothing about the predicate the item uses, which is the defect B69-M1 found
+    in the first form of this item.
+    """
+    homes = _prep_call_homes(source)
+    verdict = all(
+        len(sites) == 1 and sites[0][0] == _PREP_CALLER for sites in homes.values()
+    )
+    return verdict, homes
+
+
+def _source_with_the_scale_prep_moved_out(source: str) -> str:
+    """B69's mutation, applied to a COPY of the module text. The tree is untouched.
+
+    It deletes the ``prepare_scale_operands`` call from the caller and plants an
+    equivalent call inside ``load_weights`` immediately ABOVE the anchor -- the
+    exact shape the reviewer used to make the unrepaired item pass on wrong code.
+
+    The result is only ever PARSED. It is never written to disk and never
+    executed, so the planted call's names need not resolve to anything.
+    """
+    def indent_of(line: str) -> str:
+        return " " * (len(line) - len(line.lstrip()))
+
+    lines = source.split("\n")
+    ((_, call_line),) = _prep_call_homes(source)["prepare_scale_operands"]
+    anchor_line = next(
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load_state_dict"
+    )
+    planted = "module.prepare_scale_operands(**operands)"
+    # The removal first, because it keeps the line count fixed; the insertion
+    # second, because it shifts every line after it.
+    lines[call_line - 1] = indent_of(lines[call_line - 1]) + _NO_OP_STATEMENT
+    lines.insert(anchor_line - 1, f"{indent_of(lines[anchor_line - 1])}{planted}")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- #
 # (4) The scale grids stay fp32, and the ones the loader drops are read.
 # --------------------------------------------------------------------------- #
@@ -1310,11 +1414,23 @@ def test_the_load_time_preps_run_after_the_device_by_name(
 
     THE ORDERING IS READ IN TWO PARTS, because the two prep calls sit one level
     down in ``_run_load_time_preps``. Part one: inside ``load_weights`` the call
-    to that method comes AFTER the anchor. Part two: the two preps are called
-    from nowhere else in the package at all -- which conjunct 5's count of
-    exactly 1 each already establishes, and this item reads the position. Two
-    parts together say more than a raw line comparison would: a prep cannot be
-    reached before the anchor by any path.
+    to that method comes AFTER the anchor. Part two: EACH PREP CALL'S OWN
+    ENCLOSING FUNCTION IS THAT CALLER, read by :mod:`ast` over the module source,
+    and both prep call lines are recorded. Five positions, not three.
+
+    PART TWO IS THE B69-M1 REPAIR AND THIS PARAGRAPH IS WHY IT WAS NEEDED. The
+    first form of this item argued that conjunct 5's count of exactly one call
+    site each already ruled out any earlier path. That inference does not follow:
+    one call site says nothing about WHERE that site is. The reviewer moved the
+    scale prep out of the caller to directly above the anchor and every one of
+    the nine items still passed -- part one keeps reading the CALLER's position,
+    which had not moved, and the misplaced call is never executed on the
+    miniature (no shared expert) or on the real configuration (the load stops at
+    the bank refusal first). A proxy plus an inference is not a position read.
+
+    SO THE ITEM NOW CARRIES THAT MUTATION AS ITS NEGATIVE CONTROL (D1.5): the
+    same predicate is run against a mutated COPY of the module text and must
+    FAIL on it. The copy is parsed, never written and never executed.
     """
     positions, anchor = _statement_positions(
         Glm5NextForConditionalGeneration.load_weights,
@@ -1337,6 +1453,48 @@ def test_the_load_time_preps_run_after_the_device_by_name(
     assert (
         positions["_load_out_of_band_scales"] < positions["_run_load_time_preps"]
     )
+
+    # Part two: where each prep call ITSELF lives. Read over the module's own
+    # source text, so the reading is about the shipped file and not about an
+    # object this test built.
+    module_source = Path(
+        inspect.getsourcefile(Glm5NextForConditionalGeneration)
+    ).read_text()
+    lives_in_the_caller, homes = _every_prep_call_lives_in_the_caller(module_source)
+    for prep in _LOAD_TIME_PREPS:
+        sites = homes[prep]
+        print(f"CONJUNCT8_{prep.upper()}_CALL_SITES={len(sites)}")
+        assert len(sites) == 1, f"{prep} has {len(sites)} call sites, not one: {sites}"
+        enclosing, line = sites[0]
+        print(f"CONJUNCT8_{prep.upper()}_CALL_LINE={line}")
+        print(f"CONJUNCT8_{prep.upper()}_ENCLOSING_FUNCTION={enclosing}")
+        assert enclosing == _PREP_CALLER, (
+            f"{prep} is called from {enclosing!r} at line {line}, not from "
+            f"{_PREP_CALLER!r} -- the ordering part one reads no longer governs it"
+        )
+    assert lives_in_the_caller
+
+    # And the control, which MOVES (D1.5): B69's mutation on a COPY of that text
+    # must FAIL the same predicate. The copy is parsed first on its own, so a
+    # syntax error in the mutation cannot be mistaken for a moved call.
+    mutated = _source_with_the_scale_prep_moved_out(module_source)
+    ast.parse(mutated)
+    assert mutated != module_source
+    still_in_the_caller, mutated_homes = _every_prep_call_lives_in_the_caller(mutated)
+    mutated_enclosing = mutated_homes["prepare_scale_operands"][0][0]
+    print("CONJUNCT8_CONTROL_MUTATED_COPY_PARSES=True")
+    print(f"CONJUNCT8_CONTROL_MUTATED_ENCLOSING_FUNCTION={mutated_enclosing}")
+    print(f"CONJUNCT8_CONTROL_PREDICATE_ON_THE_MUTATED_COPY={still_in_the_caller}")
+    assert mutated_enclosing == "load_weights", mutated_enclosing
+    assert not still_in_the_caller, (
+        "the predicate passed on a copy with the scale prep moved out of its "
+        "caller, so it is still the hollow read B69-M1 found"
+    )
+
+    # The mutation stayed in memory. Read the file again and compare.
+    on_disk = Path(inspect.getsourcefile(Glm5NextForConditionalGeneration)).read_text()
+    print(f"CONJUNCT8_CONTROL_SOURCE_FILE_UNCHANGED={on_disk == module_source}")
+    assert on_disk == module_source, "the mutation reached the file on disk"
 
     # Case A: the prep's own refusal when a scale was never materialised. It is
     # -090's landed message at ``model_fp8.py:1563-1568``, and NOT ``:1589``,
