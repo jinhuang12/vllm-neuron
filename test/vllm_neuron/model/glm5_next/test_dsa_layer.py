@@ -1103,12 +1103,20 @@ def _ref_expand(pool_ids: torch.Tensor, seq_lens: torch.Tensor, pool_size: int) 
     (``index_expand.py:525-546``). That is deliberate: a loop and a gather-and-mask are different
     enough that a transcription slip in either shows up as a mismatch rather than as a shared bug.
 
-    The width is DERIVED, never typed, and ``-102`` HAS NOW LANDED so there are TWO widths. This
-    reference matches the EMITTED one. ``index_expand_raw_width`` is
-    ``n_groups * pool_size + pool_size - 1`` (``index_expand.py:242-252``) and covers the columns
-    that carry meaning; ``index_expand_width`` rounds that up to a whole number of ``KEY_CHUNK``
-    (``index_expand.py:255-267``) and is what the seam allocates and emits
-    (``index_expand.py:526``).
+    THIS REFERENCE RETURNS THE RAW WIDTH, AND THAT IS THE FIXED CHOICE. ``-102`` landed two widths.
+    ``index_expand_raw_width`` is ``n_groups * pool_size + pool_size - 1``
+    (``index_expand.py:242-252``) and covers the columns that CARRY MEANING; ``index_expand_width``
+    rounds that up to a whole number of ``KEY_CHUNK`` (``index_expand.py:255-267``) and is what the
+    seam allocates and emits (``index_expand.py:527``). This function is a content reference, so it
+    returns the meaningful columns and nothing else -- which is the consumer
+    ``index_expand_raw_width``'s own docstring describes at ``index_expand.py:249-250``.
+
+    The emitted width and the padding are therefore NOT this function's claims. The ragged arm makes
+    them, as two claims of its own beside the content one, because they fail for different reasons: a
+    wrong emitted width means the seam allocated the wrong shape, and a padding column that is not
+    ``-1`` means the seam wrote meaning where it promised none. Rolling all three into one shape
+    comparison is what an earlier round of this increment did, and it read a hand-typed width as the
+    emitted width for a whole counted run.
     """
     rows, n_groups = (int(d) for d in pool_ids.shape)
     pool = int(pool_size)
@@ -1953,16 +1961,77 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     )
     spy.report("arm")
 
-    say("arm", "expanded_shape", tuple(got.shape), "reference_shape", tuple(reference.shape))
-    assert tuple(got.shape) == tuple(reference.shape), (
-        f"the arm returned {tuple(got.shape)} against the reference's {tuple(reference.shape)}"
+    # THE EXPANSION IS THREE CLAIMS, NOT ONE. `-051` round 2 asserted a single shape equality against a
+    # reference that had the raw width TYPED into it, so a claim about the EMITTED width was settled by a
+    # number nobody measured. The three below fail for three different reasons and say so separately:
+    # the emitted width is the seam's own allocation rule, the meaningful columns are the content, and
+    # the padding is a promise that those columns carry nothing.
+    expand_mod = _seam_module("index_expand")
+    raw_want = int(expand_mod.index_expand_raw_width(select_k, pool))
+    emitted_want = int(expand_mod.index_expand_width(select_k, pool))
+    # KEY_CHUNK read from the module that DEFINES it (mla_sparse.py:111), which is where index_expand
+    # imports it from too (index_expand.py:152). Reading it here is what keeps claim 1 from resting on
+    # index_expand_width alone: if that helper were wrong, the multiple-of-KEY_CHUNK arm and the
+    # not-below-raw arm would still catch a width that cannot be what the sparse kernel admits.
+    key_chunk = int(importlib.import_module("vllm_neuron.functional.attention.mla_sparse").KEY_CHUNK)
+    raw_got = int(reference.shape[1])
+    say("arm", "raw_width", raw_got, "from_helper", raw_want, "key_chunk", key_chunk)
+    assert raw_got == raw_want, (
+        f"the reference emitted {raw_got} columns where index_expand_raw_width({select_k}, {pool}) "
+        f"says {raw_want}; the reference's own width is a reading before it is a yardstick"
     )
-    mismatches = int((got.to(torch.int64) != reference.to(torch.int64)).sum())
-    say("arm", "index_mismatches", mismatches, "of", int(reference.numel()))
+
+    # CLAIM 1, THE EMITTED WIDTH.
+    say("arm", "emitted_width", int(got.shape[1]), "want", emitted_want, "rows", int(got.shape[0]))
+    assert int(got.shape[0]) == int(reference.shape[0]), (
+        f"the arm returned {int(got.shape[0])} rows against the reference's "
+        f"{int(reference.shape[0])}; the row count is the packed token count and must agree exactly"
+    )
+    assert int(got.shape[1]) == emitted_want, (
+        f"the arm emitted {int(got.shape[1])} columns where index_expand_width({select_k}, {pool}) "
+        f"says {emitted_want} (index_expand.py:255-267, allocated at :527)"
+    )
+    assert int(got.shape[1]) % key_chunk == 0, (
+        f"the emitted width {int(got.shape[1])} is not a whole multiple of KEY_CHUNK={key_chunk}, so "
+        f"mla_sparse_attention would refuse it (mla_sparse.py:1162-1168) whatever index_expand_width "
+        f"returns -- this arm holds even if that helper is wrong"
+    )
+    assert int(got.shape[1]) >= raw_want, (
+        f"the emitted width {int(got.shape[1])} is below the raw width {raw_want}, so meaningful "
+        f"columns were dropped by the allocation itself"
+    )
+
+    # CLAIM 2, THE MEANINGFUL COLUMNS.
+    head = got[:, :raw_got]
+    mismatches = int((head.to(torch.int64) != reference.to(torch.int64)).sum())
+    say("arm", "content_mismatches", mismatches, "of", int(reference.numel()), "cols", raw_got)
     assert mismatches == 0, (
-        f"{mismatches} of {int(reference.numel())} expanded indices differ. The implementation "
-        f"claims the pack COMMUTES with the row-wise projections bit-for-bit "
-        f"(model_fp8.py:3679-3682); this is that claim failing, not a tolerance to widen"
+        f"{mismatches} of {int(reference.numel())} meaningful expanded indices differ over the first "
+        f"{raw_got} columns. The implementation claims the pack COMMUTES with the row-wise "
+        f"projections bit-for-bit (model_fp8.py:3679-3682); this is that claim failing, not a "
+        f"tolerance to widen"
+    )
+
+    # CLAIM 3, THE PADDING. Its own claim because a padding column carrying a real token index is a
+    # DIFFERENT fault from a wrong content column: mla_sparse drops `-1` and attends anything else
+    # (mla_sparse.py:1483-1496), so meaning written here would be silently attended.
+    tail = got[:, raw_got:]
+    pad_cols = int(tail.shape[1])
+    bad_pad = int((tail.to(torch.int64) != -1).sum())
+    say("arm", "padding_columns", pad_cols, "non_sentinel", bad_pad)
+    assert pad_cols == emitted_want - raw_want, (
+        f"the padding region measured {pad_cols} columns where the two widths say "
+        f"{emitted_want - raw_want}; the region this claim is about has to be the region it measures"
+    )
+    assert pad_cols > 0, (
+        f"there is no padding region at this geometry ({emitted_want} emitted, {raw_want} raw), so "
+        f"the sentinel claim below would be a statement about an empty set. A subset or all-equal "
+        f"assertion over a measured set also asserts the set is non-empty, or it is not a measurement"
+    )
+    assert bad_pad == 0, (
+        f"{bad_pad} of {pad_cols * int(got.shape[0])} padding entries are not -1. mla_sparse keeps "
+        f"every column that is not -1 (mla_sparse.py:1483-1484) and attends it, so a real token "
+        f"index written past the raw width is extra attention with no other symptom"
     )
 
     per_family = spy.per_family()
