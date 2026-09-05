@@ -76,6 +76,21 @@ force a fresh trace per composition. This is the same compile-stability argument
 measured claim -- this increment's declared case set has no two patterns sharing a bucket, so it
 does not measure trace reuse and this file does not claim it.
 
+WHAT `-051` LATER SETTLED ABOUT THAT BUCKET, and it is a clarification of the sentence above rather
+than a new claim by this file. `-051` read the runner and found the bound is ``len(num_seqs_buckets)``
+traces -- ONE PER SEQUENCE BUCKET, not one per batch composition -- because every request contributes
+the same number of tokens per decode step: one without speculative decoding
+(``vllm_neuron/vllm/worker/neuron_model_runner.py:3301``) and the same ``k`` with it, under the
+scheduler invariant the runner states in its own words (``:3293-3297``). So the lengths tuple is
+uniform either way and the only free variable is the batch size, which ``num_seqs_buckets`` already
+buckets. Two consequences worth writing down. First, the compile-stability argument above is stronger
+than it claimed: there is nothing left to bucket that the runner does not already bucket. Second,
+NOTHING IN THE FORK CAN PRESENT A NON-UNIFORM DECODE BATCH TODAY -- ``requires_padding``, upstream's
+own trigger for packing at all, appears in this fork only in two ``model_fp8.py`` docstrings and zero
+times in the runner. So this seam has no production caller yet, and `-051` recorded that as a
+disclosure rather than writing a caller to make a landed seam look live. Evidence:
+``increments/watch-item-051-trace-bound.md`` with ``probe-051-watch-item-trace-bound-r2.out``.
+
 WHY THE POSITION IOTA COMES IN AS A TENSOR. This NKI image has no ``nl.arange``, no ``nl.mgrid``
 and no ``nl.iota`` -- a fact `-044` measured on this pin. So a per-row position vector cannot be
 generated on device and is handed in. It is metadata, not payload.

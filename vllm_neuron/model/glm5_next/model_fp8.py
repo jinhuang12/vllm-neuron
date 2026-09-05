@@ -65,7 +65,7 @@ the six fields that exist.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -2718,10 +2718,39 @@ class Glm5NextKDALayer(nn.Module):
 # ---------------------------------------------------------------------------
 # The DSA (``deepseek_sparse_attention``) half. D14 owners:
 # ``inc-glm53f-039`` (MLA projections) and ``-042`` (MLA decode path) inside
-# ``Glm5NextMLAAttention``; ``-051`` for ``Glm5NextDSALayer`` (layer +
-# sequence tiling), whose acceptance runs "a 3-layer DSA stack" -- so that
-# class is the decoder layer and the MLA module sits at ``self_attn``.
+# ``Glm5NextMLAAttention``; ``-051`` for ``Glm5NextDSALayer``, whose acceptance
+# runs "a 3-layer DSA stack" -- so that class is the decoder layer and the MLA
+# module sits at ``self_attn``.
+#
+# THIS COMMENT USED TO SAY "layer + sequence tiling", and the second half was
+# wrong rather than merely stale: there is NO DSA sequence-tiling seam in this
+# fork to integrate. Removed at design entry ``design-20260905-am`` (plan
+# revision 223), which cut ``-051``'s acceptance from eight counted runs to
+# two. The tiling question belongs to ``-052``'s untiled-S ladder.
+#
+# THE RUNNER HALF IS ALSO NOT ``-051``'s, as of design entry
+# ``design-20260905-an`` (plan revision 224): ``-051`` DECLARES the layer-side
+# interface and ``-054`` threads it, because two ``-054``-owned stubs sit
+# between the runner and ``Glm5NextDSALayer.forward``.
 # ---------------------------------------------------------------------------
+
+
+class Glm5NextDSAIndexerError(ValueError):
+    """Raised when the DSA indexer is asked for something it cannot serve.
+
+    ``inc-glm53f-051``. Declared beside the class that raises it, the convention
+    every sibling route error in this file already follows. NO COUNT OF THOSE
+    SIBLINGS IS WRITTEN HERE ON PURPOSE: ``Glm5NextMLADecodeError`` below says
+    "the three sibling route errors" and there are more than three now, which is
+    what a typed count does as a file grows.
+
+    A DISTINCT TYPE RATHER THAN A BARE ``ValueError``, for the reason the sibling
+    ``Glm5NextMLADecodeError`` gives: the acceptance asserts that a refusal is
+    raised BY NAME, and a bare ``ValueError`` cannot tell a refusal this section
+    owns from one torch raised on its way through. The indexer's refusals are
+    geometry and materialisation checks on operands it did not load, so they must
+    be distinguishable from a defect inside a seam.
+    """
 
 
 class Glm5NextDSAIndexer(nn.Module):
@@ -2729,13 +2758,71 @@ class Glm5NextDSAIndexer(nn.Module):
 
     LEAF NAMES PROVISIONAL AT THIS INCREMENT, and not any more: the map now
     records ``dsa_indexer`` as GROUNDED (``weight_loaders_fp8.py:84-86``) because
-    ``inc-glm53f-078`` read the real shard index. The two dials it was sized from,
-    ``index_n_heads`` / ``index_head_dim``, live in ``fixtures/config.json:195-196`` and in
-    ``fixtures/hf-config.json:25``/``:21``, never in fork Python -- as the map declares them.
+    ``inc-glm53f-078`` read the real shard index. The dials it is sized from,
+    ``index_n_heads`` / ``index_head_dim``, USED to live only in the fixtures and
+    never in fork Python; ``inc-glm53f-051`` made all seven ``index_*`` keys typed
+    ``Glm5NextTextConfig`` fields (entry ``design-20260905-ad``), so this class
+    reads them from the config like every other width in this file.
+
+    WHAT THIS CLASS OWNS, since it now owns arithmetic. ``inc-glm53f-051`` gives it
+    the four projections of the indexer chain, its key normalisation and its
+    forward. The four projections run on the landed ``mla_projection`` seam and
+    their weights are prepared ONCE per instance, which is the same division of
+    labour the sibling ``Glm5NextMLAAttention`` PROJECTIONS section states and the
+    same one the reference's own indexer applies -- it caches its transposed
+    weights-projection half on the indexer module rather than transposing per call
+    (``vllm/models/glm5next/nvidia/attention.py:326-332`` at pin ``878631b6``).
     """
 
-    def __init__(self) -> None:
+    #: Attribute the prepared weights are cached on. A plain attribute and NOT a
+    #: buffer, for the reason the sibling section gives: a buffer enters
+    #: ``state_dict()``, which would double every prepared weight in a saved
+    #: checkpoint.
+    PREPARED_WEIGHTS_ATTR = "_prepared_indexer_weights"
+
+    #: Site name -> the parameter attribute that site's weight arrives on.
+    #:
+    #: WHY THIS MAP EXISTS AT ALL, and why the sibling section needs no such thing.
+    #: There, every site's weight is ``f"{name}_weight"`` and the convention can be
+    #: left implicit. Here THREE of the four follow that convention and the fourth
+    #: does not: ``index_kpool_compress_gate`` is a bare checkpoint tensor with no
+    #: ``.weight`` leaf (``weight_loaders_fp8.py``, the ``_add_dsa_attention``
+    #: mapping), so a name-plus-suffix rule would look for a parameter that does
+    #: not exist. Stating all four here makes the exception visible instead of
+    #: hiding it in a fallback.
+    #:
+    #: ONE CONSEQUENCE, DISCLOSED. The model's production prep walk pre-flights
+    #: each operand by building ``name + _WEIGHT_LEAF_SUFFIX`` and CONTINUES past a
+    #: ``None``, so it covers three of these four sites and silently skips the
+    #: fourth. It does not fail. :meth:`prepare_projection_weights` below therefore
+    #: performs that site's own absent and placeholder checks, so the skip does not
+    #: become a gap.
+    PROJECTION_PARAMETERS: dict[str, str] = {
+        "wq_b": "wq_b_weight",
+        "wk": "wk_weight",
+        "weights_proj": "weights_proj_weight",
+        "index_kpool_compress_gate": "index_kpool_compress_gate",
+    }
+
+    def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
+        # The four dials this class computes with, each read from the config
+        # rather than transcribed. ``inc-glm53f-051`` added them as fields; before
+        # that the adapter dropped them and there was nothing to read.
+        self.hidden_size = int(text_config.hidden_size)
+        self.q_lora_rank = int(text_config.q_lora_rank)
+        self.index_n_heads = int(text_config.index_n_heads)
+        self.index_head_dim = int(text_config.index_head_dim)
+        self.index_kpool = int(text_config.index_kpool)
+        self.index_topk = int(text_config.index_topk)
+        # BOTH compress dials are read, and neither is a switch: the forward
+        # REFUSES any value but True for either (:meth:`require_dials`). They are
+        # preconditions, so no branch in this class serves False.
+        self.index_kpool_compress = bool(text_config.index_kpool_compress)
+        self.index_kpool_always_select_tail = bool(
+            text_config.index_kpool_always_select_tail
+        )
+
         # The map's seven, in the map's own order: the four scaled projections,
         # then ``k_norm_bias``, then the two bare compress tensors.
         # ``inc-glm53f-082`` replaced the provisional ``wq_weight`` with the
@@ -2751,11 +2838,1021 @@ class Glm5NextDSAIndexer(nn.Module):
             "index_kpool_compress_gate",
         )
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextDSAIndexer.forward is a stub created by "
-            "inc-glm53f-013; the DSA indexer lands with the DSA path"
+    def projection_widths(self) -> tuple[tuple[str, int, int], ...]:
+        """The four sites as ``(name, in_features, out_features)``, closed form.
+
+        Every width is computed from a config dial and named where it comes from,
+        so a test's expectation is not a transcription of the same literal this
+        code used -- the reason the sibling section's own method gives.
+
+        ``index_n_heads * index_head_dim`` and ``hidden_size`` are both 4096 on this
+        checkpoint AND THEY ARE NOT THE SAME QUANTITY: the first is the indexer's
+        total head width and the second is the model's residual width. Each is
+        written from its own dial below so the coincidence cannot be mistaken for
+        an identity by a later reader or by a checkpoint that separates them.
+
+        ``index_kpool_compress_gate`` is a projection here because that is what it
+        is: the reference computes the per-token pool gate as
+        ``F.linear(hidden_states, index_kpool_compress_gate)`` with the weight
+        shaped ``[index_head_dim, hidden_size]``
+        (``vllm/models/glm5next/nvidia/attention.py:380`` at pin ``878631b6``), so
+        it contracts the hidden width exactly as the other three do.
+        """
+        return (
+            ("wq_b", self.q_lora_rank, self.index_n_heads * self.index_head_dim),
+            ("wk", self.hidden_size, self.index_head_dim),
+            ("weights_proj", self.hidden_size, self.index_n_heads),
+            ("index_kpool_compress_gate", self.hidden_size, self.index_head_dim),
         )
+
+    def prepare_projection_weights(self) -> int:
+        """Transpose the four indexer weights ONCE. Returns how many.
+
+        SAME REASON AS THE SIBLING SECTION'S, restated only where this class
+        differs. ``mla_projection`` needs each weight contraction-major,
+        ``[in_features, out_features]``; a checkpoint stores the torch orientation,
+        ``[out_features, in_features]``. A projection weight never changes, so it
+        is transposed here once rather than on every call.
+
+        THIS METHOD IS FOUND BY DUCK TYPE, not by a new call site. The model's
+        production prep walk calls ``prepare_projection_weights`` on any module
+        whose TYPE declares it, so binding this class under the attention module is
+        all the wiring it needs and no load-path code is touched.
+
+        IT CARRIES ITS OWN ABSENT AND PLACEHOLDER CHECKS, and that is not
+        duplication. The walk's pre-flight builds each attribute name by appending
+        ``_weight`` and continues past a ``None``, so it cannot see this class's
+        bare ``index_kpool_compress_gate`` leaf at all. Checking here means all
+        four sites are checked, whoever called.
+
+        Each weight is checked against the closed-form widths BEFORE it is
+        transposed, so a checkpoint whose indexer geometry differs fails here with
+        the site named -- rather than reaching a seam that would accept the
+        geometry and quietly compute the wrong thing. That check is what lets the
+        widths above come from named dials instead of from the weights themselves.
+        """
+        prepared: dict[str, torch.Tensor] = {}
+        for name, idim, odim in self.projection_widths():
+            attribute = self.PROJECTION_PARAMETERS[name]
+            weight = getattr(self, attribute, None)
+            if weight is None:
+                raise Glm5NextDSAIndexerError(
+                    f"{attribute} is declared but not materialised; load the "
+                    f"checkpoint before preparing the indexer's weights"
+                )
+            if torch.nn.parameter.is_lazy(weight):
+                raise Glm5NextDSAIndexerError(
+                    f"{attribute} is still a shape-free placeholder, so preparing "
+                    f"it would transpose a parameter no checkpoint has filled"
+                )
+            if tuple(weight.shape) != (odim, idim):
+                raise Glm5NextDSAIndexerError(
+                    f"{attribute} is {tuple(weight.shape)}; this config's closed "
+                    f"form for the {name} site is [out_features, in_features] = "
+                    f"{(odim, idim)}"
+                )
+            # ``.t()`` alone is a view and the kernel loads from memory, so the
+            # copy is forced here -- once -- rather than left for the seam.
+            prepared[name] = weight.to(torch.float32).t().contiguous()
+        setattr(self, self.PREPARED_WEIGHTS_ATTR, prepared)
+        return len(prepared)
+
+    def _prepared_weight(self, name: str) -> torch.Tensor:
+        """One prepared weight, or a refusal naming what was not done.
+
+        Refusing is what makes "never per call" checkable, the reason the sibling
+        section's own accessor gives: a fallback that transposed on demand would
+        bring back the per-call copy this preparation exists to remove, and nothing
+        would report it.
+        """
+        prepared = getattr(self, self.PREPARED_WEIGHTS_ATTR, None)
+        if not prepared:
+            raise Glm5NextDSAIndexerError(
+                "prepare_projection_weights() has not run; the indexer's "
+                "projection weights are transposed once at load time, never per "
+                "call"
+            )
+        return prepared[name]
+
+    #: Epsilon of the indexer's key normalisation. A MODULE CONSTANT and not a
+    #: config read, because this fork's config carries no field for it: the
+    #: adapter keeps only declared dataclass fields and drops the rest
+    #: (``config.py:103`` and ``:121``), and no indexer dial survives that filter.
+    #: The value is the reference's, read at the pin rather than defaulted here --
+    #: ``LayerNorm(self.head_dim, eps=1e-6)`` at upstream
+    #: ``vllm/models/glm5next/nvidia/attention.py:267`` (blob at ``878631b6``),
+    #: which its own DeepSeek-V3.2 ancestor states identically at
+    #: ``vllm/models/deepseek_v32/attention.py:84``. NOT ``rms_norm_eps``: that is
+    #: this checkpoint's 1e-05 for the RMS norms, a different constant on a
+    #: different norm, and reusing it would be a silent substitution.
+    #: Authorised as a module constant by the lead at design entry
+    #: ``design-20260905-ab``, on the ``_latent_norm`` precedent.
+    KEY_NORM_EPS = 1e-6
+
+    def _key_norm(
+        self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        """LayerNorm on the indexer key: ``[tokens, index_head_dim]`` in, same out.
+
+        TORCH GLUE ON PURPOSE, and the ruling says which kind. This is elementwise
+        work with one reduction over a 128-wide axis, no landed ``functional/``
+        seam performs a standalone LayerNorm, and P13 keeps torch legitimate for
+        glue. The sibling ``_latent_norm`` in this file is the precedent for the
+        shape of this method: a method rather than a module-level helper, because
+        this file's module-level region is another increment's D14 section.
+
+        A LAYERNORM AND NOT AN RMSNORM, and the checkpoint is what says so. The
+        weight map binds ``k_norm_bias`` beside ``k_norm_weight``
+        (``weight_loaders_fp8.py``), and an RMS norm has no bias to bind. So the
+        mean is subtracted here; treating this as the sibling RMS norm would drop
+        that subtraction and compute a different function at exactly the right
+        shape.
+
+        THE FP32 CAST IS THE REFERENCE'S, not a local preference. Upstream
+        normalises in float32 and casts back to the input dtype in one fused step
+        (``_fused_indexer_k_norm``, ``attention.py:54-58`` at the pin). The cast
+        back matters because the value returned here feeds seams whose gates admit
+        bf16 only, and a float32 key would take a torch oracle instead of the NKI
+        route while every shape still checked out.
+        """
+        if x.ndim != 2:
+            raise Glm5NextDSAIndexerError(
+                f"the indexer key must be [tokens, index_head_dim]; got shape "
+                f"{tuple(x.shape)}"
+            )
+        width = int(x.shape[1])
+        for name, operand in (("k_norm_weight", weight), ("k_norm_bias", bias)):
+            if operand is None:
+                raise Glm5NextDSAIndexerError(
+                    f"{name} is declared but not materialised; load the "
+                    f"checkpoint before the indexer runs"
+                )
+            if operand.ndim != 1 or int(operand.shape[0]) != width:
+                raise Glm5NextDSAIndexerError(
+                    f"{name} must be [{width}] to normalise a key of width "
+                    f"{width}; got {tuple(operand.shape)}"
+                )
+        normed = torch.nn.functional.layer_norm(
+            x.float(),
+            (width,),
+            weight.float(),
+            bias.float(),
+            self.KEY_NORM_EPS,
+        )
+        return normed.to(x.dtype)
+
+    def projection_scale(self) -> float:
+        """The single constant folded into ``weights`` before the score GEMM.
+
+        Upstream folds TWO factors into one constant and says so in the helper's
+        own comment -- *"scale folds softmax_scale (head_dim**-0.5) and
+        n_head**-0.5 into a single constant"*
+        (``_fused_indexer_weight_scale``, ``attention.py:62-68`` at pin
+        ``878631b6``, applied ``:373-375``). Both come from this class's own
+        dials, so nothing is minted here and no caller passes a scale in.
+
+        NOT THE LAYER'S ``softmax_scale``, and the two must not be confused.
+        That one is the MLA attention's and reaches ``attend()`` as a caller
+        argument; this one is the INDEXER's, and upstream's ``softmax_scale``
+        at the cite above is its own ``index_head_dim ** -0.5``.
+
+        THE QUERY SCALE IS ABSENT AND THAT IS THE FORK'S CHOICE, not an
+        omission here. Upstream's third factor is the fp8 quantisation scale
+        from ``fwht128_quant_fp8`` (``:369``); this fork's rotation seam
+        ``dsa_hadamard128`` returns a plain tensor, and
+        ``kpool_hadamard.py:57`` and ``decode_tail_update.py:85`` each record
+        fp8 and the ue8m0 scale as out of scope with no plan block owning
+        them. So a reference for this chain must fold two factors, not three.
+        """
+        return float(self.index_head_dim**-0.5) * float(self.index_n_heads**-0.5)
+
+    def project_stage(
+        self, hidden_states: torch.Tensor, q_latent: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The indexer's four projections, its key norm and its query rotation.
+
+        Returns ``(query, key, weights, gate_score)``:
+
+        * ``query`` ``[tokens, index_n_heads, index_head_dim]`` bf16, rotated.
+        * ``key`` ``[tokens, index_head_dim]`` bf16, normalised.
+        * ``weights`` ``[tokens, index_n_heads]`` float32, scale already folded.
+        * ``gate_score`` ``[tokens, index_head_dim]`` bf16.
+
+        ``q_latent`` is the NORMALISED query latent, which upstream's indexer
+        also takes as an argument rather than computing
+        (``attention.py:317``, consumed ``:319``). In this fork it comes from
+        ``Glm5NextMLAAttention.project_query_latent``.
+
+        FIVE DISPATCHES, and which seam takes each. Four go to
+        ``mla_projection`` -- one per site in :meth:`projection_widths` -- and
+        one to ``dsa_hadamard128`` for the rotation. The four are the ruled
+        substrate (design entry ``design-20260905-ab``): the increment stays
+        NON-KERNEL-CLASS because every accelerator step here reaches a landed
+        kernel, and none of them authors a torch substitute for kernel work.
+
+        THE DTYPE LADDER IS FORCED BY THE SEAMS' OWN GATES, not chosen.
+        ``mla_projection`` returns float32 by contract. ``dsa_hadamard128``
+        and the pooling seams take the NKI route on bf16 only
+        (``kpool_hadamard.py:147``), and ``dsa_score_gemm`` wants bf16 queries
+        with float32 weights (``score_gemm.py:149`` and ``:158``). So the key,
+        the query and the gate are cast to bf16 and the weights stay float32 --
+        a float32 key would pass every shape check and silently take a torch
+        oracle instead of the kernel.
+
+        WHAT IS DELIBERATELY ABSENT, both because this checkpoint does not
+        reach it. RoPE: upstream skips the split, the rotary and the cat
+        entirely when ``rope_dim == 0`` (``:339-361``) and this checkpoint's
+        ``qk_rope_head_dim`` is 0. Head zero-padding: upstream pads only when
+        ``n_head < 32`` (``:383-389``) and this checkpoint has exactly 32.
+        """
+        # Fully-qualified module imports, which is this file's own form for a
+        # `functional/` seam and NOT a package-level one: the DSA package's
+        # `__init__.py` is EMPTY (0 bytes at this tip), so a package-level
+        # import of a seam name would raise ImportError at the first call.
+        from vllm_neuron.functional.attention.mla_projections import mla_projection
+        from vllm_neuron.functional.dsa.kpool_hadamard import dsa_hadamard128
+
+        if hidden_states.ndim != 2 or int(hidden_states.shape[1]) != self.hidden_size:
+            raise Glm5NextDSAIndexerError(
+                f"hidden_states must be [tokens, {self.hidden_size}]; got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        tokens = int(hidden_states.shape[0])
+        if q_latent.ndim != 2 or tuple(q_latent.shape) != (tokens, self.q_lora_rank):
+            raise Glm5NextDSAIndexerError(
+                f"q_latent must be [tokens, q_lora_rank] = "
+                f"{(tokens, self.q_lora_rank)} to pair with these hidden "
+                f"states; got {tuple(q_latent.shape)}"
+            )
+
+        hidden_f32 = hidden_states.to(torch.float32)
+
+        # 1. The query. Upstream views the projection to [-1, n_head, head_dim]
+        #    (`:319-320`); the rotation seam takes a 2-D [rows, 128], so the
+        #    view is flat for the call and restored after it.
+        query = mla_projection(q_latent.to(torch.float32), self._prepared_weight("wq_b"))
+        query = dsa_hadamard128(
+            query.reshape(tokens * self.index_n_heads, self.index_head_dim).to(
+                torch.bfloat16
+            )
+        ).reshape(tokens, self.index_n_heads, self.index_head_dim)
+
+        # 2. The key, then its LayerNorm. The cast to bf16 happens BEFORE the
+        #    norm so the norm's own cast-back lands on bf16, which is
+        #    upstream's order: its `k` leaves a bf16 linear and
+        #    `_fused_indexer_k_norm` normalises in float32 and casts back
+        #    (`:335-337`, helper `:54-58`).
+        key = self._key_norm(
+            mla_projection(hidden_f32, self._prepared_weight("wk")).to(torch.bfloat16),
+            self.k_norm_weight,
+            self.k_norm_bias,
+        )
+
+        # 3. The weights, with the single constant folded in. float32 all the
+        #    way: `dsa_score_gemm` requires it and applies no scale of its own.
+        weights = mla_projection(
+            hidden_f32, self._prepared_weight("weights_proj")
+        ) * self.projection_scale()
+
+        # 4. The kpool gate. Upstream's `F.linear(hidden_states,
+        #    index_kpool_compress_gate)` (`:380`), which is why
+        #    `projection_widths` carries this site as a projection.
+        gate_score = mla_projection(
+            hidden_f32, self._prepared_weight("index_kpool_compress_gate")
+        ).to(torch.bfloat16)
+
+        return query, key, weights, gate_score
+
+    def pool_window(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool complete blocks of ``index_kpool`` keys. The prefill leg.
+
+        Returns ``(pooled, write_mask)``: ``pooled`` is
+        ``[tokens, index_head_dim]`` in ``key``'s dtype, one candidate per
+        position, and ``write_mask`` is ``[tokens]`` bool marking which of
+        those positions actually completed a pool. The caller writes only the
+        masked rows, at ``slot_mapping``'s slots.
+
+        TRANSCRIBED FROM THE REFERENCE THIS INCREMENT IS POINTED AT.
+        ``_kpool_compress_insert`` (``sparse_attn_indexer_kpool.py:54-99`` at
+        pin ``878631b6``) is named as this increment's integration surface by
+        the plan's rev-169 rider, and its shape is reproduced rather than
+        improved on: EVERY position is treated as a pool-completion candidate
+        and the non-completions are masked, because -- in the reference's own
+        words -- compacting the valid rows first *"costs two device syncs on
+        the eager prefill path and buys nothing numerically"*.
+
+        ``slot_mapping`` IS POOL-GRANULAR, which is the whole reason the mask
+        exists: only the LAST token of each complete pool carries a
+        non-negative slot and intra-pool positions carry ``-1``
+        (``:64-68``). The second term, ``pos >= index_kpool - 1``, drops a pool
+        whose start falls before the batch -- leading padding, whose gate and
+        key data the reference calls undefined.
+
+        THE SEAM SEES NO PARTIAL POOL, and that is a landed contract rather
+        than a convention: ``dsa_kpool_hadamard`` asserts complete pools, and
+        the plan's rev-169 correction records that the caller masks
+        non-completions and persists the raw remainder to the tail cache. The
+        remainder is the decode ring's, ``dsa_decode_tail_update``, not this
+        method's.
+
+        ONE DISPATCH, on ``dsa_kpool_hadamard``. The sliding window is index
+        arithmetic and carries no dispatch of its own.
+        """
+        from vllm_neuron.functional.dsa.kpool_hadamard import dsa_kpool_hadamard
+
+        if key.ndim != 2 or int(key.shape[1]) != self.index_head_dim:
+            raise Glm5NextDSAIndexerError(
+                f"key must be [tokens, {self.index_head_dim}]; got "
+                f"{tuple(key.shape)}"
+            )
+        if tuple(gate_score.shape) != tuple(key.shape):
+            raise Glm5NextDSAIndexerError(
+                f"gate_score must match key; got {tuple(gate_score.shape)} "
+                f"against {tuple(key.shape)}"
+            )
+        tokens = int(key.shape[0])
+        if slot_mapping.ndim != 1 or int(slot_mapping.shape[0]) != tokens:
+            raise Glm5NextDSAIndexerError(
+                f"slot_mapping must be [tokens] = {(tokens,)}, one pool-granular "
+                f"slot per position; got {tuple(slot_mapping.shape)}"
+            )
+        pool = self.index_kpool
+        if tokens < pool:
+            raise Glm5NextDSAIndexerError(
+                f"no pool can complete in {tokens} token(s) at a pool size of "
+                f"{pool}; the reference returns early here "
+                f"(sparse_attn_indexer_kpool.py:76-77) and this caller refuses "
+                f"instead, so a silent no-op cannot look like a pooled prefill"
+            )
+
+        ape = self.index_kpool_compress_ape
+        if ape is None:
+            raise Glm5NextDSAIndexerError(
+                "index_kpool_compress_ape is declared but not materialised; "
+                "load the checkpoint before the indexer runs"
+            )
+        if ape.ndim != 2 or tuple(ape.shape) != (pool, self.index_head_dim):
+            raise Glm5NextDSAIndexerError(
+                f"index_kpool_compress_ape must be [index_kpool, "
+                f"index_head_dim] = {(pool, self.index_head_dim)}; got "
+                f"{tuple(ape.shape)}"
+            )
+
+        pos = torch.arange(tokens, device=key.device)
+        offsets = torch.arange(pool, device=key.device)
+        window = (pos - (pool - 1)).clamp_min(0)[:, None] + offsets[None, :]
+        write_mask = (slot_mapping >= 0) & (pos >= pool - 1)
+
+        # The ape is float32 for the kernel's inner contract even though the
+        # checkpoint leaf is bf16; it is [4, 128], so the cast is free and is
+        # done here rather than cached, unlike the projection weights.
+        pooled = dsa_kpool_hadamard(
+            key[window], gate_score[window], ape.to(torch.float32)
+        )
+        return pooled, write_mask
+
+    def tail_step(
+        self,
+        tail: torch.Tensor,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        position: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Advance the decode ring by one token. Returns ``(pooled, new_tail)``.
+
+        ``pooled`` is ``[1, index_head_dim]`` when this token COMPLETED a pool
+        and ``None`` when it did not; ``new_tail`` always has ``tail``'s shape.
+
+        THE RING IS STATE AND THIS METHOD DOES NOT OWN IT. The seam's own
+        docstring is explicit -- *"The caller threads ``new_tail`` into the next
+        step -- the ring is state, and this function does not mutate its
+        argument"* -- so the returned ring goes back to the caller, exactly as
+        ``attend()`` takes its latent cache as an argument rather than holding
+        one. This method allocates nothing.
+
+        WHY THIS IS THE DECODE COUNTERPART OF :meth:`pool_window` AND NOT A
+        SPECIAL CASE OF IT. A prefill sees whole pools and pools them in one
+        call; a decode step sees ONE token and must remember the pool it is
+        part-way through, which is what the ring holds -- half 0 keys, half 1
+        gate scores, upstream's own layout. The plan's rev-169 correction
+        assigns the raw remainder to this ring rather than to the pooling seam,
+        which *"NEVER SEES A PARTIAL POOL"*.
+
+        ``position`` IS THE TOKEN'S ABSOLUTE POSITION and a python int, not a
+        tensor, for the reason the seam's module docstring gives; it decides
+        which ring row is written and whether the pool completes.
+
+        ONE DISPATCH, on ``dsa_decode_tail_update``, and it is the only seam in
+        this chain that fires on the decode leg and not the prefill leg.
+        """
+        from vllm_neuron.functional.dsa.decode_tail_update import (
+            dsa_decode_tail_update,
+        )
+
+        pool = self.index_kpool
+        want_tail = (2, pool, self.index_head_dim)
+        if tail.ndim != 3 or tuple(tail.shape) != want_tail:
+            raise Glm5NextDSAIndexerError(
+                f"tail must be [2, index_kpool, index_head_dim] = {want_tail} "
+                f"-- half 0 keys, half 1 gate scores; got {tuple(tail.shape)}"
+            )
+        want_row = (1, self.index_head_dim)
+        for name, operand in (("key", key), ("gate_score", gate_score)):
+            if operand.ndim != 2 or tuple(operand.shape) != want_row:
+                raise Glm5NextDSAIndexerError(
+                    f"{name} must be [1, index_head_dim] = {want_row} for one "
+                    f"decode token; got {tuple(operand.shape)}"
+                )
+        if int(position) < 0:
+            raise Glm5NextDSAIndexerError(
+                f"position must be the token's absolute position in the "
+                f"request; got {position}"
+            )
+
+        ape = self.index_kpool_compress_ape
+        if ape is None or tuple(ape.shape) != (pool, self.index_head_dim):
+            raise Glm5NextDSAIndexerError(
+                f"index_kpool_compress_ape must be materialised and shaped "
+                f"{(pool, self.index_head_dim)}; got "
+                f"{None if ape is None else tuple(ape.shape)}"
+            )
+
+        return dsa_decode_tail_update(
+            tail, key, gate_score, ape.to(torch.float32), int(position)
+        )
+
+    def score_pools(
+        self,
+        query: torch.Tensor,
+        candidate_keys: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score every candidate pool against every token. ``[tokens, cands]`` fp32.
+
+        ``query`` is ``[tokens, index_n_heads, index_head_dim]`` bf16 and
+        ``candidate_keys`` is ``[cands, index_head_dim]`` -- ONE key per
+        candidate, shared across heads, which is this checkpoint's MQA shape.
+
+        THE CANDIDATE AXIS IS POOL-GRANULAR, not token-granular, and the seam
+        says so from upstream: *"logits are pool-granular (compress_ratio ==
+        index_kpool)"* (``sparse_attn_indexer_kpool.py:551-554``, quoted in
+        ``score_gemm.py``). That is why the next stage selects POOLS and why an
+        expansion is needed afterwards to reach tokens.
+
+        ``weights`` ARRIVES ALREADY SCALED and this method adds nothing. The
+        seam applies no scale of its own by contract, and the constant is
+        :meth:`projection_scale`, folded in by :meth:`project_stage`. Folding it
+        twice would square it, which is exactly the kind of defect a
+        scale-carrying argument invites -- so the fold has ONE site and this
+        docstring names it.
+
+        ONE DISPATCH, on ``dsa_score_gemm``.
+        """
+        from vllm_neuron.functional.dsa.score_gemm import dsa_score_gemm
+
+        if query.ndim != 3 or tuple(query.shape[1:]) != (
+            self.index_n_heads,
+            self.index_head_dim,
+        ):
+            raise Glm5NextDSAIndexerError(
+                f"query must be [tokens, index_n_heads, index_head_dim] = "
+                f"[tokens, {self.index_n_heads}, {self.index_head_dim}]; got "
+                f"{tuple(query.shape)}"
+            )
+        tokens = int(query.shape[0])
+        if candidate_keys.ndim != 2 or int(candidate_keys.shape[1]) != self.index_head_dim:
+            raise Glm5NextDSAIndexerError(
+                f"candidate_keys must be [cands, {self.index_head_dim}], one "
+                f"key per candidate pool; got {tuple(candidate_keys.shape)}"
+            )
+        if tuple(weights.shape) != (tokens, self.index_n_heads):
+            raise Glm5NextDSAIndexerError(
+                f"weights must be [tokens, index_n_heads] = "
+                f"{(tokens, self.index_n_heads)} to pair with this query; got "
+                f"{tuple(weights.shape)}"
+            )
+        return dsa_score_gemm(query, candidate_keys, weights)
+
+    def select_k(self) -> int:
+        """How many POOLS the selection keeps. Derived in ONE place.
+
+        ``index_topk`` counts TOKENS, while the selection on this checkpoint is
+        pool-granular -- ``sparse_attn_indexer_kpool.py:551-554`` at pin
+        ``878631b6`` reads *"logits are pool-granular (compress_ratio ==
+        index_kpool)"*. So the token budget divides by the pool width before it
+        reaches ``dsa_topk_select``. Neither number is spelled here; both are
+        config dials, and the campaign's earlier rounds show what typing a count
+        instead of computing it costs.
+        """
+        return self.index_topk // self.index_kpool
+
+    def require_dials(self) -> None:
+        """Refuse the two compress dials this class does not serve.
+
+        WHY A REFUSAL AND NOT A BRANCH. The plan's rev-167 rider, re-issued at
+        entry ``design-20260905-af``, owns ``index_kpool_always_select_tail``
+        here as a PRECONDITION and a READING and never as a step: the landed
+        ``dsa_index_expand`` IS upstream's fused expand-plus-tail and appends the
+        tail itself, deriving ``tail_start`` internally
+        (``kpool_compress.py:762``, ``:860-871``;
+        ``sparse_attn_indexer_kpool.py:598``, ``:883``). So there is no
+        force-include step for this class to author, and a ``False`` would need a
+        different expansion that no landed seam provides.
+
+        WHAT THE TAIL ACTUALLY IS, because an earlier draft of this docstring
+        called it "the tail pooled block" and that was loose on two counts.
+        (1) The appended entities are RAW TOKEN indices, not a pool id: the seam
+        adds ``pool_size - 1`` columns holding ``tail_start + t`` with
+        ``tail_start = seq_len // pool_size * pool_size``, one column per
+        possible position in the incomplete final pool (``index_expand.py:9``,
+        ``:48-50``, ``:428-439``). Every other column of the row carries pool
+        ids expanded to tokens; these carry individual tokens directly.
+        (2) The append is EMPTY whenever ``seq_len % pool_size == 0``, because
+        ``tail_count = seq_len - tail_start`` is then zero and every tail column
+        masks to ``-1``. So "force-includes" never means "always adds a token" --
+        a sequence that divides evenly into pools contributes no tail token at
+        all, and that is the common case at a pool-aligned length rather than an
+        edge case. The dial still binds: it selects an expansion SHAPE that
+        reserves those columns, not a guarantee that they are populated.
+
+        UPSTREAM REFUSES THE SAME TWO VALUES, so this is a transcription and not
+        a local policy: ``transformers_utils/configs/glm5_next.py:118-126`` at
+        pin ``878631b6`` raises ``NotImplementedError`` for each. Upstream tests
+        ``is not True`` rather than falsiness; both dials are stored through
+        ``bool()`` at construction, so the two tests cannot diverge here.
+
+        AND WRITING A TORCH PATH FOR ``False`` WOULD BE A P13 DEFECT -- a
+        torch-level fallback for work the kernel owns.
+        """
+        if not self.index_kpool_compress:
+            raise Glm5NextDSAIndexerError(
+                "index_kpool_compress must be True; this indexer serves only "
+                "the compressed, pool-granular path, because the landed "
+                "dsa_index_expand seam expands POOL ids and no landed seam "
+                "selects token-granular candidates. Upstream refuses the same "
+                "value (transformers_utils/configs/glm5_next.py:118-126)"
+            )
+        if not self.index_kpool_always_select_tail:
+            raise Glm5NextDSAIndexerError(
+                "index_kpool_always_select_tail must be True; the landed "
+                "dsa_index_expand seam appends the tail itself -- pool_size - 1 "
+                "columns carrying the raw token indices of the incomplete final "
+                "pool, empty when seq_len % pool_size == 0 -- and derives "
+                "tail_start internally, so False would need an expansion no "
+                "landed seam provides. Upstream refuses the same value "
+                "(transformers_utils/configs/glm5_next.py:118-126)"
+            )
+
+    def select_pools(self, scores: torch.Tensor) -> torch.Tensor:
+        """Keep the ``select_k`` highest-scoring pools. ``[rows, select_k]`` int32.
+
+        THE ONE CAST BETWEEN TWO SEAMS THAT DISAGREE, and it belongs here.
+        ``dsa_topk_select`` returns int64 indices *"to match ``torch.topk``"*
+        (``topk_select.py:302-317``), while ``dsa_index_expand`` admits int32
+        ONLY and says why -- *"int64 indices would double the SBUF traffic for a
+        range no sequence length reaches"* (``index_expand.py:139-141``). So
+        exactly one cast is needed and this is its single site.
+
+        WHY THIS METHOD DOES NOT RE-CHECK THE STRICT BOUND. ``dsa_topk_select``
+        needs ``0 < k < width`` STRICTLY, and at ``k == width`` its gate RETURNS
+        FALSE rather than raising (``topk_select.py:294``) -- which takes the
+        torch route and increments ``torch_fallback``, breaking a declared zero
+        SILENTLY, unlike the loud raise at ``k > width`` (``:320-323``). That is
+        finding F10, and :meth:`forward` refuses the regime BY NAME before a
+        score exists, so the bound already holds by the time this runs. Checking
+        it in two places would let the two disagree.
+
+        ONE DISPATCH, on ``dsa_topk_select``.
+        """
+        from vllm_neuron.functional.dsa.topk_select import dsa_topk_select
+
+        if scores.ndim != 2:
+            raise Glm5NextDSAIndexerError(
+                f"scores must be [rows, cands] from score_pools; got "
+                f"{tuple(scores.shape)}"
+            )
+        _values, indices = dsa_topk_select(scores, self.select_k())
+        return indices.to(torch.int32)
+
+    def expand_indices(
+        self, pool_ids: torch.Tensor, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        """Selected pools expanded to token indices, tail appended. ONE dispatch.
+
+        Returns ``[rows, select_k * index_kpool + index_kpool - 1]`` int32 token
+        indices in upstream's column order, where ``-1`` means *"this column
+        selects no token"* and is a VALUE rather than an out-of-bounds index.
+
+        THE ``-1`` LEAVES THIS CLASS UNTOUCHED, which is a ruling and not a
+        preference. Entry ``design-20260905-af`` took route (a): the mask goes
+        INSIDE the kernel, where ``inc-glm53f-098`` masks ``-1`` in
+        ``mla_sparse_attention`` and narrows its gate to ``lo < -1``. So this
+        class applies no filler, no compaction, no clamp and no mask, and hands
+        the sentinel-bearing tensor to ``attend()`` unchanged.
+
+        FINDING F8 IS WHY THE RULING WAS NEEDED. The fork's
+        ``mla_sparse_attention`` refuses ANY negative index by name
+        (``mla_sparse.py:1259-1267``), while upstream bounds its kernel with a
+        SEPARATE per-row valid count instead -- ``sparse_mla_top_k_lens =
+        seq_lens.clamp(min=1)``, ``flashinfer_mla_sparse.py:467`` -- a parameter
+        the fork's seam does not have. The sentinel is upstream's DESIGN, not an
+        accident: it initialises its whole index buffer to ``-1``
+        (``sparse_attn_indexer_kpool.py:435``) and writes the ``-1``-bearing
+        expansion straight into it (``:606``, ``:892``).
+
+        AND NO FILLER WOULD HAVE BEEN FREE, which is why route (a) is not merely
+        tidier. Softmax normalises over the columns it is given, so any in-range
+        filler duplicates a real cache row and takes real probability mass.
+        Upstream can point its empty rows at slot 0 ONLY because it also clamps
+        their length to 1 and zeroes the output afterwards
+        (``flashinfer_mla_sparse.py:467``, ``:497-499``).
+        """
+        from vllm_neuron.functional.dsa.index_expand import dsa_index_expand
+
+        if pool_ids.ndim != 2:
+            raise Glm5NextDSAIndexerError(
+                f"pool_ids must be [rows, select_k] from select_pools; got "
+                f"{tuple(pool_ids.shape)}"
+            )
+        if seq_lens.ndim != 1 or int(seq_lens.shape[0]) != int(pool_ids.shape[0]):
+            raise Glm5NextDSAIndexerError(
+                f"seq_lens must be [rows] = {(int(pool_ids.shape[0]),)}, one "
+                f"length per selected row; got {tuple(seq_lens.shape)}"
+            )
+        return dsa_index_expand(pool_ids, seq_lens, self.index_kpool)
+
+    def _require_serviceable(
+        self, max_seq_len: int, page_size: int, pool_cache: torch.Tensor
+    ) -> tuple[int, int]:
+        """Refuse a regime no landed seam serves. Returns ``(candidates, trash_row)``.
+
+        ONE IMPLEMENTATION FOR BOTH ENTRY POINTS, which is the point of extracting it:
+        :meth:`forward` and :meth:`forward_ragged` must agree about what is serviceable,
+        and two copies of a refusal are two things that can drift apart. F10's earlier
+        laps were about exactly this class of divergence.
+
+        THE F10 REFUSAL. ``dsa_topk_select`` needs ``0 < k < width`` STRICTLY, and at
+        ``k == width`` its gate RETURNS FALSE rather than raising
+        (``topk_select.py:294``) -- taking the torch route and breaking the declared
+        ``torch_fallback == 0`` SILENTLY, unlike the loud raise at ``k > width``
+        (``:320-323``). ``width`` is the WIDEST row's complete-pool count, because that
+        row sizes the shared candidate axis.
+        """
+        pool = self.index_kpool
+        if int(max_seq_len) <= 0:
+            raise Glm5NextDSAIndexerError(
+                f"max_seq_len must be the batch's longest sequence as a python "
+                f"int; got {max_seq_len!r}"
+            )
+        if int(page_size) <= 0:
+            raise Glm5NextDSAIndexerError(
+                f"page_size must be positive; got {page_size!r}"
+            )
+        if pool_cache.ndim != 2 or int(pool_cache.shape[1]) != self.index_head_dim:
+            raise Glm5NextDSAIndexerError(
+                f"pool_cache must be [slots, index_head_dim] with "
+                f"index_head_dim={self.index_head_dim}; got "
+                f"{tuple(pool_cache.shape)}"
+            )
+
+        candidates = int(max_seq_len) // pool
+        if candidates <= self.select_k():
+            raise Glm5NextDSAIndexerError(
+                f"this indexer cannot serve max_seq_len={int(max_seq_len)}: it "
+                f"yields {candidates} complete pool(s) at index_kpool={pool}, "
+                f"which is not strictly more than select_k="
+                f"{self.select_k()} (index_topk={self.index_topk} // {pool}). "
+                f"dsa_topk_select refuses k == width for sorted output and its "
+                f"gate returns False rather than raising, so serving this "
+                f"regime would silently take the torch route "
+                f"(topk_select.py:294). The short-sequence route is "
+                f"inc-glm53f-099's; upstream bypasses selection entirely here "
+                f"(sparse_attn_indexer_kpool.py:203-217). Refusing by name "
+                f"keeps the wrong answer unreachable"
+            )
+        trash = int(pool_cache.shape[0]) - 1
+        if candidates > trash:
+            raise Glm5NextDSAIndexerError(
+                f"pool_cache has {int(pool_cache.shape[0])} row(s), which "
+                f"leaves no trash row above the {candidates} addressable "
+                f"candidate pool(s); allocate at least {candidates + 1}"
+            )
+        return candidates, trash
+
+    def _gather_candidates(
+        self, pool_cache: torch.Tensor, candidates: int, page_size: int
+    ) -> torch.Tensor:
+        """The candidate pooled keys. ONE dispatch on ``dsa_paged_gather``.
+
+        The candidate axis is every complete pool of the widest row, SHARED across the
+        batch -- which is upstream's own shape, a ``[tokens, max_seq_len_pooled]`` logits
+        grid rather than a per-row candidate set. Per-row differences enter later, at the
+        expansion, where ``dsa_index_expand`` derives each row's tail from that row's own
+        ``seq_len``.
+
+        THE PAGE TABLE IS ARITHMETIC, NOT A LOOKUP, and only because of the serving
+        constraint: at one sequence per call (the sibling attention's G1) pool ``j`` lives
+        at a fixed page and slot, which is the same contract ``attend()`` states as *"slot
+        0 through the last written slot"*. A batched page table would be a real lookup and
+        is not this increment's.
+        """
+        from vllm_neuron.functional.dsa.paged_gather import dsa_paged_gather
+
+        flat = torch.arange(candidates, device=pool_cache.device, dtype=torch.int32)
+        return dsa_paged_gather(
+            pool_cache,
+            torch.div(flat, int(page_size), rounding_mode="floor"),
+            torch.remainder(flat, int(page_size)),
+            int(page_size),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        q_latent: torch.Tensor,
+        pool_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        max_seq_len: int,
+        page_size: int,
+        slot_mapping: torch.Tensor | None = None,
+        tail: torch.Tensor | None = None,
+        position: int | None = None,
+    ) -> torch.Tensor:
+        """The whole indexer chain. Returns ``topk_indices`` and NOTHING ELSE.
+
+        INDICES ALONE IS A RULING. Entry ``design-20260905-af`` route (a) keeps
+        the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so no per-row valid
+        length leaves this class -- returning one would give a caller a second,
+        contradictory way to bound the same kernel. :meth:`expand_indices` states
+        the finding behind it.
+
+        Args:
+            hidden_states: ``[tokens, hidden_size]``.
+            q_latent: ``[tokens, q_lora_rank]`` fp32, from the sibling
+                attention's ``project_query_latent``.
+            pool_cache: ``[slots, index_head_dim]`` bf16, the pooled-key store,
+                WRITTEN IN PLACE for this call's completed pools and then read
+                back as the candidate set. Its LAST row is reserved as write
+                trash; see below.
+            seq_lens: ``[rows]`` int32, upstream's shape, consumed on device by
+                the expansion seam.
+            max_seq_len: the batch's longest sequence, as a PYTHON INT.
+            page_size: rows per page in ``pool_cache``.
+            slot_mapping: ``[tokens]`` int32, pool-granular. Prefill only.
+            tail: ``[2, index_kpool, index_head_dim]`` bf16 ring, WRITTEN IN
+                PLACE. Passing it selects the decode leg.
+            position: the decode token's absolute position, a python int.
+
+        WHY ``max_seq_len`` IS A PYTHON INT AND NOT READ OFF ``seq_lens``. The
+        obvious ``int(seq_lens.max())`` is a host read of tensor DATA inside a
+        region the runner compiles with ``fullgraph=True``, which is a GRAPH
+        BREAK -- ``ragged_pack.py`` measured and recorded exactly this and took
+        python ints for the same reason (``neuron_model_runner.py:1457-1462``).
+        The candidate count also sizes an ``arange``, so it must be a trace-time
+        constant regardless. The cost is that consistency with ``seq_lens`` is
+        DECLARED by the caller rather than measured here, and the tests assert it
+        host-side, outside the traced region.
+
+        WHY THE RING AND THE POOL STORE ARE WRITTEN IN PLACE. ``attend()`` states
+        this file's own contract for carried state -- *"The cache is WRITTEN in
+        place for those tokens and then READ from slot 0 through the last written
+        slot"* -- and following it is what lets this method return indices alone.
+        ``dsa_decode_tail_update`` is functional by design (*"the ring is state,
+        and this function does not mutate its argument"*), so its new ring is
+        copied into the caller's buffer here, at one site.
+
+        WHY THE POOL WRITE USES A TRASH ROW INSTEAD OF A BOOLEAN MASK. Indexing
+        with a bool mask produces a DATA-DEPENDENT shape, which is the same graph
+        break in another costume. So every position writes, and the positions
+        that completed no pool are redirected to ``pool_cache``'s last row. That
+        is ``inc-glm53f-045``'s own measured pattern -- it *"sends every padding
+        row to a REAL in-range trash row"* rather than masking by going out of
+        bounds. Duplicate trash destinations resolve in unspecified order and
+        that is harmless: the row is never addressed as a candidate.
+
+        THE SUBSTRATE (P13). Every arithmetic stage is one of the eight landed
+        kernel-class DSA seams or the landed ``mla_projection`` seam. What is
+        torch here is orchestration and named so a reviewer can check it: shape
+        validation, index arithmetic for the gather, one ``index_copy_`` per leg,
+        and one ring copy. No torch path computes an indexer value.
+        """
+        self.require_dials()
+
+        pool = self.index_kpool
+        candidates, trash = self._require_serviceable(
+            int(max_seq_len), int(page_size), pool_cache
+        )
+        is_decode = tail is not None
+        if is_decode and position is None:
+            raise Glm5NextDSAIndexerError(
+                "the decode leg needs both tail and position; got a tail with "
+                "no position"
+            )
+        if not is_decode and slot_mapping is None:
+            raise Glm5NextDSAIndexerError(
+                "the prefill leg needs slot_mapping, the pool-granular slot per "
+                "position; pass tail and position instead for a decode step"
+            )
+        query, key, weights, gate_score = self.project_stage(hidden_states, q_latent)
+
+        if is_decode:
+            pooled, new_tail = self.tail_step(tail, key, gate_score, int(position))
+            # The seam does not mutate its argument, so the ring is threaded
+            # back into the caller's buffer here.
+            tail.copy_(new_tail)
+            if pooled is not None:
+                # `pooled is not None` is decided from `position`, a python int,
+                # so this branch is a trace-time choice and not a data read.
+                pool_slot = torch.full(
+                    (1,), int(position) // pool, dtype=torch.int64,
+                    device=pool_cache.device,
+                )
+                pool_cache.index_copy_(0, pool_slot, pooled.to(pool_cache.dtype))
+        else:
+            pooled, write_mask = self.pool_window(key, gate_score, slot_mapping)
+            destination = torch.where(
+                write_mask, slot_mapping.to(torch.int64), torch.tensor(
+                    trash, dtype=torch.int64, device=pool_cache.device
+                )
+            )
+            pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+
+        candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
+        scores = self.score_pools(query, candidate_keys, weights)
+        pool_ids = self.select_pools(scores)
+        return self.expand_indices(pool_ids, seq_lens)
+
+    def forward_ragged(
+        self,
+        hidden_states: torch.Tensor,
+        q_latent: torch.Tensor,
+        pool_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        lengths: Sequence[int],
+        *,
+        max_seq_len: int,
+        page_size: int,
+    ) -> torch.Tensor:
+        """The NON-UNIFORM decode arm. Returns dense ``[tokens, width]`` int32.
+
+        WHY THIS ARM EXISTS AT ALL, and it is not a second code path for its own sake.
+        Finding F3: the ragged-pack family is UNREACHABLE at batch one, because upstream
+        guards its whole pack region with ``if decode_metadata.requires_padding:``
+        (``sparse_attn_indexer_kpool.py:744``) and a batch of one is uniform by
+        construction. Entry ``design-20260905-aa`` route (i) answers that with two cases
+        whose UNION carries the family readings, and this is the second of them. It is
+        called on the indexer DIRECTLY, so no layer and no ``attend()`` is involved.
+
+        WHAT IT PACKS, AND WHY THAT IS EXACTLY ONE THING. Only the query is packed, and
+        only because ``dsa_score_gemm`` needs its rows dense and aligned with the gate.
+        Packing anything else would be authoring a dispatch to move a counter, which this
+        seat has refused three times now and refuses here. Finding F11 is the reason the
+        obvious second pack is impossible rather than merely unnecessary: the gate weights
+        are fp32 by ``dsa_score_gemm``'s contract (``score_gemm.py:158``) and
+        ``dsa_ragged_pack`` admits bfloat16 ALONE (``ragged_pack.py:121``), so a weights
+        pack would take the torch route and break the standing ``torch_fallback == 0``.
+        The weights are moved by ``index_select`` instead -- torch glue on a narrow fp32
+        gate, which preserves every bit of the fold that a bf16 round trip would lose.
+
+        AND NOTHING IS UNPACKED, which is a ruling. Entry ``design-20260905-aj`` route (b)
+        makes ``dsa_ragged_unpack``'s reading on this arm a DECLARED 0, covered by
+        ``inc-glm53f-045``'s own landed bit-identical round-trip item. The arm's result is
+        int32 by ``dsa_index_expand``'s contract, the pack module admits bf16 only, and the
+        consumer wants the DENSE form anyway: ``mla_sparse_attention`` gates
+        ``topk_indices.ndim != 2`` and raises by name (``mla_sparse.py:1214``, ``:1216``),
+        so a padded rank-3 tensor would be refused. There is no dense-to-padded step to
+        author.
+
+        MIND THE NAMES, because upstream's are inverted. Upstream's ``pack_seq_triton`` is
+        dense-to-padded (its result is named ``padded_q_quant_decode_tokens``,
+        ``sparse_attn_indexer_kpool.py:745-760``) and ``unpack_seq_triton`` is
+        padded-to-dense (``:889``). The fork's ``dsa_ragged_pack`` is padded-to-dense and
+        ``dsa_ragged_unpack`` dense-to-padded. This method is written to the FORK's
+        contract; reading either name by upstream habit inverts the arm silently.
+
+        Args:
+            hidden_states: ``[batch, max_len, hidden_size]`` -- the PADDED batch.
+            q_latent: ``[batch, max_len, q_lora_rank]`` fp32, padded to match.
+            pool_cache: ``[slots, index_head_dim]`` bf16, READ ONLY here.
+            seq_lens: ``[tokens]`` int32, one per PACKED row.
+            lengths: valid rows per request, as python ints.
+            max_seq_len: the batch's longest sequence, a python int.
+            page_size: rows per page in ``pool_cache``.
+
+        WHY ``lengths`` IS A SEQUENCE OF PYTHON INTS: ``dsa_ragged_pack``'s own contract,
+        for the reason its module docstring gives -- the packed length is DERIVED from
+        them, and deriving it from tensor data would be a host read inside a
+        ``fullgraph=True`` region and so a graph break.
+
+        WHY THIS ARM DOES NOT WRITE THE CACHE OR ADVANCE THE RING, declared rather than
+        omitted. Its job is the selection chain on a non-uniform batch; the pooled-key
+        store arrives already populated and the ring is the uniform case's business, which
+        already reads ``dsa_decode_tail_update`` and ``dsa_kpool_hadamard``. So both of
+        those families read 0 here. THE ARM'S DECLARED READINGS, one line per entry point
+        because two of the nine share a module and a family name cannot say which half
+        moved: ``dsa_ragged_pack`` 1, ``dsa_ragged_unpack`` 0, ``dsa_hadamard128`` 1,
+        ``dsa_kpool_hadamard`` 0, ``dsa_paged_gather`` 1, ``dsa_score_gemm`` 1,
+        ``dsa_topk_select`` 1, ``dsa_index_expand`` 1, ``dsa_decode_tail_update`` 0. The
+        rotation the projection needs is the moving half; the pooling entry point is the
+        one this arm never calls, and an earlier draft of this list named the shared module
+        instead, which read as a claim about the pooling. Nine named readings, no family
+        shorthand, so ``probe-051-arm-authored`` can compare each one to a measurement.
+
+        ONE COST, DISCLOSED. :meth:`project_stage` computes the key and the gate score
+        that this arm never uses, because it is one dispatch-counted unit whose reading of
+        exactly 4 ``mla_projection`` dispatches per indexer call is the declared
+        substrate-binding measurement. Two unused projections is the price of that count
+        staying stable across both entry points, and it is the right trade -- but it is a
+        real cost and it is stated rather than hidden.
+        """
+        from vllm_neuron.functional.dsa.ragged_pack import dsa_ragged_pack
+
+        self.require_dials()
+        candidates, _trash = self._require_serviceable(
+            int(max_seq_len), int(page_size), pool_cache
+        )
+
+        if hidden_states.ndim != 3 or q_latent.ndim != 3:
+            raise Glm5NextDSAIndexerError(
+                f"the ragged arm takes a PADDED batch: hidden_states "
+                f"[batch, max_len, hidden_size] and q_latent "
+                f"[batch, max_len, q_lora_rank]; got "
+                f"{tuple(hidden_states.shape)} and {tuple(q_latent.shape)}"
+            )
+        batch, max_len = int(hidden_states.shape[0]), int(hidden_states.shape[1])
+        if tuple(q_latent.shape[:2]) != (batch, max_len):
+            raise Glm5NextDSAIndexerError(
+                f"q_latent's leading dims must match hidden_states' "
+                f"{(batch, max_len)}; got {tuple(q_latent.shape[:2])}"
+            )
+        checked = [int(n) for n in lengths]
+        if len(checked) != batch:
+            raise Glm5NextDSAIndexerError(
+                f"lengths must carry one valid-row count per request; got "
+                f"{len(checked)} for a batch of {batch}"
+            )
+        if any(n < 0 or n > max_len for n in checked):
+            raise Glm5NextDSAIndexerError(
+                f"every length must lie in [0, max_len={max_len}]; got {checked}"
+            )
+        tokens = sum(checked)
+        if tokens <= 0:
+            raise Glm5NextDSAIndexerError(
+                "every request is empty; there is nothing to index"
+            )
+        if len(set(checked)) == 1:
+            raise Glm5NextDSAIndexerError(
+                f"this arm exists for a NON-UNIFORM batch and every request here "
+                f"has {checked[0]} row(s). A uniform batch needs no pack at all "
+                f"-- upstream guards its pack region with "
+                f"requires_padding (sparse_attn_indexer_kpool.py:744) -- so "
+                f"serving it here would move the pack counter on a case that "
+                f"does not need one. Use forward() instead"
+            )
+        if seq_lens.ndim != 1 or int(seq_lens.shape[0]) != tokens:
+            raise Glm5NextDSAIndexerError(
+                f"seq_lens must be [tokens] = {(tokens,)}, one per PACKED row, "
+                f"which is what the lengths sum to; got {tuple(seq_lens.shape)}"
+            )
+
+        # The projections are ROW-WISE, so they commute exactly with row selection:
+        # projecting the padded grid and then packing gives bit-for-bit what packing
+        # and then projecting would. Padding rows compute values that the pack drops
+        # and nothing downstream ever sees. Flattening is a reshape, not a move.
+        heads, head_dim = self.index_n_heads, self.index_head_dim
+        query, _key, weights, _gate_score = self.project_stage(
+            hidden_states.reshape(batch * max_len, -1),
+            q_latent.reshape(batch * max_len, -1),
+        )
+
+        # THE ONE PACK. The query carries `heads * head_dim` per row, and the seam takes
+        # a 3-D `[batch, max_len, width]`, so the head axis folds into the width for the
+        # move and unfolds after -- upstream reshapes around its own pack for the same
+        # reason (`padded_weights = pack_seq_triton(...).reshape(...)`, `:759-760`).
+        packed_query = dsa_ragged_pack(
+            query.reshape(batch, max_len, heads * head_dim), checked
+        ).reshape(tokens, heads, head_dim)
+
+        # The fp32 gate moves by index_select, NOT through the seam: F11. The row index
+        # is built from the lengths, which are python ints, so its shape is a trace-time
+        # constant and no tensor data is read on the host.
+        keep = [
+            b * max_len + r for b, n in enumerate(checked) for r in range(n)
+        ]
+        packed_weights = weights.index_select(
+            0, torch.tensor(keep, dtype=torch.int64, device=weights.device)
+        )
+
+        candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
+        scores = self.score_pools(packed_query, candidate_keys, packed_weights)
+        pool_ids = self.select_pools(scores)
+        return self.expand_indices(pool_ids, seq_lens)
 
 
 class Glm5NextMLADecodeError(ValueError):
@@ -2846,7 +3943,7 @@ class Glm5NextMLAAttention(nn.Module):
             self,
             *(f"{leaf}_{FP8_SCALE_SUFFIX}" for leaf in DSA_SCALED_PROJECTIONS),
         )
-        self.indexer = Glm5NextDSAIndexer()
+        self.indexer = Glm5NextDSAIndexer(text_config)
 
     # -- the PROJECTIONS section -- D14 owner: ``inc-glm53f-039b`` (M3) -------
     #
@@ -3232,6 +4329,52 @@ class Glm5NextMLAAttention(nn.Module):
     #    refactor that is invisible, so ``project_qkv`` above is untouched --
     #    byte-for-byte, including its three returns.
 
+    def project_query_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The NORMALISED query latent. ONE dispatch. ``[tokens, q_lora_rank]``, float32.
+
+        ADDITIVE, AND THAT IS THE WHOLE OF IT. ``inc-glm53f-051`` needs this exact
+        value and no caller could obtain it: the sibling below computed it as its
+        first two statements and returned only the query and the KV latent. This
+        method is those two statements, named, and the sibling now calls it -- so
+        the value has one producer instead of two copies, and the sibling's
+        signature, returns and dispatch count are all unchanged. Authorised at
+        design entry ``design-20260905-ad``; the D14 owner of this section is
+        ``inc-glm53f-039b`` and this is the only line of it that moves.
+
+        WHO NEEDS IT AND WHY IT IS NOT AN INTERNAL. The DSA indexer's ``wq_b``
+        projection contracts ``q_lora_rank``, so the indexer's input IS this
+        latent -- exactly as the reference passes it in as an argument
+        (``vllm/models/glm5next/nvidia/attention.py:317``, consumed at ``:319``,
+        blob at pin ``878631b6``). The DSA layer calls this once per phase and
+        hands the result to the indexer.
+
+        FLOAT32 ON PURPOSE, and the caller is told rather than left to infer. The
+        seam returns float32 by contract and the norm runs in float32; the sibling
+        casts back to the model dtype only at its own return, because that is what
+        its callers consume. This method hands back what the seam and the norm
+        produced, so a caller that needs another dtype casts once, itself, at the
+        point it knows about.
+
+        RECORDED DEBT, not a defect and not this increment's to pay: ``attend()``
+        recomputes this latent inside ``project_query_and_latent``, so a DSA layer
+        that calls the indexer and then ``attend()`` computes it twice. Threading
+        the latent into ``attend()`` changes a landed signature with its own
+        callers, which is ``inc-glm53f-054``'s to do when it writes the 45-layer
+        forward. The cost is one dispatch of a ``[tokens, 4096] x [4096, 1536]``
+        projection per layer per phase, and it is declared in this increment's
+        predictions rather than absorbed.
+        """
+        from vllm_neuron.functional.attention.mla_projections import mla_projection
+
+        x = hidden_states.to(torch.float32)
+        if x.ndim != 2 or int(x.shape[1]) != self.hidden_size:
+            raise Glm5NextMLADecodeError(
+                f"hidden_states must be [tokens, {self.hidden_size}]; got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        q_latent = mla_projection(x, self._prepared_weight("q_a_proj"))
+        return self._latent_norm(q_latent, self.q_a_layernorm_weight)
+
     def project_query_and_latent(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3250,6 +4393,13 @@ class Glm5NextMLAAttention(nn.Module):
         and what the seam contracts against; returning the un-normalised
         compression would put a norm on every reader of the cache instead of one
         norm on the writer.
+
+        THE FIRST TWO STATEMENTS NOW LIVE IN :meth:`project_query_latent`, and
+        nothing else about this method moved (``inc-glm53f-051``, entry
+        ``design-20260905-ad``). Same signature, same two returns, same THREE
+        dispatches -- the extracted method performs the first of the three. The
+        extraction exists because the DSA indexer needs that intermediate value
+        and no caller could reach it while it was a local here.
         """
         from vllm_neuron.functional.attention.mla_projections import mla_projection
 
@@ -3263,8 +4413,7 @@ class Glm5NextMLAAttention(nn.Module):
         tokens = int(x.shape[0])
         heads = self.num_attention_heads
 
-        q_latent = mla_projection(x, self._prepared_weight("q_a_proj"))
-        q_latent = self._latent_norm(q_latent, self.q_a_layernorm_weight)
+        q_latent = self.project_query_latent(hidden_states)
         query = mla_projection(q_latent, self._prepared_weight("q_b_proj"))
         query = query.reshape(tokens, heads, widths["q_b_proj"][1] // heads)
 
@@ -3470,17 +4619,97 @@ class Glm5NextDSALayer(nn.Module):
         )
         self.self_attn = Glm5NextMLAAttention(text_config)
         self.mlp = _build_mlp(text_config, layer_idx)
+        # Resolved at construction, on the same ground the KDA sibling states.
+        self.rms_norm_eps = float(text_config.rms_norm_eps)
 
     @property
     def attention(self) -> nn.Module:
         return getattr(self, self.ATTENTION_ATTR)
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextDSALayer.forward is a stub created by inc-glm53f-013; "
-            "the DSA layer lands with inc-glm53f-051 and the full 45-layer "
-            "forward with inc-glm53f-054"
+    def _input_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Pre-attention RMSNorm: ``x / sqrt(mean(x**2) + eps) * gain``.
+
+        DELIBERATELY THE SAME BODY AS ``Glm5NextKDALayer._input_norm``, and the
+        duplication is forced rather than lazy. Sharing it would mean either a
+        module-level helper -- and that region is another increment's D14 section,
+        the reason the sibling gives for it being a method at all -- or a new base
+        class, which would move a landed class this increment does not own. D14
+        tells an implementer to raise a widening rather than take it, so the body
+        is repeated here in this increment's own section and the sibling stays
+        untouched.
+        """
+        x = hidden_states.to(torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        normed = x * torch.rsqrt(variance + self.rms_norm_eps)
+        normed = normed * self.input_layernorm_weight.to(torch.float32)
+        return normed.to(hidden_states.dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        latent_cache: torch.Tensor,
+        pool_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        start_position: int,
+        softmax_scale: float,
+        max_seq_len: int,
+        page_size: int,
+        slot_mapping: torch.Tensor | None = None,
+        tail: torch.Tensor | None = None,
+        position: int | None = None,
+    ) -> torch.Tensor:
+        """Pre-norm, then the sparse attention half, then the residual add.
+
+        THE INDICES PASS THROUGH UNCHANGED, which is the ruling and the whole
+        point of this method's shape. Entry ``design-20260905-af`` route (a) puts
+        the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so this layer applies
+        no filler, no compaction, no clamp and no mask between the indexer and
+        ``attend()`` -- it hands over exactly what the indexer returned.
+
+        WHAT THIS FORWARD DELIBERATELY DOES NOT DO, AND WHY IT IS NOT A GAP. The
+        same two absences the KDA sibling records, for the same D14 reason:
+
+        * ``self.mlp`` raises whichever branch ``_build_mlp`` chose, and those
+          sections belong to ``inc-glm53f-031`` through ``inc-glm53f-033``.
+        * the six mHC weights sit flat on this layer but no
+          ``Glm5NextHyperConnection`` instance is bound to it, and that wiring is
+          ``inc-glm53f-030``'s section.
+
+        So this forward stops at the attention half and ``inc-glm53f-054`` joins
+        the halves when it writes the 45-layer forward.
+
+        THE TWO CARRIERS ARE THE CALLER'S, both written in place: ``latent_cache``
+        is ``attend()``'s own contract and ``pool_cache`` and ``tail`` are the
+        indexer's. See :meth:`Glm5NextDSAIndexer.forward` for what each means and
+        why ``max_seq_len`` is a python int.
+        """
+        residual = hidden_states
+        normed = self._input_norm(hidden_states)
+        attention = self.attention
+        # ONE dispatch, and the reason this accessor exists: the indexer's `wq_b`
+        # contracts `q_lora_rank`, so its input IS the normalised latent, exactly
+        # as the reference passes it in as an argument.
+        q_latent = attention.project_query_latent(normed)
+        topk_indices = attention.indexer(
+            normed,
+            q_latent,
+            pool_cache,
+            seq_lens,
+            max_seq_len=int(max_seq_len),
+            page_size=int(page_size),
+            slot_mapping=slot_mapping,
+            tail=tail,
+            position=position,
         )
+        attn_out = attention.attend(
+            normed,
+            latent_cache,
+            int(start_position),
+            topk_indices,
+            float(softmax_scale),
+        )
+        return residual + attn_out
 
 
 def _build_layer(

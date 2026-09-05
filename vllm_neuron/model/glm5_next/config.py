@@ -181,6 +181,41 @@ class Glm5NextTextConfig:
     v_head_dim: int = 256
     mla_use_nope: bool = True
 
+    # -- The DSA sparse indexer --------------------------------------------
+    #
+    # ``inc-glm53f-051``, authorised at design entry ``design-20260905-ad``.
+    # These seven keys are in every checkpoint this campaign targets and were
+    # DROPPED by the adapter until now, because the adapter keeps only declared
+    # fields. That was harmless while nothing read them and is not harmless any
+    # more: the indexer's four projection widths and its logit scale are all
+    # derived from ``index_n_heads`` and ``index_head_dim``, and the increment
+    # that wires the indexer must read them from the checkpoint rather than
+    # transcribe them. Adding them as fields is the whole change -- the adapter's
+    # filter and its drop log are untouched, and the log simply stops naming
+    # these seven.
+    #
+    # THE DEFAULTS ARE THE CHECKPOINT'S OWN VALUES, in this dataclass's style,
+    # read from ``../../../test/vllm_neuron/model/glm5_next/fixtures/config.json``
+    # (the ``index_*`` block) and cross-read in ``fixtures/hf-config.json``, which
+    # carries the same seven keys at the same values in a different order. A
+    # default is not an invented value here: every one of the seven is present in
+    # both fixtures, so a config that omits one is not a config this campaign has
+    # ever seen.
+    index_topk: int = 2048
+    index_n_heads: int = 32
+    index_head_dim: int = 128
+    index_kpool: int = 4
+    index_kpool_compress: bool = True
+    index_kpool_always_select_tail: bool = True
+    index_share_for_mtp_iteration: bool = True
+    #
+    # ``indexer_rope_interleave`` is deliberately NOT modelled and stays a
+    # dropped key. It is spelled ``indexer_``, not ``index_``, and it selects a
+    # rotary interleaving this checkpoint cannot reach: ``qk_rope_head_dim`` is 0
+    # above, so there is no rotary slice to interleave. Modelling it would add a
+    # field no code can act on, which is the untestable-branch case the sibling
+    # sections already refuse.
+
     # -- MoE ---------------------------------------------------------------
     n_routed_experts: int = 288
     n_shared_experts: int = 1
