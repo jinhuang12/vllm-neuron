@@ -57,7 +57,9 @@ from vllm_neuron.model.glm5_next.model_fp8 import (
     Glm5NextSharedExpertRouteError,
     Glm5NextSharedExperts,
     Glm5NextWeightLoadError,
+    _WEIGHT_LEAF_SUFFIX,
     _is_fp8_dtype,
+    _scale_prep_leaves,
 )
 from vllm_neuron.model.glm5_next.quantization import DEFAULT_WEIGHT_BLOCK_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
@@ -2002,8 +2004,9 @@ def _stacked_bank_geometry(experts: int, per_rank: int):
     """A stand-in owner declaring a fixed expert partition, for a direct call.
 
     Conjunct 3 needs a geometry it chose rather than the one the model resolved,
-    and conjunct 4 needs an owner that declares nothing. Both are one object each,
-    so neither reaches for a real model it does not need.
+    so this is one object instead of a real model it does not need. It is the only
+    caller's owner: the refusal reading builds its own bare object, because an
+    owner that declares NOTHING is what that reading is about.
     """
 
     class Owner:
@@ -2402,3 +2405,503 @@ def test_the_stacked_bank_refusal_is_gone_for_this_case_only(tmp_path) -> None:
         )
     print(f"CONJUNCT4_REFUSALS_CHECKED={len(refusals)}")
     assert len(refusals) == 3, "one of the malformed shapes did not refuse"
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-095b -- the bank's scale grids reach the module, and the prep
+# loop's leaf derivation reads PRESENCE. Three items, selected by ``-k
+# bankscale``, one per conjunct.
+#
+# WHY THE BANK'S OWN SCALE PREP IS NOT HERE. It was designed here and moved to
+# ``inc-glm53f-054`` at design entry ``design-20260905-x``, on a reading this
+# seat took first: the miniature every load in this file reads is 128 x 128 with
+# (1, 1) grids, ``BLOCK_QUANT_SIZE`` is 256, and both ``retile_block_scales``
+# and ``scale_grid_shape`` refuse an extent that is not a multiple of it. The
+# prep loop's gate is a TYPE test, so a prep on the bank would fire inside
+# ``-095``'s own conjunct-1 load -- the one completing load in this file that
+# carries a bank -- and break it. Measured in
+# ``increments/probe-095b-geometry-r3.out``; ``-054``'s configuration already
+# requires ``hidden_size % 256 == 0``, so the prep belongs there.
+#
+# So these three items read the two halves that DO belong here: the grids
+# arriving, and the derivation that will hand them over when ``-054`` adds the
+# prep. Every configuration and constant is the landed one, reused rather than
+# copied.
+# --------------------------------------------------------------------------- #
+
+#: The three projection leaves that have a scale grid, stated INDEPENDENTLY of
+#: the code under test because it is the expected answer: a value derived from
+#: the same declaration the helper reads could not disagree with it. The items
+#: below assert against this AND against the declaration tuple, so a change to
+#: ``Glm5NextRoutedExperts`` reddens them rather than passing beside them.
+BANKSCALE_LEAVES = ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
+
+
+def _scale_grid_attribute(leaf: str) -> str:
+    """The attribute a weight leaf's scale grid arrives under -- ASKED, not retyped.
+
+    LEG D ROUND 1 FAILED HERE, and this helper is the repair. This section first
+    wrote the name as ``f"{leaf}_{FP8_SCALE_SUFFIX}"`` in four places, which
+    doubles the weight suffix: the rule STRIPS ``_weight`` before it appends, so
+    ``gate_proj_weight`` names ``gate_proj_weight_scale_inv`` and not
+    ``gate_proj_weight_weight_scale_inv``. Items (1) and (2) both went red, item
+    (1) reading zero grids present and item (2)'s shared-expert control attaching
+    its grids where nothing would look for them.
+
+    The rule has ONE definition,
+    :meth:`Glm5NextForConditionalGeneration._sibling_scale_grid_name`, and this
+    asks that definition. The source helper's own docstring says a second copy of
+    the naming rule is the drift this file's one-classifier convention exists to
+    prevent; round 1 is what that sentence was warning about.
+
+    ASKING DOES NOT MAKE THE ITEMS CIRCULAR. The name is not what they measure.
+    They measure that a grid ARRIVES, with the right leading axis, holding expert
+    ``e``'s own bytes in row ``[e]``, at the one name both source sites use -- the
+    ``setattr`` in the reader and the ``hasattr`` in ``_scale_prep_leaves``. If
+    those two ever disagreed, the arrival reading would go red no matter which of
+    them this helper agreed with. Item (1) also keeps the wrong name of round 1 as
+    a printed control, so the fact that the rule strips is itself on the record.
+    """
+    return Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+
+
+def _alter_one_scale_slice(directory: Path, key: str) -> float:
+    """Add 1.0 to every element of ONE scale key, in the written file.
+
+    The D1.5 control for conjunct (1). Every other tensor is carried across
+    unchanged, read back from the file rather than rebuilt, so the only thing
+    that differs between the two loads is this one expert's grid -- which is what
+    makes "exactly one row moved" a measurement of the row-to-expert mapping
+    rather than of the write.
+    """
+    path = directory / MINI_CHECKPOINT_FILE
+    tensors: dict[str, torch.Tensor] = {}
+    with safe_open(str(path), framework="pt") as opened:
+        for name in opened.keys():
+            tensors[name] = opened.get_tensor(name)
+    tensors[key] = tensors[key].to(torch.float32) + 1.0
+    save_file(tensors, str(path))
+    return float(tensors[key].flatten()[0])
+
+
+def _bank_owner_paths(banks: dict[str, list[str]]) -> list[str]:
+    """The module paths that own the bank entries, deduplicated and sorted."""
+    return sorted({name.rsplit(".", 1)[0] for name in banks})
+
+
+def test_bankscale_grids_arrive_on_the_bank_as_plain_attributes(
+    tmp_path, single_rank_process_group
+) -> None:
+    """(1) THE BANK'S SCALE GRIDS ARRIVE, as plain attributes, row per expert.
+
+    Certifies the bank branch of
+    :meth:`Glm5NextForConditionalGeneration._load_out_of_band_scales` as
+    ``load_weights`` reaches it. FOUR readings and each has its own control.
+
+    (i) After a completing load of ``-095``'s miniature bank, every bank module
+    carries ``gate_proj_weight_scale_inv``, ``up_proj_weight_scale_inv`` and
+    ``down_proj_weight_scale_inv``, and NONE of those names is in
+    ``named_parameters()`` -- asserted by name, because that is the whole design
+    ground for the plain-attribute convention: a registered parameter would add a
+    name the weight map does not carry.
+
+    (ii) Each grid's leading axis is the module's OWN ``num_local_experts``, read
+    off the module rather than from a constant.
+
+    (iii) Row ``[e]`` is bit-identical to expert ``e``'s checkpoint grid through
+    the SAME compensation the loader applies, :func:`compensate_block_scales`.
+    ``torch.equal``, not a tolerance: a stack is a permutation of its inputs, so
+    any difference at all is an indexing defect. The landed writer gives every
+    expert identical bytes, so :func:`_distinguish_bank_experts` runs first --
+    otherwise every row would match every reference and the reading would certify
+    nothing.
+
+    (iv) THE READER'S RETURN RISES BY EXACTLY THREE PER BANK, read from the
+    return value of a direct call. Its control MOVES: the same call with the bank
+    entries removed from the map reads only the lone grids, and the difference is
+    the bank-entry count.
+
+    THE D1.5 CONTROL FOR (iii) is a second checkpoint identical to the first
+    except that ONE expert's scale slice has 1.0 added. Exactly one row of the
+    loaded grid differs, and it is that expert's row. A reader that stacked the
+    same grid E times, or ignored the file, would move zero rows or all of them.
+    """
+    device = torch.device("cpu")
+    directory = tmp_path / "bankscale"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+    _write_miniature_checkpoint(directory, mappings, model)
+    banks = _bank_entries(mappings)
+    assert banks, (
+        "this configuration produced no expert-bank entry, so conjunct (1) would "
+        "certify nothing: the branch it exercises could not be reached"
+    )
+    owner_paths = _bank_owner_paths(banks)
+    subject = sorted(banks)[0]
+    subject_keys = banks[subject]
+    layout = bank_layout(subject_keys, param_name=subject)
+    _distinguish_bank_experts(directory, subject_keys)
+
+    print(f"BANKSCALE1_BANK_ENTRIES={len(banks)}")
+    print(f"BANKSCALE1_BANK_MODULES={len(owner_paths)}")
+    print(f"BANKSCALE1_SUBJECT={subject} EXPERTS={layout.experts}")
+
+    model.load_weights(str(directory), device, None)
+
+    # ── (i) the three attributes, and none of them a parameter ───────────────
+    # The names are ASKED for. Round 1 retyped them and doubled the weight
+    # suffix, so the wrong form is printed beside the right one and asserted to
+    # differ: that keeps "the rule strips" a reading rather than a memory.
+    resolved = [_scale_grid_attribute(leaf) for leaf in BANKSCALE_LEAVES]
+    retyped = [f"{leaf}_{FP8_SCALE_SUFFIX}" for leaf in BANKSCALE_LEAVES]
+    print(f"BANKSCALE1_ATTRIBUTES={'|'.join(resolved)}")
+    print(f"BANKSCALE1_CONTROL_RETYPED_ATTRIBUTES={'|'.join(retyped)}")
+    assert all(a != b for a, b in zip(resolved, retyped)), (
+        f"the resolved attribute names {resolved} equal the retyped ones "
+        f"{retyped}, so the naming rule no longer strips the weight suffix and "
+        f"round 1's defect would now pass unnoticed"
+    )
+
+    parameter_names = set(dict(model.named_parameters()))
+    present: dict[str, tuple[int, ...]] = {}
+    missing: list[str] = []
+    as_parameters: list[str] = []
+    axes: dict[str, int] = {}
+    for path in owner_paths:
+        module = model.get_submodule(path)
+        for leaf in BANKSCALE_LEAVES:
+            attribute = _scale_grid_attribute(leaf)
+            dotted = f"{path}.{attribute}"
+            grid = getattr(module, attribute, None)
+            if grid is None:
+                missing.append(dotted)
+                continue
+            present[dotted] = tuple(grid.shape)
+            axes[dotted] = int(grid.shape[0]) - int(module.num_local_experts)
+            if dotted in parameter_names:
+                as_parameters.append(dotted)
+
+    print(f"BANKSCALE1_GRIDS_PRESENT={len(present)}")
+    print(f"BANKSCALE1_GRIDS_MISSING={missing}")
+    print(f"BANKSCALE1_GRIDS_IN_NAMED_PARAMETERS={as_parameters}")
+    print(f"BANKSCALE1_ONE_GRID={sorted(present)[0]} shape={present[sorted(present)[0]]}")
+    print(f"BANKSCALE1_LEADING_AXIS_MINUS_LOCAL_EXPERTS={sorted(set(axes.values()))}")
+
+    assert missing == [], (
+        f"{len(missing)} bank scale grids never arrived, e.g. {missing[:3]}; the "
+        f"reader's bank branch did not run or stored them under other names"
+    )
+    assert len(present) == 3 * len(owner_paths), (
+        f"expected three grids on each of {len(owner_paths)} bank modules, found "
+        f"{len(present)}"
+    )
+    assert as_parameters == [], (
+        f"{len(as_parameters)} scale grids were registered as parameters, e.g. "
+        f"{as_parameters[:3]}. Registering one adds a name to named_parameters() "
+        f"that the weight map does not carry, which is the map widening the "
+        f"plain-attribute convention exists to avoid"
+    )
+    # ── (ii) the leading axis is the module's own local expert count ──────────
+    assert set(axes.values()) == {0}, (
+        f"a grid's leading axis is not its module's num_local_experts: read "
+        f"differences {sorted(set(axes.values()))}, expected [0]"
+    )
+
+    # ── (iii) row [e] is expert e's own grid through the same compensation ────
+    owner = model.get_submodule(subject.rsplit(".", 1)[0])
+    attribute = _scale_grid_attribute(subject.rsplit(".", 1)[1])
+    grid = getattr(owner, attribute)
+    references = [
+        compensate_block_scales(
+            _checkpoint_tensor(directory, subject_keys[position])
+        ).scale_inv
+        for position in layout.scale_at
+    ]
+    unequal = [
+        expert
+        for expert in range(layout.experts)
+        if not torch.equal(grid[expert], references[expert])
+    ]
+    print(f"BANKSCALE1_ROWS_COMPARED={layout.experts}")
+    print(f"BANKSCALE1_ROWS_NOT_BIT_IDENTICAL={unequal}")
+    assert unequal == [], (
+        f"rows {unequal} are not bit-identical to their own expert's grid "
+        f"through compensate_block_scales. A stack is a permutation of its "
+        f"inputs, so this is an indexing defect and not a tolerance question"
+    )
+
+    # ── (iv) the return rises by exactly three per bank, with its control ────
+    without_banks = {
+        name: keys for name, keys in mappings.items() if name not in banks
+    }
+    full_read = _stacked_model()._load_out_of_band_scales(
+        SafetensorsCheckpoint(str(directory)), mappings, device
+    )
+    lone_read = _stacked_model()._load_out_of_band_scales(
+        SafetensorsCheckpoint(str(directory)), without_banks, device
+    )
+    print(f"BANKSCALE1_READ_WITH_BANKS={full_read}")
+    print(f"BANKSCALE1_READ_CONTROL_WITHOUT_BANK_ENTRIES={lone_read}")
+    print(f"BANKSCALE1_RISE={full_read - lone_read}")
+    assert full_read - lone_read == len(banks), (
+        f"the reader's return rose by {full_read - lone_read} with the bank "
+        f"entries in the map, not by the {len(banks)} bank entries it read"
+    )
+    assert len(banks) == 3 * len(owner_paths), (
+        f"{len(banks)} bank entries over {len(owner_paths)} bank modules is not "
+        f"three per bank, so the rise above is not the per-bank rise"
+    )
+
+    # ── the D1.5 control: alter ONE scale slice, move EXACTLY one row ─────────
+    control_directory = tmp_path / "bankscale-control"
+    control_model = _stacked_model()
+    _write_miniature_checkpoint(control_directory, mappings, control_model)
+    _distinguish_bank_experts(control_directory, subject_keys)
+    altered_expert = layout.experts - 1
+    altered_key = subject_keys[layout.scale_at[altered_expert]]
+    _alter_one_scale_slice(control_directory, altered_key)
+    control_model.load_weights(str(control_directory), device, None)
+    control_grid = getattr(
+        control_model.get_submodule(subject.rsplit(".", 1)[0]), attribute
+    )
+    moved = [
+        expert
+        for expert in range(layout.experts)
+        if not torch.equal(grid[expert], control_grid[expert])
+    ]
+    print(f"BANKSCALE1_CONTROL_ALTERED_KEY={altered_key}")
+    print(f"BANKSCALE1_CONTROL_ROWS_MOVED={moved}")
+    assert moved == [altered_expert], (
+        f"altering expert {altered_expert}'s scale slice moved rows {moved}. "
+        f"Zero rows means the reader is not reading this file; every row means "
+        f"it is not reading per expert"
+    )
+
+
+def test_bankscale_leaf_derivation_reads_presence_not_declaration(
+    tmp_path, single_rank_process_group
+) -> None:
+    """(2) THE DERIVATION READS PRESENCE, and the bank is where that shows.
+
+    Certifies :func:`_scale_prep_leaves`, the helper ``inc-glm53f-095b`` factored
+    out of ``_run_load_time_preps``. TWO readings and TWO controls, all four in
+    this one run.
+
+    (i) On the loaded bank the helper returns exactly the three projection leaves
+    and NOT ``router_weight`` -- which the bank does declare, which does end in
+    the weight suffix, and which has no scale grid anywhere in this tree.
+
+    (ii) On a shared-expert module with its three grids attached it returns that
+    module's three leaves, so the presence test did not narrow the landed caller.
+
+    THE FIRST CONTROL MOVES ON THE SAME MODULE: the UNFACTORED derivation -- the
+    declaration tuple filtered by the weight suffix and nothing else, which is
+    what the loop read before this increment -- returns four leaves for the same
+    bank, including ``router_weight``. So (i) is a measurement of the presence
+    conjunct and not of the tuple's contents.
+
+    THE SECOND CONTROL MOVES ON THE SAME CLASS: a shared-expert module with NO
+    grids attached returns zero leaves, so the helper is reading the attributes
+    and not the class.
+
+    BOTH ALTERNATIVE DERIVATIONS ARE ALREADY ON RECORD, measured before this item
+    was authored: the unfactored four-leaf / eight-operand reading in
+    ``increments/probe-095b-readfirst-r3.out``, and entry v's
+    declaration-membership variant -- zero leaves for the shared expert and the
+    six-argument ``TypeError`` -- in ``increments/probe-095b-conjunct.out``.
+    """
+    device = torch.device("cpu")
+    directory = tmp_path / "bankscale-leaves"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+    _write_miniature_checkpoint(directory, mappings, model)
+    banks = _bank_entries(mappings)
+    assert banks, "no bank entry, so this item has no subject"
+    model.load_weights(str(directory), device, None)
+
+    bank = model.get_submodule(_bank_owner_paths(banks)[0])
+    declared = tuple(getattr(bank, "declared_param_names", ()))
+    leaves = _scale_prep_leaves(bank)
+
+    # The first control: what the loop derived BEFORE this increment factored it.
+    unfactored = [
+        leaf for leaf in declared if leaf.endswith(_WEIGHT_LEAF_SUFFIX)
+    ]
+
+    print(f"BANKSCALE2_BANK_DECLARES={'|'.join(declared)}")
+    print(f"BANKSCALE2_LEAVES={'|'.join(leaves)}")
+    print(f"BANKSCALE2_CONTROL_UNFACTORED_LEAVES={'|'.join(unfactored)}")
+    print(f"BANKSCALE2_ROUTER_IN_LEAVES={'router_weight' in leaves}")
+    print(f"BANKSCALE2_ROUTER_IN_UNFACTORED={'router_weight' in unfactored}")
+    print(
+        "BANKSCALE2_ROUTER_SCALE_ON_THE_MODULE="
+        f"{hasattr(bank, _scale_grid_attribute('router_weight'))}"
+    )
+
+    assert leaves == list(BANKSCALE_LEAVES), (
+        f"the helper returned {leaves} for a loaded bank, not the three "
+        f"projection leaves {list(BANKSCALE_LEAVES)} whose grids arrived"
+    )
+    assert "router_weight" in declared, (
+        "the bank no longer declares router_weight, so this item's control has "
+        "lost its subject and the reading below certifies nothing"
+    )
+    assert "router_weight" in unfactored and len(unfactored) == len(leaves) + 1, (
+        f"the unfactored derivation returned {unfactored}, which does not differ "
+        f"from the factored one by router_weight; the control did not move, so "
+        f"the reading above would hold for a helper that filtered nothing"
+    )
+
+    # ── (ii) the landed caller's own module, with and without its grids ───────
+    shared = Glm5NextSharedExperts(_dense_config().text_config)
+    bare = _scale_prep_leaves(shared)
+    for leaf in BANKSCALE_LEAVES:
+        setattr(shared, _scale_grid_attribute(leaf), torch.zeros(1, 1))
+    attached = _scale_prep_leaves(shared)
+
+    print(f"BANKSCALE2_SHARED_DECLARES={'|'.join(shared.declared_param_names)}")
+    print(f"BANKSCALE2_SHARED_CONTROL_NO_GRIDS={bare}")
+    print(f"BANKSCALE2_SHARED_WITH_GRIDS={'|'.join(attached)}")
+
+    assert attached == list(BANKSCALE_LEAVES), (
+        f"the helper returned {attached} for a shared expert with its three grids "
+        f"attached, so the presence test narrowed the landed caller"
+    )
+    assert bare == [], (
+        f"the helper returned {bare} for a shared expert with NO grids attached, "
+        f"so it is reading the class rather than the attributes and the reading "
+        f"above would hold whether the grids arrived or not"
+    )
+
+
+def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """(3) THE LOOP'S BEHAVIOUR IS UNCHANGED for every landed module.
+
+    Certifies ``_run_load_time_preps``'s visit, read from its RETURN VALUE. The
+    bank now carries three scale grids, and the question this item answers is
+    whether that changed who the loop calls. It did not, and it could not: the
+    loop's gate is a TYPE test and ``Glm5NextRoutedExperts`` defines no
+    ``prepare_scale_operands`` -- ``inc-glm53f-054``'s work, moved there at design
+    entry ``design-20260905-x``.
+
+    (i) On a completing load of the bank configuration, the returned pair equals
+    the module counts the loop's own two gates select, derived from the tree
+    rather than written down. The scale count is zero because this configuration
+    builds no shared-expert module, and no bank is visited.
+
+    THE CONTROL MOVES, which is what makes that zero a reading. A stub
+    ``prepare_scale_operands`` is planted on the BANK'S TYPE -- the thing the gate
+    actually tests -- and the scale count rises by the number of bank modules. The
+    stub is reached through the full landed path: the device pre-flight passes,
+    ``_scale_prep_leaves`` hands over three leaves, and the operands the loop
+    collects include the three grids conjunct (1) read. So the zero above means
+    "no bank declares a prep", not "the loop cannot reach one".
+    """
+    device = torch.device("cpu")
+    directory = tmp_path / "bankscale-loop"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+    _write_miniature_checkpoint(directory, mappings, model)
+    banks = _bank_entries(mappings)
+    owner_paths = _bank_owner_paths(banks)
+    assert owner_paths, "no bank module, so this item has no subject"
+    model.load_weights(str(directory), device, None)
+
+    expected_projection = sum(
+        1
+        for _, module in model.named_modules()
+        if hasattr(type(module), "prepare_projection_weights")
+    )
+    expected_scale = sum(
+        1
+        for _, module in model.named_modules()
+        if hasattr(type(module), "prepare_scale_operands")
+    )
+    projection_calls, scale_calls = model._run_load_time_preps(device)
+
+    print(f"BANKSCALE3_MODULES_WITH_A_PROJECTION_PREP={expected_projection}")
+    print(f"BANKSCALE3_MODULES_WITH_A_SCALE_PREP={expected_scale}")
+    print(f"BANKSCALE3_RETURNED_PAIR=({projection_calls}, {scale_calls})")
+    print(f"BANKSCALE3_BANK_MODULES={len(owner_paths)}")
+
+    assert (projection_calls, scale_calls) == (expected_projection, expected_scale), (
+        f"the loop returned ({projection_calls}, {scale_calls}) where its own two "
+        f"gates select ({expected_projection}, {expected_scale}) modules, so it "
+        f"visited something other than what it tests for"
+    )
+    assert scale_calls == 0, (
+        f"the loop ran {scale_calls} scale preps on a configuration with no "
+        f"shared-expert module, so it is now visiting a bank -- which is "
+        f"inc-glm53f-054's work and breaks the 128-extent load this file reads"
+    )
+
+    # ── the same reading on the DENSE configuration ──────────────────────────
+    # Six of the seven completing loads in this file build ``_dense_model()``, and
+    # the STOP condition of this increment's block is that none of their readings
+    # moves. The bank branch cannot reach this tree -- an all-dense config has no
+    # sparse layer and so no bank entry -- and the pair is read here to say so
+    # from the return value rather than from that argument.
+    dense_directory = tmp_path / "bankscale-loop-dense"
+    dense = _dense_model()
+    dense_mappings = _mappings_for(_dense_config())
+    _write_miniature_checkpoint(dense_directory, dense_mappings, dense)
+    dense.load_weights(str(dense_directory), device, None)
+    dense_banks = _bank_entries(dense_mappings)
+    dense_expected = (
+        sum(
+            1
+            for _, module in dense.named_modules()
+            if hasattr(type(module), "prepare_projection_weights")
+        ),
+        sum(
+            1
+            for _, module in dense.named_modules()
+            if hasattr(type(module), "prepare_scale_operands")
+        ),
+    )
+    dense_pair = dense._run_load_time_preps(device)
+    print(f"BANKSCALE3_DENSE_BANK_ENTRIES={len(dense_banks)}")
+    print(f"BANKSCALE3_DENSE_RETURNED_PAIR={dense_pair}")
+    print(f"BANKSCALE3_DENSE_GATES_SELECT={dense_expected}")
+    assert dense_banks == {}, (
+        f"the all-dense configuration produced {len(dense_banks)} bank entries, "
+        f"so it is no longer the bank-free tree the landed items read"
+    )
+    assert dense_pair == dense_expected, (
+        f"the loop returned {dense_pair} on the dense tree where its own gates "
+        f"select {dense_expected}"
+    )
+
+    # ── the control, and it MOVES: plant a prep on the BANK'S TYPE ────────────
+    handed: dict[str, list[str]] = {}
+
+    def stub(self, **operands) -> None:
+        handed[type(self).__name__] = sorted(operands)
+
+    bank_type = type(model.get_submodule(owner_paths[0]))
+    monkeypatch.setattr(bank_type, "prepare_scale_operands", stub, raising=False)
+    planted_projection, planted_scale = model._run_load_time_preps(device)
+
+    print(f"BANKSCALE3_CONTROL_PLANTED_ON={bank_type.__name__}")
+    print(f"BANKSCALE3_CONTROL_RETURNED_PAIR=({planted_projection}, {planted_scale})")
+    print(f"BANKSCALE3_CONTROL_OPERANDS_HANDED_OVER={handed}")
+
+    assert planted_scale == len(owner_paths), (
+        f"with a prep planted on {bank_type.__name__} the loop ran "
+        f"{planted_scale} scale preps over {len(owner_paths)} bank modules, so "
+        f"the zero above is not a reading of who declares a prep"
+    )
+    assert planted_projection == projection_calls, (
+        f"planting a SCALE prep moved the projection count from "
+        f"{projection_calls} to {planted_projection}"
+    )
+    expected_operands = sorted(
+        [leaf for leaf in BANKSCALE_LEAVES]
+        + [f"{leaf[: -len(_WEIGHT_LEAF_SUFFIX)]}_scale" for leaf in BANKSCALE_LEAVES]
+    )
+    assert handed.get(bank_type.__name__) == expected_operands, (
+        f"the planted prep was handed {handed.get(bank_type.__name__)}, not the "
+        f"six operands {expected_operands} the three arrived grids imply"
+    )

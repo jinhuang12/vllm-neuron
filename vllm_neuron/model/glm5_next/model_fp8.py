@@ -86,6 +86,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     dequantise_blockwise,
     loader_for_mapped_keys,
     scale_keys,
+    stacked_expert_scale_loader,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
@@ -3421,6 +3422,46 @@ _FP8_DTYPE = torch.float8_e4m3fn
 _WEIGHT_LEAF_SUFFIX = "_weight"
 
 
+def _scale_prep_leaves(module: nn.Module) -> list[str]:
+    """The declared weight leaves whose scale grid is actually ON the module.
+
+    ``inc-glm53f-095b``. Factored out of
+    :meth:`Glm5NextForConditionalGeneration._run_load_time_preps`, where the same
+    derivation read the declaration tuple and nothing else.
+
+    IT READS PRESENCE BECAUSE PRESENCE IS WHAT THE LOOP DOES NEXT. For every leaf
+    this returns, the caller takes a bare ``getattr`` of the sibling grid with no
+    default, so a leaf kept here on the strength of a DECLARATION would raise
+    ``AttributeError`` the moment that grid had not arrived. The routed expert
+    bank is where the two answers part: it declares ``router_weight``, and no
+    ``router_weight_scale_inv`` exists anywhere in this tree. The unfactored
+    derivation yielded four leaves and eight operands for a bank; this one yields
+    the three leaves that have grids.
+
+    AND A DECLARATION TEST WOULD BE WRONG IN THE OTHER DIRECTION TOO. Scale grids
+    in this tree are deliberately plain attributes rather than registered
+    parameters, for the reason recorded on
+    :meth:`Glm5NextForConditionalGeneration._load_out_of_band_scales`, so NO
+    module in this file declares one. A membership test against
+    ``declared_param_names`` therefore returns nothing at all for the shared
+    expert, whose six-operand prep then fails on six missing positional
+    arguments.
+
+    The name helper is reached through the class because that ``@staticmethod`` is
+    its single definition; a second copy of the naming rule here is the drift this
+    file's one-classifier convention exists to prevent.
+    """
+    return [
+        leaf
+        for leaf in getattr(module, "declared_param_names", ())
+        if leaf.endswith(_WEIGHT_LEAF_SUFFIX)
+        and hasattr(
+            module,
+            Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf),
+        )
+    ]
+
+
 class Glm5NextWeightLoadError(ValueError):
     """A checkpoint could not be read onto this model tree.
 
@@ -3536,8 +3577,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         bank placeholders on the real configuration would then be bf16 while
         their loader delivers fp8, and the reader warns on exactly that mismatch
         (``utils/checkpoints.py:437``, ``:570-575``). Settled from source before
-        the fourth kind was added, not after:
-        ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/contradiction-095-refusal-collision.md``.
+        the fourth kind was added, not after -- ``inc-glm53f-095``'s
+        refusal-collision reading, recorded with that increment.
         This is the second consumer in "one classifier, two consumers", and it
         moves whenever the classifier gains a kind.
 
@@ -3840,15 +3881,84 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ``:2813``. Plain, not a registered parameter: registering it would add a
         name to ``named_parameters()`` that the map does not carry, which is the
         map widening this method exists to avoid.
+
+        AND A ROUTED EXPERT BANK IS READ HERE TOO, added by ``inc-glm53f-095b``.
+        A bank's E scale grids are interleaved with its E weight keys inside ONE
+        map entry, so the lone-grid path below cannot see them: it wants a single
+        companion scale and finds E. The bank branch asks the landed classifier
+        whether an entry is a bank, hands the whole key list to ``-095``'s
+        stacking loader, and stores the result under the SAME plain-attribute
+        name -- so the bank gains three attributes per layer while
+        ``named_parameters()``, ``build_weight_mappings`` and
+        ``inc-glm53f-085``'s asserted set stay where they landed. The
+        kernel-side consumption of those grids is
+        ``inc-glm53f-054``: no module in this file declares a
+        ``prepare_scale_operands`` for a bank yet, so the prep loop does not
+        visit one.
         """
         checkpoint._ensure_indexed()
         read = 0
         for param_name, keys in mappings.items():
             key_list = [keys] if isinstance(keys, str) else list(keys)
             scales = scale_keys(key_list)
+            if classify_mapped_keys(key_list) == MAPPED_KEY_STACKED_BANK:
+                # ``inc-glm53f-095b``. A BANK DOES REACH HERE, and it is the one
+                # entry shape the lone-grid path below cannot serve: its E scale
+                # grids travel interleaved with its E weight keys inside this one
+                # entry, so there is no companion entry to read and no single
+                # ``scales[0]`` to read it from. The classifier is asked rather
+                # than re-derived, so "what is a bank" has one answer in this file
+                # and not two.
+                #
+                # THE RANK IS RESOLVED HERE, not taken as an argument. The
+                # loader's transform needs one, and both landed call sites in
+                # ``load_weights`` pass this method three positionals; widening
+                # its signature to thread a rank through would move landed code
+                # for a value ``_resolve_rank`` already owns.
+                module_path, _, leaf = param_name.rpartition(".")
+                attribute = self._sibling_scale_grid_name(leaf)
+                if not attribute:
+                    raise Glm5NextWeightLoadError(
+                        f"{param_name} is a bank of "
+                        f"{len(scales)} expert scale grids but its leaf name "
+                        f"does not end in {_WEIGHT_LEAF_SUFFIX!r}, so the "
+                        f"stacked grid has no name to be stored under; the map "
+                        f"and this reader disagree about what a weight "
+                        f"parameter is called"
+                    )
+                absent = [
+                    key
+                    for key in key_list
+                    if key not in checkpoint._tensor_name_to_file
+                ]
+                if absent:
+                    raise Glm5NextWeightLoadError(
+                        f"{param_name} is a bank of {len(scales)} experts and "
+                        f"{len(absent)} of its {len(key_list)} checkpoint keys "
+                        f"are absent, first {absent[0]!r}, so its fp8 bytes "
+                        f"cannot be dequantised; reading a default of 1.0 here "
+                        f"would use the bytes as if they were numbers"
+                    )
+                module = self.get_submodule(module_path) if module_path else self
+                # ``-095``'s landed loader is what de-interleaves and stacks
+                # these grids -- this rank's experts through
+                # ``local_expert_indices``, each grid compensated by
+                # ``compensate_block_scales``, stacked on the leading axis in
+                # expert order, so row ``[e]`` matches the weight bank's row
+                # ``[e]``. It was landed "to be CALLED rather than attached"
+                # (``weight_loaders_fp8.py:1894-1903``) and this is that caller.
+                grid = stacked_expert_scale_loader(
+                    key_list, param_name=param_name, owner=module
+                ).load(
+                    [checkpoint._get_slice(key) for key in key_list],
+                    _resolve_rank(),
+                )
+                setattr(module, attribute, grid.to(dtype=torch.float32, device=device))
+                read += 1
+                continue
             if len(key_list) < 2 or len(scales) != 1:
                 # A lone scale grid already has its own parameter, and a bank
-                # never reaches here -- the loader choice refused it long before.
+                # takes the branch above.
                 continue
             module_path, _, leaf = param_name.rpartition(".")
             attribute = self._sibling_scale_grid_name(leaf)
@@ -3924,14 +4034,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if hasattr(type(module), "prepare_scale_operands"):
                 # The projection names come off the module's OWN declaration
                 # tuple, so this call cannot ask for a projection the shared
-                # expert does not have. Passed by KEYWORD: the prep takes six
-                # positional operands and a silent reordering of three weights
-                # against three scales would compute a wrong answer at exactly
-                # the right shapes.
+                # expert does not have -- and, since ``inc-glm53f-095b`` factored
+                # the derivation into ``_scale_prep_leaves``, only for one whose
+                # scale grid is present to be read two lines below. Passed by
+                # KEYWORD: the prep takes six positional operands and a silent
+                # reordering of three weights against three scales would compute
+                # a wrong answer at exactly the right shapes.
                 names = [
                     leaf[: -len(_WEIGHT_LEAF_SUFFIX)]
-                    for leaf in getattr(module, "declared_param_names", ())
-                    if leaf.endswith(_WEIGHT_LEAF_SUFFIX)
+                    for leaf in _scale_prep_leaves(module)
                 ]
                 self._require_prep_operands_on_device(path, module, names, device)
                 operands = {}
