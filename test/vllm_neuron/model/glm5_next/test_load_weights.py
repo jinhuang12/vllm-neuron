@@ -47,6 +47,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 import vllm_neuron
+import vllm_neuron.model.glm5_next.factory  # noqa: F401 -- bound as _FACTORY below
+import vllm_neuron.parallel.neuron_parallel_state  # noqa: F401 -- bound as _NPS below
 from vllm_neuron.model.glm5_next.config import (
     DSA_LAYER_TYPE,
     Glm5NextConfig,
@@ -77,6 +79,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     build_weight_mappings,
     classify_mapped_keys,
     compensate_block_scales,
+    dequantise_blockwise,
     downscale_fp8_weight_bytes,
     loader_for_mapped_keys,
     scale_keys,
@@ -2960,6 +2963,15 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 _MODEL_FP8 = vllm_neuron.model.glm5_next.model_fp8
 _WL_FP8 = vllm_neuron.model.glm5_next.weight_loaders_fp8
 
+# ``inc-glm53f-101``. Two more modules reached by NAME rather than by a re-import,
+# because the code under test imports them FUNCTION-LOCALLY -- the expert-parallel
+# getters inside ``weight_loaders_fp8`` and ``_resolve_ep_degree`` inside
+# ``Glm5NextRoutedExperts.__init__``. A function-local import resolves the attribute
+# on the module object at call time, so patching the module here is what the loader
+# actually reads.
+_NPS = vllm_neuron.parallel.neuron_parallel_state
+_FACTORY = vllm_neuron.model.glm5_next.factory
+
 #: The shard fixture's linear-attention widths: the config's own four keys
 #: (``config.py:165-172``) with two values shrunk. EIGHT heads of THIRTY-TWO make
 #: a full head width of 256 and a per-rank width of 128 at world size 2 --
@@ -2973,9 +2985,18 @@ SHARD_LINEAR_ATTN = {
     "gate_lower_bound": -5.0,
 }
 
-#: The dense MLP's intermediate width, 256 for the same reason: 128 per rank is
-#: one whole block. Shrunk for size, not for correctness.
-SHARD_INTERMEDIATE = 256
+#: The dense MLP's intermediate width, 512 for the same reason it used to be 256:
+#: 256 per rank is one whole CONSUMER block. Shrunk for size, not for correctness.
+#:
+#: IT MOVED AT ``inc-glm53f-101`` (plan revision 232, DECISIONS section 80(a)), and
+#: the reason is a boundary that got wider rather than a convenience. The number
+#: that has to divide is no longer the checkpoint's 128-row tile but the consumer's
+#: 256-row block: ``blockwise_fp8_mm.scale_grid_shape`` refuses any weight extent
+#: that is not a whole number of them. At 256 the per-rank shard was 128, half a
+#: consumer block, so the padded loader rounded the width to 512 and both conjunct
+#: (1) and conjunct (2) read a shape no rank was meant to hold. At 512 the pad is a
+#: no-op at world size 2 and a REAL pad at world size 4, which item (3) reads.
+SHARD_INTERMEDIATE = 512
 
 SHARD_WORLD = 2
 
@@ -3555,18 +3576,21 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     # A BLOCK-MISALIGNED SHARD REFUSES BY NAME. The aligned case beside it is what
     # makes the refusal a boundary rather than a blanket. The exception class is
     # the one ``_refuse`` raises for every refusal in that section, bank or not.
+    # ``inc-glm53f-101`` (DECISIONS section 80(b)): the aligned case is now one whole
+    # CONSUMER block, which is two checkpoint tiles. One tile alone is what the new
+    # gate refuses, so the old aligned value became the third control below.
     aligned = _WL_FP8.shard_geometry_for_grid(
         _WL_FP8.ShardGeometry(
             shard_dim=0,
-            shard_size=DEFAULT_WEIGHT_BLOCK_SIZE[0],
+            shard_size=2 * DEFAULT_WEIGHT_BLOCK_SIZE[0],
             num_shards=SHARD_WORLD,
         ),
         param_name="probe.gate_proj_weight_scale_inv",
     )
     print(f"CONJUNCT3_ALIGNED_GRID_SHARD_SIZE={aligned.shard_size}")
-    assert aligned.shard_size == 1, (
-        f"an aligned shard of exactly one block gave {aligned.shard_size} grid "
-        f"rows, not 1"
+    assert aligned.shard_size == 2, (
+        f"an aligned shard of exactly one consumer block gave "
+        f"{aligned.shard_size} grid rows, not 2"
     )
     misaligned = DEFAULT_WEIGHT_BLOCK_SIZE[0] + 1
     with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
@@ -3583,6 +3607,43 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     )
     assert str(DEFAULT_WEIGHT_BLOCK_SIZE[0]) in message, (
         f"the refusal does not name the block boundary it enforced: {message}"
+    )
+
+    # THE THIRD CONTROL, and the one the consumer's gate exists for
+    # (``inc-glm53f-101``, DECISIONS section 80(b)). 384 rows is THREE whole
+    # checkpoint tiles, so the tile rule above lets it pass; it is one and a half
+    # consumer blocks, so the kernel cannot index it. Without this reading the new
+    # gate could be deleted and every assertion above would still pass.
+    consumer_block = _WL_FP8.consumer_block_quant_size()
+    tile_clearing_block_missing = 3 * DEFAULT_WEIGHT_BLOCK_SIZE[0]
+    print(f"CONJUNCT3_CONSUMER_BLOCK={consumer_block}")
+    print(f"CONJUNCT3_TILE_CLEARING_SHARD={tile_clearing_block_missing}")
+    assert tile_clearing_block_missing % DEFAULT_WEIGHT_BLOCK_SIZE[0] == 0, (
+        f"{tile_clearing_block_missing} is not a whole number of "
+        f"{DEFAULT_WEIGHT_BLOCK_SIZE[0]}-row tiles, so it would be refused by the "
+        f"tile rule and this control would certify nothing about the consumer's"
+    )
+    assert tile_clearing_block_missing % consumer_block != 0, (
+        f"{tile_clearing_block_missing} IS a whole number of {consumer_block}-row "
+        f"consumer blocks, so it is not the case this control means to construct"
+    )
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as consumer_refusal:
+        _WL_FP8.shard_geometry_for_grid(
+            _WL_FP8.ShardGeometry(
+                shard_dim=0,
+                shard_size=tile_clearing_block_missing,
+                num_shards=SHARD_WORLD,
+            ),
+            param_name="probe.gate_proj_weight_scale_inv",
+        )
+    consumer_message = str(consumer_refusal.value)
+    print(f"CONJUNCT3_CONSUMER_REFUSAL={consumer_message}")
+    assert "probe.gate_proj_weight_scale_inv" in consumer_message, (
+        f"the consumer refusal does not name the parameter: {consumer_message}"
+    )
+    assert str(consumer_block) in consumer_message, (
+        f"the consumer refusal does not name the {consumer_block}-row block it "
+        f"enforced: {consumer_message}"
     )
 
 
@@ -3796,4 +3857,806 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     assert "rank 1" in bounded_text and "1 ranks" in bounded_text, (
         f"the refusal does not name both the rank it was given and the size of "
         f"the partition it was checked against: {bounded_text}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-101 -- THE SIX DEFERRED FAMILIES, sharded from the checkpoint's own
+# width. Plan revision 232, design entry ``design-20260905-ap`` as amended at
+# DECISIONS section 80. Five items, one per conjunct, no ``parametrize``.
+#
+# WHY THESE SIX NEEDED A BLOCK OF THEIR OWN. ``inc-glm53f-094`` shards a family by
+# resolving its per-rank extent when the loader is attached. Neither the shared
+# expert nor the routed bank can be served that way: ``Glm5NextSharedExperts``
+# holds ``num_shared_experts`` and ``swiglu_limit`` and no width, and
+# ``Glm5NextRoutedExperts`` holds counts and degrees. Their width is read off the
+# checkpoint tensor instead, which is also the one source that cannot disagree
+# with the weights.
+#
+# AND WHY THE DENSE THREE MOVED WITH THEM. Their old width function floored --
+# 12288 // 64 is 192 -- and 192 is neither a whole checkpoint tile nor a whole
+# consumer block, so the real model could not load at the registered degree at
+# all. They now take the same padded route.
+# --------------------------------------------------------------------------- #
+
+#: The shared expert's intermediate width. A multiple of ``4 x 256``, so at world
+#: size 4 the pad is a NO-OP and this family's reassembly is exact end to end --
+#: the padded case is the dense three's, deliberately, so one item reads a pad and
+#: another reads its absence.
+SHARED_INTERMEDIATE = 2048
+
+#: One routed expert's intermediate width. A multiple of ``tp_per_ep x 256``, for
+#: the same reason and with the same intent.
+BANK_INTERMEDIATE = 512
+
+#: The world these items load at, and the expert-parallel degree inside it. FOUR
+#: rather than two because two cannot tell the bank's divisor apart from the
+#: world: at world 4 with ``ep_degree`` 2 the bank divides by 2 and the shared
+#: expert by 4, so a loader that used the wrong one reads a different shape.
+SHARD_EP_WORLD = 4
+SHARD_EP_DEGREE = 2
+SHARD_TP_PER_EP = SHARD_EP_WORLD // SHARD_EP_DEGREE
+
+#: ``(declaring class, declared leaf) -> (shard dim, full extent)`` for the SIX.
+#: Stated here rather than read from the code's table, for the reason
+#: :data:`SHARD_FAMILIES` states: the code under test and the expectation must not
+#: share one source.
+DEFERRED_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
+    ("Glm5NextSharedExperts", "gate_proj_weight"): (0, SHARED_INTERMEDIATE),
+    ("Glm5NextSharedExperts", "up_proj_weight"): (0, SHARED_INTERMEDIATE),
+    ("Glm5NextSharedExperts", "down_proj_weight"): (1, SHARED_INTERMEDIATE),
+    ("Glm5NextRoutedExperts", "gate_proj_weight"): (0, BANK_INTERMEDIATE),
+    ("Glm5NextRoutedExperts", "up_proj_weight"): (0, BANK_INTERMEDIATE),
+    ("Glm5NextRoutedExperts", "down_proj_weight"): (1, BANK_INTERMEDIATE),
+}
+
+#: The three classes, split by which rank count divides them. The bank is the one
+#: family whose divisor is not the world size.
+DEFERRED_WHOLE_WORLD_CLASSES = ("Glm5NextDenseMLP", "Glm5NextSharedExperts")
+DEFERRED_EP_GROUP_CLASSES = ("Glm5NextRoutedExperts",)
+
+
+def _padded_shard_extent(full: int, num_shards: int, block: int) -> int:
+    """One rank's extent after the width is rounded up to ``num_shards x block``.
+
+    The expectation's OWN arithmetic, written here from the rule in plain words
+    rather than imported from the loader, so the two can disagree.
+    """
+    step = num_shards * block
+    return (math.ceil(full / step) * step) // num_shards
+
+
+def _deferred_config() -> Glm5NextConfig:
+    """:func:`_shard_config`'s fixture with the shared expert switched ON.
+
+    ``n_shared_experts`` is 1 here where :func:`_shard_config` sets 0, and that is
+    the whole difference. ``-094`` set it to 0 because the shared expert's three
+    families were REPLICATED-IN-EFFECT at that increment and its own conjunct (4)
+    said so; this block attaches them, so they have to be observed by a real load.
+    """
+    return Glm5NextConfig(
+        text_config=Glm5NextTextConfig(
+            num_hidden_layers=MINI_LAYERS,
+            n_routed_experts=MINI_ROUTED_EXPERTS,
+            n_shared_experts=MINI_SHARED_EXPERTS,
+            first_k_dense_replace=MINI_FIRST_K_DENSE,
+            tie_word_embeddings=False,
+            linear_attn_config=SHARD_LINEAR_ATTN,
+            intermediate_size=SHARD_INTERMEDIATE,
+            **MINI_MLA_WIDTHS,
+        )
+    )
+
+
+def _deferred_key_overrides(
+    model: Glm5NextForConditionalGeneration,
+    mappings: dict[str, str | list[str]],
+) -> dict[str, torch.Tensor]:
+    """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
+
+    A bank entry is E weight keys and E scale keys interleaved, so its arm writes
+    one tensor per expert at that expert's own full width -- the loader's job is to
+    take a column of each, and a bank written at one shared shape could not tell a
+    column error from an expert error.
+
+    Nothing here spells a checkpoint key: the keys come from the map and the shapes
+    from :data:`DEFERRED_FAMILIES`, the same discipline
+    :func:`_shard_key_overrides` follows.
+    """
+    overrides = dict(_shard_key_overrides(model, mappings))
+    for path, module in model.named_modules():
+        cls = type(module).__name__
+        for (family, leaf), (shard_dim, full) in DEFERRED_FAMILIES.items():
+            if cls != family:
+                continue
+            param = f"{path}.{leaf}"
+            if param not in mappings:
+                continue
+            keys = _keys_of(mappings, param)
+            scales = scale_keys(keys)
+            weights = [key for key in keys if key not in scales]
+            shape = _shard_full_shape(leaf, shard_dim, full)
+            grid_shape = block_grid_shape(shape, DEFAULT_WEIGHT_BLOCK_SIZE)
+            for key in weights:
+                overrides[key] = _shard_pattern(
+                    shape, shard_dim, torch.float8_e4m3fn
+                )
+            for key in scales:
+                overrides[key] = _shard_pattern(grid_shape, shard_dim, torch.float32)
+    return overrides
+
+
+def _deferred_checkpoint(tmp_path: Path) -> tuple[Path, dict, dict]:
+    """One checkpoint holding every full tensor these five items read."""
+    config = _deferred_config()
+    mappings = _mappings_for(config)
+    reference = Glm5NextForConditionalGeneration(config)
+    overrides = _deferred_key_overrides(reference, mappings)
+    directory = tmp_path / "deferred"
+    _write_miniature_checkpoint(
+        directory, mappings, reference, extra_overrides=overrides
+    )
+    return directory, overrides, mappings
+
+
+class _FixtureGroup:
+    """The two fields this file's code reads off a ``GroupCoordinator``.
+
+    Not a stand-in for the real class: the two attributes are the two the loader
+    asks for -- ``rank_in_group`` (``parallel/neuron_parallel_state.py:1206``) and
+    ``world_size`` (``:1199``) -- and their VALUES come from the package's own
+    ``_build_ep_group_ranks`` in every item below, never from a number typed here.
+    """
+
+    def __init__(self, rank_in_group: int, world_size: int) -> None:
+        self.rank_in_group = rank_in_group
+        self.world_size = world_size
+
+
+def _mesh_answers(world_size: int, ep_degree: int, rank: int) -> tuple[int, int]:
+    """``(ep_rank, column)`` for one global rank, from the PACKAGE's own mesh.
+
+    ``_build_ep_group_ranks`` returns ``(ep_tp_groups, ep_groups)`` -- rows then
+    columns (``:218-232``). A rank's EP index is which ROW it is in, because the EP
+    group is the column group and ``get_neuron_ep_rank`` reads its position there
+    (``:1202-1206``); its shard column is its POSITION IN THAT ROW. Both come from
+    the same call, so this helper cannot describe a mesh the package does not build.
+    """
+    rows, _columns = _NPS._build_ep_group_ranks(world_size, ep_degree)
+    for row_index, row in enumerate(rows):
+        if rank in row:
+            return row_index, row.index(rank)
+    raise AssertionError(
+        f"global rank {rank} is in none of the {len(rows)} EP-TP rows the package "
+        f"built for world {world_size} at expert-parallel degree {ep_degree}"
+    )
+
+
+def _load_at_ep(
+    directory: Path,
+    world_size: int,
+    rank: int,
+    ep_degree: int,
+    monkeypatch,
+) -> Glm5NextForConditionalGeneration:
+    """Load at a synthetic world size, rank AND expert-parallel degree.
+
+    THE EP ANSWERS COME FROM THE PACKAGE'S MESH, not from arithmetic here. The two
+    getters the loader reads are patched to report what ``_build_ep_group_ranks``
+    says for this rank, so a test that agreed with a wrong loader would have to
+    disagree with the shipped mesh builder to do it.
+    """
+    ep_rank, column = _mesh_answers(world_size, ep_degree, rank)
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_world_size", lambda: world_size)
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_rank", lambda: rank)
+    monkeypatch.setattr(_FACTORY, "_resolve_ep_degree", lambda given: ep_degree)
+    monkeypatch.setattr(_NPS, "get_neuron_ep_rank", lambda: ep_rank)
+    monkeypatch.setattr(
+        _NPS,
+        "get_neuron_ep_tp_group",
+        lambda: _FixtureGroup(column, world_size // ep_degree),
+    )
+    model = Glm5NextForConditionalGeneration(_deferred_config())
+    assert model.world_size == world_size, (
+        f"the model resolved world size {model.world_size}, not the patched "
+        f"{world_size}"
+    )
+    _seed_page_cache_signal()
+    model.load_weights(str(directory), torch.device("cpu"), None)
+    return model
+
+
+def _deferred_leaves(
+    model: Glm5NextForConditionalGeneration,
+) -> list[tuple[str, torch.nn.Module, str, int, int]]:
+    """Every ``(path, module, leaf, shard_dim, full)`` among the SIX."""
+    found: list[tuple[str, torch.nn.Module, str, int, int]] = []
+    for path, module in model.named_modules():
+        cls = type(module).__name__
+        declared = getattr(module, "declared_param_names", ())
+        for (family, leaf), (shard_dim, full) in DEFERRED_FAMILIES.items():
+            if cls == family and leaf in declared:
+                found.append((path, module, leaf, shard_dim, full))
+    return found
+
+
+# --------------------------------------------------------------------------- #
+# (1) SHAPES -- every deferred family lands at its declared per-rank extent.
+# --------------------------------------------------------------------------- #
+
+
+def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (1), counted N/N, with the world-size-1 load as the moving control.
+
+    THREE DIVISORS IN ONE READING, which is why the world is 4 and not 2. The dense
+    three divide by the world size and pad, the shared three divide by the world
+    size and do not, and the bank divides by ``tp_per_ep`` -- half the world -- and
+    holds half the experts. At world size 2 with expert-parallel degree 1 all three
+    collapse to the same number and a loader using the wrong divisor would pass.
+
+    The expected extent is this file's own arithmetic
+    (:func:`_padded_shard_extent`), written from the rule in words, never asked of
+    the loader.
+    """
+    directory, overrides, mappings = _deferred_checkpoint(tmp_path)
+    block = _WL_FP8.consumer_block_quant_size()
+    print(f"CONJUNCT1D_CONSUMER_BLOCK={block}")
+    print(f"CONJUNCT1D_WORLD={SHARD_EP_WORLD} EP_DEGREE={SHARD_EP_DEGREE}")
+    print(f"CONJUNCT1D_TP_PER_EP={SHARD_TP_PER_EP}")
+
+    models = {
+        rank: _load_at_ep(
+            directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
+        )
+        for rank in range(SHARD_EP_WORLD)
+    }
+    whole = _load_at_ep(directory, 1, 0, 1, monkeypatch)
+
+    expected_local_experts = MINI_ROUTED_EXPERTS // SHARD_EP_DEGREE
+    checked = 0
+    readings: list[str] = []
+    for rank, model in models.items():
+        for path, module, leaf, shard_dim, full in _deferred_leaves(model):
+            cls = type(module).__name__
+            dotted = f"{path}.{leaf}"
+            got = tuple(_loaded(model, dotted).shape)
+            if cls in DEFERRED_EP_GROUP_CLASSES:
+                # A bank carries a LEADING expert axis, so its declared dim moves
+                # one place right and the leading extent is this EP rank's experts.
+                per_rank = _padded_shard_extent(full, SHARD_TP_PER_EP, block)
+                base = list(_shard_full_shape(leaf, shard_dim, full))
+                base[shard_dim] = per_rank
+                expected = (expected_local_experts, *base)
+            else:
+                per_rank = _padded_shard_extent(full, SHARD_EP_WORLD, block)
+                expected = list(_shard_full_shape(leaf, shard_dim, full))
+                expected[shard_dim] = per_rank
+                expected = tuple(expected)
+            assert got == expected, (
+                f"{dotted} loaded {got} at rank {rank}; this file's rule says "
+                f"{expected} -- full extent {full} on dim {shard_dim}, divided by "
+                f"{'tp_per_ep ' + str(SHARD_TP_PER_EP) if cls in DEFERRED_EP_GROUP_CLASSES else 'world ' + str(SHARD_EP_WORLD)}"
+                f" after rounding up to a multiple of {block} per rank"
+            )
+            checked += 1
+            if rank == 0:
+                readings.append(f"{cls}.{leaf}={got}")
+    print(f"CONJUNCT1D_RANK0_SHAPES={sorted(readings)}")
+    print(
+        f"CONJUNCT1D_PER_RANK_SHAPES_AS_DECLARED={checked}/"
+        f"{SHARD_EP_WORLD * len(_deferred_leaves(models[0]))}"
+    )
+    assert checked == SHARD_EP_WORLD * len(_deferred_leaves(models[0]))
+    # Section 79.1: a subset reading over a measured set also asserts non-empty.
+    assert checked > 0, (
+        "no deferred family was measured at all, so every assertion above is "
+        "vacuously true"
+    )
+
+    # THE CONTROL THAT MOVES. At world size 1 the table's reader returns no
+    # geometry, so every one of the six holds its whole checkpoint tensor.
+    whole_checked = 0
+    for path, module, leaf, shard_dim, full in _deferred_leaves(whole):
+        dotted = f"{path}.{leaf}"
+        got = tuple(_loaded(whole, dotted).shape)
+        base = list(_shard_full_shape(leaf, shard_dim, full))
+        expected = (
+            (MINI_ROUTED_EXPERTS, *base)
+            if type(module).__name__ in DEFERRED_EP_GROUP_CLASSES
+            else tuple(base)
+        )
+        assert got == expected, (
+            f"{dotted} loaded {got} at world size 1, not the whole {expected}"
+        )
+        whole_checked += 1
+    print(f"CONJUNCT1D_WHOLE_AT_WORLD_ONE={whole_checked}")
+    assert whole_checked > 0, "the world-size-1 control measured nothing"
+    assert whole_checked == len(_deferred_leaves(whole))
+    assert len(overrides) > 0 and len(mappings) > 0
+
+
+# --------------------------------------------------------------------------- #
+# (2) REASSEMBLY -- the shards put back together are the checkpoint's tensor.
+# --------------------------------------------------------------------------- #
+
+
+def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (2), bit for bit, plus the two refusals the design names.
+
+    REASSEMBLED OVER THE RIGHT AXIS FOR EACH FAMILY. The whole-world three
+    concatenate along their shard dim over all four ranks; the bank concatenates
+    along its shard dim over the ranks of one EP-TP ROW and along the expert axis
+    over the EP rows. Reading a bank along the world instead would double-count
+    every expert, which is the error this shape of reading exists to catch.
+
+    A PADDED FAMILY IS COMPARED ON ITS REAL EXTENT ONLY, and the pad itself is item
+    (3)'s reading rather than a tolerance here. Comparison is ``max abs diff``
+    against exactly 0.0, so nothing is being called close.
+    """
+    directory, overrides, mappings = _deferred_checkpoint(tmp_path)
+    models = {
+        rank: _load_at_ep(
+            directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
+        )
+        for rank in range(SHARD_EP_WORLD)
+    }
+
+    reassembled = 0
+    for path, module, leaf, shard_dim, full in _deferred_leaves(models[0]):
+        cls = type(module).__name__
+        dotted = f"{path}.{leaf}"
+        keys = _keys_of(mappings, dotted)
+        scales = scale_keys(keys)
+        weight_keys = [key for key in keys if key not in scales]
+        if cls in DEFERRED_EP_GROUP_CLASSES:
+            rows, _cols = _NPS._build_ep_group_ranks(
+                SHARD_EP_WORLD, SHARD_EP_DEGREE
+            )
+            per_expert = []
+            for row in rows:
+                columns = [_loaded(models[rank], dotted) for rank in row]
+                per_expert.append(torch.cat(columns, dim=shard_dim + 1))
+            joined = torch.cat(per_expert, dim=0)
+            expected = torch.stack(
+                [overrides[key] for key in weight_keys]
+            )
+            trim = [slice(None)] * joined.dim()
+            trim[shard_dim + 1] = slice(0, full)
+            got = joined[tuple(trim)]
+        else:
+            got = torch.cat(
+                [_loaded(models[rank], dotted) for rank in range(SHARD_EP_WORLD)],
+                dim=shard_dim,
+            )
+            expected = overrides[weight_keys[0]]
+            trim = [slice(None)] * got.dim()
+            trim[shard_dim] = slice(0, full)
+            got = got[tuple(trim)]
+        # The checkpoint's fp8 bytes are squeezed on the way in, so the comparison
+        # is against the same squeeze the loader applies rather than raw bytes.
+        reference = downscale_fp8_weight_bytes(expected)
+        assert got.shape == reference.shape, (
+            f"{dotted} reassembled to {tuple(got.shape)}, not the checkpoint's "
+            f"{tuple(reference.shape)}"
+        )
+        diff = _max_abs_diff(got, reference)
+        assert diff == 0.0, (
+            f"{dotted} reassembled with max abs diff {diff}, not 0.0 -- the shards "
+            f"do not put the checkpoint tensor back together"
+        )
+        reassembled += 1
+    print(f"CONJUNCT2D_FAMILIES_REASSEMBLED={reassembled}")
+    assert reassembled > 0, "no family was reassembled, so this item read nothing"
+    assert reassembled == len(_deferred_leaves(models[0]))
+
+    # REFUSAL ONE -- a ragged expert-parallel degree, refused by the fork's own gate.
+    from vllm_neuron.model.glm5_next.factory import (
+        RaggedExpertPartitionError,
+        require_uniform_expert_partition,
+    )
+
+    ragged_degree = MINI_ROUTED_EXPERTS + 1
+    assert MINI_ROUTED_EXPERTS % ragged_degree != 0, (
+        f"{MINI_ROUTED_EXPERTS} experts divide evenly by {ragged_degree}, so this "
+        f"is not the ragged case"
+    )
+    with pytest.raises(RaggedExpertPartitionError) as ragged:
+        require_uniform_expert_partition(MINI_ROUTED_EXPERTS, ragged_degree)
+    print(f"CONJUNCT2D_RAGGED_REFUSAL={str(ragged.value)[:160]}")
+
+    # REFUSAL TWO -- an intermediate shard the CONSUMER cannot take.
+    block = _WL_FP8.consumer_block_quant_size()
+    not_a_whole_block = block + DEFAULT_WEIGHT_BLOCK_SIZE[0]
+    assert not_a_whole_block % block != 0
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as unusable:
+        _WL_FP8.shard_geometry_for_grid(
+            _WL_FP8.ShardGeometry(
+                shard_dim=0,
+                shard_size=not_a_whole_block,
+                num_shards=SHARD_TP_PER_EP,
+            ),
+            param_name="probe.experts.gate_proj_weight_scale_inv",
+        )
+    message = str(unusable.value)
+    print(f"CONJUNCT2D_CONSUMER_REFUSAL={message[:200]}")
+    assert "probe.experts.gate_proj_weight_scale_inv" in message
+    assert str(block) in message
+
+
+# --------------------------------------------------------------------------- #
+# (3) PADDING EXACTNESS -- zeros, ones, and a dequantisation that does not move.
+# --------------------------------------------------------------------------- #
+
+
+def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (3). The padded ranks hold fp8 zero and grid 1.0, and the pad
+    changes no number the model would compute.
+
+    WHY THE DENSE THREE ARE THE SUBJECT. At world 4 the dense intermediate 512 pads
+    to 1024, so ranks 2 and 3 hold no real row at all -- the strongest form of the
+    padded case. The shared three at 2048 need no pad at this world, and that
+    absence is read here too, so "the pad happened" and "the pad did not happen"
+    are both measurements rather than one assumption.
+
+    THE EXACTNESS CLAIM IS AN EQUALITY, NOT A TOLERANCE. A padded weight row is fp8
+    zero and its grid entry is 1.0, so the row dequantises to exactly 0.0; a zero
+    row contributes exactly nothing to the down projection's contraction. So the
+    padded emulation must equal the unpadded reference at max abs diff 0.0 and no
+    numeric pair is authored.
+    """
+    directory, overrides, mappings = _deferred_checkpoint(tmp_path)
+    block = _WL_FP8.consumer_block_quant_size()
+    models = {
+        rank: _load_at_ep(
+            directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
+        )
+        for rank in range(SHARD_EP_WORLD)
+    }
+
+    dense_paths = sorted(
+        {
+            path
+            for path, module in models[0].named_modules()
+            if type(module).__name__ == "Glm5NextDenseMLP"
+        }
+    )
+    print(f"CONJUNCT3D_DENSE_MODULES={dense_paths}")
+    assert dense_paths, "the fixture built no dense MLP, so this item reads nothing"
+
+    per_rank = _padded_shard_extent(SHARD_INTERMEDIATE, SHARD_EP_WORLD, block)
+    real_ranks = SHARD_INTERMEDIATE // per_rank
+    print(f"CONJUNCT3D_PER_RANK={per_rank} REAL_RANKS={real_ranks}")
+    assert real_ranks < SHARD_EP_WORLD, (
+        f"every one of the {SHARD_EP_WORLD} ranks holds a real row, so this fixture "
+        f"constructs no padded rank and the readings below would be vacuous"
+    )
+
+    zero_ranks = 0
+    for path in dense_paths:
+        for leaf in SHARD_DENSE_LEAVES:
+            shard_dim, _full = SHARD_FAMILIES[("Glm5NextDenseMLP", leaf)]
+            attribute = SHARD_GRID_ATTRIBUTES[SHARD_DENSE_LEAVES.index(leaf)]
+            for rank in range(real_ranks, SHARD_EP_WORLD):
+                weight = _loaded(models[rank], f"{path}.{leaf}")
+                grid = getattr(models[rank].get_submodule(path), attribute)
+                as_float = weight.to(torch.float32)
+                assert bool((as_float == 0.0).all()), (
+                    f"{path}.{leaf} at rank {rank} sits wholly past the real "
+                    f"{SHARD_INTERMEDIATE} rows, so every element must be fp8 zero; "
+                    f"max abs is {as_float.abs().max().item()}"
+                )
+                assert bool((grid.to(torch.float32) == 1.0).all()), (
+                    f"{path}.{leaf}'s grid at rank {rank} must be all 1.0 past the "
+                    f"real rows; it holds values from "
+                    f"{grid.min().item()} to {grid.max().item()}"
+                )
+                zero_ranks += 1
+                del shard_dim
+    print(f"CONJUNCT3D_PADDED_RANK_READINGS={zero_ranks}")
+    assert zero_ranks > 0, "no padded rank was read"
+
+    # THE SHARED THREE NEED NO PAD AT THIS WORLD, and that is read rather than said.
+    shared_per_rank = _padded_shard_extent(SHARED_INTERMEDIATE, SHARD_EP_WORLD, block)
+    print(f"CONJUNCT3D_SHARED_PER_RANK={shared_per_rank}")
+    assert shared_per_rank * SHARD_EP_WORLD == SHARED_INTERMEDIATE, (
+        f"the shared expert's {SHARED_INTERMEDIATE} padded to "
+        f"{shared_per_rank * SHARD_EP_WORLD}; this item's premise is that it does not"
+    )
+
+    # THE EMULATION. Dequantise each rank's dense shards, put them back in rank
+    # order, and run gate * up through down. Then do the same from the checkpoint's
+    # own unpadded tensors. The two must agree exactly.
+    path = dense_paths[0]
+    hidden = int(_loaded(models[0], f"{path}.gate_proj_weight").shape[1])
+    torch.manual_seed(0)
+    x = torch.randn(hidden, dtype=torch.float32)
+
+    def _dequantised(rank: int, leaf: str) -> torch.Tensor:
+        module = models[rank].get_submodule(path)
+        attribute = SHARD_GRID_ATTRIBUTES[SHARD_DENSE_LEAVES.index(leaf)]
+        return dequantise_blockwise(
+            _loaded(models[rank], f"{path}.{leaf}"),
+            getattr(module, attribute),
+            DEFAULT_WEIGHT_BLOCK_SIZE,
+        ).to(torch.float32)
+
+    gate_padded = torch.cat(
+        [_dequantised(rank, "gate_proj_weight") for rank in range(SHARD_EP_WORLD)],
+        dim=0,
+    )
+    up_padded = torch.cat(
+        [_dequantised(rank, "up_proj_weight") for rank in range(SHARD_EP_WORLD)],
+        dim=0,
+    )
+    down_padded = torch.cat(
+        [_dequantised(rank, "down_proj_weight") for rank in range(SHARD_EP_WORLD)],
+        dim=1,
+    )
+    h_padded = (gate_padded @ x) * (up_padded @ x)
+    y_padded = down_padded @ h_padded
+
+    def _reference(leaf: str) -> torch.Tensor:
+        keys = _keys_of(mappings, f"{path}.{leaf}")
+        scales = scale_keys(keys)
+        weight_key = next(key for key in keys if key not in scales)
+        return dequantise_blockwise(
+            downscale_fp8_weight_bytes(overrides[weight_key]),
+            compensate_block_scales(overrides[scales[0]]).scale_inv,
+            DEFAULT_WEIGHT_BLOCK_SIZE,
+        ).to(torch.float32)
+
+    h_whole = (_reference("gate_proj_weight") @ x) * (_reference("up_proj_weight") @ x)
+    y_whole = _reference("down_proj_weight") @ h_whole
+
+    print(f"CONJUNCT3D_PADDED_INTERMEDIATE={tuple(h_padded.shape)}")
+    print(f"CONJUNCT3D_WHOLE_INTERMEDIATE={tuple(h_whole.shape)}")
+    print(f"CONJUNCT3D_OUTPUT_MAX_ABS_DIFF={_max_abs_diff(y_padded, y_whole)}")
+    assert h_padded.shape[0] > h_whole.shape[0], (
+        f"the padded intermediate is {h_padded.shape[0]} wide and the unpadded "
+        f"{h_whole.shape[0]}; if they matched, no pad was exercised"
+    )
+    tail = h_padded[h_whole.shape[0] :]
+    print(f"CONJUNCT3D_PAD_TAIL_MAX_ABS={tail.abs().max().item()}")
+    assert tail.abs().max().item() == 0.0, (
+        "the padded intermediate's tail is not exactly zero, so the padded rows are "
+        "contributing to the down projection"
+    )
+    assert _max_abs_diff(y_padded, y_whole) == 0.0, (
+        "the padded shards compute a different output from the unpadded reference; "
+        "the pad is not exact"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (4) The six LEFT the replicated set, both directions.
+# --------------------------------------------------------------------------- #
+
+
+def test_sharedshard_the_six_families_left_the_replicated_set_both_directions(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Conjunct (4) re-read at this candidate, both directions and both non-empty.
+
+    ``inc-glm53f-094``'s own conjunct (4) counted these six IN the replicated set
+    and said in those words that ``inc-glm53f-101`` would consume them. This is that
+    consumption, measured the same way: the set of families that changed between two
+    ranks is compared against the set this file declares sharded, in both
+    directions, so neither a family that stayed replicated nor one that shards
+    without being declared can hide.
+
+    BOTH SETS ARE ASSERTED NON-EMPTY (section 79.1). A subset relation between two
+    empty sets holds, and would hold if the load had read nothing at all.
+    """
+    directory, _overrides, _mappings = _deferred_checkpoint(tmp_path)
+    rank0 = _load_at_ep(directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch)
+    rank1 = _load_at_ep(directory, SHARD_EP_WORLD, 1, SHARD_EP_DEGREE, monkeypatch)
+
+    declared_sharded = {
+        f"{path}.{leaf}"
+        for path, _module, leaf, _dim, _full in _deferred_leaves(rank0)
+    } | {
+        f"{path}.{leaf}"
+        for path, _module, leaf, _dim, _full in _sharded_leaves(rank0)
+    }
+    print(f"CONJUNCT4D_DECLARED_SHARDED={len(declared_sharded)}")
+    assert declared_sharded, "this file declares no sharded family, so nothing is read"
+
+    left = dict(rank0.named_parameters())
+    right = dict(rank1.named_parameters())
+    assert set(left) == set(right), (
+        f"the two ranks registered different parameter names, so a family could "
+        f"drop out of the comparison unseen. Only at rank 0: "
+        f"{sorted(set(left) - set(right))[:3]}; only at rank 1: "
+        f"{sorted(set(right) - set(left))[:3]}"
+    )
+    common = sorted(left)
+    print(f"CONJUNCT4D_PARAMETERS_COMPARED={len(common)}")
+    assert common, "the two ranks share no parameter name, so no comparison happened"
+
+    moved = {
+        name
+        for name in common
+        if tuple(left[name].shape) != tuple(right[name].shape)
+        or _max_abs_diff(left[name].data, right[name].data) != 0.0
+    }
+    still = set(common) - moved
+    print(f"CONJUNCT4D_MOVED={len(moved)} STILL={len(still)}")
+    assert moved, "no parameter differs between the two ranks, so nothing is sharded"
+    assert still, "every parameter differs, so the replicated set is empty"
+
+    # DIRECTION ONE: every family this file declares sharded actually moved.
+    declared_but_still = sorted(name for name in declared_sharded if name in still)
+    print(f"CONJUNCT4D_DECLARED_BUT_STILL={declared_but_still[:5]}")
+    assert not declared_but_still, (
+        f"{len(declared_but_still)} declared-sharded families read identically on "
+        f"both ranks, first {declared_but_still[:3]} -- they are still replicated"
+    )
+
+    # DIRECTION TWO: nothing moved that this file did not declare sharded.
+    moved_but_undeclared = sorted(moved - declared_sharded)
+    print(f"CONJUNCT4D_MOVED_BUT_UNDECLARED={moved_but_undeclared[:5]}")
+    assert not moved_but_undeclared, (
+        f"{len(moved_but_undeclared)} families differ between ranks without being "
+        f"declared sharded, first {moved_but_undeclared[:3]}"
+    )
+
+    # AND THE SIX SPECIFICALLY, named so a count cannot stand in for them. The
+    # coverage check is over the TABLE'S OWN KEYS, not over a length: four layers
+    # make more than six dotted names, so a length of six could be reached with
+    # one class missing entirely.
+    found_keys = {
+        (type(module).__name__, leaf)
+        for _path, module, leaf, _dim, _full in _deferred_leaves(rank0)
+    }
+    missing_keys = sorted(set(DEFERRED_FAMILIES) - found_keys)
+    six = sorted(
+        f"{path}.{leaf}"
+        for path, _module, leaf, _dim, _full in _deferred_leaves(rank0)
+    )
+    print(f"CONJUNCT4D_THE_SIX_DOTTED_NAMES={len(six)}")
+    print(f"CONJUNCT4D_TABLE_KEYS_FOUND={len(found_keys)} MISSING={missing_keys}")
+    assert not missing_keys, (
+        f"the tree holds no parameter for {missing_keys}, so a class the table "
+        f"names was never built and this item did not read it"
+    )
+    assert all(name in moved for name in six), (
+        f"one of the six did not move between ranks: "
+        f"{[name for name in six if name not in moved][:3]}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (5) GROUP READ -- the mesh answers, and the disagreement that is refused.
+# --------------------------------------------------------------------------- #
+
+
+def test_sharedshard_the_column_comes_from_the_group_and_refuses_a_disagreement(
+    monkeypatch,
+) -> None:
+    """Conjunct (5). The loader reads the mesh; a division would read something else.
+
+    THE MESH IS THE PACKAGE'S OWN, built by ``_build_ep_group_ranks`` at the real
+    registered world size of 64, not a fixture invented here. On this platform that
+    call substitutes ``_TRN2_MESH`` whenever the world is 64 and the row is 8
+    (``uses_noncontiguous_mesh``), and the whole point of remedy part 3 is that on
+    such a mesh neither ``rank // tp_per_ep`` nor ``rank % tp_per_ep`` is the right
+    answer.
+
+    THREE READINGS, and the third is what makes the first two mean something:
+
+    1. THE ROW. Global rank 12 sits in row 0, while ``12 // 8`` is 1. The rank map
+       returns the group's answer.
+    2. THE COLUMN, DISAGREEING. Global rank 4 sits at column 0 of its row, while
+       ``4 % 8`` is 4. The column reader REFUSES BY NAME, because the loader would
+       otherwise write a column the kernel does not read.
+    3. THE REGISTERED DEGREE. At expert-parallel degree 16 the same two answers
+       AGREE for every rank, and the column reader returns without refusing. Without
+       this the refusal above could be a blanket rather than a boundary.
+    """
+    world = 64
+    disagreeing_degree = 8
+    registered_degree = 16
+    tp_per_ep = world // disagreeing_degree
+
+    rows, _cols = _NPS._build_ep_group_ranks(world, disagreeing_degree)
+    print(f"CONJUNCT5D_ROWS={len(rows)} ROW_SIZE={len(rows[0])}")
+    print(f"CONJUNCT5D_ROW_0={rows[0]}")
+    assert _NPS.uses_noncontiguous_mesh(world, tp_per_ep), (
+        f"the package does not call world {world} with row {tp_per_ep} "
+        f"non-contiguous, so this item's premise is gone"
+    )
+
+    # 1. THE ROW.
+    row_rank, row_column = _mesh_answers(world, disagreeing_degree, 12)
+    print(f"CONJUNCT5D_RANK12_GROUP_ROW={row_rank} MODULO_ROW={12 // tp_per_ep}")
+    assert row_rank != 12 // tp_per_ep, (
+        f"the group puts rank 12 in row {row_rank} and the division also says "
+        f"{12 // tp_per_ep}; they agree, so this reading distinguishes nothing"
+    )
+    monkeypatch.setattr(_NPS, "get_neuron_ep_rank", lambda: row_rank)
+    owner = type(
+        "Owner", (), {"ep_degree": disagreeing_degree, "tp_degree": world}
+    )()
+    to_partition_rank = _WL_FP8._expert_parallel_rank_map(
+        owner, "probe.experts.gate_proj_weight"
+    )
+    got_row = to_partition_rank(12)
+    print(f"CONJUNCT5D_RANK_MAP_RETURNED={got_row}")
+    assert got_row == row_rank, (
+        f"the rank map returned {got_row} where the group says {row_rank}"
+    )
+    assert got_row != 12 // tp_per_ep, (
+        f"the rank map returned the divided answer {12 // tp_per_ep}"
+    )
+    del row_column
+
+    # 2. THE COLUMN, DISAGREEING.
+    _row_of_4, column_of_4 = _mesh_answers(world, disagreeing_degree, 4)
+    print(
+        f"CONJUNCT5D_RANK4_GROUP_COLUMN={column_of_4} "
+        f"MODULO_COLUMN={4 % tp_per_ep}"
+    )
+    assert column_of_4 != 4 % tp_per_ep, (
+        f"the group puts rank 4 at column {column_of_4} and the modulo also says "
+        f"{4 % tp_per_ep}; they agree, so there is no disagreement to refuse"
+    )
+    monkeypatch.setattr(
+        _NPS,
+        "get_neuron_ep_tp_group",
+        lambda: _FixtureGroup(column_of_4, tp_per_ep),
+    )
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+        _WL_FP8._expert_parallel_shard_column(
+            4, tp_per_ep, "probe.experts.gate_proj_weight"
+        )
+    message = str(refusal.value)
+    print(f"CONJUNCT5D_DISAGREEMENT_REFUSAL={message[:220]}")
+    assert message.startswith("probe.experts.gate_proj_weight "), (
+        f"the refusal does not name the parameter first: {message}"
+    )
+    # The two numbers are asserted IN THEIR PHRASES, not as bare digits: "0" and
+    # "4" occur in a file:line cite in the same message, so a substring test on the
+    # digit alone would pass on a refusal that named neither column.
+    assert f"at column {column_of_4}" in message, (
+        f"the refusal does not say which column the group reported: {message}"
+    )
+    assert f"= {4 % tp_per_ep} " in message or message.rstrip().endswith(
+        f"= {4 % tp_per_ep}"
+    ), f"the refusal does not say which column the consumer derives: {message}"
+
+    # 3. THE REGISTERED DEGREE, where the two agree and nothing is refused.
+    registered_tp_per_ep = world // registered_degree
+    agreements = 0
+    for rank in range(world):
+        row_index, column = _mesh_answers(world, registered_degree, rank)
+        if column == rank % registered_tp_per_ep:
+            agreements += 1
+        del row_index
+    print(
+        f"CONJUNCT5D_REGISTERED_DEGREE={registered_degree} "
+        f"COLUMN_AGREEMENTS={agreements}/{world}"
+    )
+    assert agreements == world, (
+        f"only {agreements} of {world} ranks agree at the registered degree "
+        f"{registered_degree}; the registered value would refuse at load"
+    )
+    _row, registered_column = _mesh_answers(world, registered_degree, 12)
+    monkeypatch.setattr(
+        _NPS,
+        "get_neuron_ep_tp_group",
+        lambda: _FixtureGroup(registered_column, registered_tp_per_ep),
+    )
+    accepted = _WL_FP8._expert_parallel_shard_column(
+        12, registered_tp_per_ep, "probe.experts.gate_proj_weight"
+    )
+    print(f"CONJUNCT5D_REGISTERED_COLUMN_ACCEPTED={accepted}")
+    assert accepted == registered_column, (
+        f"the column reader returned {accepted} where the group says "
+        f"{registered_column} at the registered degree"
     )
