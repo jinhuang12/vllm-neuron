@@ -1603,6 +1603,43 @@ def report_close(label: str, got: torch.Tensor, reference: torch.Tensor) -> None
     torch.testing.assert_close(got.float(), reference.float(), rtol=RTOL, atol=ATOL)
 
 
+#: The floor a selection gap must clear. UNCHANGED in value at the round-2 repair; it is named here
+#: only so the two call paths below cannot drift to two different numbers. Two definitions of one
+#: control's arithmetic is the defect class this file keeps finding elsewhere.
+TIE_FLOOR = 1e-4
+
+
+def kth_place_gap(scores: torch.Tensor, k: int) -> float:
+    """The smallest gap at the k-th place, MEASURED AND RETURNED rather than asserted on.
+
+    Split out at the round-2 repair so a caller with several labels can read every one of them
+    before any of them is allowed to abort. Round 1 asserted inside the loop, stopped at the ragged
+    arm's request 0, and left request 1 unmeasured -- so the fixture's admissibility was only half
+    known and the transcript could not say whether the near-tie was one row's bad luck or the whole
+    draw's. The arithmetic is unchanged.
+    """
+    top = torch.topk(scores.float(), int(k) + 1, dim=-1).values
+    return float((top[:, int(k) - 1] - top[:, int(k)]).min())
+
+
+def say_and_check_gaps(gaps: list[tuple[str, float]]) -> None:
+    """Print EVERY label's gap, then assert over all of them at once.
+
+    The printing comes first on purpose: a reading that only reaches the transcript when it passes
+    is not a reading. With this order a failing run still shows every label's number, so a reader
+    can see at a glance whether one row was unlucky or the seed is bad everywhere.
+    """
+    for label, gap in gaps:
+        say(label, "kth_place_gap_min", f"{gap:.3e}")
+    bad = [(label, gap) for label, gap in gaps if not gap > TIE_FLOOR]
+    assert not bad, (
+        f"{', '.join(label for label, _ in bad)}: the smallest gap at the k-th place is "
+        f"{', '.join(f'{gap:.3e}' for _, gap in bad)}, so at least one row's selection is "
+        f"effectively a tie and this case cannot tell a tie-break difference from a defect. "
+        f"Reseed the fixture rather than loosening the comparison"
+    )
+
+
 def assert_selection_is_not_a_tie(scores: torch.Tensor, k: int, label: str) -> None:
     """No row may be decided by a tie at the k-th place.
 
@@ -1611,15 +1648,12 @@ def assert_selection_is_not_a_tie(scores: torch.Tensor, k: int, label: str) -> N
     attend different cache rows and the numeric comparison would fail for a reason that is not a
     defect -- or, worse, a real defect could be excused as a tie. ``torch.topk``'s tie order is not
     contracted to match the kernel's, so the fixture must make ties impossible rather than hope.
+
+    The single-label form, kept because run 1 reads one label per layer per phase and each of those
+    is its own reading. It now routes through the shared reader above so there is ONE definition of
+    the gap arithmetic and ONE floor.
     """
-    top = torch.topk(scores.float(), int(k) + 1, dim=-1).values
-    gap = (top[:, int(k) - 1] - top[:, int(k)]).min()
-    say(label, "kth_place_gap_min", f"{float(gap):.3e}")
-    assert float(gap) > 1e-4, (
-        f"{label}: the smallest gap at the k-th place is {float(gap):.3e}, so at least one row's "
-        f"selection is effectively a tie and this case cannot tell a tie-break difference from a "
-        f"defect. Reseed the fixture rather than loosening the comparison"
-    )
+    say_and_check_gaps([(label, kth_place_gap(scores, int(k)))])
 
 
 # =========================================================================== #
@@ -1823,7 +1857,17 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     tokens = sum(lengths)
     assert len(set(lengths)) > 1, "a uniform batch is refused by the arm, and rightly"
 
-    gen = torch.Generator().manual_seed(9_051_002)
+    # THE SEED, RESEEDED AT ROUND 2 UNDER THE LEAD'S RULING (DECISIONS §78), and the rule is stated
+    # rather than the number chosen to make the suite quiet. This file allocates seeds as
+    # ``9_051_NNN``: run 1 takes 001 and 002 for its two tensors, rider B67 takes 067, rider B71
+    # takes 071. The arm was written with 9_051_002, which is a COLLISION -- it duplicated run 1's
+    # ``q_latent`` seed, so five seed sites held only four distinct values and the arm was never an
+    # independent draw at all. The next value in the file's own sequence is 003, which both follows
+    # the rule and removes the duplication. Round 1's 002 draw put request 0's 2nd and 3rd scores
+    # 3.296e-05 apart, under the TIE_FLOOR, so the fixture could not tell a tie-break difference
+    # from a defect and refused to measure -- exactly as designed. ONE try: if 003 also near-ties,
+    # that is a structural finding for the lead and not a third seed.
+    gen = torch.Generator().manual_seed(9_051_003)
     hidden = torch.randn(len(lengths), max_len, hidden_size, generator=gen, dtype=torch.float32)
     q_latent = torch.randn(len(lengths), max_len, q_lora, generator=gen, dtype=torch.float32)
 
@@ -1843,15 +1887,28 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     # THE REFERENCE: each request's own valid rows, projected and selected with NO pack at all,
     # concatenated in the pack's own order. This is "the same request run alone" as the design
     # names it, and it is what makes the commutation claim falsifiable.
-    ref_rows = []
-    offset = 0
+    # Scored first for EVERY request, then read, then expanded. Round 1 asserted inside one loop and
+    # aborted at request 0, so request 1's gap never reached the transcript and nobody could tell
+    # whether one row was unlucky or the whole draw was bad. The three passes cost one extra list.
+    select_k = int(indexer.select_k())
+    scored: list[tuple[int, torch.Tensor]] = []
     for b, n in enumerate(lengths):
         q_own, _k, w_own, _g = _ref_project_stage(
             indexer, hidden[b, :n], q_latent[b, :n]
         )
-        scores = _ref_score(q_own, _ref_candidate_keys(pool_cache, candidates), w_own)
-        assert_selection_is_not_a_tie(scores, int(indexer.select_k()), f"arm-request-{b}")
-        pool_ids = _ref_topk(scores, int(indexer.select_k()))
+        scored.append((n, _ref_score(q_own, _ref_candidate_keys(pool_cache, candidates), w_own)))
+
+    say_and_check_gaps(
+        [
+            (f"arm-request-{b}", kth_place_gap(scores, select_k))
+            for b, (_n, scores) in enumerate(scored)
+        ]
+    )
+
+    ref_rows = []
+    offset = 0
+    for n, scores in scored:
+        pool_ids = _ref_topk(scores, select_k)
         ref_rows.append(_ref_expand(pool_ids, seq_lens[offset : offset + n], pool))
         offset += n
     reference = torch.cat(ref_rows, dim=0)
