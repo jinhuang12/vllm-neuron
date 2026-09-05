@@ -4613,7 +4613,7 @@ def test_sharedshard_the_column_comes_from_the_group_and_refuses_a_disagreement(
     )
     with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
         _WL_FP8._expert_parallel_shard_column(
-            4, tp_per_ep, "probe.experts.gate_proj_weight"
+            4, tp_per_ep, disagreeing_degree, "probe.experts.gate_proj_weight"
         )
     message = str(refusal.value)
     print(f"CONJUNCT5D_DISAGREEMENT_REFUSAL={message[:220]}")
@@ -4653,10 +4653,35 @@ def test_sharedshard_the_column_comes_from_the_group_and_refuses_a_disagreement(
         lambda: _FixtureGroup(registered_column, registered_tp_per_ep),
     )
     accepted = _WL_FP8._expert_parallel_shard_column(
-        12, registered_tp_per_ep, "probe.experts.gate_proj_weight"
+        12, registered_tp_per_ep, registered_degree, "probe.experts.gate_proj_weight"
     )
     print(f"CONJUNCT5D_REGISTERED_COLUMN_ACCEPTED={accepted}")
     assert accepted == registered_column, (
         f"the column reader returned {accepted} where the group says "
         f"{registered_column} at the registered degree"
+    )
+
+    # 4. DEGREE 1, WHERE THERE IS NO GROUP AT ALL. This reading exists because its
+    # absence broke a landed item: the first version of the reader asked the group
+    # before it asked the degree, so every degree-1 bank load was refused with a
+    # message claiming the module declared a degree above 1 when it declared 1
+    # (`accept-101-r8-host.out`). The getter is patched to RAISE here, so if the
+    # reader touches the group at all this reading fails instead of passing quietly.
+    def _the_group_must_not_be_asked():
+        raise AssertionError(
+            "Neuron EP-TP group is not initialized. "
+            "Call initialize_neuron_parallel_state() with ep_degree > 1."
+        )
+
+    monkeypatch.setattr(_NPS, "get_neuron_ep_tp_group", _the_group_must_not_be_asked)
+    at_degree_one = [
+        _WL_FP8._expert_parallel_shard_column(
+            rank, world, 1, "probe.experts.gate_proj_weight"
+        )
+        for rank in (0, 1, 12, 63)
+    ]
+    print(f"CONJUNCT5D_DEGREE_ONE_COLUMNS={at_degree_one}")
+    assert at_degree_one == [0, 1, 12, 63], (
+        f"at expert-parallel degree 1 the group is the whole world, so each rank's "
+        f"column is its own rank; the reader returned {at_degree_one}"
     )

@@ -1589,6 +1589,15 @@ class DeferredShardGeometry:
     #: What the padded elements hold. 0.0 for a weight, 1.0 for a reciprocal
     #: block scale -- see :func:`~vllm_neuron.utils.weight_loader.pad_to_shape`.
     pad_value: float = 0.0
+    #: The owning module's expert-parallel degree, carried for ONE reason: the
+    #: EP-TP group only exists above 1. ``get_neuron_ep_tp_group`` asserts with
+    #: "Call initialize_neuron_parallel_state() with ep_degree > 1"
+    #: (``parallel/neuron_parallel_state.py:1186-1192``), so at degree 1 there is
+    #: no group to read a column from and the group IS the whole world. A bank
+    #: geometry that did not carry the degree made the column reader treat a
+    #: degree-1 load as a missing group and refuse it -- measured at
+    #: ``accept-101-r8-host.out``. Only the bank sets this above 1.
+    expert_parallel_degree: int = 1
 
     def __post_init__(self) -> None:
         if self.shard_dim not in (0, 1):
@@ -1603,6 +1612,11 @@ class DeferredShardGeometry:
             raise ValueError(
                 f"pad_to_multiple_of must be >= 1 or None, got "
                 f"{self.pad_to_multiple_of}"
+            )
+        if self.expert_parallel_degree < 1:
+            raise ValueError(
+                f"expert_parallel_degree must be >= 1, got "
+                f"{self.expert_parallel_degree}"
             )
 
 
@@ -2179,7 +2193,7 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
 
 
 def _expert_parallel_shard_column(
-    rank: int, tp_per_ep: int, param_name: str | None
+    rank: int, tp_per_ep: int, ep_degree: int, param_name: str | None
 ) -> int:
     """This process's column inside its expert-parallel TP group, checked twice.
 
@@ -2206,12 +2220,29 @@ def _expert_parallel_shard_column(
     bank's refusal set, beside a ragged expert degree and a shard the consumer
     cannot take.
 
-    AN UNINITIALISED GROUP IS REFUSED BY NAME TOO. The getter asserts
-    (``:1188-1191``), which would land as a bare ``AssertionError`` naming no
-    parameter in the middle of a load; the owner declared a degree above 1, so a
-    missing group is a real contradiction and it is said in those terms.
+    AT EXPERT-PARALLEL DEGREE 1 THERE IS NO GROUP TO READ, and the degree is read
+    here rather than assumed. ``get_neuron_ep_tp_group`` asserts with "Call
+    initialize_neuron_parallel_state() with ep_degree > 1" (``:1186-1192``), so a
+    degree-1 load has no EP-TP group by construction -- and it needs none, because
+    at degree 1 the expert-parallel group IS the whole world and the column is the
+    rank's own place in it. The first version of this function asked the group
+    before it asked the degree, and refused every degree-1 bank load with a message
+    claiming the module "declares an expert-parallel degree above 1" when it
+    declared 1. That broke ``inc-glm53f-094``'s landed conjunct (4)
+    (``accept-101-r8-host.out``, ``rank = 0, tp_per_ep = 2``) and it is the same
+    defect this seat keeps making: a predicate that does not read the thing it
+    names.
+
+    AN UNINITIALISED GROUP IS STILL REFUSED BY NAME, at the degrees that require
+    one. The getter asserts (``:1188-1191``), which would land as a bare
+    ``AssertionError`` naming no parameter in the middle of a load; above degree 1
+    the owner really does declare a group, so a missing one is a real contradiction
+    and it is said in those terms.
     """
     from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_tp_group
+
+    if ep_degree <= 1:
+        return rank % tp_per_ep
 
     try:
         group = get_neuron_ep_tp_group()
@@ -2374,7 +2405,10 @@ def _column_of_each_expert(
 
     def transform(local_slices: list, rank: int) -> torch.Tensor:
         column = _expert_parallel_shard_column(
-            rank, geometry.num_shards, param_name
+            rank,
+            geometry.num_shards,
+            geometry.expert_parallel_degree,
+            param_name,
         )
         whole = stack_whole(local_slices, rank)
         # The stacked result carries a LEADING expert axis, so the geometry's

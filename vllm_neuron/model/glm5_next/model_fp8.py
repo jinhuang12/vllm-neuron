@@ -438,6 +438,11 @@ def _shard_geometry_for(
     if declared is None:
         return None
     num_shards = world_size
+    # Declared before the branch because the geometry CARRIES it: the EP-TP group
+    # the column reader consults only exists above 1, so a bank geometry that did
+    # not say which degree it was built at made the reader treat degree 1 as a
+    # missing group. Every non-bank family is built at 1 and means it.
+    ep_degree = 1
     if declared.shards_within_expert_parallel_group:
         # The divisor is the ranks inside ONE expert-parallel group. Read off the
         # module that already resolved both degrees at construction
@@ -458,6 +463,7 @@ def _shard_geometry_for(
             pad_to_multiple_of=(
                 consumer_block_quant_size() if declared.pad_to_consumer_block else None
             ),
+            expert_parallel_degree=ep_degree,
         )
     if declared.shards_within_expert_parallel_group:
         # No family declares both today, and this refusal is what keeps it that
