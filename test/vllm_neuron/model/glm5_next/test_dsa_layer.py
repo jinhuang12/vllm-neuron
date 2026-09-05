@@ -46,13 +46,13 @@ directly -- and ``7/7`` is read over the UNION of the two. That arm's table is
 carries its own one-third moving control. Ruled at design entry ``design-20260905-aa``.
 
 THE ARM PACKS ONCE AND UNPACKS NEVER, and the reason is a dtype gate rather than a preference.
-``dsa_ragged_pack`` admits bf16 alone (``ragged_pack.py:121``, gating both directions at ``:594``
-and ``:609``), and the only tensors the arm could pack are the indexer query and the gate weights.
+``dsa_ragged_pack`` admits bf16 alone (``ragged_pack.py:136``, gating both directions at ``ragged_pack.py:609``
+and ``ragged_pack.py:624``), and the only tensors the arm could pack are the indexer query and the gate weights.
 The weights are fp32 because ``dsa_score_gemm`` admits fp32 weights alone (``score_gemm.py:158``,
 whose own comment says a bf16 weight would quietly lose the fold's precision), so packing them is
 not available at any price a design may pay. And nothing on the arm needs the padded form back:
 ``mla_sparse_attention`` requires DENSE 2-D ``[seq, topk]`` indices and raises by name on any other
-rank (``mla_sparse.py:1214-1216``), so a padded rank-3 tensor would be REFUSED by the consumer. So
+rank (``mla_sparse.py:1345-1347``), so a padded rank-3 tensor would be REFUSED by the consumer. So
 one pack, one counter moved for the family, no unpack. This seat raised the collision as F11 and
 chose no route; the lead ruled route (b) and refused both a bf16 round trip taken to move a counter
 and a declared torch fallback. The unpack direction's own coverage is ``inc-glm53f-045``'s landed
@@ -121,7 +121,7 @@ INDEX_TOPK = 2048
 #: is the one undetermined risk in this fixture:
 #:
 #:   ``dsa_topk_select``'s gate admits any ``0 < k < width`` (``topk_select.py:294``) and its dry run
-#:   cannot see a body-level failure (``:299`` catches only ``AssertionError`` from the config
+#:   cannot see a body-level failure (``topk_select.py:299`` catches only ``AssertionError`` from the config
 #:   factories). At ``k = 2`` the body takes the ``k % 8 != 0`` branch, which calls
 #:   ``nisa.max8(dst=val_buf[8 wide], src=data[:, :width])``
 #:   (``rotational_topk_utils.py:1028-1039``). Whether that instruction tolerates a source free axis
@@ -174,37 +174,37 @@ BATCH = 1
 #
 # THE THREE THAT MAY NOT MOVE:
 #   * ``index_head_dim = 128`` is PINNED, not chosen. Three seams refuse any other width by name --
-#     ``kpool_hadamard.py:485`` and ``:564`` ("the Hadamard path is a 128-point transform"),
+#     ``kpool_hadamard.py:485`` and ``kpool_hadamard.py:564`` ("the Hadamard path is a 128-point transform"),
 #     ``score_gemm.py:362``, ``decode_tail_update.py:475`` -- and the transform is 128-specific in
 #     its own body: ``HADAMARD_STAGES`` (``kpool_hadamard.py:102-115``) is a fixed 7-entry table
 #     whose stated invariant is ``groups * 2 * stride == 128``, and ``HADAMARD_SCALE``
-#     (``:134``) is that width's reciprocal square root baked in as a literal.
+#     (``kpool_hadamard.py:134``) is that width's reciprocal square root baked in as a literal.
 #   * ``index_kpool = 4`` stays a power of two, which ``can_run_dsa_index_expand`` requires
-#     (``index_expand.py:353``).
+#     (``index_expand.py:442``).
 #   * ``qk_rope_head_dim = 0`` is the checkpoint's value and the whole point of the increment:
-#     ``mla_sparse.py:1156`` admits it explicitly ("Zero IS admissible"), which is what this
+#     ``mla_sparse.py:1287`` admits it explicitly ("Zero IS admissible"), which is what this
 #     increment's acceptance is meant to exercise.
 #
 # THE REST ARE FREE, and the sweep says so from the validators rather than from silence:
-#   * ``num_attention_heads``: ``mla_sparse.py:1142`` is ``heads < 1 or heads > 128`` -- a floor of
+#   * ``num_attention_heads``: ``mla_sparse.py:1273`` is ``heads < 1 or heads > 128`` -- a floor of
 #     one and a ceiling, no multiple-of rule; heads ride the matmul stationary free axis as a full
 #     width, so there is no head-tiling granularity to satisfy. ``mla_absorb.py:260`` likewise.
-#   * ``kv_lora_rank``: ``mla_sparse.py:1147`` is ``latent < 1``, and its message says why the old
+#   * ``kv_lora_rank``: ``mla_sparse.py:1278`` is ``latent < 1``, and its message says why the old
 #     bounds are gone ("inc-glm53f-041 TILES both axes this used to be bounded on"). 128 is chosen
 #     over a ragged value ON PURPOSE: ``latent % 128 == 0`` selects the UNTILED body
-#     (``:1282``), the same body production's 512 takes, so the tiled counters
-#     (``:1283-1284``) stay at the zero this file's table declares. A ragged latent would move a
+#     (``mla_sparse.py:1420``), the same body production's 512 takes, so the tiled counters
+#     (``mla_sparse.py:1421-1422``) stay at the zero this file's table declares. A ragged latent would move a
 #     counter the declared table does not predict.
 #   * ``q_lora_rank``, ``hidden_size``, ``qk_nope_head_dim``, ``v_head_dim``: ``mla_projection``
 #     checks POSITIVITY only, and says so ("ONLY POSITIVITY IS CHECKED, and the absence of an upper
 #     bound is the whole point of this module", ``mla_projections.py:219-223``).
 #   * ``index_n_heads``: ``score_gemm.py:358`` is ``heads <= 0``; the module's ``INDEX_N_HEADS = 32``
-#     (``:126-132``) is annotated in its own source as "recorded for the reader; NOT a limit".
+#     (``score_gemm.py:126-132``) is annotated in its own source as "recorded for the reader; NOT a limit".
 #
 # ONE COUPLING TO RESPECT, so the cache shape is derived and not typed:
-# ``head_size = kv_lora_rank + qk_rope_head_dim`` (``model_fp8.py:262-271``), so ``latent_cache``
+# ``head_size = kv_lora_rank + qk_rope_head_dim`` (``model_fp8.py:407-416``), so ``latent_cache``
 # is ``[slots, 1, head_size]``; and ``attend`` refuses an absorb-in width that is not the latent
-# (``model_fp8.py:4416-4420``), which holds because ``W_UK`` is
+# (``model_fp8.py:4561-4565``), which holds because ``W_UK`` is
 # ``[heads, qk_nope_head_dim, kv_lora_rank]``.
 TINY_GEOMETRY: dict[str, int] = {
     "hidden_size": 256,
@@ -220,7 +220,7 @@ TINY_GEOMETRY: dict[str, int] = {
 }
 
 #: ``head_size``, DERIVED from the two config fields the way the implementation derives it
-#: (``model_fp8.py:262-271``) rather than typed, so a config change reaches this file.
+#: (``model_fp8.py:407-416``) rather than typed, so a config change reaches this file.
 TINY_HEAD_SIZE = TINY_GEOMETRY["kv_lora_rank"] + TINY_GEOMETRY["qk_rope_head_dim"]
 
 #: Registered tolerance for item (1), the plan block's own.
@@ -260,9 +260,9 @@ FAMILIES: tuple[str, ...] = tuple(sorted(set(ENTRY_POINTS.values())))
 #
 # The layer case below never packs, and that is upstream's design rather than a gap here.
 # Upstream guards its whole pack/unpack region with ``if decode_metadata.requires_padding:``
-# (``sparse_attn_indexer_kpool.py:744`` at pin ``878631b6``, the unpack at ``:889``), and a
+# (``sparse_attn_indexer_kpool.py:744`` at pin ``878631b6``, the unpack at ``sparse_attn_indexer_kpool.py:889``), and a
 # batch of one is uniform by construction -- ``attend()`` refuses any ``batch_size != 1``
-# (``model_fp8.py:3227``). So the layer case's ``ragged_pack`` reading is a DECLARED ZERO,
+# (``model_fp8.py:3372``). So the layer case's ``ragged_pack`` reading is a DECLARED ZERO,
 # not a miss, and inserting a pack there to move a counter would be the instrument driving
 # the design. The seventh family is reached instead by a second case: a NON-UNIFORM decode
 # batch called on ``Glm5NextDSAIndexer`` directly, which is where padding is required.
@@ -291,8 +291,8 @@ DECLARED_PER_LAYER: dict[str, tuple[int, int]] = {
 #:
 #: SUPERSEDED, and recorded rather than quietly replaced. An earlier draft of this table read
 #: ``dsa_ragged_pack`` (0, 2) and ``dsa_ragged_unpack`` (0, 1), derived from upstream's branch:
-#: upstream packs the quantised query (``:748`` or ``:756``), packs the query scale only when one
-#: exists (``:751``), packs the weights (``:759``), and unpacks once (``:889``). Two of those three
+#: upstream packs the quantised query (``sparse_attn_indexer_kpool.py:748`` or ``sparse_attn_indexer_kpool.py:756``), packs the query scale only when one
+#: exists (``sparse_attn_indexer_kpool.py:751``), packs the weights (``sparse_attn_indexer_kpool.py:759``), and unpacks once (``sparse_attn_indexer_kpool.py:889``). Two of those three
 #: figures do not survive the FORK's own gates. The query scale never existed here, which was
 #: already known. The WEIGHTS cannot pack, because they are fp32 by ``dsa_score_gemm``'s gate and
 #: ``dsa_ragged_pack`` admits bf16 alone -- so upstream's pair is a single pack here. And the
@@ -746,7 +746,7 @@ def test_a_false_compress_dial_is_refused_by_name_before_anything_dispatches(
     loose twice over: the appended columns carry RAW TOKEN indices ``tail_start + t``, not a
     pool id, and there are ``pool_size - 1`` of them whether or not any is populated -- the
     whole append masks to ``-1`` when ``seq_len % pool_size == 0`` (``index_expand.py:9``,
-    ``:428-439``). This case's ``PREFILL_TOKENS = 19`` gives ``19 % 4 = 3``, so three tail
+    ``index_expand.py:533-544``). This case's ``PREFILL_TOKENS = 19`` gives ``19 % 4 = 3``, so three tail
     columns are populated and the reading is non-degenerate; the assertion below does not
     depend on that, but a reader comparing the two numbers should not have to derive it.
 
@@ -841,7 +841,7 @@ def test_rider_B71_N3_the_indexer_hands_the_pooling_seam_bf16_keys() -> None:
 
     WHAT THIS TEST MEASURES, and it needs no simulator. ``project_stage`` is pure torch, so the dtypes
     it returns are readable on any host. It casts the key to bf16 BEFORE the norm and the norm casts
-    back to its input's dtype (``model_fp8.py:2857``, ``return normed.to(x.dtype)``), so the bf16
+    back to its input's dtype (``model_fp8.py:3002``, ``return normed.to(x.dtype)``), so the bf16
     survives the norm -- which is the link the finding turns on and the one a refactor would break.
 
     WHAT IT DOES NOT MEASURE, said plainly rather than implied. It does not read the gate: every
@@ -852,7 +852,7 @@ def test_rider_B71_N3_the_indexer_hands_the_pooling_seam_bf16_keys() -> None:
 
     THE SECOND HALF OF THE FINDING IS NOT MINE TO FIX, and this records it rather than papering over
     it: ``can_run_dsa_hadamard128`` (``kpool_hadamard.py:505-509``) tests rank and width and has NO
-    dtype clause at all, while its sibling ``can_run_dsa_kpool_hadamard`` (``:496``) does. So the two
+    dtype clause at all, while its sibling ``can_run_dsa_kpool_hadamard`` (``kpool_hadamard.py:496``) does. So the two
     entry points of one counter family admit different dtypes. That asymmetry belongs to the seam's
     owner; this increment reports it and does not edit another block's gate.
     """
@@ -890,8 +890,8 @@ def test_rider_B67_N4_the_ragged_pack_admits_bf16_only_and_preserves_it() -> Non
 
     THE FINDING: ``-045``'s own tests never read the packed output's dtype, so this is a genuine
     addition rather than a duplicate. The module declares ``_SUPPORTED_DTYPES = (torch.bfloat16,)``
-    (``ragged_pack.py:121``) and both kernels allocate their output in the INPUT's dtype
-    (``:319``, ``:435``), so a dtype change would be visible here and nowhere else in the suite.
+    (``ragged_pack.py:136``) and both kernels allocate their output in the INPUT's dtype
+    (``ragged_pack.py:334``, ``ragged_pack.py:450``), so a dtype change would be visible here and nowhere else in the suite.
 
     Read without a simulator on purpose: the declared admission and the torch path's dtype
     preservation are both readable on any host, and the ARM in run 2 reads the same property on the
@@ -959,7 +959,7 @@ def test_rider_B67_N4_the_ragged_pack_admits_bf16_only_and_preserves_it() -> Non
 
 
 def _ref_scale(indexer) -> float:
-    """``projection_scale()``: EXACTLY two folded factors (``model_fp8.py:2882``).
+    """``projection_scale()``: EXACTLY two folded factors (``model_fp8.py:3027``).
 
     Computed, never typed. The product is not the tidy reciprocal a reader expects -- at
     ``index_head_dim = 128`` and ``index_n_heads = 4`` it is not exactly ``1/16`` in binary -- so a
@@ -973,9 +973,9 @@ def _ref_projection(x: torch.Tensor, weight_out_in: torch.Tensor) -> torch.Tenso
 
     The seam's own oracle is ``x.to(float32) @ weight.to(float32)``
     (``mla_projections.py:285``) and its validator fixes the orientation at
-    ``weight.shape[0] == in_features`` (``:261``). This helper takes the CHECKPOINT-shaped
+    ``weight.shape[0] == in_features`` (``mla_projections.py:261``). This helper takes the CHECKPOINT-shaped
     ``[out, in]`` leaf and transposes it here, which is the same thing
-    ``prepare_projection_weights`` does once at load time (``model_fp8.py:2771``) -- done
+    ``prepare_projection_weights`` does once at load time (``model_fp8.py:2916``) -- done
     independently so the reference does not read the implementation's cache.
     """
     return x.to(torch.float32) @ weight_out_in.to(torch.float32).t()
@@ -989,10 +989,10 @@ def _ref_absorb(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 def _ref_layer_norm(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """``_key_norm``: normalise in float32, cast back to the INPUT's dtype (``model_fp8.py:2850``).
+    """``_key_norm``: normalise in float32, cast back to the INPUT's dtype (``model_fp8.py:2995``).
 
     The cast back matters and is not cosmetic: ``project_stage`` casts the key to bf16 BEFORE the
-    norm so the norm's own cast-back lands on bf16 (``:2944-2953``), which is upstream's order.
+    norm so the norm's own cast-back lands on bf16 (``model_fp8.py:3100-3109``), which is upstream's order.
     """
     width = int(x.shape[1])
     normed = torch.nn.functional.layer_norm(
@@ -1002,7 +1002,7 @@ def _ref_layer_norm(
 
 
 def _ref_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """``Glm5NextDSALayer._input_norm`` (``model_fp8.py:4496-4500``)."""
+    """``Glm5NextDSALayer._input_norm`` (``model_fp8.py:4641-4645``)."""
     f = x.to(torch.float32)
     normed = f * torch.rsqrt(f.pow(2).mean(dim=-1, keepdim=True) + float(eps))
     return (normed * weight.to(torch.float32)).to(x.dtype)
@@ -1092,7 +1092,7 @@ def _ref_score(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -> torch
 
 
 def _ref_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
-    """``dsa_topk_select`` then ``select_pools``' cast (``topk_select.py:369``, ``:3283-3284``)."""
+    """``dsa_topk_select`` then ``select_pools``' cast (``topk_select.py:369``, ``model_fp8.py:3439-3440``)."""
     return torch.topk(scores, int(k), dim=-1).indices.to(torch.int32)
 
 
@@ -1100,12 +1100,15 @@ def _ref_expand(pool_ids: torch.Tensor, seq_lens: torch.Tensor, pool_size: int) 
     """``dsa_index_expand``: pool ids become token indices, with a raw-token tail appended.
 
     Written as an explicit LOOP where the seam's own reference is vectorised
-    (``index_expand.py:420-441``). That is deliberate: a loop and a gather-and-mask are different
+    (``index_expand.py:525-546``). That is deliberate: a loop and a gather-and-mask are different
     enough that a transcription slip in either shows up as a mismatch rather than as a shared bug.
 
-    The width is DERIVED, never typed -- ``n_groups * pool_size + pool_size - 1``
-    (``index_expand.py:384``, ``:421-422``) -- because the declared width MOVES when ``-102`` lands
-    its padding to a multiple of ``KEY_CHUNK``.
+    The width is DERIVED, never typed, and ``-102`` HAS NOW LANDED so there are TWO widths. This
+    reference matches the EMITTED one. ``index_expand_raw_width`` is
+    ``n_groups * pool_size + pool_size - 1`` (``index_expand.py:242-252``) and covers the columns
+    that carry meaning; ``index_expand_width`` rounds that up to a whole number of ``KEY_CHUNK``
+    (``index_expand.py:255-267``) and is what the seam allocates and emits
+    (``index_expand.py:526``).
     """
     rows, n_groups = (int(d) for d in pool_ids.shape)
     pool = int(pool_size)
@@ -1130,15 +1133,21 @@ def _ref_sparse_attention(
 ) -> torch.Tensor:
     """Sparse attention over each row's NON-SENTINEL columns only.
 
-    HAND-WRITTEN RATHER THAN THE SEAM'S OWN ORACLE, and this is the one place where the seam's
-    oracle would give the WRONG answer. ``mla_sparse_attention_torch_oracle`` gathers with
-    ``cache[idx[s]]`` (``mla_sparse.py:1343``), and a ``-1`` there does not skip a column -- torch
-    WRAPS it onto the LAST cache row, silently attending a real key. Sentinels are exactly what this
-    increment's operands carry once ``-102`` pads the expansion, and ``-098``'s whole content is
-    masking ``-1`` inside the kernel. So the oracle and the post-``-098`` kernel disagree about
-    ``-1``, and this reference follows the KERNEL. The design ruled the same way at design entry
-    ``design-20260905-af`` (plan revision 215): the reference attends each row's non-sentinel
-    columns only.
+    HAND-WRITTEN RATHER THAN THE SEAM'S OWN ORACLE, AND THE REASON CHANGED WHEN ``-098`` LANDED.
+    It used to be that the seam's oracle was simply wrong here: it gathered with ``cache[idx[s]]``,
+    and a ``-1`` does not skip a column in torch -- it WRAPS onto the last cache row and silently
+    attends a real key. ``-098`` fixed that inside the oracle itself. It now builds
+    ``keep = idx >= 0`` (``mla_sparse.py:1483``), clamps ``-1`` to row 0 (``mla_sparse.py:1484``), gathers
+    on the clamped rows (``mla_sparse.py:1488``), masks the sentinel columns to ``-inf``
+    (``mla_sparse.py:1493``), and replaces the NaN a wholly-sentinel row's softmax would otherwise
+    produce (``mla_sparse.py:1496``). So the oracle and the
+    kernel now AGREE about ``-1``, and the original justification for this function is GONE.
+
+    IT IS KEPT ANYWAY, on a weaker reason stated rather than implied: a loop is a genuinely
+    independent transcription of a gather-and-mask, so a slip in either shows up as a mismatch
+    instead of as a shared bug. The design ruled this reference's semantics at design entry
+    ``design-20260905-af`` (plan revision 215), and the lead settled the oracle question separately
+    -- the module oracle masks, and the only gap was coverage, which ``-098`` carries.
 
     DUPLICATES ARE KEPT. A selected pool can cover the tail region, so an expanded row can name the
     same token twice, and the kernel does not de-duplicate -- its softmax normalises over the columns
@@ -1177,7 +1186,7 @@ def _raw(module, name: str) -> torch.Tensor:
     implementation's own prepared cache. The attribute name comes from the module's own
     ``PROJECTION_PARAMETERS`` map where it has one, because that map is not uniform -- three
     indexer sites carry a ``_weight`` suffix and ``index_kpool_compress_gate`` does not
-    (``model_fp8.py:2655-2660``), so guessing the suffix would work for three of four.
+    (``model_fp8.py:2800-2805``), so guessing the suffix would work for three of four.
     """
     mapping = getattr(module, "PROJECTION_PARAMETERS", None)
     attribute = mapping[name] if mapping and name in mapping else f"{name}_weight"
@@ -1192,7 +1201,7 @@ def _raw(module, name: str) -> torch.Tensor:
 def _ref_project_stage(indexer, hidden: torch.Tensor, q_latent: torch.Tensor) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """``Glm5NextDSAIndexer.project_stage`` (``model_fp8.py:2943-2979``), step for step.
+    """``Glm5NextDSAIndexer.project_stage`` (``model_fp8.py:3088-3124``), step for step.
 
     Four projections and their dtypes, in the implementation's own order. The ORDER of the casts is
     the part worth mirroring exactly: the key is cast to bf16 BEFORE its LayerNorm so the norm's
@@ -1226,7 +1235,7 @@ def _ref_candidate_keys(pool_cache: torch.Tensor, candidates: int) -> torch.Tens
     """``_gather_candidates`` collapses to a PREFIX SLICE, and the collapse is proven not assumed.
 
     The implementation sends ``page = j // page_size`` and ``slot = j % page_size`` for
-    ``j in arange(candidates)`` (``model_fp8.py:3421-3427``) and the kernel recomputes
+    ``j in arange(candidates)`` (``model_fp8.py:3566-3572``) and the kernel recomputes
     ``page * page_size + slot``, which is the identity on ``j``. So the gather returns
     ``pool_cache[:candidates]``. The reference states the identity as an assertion on the arithmetic
     rather than quietly slicing, because if the page arithmetic ever stops being the identity this
@@ -1256,7 +1265,7 @@ def _ref_indexer(
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """``Glm5NextDSAIndexer.forward``, both legs (``model_fp8.py:3500-3544``).
+    """``Glm5NextDSAIndexer.forward``, both legs (``model_fp8.py:3645-3689``).
 
     ``probe``, when given, collects the pool SCORES this call selected from. The caller uses them for
     the tie control: item (1) compares the layer's final output, so a selection decided by a tie
@@ -1272,7 +1281,7 @@ def _ref_indexer(
     ape = indexer.index_kpool_compress_ape.to(torch.float32)
 
     if is_decode:
-        # ``tail_step`` -> ``dsa_decode_tail_update`` (``model_fp8.py:3140``,
+        # ``tail_step`` -> ``dsa_decode_tail_update`` (``model_fp8.py:3285``,
         # ``decode_tail_update.py:585-599``). ``slot_of`` is ``position % pool_size``.
         slot = int(position) % pool
         pool_key = tail[0].clone()
@@ -1285,7 +1294,7 @@ def _ref_indexer(
         if pooled is not None:
             pool_cache[int(position) // pool] = pooled.to(pool_cache.dtype)[0]
     else:
-        # ``pool_window`` (``model_fp8.py:3061-3071``): a sliding window of ``pool`` positions
+        # ``pool_window`` (``model_fp8.py:3206-3216``): a sliding window of ``pool`` positions
         # ending at each token, clamped at the start; a row is WRITTEN only where the slot is real
         # and the window is full. Everything else is steered to the trash row.
         tokens = int(key.shape[0])
@@ -1315,9 +1324,9 @@ def _ref_attend(
     topk_indices: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """``Glm5NextMLAAttention.attend`` (``model_fp8.py:4398-4431``).
+    """``Glm5NextMLAAttention.attend`` (``model_fp8.py:4543-4576``).
 
-    MUTATES ``latent_cache``, as the implementation does at ``:4393``. The write happens BEFORE the
+    MUTATES ``latent_cache``, as the implementation does at ``model_fp8.py:4549``. The write happens BEFORE the
     read on purpose -- so a decode step attends to its own token -- and mirroring that order is the
     whole reason this is not written as a pure function.
     """
@@ -1349,13 +1358,13 @@ def _ref_attend(
 
 
 def _ref_latent_norm(x: torch.Tensor, gain: torch.Tensor, eps: float) -> torch.Tensor:
-    """``_latent_norm`` (``model_fp8.py:4112-4114``): an RMS norm with a gain and NO cast back."""
+    """``_latent_norm`` (``model_fp8.py:4257-4259``): an RMS norm with a gain and NO cast back."""
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     return x * torch.rsqrt(variance + float(eps)) * gain.to(torch.float32)
 
 
 def _ref_absorb_operands(attention) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split the raw ``kv_b_proj`` into ``W_UK`` and ``W_UV`` (``model_fp8.py:4063-4070``).
+    """Split the raw ``kv_b_proj`` into ``W_UK`` and ``W_UV`` (``model_fp8.py:4208-4215``).
 
     Re-derived here rather than read from ``_absorb_weight``, because the SPLIT is part of the
     chain under test: a permutation error there would move every head's output and a reference that
@@ -1389,11 +1398,11 @@ def _ref_layer(
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """``Glm5NextDSALayer.forward`` (``model_fp8.py:4542-4567``).
+    """``Glm5NextDSALayer.forward`` (``model_fp8.py:4687-4712``).
 
     Note what the landed layer does NOT do, mirrored here rather than corrected: no MLP and no
     post-attention norm. Both are built and declared but unthreaded, and BOTH layer families say so
-    in their own docstrings (``:4517`` for this one, ``:2545`` for the KDA sibling), so the omission
+    in their own docstrings (``model_fp8.py:4673`` for this one, ``model_fp8.py:2690`` for the KDA sibling), so the omission
     is a staged design and not a gap this reference should quietly fill in.
     """
     attention = layer.attention
@@ -1431,7 +1440,7 @@ def _ref_layer(
 #: contraction width is ``kv_lora_rank`` (``qk_rope_head_dim`` is 0 on this checkpoint). ``attend``
 #: takes the scale as a caller's argument on purpose and its own comment says why -- "no block
 #: registers a value for it ... deriving one here would mint a registered value this increment has no
-#: authority to mint" (``model_fp8.py:4335-4337``). So this file derives one for its own run and
+#: authority to mint" (``model_fp8.py:4480-4482``). So this file derives one for its own run and
 #: registers nothing.
 SOFTMAX_SCALE = float(TINY_GEOMETRY["kv_lora_rank"] ** -0.5)
 
@@ -1454,7 +1463,7 @@ def _materialise_indexer(indexer, gen: torch.Generator) -> None:
         torch.randn(head_dim, generator=gen, dtype=torch.float32) * 0.02
     )
     # The ape is a bf16 checkpoint leaf; the caller casts it to float32 per call
-    # (``model_fp8.py:3070``), so the leaf is stored in the checkpoint's dtype here rather than
+    # (``model_fp8.py:3215``), so the leaf is stored in the checkpoint's dtype here rather than
     # pre-cast -- otherwise the reference would agree with a cast the implementation still has to do.
     indexer.index_kpool_compress_ape = torch.nn.Parameter(
         (torch.randn(pool, head_dim, generator=gen, dtype=torch.float32) * 0.1).to(
@@ -1514,8 +1523,8 @@ def prefill_slot_mapping(tokens: int, pool: int) -> torch.Tensor:
     """The pool-granular slot per position: the pool's own id where a pool COMPLETES, else ``-1``.
 
     ``pool_window``'s write mask is ``(slot_mapping >= 0) & (pos >= pool - 1)``
-    (``model_fp8.py:3064``), so a ``-1`` here is how a position says "my window is not a whole pool";
-    those rows are steered to the trash row rather than dropped (``:3523-3528``).
+    (``model_fp8.py:3209``), so a ``-1`` here is how a position says "my window is not a whole pool";
+    those rows are steered to the trash row rather than dropped (``model_fp8.py:3679-3684``).
     """
     slots = torch.full((int(tokens),), -1, dtype=torch.int32)
     for p in range(int(tokens)):
@@ -1528,7 +1537,7 @@ def case_operands(cfg, *, tokens: int = PREFILL_TOKENS):
     """Every operand both runs need, plus the two derived counts the indexer will re-derive.
 
     ``candidates = max_seq_len // pool`` and ``trash = pool_cache.shape[0] - 1``
-    (``model_fp8.py:3378``, ``:3382-3388``). Both are recomputed here from the same closed forms so
+    (``model_fp8.py:3523``, ``model_fp8.py:3538-3544``). Both are recomputed here from the same closed forms so
     the reference does not have to call ``_require_serviceable``.
     """
     pool = int(cfg.index_kpool)
@@ -1795,7 +1804,7 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
 
     THE CORRECTNESS READING IS BIT-EXACT, and the implementation's own docstring is why. It claims
     the projections are row-wise and therefore "projecting the padded grid and then packing gives
-    bit-for-bit what packing and then projecting would" (``model_fp8.py:3679-3682``). This test
+    bit-for-bit what packing and then projecting would" (``model_fp8.py:3824-3827``). This test
     takes that claim at its word and compares INDICES for equality -- no tolerance -- because the
     output is an int32 index tensor and a tolerance on an index would hide an off-by-one.
     """
@@ -1808,7 +1817,7 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     hidden_size = int(cfg.hidden_size)
     q_lora = int(cfg.q_lora_rank)
 
-    # A NON-UNIFORM batch: the arm refuses a uniform one by name (``model_fp8.py:3664-3671``).
+    # A NON-UNIFORM batch: the arm refuses a uniform one by name (``model_fp8.py:3809-3816``).
     lengths = [PREFILL_TOKENS // 2, PREFILL_TOKENS]
     max_len = max(lengths)
     tokens = sum(lengths)
