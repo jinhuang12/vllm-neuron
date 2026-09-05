@@ -182,8 +182,21 @@ def mla_sparse_dispatch_counters() -> tuple[int, int]:
     )
 
 
-def _sbuf(*shape: int, dtype=nl.float32):
-    return nl.ndarray(tuple(shape), dtype=dtype, buffer=nl.sbuf)
+# THESE THREE TAKE POSITIONAL SHAPES ONLY, and no caller anywhere passes a keyword.
+# NKI's compiler DROPS a keyword-only parameter -- it discards the name instead of
+# applying the default -- so a helper written `def _sbuf(*shape, dtype=nl.float32)`
+# leaves `dtype` unbound, and every kernel that reaches the compiler through it is
+# refused with "unbound variable 'dtype'". A `**kwargs` form is refused as well. No
+# call-preserving form exists, which is why the uint32 case gets its own NAME rather
+# than an argument. Evidence: increments/probe-096-repair-host.out arms G1, G2A, G2B,
+# G5 and G6, and increments/probe-096-loop-host.out arm FIRE, each measured against a
+# floor that captured in the same process.
+def _sbuf(*shape: int):
+    return nl.ndarray(tuple(shape), dtype=nl.float32, buffer=nl.sbuf)
+
+
+def _sbuf_u32(*shape: int):
+    return nl.ndarray(tuple(shape), dtype=nl.uint32, buffer=nl.sbuf)
 
 
 def _psum(*shape: int):
@@ -220,7 +233,13 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     # HBM holds it [S_kv, L]; MM1 and the gather both want [L_partition, S_kv]. One
     # `dma_transpose` per latent tile does it, and the cache is read-only for the
     # rest of the call, so this cost is per call and not per query.
-    c_sb = [_sbuf(LATENT_TILE, s_kv) for _ in range(n_latent)]
+    #
+    # Built by a loop and not by a comprehension: a comprehension inside a traced
+    # kernel is refused at SPECIALIZATION with "unsupported expression". Same tiles,
+    # same order, same name. Evidence: increments/probe-096-expr-host.out rung F1.
+    c_sb = []
+    for _ in range(n_latent):
+        c_sb.append(_sbuf(LATENT_TILE, s_kv))
     for li in range(n_latent):
         nisa.dma_transpose(
             dst=c_sb[li],
@@ -236,7 +255,7 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
         )
 
     # ---- per-query working set, allocated once and reused across the loop -------
-    idx_sb = _sbuf(LATENT_TILE, topk, dtype=nl.uint32)
+    idx_sb = _sbuf_u32(LATENT_TILE, topk)
     q_lift_t = _sbuf(LATENT_TILE, n_latent, heads)
     c_g = _sbuf(LATENT_TILE, n_latent, topk)
     c_g_t = _sbuf(KEY_CHUNK, n_chunks, latent)
@@ -510,8 +529,24 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     # One `dma_transpose` per latent tile, exactly as `-040`, except the last tile's
     # extent is the remainder. The tail transpose was measured on its own before this
     # was written, because it was the reading least likely to be legal.
-    c_sb = [_sbuf(extent, s_kv) for _, extent in lat_tiles]
-    for li, (offset, extent) in enumerate(lat_tiles):
+    #
+    # LOOPS RATHER THAN COMPREHENSIONS, AND AN INDEX RATHER THAN A TUPLE TARGET. Those
+    # two source lines held three separate refusals, and this body repeats the shape
+    # five more times below, so the reason is recorded once here. A comprehension is
+    # refused at SPECIALIZATION with "unsupported expression"; a for-target that is not
+    # a plain name is refused later, at COMPILATION, with "expecting simple variable";
+    # and `enumerate` is refused on its own with "failed to resolve name
+    # 'builtins.enumerate'". Same tiles, same order, same names, and the allocation
+    # order is preserved by keeping each list's loop separate. Evidence:
+    # increments/probe-096-loop-host.out arms H1 and H1C (the target), H2 (the nested
+    # target this body used) and H5 (`enumerate` on its own), plus
+    # increments/probe-096-expr-host.out rung F1 (the comprehension).
+    c_sb = []
+    for li in range(len(lat_tiles)):
+        c_sb.append(_sbuf(lat_tiles[li][1], s_kv))
+    for li in range(len(lat_tiles)):
+        offset = lat_tiles[li][0]
+        extent = lat_tiles[li][1]
         nisa.dma_transpose(
             dst=c_sb[li],
             src=c_kv_hbm.ap(pattern=[[latent, s_kv], [1, extent]], offset=offset),
@@ -528,9 +563,13 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     # `c_g_t` and `out_sb` stay single buffers with the latent on their FREE axis,
     # where a ragged extent needs no special case; only the partition-axis buffers
     # become lists.
-    idx_sb = _sbuf(LATENT_TILE, topk, dtype=nl.uint32)
-    q_lift_t = [_sbuf(extent, heads) for _, extent in lat_tiles]
-    c_g = [_sbuf(extent, topk) for _, extent in lat_tiles]
+    idx_sb = _sbuf_u32(LATENT_TILE, topk)
+    q_lift_t = []
+    for li in range(len(lat_tiles)):
+        q_lift_t.append(_sbuf(lat_tiles[li][1], heads))
+    c_g = []
+    for li in range(len(lat_tiles)):
+        c_g.append(_sbuf(lat_tiles[li][1], topk))
     c_g_t = _sbuf(KEY_CHUNK, n_chunks, latent)
     p_t = _sbuf(KEY_CHUNK, n_chunks, heads)
     p = _sbuf(heads, topk)
@@ -557,11 +596,14 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
         # The index tile is SLICED to the data tile's extent. `nc_n_gather` reads its
         # offsets from the same partition it writes, so a 3-deep data tile needs a
         # 3-deep index tile and not the full 128.
-        for li, (_, extent) in enumerate(lat_tiles):
+        for li in range(len(lat_tiles)):
+            extent = lat_tiles[li][1]
             nisa.nc_n_gather(dst=c_g[li], data=c_sb[li], indices=idx_sb[0:extent, :])
 
         # ---- this query's Q latent, transposed onto partitions ------------------
-        for li, (offset, extent) in enumerate(lat_tiles):
+        for li in range(len(lat_tiles)):
+            offset = lat_tiles[li][0]
+            extent = lat_tiles[li][1]
             nisa.dma_transpose(
                 dst=q_lift_t[li],
                 src=q_lift_hbm.ap(pattern=[[latent, heads], [1, extent]],
@@ -595,7 +637,9 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
         # the ragged tail lands as a 3-wide slice rather than a padded 128-wide one.
         for ck in range(n_chunks):
             ks = ck * KEY_CHUNK
-            for li, (offset, extent) in enumerate(lat_tiles):
+            for li in range(len(lat_tiles)):
+                offset = lat_tiles[li][0]
+                extent = lat_tiles[li][1]
                 c_g_t_ps = _psum(KEY_CHUNK, extent)
                 nisa.nc_transpose(dst=c_g_t_ps, data=c_g[li][:, ks:ks + KEY_CHUNK])
                 nisa.tensor_copy(
@@ -626,7 +670,12 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
         # is MM2's moving free axis, so the output is produced 512 columns at a time
         # and the last tile is 3 wide. The denominator is applied per output tile, for
         # `-040`'s reason -- one pass over [H, L] rather than one over [H, K].
-        for offset, extent in out_tiles:
+        # A simple target plus subscripts, the smaller of the two measured repairs: the
+        # iteration survives and only the unpacking goes. This one carries no
+        # `enumerate`, so it needs no index. Evidence: probe-096-loop-host.out arm H4.
+        for otile in out_tiles:
+            offset = otile[0]
+            extent = otile[1]
             pv_ps = _psum(heads, extent)
             for ck in range(n_chunks):
                 nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
@@ -806,13 +855,28 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     rope = 0 if q_pe_hbm is None else q_pe_hbm.shape[2]
     tiles = _score_tiles(topk)
     single = len(tiles) == 1
-    tile_max = max(extent for _, extent in tiles)
+    # NOT ``max(extent for _, extent in tiles)``, and NOT ``for _, extent in tiles``.
+    # That one line held two refusals. A comprehension or generator expression is
+    # refused at SPECIALIZATION with "unsupported expression"; a for-statement whose
+    # target is a tuple is refused later, at COMPILATION, with "expecting simple
+    # variable". So the target is a plain name and the pair is read by subscript.
+    # Same tiles, same order, same maximum. Evidence:
+    # increments/probe-096-expr-host.out rung F1, and probe-096-loop-host.out arms
+    # H1, H3 and H4, each against its own control.
+    tile_max = 0
+    for tile in tiles:
+        if tile[1] > tile_max:
+            tile_max = tile[1]
     chunk_max = tile_max // KEY_CHUNK
 
     # ---- the cache, transposed onto partitions ONCE for the whole call ----------
     # `-040`'s exactly. The cache does not depend on which score tile is being served,
     # so this stays outside both loops and the widened K costs nothing here.
-    c_sb = [_sbuf(LATENT_TILE, s_kv) for _ in range(n_latent)]
+    # Built by a loop, not a comprehension, for the reason recorded at ``tile_max``
+    # above. Same tiles, same order, same name.
+    c_sb = []
+    for _ in range(n_latent):
+        c_sb.append(_sbuf(LATENT_TILE, s_kv))
     for li in range(n_latent):
         nisa.dma_transpose(
             dst=c_sb[li],
@@ -830,7 +894,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # ---- the working set, sized to ONE SCORE TILE and reused by every tile -------
     # This is the point of tiling rather than widening: every buffer below is the size
     # `-040`'s was at `topk == MOVING_MAX`, whatever K the caller passes.
-    idx_sb = _sbuf(LATENT_TILE, tile_max, dtype=nl.uint32)
+    idx_sb = _sbuf_u32(LATENT_TILE, tile_max)
     q_lift_t = _sbuf(LATENT_TILE, n_latent, heads)
     c_g = _sbuf(LATENT_TILE, n_latent, tile_max)
     c_g_t = _sbuf(KEY_CHUNK, chunk_max, latent)
@@ -885,7 +949,15 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                                 offset=q_idx * heads * rope),
             )
 
-        for ti, (ks, extent) in enumerate(tiles):
+        # NOT ``for ti, (ks, extent) in enumerate(tiles)``. That line held TWO
+        # refusals of its own: the tuple target is refused with "expecting simple
+        # variable", and `enumerate` is refused separately with "failed to resolve
+        # name 'builtins.enumerate'". Evidence: increments/probe-096-loop-host.out,
+        # arms H2 and H5. Indexing by range avoids both, and `ti`, `ks` and `extent`
+        # are bound to exactly what they were before, in the same order.
+        for ti in range(len(tiles)):
+            ks = tiles[ti][0]
+            extent = tiles[ti][1]
             n_chunks = extent // KEY_CHUNK
 
             # ---- THIS TILE's selected rows, replicated to every partition --------
