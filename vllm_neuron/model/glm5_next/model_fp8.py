@@ -86,6 +86,8 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MAPPED_KEY_STACKED_BANK,
     build_weight_mappings,
     classify_mapped_keys,
+    consumer_block_quant_size,
+    DeferredShardGeometry,
     dequantise_blockwise,
     loader_for_mapped_keys,
     scale_keys,
@@ -236,13 +238,31 @@ def _per_rank(count: int, world_size: int) -> int:
 
 @dataclass(frozen=True)
 class _DeclaredShard:
-    """One family's declared shard: the dim, and this rank's extent along it."""
+    """One family's declared shard: the dim, and this rank's extent along it.
+
+    ``width`` IS ``None`` FOR A FAMILY WHOSE WIDTH ARRIVES WITH THE TENSOR
+    (``inc-glm53f-101``). Two cases need it and both are readings rather than
+    conveniences: ``Glm5NextSharedExperts`` carries no width at all
+    (``:1520-1535`` -- ``num_shared_experts`` and ``swiglu_limit``), and the dense
+    MLP's three are moved onto the same route so ONE rule pads both, because
+    ``intermediate_size`` is a config product and the checkpoint tensor is the
+    width source that cannot disagree with the weights.
+
+    ``pad_to_consumer_block`` rounds the full width UP to the smallest multiple of
+    ``world_size * BLOCK_QUANT_SIZE`` before dividing, so every rank's shard is a
+    whole consumer block. It is a FLAG and not the number, because the number
+    lives in the consumer and is imported at attachment time rather than at
+    import time -- see
+    :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.consumer_block_quant_size`.
+    Ruled at design entry ``design-20260905-ap``, remedy part 2.
+    """
 
     shard_dim: int
-    width: Callable[[nn.Module, int], int]
+    width: Callable[[nn.Module, int], int] | None
     #: Why this family is sharded on this dim, in one clause, for the reader who
     #: finds this table before finding the shard table.
     because: str
+    pad_to_consumer_block: bool = False
 
 
 def _kda_head_width(module: nn.Module, world_size: int) -> int:
@@ -264,15 +284,17 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
     return int(module.num_kv_heads_per_rank)
 
 
-def _dense_intermediate(module: nn.Module, world_size: int) -> int:
-    """This rank's slice of the dense MLP's intermediate width.
-
-    ``Glm5NextDenseMLP`` holds the FULL width (``intermediate_size``) and receives
-    no world size, so unlike the KDA families this one is divided HERE, at the
-    attachment site, where the root's world size is known. ``_per_rank`` is reused
-    rather than re-derived so both halves of the surface floor identically.
-    """
-    return _per_rank(int(module.intermediate_size), world_size)
+# THE DENSE MLP'S WIDTH FUNCTION IS GONE (``inc-glm53f-101``), and its removal is
+# the fix rather than a tidy-up. It read ``_per_rank(module.intermediate_size,
+# world_size)``, which FLOORS: at the registered TP=64 the real 12288 gave 192 rows
+# per rank, and 192 is neither a whole 128-row checkpoint tile nor a whole 256-row
+# consumer block, so every dense projection on every dense layer refused by name
+# and the model could not load at all. Measured in
+# ``increments/probe-101-grid-host-r6.out``. The three families now declare
+# ``width=None`` with ``pad_to_consumer_block=True``: the width is read off the
+# checkpoint tensor and rounded UP to a multiple of ``world_size * 256``, which is
+# 16384 at 64 and 32 ranks and 12288 unchanged at 16 or fewer. Ruled at design
+# entry ``design-20260905-ap``, remedy part 2.
 
 
 #: Declaring class name -> declared leaf -> its shard. Keyed by NAME rather than by
@@ -305,13 +327,33 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
     },
     "Glm5NextDenseMLP": {
         "gate_proj_weight": _DeclaredShard(
-            0, _dense_intermediate, "column-parallel on the intermediate width"
+            0, None, "column-parallel on the intermediate width", True
         ),
         "up_proj_weight": _DeclaredShard(
-            0, _dense_intermediate, "column-parallel on the intermediate width"
+            0, None, "column-parallel on the intermediate width", True
         ),
         "down_proj_weight": _DeclaredShard(
-            1, _dense_intermediate, "row-parallel -- the intermediate width is its input"
+            1, None, "row-parallel -- the intermediate width is its input", True
+        ),
+    },
+    # inc-glm53f-101. The shared expert's three, on the same route as the dense
+    # three above and for the stronger version of the same reason: this class holds
+    # NO width to divide, so there is nothing at the attachment site to resolve.
+    # It is NOT an expert-parallel entity -- it runs on every token, so it shards
+    # its intermediate width across the FULL world like the dense MLP and its
+    # consumer is the dense blockwise route. Ruled at design entry
+    # ``design-20260905-ap``, remedy part 3(d); the alternative (an EP-TP-group
+    # shard replicated across groups) is recorded there for a stage-7 ruling and is
+    # not authored here.
+    "Glm5NextSharedExperts": {
+        "gate_proj_weight": _DeclaredShard(
+            0, None, "column-parallel on the intermediate width", True
+        ),
+        "up_proj_weight": _DeclaredShard(
+            0, None, "column-parallel on the intermediate width", True
+        ),
+        "down_proj_weight": _DeclaredShard(
+            1, None, "row-parallel -- the intermediate width is its input", True
         ),
     },
 }
@@ -319,7 +361,7 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
 
 def _shard_geometry_for(
     module: nn.Module, leaf: str, world_size: int
-) -> ShardGeometry | None:
+) -> ShardGeometry | DeferredShardGeometry | None:
     """This parameter's resolved shard, or ``None`` when it is replicated.
 
     ``inc-glm53f-094``. The single reader of :data:`_SHARD_GEOMETRY`, called from
@@ -331,12 +373,27 @@ def _shard_geometry_for(
     control that the sharded path is what changed. This is also what makes
     conjunct (1)'s ``world_size=1`` reading a real control rather than a
     restatement.
+
+    TWO KINDS COME BACK SINCE ``inc-glm53f-101``. A family that declares a width
+    function gets its extent resolved here, exactly as before. A family declaring
+    ``width=None`` gets a :class:`DeferredShardGeometry` instead, which carries the
+    dim, the rank count and the pad multiple and leaves the extent to the loader
+    that will hold the tensor. The consumer's block size is imported HERE rather
+    than written into the table, so the number has one home.
     """
     if world_size <= 1:
         return None
     declared = _SHARD_GEOMETRY.get(type(module).__name__, {}).get(leaf)
     if declared is None:
         return None
+    if declared.width is None:
+        return DeferredShardGeometry(
+            shard_dim=declared.shard_dim,
+            num_shards=world_size,
+            pad_to_multiple_of=(
+                consumer_block_quant_size() if declared.pad_to_consumer_block else None
+            ),
+        )
     return ShardGeometry(
         shard_dim=declared.shard_dim,
         shard_size=declared.width(module, world_size),
@@ -4924,6 +4981,34 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     # ── weight loading (``inc-glm53f-091``) ──────────────────────────────
 
+    def _checkpoint_block_size(self) -> tuple[int, int]:
+        """The quantisation block shape THIS CHECKPOINT declares, as two ints.
+
+        ``inc-glm53f-101``, remedy part 1. Read off
+        ``quantization_config.weight_block_size``, which ``config.py:458`` already
+        lifts verbatim, so the rule that converts a weight shard into grid rows is
+        told the checkpoint's own tile instead of taking the parser's fallback
+        (``quantization.py:114``). The fallback is right for this checkpoint and
+        would be silently wrong for the next one, which is the whole reason this
+        is threaded rather than defaulted.
+
+        REFUSED RATHER THAN DEFAULTED when the field is absent or malformed. The
+        only caller reaches this after finding a scale grid in the checkpoint, so
+        a checkpoint that ships scale grids and declares no block shape is a
+        contradiction, and guessing 128 there would scale real weight blocks by
+        the wrong grid row.
+        """
+        declared = self.config.weight_block_size
+        if not declared or len(declared) != 2:
+            raise Glm5NextWeightLoadError(
+                f"this checkpoint ships block-FP8 scale grids but declares "
+                f"quantization_config.weight_block_size={declared!r}; a sharded "
+                f"grid cannot be converted from weight rows to grid rows without "
+                f"the block shape, and defaulting it would scale weight blocks by "
+                f"the wrong grid row"
+            )
+        return (int(declared[0]), int(declared[1]))
+
     def _placeholder_dtype(
         self,
         checkpoint_keys: str | list[str],
@@ -5382,9 +5467,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if geometry is None:
                 grid = checkpoint._get_slice(scales[0])[:]
             else:
-                grid = sharded_scale_grid_loader(geometry, param_name).load(
-                    [checkpoint._get_slice(scales[0])], _resolve_rank()
-                )
+                # The block shape is THIS CHECKPOINT'S, threaded rather than
+                # defaulted (``inc-glm53f-101``, remedy part 1). Read here, inside
+                # the branch that already found a scale grid, so a checkpoint with
+                # no grids never has to declare one.
+                grid = sharded_scale_grid_loader(
+                    geometry, param_name, self._checkpoint_block_size()
+                ).load([checkpoint._get_slice(scales[0])], _resolve_rank())
             setattr(module, attribute, grid.to(dtype=torch.float32, device=device))
             read += 1
         return read

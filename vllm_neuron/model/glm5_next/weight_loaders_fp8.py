@@ -848,6 +848,7 @@ import torch
 from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
     sharding_weight_loader,
+    tensor_width_sharding_loader,
 )
 
 from .quantization import DEFAULT_WEIGHT_BLOCK_SIZE
@@ -1556,11 +1557,85 @@ class ShardGeometry:
             raise ValueError(f"num_shards must be >= 1, got {self.num_shards}")
 
 
+@dataclass(frozen=True)
+class DeferredShardGeometry:
+    """One family's shard when its FULL WIDTH is only known at load time.
+
+    ``inc-glm53f-101``. Same two ideas as :class:`ShardGeometry` -- a dimension
+    and a rank count -- with the third one MISSING on purpose: there is no
+    ``shard_size``, because the tensor that answers it has not arrived yet.
+
+    WHICH FAMILIES NEED THIS, read rather than assumed.
+    ``Glm5NextSharedExperts`` holds ``num_shared_experts`` and ``swiglu_limit``
+    and no width at all (``model_fp8.py:1520-1535``), so a resolved geometry for
+    its three projections cannot be built at the attachment site. The dense MLP's
+    three take the same route so that ONE rule pads both -- the block's own
+    thesis is that the checkpoint tensor is the width source that cannot disagree
+    with the weights, and ``intermediate_size`` is a config product like the one
+    this block refuses for the shared expert.
+
+    ``pad_to_multiple_of`` IS THE CONSUMER'S BLOCK, NOT A CONVENIENCE. When it is
+    set, the full width is first rounded UP to the smallest multiple of
+    ``num_shards * pad_to_multiple_of``, so every rank's shard is a whole number
+    of consumer blocks and the padded tail is zeros (weight) or ones (grid). This
+    is what makes a 12288-wide dense intermediate loadable at 64 ranks, where
+    12288 // 64 == 192 is neither a 128-row checkpoint tile nor a 256-row
+    consumer block. Ruled at design entry ``design-20260905-ap``, remedy part 2.
+    """
+
+    shard_dim: int
+    num_shards: int
+    pad_to_multiple_of: int | None = None
+    #: What the padded elements hold. 0.0 for a weight, 1.0 for a reciprocal
+    #: block scale -- see :func:`~vllm_neuron.utils.weight_loader.pad_to_shape`.
+    pad_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.shard_dim not in (0, 1):
+            raise ValueError(
+                f"shard_dim must be 0 or 1, got {self.shard_dim}; this package's "
+                f"parameter layout is [out_features, in_features] and a shard "
+                f"outside those two dimensions has no declared meaning"
+            )
+        if self.num_shards < 1:
+            raise ValueError(f"num_shards must be >= 1, got {self.num_shards}")
+        if self.pad_to_multiple_of is not None and self.pad_to_multiple_of < 1:
+            raise ValueError(
+                f"pad_to_multiple_of must be >= 1 or None, got "
+                f"{self.pad_to_multiple_of}"
+            )
+
+
+#: Either kind of shard declaration. Named once so the four functions that accept
+#: both say so identically.
+AnyShardGeometry = ShardGeometry | DeferredShardGeometry
+
+
+def consumer_block_quant_size() -> int:
+    """The block extent the block-FP8 consumer will accept, from the consumer.
+
+    ``inc-glm53f-101``, remedy part 1. IMPORTED rather than re-typed, and that is
+    the whole point of the function: ``blockwise_fp8_mm.scale_grid_shape``
+    (``:276-288``) refuses any weight extent that is not a whole number of
+    ``BLOCK_QUANT_SIZE`` blocks, and ``blockwise_fp8_retile`` fixes the same
+    number from the vendor's own kernel (``:91``). A literal here would be a
+    second place for the consumer's granularity to live.
+
+    The import is function-local, which is this file's own precedent (``:2131``):
+    the module-level block above imports only what every path needs, and a
+    consumer import at module scope would make a load-path module depend on a
+    kernel module at import time.
+    """
+    from vllm_neuron.functional.blockwise_fp8_mm import BLOCK_QUANT_SIZE
+
+    return int(BLOCK_QUANT_SIZE)
+
+
 def shard_geometry_for_grid(
-    geometry: ShardGeometry,
+    geometry: AnyShardGeometry,
     param_name: str | None = None,
     block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
-) -> ShardGeometry:
+) -> AnyShardGeometry:
     """The scale grid's geometry for a weight sharded by ``geometry``.
 
     ``inc-glm53f-094``, and the whole of conjunct (3). A grid holds one fp32
@@ -1582,7 +1657,51 @@ def shard_geometry_for_grid(
     lands with parameters already registered. The bank refusals further down this
     file do hold that property (``:2098-2103``); this one does not, and the
     difference is recorded rather than assumed.
+
+    TWO BOUNDARIES, NOT ONE (``inc-glm53f-101``, remedy part 1). The checkpoint's
+    tile is 128 rows and the CONSUMER's block is 256
+    (:func:`consumer_block_quant_size`), so a shard can clear the tile rule and
+    still be a shard the kernel cannot take -- 12288 // 32 == 384 is three whole
+    tiles and one and a half blocks. Both are checked here, tile first so the
+    landed refusal keeps its landed message, and the consumer's second with its
+    own wording. ``block_size`` is the CHECKPOINT's declared ``weight_block_size``
+    threaded in by the caller; the default is the parser's fallback only.
+
+    A DEFERRED GEOMETRY CONVERTS WITHOUT EITHER CHECK, because there is nothing
+    yet to check: the width arrives with the tensor, and the pad multiple is what
+    then makes the shard a whole consumer block by construction. The pad multiple
+    is converted from weight rows to GRID rows here -- one grid row per
+    ``extent`` weight rows -- and the two ceilings agree exactly, since
+    ``ceil(full / (N * pad)) == ceil((full / extent) / (N * pad / extent))`` when
+    ``extent`` divides both ``full`` and ``pad``. The padded grid entries hold
+    1.0, not 0.0: the grid is a RECIPROCAL scale that multiplies its weight block,
+    so 1.0 leaves the padded zero rows exactly zero and 0.0 would not.
     """
+    if isinstance(geometry, DeferredShardGeometry):
+        extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
+        pad = geometry.pad_to_multiple_of
+        if pad is None:
+            return DeferredShardGeometry(
+                shard_dim=geometry.shard_dim,
+                num_shards=geometry.num_shards,
+                pad_to_multiple_of=None,
+                pad_value=1.0,
+            )
+        if pad % extent:
+            _refuse(
+                param_name,
+                f"pads its weight to a multiple of {pad} rows along dim "
+                f"{geometry.shard_dim}, which is NOT a multiple of the {extent}-row "
+                f"block extent at block size {block_size}. Its scale grid holds one "
+                f"value per {block_size[0]}x{block_size[1]} tile, so a pad that ends "
+                f"inside a tile has no whole number of grid rows to pad to.",
+            )
+        return DeferredShardGeometry(
+            shard_dim=geometry.shard_dim,
+            num_shards=geometry.num_shards,
+            pad_to_multiple_of=pad // extent,
+            pad_value=1.0,
+        )
     extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
     if geometry.shard_size % extent:
         _refuse(
@@ -1596,6 +1715,26 @@ def shard_geometry_for_grid(
             f"sizes are {(geometry.shard_size // extent) * extent} and "
             f"{((geometry.shard_size // extent) + 1) * extent}.",
         )
+    consumer_block = consumer_block_quant_size()
+    if geometry.shard_size % consumer_block:
+        _refuse(
+            param_name,
+            f"is sharded into {geometry.shard_size} rows along dim "
+            f"{geometry.shard_dim}, which clears the {extent}-row checkpoint tile "
+            f"but is NOT a whole number of the CONSUMER's {consumer_block}-row "
+            f"blocks. The block-FP8 kernel this weight is dequantised for indexes "
+            f"its scales by whole {consumer_block}-row blocks "
+            f"(blockwise_fp8_mm.scale_grid_shape refuses anything else, and "
+            f"blockwise_fp8_retile fixes the same number), so this shard would "
+            f"load and then be refused at the first forward pass instead of here. "
+            f"The nearest consumer-aligned shard sizes are "
+            f"{(geometry.shard_size // consumer_block) * consumer_block} and "
+            f"{((geometry.shard_size // consumer_block) + 1) * consumer_block}; at "
+            f"{geometry.num_shards} ranks that is a full width of "
+            f"{(geometry.shard_size // consumer_block) * consumer_block * geometry.num_shards}"
+            f" or {((geometry.shard_size // consumer_block) + 1) * consumer_block * geometry.num_shards}"
+            f", which is what a padded shard supplies.",
+        )
     return ShardGeometry(
         shard_dim=geometry.shard_dim,
         shard_size=geometry.shard_size // extent,
@@ -1603,8 +1742,10 @@ def shard_geometry_for_grid(
     )
 
 
-def _sharding_loader(geometry: ShardGeometry) -> SafetensorsWeightLoader:
-    """The pin's shard loader, built from a resolved geometry.
+def _sharding_loader(
+    geometry: AnyShardGeometry, param_name: str | None = None
+) -> SafetensorsWeightLoader:
+    """The pin's shard loader, built from either kind of geometry.
 
     ``is_storage_transposed`` is FALSE, and that is a reading rather than a
     default: in this package the parameter layout IS the checkpoint layout, on
@@ -1614,7 +1755,23 @@ def _sharding_loader(geometry: ShardGeometry) -> SafetensorsWeightLoader:
     consumer transposes at compute time instead. The qwen3 precedent passes
     ``True`` because ITS checkpoint stores those weights transposed; copying that
     flag here would slice the wrong dimension of every family.
+
+    THE DISPATCH IS ON WHICH GEOMETRY ARRIVED (``inc-glm53f-101``), not on a flag:
+    a resolved geometry already carries its per-rank extent and takes the pin's
+    own ``sharding_weight_loader``, and a deferred one takes
+    ``tensor_width_sharding_loader``, which reads the extent off the checkpoint
+    slice. Neither loader can serve the other's case -- the pin's takes
+    ``shard_size`` as a construction-time number and the new one has none to take
+    -- so this is the only place that has to know the difference.
     """
+    if isinstance(geometry, DeferredShardGeometry):
+        return tensor_width_sharding_loader(
+            shard_dim=geometry.shard_dim,
+            num_shards=geometry.num_shards,
+            pad_to_multiple_of=geometry.pad_to_multiple_of,
+            pad_value=geometry.pad_value,
+            param_name=param_name,
+        )
     return sharding_weight_loader(
         shard_dim=geometry.shard_dim,
         shard_size=geometry.shard_size,
@@ -1656,7 +1813,9 @@ def _weight_slice_only(
 
 
 def sharded_scale_grid_loader(
-    geometry: ShardGeometry, param_name: str | None = None
+    geometry: AnyShardGeometry,
+    param_name: str | None = None,
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
 ) -> SafetensorsWeightLoader:
     """This rank's ROWS of a sharded weight's scale grid, and nothing else.
 
@@ -1679,8 +1838,17 @@ def sharded_scale_grid_loader(
     scale grids DECLARED as parameters are ``Glm5NextMLAAttention``'s four, whose
     geometry is deferred to ``inc-glm53f-100``, so no geometry ever reached that
     branch. Recorded in ``increments/shard-table-094.md`` Part 7.
+
+    ``block_size`` IS THE CHECKPOINT'S OWN, threaded by the caller
+    (``inc-glm53f-101``, remedy part 1). Before this increment the conversion took
+    the parser's fallback ``DEFAULT_WEIGHT_BLOCK_SIZE``, which is right for this
+    checkpoint and would silently be wrong for the next one; the caller now reads
+    ``quantization_config.weight_block_size`` and hands it over. The default is
+    kept so no landed call site and no test that composes this directly moves.
     """
-    return _sharding_loader(shard_geometry_for_grid(geometry, param_name))
+    return _sharding_loader(
+        shard_geometry_for_grid(geometry, param_name, block_size), param_name
+    )
 
 
 def loader_for_mapped_keys(
@@ -1688,7 +1856,7 @@ def loader_for_mapped_keys(
     *,
     param_name: str | None = None,
     owner: object | None = None,
-    geometry: ShardGeometry | None = None,
+    geometry: AnyShardGeometry | None = None,
 ) -> SafetensorsWeightLoader | None:
     """The loader that serves one mapped parameter, or ``None`` for the default.
 
@@ -1808,10 +1976,12 @@ def loader_for_mapped_keys(
             weight_index = next(
                 index for index, key in enumerate(keys) if key not in scales
             )
-            base = _weight_slice_only(_sharding_loader(geometry), weight_index)
+            base = _weight_slice_only(
+                _sharding_loader(geometry, param_name), weight_index
+            )
         return wrap_with_blockwise_fp8_downscale(base)
     if len(keys) == 1 and geometry is not None:
-        return _sharding_loader(geometry)
+        return _sharding_loader(geometry, param_name)
     if len(keys) > 1:
         raise Glm5NextExpertBankNotLoadableError(
             f"{param_name or '<unnamed parameter>'} maps to {len(keys)} "
