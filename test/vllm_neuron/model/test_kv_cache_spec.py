@@ -339,11 +339,18 @@ def test_kv_cache_spec_c04_state_page_bytes_reconcile_with_zero_discrepancy() ->
 # collected item each, selected by ``-k unification``, no ``parametrize`` added.
 #
 # APPENDED BELOW EVERY EXISTING ITEM ON PURPOSE. Three live citations pin lines
-# of this file BY NUMBER: ``model_fp8.py:2047`` pins ``:31-40``, the increment
+# of this file BY NUMBER: ``model_fp8.py:2098`` pins ``:31-40``, the increment
 # plan pins ``:98`` and ``:322-327``, and ``test_kda_layer.py:99`` pins ``:94``.
 # An insertion above any of them would move bytes another file names, which is
 # the drift ``inc-glm53f-085`` had to repair. Every constant this section needs
 # therefore sits HERE and not in the file's top block.
+#
+# RE-ANCHORED BY ``inc-glm53f-091b`` (D2.3, comment-only), and the old number
+# was ALREADY WRONG before that increment: ``model_fp8.py:2047`` was a BLANK
+# LINE at ``4b705cdf`` (the base), so it pinned nothing, while the line that
+# really carries the citation sat at ``:2082`` there. Recovered by content --
+# the one line in that file naming ``test_kv_cache_spec.py:31-40`` -- which is
+# at ``:2098`` now. The pre-existing defect is recorded rather than absorbed.
 #
 # THIS FILE STILL IMPORTS NO OTHER TEST MODULE, which is the convention the
 # module docstring states and the reason it states it. The 45-layer fake is

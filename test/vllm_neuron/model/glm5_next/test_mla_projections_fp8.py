@@ -306,8 +306,15 @@ def test_conjunct_1_scale_grids_resolve_at_five_sites_above_the_floor() -> None:
     """CONJUNCT 1 of 7 — the four scale parameters exist, and at the shape floor.
 
     CERTIFYING COMPONENT: the module-level ``_declare_parameters``
-    (``model_fp8.py:105-120``, called from ``Glm5NextMLAAttention.__init__``) and
+    (``model_fp8.py:128-143``, called from ``Glm5NextMLAAttention.__init__``) and
     ``DSA_SCALED_PROJECTIONS``.
+
+    RE-ANCHORED BY ``inc-glm53f-091b`` (D2.3, comment-only). That increment
+    inserted a helper between this span's old first line and the function it
+    names, so the old span ``:105-120`` had no byte-equal target to shift to:
+    it began five lines inside ``_is_fp8_dtype``'s docstring. The span above is
+    now the whole extent of ``_declare_parameters`` read by :mod:`ast`, which
+    is what this sentence always meant.
 
     Five sites are read, not four: the fifth reading is that ``kv_b_proj``
     declares NO scale parameter. An absence asserted is a reading; an absence

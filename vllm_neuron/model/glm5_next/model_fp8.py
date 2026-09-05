@@ -84,6 +84,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     classify_mapped_keys,
     dequantise_blockwise,
     loader_for_mapped_keys,
+    scale_keys,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
@@ -107,6 +108,21 @@ def _is_fp8_dtype(dtype: torch.dtype) -> bool:
     property of the installed ``torch``, not of this file.
     """
     return dtype.itemsize == 1 and "float8" in str(dtype)
+
+
+def _is_on_device(where: torch.device, target: torch.device) -> bool:
+    """Is a tensor sitting on the device this load targets?
+
+    NOT plain ``==``. ``torch.device("cpu")`` and ``torch.device("cpu", 0)``
+    compare unequal while naming the same place, and a target written without an
+    index means "this kind of device" rather than "index None". So the kind must
+    match, and the index only has to match when the target names one.
+    """
+    if where.type != target.type:
+        return False
+    if target.index is None:
+        return True
+    return where.index == target.index
 
 
 def _declare_parameters(module: nn.Module, *names: str) -> None:
@@ -3060,6 +3076,12 @@ class Glm5NextModel(nn.Module):
 #: increment's partition of that file, which is the loader wiring only.
 _FP8_DTYPE = torch.float8_e4m3fn
 
+#: The leaf suffix every weight parameter in this tree carries, so a scale grid
+#: can be named from its weight. ``inc-glm53f-011``'s naming convention, read
+#: rather than restated: the map's own parameter names end in it
+#: (``weight_loaders_fp8.py:295-298``).
+_WEIGHT_LEAF_SUFFIX = "_weight"
+
 
 class Glm5NextWeightLoadError(ValueError):
     """A checkpoint could not be read onto this model tree.
@@ -3147,26 +3169,72 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     # ── weight loading (``inc-glm53f-091``) ──────────────────────────────
 
-    def _placeholder_dtype(self, checkpoint_keys: str | list[str]) -> torch.dtype:
+    def _placeholder_dtype(
+        self,
+        checkpoint_keys: str | list[str],
+        *,
+        param_name: str,
+        mappings: dict,
+    ) -> torch.dtype:
         """The dtype the loader will hand back for one mapped parameter.
 
         Load-bearing rather than cosmetic. The checkpoint reader takes its
         target dtype OFF THE PLACEHOLDER (``utils/checkpoints.py:437``) and
-        warns whenever the tensor it built differs (``:570-575``), so a
-        placeholder typed by guess would make every load emit that warning for
-        every parameter.
+        CASTS the tensor it built to that dtype after a warning
+        (``:570-576``), so a placeholder typed one step too wide does not merely
+        log -- it changes the values that reach the model.
 
         The three cases come from
         :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.classify_mapped_keys`,
         which is the one classifier this and the loader choice share, so the
         dtype and the loader cannot disagree about what a key is.
+
+        THE SIBLING CLAUSE, AND THE DEFECT IT REPAIRS. A quantised weight whose
+        scale travels in the SAME map entry classifies ``quantised_weight`` and
+        takes fp8 from the case above. But ``inc-glm53f-085`` gave each of the
+        four scaled MLA projections its own scale-grid entry, which left each of
+        those weights ALONE in its entry -- and a lone weight key classifies
+        ``plain``. Without the clause below they took the config dtype, the
+        reader narrowed the checkpoint's fp8 bytes to bf16, and
+        :meth:`Glm5NextMLAAttention._dequantised_projection_weight` then saw a
+        real dtype and returned the weight UNCHANGED. The dequant did nothing,
+        silently, on every scaled projection of every sparse-attention layer,
+        and the transpose that follows it operated on narrowed bytes -- exactly
+        the defect ``inc-glm53f-085`` exists to repair, arriving through the
+        placeholder dtype instead of through the transpose. Measured before this
+        clause was written, with the dense-MLP two-key entry as the control that
+        still reached the dequant:
+        ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-091b-dsa-dtype.out``
+        (``DEQUANT_BRANCHES_REACHED=0`` of 4, four cast lines logged).
+
+        The clause asks the MAP whether a sibling scale grid exists for this
+        weight, which is the same question
+        ``_dequantised_projection_weight`` asks of the module at ``:2813`` --
+        one question, asked of the two places that have to agree. It adds no
+        second classifier of the three cases: ``classify_mapped_keys`` still
+        decides, and this only distinguishes the two kinds of ``plain``.
         """
         kind = classify_mapped_keys(checkpoint_keys)
         if kind == MAPPED_KEY_SCALE_GRID:
             return torch.float32
         if kind == MAPPED_KEY_QUANTISED_WEIGHT:
             return _FP8_DTYPE
+        if self._sibling_scale_grid_name(param_name) in mappings:
+            return _FP8_DTYPE
         return self.text_config.torch_dtype
+
+    @staticmethod
+    def _sibling_scale_grid_name(param_name: str) -> str:
+        """The scale-grid parameter that would accompany this weight, by name.
+
+        Returns a name that is deliberately unmatchable for a parameter that is
+        not a weight, rather than ``None``, so every caller is a membership test
+        and none has to branch on the shape of the answer.
+        """
+        if not param_name.endswith(_WEIGHT_LEAF_SUFFIX):
+            return ""
+        base = param_name[: -len(_WEIGHT_LEAF_SUFFIX)]
+        return f"{base}_{FP8_SCALE_SUFFIX}"
 
     def _materialise_declared_parameters(
         self, mappings: dict, device: torch.device
@@ -3225,7 +3293,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 name = f"{module_path}.{leaf}" if module_path else leaf
                 checkpoint_keys = mappings.get(name, name)
                 placeholder = nn.parameter.UninitializedParameter(
-                    dtype=self._placeholder_dtype(checkpoint_keys),
+                    dtype=self._placeholder_dtype(
+                        checkpoint_keys, param_name=name, mappings=mappings
+                    ),
                     device=device,
                     requires_grad=False,
                 )
@@ -3349,6 +3419,197 @@ class Glm5NextForConditionalGeneration(nn.Module):
             rank, self.world_size, self, mappings, device
         ).state_dict
         self.load_state_dict(rank_sharded, strict=False, assign=True)
+
+        # Everything below runs AFTER the line above, and that is the whole
+        # ordering contract of ``inc-glm53f-091b``: the line above is what turns
+        # a shape-free placeholder into a real on-device tensor, so a scale read
+        # or a prep placed before it would work on placeholders. The acceptance
+        # reads the three source positions rather than trusting this comment.
+        self._load_out_of_band_scales(checkpoint, mappings, device)
+        self._run_load_time_preps(device)
+
+    def _load_out_of_band_scales(
+        self,
+        checkpoint: SafetensorsCheckpoint,
+        mappings: dict,
+        device: torch.device,
+    ) -> int:
+        """Read every scale grid the loaders drop, straight from the checkpoint.
+
+        Returns how many were read.
+
+        WHY ANY SCALE IS READ OUT OF BAND AT ALL, measured rather than
+        preferred. A map entry holding a weight AND its scale is served by
+        :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.wrap_with_blockwise_fp8_downscale`,
+        whose base transform is ``slices[0][:]``
+        (``weight_loaders_fp8.py:1339``) -- it keeps the WEIGHT slice and drops
+        the companion, so the scale reaches nothing through the reader.
+        Widening the map so each of those scales became its own parameter would
+        move ``inc-glm53f-085``'s asserted difference set
+        (``test/vllm_neuron/model/glm5_next/test_kv_spec.py:840-848``), and that
+        is a lead call this block does not take. So the scales are read here
+        instead, on the fork's own landed precedent for exactly this problem:
+        ``qwen3/model.py:1050-1072``.
+
+        THE INDEXING IS EXPLICIT, for the reason the precedent states in its own
+        comment (``qwen3/model.py:1045-1046``): ``load_sharded_pipelined``
+        indexes as a side effect, and a lookup on an unindexed checkpoint
+        silently misses. This method is called after that reader has run, so the
+        index is already built -- and it calls
+        :meth:`~vllm_neuron.utils.checkpoints.SafetensorsCheckpoint._ensure_indexed`
+        anyway, because a later caller that reads scales without the pipelined
+        load would otherwise get zeros with no complaint.
+
+        AND A MISS IS A REFUSAL, NOT A DEFAULT. The precedent falls back to
+        ``torch.ones`` when a key is absent, which is right for a KV scale that
+        may legitimately not be published. It is wrong here: a missing block
+        scale means the fp8 bytes of that projection cannot be dequantised, and
+        a silent 1.0 would make the bytes look like numbers -- pass-shaped
+        failure, the same class of defect as the narrowing this increment
+        repairs. So an absent key raises and names itself.
+
+        WHERE THE SCALE IS PUT. As a plain attribute on the owning module,
+        named the way the consumer already looks it up --
+        ``f"{leaf}_{FP8_SCALE_SUFFIX}"``, the name
+        :meth:`Glm5NextMLAAttention._dequantised_projection_weight` reads at
+        ``:2813``. Plain, not a registered parameter: registering it would add a
+        name to ``named_parameters()`` that the map does not carry, which is the
+        map widening this method exists to avoid.
+        """
+        checkpoint._ensure_indexed()
+        read = 0
+        for param_name, keys in mappings.items():
+            key_list = [keys] if isinstance(keys, str) else list(keys)
+            scales = scale_keys(key_list)
+            if len(key_list) < 2 or len(scales) != 1:
+                # A lone scale grid already has its own parameter, and a bank
+                # never reaches here -- the loader choice refused it long before.
+                continue
+            module_path, _, leaf = param_name.rpartition(".")
+            attribute = self._sibling_scale_grid_name(leaf)
+            if not attribute:
+                raise Glm5NextWeightLoadError(
+                    f"{param_name} carries the scale key {scales[0]!r} but its "
+                    f"leaf name does not end in {_WEIGHT_LEAF_SUFFIX!r}, so the "
+                    f"scale has no name to be stored under; the map and this "
+                    f"reader disagree about what a weight parameter is called"
+                )
+            if scales[0] not in checkpoint._tensor_name_to_file:
+                raise Glm5NextWeightLoadError(
+                    f"the scale grid {scales[0]!r} of {param_name} is not in "
+                    f"the checkpoint, so its fp8 bytes cannot be dequantised; "
+                    f"reading a default of 1.0 here would use the bytes as if "
+                    f"they were numbers"
+                )
+            grid = checkpoint._get_slice(scales[0])[:].to(
+                dtype=torch.float32, device=device
+            )
+            module = self.get_submodule(module_path) if module_path else self
+            setattr(module, attribute, grid)
+            read += 1
+        return read
+
+    def _run_load_time_preps(self, device: torch.device) -> tuple[int, int]:
+        """Call both load-time preps, each behind its own device pre-flight.
+
+        Returns ``(projection prep calls, scale prep calls)``.
+
+        THE SINGLE PRODUCTION CALLER. Before this method
+        ``prepare_projection_weights`` and ``prepare_scale_operands`` had ZERO
+        production call sites -- every mention in ``vllm_neuron/`` was a test, a
+        docstring, a comment or an error-message literal. The acceptance counts
+        those sites, so this method is the one place either is called.
+
+        WHY THE PRE-FLIGHT EXISTS, and why it is authored here rather than in the
+        preps. Both preps build their operands on the DEVICE OF THE TENSORS THEY
+        ARE GIVEN and store them by plain ``setattr`` into a dict attribute that
+        ``nn.Module._apply`` never visits. So a prep run before the weights
+        reached the device would leave the operands on the CPU **permanently**,
+        while every later ``.to(device)`` reported success -- measured in
+        ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-091-device-binding.out``
+        (``PLAIN_DICT_IS_LEFT_BEHIND=True``). Neither prep checks a device: the
+        ``.device`` count inside ``prepare_scale_operands`` is 0 and inside
+        ``to_kernel_scale_layout`` is 0. The refusal therefore has to live on the
+        caller's side, and ``inc-glm53f-090``'s method and this file's
+        shared-expert section stay byte-frozen.
+        """
+        projection_calls = 0
+        scale_calls = 0
+        for path, module in self.named_modules():
+            if hasattr(type(module), "prepare_projection_weights"):
+                names = [n for n, _, _ in module.projection_widths()]
+                self._require_prep_operands_on_device(path, module, names, device)
+                module.prepare_projection_weights()
+                projection_calls += 1
+            if hasattr(type(module), "prepare_scale_operands"):
+                # The projection names come off the module's OWN declaration
+                # tuple, so this call cannot ask for a projection the shared
+                # expert does not have. Passed by KEYWORD: the prep takes six
+                # positional operands and a silent reordering of three weights
+                # against three scales would compute a wrong answer at exactly
+                # the right shapes.
+                names = [
+                    leaf[: -len(_WEIGHT_LEAF_SUFFIX)]
+                    for leaf in getattr(module, "declared_param_names", ())
+                    if leaf.endswith(_WEIGHT_LEAF_SUFFIX)
+                ]
+                self._require_prep_operands_on_device(path, module, names, device)
+                operands = {}
+                for name in names:
+                    leaf = f"{name}{_WEIGHT_LEAF_SUFFIX}"
+                    operands[leaf] = getattr(module, leaf)
+                    operands[f"{name}_scale"] = getattr(
+                        module, self._sibling_scale_grid_name(leaf)
+                    )
+                module.prepare_scale_operands(**operands)
+                scale_calls += 1
+        return projection_calls, scale_calls
+
+    def _require_prep_operands_on_device(
+        self,
+        module_path: str,
+        module: nn.Module,
+        names: list[str],
+        device: torch.device,
+    ) -> int:
+        """Every operand a prep is about to read is already on ``device``.
+
+        Returns how many operands were checked, so a caller can tell a passing
+        check from a check that had nothing to look at.
+
+        This is case B of conjunct 8. A weight or scale that is absent, still a
+        shape-free placeholder, or sitting on another device is named here and
+        the prep is not called -- because after the prep there is nothing left to
+        detect: the operands are built and stored, on whatever device they were
+        built on, and no later move touches them.
+        """
+        checked = 0
+        for name in names:
+            for attribute in (
+                f"{name}{_WEIGHT_LEAF_SUFFIX}",
+                self._sibling_scale_grid_name(f"{name}{_WEIGHT_LEAF_SUFFIX}"),
+            ):
+                operand = getattr(module, attribute, None)
+                if operand is None:
+                    continue
+                if torch.nn.parameter.is_lazy(operand):
+                    raise Glm5NextWeightLoadError(
+                        f"{module_path}.{attribute} is still a shape-free "
+                        f"placeholder, so the prep would build its operands "
+                        f"from a parameter no checkpoint has filled; load the "
+                        f"checkpoint before preparing the operands"
+                    )
+                if not _is_on_device(operand.device, device):
+                    raise Glm5NextWeightLoadError(
+                        f"{module_path}.{attribute} is on {operand.device} but "
+                        f"this load targets {device}; both preps build their "
+                        f"operands on the device of the tensors they are given "
+                        f"and store them where nn.Module._apply never looks, so "
+                        f"preparing now would strand them on {operand.device} "
+                        f"for the life of the model"
+                    )
+                checked += 1
+        return checked
 
     # ── KV cache management ──────────────────────────────────────────────
     # >>> PARALLELISM: KV spec uses per-rank head counts (TP-sharded) <<<
