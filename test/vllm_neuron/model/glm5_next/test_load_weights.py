@@ -30,8 +30,11 @@ difference between them is one field.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import math
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -138,11 +141,20 @@ def _routed_model() -> Glm5NextForConditionalGeneration:
 
 
 def _mappings_for(config: Glm5NextConfig) -> dict[str, str | list[str]]:
-    """The map exactly as ``load_weights`` builds it, from the same settings.
+    """A REFERENCE map, built from the same settings ``load_weights`` reads.
 
-    Deliberately not a copy of the call: the settings are read off the same two
-    config members ``load_weights`` reads (``config.py:400`` and ``:408``), so a
-    test that agreed with a wrong ``load_weights`` is not possible here.
+    The settings are the same two config members ``load_weights`` reads
+    (``config.py:400`` and ``:408``), so this is the right map to compare a load
+    against.
+
+    WHAT IT IS NOT EVIDENCE OF, corrected by B65-M1. This helper says nothing
+    about the map ``load_weights`` actually builds, because it calls
+    ``build_weight_mappings`` itself. An earlier docstring here claimed that "a
+    test that agreed with a wrong ``load_weights`` is not possible", and that was
+    FALSE: a ``load_weights`` that built its map off the wrong config member, or
+    dropped it, would still agree with this helper. The item whose subject IS the
+    handed-over map observes it inside the running ``load_weights`` instead --
+    see ``test_the_map_load_weights_hands_over_covers_the_in_scope_index``.
     """
     return build_weight_mappings(
         config.text_config,
@@ -261,6 +273,66 @@ def _not_lazy_count(model: torch.nn.Module) -> int:
         for _, param in model.named_parameters()
         if not torch.nn.parameter.is_lazy(param)
     )
+
+
+def _token_checkpoint_directory(tmp_path: Path) -> Path:
+    """A directory that gets past ``load_weights``'s opener and holds no weights.
+
+    ``load_weights`` refuses a checkpoint whose ``get_num_files()`` reads zero
+    (``model_fp8.py:3309-3314``), so even a dict-level reading needs ONE
+    ``.safetensors`` file to exist. This one holds a single one-element tensor and
+    is never opened: the run refuses at materialisation, which is before
+    ``load_sharded_pipelined``, so not one tensor byte of it is read. Writing the
+    real checkpoint instead is not an option at any size -- its published index
+    lists 76,108 tensors.
+    """
+    directory = tmp_path / "token-checkpoint"
+    directory.mkdir()
+    save_file(
+        {"token": torch.zeros(1, dtype=torch.float32)},
+        str(directory / "model-00001-of-00001.safetensors"),
+    )
+    return directory
+
+
+def _mappings_flow_in_load_weights() -> tuple[int, int]:
+    """How often ``load_weights`` binds ``mappings``, and hands that name onward.
+
+    This reads ``load_weights``'s own source, because the fact needed is about the
+    code rather than about one run. The hand-over to ``load_sharded_pipelined``
+    (``model_fp8.py:3348``) cannot be reached while a routed expert bank refuses,
+    so the item observes the map one line earlier and needs to know the two lines
+    cannot disagree: ONE binding, and a hand-over passing THAT SAME NAME, is what
+    makes the observed object the object the hand-over would pass.
+
+    A count, not a pattern match. A diff that rebinds ``mappings`` -- a filter, a
+    copy, a re-read -- moves the first number, and the item reddens by position
+    rather than by anyone's judgement.
+    """
+    tree = ast.parse(
+        textwrap.dedent(
+            inspect.getsource(Glm5NextForConditionalGeneration.load_weights)
+        )
+    )
+    bindings = sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and node.id == "mappings"
+    )
+    handovers = sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load_sharded_pipelined"
+        and any(
+            isinstance(arg, ast.Name) and arg.id == "mappings"
+            for arg in node.args
+        )
+    )
+    return bindings, handovers
 
 
 @pytest.fixture
@@ -465,6 +537,33 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
     ``test_skeleton_real_index_coverage_is_one_hundred_percent``; this is a
     different claim about a different subject.
 
+    THE SUBJECT IS THE OBJECT, NOT THE VALUE (B65-M1, plan revision 157). An
+    earlier form of this item rebuilt the map with ``_mappings_for`` and counted
+    over that. The counts were right and the object was wrong: a ``load_weights``
+    that built its map off the wrong config member, or dropped it, would have
+    left this item green. So the map is now taken OUT OF THE RUNNING
+    ``load_weights``.
+
+    HOW, AND WHY NOT AT THE HAND-OVER ITSELF. The hand-over
+    (``model_fp8.py:3348``) cannot be reached while a routed expert bank refuses,
+    and this checkpoint's banks each carry 288 experts, so no run observes that
+    line at ``inc-glm53f-091a``. The observer therefore sits on
+    ``_materialise_declared_parameters`` one line earlier (``:3339``) and records
+    its argument before calling the real method, so production code still builds
+    the map and still decides to refuse. ``_mappings_flow_in_load_weights`` then
+    reads the source and reports that ``mappings`` is bound once and that the
+    hand-over passes that same name, which is what makes the observed object the
+    object the hand-over would pass.
+
+    THE REFUSAL IS THE MEANS HERE, NOT A SECOND SUBJECT -- conjunct 1 owns it.
+    It is asserted so that a SILENT COMPLETION reddens this item: when
+    ``inc-glm53f-095`` makes stacked banks loadable, this item fails loudly and
+    gets re-read, instead of quietly measuring a path that no longer refuses.
+
+    No process group is initialised, on purpose. The fixture that provides one
+    exists for the reader's default-store call inside ``load_sharded_pipelined``,
+    which this run never reaches.
+
     The population is ``inc-glm53f-078``'s in-scope partition of the published
     index, re-derived here from the fixture rather than restated: a count over
     the raw 76,108 keys would read 2,107 unclaimed and would be the WRONG
@@ -485,11 +584,67 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
         "the three parts do not sum to the whole, so a family is being counted "
         "twice or not at all"
     )
+    print(f"CONJUNCT2_INDEX_TOTAL_KEYS={total}")
+    print(f"CONJUNCT2_INDEX_MTP_KEYS={len(mtp)}")
+    print(f"CONJUNCT2_INDEX_VISION_KEYS={len(vision)}")
+    print(f"CONJUNCT2_IN_SCOPE_POPULATION={len(in_scope)}")
 
     real_config = Glm5NextConfig.from_configs(
         json.loads(REAL_CONFIG_PATH.read_text())
     )
-    mappings = _mappings_for(real_config)
+    model = Glm5NextForConditionalGeneration(real_config)
+    print(f"CONJUNCT2_DECLARED_NAMES={len(model.declared_parameter_names())}")
+
+    observed: list[dict[str, str | list[str]]] = []
+    real_materialise = model._materialise_declared_parameters
+
+    def observer(handed_over, device):
+        observed.append(handed_over)
+        return real_materialise(handed_over, device)
+
+    model._materialise_declared_parameters = observer
+
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+        model.load_weights(
+            str(_token_checkpoint_directory(tmp_path)),
+            torch.device("cpu"),
+            None,
+        )
+
+    message = str(refusal.value)
+    print(f"CONJUNCT2_REFUSAL_CLASS={type(refusal.value).__name__}")
+    print(f"CONJUNCT2_CAPTURED_MAPS={len(observed)}")
+    print(f"CONJUNCT2_NAMED_PARAMETERS_AFTER={len(list(model.named_parameters()))}")
+
+    assert len(observed) == 1, (
+        f"the observer recorded {len(observed)} maps where conjunct 2 needs "
+        f"exactly the one load_weights built"
+    )
+    assert "576 checkpoint keys" in message and "288 scale keys" in message, (
+        f"the refusal does not name the key counts it refused on: {message!r}"
+    )
+    assert "inc-glm53f-095" in message, (
+        f"the refusal does not name where stacked banks land: {message!r}"
+    )
+    assert list(model.named_parameters()) == [], (
+        "the refusal left parameters registered, so it half built the tree"
+    )
+
+    bindings, handovers = _mappings_flow_in_load_weights()
+    print(f"CONJUNCT2_MAPPINGS_BINDINGS_IN_SOURCE={bindings}")
+    print(f"CONJUNCT2_HANDOVER_PASSES_THAT_NAME={handovers}")
+    assert bindings == 1, (
+        f"`mappings` is bound {bindings} times inside load_weights, so the "
+        f"object observed at the materialiser is not provably the one the "
+        f"hand-over passes"
+    )
+    assert handovers == 1, (
+        "load_sharded_pipelined is not passed the `mappings` name, so this "
+        "item's subject is no longer the map that is handed over"
+    )
+
+    mappings = observed[0]
+    print(f"CONJUNCT2_CAPTURED_MAP_ENTRIES={len(mappings)}")
 
     claimed: set[str] = set()
     for keys in mappings.values():
@@ -497,6 +652,9 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
 
     unclaimed = in_scope - claimed
     absent_from_index = claimed - set(weight_map)
+    print(f"CONJUNCT2_UNCLAIMED={len(unclaimed)}")
+    print(f"CONJUNCT2_MAPPED_KEYS_ABSENT_FROM_INDEX={len(absent_from_index)}")
+    print(f"CONJUNCT2_MTP_KEYS_CLAIMED={len(claimed & mtp)}")
 
     assert unclaimed == set(), (
         f"{len(unclaimed)} in-scope checkpoint keys are claimed by no mapping, "
