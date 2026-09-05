@@ -1778,7 +1778,13 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
                 position=kwargs.get("position"),
             )
         monkeypatch.undo()
+        # BOTH of the spy's lists are carried across, and this line is the repair. Round 1 merged
+        # ``calls`` alone, so ``first_arg_dtypes`` never left the per-phase spy: the rider check below
+        # then read an empty set off the OUTER spy, asserted a subset of nothing, printed "not called"
+        # and passed -- while the per-entry counts in the same transcript showed those seams called
+        # three times each. Two lists filled by one wrapper have to be merged by one step.
         spy.calls.extend(spy_here.calls)
+        spy.first_arg_dtypes.extend(spy_here.first_arg_dtypes)
 
         # (5) THE READINGS, then the comparison.
         readings = read_all_counters()
@@ -1812,7 +1818,17 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
     for entry in ("dsa_kpool_hadamard", "dsa_hadamard128", "dsa_decode_tail_update"):
         seen = spy.dtypes_for(entry)
         say("B71-N3", "production dtype", entry, sorted(str(d) for d in seen) or "not called")
-        assert seen <= {torch.bfloat16}, (
+        # NON-EMPTINESS FIRST, as its own claim with its own message. A subset assertion over a MEASURED
+        # set also asserts the set is non-empty, or it is not a measurement: `set() <= {bfloat16}` is
+        # True, so round 1 passed this rider while reading nothing at all. The two claims are separate
+        # because they fail for different reasons -- an empty set means the INSTRUMENT did not record,
+        # and a wrong dtype means the SEAM was handed the wrong thing.
+        assert seen, (
+            f"{entry} has no recorded production dtype, so the dtype check below would assert a subset "
+            f"of nothing and pass while measuring nothing. The per-entry counts printed above say "
+            f"whether the seam was called; if it was, the spy's dtype log did not reach this spy"
+        )
+        assert seen == {torch.bfloat16}, (
             f"{entry} was handed {sorted(str(d) for d in seen)} on the production path; anything but "
             f"bf16 fails the seam's dtype gate and takes the torch oracle while every shape still "
             f"checks out (kpool_hadamard.py:147, :496)"
