@@ -3706,39 +3706,94 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
         f"the bankscale zero is asserting"
     )
 
-    # ── THE ROUTED BANK REFUSES RANK 1, MEASURED RATHER THAN DESCRIBED ────────
-    # This is why the other three items use an all-dense fixture, and recording it
-    # as a passing reading is the point: a finding written only in prose goes stale
-    # without anything failing.
+    # ── THE ROUTED BANK NOW LOADS AT RANK 1, AND THE MAP IS WHAT MOVED ────────
+    # ``inc-glm53f-101``, replacing the reading ``-094`` left here. That reading
+    # asserted the OPPOSITE -- a rank-1 load of the routed fixture refused with
+    # "outside the partition" -- and named this increment as the owner of its
+    # revision in its own words: "If it now completes, the bank's rank derivation
+    # was fixed and this reading ... should be revisited together with
+    # inc-glm53f-101". This is that revision. The behaviour changed, so the reading
+    # changed with it; the old text is quoted here so the repair is legible rather
+    # than silently absent.
     #
-    # THE DEFECT IS A RANK CONFUSION, AND IT IS NOT THIS INCREMENT'S.
-    # ``Glm5NextRoutedExperts`` keeps two degrees: ``tp_degree``, the
-    # tensor-parallel world size, and ``ep_degree``, the expert-parallel degree the
-    # partition is actually built from (``model_fp8.py:1029-1037``). This
-    # campaign's production expert-parallel degree is 1
-    # (``factory.py:204-211``), so at tensor-parallel world size 2 the bank is
-    # REPLICATED and every rank's expert-parallel rank is 0. The bank loader passes
-    # the GLOBAL rank instead, and ``local_expert_indices`` refuses anything at or
-    # above the partition's one rank (``factory.py:132-136``). The families this
-    # touches are the routed bank's three, which the ratified shard table defers to
-    # ``inc-glm53f-101`` -- so the repair belongs there, with the rest of the bank's
-    # geometry, and this reading is the handover.
-    with pytest.raises(Exception) as refused:  # noqa: B017 -- see below
-        _load_at_world(directory, SHARD_WORLD, 1, monkeypatch, with_bank)
-    text = str(refused.value)
-    print(f"CONJUNCT4_BANK_RANK1_REFUSAL_CLASS={type(refused.value).__name__}")
-    print(f"CONJUNCT4_BANK_RANK1_REFUSAL={text}")
-    # The class is read rather than asserted: the reader logs and re-raises
-    # (``utils/checkpoints.py:469``), so which class arrives here is the reader's
-    # business. The MESSAGE is the finding, and it is asserted.
-    assert "outside the partition" in text, (
-        f"a rank-1 load of the ROUTED fixture did not refuse with the partition "
-        f"message. It raised: {text}. If it now completes, the bank's rank "
-        f"derivation was fixed and this reading -- and the all-dense fixture the "
-        f"other three items use -- should be revisited together with "
-        f"inc-glm53f-101"
+    # WHAT THE DEFECT WAS. ``Glm5NextRoutedExperts`` keeps two degrees:
+    # ``tp_degree``, the tensor-parallel world size, and ``ep_degree``, the
+    # expert-parallel degree the bank's partition is built from
+    # (``model_fp8.py:1029-1037``). This campaign's production expert-parallel
+    # degree is 1 (``factory.py:204-211``), so the partition holds ONE rank while
+    # the load supplies the GLOBAL rank -- and every global rank above 0 was
+    # refused (``factory.py:132-137``).
+    #
+    # WHAT THE REPAIR IS. ``_expert_parallel_rank_map`` maps the global rank to the
+    # rank the partition was built over BEFORE the owner is asked which experts are
+    # local. At degree 1 that map is the constant 0, which is what the package
+    # itself declares the degree to mean in two places
+    # (``parallel/neuron_parallel_state.py:1202-1206`` and
+    # ``factory.py:260-264``): the bank is local on every rank.
+    bank_rank1 = _load_at_world(directory, SHARD_WORLD, 1, monkeypatch, with_bank)
+    banks = [
+        (path, module)
+        for path, module in bank_rank1.named_modules()
+        if type(module).__name__ == "Glm5NextRoutedExperts"
+    ]
+    print(f"CONJUNCT4_BANK_MODULES_AT_RANK1={[p for p, _ in banks]}")
+    assert banks, (
+        "this configuration built no Glm5NextRoutedExperts module, so a rank-1 "
+        "bank load is not what was just measured and the reading has no subject"
     )
-    assert "rank 1" in text and "1 ranks" in text, (
-        f"the refusal does not name both the rank it was given and the size of the "
-        f"partition it was checked against: {text}"
+    loaded_at_rank1 = dict(bank_rank1.named_parameters())
+    leading: list[tuple[str, int, int]] = []
+    for path, module in banks:
+        for leaf in getattr(module, "declared_param_names", ()):
+            dotted = f"{path}.{leaf}"
+            if dotted not in loaded_at_rank1 or loaded_at_rank1[dotted].dim() < 2:
+                continue
+            leading.append(
+                (
+                    dotted,
+                    int(loaded_at_rank1[dotted].shape[0]),
+                    int(module.num_local_experts),
+                )
+            )
+    print(f"CONJUNCT4_BANK_EP_DEGREE_AT_RANK1={banks[0][1].ep_degree}")
+    print(f"CONJUNCT4_BANK_TP_DEGREE_AT_RANK1={banks[0][1].tp_degree}")
+    print(f"CONJUNCT4_BANK_LOCAL_EXPERTS_AT_RANK1={banks[0][1].num_local_experts}")
+    print(f"CONJUNCT4_BANK_LEADING_AXES_AT_RANK1={leading}")
+    assert len(leading) >= 1, (
+        "the rank-1 load completed but no bank parameter with a leading expert "
+        "axis was found, so 'the bank loaded' has not been measured"
+    )
+    assert banks[0][1].ep_degree == 1, (
+        f"this route's expert-parallel degree read {banks[0][1].ep_degree}, not 1, "
+        f"so the constant-0 map is not the map under test here"
+    )
+    assert banks[0][1].num_local_experts == MINI_ROUTED_EXPERTS, (
+        f"at expert-parallel degree 1 every expert is local, so rank 1 should own "
+        f"all {MINI_ROUTED_EXPERTS}; the module declares "
+        f"{banks[0][1].num_local_experts}"
+    )
+    for dotted, axis, expected in leading:
+        assert axis == expected, (
+            f"{dotted} loaded a leading axis of {axis} at rank 1 while its module "
+            f"declares {expected} local experts, so the rank got a different "
+            f"number of experts than the partition assigns it"
+        )
+
+    # THE CONTROL THAT MOVES. The partition's own bound check is UNCHANGED -- what
+    # the repair changed is which rank reaches it. Asking the partition directly
+    # for rank 1 at degree 1 must still refuse with the same message the old
+    # reading asserted, so this reading distinguishes "the map was fixed" from
+    # "the check was deleted", which is the way this repair could have been faked.
+    with pytest.raises(ValueError) as still_bounded:
+        banks[0][1].expert_partition.local_expert_indices(1)
+    bounded_text = str(still_bounded.value)
+    print(f"CONJUNCT4_PARTITION_STILL_BOUNDS_RANK1={bounded_text}")
+    assert "outside the partition" in bounded_text, (
+        f"the partition no longer refuses an out-of-range rank: {bounded_text}. "
+        f"The repair was supposed to map the rank, not remove the bound check, so "
+        f"a bank at a real expert-parallel degree would now be placed by guess"
+    )
+    assert "rank 1" in bounded_text and "1 ranks" in bounded_text, (
+        f"the refusal does not name both the rank it was given and the size of "
+        f"the partition it was checked against: {bounded_text}"
     )

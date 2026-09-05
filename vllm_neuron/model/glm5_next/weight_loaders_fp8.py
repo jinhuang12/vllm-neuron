@@ -1573,8 +1573,15 @@ def shard_geometry_for_grid(
     split that tile's single scale between them. Rounding would hand one rank a
     tile scaled for another's rows, which is silent numerical corruption of a
     whole 128-row band. So it is REFUSED BY NAME, with the parameter and the
-    boundary in the message, and the refusal happens at construction time like
-    every other refusal in this file -- before any parameter is registered.
+    boundary in the message.
+
+    WHEN THE REFUSAL HAPPENS, CORRECTED (``B84-N3``, ``inc-glm53f-101``). The
+    landed text said "at construction time … before any parameter is registered",
+    and that is wrong for the only production caller: the scale-grid read at
+    ``model_fp8.py:4152-4157`` runs AFTER the tree is materialised, so this refusal
+    lands with parameters already registered. The bank refusals further down this
+    file do hold that property (``:2098-2103``); this one does not, and the
+    difference is recorded rather than assumed.
     """
     extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
     if geometry.shard_size % extent:
@@ -1922,13 +1929,78 @@ def bank_layout(
     )
 
 
+def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
+    """The map from the load's GLOBAL rank to the bank partition's rank.
+
+    ``inc-glm53f-101``, repairing the rank confusion ``-094``'s fourth item
+    measured and handed here by name (``test_load_weights.py:3694-3729``, design
+    entry ``design-20260905-r`` ruling 3).
+
+    THE DEFECT IN ONE SENTENCE. The bank's partition is built over ``ep_degree``,
+    the expert-parallel degree (``model_fp8.py:1034-1037``), while the load hands
+    this file the global tensor-parallel rank (``model_fp8.py:172-179``). At this
+    campaign's production expert-parallel degree of 1 (``factory.py:204-211``) the
+    partition holds ONE rank, so every global rank above 0 was refused
+    (``factory.py:132-137``) -- 63 of 64 ranks on the target host.
+
+    AT DEGREE 1 THE MAP IS THE CONSTANT 0, AND THE PACKAGE DECLARES THAT TWICE, so
+    this is a read of the shipped geometry rather than a second copy of it:
+    ``get_neuron_ep_rank`` returns 0 when no expert-parallel group was initialised
+    (``parallel/neuron_parallel_state.py:1202-1206``), and
+    ``require_uniform_expert_partition`` says in its own refusal text that with
+    expert parallelism off "every expert is local on every rank"
+    (``factory.py:260-264``). So the whole bank is local on every rank.
+
+    ABOVE DEGREE 1 IT REFUSES, AND THE GROUND IS THE PLATFORM'S MESH, NOT A
+    MISSING GETTER. ``_build_ep_group_ranks``
+    (``parallel/neuron_parallel_state.py:218-232``) lays the ranks out through
+    ``_build_2d_mesh``, which substitutes ``_TRN2_MESH`` (``:118-127``) whenever
+    the world is 64 and the row is 8 (``uses_noncontiguous_mesh``, ``:111-115``).
+    That mesh's first row is ``[0, 1, 2, 3, 12, 13, 14, 15]``, so rank 12 belongs
+    to group 0 while ``12 // 8`` is 1: dividing the global rank would place a bank
+    on the wrong ranks on the very host this campaign targets. The group index has
+    to be READ from the initialised group, and this loader is handed a bare global
+    rank with no group to read, so it refuses by name instead of guessing.
+
+    AN OWNER THAT DECLARES NO DEGREES IS PASSED THROUGH UNCHANGED. Every landed
+    caller that builds a bare owner with ``local_expert_indices`` and
+    ``num_routed_experts`` and nothing else keeps reading exactly as it did, and
+    the partition's own bound check is still the guard behind this map.
+    """
+    ep_degree = getattr(owner, "ep_degree", None)
+    tp_degree = getattr(owner, "tp_degree", None)
+    if ep_degree is None:
+        return lambda rank: rank
+    ep_degree = int(ep_degree)
+    if ep_degree == 1:
+        return lambda rank: 0
+    if tp_degree is None or int(tp_degree) <= 1:
+        # One tensor-parallel rank means the only global rank is 0, which is also
+        # its group index, so the identity is the read and not an assumption.
+        return lambda rank: rank
+    _refuse(
+        param_name,
+        f"is a routed expert bank at expert-parallel degree {ep_degree} AND "
+        f"tensor-parallel degree {int(tp_degree)}, and the load hands this loader "
+        f"the GLOBAL tensor-parallel rank. On this platform the expert-parallel "
+        f"group index is not that rank divided by anything: at world 64 and row 8 "
+        f"the layout is _TRN2_MESH "
+        f"(parallel/neuron_parallel_state.py:111-127), whose first row holds rank "
+        f"12 while 12 // 8 is 1. The index must be read from the initialised "
+        f"group (get_neuron_ep_rank, :1202-1206), which this loader has no handle "
+        f"on, so the bank is refused by name rather than placed on the wrong "
+        f"ranks. Expert-parallel degree 1 -- this campaign's production route -- "
+        f"is unaffected: the bank is local on every rank.",
+    )
+
+
 def _bank_expert_indices(
     owner: object | None, layout: BankLayout, param_name: str | None
 ):
     """The owning module's local-expert resolver, or REFUSE by name.
 
     ``inc-glm53f-095``. The expert geometry is declared in exactly one place --
-    ``Glm5NextRoutedExperts`` (``model_fp8.py:962``, geometry set at
+    ``Glm5NextRoutedExperts`` (``model_fp8.py:964``, geometry set at
     ``:1032-1037``), authored by
     ``inc-glm53f-031`` -- and it is read there rather than derived a second time
     from the key count, so there is one partition and not two that can disagree.
@@ -1969,7 +2041,15 @@ def _bank_expert_indices(
             f"module disagree about how many experts exist, so stacking would "
             f"silently drop or invent one; refused instead.",
         )
-    return resolve
+    # ``inc-glm53f-101``. What is returned takes the GLOBAL rank the load supplies,
+    # maps it to the rank the bank's partition was actually built over, and only
+    # then asks the owner which experts are local -- so the owner's two degrees are
+    # no longer confused for each other. The map is built HERE, at construction,
+    # because it depends only on the owner's declared degrees, which keeps this
+    # file's rule that every bank refusal is raised before any parameter is
+    # registered.
+    to_partition_rank = _expert_parallel_rank_map(owner, param_name)
+    return lambda rank: resolve(to_partition_rank(rank))
 
 
 def _stack_local_expert_weights(local_slices: list, rank: int) -> torch.Tensor:
