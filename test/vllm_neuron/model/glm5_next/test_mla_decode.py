@@ -8,10 +8,12 @@ attention, bring the result back down to the head width with the same absorb sea
 project out. The expansion of ``kv_b_proj`` from a 512 latent to 32,768 per token --
 which is what absorption exists to avoid -- never happens on this path.
 
-THE ACCEPTANCE ITEMS, and where their wording comes from. All five are the plan block's
-(revision 178, L690-704), and item (b) is the RE-REGISTERED form recorded at design
+THE ACCEPTANCE ITEMS, and where their wording comes from. All are the plan block
+``#### `inc-glm53f-042``'s, and item (b) is the RE-REGISTERED form recorded at design
 entry ``design-20260905-q`` / ``DECISIONS.md`` §16 after the first attempt measured the
-original tolerance unachievable:
+original tolerance unachievable. The block is cited BY ANCHOR and not by line number,
+per D-18 and review item B72-N6: the line span moved twice while this file was being
+written, and a number folded today is stale at the next lap.
 
   (iv-a)  the weight split is EXACT for all 64 heads, bit-identical.
   (iv-b)  the split reproduces ``-039b``'s landed dense expansion, per head, at
@@ -19,8 +21,19 @@ original tolerance unachievable:
           -- (iv-a)/(iv-b) per DECISIONS §15a.5 --
   (b-i)   a decode step matches the prefill run's corresponding slice, 3/3 steps.
   (b-ii)  a decode step matches an S-INDEPENDENT pure-fp32 torch oracle, 3/3 steps.
+  (b-iii) the latent this step WROTE reads back bit-identical from its cache slot.
+  (b-iv)  a measurement, not a criterion: how much the own slot moves the output.
   (c)     ``B > 1`` raises a NAMED error rather than producing wrong numbers.
   (d)     the route predicate: five counter readings per arm.
+
+WHY (b-iii) AND (b-iv) EXIST -- review finding B72-M1, repaired under this same id. The
+first landing of this file could not fail if the cache write were deleted, misplaced or
+wrong. Every selected row was a PRIOR row (``selection.max() < CONTEXT_ROWS``), the seam
+and both oracles only ever gather selected rows, and every arm passed ``cache.clone()``
+and then discarded it -- so no reading in the file depended on the write at all, while
+two of its own sentences claimed otherwise. The repair is test-only: the selection now
+includes each step's OWN slot, the two false sentences are corrected below, and (b-iii)
+reads the written latent back with NO tolerance to hide in.
 
 WHY (b) CARRIES A COMPUTED TOLERANCE RATHER THAN A FIXED ``atol``. The first attempt
 registered ``atol=1e-5``, and it could not be met by ANY implementation: the path
@@ -236,22 +249,61 @@ def seeded_cache(module, gen, *, rows: int = CONTEXT_ROWS, steps: int = DECODE_S
     return cache
 
 
-def decode_inputs(module, gen, *, steps: int = DECODE_STEPS):
-    """Hidden states and a selection whose every row lies BEFORE the new tokens.
+def decode_inputs(module, gen, *, steps: int = DECODE_STEPS, self_inclusive: bool = True):
+    """Hidden states, and a selection of prior rows PLUS each step's own cache slot.
 
-    That restriction is what makes (b-i) a comparison of the plumbing rather than of the
-    attention mask. A batched call writes all three latents before the seam reads the
-    cache, so all three tokens would see each other; a step-by-step run lets token 1 see
-    token 0 but not token 2. Selecting only prior rows removes that difference, and then
-    a disagreement is the path's and not causality's.
+    WHAT CHANGED AND WHY (review finding B72-M1). This helper used to select only rows
+    BEFORE the new tokens and assert ``selection.max() < CONTEXT_ROWS``. That made every
+    reading in the file blind to the cache write: the sparse seam and both oracles only
+    ever gather SELECTED rows, so a slot no one selects cannot influence any output, and
+    the write could have been deleted with six of six items still passing.
+
+    Step ``s`` now selects its OWN slot ``CONTEXT_ROWS + s`` and no other new slot. That
+    is the one form that keeps (b-i) valid. The reason the old code gave for excluding
+    new rows is still true as far as it goes -- a batched call writes all three latents
+    before its single read, so a token selecting a LATER token would see it in the
+    batched arm and not in the step-by-step arm -- but a token selecting only ITSELF is
+    causally identical in both arms: the batched arm has already written slot
+    ``CONTEXT_ROWS + s`` before it reads, and the step-by-step arm writes that same slot
+    at the start of step ``s``. So the two arms still gather the same rows, and a
+    disagreement is still the path's rather than causality's.
+
+    The selected count does not move: ``SELECTED_ROWS`` prior rows becomes
+    ``SELECTED_ROWS - 1`` prior rows plus the own slot, so the total stays 2,048 and
+    stays a multiple of the seam's ``KEY_CHUNK``.
+
+    ``self_inclusive=False`` reproduces the OLD selection exactly. It exists for (b-iv),
+    which measures how much the own slot actually moves the output, and it is not used by
+    any acceptance item.
     """
     hidden = (
         torch.randn((steps, module.hidden_size), generator=gen, dtype=torch.float32)
         * 0.5
     ).to(torch.bfloat16)
-    order = torch.randperm(CONTEXT_ROWS, generator=gen)[:SELECTED_ROWS]
-    selection = order.to(torch.int32).unsqueeze(0).repeat(steps, 1)
-    assert int(selection.max()) < CONTEXT_ROWS
+    priors = SELECTED_ROWS - 1 if self_inclusive else SELECTED_ROWS
+    order = torch.randperm(CONTEXT_ROWS, generator=gen)[:priors].to(torch.int32)
+    if self_inclusive:
+        rows = [
+            torch.cat([order, torch.tensor([CONTEXT_ROWS + step], dtype=torch.int32)])
+            for step in range(steps)
+        ]
+        selection = torch.stack(rows)
+    else:
+        selection = order.unsqueeze(0).repeat(steps, 1)
+    # Asserted rather than trusted: the width the seam requires, and -- for the
+    # self-inclusive form -- that step s carries its own slot exactly once and carries no
+    # OTHER step's slot, which is the property that keeps (b-i) causally sound.
+    assert tuple(selection.shape) == (steps, SELECTED_ROWS)
+    if self_inclusive:
+        for step in range(steps):
+            own = CONTEXT_ROWS + step
+            assert int((selection[step] == own).sum()) == 1
+            others = [CONTEXT_ROWS + other for other in range(steps) if other != step]
+            for other in others:
+                assert int((selection[step] == other).sum()) == 0
+        assert int(selection.max()) == CONTEXT_ROWS + steps - 1
+    else:
+        assert int(selection.max()) < CONTEXT_ROWS
     scale = float(NOPE_WIDTH) ** -0.5
     return hidden, selection, scale
 
@@ -478,8 +530,17 @@ def test_item_b_i_decode_matches_the_prefill_slice_for_every_step() -> None:
     The prefill reference arm is ONE call carrying all three tokens; the decode arm is
     three calls of one token each with the cache growing between them. Both run the same
     method -- there is no separate prefill implementation to drift from -- so this item
-    asks whether the cache write, the cache read and the two absorb call sites behave
-    the same way regardless of how many tokens arrive at once.
+    asks whether the cache read and the two absorb call sites behave the same way
+    regardless of how many tokens arrive at once.
+
+    WHAT THIS ITEM DOES NOT ASK, corrected per review finding B72-N1. The sentence here
+    used to claim this item asks about "the cache write". It cannot, and it still cannot
+    after the M1 repair: both arms run the same write, so agreeing tells us they are
+    CONSISTENT and says nothing about whether either wrote the right value to the right
+    slot. That question has no tolerance in it and belongs to (b-iii), which reads the
+    slot back bit-identically. What the repair does buy this item is that the written
+    row is now GATHERED, so a write that landed in the wrong slot in one arm and not the
+    other would now show up here.
     """
     module, _, _, gen = build_attention()
     cache = seeded_cache(module, gen)
@@ -524,8 +585,16 @@ def test_item_b_ii_decode_matches_a_token_count_independent_fp32_oracle() -> Non
 
     decode = run_decode_steps(module, cache.clone(), hidden, selection, scale)
 
-    # The oracle reads the same cache the path wrote, including the three new latents,
-    # so the two sides attend over identical rows.
+    # The oracle attends over CORRESPONDING rows, not over the same tensor -- corrected
+    # per review finding B72-N1. The sentence here used to say the oracle "reads the same
+    # cache the path wrote, including the three new latents". It does not: it reads its
+    # OWN clone, whose three new slots are filled below with the ORACLE's fp32 latents,
+    # while the path reads its own clone holding the bf16 latents IT wrote. Before the M1
+    # repair the claim was doubly false, because nothing gathered those three rows on
+    # either side. Now step s selects slot CONTEXT_ROWS + s, so both sides do gather the
+    # row -- each its own version of it -- and the comparison covers the written value at
+    # the §16 pair. That is a correspondence between two independent computations, which
+    # is what an oracle is for, and it is stated that way rather than as shared state.
     oracle_cache = cache.clone()
     oracle_cache[CONTEXT_ROWS : CONTEXT_ROWS + DECODE_STEPS, 0, :] = oracle_latent(
         module, raw, gains, hidden
@@ -548,6 +617,163 @@ def test_item_b_ii_decode_matches_a_token_count_independent_fp32_oracle() -> Non
     )
     say("B_II_CONTROL_REJECTS_A_MOVED_ELEMENT", fired)
     assert fired
+
+
+# --------------------------------------------------------------------------- #
+def test_item_b_iii_the_written_latent_reads_back_bit_identical() -> None:
+    """The latent step ``s`` wrote IS in slot ``CONTEXT_ROWS + s``, bit for bit.
+
+    THIS IS THE ITEM THAT CLOSES B72-M1, and it closes it because it has no tolerance to
+    hide in. ``torch.equal`` on bf16 is exact, so a deleted write, a write to the wrong
+    slot, a write of the wrong value and a write of the right value in the wrong dtype
+    are four different failures here and none of them can pass.
+
+    THE CONTROLS COME FIRST, and each asserts its own plant landed before it reads
+    anything. That order matters: a control that never planted would report the same
+    clean result as a control that planted and saw the effect, which is the vacuity class
+    this campaign has hit twice.
+
+      1. Every step slot is PRE-POISONED with a sentinel no latent can equal. If the
+         write line were absent, the sentinel would still be there afterwards -- so
+         "0 slots still hold the sentinel" is a positive reading about the write having
+         happened, not an absence of evidence.
+      2. One slot BEYOND the steps is never written and must still read zero, which is
+         what would fire on a write that ran off its slot.
+      3. The comparison itself is shown able to reject: one element of the expected
+         latent is moved and ``torch.equal`` must return False.
+
+    The expectation is ``project_query_and_latent(hidden[s : s + 1])[1]`` cast to the
+    cache dtype -- the same three deterministic dispatches the path itself runs, whose
+    determinism on one input is already proven by (iv-b)'s bit-identical shared-prefix
+    reading. So this is the (iv-a) form applied to the cache: exact, not approximate.
+    """
+    module, _, _, gen = build_attention()
+    # One SPARE slot past the three the path writes, so control 2 has something untouched
+    # to read. attend() reads [:start + tokens], so a trailing row is never gathered.
+    cache = seeded_cache(module, gen, steps=DECODE_STEPS + 1)
+    hidden, selection, scale = decode_inputs(module, gen)
+    spare = CONTEXT_ROWS + DECODE_STEPS
+
+    sentinel = torch.full((module.head_size,), -7.0, dtype=torch.bfloat16)
+    for step in range(DECODE_STEPS):
+        cache[CONTEXT_ROWS + step, 0, :] = sentinel
+    planted = sum(
+        int(torch.equal(cache[CONTEXT_ROWS + step, 0, :], sentinel))
+        for step in range(DECODE_STEPS)
+    )
+    say("B_III_CONTROL_1_THE_SENTINEL_PLANT_LANDED", f"{planted}/{DECODE_STEPS}")
+    assert planted == DECODE_STEPS
+    say("B_III_CONTROL_2_THE_SPARE_SLOT_STARTS_ZERO",
+        bool(torch.equal(cache[spare, 0, :], torch.zeros_like(cache[spare, 0, :]))))
+    assert torch.equal(cache[spare, 0, :], torch.zeros_like(cache[spare, 0, :]))
+
+    # NOT a clone. The whole point is to inspect the tensor the path wrote into.
+    decode = run_decode_steps(module, cache, hidden, selection, scale)
+    say("B_III_DECODE_SHAPE", tuple(decode.shape), decode.dtype)
+
+    survived = sum(
+        int(torch.equal(cache[CONTEXT_ROWS + step, 0, :], sentinel))
+        for step in range(DECODE_STEPS)
+    )
+    say("B_III_SENTINEL_SURVIVED_SLOTS", f"{survived}/{DECODE_STEPS}")
+    assert survived == 0
+
+    agreeing = 0
+    for step in range(DECODE_STEPS):
+        want = module.project_query_and_latent(hidden[step : step + 1])[1]
+        want_bf16 = want.to(cache.dtype)[0]
+        got = cache[CONTEXT_ROWS + step, 0, :]
+        same = bool(torch.equal(got, want_bf16))
+        say(f"B_III_READBACK_STEP_{step}", same, tuple(got.shape), got.dtype,
+            f"max_abs_diff={float((got.to(torch.float32) - want_bf16.to(torch.float32)).abs().max()):.10g}")
+        assert same
+        agreeing += 1
+    say("B_III_SLOTS_AGREEING_BIT_FOR_BIT", f"{agreeing}/{DECODE_STEPS}")
+    assert agreeing == DECODE_STEPS
+
+    say("B_III_THE_SPARE_SLOT_IS_STILL_ZERO",
+        bool(torch.equal(cache[spare, 0, :], torch.zeros_like(cache[spare, 0, :]))))
+    assert torch.equal(cache[spare, 0, :], torch.zeros_like(cache[spare, 0, :]))
+
+    moved = module.project_query_and_latent(hidden[0:1])[1].to(cache.dtype)[0].clone()
+    moved[0] = moved[0] + 1.0
+    fired = not torch.equal(cache[CONTEXT_ROWS, 0, :], moved)
+    say("B_III_CONTROL_3_REJECTS_A_MOVED_ELEMENT", fired)
+    assert fired
+
+
+# --------------------------------------------------------------------------- #
+def test_item_b_iv_how_much_the_own_slot_moves_the_output() -> None:
+    """A MEASUREMENT, not a criterion: is the self-inclusive selection enough on its own?
+
+    Review finding B72-M1 offered two repairs and judged that "(a) is sufficient alone",
+    (a) being the self-inclusive selection. I predicted before running that it is NOT,
+    and this item measures it instead of arguing it. The arithmetic behind the prediction
+    (``predictions-042-repair.txt`` R3): the own slot is 1 of 2,048 gathered rows, so its
+    softmax weight is about 1/2048 = 4.9e-4, while the registered allowance is
+    ``atol_b = 2 * 2**-8 * max|reference|`` -- about 1.8e-3 at the measured peak of 0.23,
+    before ``rtol * |ref|`` is even added. If that is right, a DELETED write perturbs the
+    output by less than the tolerance permits and (b-i)/(b-ii) would still pass, which
+    would leave (b-iii) as the item actually carrying the repair.
+
+    SO THIS ITEM ASSERTS ONLY WHAT MUST HOLD REGARDLESS -- that the two arms differ in
+    exactly one selected column and share their hidden states -- and REPORTS the influence
+    ratio. It deliberately does not assert the ratio in either direction: asserting
+    ``>= 1`` would redden the suite for a true fact that is not a defect, and asserting
+    ``< 1`` would freeze my own prediction into a criterion. The number is printed and
+    the reviewer reads it.
+    """
+    # ONE module for both arms. `attend` mutates only the cache passed to it and reads
+    # fixed weights, so a second build would cost two load-time prep passes and buy
+    # nothing; and the dispatch counters live in the seam modules, not here.
+    module, _, _, _ = build_attention()
+    # Two generators on ONE seed, so hidden states and the prior permutation are the same
+    # draw on both arms and the only difference is the single swapped column.
+    gen_a = torch.Generator().manual_seed(4242)
+    gen_b = torch.Generator().manual_seed(4242)
+    hidden_a, sel_inclusive, scale = decode_inputs(module, gen_a)
+    hidden_b, sel_prior_only, _ = decode_inputs(module, gen_b, self_inclusive=False)
+
+    say("B_IV_THE_TWO_ARMS_SHARE_HIDDEN_STATES", bool(torch.equal(hidden_a, hidden_b)))
+    assert torch.equal(hidden_a, hidden_b)
+    differing_columns = int((sel_inclusive != sel_prior_only).sum(dim=1).max())
+    say("B_IV_SELECTIONS_DIFFER_IN_COLUMNS", differing_columns)
+    assert differing_columns == 1
+    say("B_IV_INCLUSIVE_OWN_SLOT", int(sel_inclusive[0].max()),
+        "PRIOR_ONLY_MAX", int(sel_prior_only[0].max()))
+    assert int(sel_inclusive[0].max()) == CONTEXT_ROWS
+    assert int(sel_prior_only[0].max()) < CONTEXT_ROWS
+
+    # Both caches are seeded from generators on ONE seed, so the 2,048 prior rows are
+    # byte-identical across the arms. Without that the two runs would differ because the
+    # CONTEXT differed, and the reading would say nothing about the own slot -- the exact
+    # "value produced under one condition, applied to another" mistake this increment has
+    # made three times. So it is asserted, not assumed.
+    cache_inclusive = seeded_cache(module, torch.Generator().manual_seed(99001))
+    cache_prior_only = seeded_cache(module, torch.Generator().manual_seed(99001))
+    say("B_IV_THE_TWO_ARMS_SHARE_THEIR_PRIOR_CONTEXT",
+        bool(torch.equal(cache_inclusive, cache_prior_only)))
+    assert torch.equal(cache_inclusive, cache_prior_only)
+
+    inclusive = run_decode_steps(
+        module, cache_inclusive, hidden_a, sel_inclusive, scale
+    )
+    prior_only = run_decode_steps(
+        module, cache_prior_only, hidden_a, sel_prior_only, scale
+    )
+
+    diff = (inclusive.to(torch.float32) - prior_only.to(torch.float32)).abs()
+    allowance = atol_for(prior_only) + RTOL * prior_only.to(torch.float32).abs()
+    ratio = float((diff / allowance).max())
+    say("B_IV_MAX_ABS_DIFF", f"{float(diff.max()):.10g}",
+        "ATOL_B", f"{atol_for(prior_only):.10g}",
+        "WORST_RATIO", f"{ratio:.6g}",
+        "ELEMENTS_DIFFERING", int((diff > 0).sum()),
+        "OF", diff.numel())
+    say("B_IV_IS_THE_OWN_SLOT_DETECTABLE_AT_THE_REGISTERED_TOLERANCE",
+        "YES" if ratio >= 1.0 else "NO")
+    say("B_IV_SO_IS_REPAIR_A_SUFFICIENT_ALONE",
+        "YES" if ratio >= 1.0 else "NO -- (b-iii) carries the repair")
 
 
 # --------------------------------------------------------------------------- #
