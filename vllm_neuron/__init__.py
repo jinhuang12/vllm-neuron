@@ -239,3 +239,13 @@ apply_port_hold_patch()
 from vllm_neuron.vllm.patches.pin_memory_patch import apply_pin_memory_patch
 
 apply_pin_memory_patch()
+
+# A hybrid model whose linear-attention layers report a recurrent-state spec
+# cannot share one KV page size with its attention layers: upstream's page-size
+# unification offers its padding remedy only to AttentionSpec, and MambaSpec is
+# not one, so engine start raises. The widening must be live in the EngineCore
+# subprocess, which never calls check_and_update_config, so it is applied here at
+# import time. See the patch module docstring.
+from vllm_neuron.vllm.patches.kv_spec_patch import apply_kv_spec_patch
+
+apply_kv_spec_patch()

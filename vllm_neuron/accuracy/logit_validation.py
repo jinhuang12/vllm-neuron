@@ -21,7 +21,11 @@ torch.use_deterministic_algorithms(mode=True, warn_only=True)
 import numpy as np
 
 # Import types and utilities
-from .constants import DEFAULT_TOLERANCE_MAP, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE
+from .constants import (
+    DEFAULT_TOLERANCE_MAP,
+    DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE,
+    GLM5NEXT_ARCH,
+)
 from .logit_visualization import visualize_logit_results
 from .types import MultiPromptValidationResult
 
@@ -65,6 +69,30 @@ DEFAULT_AGGREGATE_CONFIG = {
     "agg_linf_multipliers": [1.2, 1.5],  # per-token: max_tgt_linf < N * max_base_linf
     "agg_l2_multipliers": [1.2, 1.5],  # per-token: max_tgt_l2 < N * max_base_l2
     "agg_sigma_ratio_threshold": 1.0,  # σ-ratio ≤ threshold passes
+}
+
+# Arch-scoped aggregate threshold config, ADDED BESIDE the shared default above
+# and never overwriting it: every registered architecture reads
+# DEFAULT_AGGREGATE_CONFIG, so retuning it in place would move all of them.
+#
+# COMPLETENESS IS LOAD-BEARING. Consumers read these keys through `.get` with
+# their own fallbacks, so a partial dict does not fail -- it silently gates on a
+# different number and still reports green. A missing "agg_bc_threshold", for
+# instance, downgrades 0.99 to the function-level fallback of 0.95. Every key
+# DEFAULT_AGGREGATE_CONFIG declares is therefore restated here explicitly, even
+# where the value is unchanged.
+ARCH_AGGREGATE_CONFIG = {
+    GLM5NEXT_ARCH: {
+        "pp_static_thresholds": [0.03, 0.05, 0.09],  # adds the 0.09 rung
+        "pp_linf_multipliers": [1.5, 2.0],
+        "pp_l2_multipliers": [1.5, 2.0],
+        "pp_tok_linf_multipliers": [1.5, 2.0],
+        "pp_tok_l2_multipliers": [1.5, 2.0],
+        "agg_bc_threshold": 0.99,
+        "agg_linf_multipliers": [1.2, 1.5],
+        "agg_l2_multipliers": [1.2, 1.5],
+        "agg_sigma_ratio_threshold": 1.0,
+    },
 }
 
 
@@ -173,6 +201,8 @@ def logit_validation(
     multimodal_inputs: Optional[List[dict]] = None,
     # KV cache capture
     kv_extract_fn: Callable[[int], Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    # Per-sample logit-pair exposure
+    logit_pair_sink: Callable[[int, torch.Tensor, torch.Tensor], None] = None,
 ) -> Union[
     bool,
     Tuple[bool, List[List[dict]]],
@@ -333,6 +363,21 @@ def logit_validation(
             of shape [batch, heads, seq_len, head_dim]. When provided, the merged
             KV cache is returned as part of the result.
 
+        logit_pair_sink: Optional callback that exposes the per-sample
+            actual/expected logit pair this function compares internally.
+            Called once per batch element that contributed at least one
+            validated token, as
+            ``logit_pair_sink(sample_index, actual, expected)``, where both
+            tensors are ``[validated_tokens, vocab]`` and are aligned by the
+            same teacher-forcing indices the internal comparison uses. The
+            pair is a detached clone, so a consumer cannot perturb validation.
+            Supplied purely to expose data: the return value is unchanged, no
+            existing caller is affected, and when this is None nothing is
+            accumulated. Provided so a caller can route the pair into a
+            tensor-level comparator such as
+            ``vllm_neuron.accuracy.testing.assert_close_logit_pair`` and obtain
+            an ``AssertCloseResult``. Defaults to None.
+
     Returns:
         When kv_extract_fn is None:
             - Two-way mode: bool (passed)
@@ -468,6 +513,12 @@ def logit_validation(
     results = [[] for _ in range(batch_size)]
     actual_logits = None  # Initialize directly as requested
 
+    # Per-sample logit-pair capture. Allocated only when a sink was supplied, so
+    # every existing caller keeps its exact allocation profile and control flow.
+    captured_logit_pairs = (
+        [[] for _ in range(batch_size)] if logit_pair_sink is not None else None
+    )
+
     # KV cache state: incrementally updated after each generate_fn call
     merged_kv = None
     prompt_lens = [len(ids) for ids in input_ids]
@@ -543,6 +594,18 @@ def logit_validation(
                         global_token_idx, batch_idx, :
                     ]
 
+                # Capture the exact pair the comparison below consumes, so an
+                # exposed pair can never drift from the validated one.
+                if captured_logit_pairs is not None:
+                    captured_logit_pairs[batch_idx].append(
+                        (
+                            actual_logits[token_idx, batch_idx, :].detach().clone(),
+                            expected_logits[global_token_idx, batch_idx, :]
+                            .detach()
+                            .clone(),
+                        )
+                    )
+
                 single_token_passed, single_token_results = (
                     _validate_single_token_logits(
                         expected_logits=expected_logits[global_token_idx, batch_idx, :],
@@ -581,6 +644,18 @@ def logit_validation(
             )
 
         current_output_start_idx = divergence_idx
+
+    # Expose the per-sample pair before any return path, so every mode -- two-way,
+    # three-way, with or without KV capture, and the NaN abort -- exposes alike.
+    if logit_pair_sink is not None:
+        for sample_index, sample_pairs in enumerate(captured_logit_pairs):
+            if not sample_pairs:
+                continue
+            logit_pair_sink(
+                sample_index,
+                torch.stack([pair[0] for pair in sample_pairs]),
+                torch.stack([pair[1] for pair in sample_pairs]),
+            )
 
     _print_logit_validation_results(
         results,

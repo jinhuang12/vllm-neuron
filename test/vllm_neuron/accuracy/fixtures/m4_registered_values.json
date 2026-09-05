@@ -1,0 +1,48 @@
+{
+  "design_entry_id": "design-20260828-a",
+  "campaign": "glm-5.3-flash-port",
+  "registered_at_utc": "2026-08-28T14:43:27Z",
+  "fp8_asymmetry_loosening_factor": 3,
+  "instrument": "vllm_neuron.accuracy.logit_validation.multi_prompt_logit_validation",
+  "validation_level": 2,
+  "reference": "HF transformers 5.16.1 Glm5NextForConditionalGeneration",
+  "tol_map_order": "(atol, rtol)",
+  "tol_map": {
+    "5":    [1e-5, 0.033],
+    "50":   [1e-5, 0.06],
+    "1000": [1e-5, 0.09],
+    "all":  [1e-5, 0.15]
+  },
+  "divergence_n_ulps": null,
+  "divergence_difference_tol": 0.003,
+  "mantissa_bits": 7,
+  "aggregate_config": {
+    "pp_static_thresholds": [0.03, 0.05, 0.09],
+    "pp_linf_multipliers": [1.5, 2.0],
+    "pp_l2_multipliers": [1.5, 2.0],
+    "pp_tok_linf_multipliers": [1.5, 2.0],
+    "pp_tok_l2_multipliers": [1.5, 2.0],
+    "agg_bc_threshold": 0.99,
+    "agg_linf_multipliers": [1.2, 1.5],
+    "agg_l2_multipliers": [1.2, 1.5],
+    "agg_sigma_ratio_threshold": 1.0
+  },
+  "gating_metric_keys": ["pp_static_0.09"],
+  "non_gating_metric_keys": [
+    "passed", "agg_bc", "agg_sigma_ratio", "per_token_bc",
+    "pp_static_0.03", "pp_static_0.05",
+    "pp_max_linf_1.5x", "pp_max_linf_2.0x", "pp_max_l2_1.5x", "pp_max_l2_2.0x",
+    "pp_tok_linf_1.5x", "pp_tok_linf_2.0x", "pp_tok_l2_1.5x", "pp_tok_l2_2.0x",
+    "agg_linf_1.2x", "agg_linf_1.5x", "agg_l2_1.2x", "agg_l2_1.5x"
+  ],
+  "m4_max_total_tokens": 2048,
+  "m7_registered_rungs": [512, 2048, 8192],
+  "reference_target_dtype": "torch.bfloat16",
+  "reference_kv_cache_dtype": "auto",
+  "stable_read_consecutive_count": 3,
+  "stable_read_min_spacing_seconds": 30,
+  "stable_read_spacing_backoff": [30, 60, 120, 240, 300],
+  "stable_read_hard_ceiling_seconds": 900,
+  "battery_size_min_prompts": 2,
+  "battery_size_declared_at": "realize_measurement_procedures"
+}

@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -8595,6 +8596,70 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            # A linear-attention (KDA) layer holds no key/value pair: it holds a
+            # short-convolution state plus a recurrent state, and its spec
+            # reports BOTH on two positional carriers -- shapes[0]/dtypes[0] the
+            # conv state, shapes[1]/dtypes[1] the recurrent state. That is the
+            # order `get_kv_cache_spec` constructs them in and the order the
+            # vendor's own page formula pairs them in, so the allocation below
+            # walks the carriers rather than naming a state.
+            #
+            # THE PAGE COMES FROM THE SPEC, never from a number derived here:
+            # `page_size_bytes` is the sum over the declared carriers, so
+            # `num_blocks` and every stride below are functions of what the spec
+            # reports. `inc-glm53f-086` now passes `page_size_padded`, so this
+            # reads the padded DSA page, not that sum; strides scale with it.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    page_size_bytes = kv_cache_spec.page_size_bytes
+                    assert raw_tensor.numel() % page_size_bytes == 0
+
+                    num_blocks = raw_tensor.numel() // page_size_bytes
+
+                    # Both states live side by side INSIDE each page, so each
+                    # state is a block-strided view of the same raw buffer: the
+                    # block stride is the whole page and the within-block
+                    # strides are contiguous for that state's own shape.
+                    # `strict=True` is deliberate -- the vendor pairs the two
+                    # carriers with a non-strict zip, so a short `dtypes` tuple
+                    # would shorten the page and silently under-allocate here.
+                    state_tensors = []
+                    state_offset_bytes = 0
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
+                    ):
+                        dtype_size = dtype.itemsize
+                        # The page must be a whole number of this state's
+                        # elements, or the block stride below would truncate.
+                        assert page_size_bytes % dtype_size == 0
+                        target_shape = (num_blocks, *shape)
+                        # Contiguous strides for the target shape, read off a
+                        # meta tensor: correct by construction and allocating
+                        # no storage for a reading used only as arithmetic.
+                        contiguous = torch.empty(target_shape, device="meta").stride()
+                        assert state_offset_bytes % dtype_size == 0
+                        state_tensors.append(
+                            torch.as_strided(
+                                _shared_dtype_view(raw_tensor, dtype),
+                                size=target_shape,
+                                stride=(
+                                    page_size_bytes // dtype_size,
+                                    *contiguous[1:],
+                                ),
+                                storage_offset=state_offset_bytes // dtype_size,
+                            )
+                        )
+                        # Advance by this state's own per-block footprint, so the
+                        # next carrier starts where this one ends inside a page.
+                        state_offset_bytes += contiguous[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+                    # Deliberately NOT registered in `_kv_cache_full_tensors`:
+                    # that dict feeds the KV-transfer connector's full
+                    # (2, num_blocks, ...) K/V view, and a recurrent state has
+                    # no K/V pair to hand it.
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
@@ -8648,10 +8713,46 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
+            # A linear-attention (KDA) layer holds no key/value history: it holds
+            # a short-convolution state plus a recurrent state, reported on
+            # LayerSpec's four recurrent-state fields. The layer is recognised
+            # BY THE FIELDS IT CARRIES, never by its name.
+            recurrent_state = (
+                layer.kda_conv_state_shape,
+                layer.kda_recurrent_state_shape,
+                layer.kda_conv_state_dtype,
+                layer.kda_recurrent_state_dtype,
+            )
+            if any(value is not None for value in recurrent_state):
+                if None in recurrent_state:
+                    raise ValueError(
+                        f"KV layer '{layer_name}' declares recurrent-state "
+                        "geometry but leaves part of it unset; the conv and "
+                        "recurrent carriers are paired positionally, so a "
+                        "missing member would shorten the reported page."
+                    )
+                # ONE order shared by both carriers: position 0 conv, position 1
+                # recurrent, the order the vendor's page formula pairs them in.
+                # Dtypes come from the MODEL, per state -- the global KV cache
+                # dtype describes a key/value cache and would mistype an fp32
+                # recurrent state. page_size_padded IS now passed, below the
+                # loop (`inc-glm53f-086`): it reverses this comment's premise so
+                # the KDA page matches the DSA page this same call builds.
+                spec = MambaSpec(
+                    block_size=block_size,
+                    shapes=(
+                        tuple(layer.kda_conv_state_shape),
+                        tuple(layer.kda_recurrent_state_shape),
+                    ),
+                    dtypes=(
+                        layer.kda_conv_state_dtype,
+                        layer.kda_recurrent_state_dtype,
+                    ),
+                )
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
             # this enables block clipping in the NiXL connector.
-            if layer.sliding_window_size is None:
+            elif layer.sliding_window_size is None:
                 spec = FullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
@@ -8669,6 +8770,70 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        # THE PADDED PAGE IS SET HERE, AFTER THE LOOP, NOT IN THE ARM ABOVE.
+        # `inc-glm53f-086`. The KDA arm builds its `MambaSpec` inside the loop,
+        # before any attention layer has necessarily been seen, so the attention
+        # page is not yet known there. Both pages are known only once every layer
+        # has a spec, which is here.
+        #
+        # WHY THE SPEC AND NOT A PATCH: upstream's own unification refuses a
+        # `MambaSpec` whose page neither divides the largest page nor belongs to
+        # an attention spec it can pad. Setting the field at construction makes
+        # that unification succeed on its own terms, so nothing downstream has to
+        # widen anything. `inc-glm53f-018`'s patch stays in place and goes inert
+        # on this path, because it only ever fills the field when it is None.
+        #
+        # Scoped to the layers this loop built. The drafter's spec set below is
+        # deliberately NOT padded here; the patch still covers it.
+        # The spec classes are RE-IMPORTED here instead of read off this module's
+        # globals. A landed control replaces this module's `MambaSpec` name with a
+        # factory FUNCTION to revert a dtype assignment
+        # (`test_get_kv_cache_spec_hybrid.py`, C02), and `isinstance` against a
+        # function raises TypeError. Reading the classes from their own module
+        # keeps that control measuring the dtype it is about, not this padding.
+        from dataclasses import replace
+
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec as _FullAttnSpec,
+        )
+        from vllm.v1.kv_cache_interface import MambaSpec as _MambaSpec
+        from vllm.v1.kv_cache_interface import (
+            SlidingWindowSpec as _SlidingWindowSpec,
+        )
+
+        kda_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, _MambaSpec)
+        }
+        attention_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, (_FullAttnSpec, _SlidingWindowSpec))
+        }
+        if kda_specs and attention_specs:
+            kda_page = max(spec.page_size_bytes for spec in kda_specs.values())
+            attention_page = max(
+                spec.page_size_bytes for spec in attention_specs.values()
+            )
+            if attention_page < kda_page:
+                # REFUSED BY NAME rather than padded downward. The vendor's own
+                # hook only ever raises the attention page to meet the state
+                # page, never the reverse, because a page smaller than the state
+                # it must hold cannot describe that state.
+                raise ValueError(
+                    "Cannot unify KV cache pages: the attention page is "
+                    f"{attention_page} B and the recurrent-state page is "
+                    f"{kda_page} B. Padding a recurrent state down to a "
+                    "smaller page would report a page its own geometry does "
+                    "not fit, so this refuses instead of narrowing it."
+                )
+            if attention_page > kda_page:
+                for name, spec in kda_specs.items():
+                    all_kv_cache_specs[name] = replace(
+                        spec, page_size_padded=attention_page
+                    )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

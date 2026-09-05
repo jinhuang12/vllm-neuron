@@ -168,6 +168,45 @@ class NeuronConfig:
     # it; left off by default so other models keep the standard 4-D FP8 cache.
     fp8_packed_kv: bool = False
 
+    # ---- Hybrid KDA/DSA attention stack -----------------------------------
+    # Opt-in to the hybrid KV cache: a stack whose layers do not all want the
+    # same cache geometry (linear-attention/KDA layers carry a recurrent state,
+    # sparse-attention/DSA layers carry an MLA latent). Left off by default so
+    # every model already wired for a uniform cache keeps its resolved config
+    # byte-for-byte; the platform turns it on for the archs that need it.
+    enable_hybrid_kv_cache: bool = False
+    # Cache block size to use when the hybrid cache is enabled. None = no
+    # override, so the platform's own backend default stands.
+    hybrid_kv_block_size: int | None = None
+    # dtype for the KDA recurrent-state buffers, as a torch dtype NAME (e.g.
+    # "bfloat16") so it survives a JSON additional_config round-trip.
+    # None = follow the model's own dtype.
+    kda_state_dtype: str | None = None
+    # Chunk length for the KDA chunked-recurrence path. None = let the layer
+    # choose; the recurrence is associativity-correct at any chunk length, so
+    # this is a tuning dial and not a correctness input.
+    kda_state_chunk_size: int | None = None
+
+    # ---- Multi-hyper-connections (mHC) ------------------------------------
+    # Sinkhorn iteration count for the mHC normalisation. None = use the
+    # checkpoint's own value. Trades device time against how tightly the
+    # normalised matrix converges to doubly-stochastic.
+    mhc_sinkhorn_iters: int | None = None
+    # Numerical-stability epsilon for the same normalisation. None = use the
+    # checkpoint's own value; a lower-precision device path may need it raised.
+    mhc_eps: float | None = None
+
+    # ---- Blockwise FP8 quantisation ---------------------------------------
+    # Opt-in to blockwise (2-D block-scaled) FP8 weights, as distinct from the
+    # per-tensor FP8 and MX paths this plugin already carries. Left off by
+    # default so no currently-accepted config changes how it resolves; the
+    # quantisation-recognition path turns it on from the checkpoint.
+    blockwise_fp8: bool = False
+    # Floor applied to a block scale before it is stored, guarding a denormal
+    # scale from collapsing a whole block. None = use the load path's own
+    # floor constant.
+    block_quant_scale_min: float | None = None
+
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
         """Build NeuronConfig from a dictionary (e.g., from additional_config['neuron_config']).
@@ -244,6 +283,14 @@ class NeuronConfig:
                 "enable_structured_outputs", False
             ),
             fp8_packed_kv=config_dict.get("fp8_packed_kv", False),
+            enable_hybrid_kv_cache=config_dict.get("enable_hybrid_kv_cache", False),
+            hybrid_kv_block_size=config_dict.get("hybrid_kv_block_size"),
+            kda_state_dtype=config_dict.get("kda_state_dtype"),
+            kda_state_chunk_size=config_dict.get("kda_state_chunk_size"),
+            mhc_sinkhorn_iters=config_dict.get("mhc_sinkhorn_iters"),
+            mhc_eps=config_dict.get("mhc_eps"),
+            blockwise_fp8=config_dict.get("blockwise_fp8", False),
+            block_quant_scale_min=config_dict.get("block_quant_scale_min"),
         )
 
     def __post_init__(self):
