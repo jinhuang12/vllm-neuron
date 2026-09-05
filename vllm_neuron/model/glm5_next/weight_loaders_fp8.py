@@ -1960,14 +1960,17 @@ def loader_for_mapped_keys(
         # this branch stays byte-for-byte the one ``-091`` measured.
         return blockwise_scale_loader(param_name)
     if kind == MAPPED_KEY_STACKED_BANK:
-        # NO GEOMETRY REACHES THE BANK AT THIS INCREMENT, and that is a ruling
-        # rather than an omission. A bank's intermediate shard needs a width its
-        # owning module does not declare -- ``Glm5NextRoutedExperts`` holds counts
-        # and degrees only -- so it is served by ``inc-glm53f-101``'s load-time
-        # width instead, together with the shared expert's three families. The
-        # table in ``model_fp8.py`` names no bank family, so the argument is not
-        # passed rather than being passed and ignored.
-        return stacked_expert_bank_loader(keys, param_name=param_name, owner=owner)
+        # THE BANK'S GEOMETRY REACHES IT SINCE ``inc-glm53f-101``, which is what
+        # ``-094``'s note here handed forward by name. It is a
+        # ``DeferredShardGeometry``: the width comes off the checkpoint tensor,
+        # because ``Glm5NextRoutedExperts`` holds counts and degrees only. Its rank
+        # count is ``tp_per_ep`` and not the world size, since the experts are
+        # already divided across the expert-parallel groups -- so at this
+        # campaign's production expert-parallel degree of 1 the reader returns
+        # ``None`` and this branch takes exactly the path ``-095`` measured.
+        return stacked_expert_bank_loader(
+            keys, param_name=param_name, owner=owner, geometry=geometry
+        )
     if kind == MAPPED_KEY_QUANTISED_WEIGHT:
         if geometry is None:
             base = SafetensorsWeightLoader()
@@ -2121,16 +2124,25 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
     expert parallelism off "every expert is local on every rank"
     (``factory.py:260-264``). So the whole bank is local on every rank.
 
-    ABOVE DEGREE 1 IT REFUSES, AND THE GROUND IS THE PLATFORM'S MESH, NOT A
-    MISSING GETTER. ``_build_ep_group_ranks``
+    ABOVE DEGREE 1 THE INDEX IS READ FROM THE GROUP AND NEVER DIVIDED OUT OF THE
+    GLOBAL RANK (``inc-glm53f-101``, remedy part 3(a), which REPLACED this
+    function's earlier refusal). ``_build_ep_group_ranks``
     (``parallel/neuron_parallel_state.py:218-232``) lays the ranks out through
     ``_build_2d_mesh``, which substitutes ``_TRN2_MESH`` (``:118-127``) whenever
     the world is 64 and the row is 8 (``uses_noncontiguous_mesh``, ``:111-115``).
     That mesh's first row is ``[0, 1, 2, 3, 12, 13, 14, 15]``, so rank 12 belongs
     to group 0 while ``12 // 8`` is 1: dividing the global rank would place a bank
-    on the wrong ranks on the very host this campaign targets. The group index has
-    to be READ from the initialised group, and this loader is handed a bare global
-    rank with no group to read, so it refuses by name instead of guessing.
+    on the wrong ranks on the very host this campaign targets. Measured, at the
+    real degrees, in ``increments/probe-101-grid-host-r6.out`` --
+    ``WORLD64_EP8_RANK4=group says row 1 column 0, modulo says column 4``.
+
+    THE CORRECTION TO THE EARLIER REFUSAL, RECORDED RATHER THAN QUIETLY DROPPED.
+    Its text said the group index "must be read from the initialised group ...
+    which this loader has no handle on". The first half is right and the second was
+    an absence claimed without reading the module that answers it:
+    ``get_neuron_ep_rank()`` (``:1202-1206``) is a module-level getter needing no
+    handle at all, and it returns 0 when no expert-parallel group was initialised.
+    So the read is available here, and the refusal it justified is gone.
 
     AN OWNER THAT DECLARES NO DEGREES IS PASSED THROUGH UNCHANGED. Every landed
     caller that builds a bare owner with ``local_expert_indices`` and
@@ -2148,20 +2160,91 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
         # One tensor-parallel rank means the only global rank is 0, which is also
         # its group index, so the identity is the read and not an assumption.
         return lambda rank: rank
-    _refuse(
-        param_name,
-        f"is a routed expert bank at expert-parallel degree {ep_degree} AND "
-        f"tensor-parallel degree {int(tp_degree)}, and the load hands this loader "
-        f"the GLOBAL tensor-parallel rank. On this platform the expert-parallel "
-        f"group index is not that rank divided by anything: at world 64 and row 8 "
-        f"the layout is _TRN2_MESH "
-        f"(parallel/neuron_parallel_state.py:111-127), whose first row holds rank "
-        f"12 while 12 // 8 is 1. The index must be read from the initialised "
-        f"group (get_neuron_ep_rank, :1202-1206), which this loader has no handle "
-        f"on, so the bank is refused by name rather than placed on the wrong "
-        f"ranks. Expert-parallel degree 1 -- this campaign's production route -- "
-        f"is unaffected: the bank is local on every rank.",
-    )
+
+    def read_expert_parallel_rank(rank: int) -> int:
+        """This process's expert-parallel partition index, from the group.
+
+        ``rank`` is deliberately NOT used. It is the global tensor-parallel rank,
+        and the whole point of remedy part 3(a) is that the partition index is not
+        that rank divided by anything on a non-contiguous mesh. The global rank
+        does get used, once, and by the one thing it does answer: the shard COLUMN
+        assertion in :func:`_expert_parallel_shard_column`.
+        """
+        del rank
+        from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_rank
+
+        return int(get_neuron_ep_rank())
+
+    return read_expert_parallel_rank
+
+
+def _expert_parallel_shard_column(
+    rank: int, tp_per_ep: int, param_name: str | None
+) -> int:
+    """This process's column inside its expert-parallel TP group, checked twice.
+
+    ``inc-glm53f-101``, remedy part 3(b) plus the lead's addition at DECISIONS
+    §78. Two independent answers to "which columns of each expert are mine" exist
+    in this repository and they do not always agree:
+
+    * the GROUP's own answer, ``get_neuron_ep_tp_group().rank_in_group``
+      (``parallel/neuron_parallel_state.py:1186-1192``), which is what the mesh
+      actually built; and
+    * the CONSUMER's, ``rank % tp_degree`` where ``tp_degree = world_size /
+      ep_degree`` (``functional/moe/moe_blockwise.py:55-67``, whose docstring
+      states the derivation in those words).
+
+    The group's answer is taken, as ruled. The consumer's is then COMPARED to it
+    and a disagreement is REFUSED BY NAME, because a disagreement means the loader
+    would place a column where the kernel will not look for it -- the weights load,
+    every shape checks out, and the model computes the wrong function. Measured:
+    at world 64 the two disagree for exactly one declared degree, ``ep_degree`` 8,
+    and agree at the registered ``ep_degree`` 16
+    (``increments/probe-101-grid-host-r6.out``,
+    ``DEGREES_WHERE_THEY_DISAGREE=[(64, 8)]``,
+    ``REGISTERED_DEGREE_DISAGREEMENTS=0``). So this is the third member of the
+    bank's refusal set, beside a ragged expert degree and a shard the consumer
+    cannot take.
+
+    AN UNINITIALISED GROUP IS REFUSED BY NAME TOO. The getter asserts
+    (``:1188-1191``), which would land as a bare ``AssertionError`` naming no
+    parameter in the middle of a load; the owner declared a degree above 1, so a
+    missing group is a real contradiction and it is said in those terms.
+    """
+    from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_tp_group
+
+    try:
+        group = get_neuron_ep_tp_group()
+    except AssertionError:
+        _refuse(
+            param_name,
+            f"is a routed expert bank whose owning module declares an "
+            f"expert-parallel degree above 1, so its columns are divided among "
+            f"{tp_per_ep} ranks inside one expert-parallel group -- but no EP-TP "
+            f"group is initialised, so there is no group to read the column from "
+            f"(parallel/neuron_parallel_state.py:1186-1192). Refusing rather than "
+            f"falling back to the global rank, which on this platform's mesh is a "
+            f"different column.",
+        )
+    column = int(group.rank_in_group)
+    derived = rank % tp_per_ep
+    if column != derived:
+        _refuse(
+            param_name,
+            f"would be placed on two different columns by the two answers this "
+            f"repository holds. The initialised EP-TP group puts global rank "
+            f"{rank} at column {column}; the consumer derives the column as rank % "
+            f"tp_per_ep = {rank} % {tp_per_ep} = {derived} "
+            f"(functional/moe/moe_blockwise.py:55-67). The loader takes the "
+            f"group's answer, so at this degree it would write column {column} "
+            f"where the kernel reads column {derived} -- every shape would check "
+            f"out and the model would compute the wrong function. This happens "
+            f"when the mesh is non-contiguous (parallel/neuron_parallel_state.py:"
+            f"111-127): at world 64 the two disagree at expert-parallel degree 8 "
+            f"and agree at the registered degree 16. Refused by name rather than "
+            f"loaded wrong.",
+        )
+    return column
 
 
 def _bank_expert_indices(
@@ -2258,6 +2341,58 @@ def _stack_local_expert_scales(param_name: str | None):
     return transform
 
 
+def _column_of_each_expert(
+    geometry: DeferredShardGeometry, param_name: str | None, stack_whole
+):
+    """Wrap a bank stacker so each expert contributes only THIS column's slice.
+
+    ``inc-glm53f-101``, remedy part 3. The bank's experts are already divided
+    across the expert-parallel groups; what one group still divides is each
+    expert's intermediate width, among its ``geometry.num_shards`` = ``tp_per_ep``
+    members. So this takes the stacker that reads whole experts and gives it a
+    column instead.
+
+    THE COLUMN IS READ ONCE PER LOAD, NOT ONCE PER EXPERT, and it is the same
+    column for every expert in the bank: it is a property of this process's place
+    in its group, not of the expert. Reading it once also means the loader-versus-
+    consumer disagreement check (:func:`_expert_parallel_shard_column`) refuses
+    before the first expert is touched rather than part way through a stack.
+
+    THE COLUMN IS TAKEN AFTER STACKING, FOR BOTH WEIGHTS AND GRIDS, and the cost
+    of that is disclosed rather than hidden. Taking it after means each rank READS
+    each of its experts at full intermediate width and then keeps its share -- at
+    the registered degrees that is 2048 columns read per expert to keep 512. The
+    grid has no choice: ``compensate_block_scales`` is the landed arithmetic and a
+    pre-sliced grid would change what it computes, so its column can only be taken
+    from the compensated tensor. Matching the weight to it buys one implementation
+    of the extent and the guarantee that a weight's columns and its grid's rows end
+    in the same place, which two ceiling divisions would not give. Narrowing the
+    weight's read to a pre-materialise slice is a later increment's optimisation and
+    is named here so it is a choice on the record.
+    """
+    from vllm_neuron.utils.weight_loader import shard_tensor_at_load_time
+
+    def transform(local_slices: list, rank: int) -> torch.Tensor:
+        column = _expert_parallel_shard_column(
+            rank, geometry.num_shards, param_name
+        )
+        whole = stack_whole(local_slices, rank)
+        # The stacked result carries a LEADING expert axis, so the geometry's
+        # per-expert dim sits one place to the right. Stated here because this is
+        # the one place the two numberings meet.
+        return shard_tensor_at_load_time(
+            whole,
+            geometry.shard_dim + 1,
+            geometry.num_shards,
+            column,
+            geometry.pad_to_multiple_of,
+            geometry.pad_value,
+            param_name,
+        )
+
+    return transform
+
+
 def _bank_slice_count(slices: list, layout: BankLayout, param_name: str | None) -> None:
     """Refuse a load whose slice count is not the key count this entry declared.
 
@@ -2327,6 +2462,7 @@ def stacked_expert_bank_loader(
     *,
     param_name: str | None = None,
     owner: object | None = None,
+    geometry: DeferredShardGeometry | None = None,
 ) -> SafetensorsWeightLoader:
     """Load a routed expert bank's WEIGHTS as one stacked tensor.
 
@@ -2354,11 +2490,16 @@ def stacked_expert_bank_loader(
     """
     layout = bank_layout(checkpoint_keys, param_name=param_name)
     resolve = _bank_expert_indices(owner, layout, param_name)
+    # ``inc-glm53f-101``, remedy part 3. ``None`` is the landed path, and it is what
+    # this campaign's production expert-parallel degree of 1 still takes: at that
+    # degree ``tp_per_ep`` is the whole world and the table's reader returns no
+    # geometry, so the bank is whole inside its group.
+    stack = _stack_local_expert_weights
+    if geometry is not None:
+        stack = _column_of_each_expert(geometry, param_name, stack)
     return wrap_with_blockwise_fp8_downscale(
         SafetensorsWeightLoader(
-            transform=_stacked_bank_transform(
-                layout, resolve, param_name, _stack_local_expert_weights
-            )
+            transform=_stacked_bank_transform(layout, resolve, param_name, stack)
         )
     )
 
@@ -2368,6 +2509,8 @@ def stacked_expert_scale_loader(
     *,
     param_name: str | None = None,
     owner: object | None = None,
+    geometry: DeferredShardGeometry | None = None,
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
 ) -> SafetensorsWeightLoader:
     """Load a routed expert bank's SCALE GRIDS as one stacked tensor.
 
@@ -2396,8 +2539,19 @@ def stacked_expert_scale_loader(
     """
     layout = bank_layout(checkpoint_keys, param_name=param_name)
     resolve = _bank_expert_indices(owner, layout, param_name)
-    return SafetensorsWeightLoader(
-        transform=_stacked_bank_transform(
-            layout, resolve, param_name, _stack_local_expert_scales(param_name)
+    # ``inc-glm53f-101``. A SHARDED BANK'S GRIDS ARE SHARDED WITH ITS WEIGHTS, for
+    # the reason ``-094`` recorded for the dense MLP: a whole grid beside a column
+    # of weights describes the wrong blocks, and the dequantisation would scale
+    # real rows by another column's scale. The weight geometry is converted to the
+    # grid's by the one function that does that conversion, so the block boundary
+    # is checked in one place and the padded entries hold 1.0 rather than 0.0.
+    stack = _stack_local_expert_scales(param_name)
+    if geometry is not None:
+        stack = _column_of_each_expert(
+            shard_geometry_for_grid(geometry, param_name, block_size),
+            param_name,
+            stack,
         )
+    return SafetensorsWeightLoader(
+        transform=_stacked_bank_transform(layout, resolve, param_name, stack)
     )

@@ -306,6 +306,90 @@ def sharding_weight_loader_with_padding(
     return SafetensorsWeightLoader(transform=transform)
 
 
+def load_time_shard_size(
+    full: int,
+    num_shards: int,
+    pad_to_multiple_of: int | None = None,
+    *,
+    who: str = "<unnamed parameter>",
+    shard_dim: int = 0,
+) -> int:
+    """One rank's extent along a dimension whose full width arrived at load time.
+
+    ``inc-glm53f-101``. Extracted so the two callers that need it -- the loader
+    below, which slices a checkpoint slice, and a caller slicing an already
+    materialised tensor -- compute the same number from the same code. Two copies
+    of a ceiling division is how a weight and its scale grid come to disagree
+    about where a shard ends.
+
+    With ``pad_to_multiple_of`` the full width is first rounded UP to the smallest
+    multiple of ``num_shards * pad_to_multiple_of``, so every rank's extent is a
+    whole multiple of ``pad_to_multiple_of``. Without it the width must divide
+    evenly, and an uneven one is REFUSED with its remainder and the two nearest
+    even widths named -- flooring would drop rows that no rank then holds.
+    """
+    if num_shards < 1:
+        raise ValueError(f"{who}: num_shards must be >= 1, got {num_shards}")
+    if pad_to_multiple_of is None:
+        remainder = full % num_shards
+        if remainder:
+            raise ValueError(
+                f"{who}: the checkpoint tensor is {full} wide on dim "
+                f"{shard_dim} and {num_shards} ranks divide it, leaving a "
+                f"remainder of {remainder}. The nearest widths that divide "
+                f"evenly are {full - remainder} and "
+                f"{full + num_shards - remainder}. Refusing rather than "
+                f"flooring: a floored shard drops {remainder} rows that no "
+                f"rank would then hold"
+            )
+        return full // num_shards
+    if pad_to_multiple_of < 1:
+        raise ValueError(
+            f"{who}: pad_to_multiple_of must be >= 1, got {pad_to_multiple_of}"
+        )
+    step = num_shards * pad_to_multiple_of
+    return (-(-full // step) * step) // num_shards
+
+
+def shard_tensor_at_load_time(
+    tensor: torch.Tensor,
+    shard_dim: int,
+    num_shards: int,
+    rank: int,
+    pad_to_multiple_of: int | None = None,
+    pad_value: float = 0.0,
+    param_name: str | None = None,
+) -> torch.Tensor:
+    """One rank's shard of an ALREADY MATERIALISED tensor, padded the same way.
+
+    ``inc-glm53f-101``. The sibling of :func:`tensor_width_sharding_loader` for a
+    caller that no longer holds a checkpoint slice. The routed expert bank's scale
+    grids are the case: each grid is compensated WHOLE first
+    (``compensate_block_scales``, whose arithmetic a pre-sliced grid would change),
+    so by the time the column is taken the grid is a real tensor.
+
+    Both paths take their extent from :func:`load_time_shard_size`, so a bank's
+    weight columns and its grid rows cannot end in different places.
+    """
+    who = param_name or "<unnamed parameter>"
+    if shard_dim >= tensor.dim():
+        raise ValueError(
+            f"{who}: shard_dim {shard_dim} is outside the tensor's "
+            f"{tensor.dim()} dimensions {tuple(tensor.shape)}"
+        )
+    full = int(tensor.shape[shard_dim])
+    shard_size = load_time_shard_size(
+        full, num_shards, pad_to_multiple_of, who=who, shard_dim=shard_dim
+    )
+    start_idx = (rank % num_shards) * shard_size
+    sl = [slice(None)] * tensor.dim()
+    sl[shard_dim] = slice(start_idx, start_idx + shard_size)
+    result = tensor[tuple(sl)]
+    target = list(result.shape)
+    target[shard_dim] = shard_size
+    return pad_to_shape(result, tuple(target), pad_value)
+
+
 def tensor_width_sharding_loader(
     shard_dim: int,
     num_shards: int,
@@ -363,28 +447,9 @@ def tensor_width_sharding_loader(
                 f"{len(shape)} dimensions {tuple(shape)}"
             )
         full = int(shape[shard_dim])
-        if pad_to_multiple_of is None:
-            remainder = full % num_shards
-            if remainder:
-                raise ValueError(
-                    f"{who}: the checkpoint tensor is {full} wide on dim "
-                    f"{shard_dim} and {num_shards} ranks divide it, leaving a "
-                    f"remainder of {remainder}. The nearest widths that divide "
-                    f"evenly are {full - remainder} and "
-                    f"{full + num_shards - remainder}. Refusing rather than "
-                    f"flooring: a floored shard drops {remainder} rows that no "
-                    f"rank would then hold"
-                )
-            shard_size = full // num_shards
-        else:
-            if pad_to_multiple_of < 1:
-                raise ValueError(
-                    f"{who}: pad_to_multiple_of must be >= 1, got "
-                    f"{pad_to_multiple_of}"
-                )
-            step = num_shards * pad_to_multiple_of
-            shard_size = (-(-full // step) * step) // num_shards
-
+        shard_size = load_time_shard_size(
+            full, num_shards, pad_to_multiple_of, who=who, shard_dim=shard_dim
+        )
         start_idx = (rank % num_shards) * shard_size
         sl = [slice(None)] * len(shape)
         sl[shard_dim] = slice(start_idx, start_idx + shard_size)

@@ -263,6 +263,14 @@ class _DeclaredShard:
     #: finds this table before finding the shard table.
     because: str
     pad_to_consumer_block: bool = False
+    #: True for the routed expert bank alone. Its intermediate width is divided by
+    #: ``tp_per_ep = world_size // ep_degree`` -- the ranks INSIDE one
+    #: expert-parallel group -- and not by the whole world, because the experts
+    #: themselves are already divided across the groups. The package's own
+    #: definition: ``parallel/neuron_parallel_state.py:218-232`` lays the groups out
+    #: that way and ``functional/moe/moe_blockwise.py:55-56`` divides the same two
+    #: numbers. Ruled at design entry ``design-20260905-ap``, remedy part 3(a).
+    shards_within_expert_parallel_group: bool = False
 
 
 def _kda_head_width(module: nn.Module, world_size: int) -> int:
@@ -356,6 +364,42 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
             1, None, "row-parallel -- the intermediate width is its input", True
         ),
     },
+    # inc-glm53f-101, remedy part 3. The routed bank's three, and the ONE family
+    # whose divisor is not the world size. Its experts are already divided across
+    # the expert-parallel groups, so what remains to divide inside a group is the
+    # intermediate width, by tp_per_ep.
+    #
+    # ``shard_dim`` HERE IS THE PER-EXPERT CHECKPOINT DIM, not the stacked
+    # parameter's, and the difference is stated because both are defensible. The
+    # bank's parameter carries a LEADING expert axis, so its dims are
+    # [E, out, in] and the intermediate sits one place to the right of the number
+    # below. The number is the checkpoint tensor's because that is what the bank
+    # loader actually slices -- it selects each expert's columns BEFORE stacking
+    # (``weight_loaders_fp8.py``'s ``_stack_local_expert_weights``), so a dim
+    # counted in the stacked shape would slice the wrong axis of every expert.
+    "Glm5NextRoutedExperts": {
+        "gate_proj_weight": _DeclaredShard(
+            0,
+            None,
+            "column-parallel on the intermediate width, inside the EP group",
+            True,
+            True,
+        ),
+        "up_proj_weight": _DeclaredShard(
+            0,
+            None,
+            "column-parallel on the intermediate width, inside the EP group",
+            True,
+            True,
+        ),
+        "down_proj_weight": _DeclaredShard(
+            1,
+            None,
+            "row-parallel -- the intermediate width is its input, inside the EP group",
+            True,
+            True,
+        ),
+    },
 }
 
 
@@ -380,19 +424,51 @@ def _shard_geometry_for(
     dim, the rank count and the pad multiple and leaves the extent to the loader
     that will hold the tensor. The consumer's block size is imported HERE rather
     than written into the table, so the number has one home.
+
+    THE ROUTED BANK'S RANK COUNT IS NOT THE WORLD SIZE, and it is the only family
+    of which that is true. Its experts are divided across the expert-parallel
+    groups already, so what one group divides is the intermediate width, by
+    ``tp_per_ep = world_size // ep_degree``. At ``tp_per_ep == 1`` the bank is
+    whole inside its group and ``None`` comes back, which is also this campaign's
+    production route at expert-parallel degree 1.
     """
     if world_size <= 1:
         return None
     declared = _SHARD_GEOMETRY.get(type(module).__name__, {}).get(leaf)
     if declared is None:
         return None
+    num_shards = world_size
+    if declared.shards_within_expert_parallel_group:
+        # The divisor is the ranks inside ONE expert-parallel group. Read off the
+        # module that already resolved both degrees at construction
+        # (``Glm5NextRoutedExperts.__init__``: ``tp_degree`` is the world size and
+        # ``ep_degree`` comes from ``_resolve_ep_degree``), so the two halves cannot
+        # disagree with the partition the same object built.
+        ep_degree = max(1, int(getattr(module, "ep_degree", 1)))
+        num_shards = max(1, world_size // ep_degree)
+        if num_shards <= 1:
+            # One rank per expert-parallel group: every group member holds its
+            # experts whole, so there is no intermediate shard and the replicated
+            # path is the right one.
+            return None
     if declared.width is None:
         return DeferredShardGeometry(
             shard_dim=declared.shard_dim,
-            num_shards=world_size,
+            num_shards=num_shards,
             pad_to_multiple_of=(
                 consumer_block_quant_size() if declared.pad_to_consumer_block else None
             ),
+        )
+    if declared.shards_within_expert_parallel_group:
+        # No family declares both today, and this refusal is what keeps it that
+        # way: a resolved width is divided by the WORLD size below, so a family
+        # that also asked for the expert-parallel divisor would get one divisor in
+        # its extent and another in its rank count and shard itself wrong.
+        raise ValueError(
+            f"{type(module).__name__}.{leaf} declares both a width function and "
+            f"the expert-parallel divisor; the width would be divided by the world "
+            f"size while the shard count came from tp_per_ep, so the two would "
+            f"disagree. Declare width=None for an expert-parallel family."
         )
     return ShardGeometry(
         shard_dim=declared.shard_dim,
@@ -5419,8 +5495,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # expert order, so row ``[e]`` matches the weight bank's row
                 # ``[e]``. It was landed "to be CALLED rather than attached"
                 # (``weight_loaders_fp8.py:2136-2143``) and this is that caller.
+                #
+                # ``inc-glm53f-101``. The bank's geometry now reaches this call, so
+                # a column-sharded bank gets column-sharded grids. ``None`` at
+                # expert-parallel degree 1 and at world size 1, which is every
+                # landed reading of this branch.
+                bank_geometry = _shard_geometry_for(module, leaf, self.world_size)
                 grid = stacked_expert_scale_loader(
-                    key_list, param_name=param_name, owner=module
+                    key_list,
+                    param_name=param_name,
+                    owner=module,
+                    geometry=bank_geometry,
+                    block_size=self._checkpoint_block_size(),
                 ).load(
                     [checkpoint._get_slice(key) for key in key_list],
                     _resolve_rank(),
