@@ -137,6 +137,19 @@ TARGET_LATENT_RANK = 512
 #: placeholder -- see the module docstring. Held for the same reason as above.
 TARGET_ROPE_WIDTH = 0
 
+#: The VALUE the indexer writes for a selected-row column that carries no token, and the
+#: only negative index this seam admits (`inc-glm53f-098`). The producer's constant, not
+#: this module's invention: `functional/dsa/index_expand.py` emits it and says every
+#: consumer must mask on it. This module is that consumer.
+SENTINEL_INDEX = -1
+
+#: How far below its row maximum a masked score is pushed, IN EXPONENT UNITS. The bias
+#: the kernels add is this divided by `softmax_scale`, because `nisa.activation` computes
+#: ``exp(scale * data + bias)``; a bias fixed in SCORE units would shrink with the scale
+#: and a caller passing a small one would get a masked column back with real weight.
+#: 200 is well past fp32's exp underflow point -- ``exp(-104)`` is already 0.0 there.
+_SENTINEL_EXP_FLOOR = 200.0
+
 
 class MlaSparseAttentionError(ValueError):
     """Raised for a geometry this kernel does not serve.
@@ -199,6 +212,65 @@ def _sbuf_u32(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.uint32, buffer=nl.sbuf)
 
 
+# Its own NAME for the reason recorded above the uint32 one. `inc-glm53f-098` needs the
+# SIGNED tile because -1 read as uint32 is 4,294,967,295, which no comparison sees.
+def _sbuf_i32(*shape: int):
+    return nl.ndarray(tuple(shape), dtype=nl.int32, buffer=nl.sbuf)
+
+
+def _sentinel_scratch(parts, width, heads):
+    """`inc-glm53f-098`'s sentinel working set. All three bodies allocate through here.
+
+    Returns, in order: the -1 comparand, the signed index tile, the 0/1 valid tile, the
+    clamped index tile, the valid mask in float, the additive score bias, the masked
+    scores, the masked probabilities. Written once here so the six ``nki.jit`` entry
+    points cannot drift apart.
+
+    THE MASK IS BUILT AT ``parts`` AND SLICED DOWN TO ``heads``, not built twice: every
+    partition of the index tile holds the same K offsets, so partitions ``0:heads`` are
+    exactly the per-column mask a score tile needs, and ``heads <= HEAD_MAX ==
+    LATENT_TILE`` makes that slice always available. Every parameter is positional --
+    the keyword-only refusal recorded above :func:`_sbuf` binds here too.
+    """
+    comparand = _sbuf_i32(parts, width)
+    nisa.memset(dst=comparand, value=SENTINEL_INDEX)
+    return (comparand, _sbuf_i32(parts, width), _sbuf_i32(parts, width),
+            _sbuf_i32(parts, width), _sbuf(heads, width), _sbuf(heads, width),
+            _sbuf(heads, width), _sbuf(heads, width))
+
+
+def _mask_sentinel(topk_hbm, offset, width, heads, sentinel_bias, sen, idx_sb):
+    """Read one query's selected rows, clamp the sentinel columns, build their mask.
+
+    ``-1 < index`` is 1 for a real cache row and 0 for the sentinel, and the clamp is
+    that mask TIMES the index -- so a sentinel column's offset becomes 0 and the gather
+    stays inside the cache. What it gathers is then irrelevant, because its probability
+    is forced to zero; all that matters here is that the load is legal. `-040` loaded
+    straight to uint32, and that form cannot see the sentinel at all.
+
+    The bias is ``(valid - 1) * sentinel_bias``: exactly 0.0 where a token lives and
+    ``-sentinel_bias`` where none does, by two scalar ops against PYTHON constants --
+    ``tensor_scalar``'s ``operand0`` must be a python scalar and never a tile (`-045`).
+    """
+    nisa.tensor_copy(
+        dst=sen[1][:, 0:width],
+        src=nl.load(
+            topk_hbm.ap(pattern=[[0, LATENT_TILE], [1, width]], offset=offset),
+            dtype=nl.int32,
+        ),
+    )
+    nisa.tensor_tensor(dst=sen[2][:, 0:width], data1=sen[0][:, 0:width],
+                       data2=sen[1][:, 0:width], op=nl.less)
+    nisa.tensor_tensor(dst=sen[3][:, 0:width], data1=sen[1][:, 0:width],
+                       data2=sen[2][:, 0:width], op=nl.multiply)
+    nisa.tensor_copy(dst=idx_sb[:, 0:width], src=sen[3][:, 0:width])
+    nisa.tensor_copy(dst=sen[4][:, 0:width], src=sen[2][0:heads, 0:width])
+    nisa.tensor_scalar(dst=sen[5][:, 0:width], data=sen[4][:, 0:width],
+                       op0=nl.add, operand0=-1.0)
+    nisa.tensor_scalar(dst=sen[5][:, 0:width], data=sen[5][:, 0:width],
+                       op0=nl.multiply, operand0=sentinel_bias)
+
+
 def _psum(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.float32, buffer=nl.psum)
 
@@ -214,10 +286,15 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     zero-extent SBUF tile is not a thing this image allocates, so a kernel that tried
     to keep the limb and size it 0 would not trace at all.
 
+    THE SENTINEL IS MASKED, NOT REFUSED (`inc-glm53f-098`). A column of ``topk_hbm``
+    holding :data:`SENTINEL_INDEX` carries no token: it is gathered from cache row 0 so
+    the load is legal, and then given exactly zero probability, so it moves nothing. A
+    query whose every column is the sentinel produces exactly zeros.
+
     Shapes:
         q_lift_hbm  [S, H, L]      the absorbed Q latent, per head
         c_kv_hbm    [S_kv, L]      the latent KV cache
-        topk_hbm    [S, K] int32   the selected cache rows, per query
+        topk_hbm    [S, K] int32   the selected cache rows, per query; -1 means none
         q_pe_hbm    [S, H, R]      present only when R > 0
         k_pe_hbm    [S_kv, R]      present only when R > 0
         out_hbm     [S, H, L]      written once per query
@@ -269,20 +346,24 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     q_pe_t = _sbuf(rope, heads) if rope > 0 else None
     k_pe_g = _sbuf(rope, topk) if rope > 0 else None
 
+    # `inc-glm53f-098`'s sentinel working set. In EXPONENT units divided by the scale,
+    # because `activation` below computes ``exp(scale * data + bias)``; `softmax_scale`
+    # is a Python float inside a traced body -- which is exactly why `tensor_scalar` can
+    # take it as `operand0` -- so this division happens at trace time and emits nothing.
+    sen = _sentinel_scratch(LATENT_TILE, topk, heads)
+    valid_f = sen[4]
+    mask_bias = sen[5]
+    scores_m = sen[6]
+    p_m = sen[7]
+    sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
+
     for q_idx in nl.affine_range(seq):
         # ---- this query's selected rows, replicated to every partition ----------
         # `nc_n_gather` gathers within a partition and reads its offsets from the
         # SAME partition, so all 128 latent partitions need the same K offsets. A
         # zero-stride partition read is one DMA and replicates them for free; the
         # alternative is a shuffle plus a fan-out copy.
-        nisa.tensor_copy(
-            dst=idx_sb,
-            src=nl.load(
-                topk_hbm.ap(pattern=[[0, LATENT_TILE], [1, topk]],
-                            offset=q_idx * topk),
-                dtype=nl.uint32,
-            ),
-        )
+        _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
 
         # ---- gather the latent cache rows: one instruction per latent tile ------
         for li in range(n_latent):
@@ -328,25 +409,47 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                     src=c_g_t_ps,
                 )
 
+        # ---- the sentinel columns leave the softmax, BEFORE the max -------------
+        # `inc-glm53f-098`, and the ORDER is the content. On the RAW scores because
+        # `activation` scales its data, which is what caps a masked column's exponent at
+        # -`_SENTINEL_EXP_FLOOR` whatever scale the caller passed; and BEFORE the max,
+        # because a max taken over unmasked scores could be a sentinel column's and would
+        # drag every real column's exponent down with it.
+        #
+        # WITH NO SENTINEL BOTH MASKING STEPS ARE IDENTITIES -- `mask_bias` is exactly
+        # 0.0 and `valid_f` exactly 1.0, and ``x + 0.0`` and ``x * 1.0`` are exact in
+        # fp32. That is why the acceptance claims BIT-IDENTITY there, not a tolerance.
+        nisa.tensor_tensor(dst=scores_m, data1=scores_ps, data2=mask_bias, op=nl.add)
+
         # ---- softmax over K, per head row --------------------------------------
         # The max is taken NEGATED and then scaled, so `activation` can fold the
         # subtraction into its bias and produce the row sum in the same pass. The
         # scale multiplies the raw scores, so the bias must carry the same factor --
         # that is why the negated max is scaled here and not left raw.
-        nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_ps, axis=1,
+        nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
                            negate=True)
         nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
                            operand0=softmax_scale, engine=nisa.engine.vector)
-        nisa.activation(dst=p, op=nl.exp, data=scores_ps, bias=exp_bias,
+        nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
                         scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
                         reduce_cmd=nisa.reduce_cmd.reset_reduce)
         nisa.reciprocal(dst=recip, data=row_sum)
+
+        # AND EXACTLY ZERO, not merely small. The bias alone underflows the exp for a row
+        # holding at least one real column, but a WHOLLY sentinel row's own maximum
+        # rebases its exponent back to 0 and the exp returns 1, so the zero is multiplied
+        # in. That is also what makes that row's output exactly zeros with NO
+        # divide-by-zero: its numerator is exactly 0 while `row_sum` stays at least 1
+        # (the row's argmax column contributes ``exp(0)``), and ``0 * finite`` is 0. `p`
+        # is left alone and MM2 reads `p_m` -- writing back onto an operand is the idiom
+        # `kda/decode_state.py` records as the one to avoid.
+        nisa.tensor_tensor(dst=p_m, data1=p, data2=valid_f, op=nl.multiply)
 
         # ---- MM2: out[H, L] = p[H, K] @ c_g[K, L], K contracted on partitions ---
         for ck in range(n_chunks):
             ks = ck * KEY_CHUNK
             p_t_ps = _psum(KEY_CHUNK, heads)
-            nisa.nc_transpose(dst=p_t_ps, data=p[:, ks:ks + KEY_CHUNK])
+            nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
             nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
 
         pv_ps = _psum(heads, latent)
@@ -581,16 +684,20 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     q_pe_t = _sbuf(rope, heads) if rope > 0 else None
     k_pe_g = _sbuf(rope, topk) if rope > 0 else None
 
+    # `inc-glm53f-098`'s sentinel working set, `-040`'s exactly and for a reason: the
+    # mask is a fact about the SELECTED-ROW axis, which is not the axis this body tiles.
+    # The index tile stays the full 128 partitions and each gather slices it, so one
+    # clamp serves every latent tile including the ragged one.
+    sen = _sentinel_scratch(LATENT_TILE, topk, heads)
+    valid_f = sen[4]
+    mask_bias = sen[5]
+    scores_m = sen[6]
+    p_m = sen[7]
+    sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
+
     for q_idx in nl.affine_range(seq):
         # ---- this query's selected rows, replicated to every partition ----------
-        nisa.tensor_copy(
-            dst=idx_sb,
-            src=nl.load(
-                topk_hbm.ap(pattern=[[0, LATENT_TILE], [1, topk]],
-                            offset=q_idx * topk),
-                dtype=nl.uint32,
-            ),
-        )
+        _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
 
         # ---- gather the latent cache rows: one instruction per latent tile ------
         # The index tile is SLICED to the data tile's extent. `nc_n_gather` reads its
@@ -649,21 +756,24 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
 
         # ---- softmax over K, per head row --------------------------------------
         # Untouched by the tiling: the scores tile is [H, K] whatever the latent rank
-        # was, so this is `-040`'s chain verbatim.
-        nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_ps, axis=1,
+        # was, so this is `-040`'s chain verbatim -- including `-098`'s two masking
+        # steps, which are also facts about K and not about the latent.
+        nisa.tensor_tensor(dst=scores_m, data1=scores_ps, data2=mask_bias, op=nl.add)
+        nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
                            negate=True)
         nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
                            operand0=softmax_scale, engine=nisa.engine.vector)
-        nisa.activation(dst=p, op=nl.exp, data=scores_ps, bias=exp_bias,
+        nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
                         scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
                         reduce_cmd=nisa.reduce_cmd.reset_reduce)
         nisa.reciprocal(dst=recip, data=row_sum)
+        nisa.tensor_tensor(dst=p_m, data1=p, data2=valid_f, op=nl.multiply)
 
         # ---- MM2: out[H, L] = p[H, K] @ c_g[K, L], K contracted on partitions ---
         for ck in range(n_chunks):
             ks = ck * KEY_CHUNK
             p_t_ps = _psum(KEY_CHUNK, heads)
-            nisa.nc_transpose(dst=p_t_ps, data=p[:, ks:ks + KEY_CHUNK])
+            nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
             nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
 
         # THE SECOND TILING, and the one `-040`'s bound was really about: the latent
@@ -931,6 +1041,24 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     pv_added = _sbuf(heads, latent)
     acc_new = _sbuf(heads, latent)
 
+    # `inc-glm53f-098`'s sentinel working set, sized to ONE SCORE TILE like every other
+    # buffer here and sliced per tile the same way, because the mask is a fact about the
+    # very axis this body tiles.
+    #
+    # THE MERGE NEEDS NO SPECIAL CASE, and that follows from the bias being large in
+    # EXPONENT units rather than score units. A wholly-sentinel tile's `tile_pos` lands
+    # `_SENTINEL_EXP_FLOOR` below any real tile's, so the merge's own rescale factor for
+    # it is ``exp(very negative) == 0``, which annihilates both its summed denominator
+    # and its already-zero numerator -- whichever order the tiles arrive in. A
+    # wholly-sentinel tile FIRST is the direction worth stating: it initialises the
+    # running state, and the next real tile's rescale wipes what it left.
+    sen = _sentinel_scratch(LATENT_TILE, tile_max, heads)
+    valid_f = sen[4]
+    mask_bias = sen[5]
+    scores_m = sen[6]
+    p_m = sen[7]
+    sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
+
     for q_idx in nl.affine_range(seq):
         # ---- this query's Q latent, transposed onto partitions ONCE --------------
         # HOISTED ABOVE THE TILE LOOP on purpose: Q does not depend on which selected
@@ -963,14 +1091,10 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
             # ---- THIS TILE's selected rows, replicated to every partition --------
             # The offset is where the tiling shows: `-040` loaded all K rows of the
             # query, this loads the tile's slice of them.
-            nisa.tensor_copy(
-                dst=idx_sb[:, 0:extent],
-                src=nl.load(
-                    topk_hbm.ap(pattern=[[0, LATENT_TILE], [1, extent]],
-                                offset=q_idx * topk + ks),
-                    dtype=nl.uint32,
-                ),
-            )
+            # Loaded SIGNED and clamped before the gather reads it, per `-098`. The
+            # offset carries the tile's `ks` for the same reason the load below it does.
+            _mask_sentinel(topk_hbm, q_idx * topk + ks, extent, heads, sentinel_bias,
+                           sen, idx_sb)
 
             # ---- gather this tile's cache rows: one instruction per latent tile ---
             for li in range(n_latent):
@@ -1006,21 +1130,28 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 
             # ---- softmax over THIS TILE's keys -- `-040`'s chain, verbatim -------
             # Against the TILE's own max, which is the only max available yet. The
-            # merge below is what makes that legitimate.
-            nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_ps, axis=1,
-                               negate=True)
+            # merge below is what makes that legitimate. `-098`'s two masking steps sit
+            # exactly where they sit in `-040`: the bias before the tile's max, the
+            # zeroing before the tile's MM2.
+            nisa.tensor_tensor(dst=scores_m[:, 0:extent], data1=scores_ps,
+                               data2=mask_bias[:, 0:extent], op=nl.add)
+            nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum,
+                               data=scores_m[:, 0:extent], axis=1, negate=True)
             nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
                                operand0=softmax_scale, engine=nisa.engine.vector)
-            nisa.activation(dst=p[:, 0:extent], op=nl.exp, data=scores_ps,
+            nisa.activation(dst=p[:, 0:extent], op=nl.exp,
+                            data=scores_m[:, 0:extent],
                             bias=exp_bias, scale=softmax_scale, reduce_op=nl.add,
                             reduce_res=tile_sum,
                             reduce_cmd=nisa.reduce_cmd.reset_reduce)
+            nisa.tensor_tensor(dst=p_m[:, 0:extent], data1=p[:, 0:extent],
+                               data2=valid_f[:, 0:extent], op=nl.multiply)
 
             # ---- MM2 over this tile: pv[H, L] = p[H, extent] @ c_g[extent, L] ----
             for ck in range(n_chunks):
                 cs = ck * KEY_CHUNK
                 p_t_ps = _psum(KEY_CHUNK, heads)
-                nisa.nc_transpose(dst=p_t_ps, data=p[:, cs:cs + KEY_CHUNK])
+                nisa.nc_transpose(dst=p_t_ps, data=p_m[:, cs:cs + KEY_CHUNK])
                 nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
             pv_ps = _psum(heads, latent)
             for ck in range(n_chunks):
@@ -1259,11 +1390,18 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     # An out-of-range selected row reads memory the cache never held, and the gather
     # instruction's own out-of-bound behaviour is documented as undefined -- so it is
     # refused here, where the message can name the offending value.
+    #
+    # THE LOWER BOUND ADMITS -1 AND NOTHING ELSE BELOW ZERO (`inc-glm53f-098`). -1 is
+    # the indexer's own sentinel for a selected-row column that carries no token
+    # (:data:`SENTINEL_INDEX`), and the kernels MASK it rather than reading it, so
+    # refusing it here would refuse the producer's normal output. -2 and below are still
+    # nothing at all, and are still refused by the same clause. The upper bound does not
+    # move: s_kv is out of range whether or not a sentinel is present.
     lo, hi = int(topk_indices.min()), int(topk_indices.max())
-    if lo < 0 or hi >= s_kv:
+    if lo < SENTINEL_INDEX or hi >= s_kv:
         raise MlaSparseAttentionError(
-            f"every selected row must index the cache; got the range [{lo}, {hi}] "
-            f"against s_kv={s_kv}"
+            f"every selected row must index the cache or be the {SENTINEL_INDEX} "
+            f"sentinel; got the range [{lo}, {hi}] against s_kv={s_kv}"
         )
 
     _MLA_SPARSE_COUNTERS.nki_dispatch += 1
@@ -1333,19 +1471,29 @@ def mla_sparse_attention_torch_oracle(q_lift: Tensor, c_kv: Tensor,
     This is the region the acceptance excludes BY NAME when it screens this module
     for a torch attention path. It is not a fallback and nothing dispatches to it:
     the seam above never calls it, so no input can reach it except a test's.
+
+    IT CARRIES `inc-glm53f-098`'s SENTINEL SEMANTICS, because an oracle that did not
+    would disagree with the kernels on the producer's ordinary output. The clamp is
+    load-bearing rather than defensive: torch reads a negative index as a wrap-around,
+    so an unclamped -1 would silently attend the LAST cache row.
     """
     q = q_lift.to(torch.float32)
     cache = c_kv.to(torch.float32)
     idx = topk_indices.to(torch.int64)
+    keep = idx >= 0                                       # [S, K] -- False at -1
+    rows = idx.clamp(min=0)                               # -1 -> 0, in bounds
     seq, heads, latent = q.shape
     out = torch.empty(seq, heads, latent, dtype=torch.float32)
     for s in range(seq):
-        gathered = cache[idx[s]]                          # [K, L]
+        gathered = cache[rows[s]]                         # [K, L]
         scores = q[s] @ gathered.t()                      # [H, K]
         if q_pe is not None:
-            rope_gathered = k_pe.to(torch.float32)[idx[s]]  # [K, R]
+            rope_gathered = k_pe.to(torch.float32)[rows[s]]  # [K, R]
             scores = scores + q_pe.to(torch.float32)[s] @ rope_gathered.t()
-        weights = torch.softmax(scores * softmax_scale, dim=-1)
+        scaled = scores.masked_fill(~keep[s], float("-inf"))
+        # A wholly-sentinel row is all -inf, and softmax of that is NaN rather than
+        # zero -- so the zeros the kernels produce for it are written here too.
+        weights = torch.nan_to_num(torch.softmax(scaled * softmax_scale, dim=-1))
         out[s] = weights @ gathered                       # [H, L]
     return out
 

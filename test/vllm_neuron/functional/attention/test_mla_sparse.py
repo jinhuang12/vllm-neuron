@@ -30,6 +30,7 @@ items -- the `width` selection at the end of this file, added by that increment.
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 
 import pytest
@@ -1800,3 +1801,421 @@ def test_rows_the_row_tiled_seam_counts_its_own_dispatch() -> None:
     after_reset = all_counters()
     say(f"R4_THE_ROW_TILED_RESET_LEAVES_THE_OTHER_TWO_ALONE={after_reset}")
     assert after_reset == (2, 0, 0, 0, 0, 0)
+
+
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-098` -- the SIX `sentinel` items. The kernel MASKS a `-1` selected-row
+# column instead of refusing it. Four are the block's four conjuncts at one untiled
+# shape; two repeat the sentinel readings on the other two bodies, because all three
+# read the index tensor and all three therefore carry the mask.
+# --------------------------------------------------------------------------- #
+
+#: THE THREE DECLARED SHAPES, one per body, each stamped in this block's predictions file
+#: before the first line of code and each admitted by `_require_admissible`. They are
+#: declared SHAPES, not registered values: no threshold, tolerance or comparator is
+#: authored here and the tolerance is quoted from `RTOL`/`ATOL` above.
+#:
+#: `s_kv` exceeds `topk` in all three on purpose -- `make_case` draws the selection with
+#: `randperm(s_kv)[:topk]`, so at `s_kv == topk` every query selects the whole cache and
+#: no unselected row is left for a control to reach for. Heads and latent are small
+#: because these run under the simulator and the claim is about the mask, not the width.
+SENTINEL_UNTILED = dict(seq=8, heads=4, latent=128, topk=128, s_kv=256, rope=0)
+
+#: `topk = 640 > MOVING_MAX` routes to the ROW-TILED body, and 640 splits as 512 + 128 --
+#: TWO score tiles, so the carried-softmax merge RUNS rather than being elided. That is
+#: the point of 640 over 1,024: the sentinel meets the merge and a narrower last tile in
+#: one call. `latent = 128` is an exact fit, so the refused both-tilings combination is
+#: never requested.
+SENTINEL_ROW_TILED = dict(seq=5, heads=4, latent=128, topk=640, s_kv=768, rope=0)
+
+#: `latent = 131` is no multiple of `LATENT_TILE`, so this routes to the TILED-LATENT
+#: body, whose tiles are 128 plus a ragged 3.
+SENTINEL_TILED = dict(seq=5, heads=4, latent=131, topk=128, s_kv=256, rope=0)
+
+# ---------------------------------------------------------------------------------------
+# THE PARENT KERNEL'S OWN READING, COMMITTED AS LITERALS.
+#
+# The parent body does not exist in this checkout, so the sentinel-free bit-identity item
+# needs the parent's output from somewhere. An earlier version of this block took it from a
+# file named by an environment variable; that made a plain `pytest test/vllm_neuron/functional`
+# run FAIL, because the item asserts rather than skips when the variable is unset. Committing
+# the digests instead gives ONE path and ONE reading, with no skip anywhere and nothing to
+# set up before the suite runs.
+#
+# HOW THESE VALUES WERE PRODUCED. By `probe-098-parent-ref-r3.py`, run in a checkout at the
+# parent commit below, on the leased trn2 host under the tier-N acceptance pins
+# (VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1
+# NEURON_PLATFORM_TARGET_OVERRIDE=trn2, no device). The output digest was read three times in
+# three separate processes and agreed each time, which is what makes it safe to commit as an
+# exact criterion: a digest that drifted between runs would turn this item red at random.
+#
+# THE INPUT DIGEST IS THE ANTI-DRIFT GUARD. The item rebuilds the inputs here with this
+# file's own `make_case` and checks their digest against the parent's. If the builder ever
+# changes, the input digest fails FIRST and says so, instead of the output digest failing and
+# looking like a kernel defect.
+#
+# THIS IS A BIT-IDENTITY CRITERION AND MUST NEVER BE SOFTENED INTO A TOLERANCE. It is brittle
+# on purpose: a library upgrade that shifts fp32 simulator output turns this item red, and
+# that is the correct alarm rather than a false green.
+PARENT_COMMIT = "3126168ab3407d7f362d90bd8cad02e0f48e7b80"
+PARENT_MODULE_SHA256 = \
+    "5804dccfdf9bacba432fae9b1febd70e3c669e138f84a6322027ea7e6c29abcb"
+PARENT_REF_SEED = 498
+#: sha256 over the concatenated bytes of q_lift, c_kv and idx, in that order.
+PARENT_INPUT_SHA256 = \
+    "14c0e3999b8b4302b6d7fc5b11165973fae8eb9093dafcbd4ffc922537b47a74"
+#: sha256 over `out.contiguous().numpy().tobytes()`.
+PARENT_OUTPUT_SHA256 = \
+    "55f503127262cb670fa78fda69f905a2aceea176cc8928db34b969b20c1d67b2"
+
+#: Which row carries which sentinel pattern, fixed so every item and the transcript name
+#: the same rows. Rows past the fifth are left clean.
+ROW_LEADING_RUN = 0
+ROW_TRAILING_RUN = 1
+ROW_INTERIOR_COLUMN = 2
+ROW_WHOLLY_SENTINEL = 3
+ROW_ONE_VALID_COLUMN = 4
+
+
+def sow_sentinels(idx):
+    """Doctor a clean index tensor into the declared row layout; return the kept column.
+
+    The kept cache row of `ROW_ONE_VALID_COLUMN` is returned because that row's control
+    has to know which cache row it should read back.
+    """
+    topk = int(idx.shape[1])
+    run = max(1, topk // 8)
+    idx[ROW_LEADING_RUN, 0:run] = MS.SENTINEL_INDEX
+    idx[ROW_TRAILING_RUN, topk - run:topk] = MS.SENTINEL_INDEX
+    idx[ROW_INTERIOR_COLUMN, topk // 2] = MS.SENTINEL_INDEX
+    idx[ROW_WHOLLY_SENTINEL, :] = MS.SENTINEL_INDEX
+    live = topk // 3
+    kept = int(idx[ROW_ONE_VALID_COLUMN, live])
+    idx[ROW_ONE_VALID_COLUMN, :] = MS.SENTINEL_INDEX
+    idx[ROW_ONE_VALID_COLUMN, live] = kept
+    return kept
+
+
+def sentinel_reference(q_lift, c_kv, idx, softmax_scale):
+    """float64 reference over each row's LIVE columns only, sentinel columns DROPPED.
+
+    Independently written in the spirit of `sparse_mla_torch_reference` above, and
+    deliberately unlike the kernel in the one way that matters: the sentinel columns are
+    REMOVED from the tensors rather than weighted to zero. A kernel leaking a small weight
+    onto a masked column could hide behind a zero multiply; it cannot hide behind a column
+    that is not in this computation at all. A row with no live column contributes exact
+    zeros, which is upstream's own rule for a wholly-empty row.
+    """
+    q = q_lift.to(torch.float64)
+    cache = c_kv.to(torch.float64)
+    rows = idx.to(torch.int64)
+    out = []
+    for s in range(q.shape[0]):
+        live = rows[s][rows[s] >= 0]
+        if int(live.numel()) == 0:
+            out.append(torch.zeros(q.shape[1], q.shape[2], dtype=torch.float64))
+            continue
+        gathered = cache[live]                                     # [live, L]
+        scores = torch.einsum("hl,kl->hk", q[s], gathered) * softmax_scale
+        shifted = scores - scores.max(dim=-1, keepdim=True).values
+        expd = torch.exp(shifted)
+        weights = expd / expd.sum(dim=-1, keepdim=True)
+        out.append(torch.einsum("hk,kl->hl", weights, gathered))
+    return torch.stack(out).to(torch.float32)
+
+
+def attending_reference(q_lift, c_kv, idx, softmax_scale):
+    """THE CONTROL REFERENCE: the sentinel ATTENDED as cache row 0 rather than masked.
+
+    Which is what this file's landed reference already computes once the index is clamped
+    -- so the control is the untouched `sparse_mla_torch_reference` fed a clamped index,
+    and it is exactly the wrong answer the mask exists to avoid.
+    """
+    return sparse_mla_torch_reference(q_lift, c_kv, idx.clamp(min=0), softmax_scale)
+
+
+def run_sentinel_case(tag: str, case: dict, seed: int, expect: tuple):
+    """The scaffold the five kernel items share: build, gate, dispatch, count.
+
+    Returns `(got, q_lift, c_kv, idx, scale, kept)`. Each item then asserts its OWN
+    subject; nothing about a conjunct is decided in here.
+    """
+    q_lift, c_kv, idx, q_pe, k_pe = make_case(**case, seed=seed)
+    assert q_pe is None and k_pe is None, "every sentinel shape is at R == 0"
+    kept = sow_sentinels(idx)
+    scale = case_scale(case)
+    say(f"{tag}_SHAPE " + " ".join(f"{k}={v}" for k, v in case.items()))
+    say(f"{tag}_TOLERANCE rtol={RTOL} atol={ATOL} (quoted from this file, not authored)")
+    say(f"{tag}_SENTINEL_COLUMNS={int((idx < 0).sum())}/{idx.numel()} "
+        f"ROWS_WITH_ANY={int((idx < 0).any(dim=1).sum())}/{idx.shape[0]} "
+        f"WHOLLY_SENTINEL_ROWS={int((idx < 0).all(dim=1).sum())}")
+    gate = MS.can_run_mla_sparse_attention(
+        q_lift, case["seq"], case["heads"], case["latent"], case["rope"],
+        case["topk"], case["s_kv"], scale,
+    )
+    say(f"{tag}_CAN_RUN_KERNEL={gate}")
+    assert gate, (
+        "can_run_mla_sparse_attention read False, so no dispatch reading below would mean "
+        "anything. Under the Tier N harness this means NKI_SIMULATOR=1 is unset"
+    )
+    reset_all_counters()
+    got = MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    counters = all_counters()
+    # D13 form R-1, printed BEFORE any numeric comparison so a mutated kernel still
+    # leaves these lines in the transcript.
+    say(f"{tag}_COUNTERS={counters} (seam_nki, seam_fb, tiled, tiled_fb, row, row_fb)")
+    assert counters == expect, f"got {counters}, expected {expect}"
+    assert tuple(got.shape) == (case["seq"], case["heads"], case["latent"]), (
+        f"kernel returned {tuple(got.shape)}"
+    )
+    assert bool(torch.isfinite(got).all()), (
+        "the result holds a non-finite value -- what a sentinel column reaching the "
+        "softmax as a NaN, or a tile the kernel never wrote, looks like"
+    )
+    return got, q_lift, c_kv, idx, scale, kept
+
+
+def assert_agrees_over_live_columns(tag, got, q_lift, c_kv, idx, scale) -> None:
+    """The agreement AND its control, for the KERNEL and for the shipped ORACLE.
+
+    Both halves read against the same `sentinel_reference` on the same inputs, and both
+    are required to DISAGREE with `attending_reference`. The oracle half exists because
+    the oracle carries this increment's sentinel semantics in its own four lines -- the
+    keep mask, the clamp, the masked_fill and the nan_to_num -- and every other item that
+    calls the oracle runs sentinel-FREE inputs, so without this those four lines would be
+    shipped code that no reading in this file ever executes.
+    """
+    attending = attending_reference(q_lift, c_kv, idx, scale)
+    ref = sentinel_reference(q_lift, c_kv, idx, scale)
+    err = float((got - ref).abs().max())
+    say(f"{tag}_MAXABS_VS_LIVE_COLUMN_REFERENCE={err:.3e}")
+    torch.testing.assert_close(got, ref, rtol=RTOL, atol=ATOL)
+    wrong = float((got - attending).abs().max())
+    say(f"{tag}_CONTROL_SENTINEL_ATTENDED_AS_ROW_0={wrong:.3e} (must exceed atol={ATOL}) "
+        f"FIRES={int(wrong > ATOL)}")
+    assert wrong > ATOL, (
+        f"the reference that ATTENDS the sentinel agrees with the kernel to {wrong:.3e}, "
+        f"so this item cannot see whether the sentinel was masked at all"
+    )
+    # THE SHIPPED ORACLE, on the SAME sentinel inputs. Not a second opinion on the kernel:
+    # this is the only reading in this file that drives the oracle's own sentinel branch.
+    oracle = MS.mla_sparse_attention_torch_oracle(q_lift, c_kv, idx, scale)
+    o_err = float((oracle - ref).abs().max())
+    say(f"{tag}_ORACLE_MAXABS_VS_LIVE_COLUMN_REFERENCE={o_err:.3e}")
+    torch.testing.assert_close(oracle, ref, rtol=RTOL, atol=ATOL)
+    o_wrong = float((oracle - attending).abs().max())
+    say(f"{tag}_ORACLE_CONTROL_SENTINEL_ATTENDED_AS_ROW_0={o_wrong:.3e} "
+        f"(must exceed atol={ATOL}) FIRES={int(o_wrong > ATOL)}")
+    assert o_wrong > ATOL, (
+        f"the reference that ATTENDS the sentinel agrees with the ORACLE to {o_wrong:.3e}, "
+        f"so the reading above cannot see whether the oracle masked the sentinel. An "
+        f"oracle that dropped its clamp would attend cache row -1 as the LAST row, which "
+        f"is a different wrong answer from this control's row 0 -- report it, and never "
+        f"widen the tolerance to absorb either"
+    )
+
+
+def assert_empty_row_is_exactly_zero(tag, got) -> None:
+    """The counted zero AND its firing control, both in the same call."""
+    empty = float(got[ROW_WHOLLY_SENTINEL].abs().max())
+    say(f"{tag}_WHOLLY_SENTINEL_ROW={ROW_WHOLLY_SENTINEL} MAXABS={empty!r} "
+        f"(must be exactly 0.0)")
+    assert empty == 0.0, (
+        f"a row whose every selected column is the sentinel must read exact zeros; got "
+        f"{empty!r}. A NaN here would be the divide-by-zero this design avoids by leaving "
+        f"the denominator at its unmasked value"
+    )
+    live = float(got[ROW_ONE_VALID_COLUMN].abs().max())
+    say(f"{tag}_CONTROL_ONE_LIVE_COLUMN_ROW={ROW_ONE_VALID_COLUMN} MAXABS={live:.3e} "
+        f"FIRES={int(live != 0.0)}")
+    assert live != 0.0, (
+        "the one-live-column row read zero too, so the zero above is a property of the "
+        "whole call and not of the empty row"
+    )
+
+
+def test_sentinel_rows_agree_with_the_reference_over_live_columns_only() -> None:
+    """SENTINEL 1 of 6 -- a masked column moves nothing.
+
+    CERTIFYING COMPONENT: the in-kernel mask in `_attention_body`, through the
+    `MS.mla_sparse_attention` seam and `mla_sparse_attention_nope_kernel`.
+
+    THE CONTROL IS THE ITEM. A reference could agree with the kernel because both attend
+    the sentinel identically, so the agreement is read beside a reference that ATTENDS the
+    sentinel as cache row 0 and is required to disagree outside this file's tolerance.
+    """
+    say("S1_CERTIFYING_COMPONENT=the in-kernel sentinel mask in _attention_body via the "
+        "mla_sparse_attention seam in vllm_neuron/functional/attention/mla_sparse.py")
+    got, q_lift, c_kv, idx, scale, _ = run_sentinel_case(
+        "S1", dict(SENTINEL_UNTILED), 98, (1, 0, 0, 0, 0, 0))
+    assert_agrees_over_live_columns("S1", got, q_lift, c_kv, idx, scale)
+    say("S1_AGREED=1/1")
+
+
+def test_sentinel_a_wholly_sentinel_row_reads_exactly_zeros() -> None:
+    """SENTINEL 2 of 6 -- a row that selects nothing produces nothing.
+
+    CERTIFYING COMPONENT: the multiplicative half of the mask -- the step that makes a
+    masked column's probability EXACTLY zero rather than merely small.
+
+    Beyond the shared zero-and-control reading, this item pins the control's VALUE: the
+    row with one live column must read that cache row back, which is what says the mask
+    kept the right column rather than merely kept one.
+    """
+    say("S2_CERTIFYING_COMPONENT=the exact-zero (multiplicative) half of the in-kernel "
+        "sentinel mask in _attention_body")
+    case = dict(SENTINEL_UNTILED)
+    got, _, c_kv, _, _, kept = run_sentinel_case("S2", case, 198, (1, 0, 0, 0, 0, 0))
+    assert_empty_row_is_exactly_zero("S2", got)
+    expected = c_kv[kept].to(torch.float32).expand(case["heads"], case["latent"])
+    err = float((got[ROW_ONE_VALID_COLUMN] - expected).abs().max())
+    say(f"S2_ONE_LIVE_COLUMN_ROW_READS_CACHE_ROW={kept} ERR={err:.3e}")
+    torch.testing.assert_close(got[ROW_ONE_VALID_COLUMN], expected, rtol=RTOL, atol=ATOL)
+
+
+def test_sentinel_the_gate_admits_minus_one_and_still_refuses_below_it() -> None:
+    """SENTINEL 3 of 6 -- the refusal narrows by exactly one value.
+
+    CERTIFYING COMPONENT: the seam's lower-bound clause. `-1` is the producer's sentinel
+    and is admitted; `-2` is still nothing at all and is still refused; the upper bound
+    does not move. Both refusals are read by their MESSAGE and not only by their type,
+    because the type alone cannot tell a lower-bound refusal from an upper-bound one.
+    """
+    say("S3_CERTIFYING_COMPONENT=the lower-bound clause of mla_sparse_attention's "
+        "selected-row range refusal")
+    say(f"S3_SENTINEL_INDEX={MS.SENTINEL_INDEX}")
+    case = dict(SENTINEL_UNTILED)
+    got, q_lift, c_kv, idx, scale, _ = run_sentinel_case(
+        "S3", case, 398, (1, 0, 0, 0, 0, 0))
+    assert int(idx.min()) == MS.SENTINEL_INDEX, "this reading needs a -1 in the input"
+    say(f"S3_MINUS_ONE_ADMITTED=1 SHAPE={tuple(got.shape)}")
+
+    below = idx.clone()
+    below[0, 0] = MS.SENTINEL_INDEX - 1
+    with pytest.raises(MS.MlaSparseAttentionError) as low:
+        MS.mla_sparse_attention(q_lift, c_kv, below, scale)
+    say(f"S3_MINUS_TWO_REFUSED_MESSAGE={str(low.value)!r}")
+    assert str(MS.SENTINEL_INDEX) in str(low.value), (
+        "the refusal must name the sentinel it admits, so a reader can tell which "
+        "negative values are and are not selected rows"
+    )
+    assert f"[{MS.SENTINEL_INDEX - 1}," in str(low.value), (
+        "the refusal must name the offending range it read"
+    )
+
+    above = idx.clone()
+    above[0, 0] = case["s_kv"]
+    with pytest.raises(MS.MlaSparseAttentionError) as high:
+        MS.mla_sparse_attention(q_lift, c_kv, above, scale)
+    say(f"S3_S_KV_REFUSED_MESSAGE={str(high.value)!r}")
+    assert f"s_kv={case['s_kv']}" in str(high.value)
+    say("S3_REFUSALS=2/2 ADMISSIONS=1/1")
+
+
+def test_sentinel_free_inputs_are_bit_identical_to_the_parent_kernel() -> None:
+    """SENTINEL 4 of 6 -- with no sentinel present, nothing moved.
+
+    CERTIFYING COMPONENT: that both masking steps are EXACT IDENTITIES when no column is
+    the sentinel -- ``x + 0.0`` and ``x * 1.0`` in fp32 -- so this is a bit-identity claim
+    and not a tolerance.
+
+    THE INSTRUMENT IS DISCLOSED. The parent body does not exist in this checkout, so the
+    parent's reading is COMMITTED as the two digests above -- input and output -- produced by
+    `probe-098-parent-ref-r3.py` in a checkout at PARENT_COMMIT. There is one path and no
+    skip: the item rebuilds the inputs here with this file's own `make_case`, checks their
+    digest against the parent's so the two sides cannot drift, and then checks the output
+    digest. It also requires the RUNNING module to differ from the recorded parent module, so
+    the comparison cannot quietly become this checkout against itself.
+
+    WHY DIGESTS RATHER THAN A MAX-ABS DIFFERENCE. Equal digests mean equal bytes, which is
+    exactly the bit-identity claim. The cost is that a mismatch cannot report HOW far it
+    moved, so the failure message says where to get that number.
+
+    A MISMATCH HERE CONTRADICTS THE DESIGN. It is reported, never loosened.
+    """
+    here = hashlib.sha256(module_source().encode()).hexdigest()
+    say(f"S4_PARENT_COMMIT={PARENT_COMMIT}")
+    say(f"S4_PARENT_MODULE_SHA256={PARENT_MODULE_SHA256}")
+    say(f"S4_THIS_MODULE_SHA256={here}")
+    say(f"S4_PARENT_IS_A_DIFFERENT_MODULE={int(PARENT_MODULE_SHA256 != here)}")
+    assert PARENT_MODULE_SHA256 != here, (
+        "the committed parent digest is THIS module's digest, so the reading was taken in "
+        "this checkout and not at the parent -- the comparison would be against itself"
+    )
+
+    case = dict(SENTINEL_UNTILED)
+    say("S4_SHAPE " + " ".join(f"{k}={v}" for k, v in case.items()))
+    say(f"S4_SEED={PARENT_REF_SEED}")
+    q_lift, c_kv, idx, q_pe, k_pe = make_case(**case, seed=PARENT_REF_SEED)
+    assert q_pe is None and k_pe is None, "the declared shape is at rope = 0"
+    scale = case_scale(case)
+
+    say(f"S4_SENTINEL_COLUMNS_IN_THESE_INPUTS={int((idx < 0).sum())} (must be 0)")
+    assert int((idx < 0).sum()) == 0, "this item's whole subject is inputs with NO sentinel"
+
+    in_sha = hashlib.sha256(b"".join(
+        t.contiguous().numpy().tobytes() for t in (q_lift, c_kv, idx))).hexdigest()
+    say(f"S4_INPUT_SHA256={in_sha}")
+    say(f"S4_INPUTS_MATCH_THE_PARENT_RUN={int(in_sha == PARENT_INPUT_SHA256)}")
+    assert in_sha == PARENT_INPUT_SHA256, (
+        f"the inputs rebuilt here are not the bytes the parent kernel was measured on: got "
+        f"{in_sha}, committed {PARENT_INPUT_SHA256}. `make_case` or `case_scale` has changed, "
+        f"so the output comparison below would be meaningless. Fix the builder or retake the "
+        f"parent reading -- do NOT update this digest to whatever the builder now produces"
+    )
+
+    reset_all_counters()
+    got = MS.mla_sparse_attention(q_lift, c_kv, idx, scale)
+    counters = all_counters()
+    say(f"S4_COUNTERS={counters}")
+    assert counters == (1, 0, 0, 0, 0, 0), f"got {counters}"
+
+    out_sha = hashlib.sha256(got.contiguous().numpy().tobytes()).hexdigest()
+    say(f"S4_OUTPUT_SHA256={out_sha}")
+    say(f"S4_BITWISE_EQUAL_TO_THE_PARENT_KERNEL={int(out_sha == PARENT_OUTPUT_SHA256)}")
+    assert out_sha == PARENT_OUTPUT_SHA256, (
+        f"the sentinel-free path is NOT bit-identical to the parent kernel: got {out_sha}, "
+        f"committed {PARENT_OUTPUT_SHA256}. Both masking steps are exact identities when no "
+        f"column is the sentinel (x + 0.0 and x * 1.0 in fp32), so this contradicts the "
+        f"design. Report it; never loosen it into a tolerance. For the max-abs difference, "
+        f"run increments/probe-098-parent-ref-r3.py in a checkout at {PARENT_COMMIT} and "
+        f"diff against this body's output"
+    )
+
+
+def test_sentinel_the_row_tiled_body_masks_across_its_score_tiles() -> None:
+    """SENTINEL 5 of 6 -- the same two readings on the ROW-TILED body.
+
+    CERTIFYING COMPONENT: the mask inside `_attention_body_row_tiled`, and the claim that
+    the carried-softmax MERGE needs no sentinel special case.
+
+    This body is the one production decode takes at `topk = 2,048`, so a mask that worked
+    only in the untiled body would be a mask production never runs. The shape splits into
+    two score tiles and the doctored rows put sentinels in BOTH -- a leading run in tile
+    one, a trailing run in tile two -- with one row wholly sentinel across both.
+    """
+    say("S5_CERTIFYING_COMPONENT=the in-kernel sentinel mask in "
+        "_attention_body_row_tiled, merge included")
+    case = dict(SENTINEL_ROW_TILED)
+    say(f"S5_SCORE_TILES={MS._score_tiles(case['topk'])}")
+    got, q_lift, c_kv, idx, scale, _ = run_sentinel_case(
+        "S5", case, 598, (1, 0, 0, 0, 1, 0))
+    assert_agrees_over_live_columns("S5", got, q_lift, c_kv, idx, scale)
+    assert_empty_row_is_exactly_zero("S5", got)
+
+
+def test_sentinel_the_tiled_latent_body_masks_on_its_ragged_tail() -> None:
+    """SENTINEL 6 of 6 -- the same two readings on the TILED-LATENT body.
+
+    CERTIFYING COMPONENT: the mask inside `_attention_body_tiled`. The mask is a fact
+    about the selected-row axis and this body tiles the LATENT axis, so what this reading
+    adds is that the two tilings do not interfere -- the ragged 3-wide tail included.
+    """
+    say("S6_CERTIFYING_COMPONENT=the in-kernel sentinel mask in _attention_body_tiled")
+    case = dict(SENTINEL_TILED)
+    say(f"S6_LATENT_TILES={MS._latent_tiles(case['latent'])} "
+        f"OUTPUT_TILES={MS._output_tiles(case['latent'])}")
+    got, q_lift, c_kv, idx, scale, _ = run_sentinel_case(
+        "S6", case, 698, (1, 0, 1, 0, 0, 0))
+    assert_agrees_over_live_columns("S6", got, q_lift, c_kv, idx, scale)
+    assert_empty_row_is_exactly_zero("S6", got)
