@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Acceptance test for ``inc-glm53f-056`` -- WP10: vision config and preprocessing.
 
-The declared acceptance (increment plan revision 232, design-entry ruling ``design-20260905-aq`` (iv)),
+The declared acceptance (increment plan revision 245, design-entry ruling ``design-20260905-aq`` (iv)),
 in its own words:
+
+WHAT THE REVISION CITE MEANS. It names the plan revision these tests were DERIVED AGAINST -- the revision
+current when the run that last changed them started. It is not a claim that the plan has not moved since, and
+it is not a version of this file. It is refreshed on any lap that touches this file, so a reader comparing the
+tests to the plan knows which plan text to open. The acceptance quoted below is the ruling's own wording and
+does not move with the cite.
 
     3/3 image sizes -- the bridge's ``image_grid_thw`` and ``pixel_values`` row count equal BOTH the HF
     processor called directly as the oracle AND the closed form stated in the predictions: regime A (plain)
@@ -778,23 +784,86 @@ def test_m06_the_bridge_token_count_equals_the_processors_own_grid(bridge, image
         assert info.get_num_image_tokens(image_width=width, image_height=height) == expected, name
 
 
-def test_m07_the_profiling_size_is_the_largest_that_fits_and_the_next_step_does_not(bridge):
-    """``get_image_size_with_most_features`` bounded from BOTH sides, so an off-by-one either way fails.
+def test_m07_the_profiling_size_reaches_the_token_ceiling_and_is_not_a_square(bridge, image_oracle):
+    """``get_image_size_with_most_features`` must reach the token ceiling EXACTLY, measured on the processor.
 
-    vLLM profiles memory with this size. Too small and the server under-reserves and can be killed under load;
-    too large and it over-reserves and refuses requests it could have served.
+    vLLM profiles memory with this size and then refuses any request needing more tokens than the profiled run
+    reserved for. A size that falls short therefore does not merely waste a little memory: the server rejects
+    requests it has the capacity to serve.
+
+    WHAT CHANGED AND WHY. The earlier version of this test asserted the size was SQUARE. That cannot be right.
+    The ceiling bounds the token grid's AREA, and a square grid's area is a perfect square, so a ceiling that is
+    not one is unreachable by any square whatsoever -- at this pin the ceiling is 8000, the best square is 89 by
+    89, and 79 tokens were simply unreachable. The squareness assertion is gone and NO SHAPE RULE replaces it.
+    The shape is whatever reaching the ceiling requires. Pinning a shape here is how the defect got in.
+
+    EVERY READING COMES FROM THE PROCESSOR, AND THE TWO SIDES ARE INDEPENDENT. The expected values below are
+    read off ``image_oracle``'s own attributes and its own ``image_grid_thw``; the answer under test comes from
+    the fork. Neither side is derived from the other, so they can disagree.
+
+    THE MESSAGES ARE PREFIXED WITH SHORT KEYS on purpose. The mutation battery gates each planted mutation on
+    the SPECIFIC assertion it is supposed to redden, not merely on the test going red for some reason, and it
+    needs a stable string to look for. Reading a key in a transcript is the difference between a control that
+    fired and a control that fired for the reason claimed.
+
+    COST. Three real-pixel runs, the largest 2240x2800. The regime-C case this suite already resamples is
+    2800x2800, so nothing here is newly expensive.
     """
     info, _processor = bridge
     consts = info.get_grid_constants()
-    size = info.get_image_size_with_most_features()
     frames = consts.temporal_patch_size
+    merge_length = image_oracle.merge_size**2
+    ceiling_tokens = image_oracle.max_image_tokens
+    patch = image_oracle.patch_size
 
-    assert frames * size.height * size.width <= consts.ceiling_pixels
+    size = info.get_image_size_with_most_features()
+
+    def grid_of(height, width):
+        return tuple(int(v) for v in _run_image_oracle(image_oracle, height, width)["image_grid_thw"][0])
+
+    def grid_the_size_implies(height, width):
+        return (1, height // patch, width // patch)
+
+    # MAXIMALITY. The one assertion the pre-fix square search cannot satisfy: it returned 7921 tokens against a
+    # ceiling of 8000. Read off the processor's own grid rather than any arithmetic in this repository.
+    grid = grid_of(size.height, size.width)
+    assert (grid[0] * grid[1] * grid[2]) // merge_length == ceiling_tokens, (
+        f"m07 maximality: the profiling size reaches {(grid[0] * grid[1] * grid[2]) // merge_length} tokens "
+        f"but the ceiling admits {ceiling_tokens}, so the server would refuse requests it could serve"
+    )
+
+    # And the fork's own counter, which is what vLLM budgets against, reads the same ceiling.
+    assert info.get_num_image_tokens(image_width=size.width, image_height=size.height) == ceiling_tokens, (
+        "m07 fork counter: the bridge's own token count for the profiling size disagrees with the ceiling"
+    )
+
+    # THE EQUALITY BOUNDARY, AS AN ACCEPTED-AND-CUT PAIR. This size's pixel budget lands exactly ON the ceiling,
+    # and the processor cuts only when the budget is STRICTLY greater. So the size must come back as the canvas
+    # it declared, and the next legal step must come back cut. Compared as GRIDS, never as token counts: one
+    # step wider is cut back to this very canvas, so its token count is the ceiling too and a count comparison
+    # would pass while measuring nothing.
+    assert grid == grid_the_size_implies(size.height, size.width), (
+        f"m07 accepted at the boundary: the processor returned {grid} for a size implying "
+        f"{grid_the_size_implies(size.height, size.width)}, so the profiled canvas is not the declared one"
+    )
+    wider = size.width + consts.factor
+    assert grid_of(size.height, wider) != grid_the_size_implies(size.height, wider), (
+        "m07 one step wider is cut: the step past the profiling size was accepted whole, so the size below it "
+        "is not at the ceiling's boundary"
+    )
+
+    # The inherited bounds and the alignment, unchanged. Both are algebraically implied by maximality at this
+    # pin, because patch_expand_factor is 1 there and that makes factor equal the token unit, which in turn
+    # makes the pixel budget a fixed multiple of the token count. They are kept because that coincidence is a
+    # property of the pinned checkpoint and not of this code: on a checkpoint where the expand factor is not 1
+    # the pixel bound carries something the token bound does not.
+    assert frames * size.height * size.width <= consts.ceiling_pixels, (
+        "m07 within the ceiling: the profiling size is over the pixel budget"
+    )
     assert (
         frames * (size.height + consts.factor) * (size.width + consts.factor) > consts.ceiling_pixels
     ), "one more alignment step still fits, so this is not the largest size"
     assert size.height % consts.factor == 0 and size.width % consts.factor == 0
-    assert size.height == size.width
 
 
 def test_m08_the_placeholder_replacement_is_the_items_own_token_count(bridge, image_oracle):

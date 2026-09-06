@@ -446,6 +446,22 @@ def build_mm_fields_config(
     )
 
 
+def closest_factor_pair(count: int) -> tuple[int, int]:
+    """Split ``count`` into the two whole factors nearest each other, shorter side first.
+
+    Used to turn a token budget into a token grid. Walking down from the integer square root returns the
+    first divisor at or below it, which is the closest-to-square pair by construction, so the caller gets the
+    least elongated rectangle of that exact area without searching for it.
+
+    A prime ``count`` has only ``(1, count)``, and that is returned rather than smoothed over. The caller is
+    what decides whether such a shape is acceptable.
+    """
+    for divisor in range(math.isqrt(count), 0, -1):
+        if count % divisor == 0:
+            return divisor, count // divisor
+    return 1, count
+
+
 class Glm5NextProcessingInfo(BaseProcessingInfo):
     """What vLLM asks about this checkpoint's multimodal inputs before it processes any."""
 
@@ -483,17 +499,80 @@ class Glm5NextProcessingInfo(BaseProcessingInfo):
         return image_grid_spec(consts, image_height, image_width).num_merged_tokens
 
     def get_image_size_with_most_features(self) -> ImageSize:
-        """The largest square input that still fits under the token ceiling.
+        """The input that reaches the most placeholder tokens the ceiling admits. It is not a square.
 
-        Derived by stepping up in canvas-alignment units until the next step would exceed the budget, so it
-        follows the checkpoint's own constants rather than a remembered number.
+        vLLM profiles memory with this size and then REFUSES any request that needs more tokens than the
+        profiled run reserved for. So a size that falls short does not merely waste a little memory: it makes
+        the server reject requests it has the capacity to serve.
+
+        WHY A SQUARE CANNOT BE THE ANSWER. The token ceiling limits the AREA of the token grid, and a square
+        grid can only have an area that is a perfect square. This checkpoint's ceiling is 8000 tokens, and
+        8000 is not one -- the best square is 89x89, which is 7921, so 79 tokens are unreachable by any
+        square whatsoever. Stepping the side up more finely does not help, because the shape is the limit and
+        not the step. vLLM's own ``qwen2_vl`` says the same thing in its own words and for the same reason,
+        and the repair follows its shape: factorize the ceiling into a height and a width directly.
+
+        WHAT IS DERIVED AND WHAT IS NOT. Nothing here is a remembered number. The token unit is
+        ``patch_size * merge_size``, the pixel side of ONE merged token, which is NOT ``factor``: factor is
+        the canvas alignment and equals the token unit times ``patch_expand_factor``. They coincide on this
+        checkpoint because that expand factor is 1, and conflating them would be right here and wrong on the
+        next checkpoint. Each token factor must therefore be a whole number of expand units, or the pixel
+        size is not factor-aligned and the processor hands back a different canvas than the one asked for.
+
+        THE SUITABILITY TEST IS NOT qwen2's. That model's helper rejects aspect ratios above 200 and raises,
+        which is what makes its step-down safe. This checkpoint's ``smart_resize`` has no ratio guard at all
+        -- measured on the transformers source, zero ratio constants and one raise that is about a budget too
+        small for a single patch. Porting the 200 would import a constraint this processor does not have. So
+        suitability is two predicates, and they are of DIFFERENT KINDS:
+
+        * MEASURED. The fork's own token counter, driven through the real processor, reads exactly the target
+          for the candidate. One call settles the round trip too: a canvas the processor would shrink or pad
+          comes back with a different count. This one is not negotiable -- it is what makes the answer true.
+        * CHOSEN. Neither side is thinner than ``isqrt(min_image_tokens)`` token units. THE CONFIG DOES NOT
+          FORCE THIS, and an earlier draft of this docstring wrongly said it did. ``min_image_tokens``
+          constrains the token TOTAL, not either side: a one-by-sixteen token canvas meets it exactly with a
+          shorter side of one, and the processor hands that canvas back unchanged. The processor's real
+          per-side minimum is ONE token unit, measured over a sweep of extreme inputs.
+
+        WHY THE CHOSEN BOUND IS KEPT ANYWAY, AND WHAT IT COSTS. This size is not only a number: the dummy
+        inputs builder synthesises a REAL IMAGE at it for the profiling run. Without the bound, a ceiling whose
+        closest pair is degenerate -- any prime -- profiles on a strip one token tall and thousands wide, a
+        shape no request resembles and a plausible source of a failure other than the one being profiled. The
+        bound costs at most a token or two of the ceiling, because the search steps down one count at a time
+        and a short run of consecutive counts contains one with a divisor at or above the floor. It is INERT on
+        this checkpoint: the first candidate's shorter side is 80 token units, far above the floor either way.
+        The number is computed from the config so it tracks a checkpoint with different constants rather than
+        being frozen at four -- but read it as a bound someone chose. On a checkpoint where the exact ceiling
+        matters more than the profiling image's shape, lower it to one and take the degenerate pair knowingly.
+
+        If no pair at the ceiling passes, the target steps down and the search repeats, which is qwen2's
+        recovery. On this checkpoint the first candidate passes and no step-down occurs.
         """
         consts = self.get_grid_constants()
-        aligned_frames = consts.temporal_patch_size
-        side = consts.factor
-        while aligned_frames * (side + consts.factor) ** 2 <= consts.ceiling_pixels:
-            side += consts.factor
-        return ImageSize(width=side, height=side)
+        token_unit = consts.patch_size * consts.merge_size
+        expand_step = consts.patch_expand_factor
+        # Named for what it is: a bound chosen here, computed from the config but not demanded by it. See the
+        # docstring for the cost of keeping it and the condition under which a future port should drop it.
+        chosen_min_side_tokens = math.isqrt(consts.min_image_tokens)
+
+        for target_tokens in range(consts.max_image_tokens, 0, -1):
+            height_factor, width_factor = closest_factor_pair(target_tokens)
+            if height_factor % expand_step or width_factor % expand_step:
+                continue
+            if height_factor < chosen_min_side_tokens:
+                continue
+            height = token_unit * height_factor
+            width = token_unit * width_factor
+            if self.get_num_image_tokens(image_width=width, image_height=height) != target_tokens:
+                continue
+            return ImageSize(width=width, height=height)
+
+        raise RuntimeError(
+            "no aligned image size reaches any token count at or below "
+            f"max_image_tokens={consts.max_image_tokens} for this processor. The search covers every count "
+            "down to one, so reaching this line means the grid constants are inconsistent -- report them "
+            "rather than widening the search."
+        )
 
 
 class Glm5NextDummyInputsBuilder(BaseDummyInputsBuilder[Glm5NextProcessingInfo]):
