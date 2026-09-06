@@ -1117,60 +1117,85 @@ def test_a_false_compress_dial_is_refused_by_name_before_anything_dispatches(
     assert "glm5_next.py:118-126" in message, "and cite the upstream refusal it mirrors"
 
 
-@pytest.mark.parametrize("method", ENTRY_METHODS)
-def test_a_sequence_too_short_to_select_is_refused_by_name_and_routed_to_099(
-    method: str,
-) -> None:
-    """F10's refusal: below the selection bound the indexer refuses instead of clamping ``k``.
-
-    The bound is ``candidates > select_k()``, and it is strict for a reason worth the test:
-    ``dsa_topk_select``'s gate is ``0 < k < width`` and it RETURNS FALSE rather than raising
-    (``topk_select.py:294``), so serving ``k == width`` would silently take the torch route
-    and break the standing torch-fallback-reads-zero check on a case that looked like a pass.
-    Upstream bypasses selection entirely in this regime
-    (``sparse_attn_indexer_kpool.py:203-217``); that route is ``inc-glm53f-099``'s, so this
-    refusal NAMES it rather than half-implementing it.
-
-    ``max_seq_len`` here is ``REFUSED_SEQ_LEN``, which yields exactly ``select_k()``
-    candidates -- one short of the strict bound. That is the interesting value: a clamp would
-    pass here, and a non-strict bound would too.
-    """
-    indexer = _bare_indexer()
-    select_k = int(indexer.select_k())
-    assert select_k == TOPK_POOLS, (select_k, TOPK_POOLS)
-    # The refused length is DERIVED from the bound rather than typed, so a config change moves
-    # the case instead of silently making it pass.
-    refused_seq_len = select_k * POOL_SIZE
-    assert refused_seq_len // POOL_SIZE == select_k
-    assert PREFILL_TOKENS // POOL_SIZE > select_k, (
-        "the counted case must sit ABOVE the bound, or every counted run would refuse"
-    )
-    message = _refuses(method, indexer, max_seq_len=refused_seq_len)
-    say("refusal", method, "F10", refused_seq_len, message.split(".")[0])
-    assert "inc-glm53f-099" in message, "the refusal must name the increment that owns the route"
-    assert "topk_select.py:294" in message, "and cite the gate that returns False rather than raising"
-    assert str(select_k) in message and str(refused_seq_len) in message
+# THE F10 LENGTH REFUSAL RETIRED HERE AT ``inc-glm53f-099``, and its two items retired with it.
+#
+# What stood here was ``test_a_sequence_too_short_to_select_is_refused_by_name_and_routed_to_099``,
+# parametrised over both entry points, asserting that below the strict selection bound the indexer
+# REFUSES by name rather than clamping ``k``. The refusal named ``inc-glm53f-099`` as the route it
+# was standing in for. That route is now built, so there is nothing left to refuse and no test can
+# assert a refusal that no longer exists. The two items are replaced by the three SERVED-regime
+# items in the bypass section at the end of this file, and the guarantee they protected --
+# ``dsa_topk_select`` never sees ``k == width`` -- is protected there instead, by reading
+# ``topk_select``'s counter as a zero on the bypass case.
+#
+# ``_refuses`` STAYS. It has a third caller, the dial item above, which is four items of
+# ``inc-glm53f-051``'s; retiring the helper would break them. Ruled at DECISIONS §97 (i) on this
+# seat's finding F1.
 
 
 def test_the_two_entry_points_refuse_in_the_SAME_order() -> None:
     """A config that breaks BOTH preconditions must report the DIAL, on both entry points.
 
     This is the extraction's real contract. ``require_dials()`` runs before
-    ``_require_serviceable()``, so a config that is both undialled and too short must name the
-    dial; if one entry point reported the length instead, the two paths would have drifted and
-    a reader could not predict which refusal a bad config produces.
+    ``_require_serviceable()``, so a config that breaks both must name the dial; if one entry
+    point reported the other fault instead, the two paths would have drifted and a reader
+    could not predict which refusal a bad config produces.
+
+    RE-POINTED AT THE TRASH-ROW REFUSAL AT ``inc-glm53f-099``, ruled at DECISIONS §97 (i) on
+    this seat's finding F2. The second fault used to be the F10 length, and that refusal is
+    gone -- so ``"inc-glm53f-099" not in message`` had become TRIVIALLY true and the item
+    would have gone on looking like an ordering test while asserting nothing. The trash-row
+    refusal (``model_fp8.py:3547-3552``) is the live replacement: it also fires inside
+    ``_require_serviceable``, it also fires before any dispatch, and its message cannot be
+    confused with the dial's.
+
+    CASE B IS CASE A's FIRING CONTROL, which is why one item carries two cases. Case A's
+    claim is an ABSENCE -- the trash-row wording must not appear -- and an absence is only a
+    reading if the same operands can produce it. Case B keeps the same undersized
+    ``pool_cache`` and repairs only the dial, and the wording appears. Without case B this
+    item would pass on an indexer that had no trash-row refusal at all.
     """
-    messages = {}
+    # ABOVE the bypass bound, so the regime still selects and the trash row is still addressed:
+    # this item is about refusal ORDER, not about the short regime.
+    long_enough = PREFILL_TOKENS
+    assert long_enough // POOL_SIZE > TOPK_POOLS, (
+        "the ordering case must sit above the strict selection bound, or the indexer would take "
+        "inc-glm53f-099's bypass and never reach the trash-row check at all"
+    )
+    # Fewer pool_cache rows than there are addressable candidate pools, so `candidates > trash`.
+    starved_rows = 2
+    assert long_enough // POOL_SIZE > starved_rows - 1, (
+        f"{starved_rows} pool_cache row(s) must leave no trash row above the "
+        f"{long_enough // POOL_SIZE} candidate pool(s), or case B refuses nothing"
+    )
+    TRASH_WORDING = "leaves no trash row above"
+
     for method in ENTRY_METHODS:
-        indexer = _bare_indexer(index_kpool_compress=False)
-        messages[method] = _refuses(method, indexer, max_seq_len=TOPK_POOLS * POOL_SIZE)
-    for method, message in messages.items():
-        say("order", method, message.split(";")[0])
-        assert "index_kpool_compress" in message
-        assert "inc-glm53f-099" not in message, (
-            "the dial must be reported first: it is the cheaper, earlier and more likely "
-            "operator error, and reporting the length would send a reader to the wrong route"
+        # CASE A: both faults present. The DIAL must be the one reported.
+        both_broken = _bare_indexer(index_kpool_compress=False)
+        message = _refuses(
+            method, both_broken, max_seq_len=long_enough, pool_rows=starved_rows
         )
+        say("order", method, "both_broken", message.split(";")[0])
+        assert "index_kpool_compress" in message
+        assert TRASH_WORDING not in message, (
+            "the dial must be reported first: it is the cheaper, earlier and more likely "
+            "operator error, and reporting the pool_cache geometry would send a reader to "
+            "resize a cache that is not the problem"
+        )
+
+        # CASE B, THE CONTROL: the dial repaired, the same starved cache. The other refusal
+        # must now appear, or case A's absence measured nothing.
+        dial_ok = _bare_indexer()
+        control = _refuses(
+            method, dial_ok, max_seq_len=long_enough, pool_rows=starved_rows
+        )
+        say("order", method, "control_dial_ok", control.split(";")[0])
+        assert TRASH_WORDING in control, (
+            f"the trash-row refusal did not fire on {starved_rows} row(s) with the dial "
+            f"repaired, so case A's absence of that wording is not a reading. Got: {control}"
+        )
+        assert "index_kpool_compress" not in control
 
 
 # =========================================================================== #
@@ -2563,4 +2588,472 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     assert seen == {torch.bfloat16}, (
         f"the pack was handed {sorted(str(d) for d in seen)}; the module admits bf16 alone "
         f"(ragged_pack.py:121) and any other dtype routes to the torch path with no other symptom"
+    )
+
+
+# =========================================================================== #
+# THE SHORT-SEQUENCE CAUSAL BYPASS -- inc-glm53f-099's dispatch half.
+#
+# WHAT THE BYPASS IS, in one sentence. When a request is short enough that selecting the top
+# select_k pools would take every candidate there is, there is nothing to select, so the indexer
+# returns the plain causal index rows instead of running the score/select/expand chain -- which is
+# what upstream does in the same regime (`sparse_attn_indexer_kpool.py:203-217`).
+#
+# WHAT USED TO BE HERE. `inc-glm53f-098` refused this regime by name and cited this increment as the
+# owner of the route. That refusal and its two items are gone; the retirement note is in the refusal
+# section above. The guarantee the refusal protected -- `dsa_topk_select` never sees `k == width`,
+# because its gate returns False rather than raising (`topk_select.py:294`) and would take the torch
+# route silently -- is protected here instead, by reading `topk_select`'s counter as a ZERO on the
+# bypass case. That is a stronger reading than the refusal gave: the refusal proved the call never
+# happened by never running at all, and this proves it never happened while the indexer ran to
+# completion and returned a correct answer.
+#
+# THE BOUNDARY IS THE CASE, not a comfortable interior value. `BYPASS_SEQ_LEN` yields EXACTLY
+# `select_k()` complete pools, which is the largest length the bypass serves. A non-strict bound
+# would select here and a clamped `k` would too, so this is the length that tells the three
+# candidate implementations apart.
+#
+# THREE ITEMS, NO parametrize, per plan section 6 rule 6 -- one item per counted conjunct. The two
+# entry points are two conjuncts because they are two code paths that can drift apart, and the
+# cross-entry-point comparison is a third because it fails for a reason neither of the first two can
+# reach: both serving the regime, differently.
+
+#: The largest length the bypass serves at this file's dials: exactly ``select_k()`` complete pools.
+#: DERIVED from the two dials rather than typed, so a dial change moves the case instead of quietly
+#: turning it into a selecting case that would pass for the wrong reason.
+BYPASS_SEQ_LEN = TOPK_POOLS * POOL_SIZE
+
+#: The five families the BYPASS DECISION governs. They must read ``(0, 0)`` on BOTH entry points.
+#: Four are the selection chain the bypass skips. ``decode_tail_update`` is here because neither
+#: case below is a decode step, so its zero is a PHASE reading rather than a bypass reading -- said
+#: plainly so a reader does not count it as evidence about selection.
+BYPASS_ZERO_FAMILIES: tuple[str, ...] = (
+    "paged_gather", "score_gemm", "topk_select", "index_expand", "decode_tail_update",
+)
+
+
+def _ref_causal_rows(seq_lens: torch.Tensor, width: int) -> torch.Tensor:
+    """The bypass's answer computed by plain torch in THIS file: row ``i`` is ``0..seq_lens[i]-1``.
+
+    Computed here rather than by calling ``dsa_causal_fill_torch_oracle``, deliberately. That oracle
+    lives in the module under test, so using it would compare the module against itself; this file's
+    ``_ref_*`` convention is that the two sides arrive by different means. Four lines of torch is
+    the whole reference, which is also the point -- a reference a reader can check by eye is worth
+    more here than a shared helper.
+    """
+    rows = int(seq_lens.shape[0])
+    columns = torch.arange(int(width), dtype=torch.int32).expand(rows, int(width))
+    positions = seq_lens.to(torch.int32).reshape(rows, 1) - 1
+    return torch.where(columns <= positions, columns, torch.full_like(columns, -1))
+
+
+def _bypass_width(indexer, pool: int) -> int:
+    """The width the bypass must emit, read from the expansion seam's own helper, with three checks.
+
+    THREE READINGS RATHER THAN ONE, the same shape the ragged arm's expansion check uses and for the
+    same reason: if ``index_expand_width`` were itself wrong, a comparison against it alone would
+    pass. So the multiple-of-``KEY_CHUNK`` arm and the not-below-raw arm are read too, with
+    ``KEY_CHUNK`` taken from the module that DEFINES it (``mla_sparse.py:111``).
+    """
+    expand_mod = _seam_module("index_expand")
+    select_k = int(indexer.select_k())
+    raw = int(expand_mod.index_expand_raw_width(select_k, pool))
+    emitted = int(expand_mod.index_expand_width(select_k, pool))
+    key_chunk = int(
+        importlib.import_module("vllm_neuron.functional.attention.mla_sparse").KEY_CHUNK
+    )
+    say("bypass", "width", emitted, "raw", raw, "key_chunk", key_chunk, "select_k", select_k)
+    assert emitted % key_chunk == 0, (
+        f"the emitted width {emitted} is not a whole multiple of KEY_CHUNK {key_chunk}, which is "
+        f"the allocation rule the sparse kernel admits"
+    )
+    assert emitted >= raw, f"the emitted width {emitted} is below the raw expansion width {raw}"
+    # THE ARITHMETIC THE BYPASS RESTS ON, read as a value rather than argued. The bypass holds only
+    # while `max_seq_len // pool <= select_k`, so the largest position it can present is
+    # `select_k * pool + pool - 2`, and that must sit strictly inside the emitted width -- otherwise
+    # some admissible length would need a clamp that nothing implements.
+    max_position = select_k * int(pool) + int(pool) - 2
+    say("bypass", "max_position", max_position, "headroom_columns", emitted - 1 - max_position)
+    assert max_position < emitted, (
+        f"the widest bypass position {max_position} does not fit inside {emitted} column(s), so "
+        f"some admissible length would write past the last column"
+    )
+    return emitted
+
+
+def _causal_fill_api():
+    """``(reset, read)`` for the bypass's own counter, discovered by the SAME rule as the seven.
+
+    ``causal_fill`` is a dsa module and follows the naming convention, so the discovery helper
+    reaches it unchanged. It is deliberately NOT folded into ``FAMILIES``: ``FAMILIES`` is the census
+    the call spy attributes against and the declared per-layer tables are written against, and
+    neither of those is about this seam.
+    """
+    return _discover_counter_api(_seam_module("causal_fill"))
+
+
+def _declared_column(table: dict[str, tuple[int, int]], column: int) -> dict[str, int]:
+    """One PHASE column of a declared table, folded onto families.
+
+    ``declared_family_totals`` sums prefill AND decode, which is right for a layer case that runs
+    both. The two cases below each run ONE phase, so each needs its own column: ``forward``'s
+    prefill leg reads column 0 of :data:`DECLARED_PER_LAYER`, and the ragged arm is a decode step so
+    it reads column 1 of :data:`DECLARED_PER_LAYER_RAGGED_ARM`. Deriving the two figures from the
+    landed tables is the whole point -- typing "2" and "1" here would make the comparison below a
+    claim about this file instead of a claim about the arms' declared design.
+    """
+    out = {family: 0 for family in FAMILIES}
+    for entry, counts in table.items():
+        out[ENTRY_POINTS[entry]] += int(counts[column])
+    return out
+
+
+def _bypass_forward_operands(cfg, *, seed: int) -> dict:
+    """Operands for ``forward``'s prefill leg at the bypass boundary. One builder, two callers."""
+    gen = torch.Generator().manual_seed(int(seed))
+    return {
+        "hidden": torch.randn(
+            BYPASS_SEQ_LEN, int(cfg.hidden_size), generator=gen, dtype=torch.float32
+        ),
+        "q_latent": torch.randn(
+            BYPASS_SEQ_LEN, int(cfg.q_lora_rank), generator=gen, dtype=torch.float32
+        ),
+        "pool_cache": torch.zeros(
+            PAGES * PAGE_SIZE, int(cfg.index_head_dim), dtype=torch.bfloat16
+        ),
+        "seq_lens": torch.arange(1, BYPASS_SEQ_LEN + 1, dtype=torch.int32),
+        "slot_mapping": prefill_slot_mapping(BYPASS_SEQ_LEN, int(cfg.index_kpool)),
+    }
+
+
+def _bypass_ragged_operands(cfg, *, seed: int) -> dict:
+    """Operands for the NON-UNIFORM ragged arm at the bypass boundary.
+
+    The arm refuses a uniform batch by name, so the two request lengths differ. It only READS the
+    pool cache and on the bypass never reads it at all, but ``_require_serviceable`` still checks the
+    cache's geometry, so it is shaped the way production shapes it.
+    """
+    lengths = [BYPASS_SEQ_LEN // 2, BYPASS_SEQ_LEN]
+    max_len = max(lengths)
+    gen = torch.Generator().manual_seed(int(seed))
+    return {
+        "hidden": torch.randn(
+            len(lengths), max_len, int(cfg.hidden_size), generator=gen, dtype=torch.float32
+        ),
+        "q_latent": torch.randn(
+            len(lengths), max_len, int(cfg.q_lora_rank), generator=gen, dtype=torch.float32
+        ),
+        "pool_cache": torch.zeros(
+            PAGES * PAGE_SIZE, int(cfg.index_head_dim), dtype=torch.bfloat16
+        ),
+        "seq_lens": torch.cat([torch.arange(1, n + 1, dtype=torch.int32) for n in lengths]),
+        "lengths": lengths,
+    }
+
+
+def _run_bypass(indexer, method: str, ops: dict, monkeypatch: pytest.MonkeyPatch):
+    """Run ONE entry point on the short regime with both instruments installed and reset first.
+
+    Returns ``(result, family_readings, causal_fill_reading, spy)``. One runner for all three items,
+    so no item can differ from another by how it drove the call rather than by what it asserted.
+    """
+    reset_all_counters()
+    _causal_fill_api()[0]()
+    spy = SeamSpy()
+    spy.install(monkeypatch)
+    try:
+        if method == "forward":
+            result = indexer.forward(
+                ops["hidden"], ops["q_latent"], ops["pool_cache"], ops["seq_lens"],
+                max_seq_len=BYPASS_SEQ_LEN, page_size=PAGE_SIZE,
+                slot_mapping=ops["slot_mapping"],
+            )
+        else:
+            result = indexer.forward_ragged(
+                ops["hidden"], ops["q_latent"], ops["pool_cache"], ops["seq_lens"],
+                ops["lengths"], max_seq_len=BYPASS_SEQ_LEN, page_size=PAGE_SIZE,
+            )
+    finally:
+        monkeypatch.undo()
+    readings = read_all_counters()
+    fill = tuple(int(v) for v in _causal_fill_api()[1]())
+    return result, readings, fill, spy
+
+
+def _assert_regime_is_the_boundary(label: str, indexer, pool: int) -> int:
+    """The case sits ON the strict bound, asserted from the closed form. Returns ``select_k``."""
+    select_k = int(indexer.select_k())
+    candidates = BYPASS_SEQ_LEN // int(pool)
+    say(label, "regime", "seq_len", BYPASS_SEQ_LEN, "candidates", candidates, "select_k", select_k)
+    assert candidates == select_k, (
+        f"{BYPASS_SEQ_LEN} token(s) yields {candidates} complete pool(s) against select_k="
+        f"{select_k}; these items exist to sit ON the boundary, where a non-strict bound and a "
+        f"clamped k would both pass and a correct bypass is the only thing that ALSO reads zero on "
+        f"topk_select"
+    )
+    return select_k
+
+
+def _check_bypass_zeros(label: str, readings: dict[str, tuple[int, int]]) -> None:
+    """The five zeros, plus the reading that makes them measurements rather than decoration.
+
+    D1.5: a counted zero needs a control that fires on the same call. ``kpool_hadamard`` is that
+    control and it costs nothing extra -- ``project_stage`` rotates the indexer query on EVERY
+    indexer call, so the family is non-zero on both entry points and in both regimes. If the counter
+    instrument were not reading this call at all, that figure would read zero too and this assertion
+    fails before the five below can pass for the wrong reason.
+    """
+    control = readings["kpool_hadamard"]
+    say(label, "D1.5_control", "kpool_hadamard", control)
+    assert control[0] > 0, (
+        f"kpool_hadamard read {control} on a call that must rotate the indexer query, so the "
+        f"counter instrument is not reading this call and the five zeros below measure nothing"
+    )
+    for family in BYPASS_ZERO_FAMILIES:
+        assert readings[family] == (0, 0), (
+            f"{family} read {readings[family]} on the bypass; the bypass exists to skip the "
+            f"selection chain, so anything it dispatched is work done for an answer it discards"
+        )
+    assert all(v[1] == 0 for v in readings.values()), (
+        f"a torch fallback ran on the bypass path: {readings}"
+    )
+
+
+def _check_the_kernel_ran(label: str, fill: tuple[int, int]) -> None:
+    """The route predicate, form R-1, plus the identity read THROUGH the seam (D13.1)."""
+    identity = _seam_module("causal_fill").causal_fill_kernel_identity()
+    say(label, "causal_fill", "nki_dispatch", fill[0], "torch_fallback", fill[1],
+        "kernel", identity)
+    assert fill == (1, 0), (
+        f"the bypass read {fill} on its own seam and owes exactly one NKI dispatch with no "
+        f"fallback; a torch-level fill would read (0, 1) here and P13 forbids it"
+    )
+    assert identity is not None, "no kernel identity was recorded, so nothing certifies what ran"
+    assert identity[1].endswith("_causal_fill_nki"), (
+        f"the seam dispatched {identity}, not the NKI kernel this increment landed"
+    )
+
+
+def _check_two_instruments_agree(label: str, spy: SeamSpy, readings: dict) -> None:
+    """The spy and the seven counters over the same events. One zero is not a reading; two are."""
+    for family, (spy_sum, counter_sum) in agreement(spy, readings).items():
+        say(label, "agreement", family, "spy", spy_sum, "counter", counter_sum)
+        assert spy_sum == counter_sum, (
+            f"the spy counted {spy_sum} {family} call(s) where the counter read {counter_sum}; two "
+            f"instruments over the same events must agree, or neither zero is a reading"
+        )
+
+
+def _check_rows_are_exact(label: str, got: torch.Tensor, reference: torch.Tensor,
+                          want_shape: tuple[int, int]) -> None:
+    """Exact int32 equality, its shape and dtype, and a doctored control that must fail."""
+    say(label, "shape", tuple(got.shape), "want", want_shape, "dtype", str(got.dtype))
+    assert got.dtype == torch.int32, f"the bypass returned {got.dtype}, not int32"
+    assert tuple(got.shape) == want_shape, (
+        f"the bypass emitted {tuple(got.shape)} where it owes {want_shape}: it must emit the SAME "
+        f"shape selection emits, or every consumer would have to branch on the regime"
+    )
+    diff = int((got.to(torch.int64) - reference.to(torch.int64)).abs().max())
+    say(label, "max_abs_diff", diff, "entries", got.numel(), "sentinels", int((got == -1).sum()))
+    assert diff == 0, (
+        f"the bypass rows differ from this file's torch reference by up to {diff}. No tolerance is "
+        f"used and none is admissible: these are indices, and a tolerance would hide an off-by-one"
+    )
+    # THE COMPARISON MUST BE ABLE TO FAIL, or `max_abs_diff == 0` is decoration. One entry of the
+    # reference is moved by one and the same reader runs again over the same population.
+    doctored = reference.clone()
+    doctored[0, 0] = int(doctored[0, 0]) + 1
+    differing = int((got != doctored).sum())
+    say(label, "doctored_control", "differing", differing, "population", got.numel())
+    assert differing == 1, (
+        f"the element-wise reader found {differing} differing entries against a reference with "
+        f"exactly one entry moved, so it is not reading the tensors it claims to compare"
+    )
+
+
+def test_forward_SERVES_the_short_regime_with_exact_causal_rows_and_no_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``forward``: at the bypass boundary the pool write still lands and selection never runs.
+
+    THREE READINGS, and they fail for three different reasons.
+      1. THE ANSWER IS EXACT. The returned int32 rows equal this file's own torch reference element
+         for element, with no tolerance -- exact integer equality is the comparator this increment
+         registered, and an index compared with a tolerance would hide an off-by-one.
+      2. THE WRITE STAGE RAN. This is the whole reason the bypass sits where it does instead of
+         inside ``_require_serviceable``: both entry points call that helper BEFORE they write the
+         pooled-key store, so an early return from there would have skipped the write silently.
+         Read as a before-and-after ROW COUNT, never as a boolean.
+      3. SELECTION NEVER DISPATCHED, read by two independent instruments -- the seven family
+         counters and the call spy -- because one instrument reading zero cannot tell "it did not
+         happen" from "I was not looking".
+    """
+    if not gate_live():
+        pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
+
+    stack, cfg, _gen = build_layer_stack(layers=1)
+    indexer = stack[0].attention.indexer
+    pool = int(cfg.index_kpool)
+    _assert_regime_is_the_boundary("D1", indexer, pool)
+    width = _bypass_width(indexer, pool)
+
+    ops = _bypass_forward_operands(cfg, seed=9_099_001)
+    pool_cache = ops["pool_cache"]
+
+    def written_rows() -> int:
+        return int((pool_cache.to(torch.float32).abs().sum(dim=1) != 0).sum())
+
+    before = written_rows()
+    reference = _ref_causal_rows(ops["seq_lens"], width)
+    got, readings, fill, spy = _run_bypass(indexer, "forward", ops, monkeypatch)
+
+    # 2. THE WRITE STAGE RAN, as a value and not a boolean.
+    after = written_rows()
+    say("D1", "pool_rows_written", "before", before, "after", after,
+        "of", int(pool_cache.shape[0]))
+    assert before == 0, f"the fixture handed a pre-populated pool_cache ({before} row(s))"
+    assert after > before, (
+        "the pooled-key store is untouched after a prefill call, so the bypass returned BEFORE the "
+        "write instead of after it -- the exact defect the placement exists to prevent"
+    )
+
+    # 3. SELECTION NEVER DISPATCHED.
+    for family in FAMILIES:
+        say("D1", "counter", family, readings[family])
+    _check_bypass_zeros("D1", readings)
+    spy.report("D1")
+    _check_two_instruments_agree("D1", spy, readings)
+    _check_the_kernel_ran("D1", fill)
+
+    # 1. THE ANSWER IS EXACT.
+    _check_rows_are_exact("D1", got, reference, (BYPASS_SEQ_LEN, width))
+
+
+def test_forward_ragged_SERVES_the_short_regime_with_exact_causal_rows_and_no_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``forward_ragged``: the same bypass on the non-uniform arm, and the pack still runs.
+
+    THE PLACEMENT IS THE EXTRA READING HERE. This arm writes no cache and advances no ring, so the
+    only thing its bypass placement decides is whether the pack still happens -- and the pack is
+    this arm's whole reason for existing (``design-20260905-aa``'s seventh family). The bypass
+    therefore sits AFTER the pack, and this item reads ``ragged_pack`` as NON-ZERO to say so.
+    Bypassing before the pack would zero the seventh family on the short regime and nothing else in
+    this file would notice.
+    """
+    if not gate_live():
+        pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
+
+    stack, cfg, _gen = build_layer_stack(layers=1)
+    indexer = stack[0].attention.indexer
+    pool = int(cfg.index_kpool)
+    _assert_regime_is_the_boundary("D2", indexer, pool)
+    width = _bypass_width(indexer, pool)
+
+    ops = _bypass_ragged_operands(cfg, seed=9_099_002)
+    tokens = int(ops["seq_lens"].shape[0])
+    assert tokens == sum(ops["lengths"]), "one seq_len per PACKED row"
+    assert len(set(ops["lengths"])) > 1, "a uniform batch is refused by the arm, and rightly"
+
+    reference = _ref_causal_rows(ops["seq_lens"], width)
+    got, readings, fill, spy = _run_bypass(indexer, "forward_ragged", ops, monkeypatch)
+
+    for family in FAMILIES:
+        say("D2", "counter", family, readings[family])
+    _check_bypass_zeros("D2", readings)
+    pack = readings["ragged_pack"]
+    say("D2", "pack_still_ran", pack)
+    assert pack[0] > 0, (
+        f"ragged_pack read {pack} on the bypass, so the bypass returned BEFORE the pack and zeroed "
+        f"the seventh counter family on this regime. The placement is after the pack on purpose"
+    )
+    spy.report("D2")
+    _check_two_instruments_agree("D2", spy, readings)
+    _check_the_kernel_ran("D2", fill)
+    _check_rows_are_exact("D2", got, reference, (tokens, width))
+
+
+def test_the_two_entry_points_read_the_SAME_bypass_governed_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bypass is ONE decision, so the families it governs must read the same on both calls.
+
+    WHAT THIS CATCHES that neither item above can: both entry points serving the short regime
+    DIFFERENTLY. Each item above reads its own call in isolation, so a change that made one entry
+    point bypass and the other select would fail only the one item that happened to be looking --
+    and if a future edit relaxed that item, nothing would compare the two paths at all.
+
+    FIVE OF THE SEVEN FAMILIES MUST MATCH, AND TWO MUST NOT, and the two that must not are read
+    against the arms' own landed tables rather than against each other. That split is a measurement
+    this seat took, not a softening of the claim: ``forward``'s prefill leg writes the pooled-key
+    store and the ragged arm declares that it does not, while the arm packs and the layer case
+    declares that it does not (``DECLARED_PER_LAYER`` against
+    ``DECLARED_PER_LAYER_RAGGED_ARM``). So ``kpool_hadamard`` and ``ragged_pack`` differ by design at
+    ANY bypass placement, and making them equal would mean authoring a dispatch to move a counter --
+    which this file has refused by name three times. Ruled at DECISIONS section 97 (v).
+    """
+    if not gate_live():
+        pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
+
+    stack, cfg, _gen = build_layer_stack(layers=1)
+    indexer = stack[0].attention.indexer
+    pool = int(cfg.index_kpool)
+    _assert_regime_is_the_boundary("D3", indexer, pool)
+
+    # Each call gets its OWN operands, so neither call can see the other's pool write.
+    _got_f, forward_readings, forward_fill, _spy_f = _run_bypass(
+        indexer, "forward", _bypass_forward_operands(cfg, seed=9_099_003), monkeypatch
+    )
+    _got_r, ragged_readings, ragged_fill, _spy_r = _run_bypass(
+        indexer, "forward_ragged", _bypass_ragged_operands(cfg, seed=9_099_004), monkeypatch
+    )
+
+    for family in FAMILIES:
+        say("D3", "family", family, "forward", forward_readings[family],
+            "forward_ragged", ragged_readings[family],
+            "same" if forward_readings[family] == ragged_readings[family] else "DIFFERS")
+
+    # THE FIVE THAT MUST MATCH, and both claims are made: equal to each other, and equal to zero.
+    # Equality alone would pass if both entry points selected identically.
+    for family in BYPASS_ZERO_FAMILIES:
+        assert forward_readings[family] == ragged_readings[family], (
+            f"{family} read {forward_readings[family]} on forward and {ragged_readings[family]} on "
+            f"forward_ragged; the bypass is one decision and the families it governs cannot differ"
+        )
+        assert forward_readings[family] == (0, 0), (
+            f"{family} read {forward_readings[family]} on BOTH entry points, equally and non-zero, "
+            f"so the two agree while both are still running selection"
+        )
+    say("D3", "matched_families", len(BYPASS_ZERO_FAMILIES), "of", len(FAMILIES))
+
+    # THE FILL RAN ON BOTH, which is the positive half of the same claim.
+    say("D3", "causal_fill", "forward", forward_fill, "forward_ragged", ragged_fill)
+    assert forward_fill == ragged_fill == (1, 0), (
+        f"the bypass seam read {forward_fill} on forward and {ragged_fill} on forward_ragged; both "
+        f"owe exactly one NKI dispatch and no fallback"
+    )
+
+    # THE TWO THAT DIFFER, each against its OWN arm's declared column, derived not typed.
+    declared_forward = _declared_column(DECLARED_PER_LAYER, 0)
+    declared_ragged = _declared_column(DECLARED_PER_LAYER_RAGGED_ARM, 1)
+    for family in ("kpool_hadamard", "ragged_pack"):
+        say("D3", "declared_difference", family,
+            "forward", forward_readings[family], "declares", declared_forward[family],
+            "forward_ragged", ragged_readings[family], "declares", declared_ragged[family])
+        assert forward_readings[family][0] == declared_forward[family], (
+            f"{family} read {forward_readings[family][0]} on forward's prefill leg where "
+            f"DECLARED_PER_LAYER's prefill column declares {declared_forward[family]}"
+        )
+        assert ragged_readings[family][0] == declared_ragged[family], (
+            f"{family} read {ragged_readings[family][0]} on the ragged arm where "
+            f"DECLARED_PER_LAYER_RAGGED_ARM's decode column declares {declared_ragged[family]}"
+        )
+    differing = sorted(
+        f for f in FAMILIES if forward_readings[f] != ragged_readings[f]
+    )
+    say("D3", "families_that_differ", differing)
+    assert differing == ["kpool_hadamard", "ragged_pack"], (
+        f"the two entry points differ on {differing}; exactly two families may differ on the short "
+        f"regime and both are named by the arms' landed tables, so a third difference is either a "
+        f"new dispatch on one path or a lost one on the other"
     )

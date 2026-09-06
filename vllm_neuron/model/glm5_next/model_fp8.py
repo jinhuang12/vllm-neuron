@@ -3562,9 +3562,13 @@ class Glm5NextDSAIndexer(nn.Module):
         FALSE rather than raising (``topk_select.py:294``) -- which takes the
         torch route and increments ``torch_fallback``, breaking a declared zero
         SILENTLY, unlike the loud raise at ``k > width`` (``:320-323``). That is
-        finding F10, and :meth:`forward` refuses the regime BY NAME before a
-        score exists, so the bound already holds by the time this runs. Checking
-        it in two places would let the two disagree.
+        finding F10, and both entry points ROUTE the regime away before a score
+        exists -- ``_require_serviceable`` reports ``selects=False`` and they
+        return ``inc-glm53f-099``'s causal bypass -- so the bound already holds
+        by the time this runs. Checking it in two places would let the two
+        disagree. Until ``inc-glm53f-099`` the same guarantee came from a refusal
+        here rather than a route; the guarantee is the same one and this method
+        is unchanged by the swap.
 
         ONE DISPATCH, on ``dsa_topk_select``.
         """
@@ -3627,20 +3631,37 @@ class Glm5NextDSAIndexer(nn.Module):
 
     def _require_serviceable(
         self, max_seq_len: int, page_size: int, pool_cache: torch.Tensor
-    ) -> tuple[int, int]:
-        """Refuse a regime no landed seam serves. Returns ``(candidates, trash_row)``.
+    ) -> tuple[int, int, bool]:
+        """Read the regime. Returns ``(candidates, trash_row, selects)``.
 
         ONE IMPLEMENTATION FOR BOTH ENTRY POINTS, which is the point of extracting it:
         :meth:`forward` and :meth:`forward_ragged` must agree about what is serviceable,
         and two copies of a refusal are two things that can drift apart. F10's earlier
-        laps were about exactly this class of divergence.
+        laps were about exactly this class of divergence. ``inc-glm53f-099`` keeps that
+        property and adds one answer to it: ``selects`` is the ONE decision, and the two
+        entry points make two calls on it.
 
-        THE F10 REFUSAL. ``dsa_topk_select`` needs ``0 < k < width`` STRICTLY, and at
-        ``k == width`` its gate RETURNS FALSE rather than raising
-        (``topk_select.py:294``) -- taking the torch route and breaking the declared
-        ``torch_fallback == 0`` SILENTLY, unlike the loud raise at ``k > width``
-        (``:320-323``). ``width`` is the WIDEST row's complete-pool count, because that
-        row sizes the shared candidate axis.
+        ``selects`` IS ``candidates > select_k()``, AND IT IS STRICT. ``dsa_topk_select``
+        needs ``0 < k < width`` STRICTLY, and at ``k == width`` its gate RETURNS FALSE
+        rather than raising (``topk_select.py:294``) -- taking the torch route and
+        breaking the declared ``torch_fallback == 0`` SILENTLY, unlike the loud raise at
+        ``k > width`` (``:320-323``). ``width`` is the WIDEST row's complete-pool count,
+        because that row sizes the shared candidate axis.
+
+        WHY THIS REPORTS WHERE IT USED TO REFUSE (``inc-glm53f-099``, entry
+        ``design-20260906-as``). Below the strict bound there is nothing to select from,
+        and upstream does not clamp ``k`` there -- it bypasses selection entirely and
+        attends causally (``sparse_attn_indexer_kpool.py:203-217``). ``inc-glm53f-098``'s
+        landed refusal named that route and left it unbuilt; it is built now, so the
+        regime is SERVED rather than refused and this method reports which of the two
+        answers the caller owes. The refusal is gone from here and no refusal replaced it,
+        because a served regime has nothing to refuse.
+
+        WHY THE BYPASS CANNOT LIVE IN THIS METHOD, which is the whole shape of the fix.
+        Both entry points call this BEFORE they write the pooled-key store and advance the
+        decode ring, so returning an answer here would skip the write and corrupt every
+        later step. So the DECISION is here, once, and the two DISPATCHES are at the two
+        entry points, each after its own write stage.
         """
         pool = self.index_kpool
         if int(max_seq_len) <= 0:
@@ -3660,20 +3681,7 @@ class Glm5NextDSAIndexer(nn.Module):
             )
 
         candidates = int(max_seq_len) // pool
-        if candidates <= self.select_k():
-            raise Glm5NextDSAIndexerError(
-                f"this indexer cannot serve max_seq_len={int(max_seq_len)}: it "
-                f"yields {candidates} complete pool(s) at index_kpool={pool}, "
-                f"which is not strictly more than select_k="
-                f"{self.select_k()} (index_topk={self.index_topk} // {pool}). "
-                f"dsa_topk_select refuses k == width for sorted output and its "
-                f"gate returns False rather than raising, so serving this "
-                f"regime would silently take the torch route "
-                f"(topk_select.py:294). The short-sequence route is "
-                f"inc-glm53f-099's; upstream bypasses selection entirely here "
-                f"(sparse_attn_indexer_kpool.py:203-217). Refusing by name "
-                f"keeps the wrong answer unreachable"
-            )
+        selects = candidates > self.select_k()
         trash = int(pool_cache.shape[0]) - 1
         if candidates > trash:
             raise Glm5NextDSAIndexerError(
@@ -3681,7 +3689,41 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"leaves no trash row above the {candidates} addressable "
                 f"candidate pool(s); allocate at least {candidates + 1}"
             )
-        return candidates, trash
+        return candidates, trash, selects
+
+    def bypass_width(self) -> int:
+        """The width the short-sequence bypass emits: SELECTION'S OWN width, derived.
+
+        The bypass and the selecting path must hand the sparse attention kernel the same
+        shape, or the emitted width would vary by regime and every consumer would have to
+        branch. ``dsa_index_expand`` allocates
+        ``index_expand_width(n_groups, pool_size)`` (the allocation at
+        ``index_expand.py:316``, the helper itself at ``index_expand.py:255-267``), so that
+        is read from the seam's own helper here rather than recomputed -- 128 at this file's
+        tiny test dials and 2176 at the checkpoint's, both measured.
+        """
+        from vllm_neuron.functional.dsa.index_expand import index_expand_width
+
+        return int(index_expand_width(self.select_k(), self.index_kpool))
+
+    def _bypass_indices(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        """The short regime's answer: each row's plain causal prefix, at :meth:`bypass_width`.
+
+        ONE DISPATCH, called from both entry points, so the two cannot answer the short
+        regime differently. Row ``i`` holds ``0 .. seq_lens[i] - 1`` and then ``-1``, which
+        is what "attend causally, select nothing" means as an index tensor; the ``-1`` is
+        the sentinel ``inc-glm53f-098``'s sparse kernel masks.
+
+        EVERY CAUSAL COLUMN FITS, with no clamp, and that is arithmetic rather than luck:
+        the bypass holds only while ``max_seq_len // pool <= select_k``, so the largest
+        position is ``select_k * pool + pool - 2``, which is one below the RAW expansion
+        width and therefore below the rounded-up emitted width. Read as a value at both
+        dial sets in ``probe-099-widths-host.out`` -- 125 spare columns at the
+        checkpoint's, 117 at the tiny dials, and zero admissible lengths that overflow.
+        """
+        from vllm_neuron.functional.dsa.causal_fill import dsa_causal_fill
+
+        return dsa_causal_fill(seq_lens.to(torch.int32) - 1, self.bypass_width())
 
     def _gather_candidates(
         self, pool_cache: torch.Tensor, candidates: int, page_size: int
@@ -3784,7 +3826,7 @@ class Glm5NextDSAIndexer(nn.Module):
         self.require_dials()
 
         pool = self.index_kpool
-        candidates, trash = self._require_serviceable(
+        candidates, trash, selects = self._require_serviceable(
             int(max_seq_len), int(page_size), pool_cache
         )
         is_decode = tail is not None
@@ -3821,6 +3863,12 @@ class Glm5NextDSAIndexer(nn.Module):
                 )
             )
             pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+
+        if not selects:
+            # inc-glm53f-099. The write stage above has already landed -- the pool row is
+            # stored and, on the decode leg, the ring has advanced -- so returning here
+            # loses nothing. Below the strict bound there is nothing to select from.
+            return self._bypass_indices(seq_lens)
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
         scores = self.score_pools(query, candidate_keys, weights)
@@ -3903,6 +3951,13 @@ class Glm5NextDSAIndexer(nn.Module):
         instead, which read as a claim about the pooling. Nine named readings, no family
         shorthand, so ``probe-051-arm-authored`` can compare each one to a measurement.
 
+        THOSE NINE ARE THE SELECTING PATH'S, and ``inc-glm53f-099`` added a second path
+        that reads differently. On the SHORT regime this arm returns the causal bypass
+        after the pack, so ``dsa_paged_gather``, ``dsa_score_gemm``, ``dsa_topk_select``
+        and ``dsa_index_expand`` all read 0 and ``dsa_causal_fill`` reads one NKI dispatch
+        with no torch fallback. ``dsa_ragged_pack`` 1 and ``dsa_hadamard128`` 1 are
+        unchanged, which is the placement's whole point.
+
         ONE COST, DISCLOSED. :meth:`project_stage` computes the key and the gate score
         that this arm never uses, because it is one dispatch-counted unit whose reading of
         exactly 4 ``mla_projection`` dispatches per indexer call is the declared
@@ -3913,7 +3968,7 @@ class Glm5NextDSAIndexer(nn.Module):
         from vllm_neuron.functional.dsa.ragged_pack import dsa_ragged_pack
 
         self.require_dials()
-        candidates, _trash = self._require_serviceable(
+        candidates, _trash, selects = self._require_serviceable(
             int(max_seq_len), int(page_size), pool_cache
         )
 
@@ -3987,6 +4042,16 @@ class Glm5NextDSAIndexer(nn.Module):
         packed_weights = weights.index_select(
             0, torch.tensor(keep, dtype=torch.int64, device=weights.device)
         )
+
+        if not selects:
+            # inc-glm53f-099, placed AFTER the pack rather than before it, deliberately.
+            # This arm has no write stage to protect, so the only thing the placement
+            # decides is the pack's counter reading -- and the pack is this arm's whole
+            # reason for existing (design-20260905-aa's seventh family). Bypassing before
+            # it would zero that reading on the short regime. The packed query it computes
+            # is then unused, which is the same disclosed cost as the two unused
+            # projections above and is stated for the same reason.
+            return self._bypass_indices(seq_lens)
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
         scores = self.score_pools(packed_query, candidate_keys, packed_weights)
