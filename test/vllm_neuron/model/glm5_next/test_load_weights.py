@@ -264,6 +264,18 @@ def _mla_key_overrides(
     CHECKPOINT KEY from the map. Writing the key by hand would be a second
     naming convention that could drift from the one the loader reads.
 
+    THE PARAMETER NAME NOW COMES FROM THE MODULE TOO, and that is this function's
+    ``inc-glm53f-051`` repair rather than a refinement. Appending ``_weight`` to a
+    site name WAS the second naming convention the paragraph above warns about,
+    and it drifted the moment a projection site arrived whose parameter is a bare
+    checkpoint tensor: ``Glm5NextDSAIndexer``'s ``index_kpool_compress_gate`` has
+    no ``.weight`` leaf, so ``<path>.index_kpool_compress_gate_weight`` is absent
+    from the map, this loop skipped the site, and the writer below gave the gate
+    ``MINI_PLAIN_SHAPE``. The prep then refused the ``(4,)`` and twelve items in
+    this file went red. A module that publishes ``PROJECTION_PARAMETERS`` is asked
+    for the name; one that does not keeps the suffix rule unchanged, which is why
+    the MLA family's own four overrides do not move.
+
     The four scaled projections are written as fp8 bytes with an fp32 grid, and
     ``kv_b_proj`` as bf16 with no grid, because that is what the published
     checkpoint holds: ``DSA_SCALED_PROJECTIONS`` is the list of leaves that
@@ -276,7 +288,10 @@ def _mla_key_overrides(
             continue
         for name, idim, odim in module.projection_widths():
             quantised = name in DSA_SCALED_PROJECTIONS
-            weight_param = f"{path}.{name}_weight"
+            attribute = getattr(type(module), "PROJECTION_PARAMETERS", {}).get(
+                name, f"{name}_weight"
+            )
+            weight_param = f"{path}.{attribute}"
             if weight_param not in mappings:
                 continue
             for key in _keys_of(mappings, weight_param):
