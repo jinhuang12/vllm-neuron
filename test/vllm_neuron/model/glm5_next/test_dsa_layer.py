@@ -25,7 +25,16 @@ stale at the next lap (D-18, review item B72-N6).
         round-trip item, so the direction is tested; it is tested there and not here.
   (P2)  parts 2 and 3 of the predicate: the tiling seam's dispatch count equals each arm's reported
         tile count.
-  (S)   standing on every run: every family's torch-fallback counter reads 0.
+  (P3)  the PROJECTION substrate reading, taken from attempt 13 and absent before it: the EIGHTH
+        counter family, ``mla_projection``, is reset and read around EVERY indexer call in this file,
+        and each case's total is the closed form printed WITH ITS TERMS. A completing indexer call
+        reads ``nki_dispatch == 4`` and ``torch_fallback == 0``, one dispatch per projection site;
+        the eight refusal calls read ``(0, 0)``, because the refusal fires before ``project_stage``.
+        Review item B86.
+  (S)   standing on every run: every family's torch-fallback counter reads 0. The PROJECTION
+        family's zero is weaker than the seven and says so where it is asserted -- no code path can
+        increment it today, so it is a reading that would only acquire teeth if a torch projection
+        route were ever added. Its ``nki_dispatch`` figure is the one with teeth.
 
 WHY THE PER-FAMILY READINGS ARE NOT ALL THE SAME NUMBER. The nine entry points sit behind SEVEN
 counter families, because ``kpool_hadamard`` counts its fused and stage-alone entries on one counter
@@ -62,6 +71,19 @@ WHY A CALL SPY AS WELL AS THE COUNTERS. A shared counter reading 9 cannot say wh
 points contributed what. The counters and the spy count the same events by different means, so the
 per-family agreement check below is a real cross-check: a call that bypassed the spy moves a counter
 without moving a spy count, and a double-counting wrapper moves a spy count without moving a counter.
+
+WHY THE PROJECTION SEAM NEEDED AN EIGHTH PAIR, and this is a defect of this file rather than a
+refinement of it. ``reset_all_counters`` and ``read_all_counters`` walk ``FAMILIES``, ``FAMILIES`` is
+derived from ``ENTRY_POINTS``, and every entry point there lives under ``vllm_neuron.functional.dsa``.
+The projection seam lives under ``vllm_neuron.functional.attention``. So the walk could not reach it
+at any reading, and this file took none for twelve attempts -- an instrument whose POPULATION excluded
+the thing its own sentence was about, which is the defect class this increment has produced over and
+over. The seam's reader states the purpose of the pair: "The counter is kept so a test can STATE that
+reading rather than assume it, which is what makes the zero a measurement"
+(``mla_projections.py:148-156``). The eighth family keeps its own pair and its own declared closed
+form, and the seven-family tables above are untouched: the projection seam is not a dsa entry point,
+so folding it into ``FAMILIES`` would move ``DECLARED_FAMILY_TOTALS``, the one-third control and the
+spy-versus-counter agreement, none of which is about projections.
 
 WHERE THE SPY PATCHES, AND WHY IT IS NOT A PREFERENCE. ``model_fp8.py`` imports every functional seam
 INSIDE the method body and never at module level, so each name is looked up fresh out of its seam
@@ -355,20 +377,30 @@ def _seam_module(family: str):
     return importlib.import_module(f"vllm_neuron.functional.dsa.{family}")
 
 
-def _counter_api(family: str):
-    """``(reset, read)`` for one family, DISCOVERED on the module rather than spelled out.
+def _discover_counter_api(module):
+    """``(reset, read)`` on one module, DISCOVERED rather than spelled out.
 
     Spelling the names out would be a fifth place they are written, and one of them does not follow
     the module name: ``decode_tail_update.py``'s pair is ``reset_decode_tail_dispatch_counters`` and
     ``decode_tail_dispatch_counters``. Discovery also fails loudly if a module ever grows a second
     pair, which a hardcoded name would silently ignore.
+
+    THE RULE LIVES HERE ONCE so the eighth family below is discovered by the SAME rule as the seven
+    and not by a second convention written beside it. It takes a module rather than a family name
+    because the eighth family is not under ``functional.dsa`` at all -- and that package prefix,
+    baked into the family-name form this helper replaced, is the whole reason its reading was
+    missing for twelve attempts.
     """
-    module = _seam_module(family)
     names = [n for n in dir(module) if n.endswith("_dispatch_counters")]
     reset = [n for n in names if n.startswith("reset_")]
     read = [n for n in names if not n.startswith("reset_")]
-    assert len(reset) == 1 and len(read) == 1, (family, reset, read)
+    assert len(reset) == 1 and len(read) == 1, (module.__name__, reset, read)
     return getattr(module, reset[0]), getattr(module, read[0])
+
+
+def _counter_api(family: str):
+    """``(reset, read)`` for one of the SEVEN dsa families."""
+    return _discover_counter_api(_seam_module(family))
 
 
 def reset_all_counters() -> None:
@@ -379,6 +411,156 @@ def reset_all_counters() -> None:
 def read_all_counters() -> dict[str, tuple[int, int]]:
     """``{family: (nki_dispatch, torch_fallback)}`` since the last reset."""
     return {family: tuple(int(v) for v in _counter_api(family)[1]()) for family in FAMILIES}
+
+
+# --------------------------------------------------------------------------- #
+# THE EIGHTH COUNTER FAMILY -- THE PROJECTION SEAM, AND WHY IT NEEDS ITS OWN PAIR.
+#
+# WHAT WAS MISSING, stated plainly because it is this increment's own defect and not a refinement.
+# Review item B86 found ZERO occurrences of a reset/read pair for ``mla_projection`` in this file.
+# The reason is structural rather than an oversight of attention: ``reset_all_counters`` and
+# ``read_all_counters`` walk ``FAMILIES``, ``FAMILIES`` is derived from ``ENTRY_POINTS``, and every
+# entry there lives under ``vllm_neuron.functional.dsa``. The projection seam lives under
+# ``vllm_neuron.functional.attention``. So the walk could not reach it at any reading -- an
+# instrument whose population EXCLUDED the thing the sentence was about, which is this increment's
+# recurring defect class in its purest form. The seam's own reader says what it is for:
+# "The counter is kept so a test can STATE that reading rather than assume it, which is what makes
+# the zero a measurement" (``mla_projections.py:148-156``).
+#
+# WHY IT IS NOT FOLDED INTO ``FAMILIES``. ``FAMILIES`` is the census the CALL SPY attributes against,
+# and the projection seam is not a dsa entry point: folding it in would move
+# ``DECLARED_FAMILY_TOTALS``, the one-third control and the spy-versus-counter agreement check, none
+# of which is about projections. The eighth family gets its own pair, its own declared closed form
+# and its own readings, and the seven-family tables are untouched.
+
+#: The module that holds the projection seam. NOT under ``functional.dsa``; see above.
+PROJECTION_MODULE = "vllm_neuron.functional.attention.mla_projections"
+
+
+def _projection_counter_api():
+    """``(reset, read)`` for the projection seam, by the same discovery rule as the seven."""
+    return _discover_counter_api(importlib.import_module(PROJECTION_MODULE))
+
+
+def reset_projection_counter() -> None:
+    _projection_counter_api()[0]()
+
+
+def read_projection_counter() -> tuple[int, int]:
+    """``(nki_dispatch, torch_fallback)`` for the projection seam since the last reset."""
+    return tuple(int(v) for v in _projection_counter_api()[1]())
+
+
+#: The two phases the layer case runs, named once. The closed form below multiplies by
+#: ``len(PHASES)`` and run 1 iterates this same tuple, so the count and the loop cannot drift.
+PHASES: tuple[str, ...] = ("prefill", "decode")
+
+#: THE CLOSED FORM, TERM BY TERM: projection dispatches ONE LAYER owes for ONE phase of the LAYER
+#: CASE, each term with the caller that makes it and the seam call sites it reaches. A reader checks
+#: any row against the source; the total is the sum and is never typed on its own.
+#:
+#: THE SAME NINE ARRIVE FROM THE REFERENCE SIDE, which is why this closed form is a derivation and
+#: not a guess dressed as one. The torch reference in this file reaches ``_ref_projection`` nine times
+#: per layer per phase, by a call graph written independently of the production one: ``_ref_layer``
+#: projects once itself (the indexer's latent), calls ``_ref_indexer`` -> ``_ref_project_stage``
+#: which projects four times, and calls ``_ref_attend`` which projects four times (q_a_proj, q_b_proj,
+#: kv_a_proj_with_mqa, o_proj). Production splits that last four as 3 + 1 across
+#: ``project_query_and_latent`` and ``project_output``; the sites are the same sites. Two structures
+#: built by different passes agreeing on nine is worth more than either one restated twice.
+#:
+#: The third term is THREE and not two, and the reason is composition rather than arithmetic:
+#: ``project_query_and_latent`` calls ``project_query_latent`` as its own first statement
+#: (``model_fp8.py:4416``, whose docstring says so at ``model_fp8.py:4397``), so the nested dispatch
+#: belongs to it. A count of the DIRECT ``mla_projection(`` lines in that method reads two and is the
+#: wrong reading -- exactly the defect class this file's own history is made of.
+#: Each row is ``(key, what calls it, dispatches, the source that makes the figure)``. The key is
+#: stable and is what the arithmetic below selects on -- selecting on the prose would make a
+#: reworded label change a number.
+DECLARED_PROJECTION_TERMS: tuple[tuple[str, str, int, str], ...] = (
+    (
+        "layer_query_latent",
+        "layer.forward -> attention.project_query_latent",
+        1,
+        "model_fp8.py:4693 calls :4332, whose one dispatch is :4375 (q_a_proj)",
+    ),
+    (
+        "indexer",
+        "indexer.forward -> project_stage",
+        4,
+        "model_fp8.py:3662 calls :3029, whose four dispatches are :3093 wq_b, :3106 wk, "
+        ":3113 weights_proj, :3120 index_kpool_compress_gate",
+    ),
+    (
+        "attend_query_and_latent",
+        "attention.attend -> project_query_and_latent",
+        3,
+        "model_fp8.py:4543 calls :4378 = the NESTED project_query_latent at :4416 (-> :4375) "
+        "plus :4417 q_b_proj plus :4420 kv_a_proj_with_mqa",
+    ),
+    (
+        "attend_output",
+        "attention.attend -> project_output",
+        1,
+        "model_fp8.py:4576 calls :4426, whose one dispatch is :4447 (o_proj)",
+    ),
+)
+
+#: The arm's closed form. It calls the indexer DIRECTLY -- "no layer and no ``attend()`` is
+#: involved" (``model_fp8.py:3710``) -- so the indexer term is the whole of it, and it projects the
+#: padded grid ONCE rather than once per request, which is the commutation claim the arm exists to
+#: test (``model_fp8.py:3824-3827``).
+#:
+#: FOUR, WHERE THE PREDICTIONS FILE SAYS TWELVE -- disclosed rather than settled by editing either
+#: number. Prediction 6 reads "12 for the arm (indexer only, three layers' worth of four) and 4 for
+#: its control", which is the THREE-LAYER idiom this file's own ``DECLARED_FAMILY_TOTALS_RAGGED_ARM``
+#: uses ("at three layers"). The arm as written builds ONE layer and calls ``forward_ragged`` ONCE,
+#: so the figure it owes is four -- which is prediction 6's own control figure. Nothing regressed,
+#: no criterion moves, and the two documents describe the same closed form at two layer counts.
+DECLARED_PROJECTION_TERMS_RAGGED_ARM: tuple[tuple[str, str, int, str], ...] = (
+    (
+        "indexer",
+        "indexer.forward_ragged -> project_stage",
+        4,
+        "model_fp8.py:3829 calls :3029 ONCE on the flattened padded grid, four dispatches as above",
+    ),
+)
+
+
+def projection_terms(table: tuple[tuple[str, str, int, str], ...]) -> dict[str, int]:
+    """``{key: dispatches}``, and a duplicate key is a failure rather than a silent overwrite."""
+    out: dict[str, int] = {}
+    for key, _label, count, _cite in table:
+        assert key not in out, f"duplicate projection term key {key!r}"
+        out[key] = count
+    return out
+
+
+#: Dispatches ONE COMPLETING indexer call owes. Read OUT of the terms table rather than typed a
+#: second time, so the per-call reading and the per-case total rest on one declaration.
+PROJECTION_PER_INDEXER_CALL = projection_terms(DECLARED_PROJECTION_TERMS)["indexer"]
+
+PROJECTION_PER_LAYER_PER_PHASE = sum(projection_terms(DECLARED_PROJECTION_TERMS).values())
+PROJECTION_NON_INDEXER_PER_LAYER_PER_PHASE = (
+    PROJECTION_PER_LAYER_PER_PHASE - PROJECTION_PER_INDEXER_CALL
+)
+PROJECTION_PER_ARM_CASE = sum(projection_terms(DECLARED_PROJECTION_TERMS_RAGGED_ARM).values())
+
+# WHAT THE CLOSED FORM DELIBERATELY EXCLUDES, named so the total is not silently wrong later.
+# ``Glm5NextMLAAttention.project_qkv`` (``model_fp8.py:4261``) holds FOUR more dispatch sites
+# (:4287, :4289, :4292, :4294) and has NO caller anywhere in the tree -- it is dead on every path
+# this file exercises, so the layer's reading is 9 and not 13. ``Glm5NextMLAAttention.forward``
+# is still a stub (``model_fp8.py:4578``) and is likewise never on the path; that stub is one of
+# the arms ``test_kv_spec.py`` keeps. Neither exclusion is asserted by a source scan here: the
+# measured per-case total is the guard, because wiring either one in would move it.
+#
+# AND WHAT THE FALLBACK ZERO IS WORTH, disclosed rather than presented as a strong reading. This
+# family's ``torch_fallback`` CANNOT be incremented by any code path: the module has no torch
+# projection route and an inadmissible geometry raises instead (``mla_projections.py:151-155``).
+# So the zero is a statement that stays true by construction, and it is asserted only because a
+# torch route added later would make it a real reading. The reading with teeth is
+# ``nki_dispatch``: it falls short if a dispatch is missed, rises if one is added, and falls short
+# if a call is served by ``mla_projection_torch_oracle`` (``mla_projections.py:278``), which moves
+# no counter at all.
 
 
 # --------------------------------------------------------------------------- #
@@ -489,6 +671,114 @@ def agreement(spy: SeamSpy, counters: dict[str, tuple[int, int]]) -> dict[str, t
     """``{family: (spy_sum, counter_delta)}`` -- two instruments counting the same events."""
     per_family = spy.per_family()
     return {family: (per_family[family], counters[family][0]) for family in FAMILIES}
+
+
+# --------------------------------------------------------------------------- #
+# THE PER-INDEXER-CALL PROJECTION READING.
+
+
+class IndexerProjectionProbe:
+    """Reads the projection counter's DELTA across every indexer call that completes.
+
+    WHY A DELTA AND NOT A RESET INSIDE EACH CALL. A reset per call would destroy the per-case
+    total, and the total is the SECOND instrument: the per-call readings and the case total are
+    taken by different means over the same events, so the two can cross-check each other the way
+    the spy and the seven family counters already do. A before-and-after read is the same
+    reset/read pair with the reset replaced by a reading -- strictly more measurement, because it
+    also leaves the running total intact to be checked against the closed form.
+
+    It calls through and returns the real value unchanged, and it moves no counter itself: the
+    counter is moved by the real seam inside the real call. The reading is recorded in a ``finally``
+    so a call that RAISES still records what it dispatched before raising, rather than vanishing.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, int]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cls = _impl().Glm5NextDSAIndexer
+        for method in ENTRY_METHODS:
+            monkeypatch.setattr(cls, method, self._wrap(method, getattr(cls, method)))
+
+    def _wrap(self, method: str, real):
+        @functools.wraps(real)
+        def wrapper(*args, **kwargs):
+            before = read_projection_counter()
+            try:
+                return real(*args, **kwargs)
+            finally:
+                after = read_projection_counter()
+                self.calls.append((method, after[0] - before[0], after[1] - before[1]))
+
+        return wrapper
+
+    @property
+    def dispatched(self) -> int:
+        """Every completing indexer call's dispatches, summed -- the indexer's share of the case."""
+        return sum(nki for _method, nki, _fallback in self.calls)
+
+    def check(self, label: str, *, want_calls: int) -> None:
+        """Every recorded call read exactly ``(4, 0)``, and the call COUNT is itself a reading."""
+        say(label, "indexer_calls", len(self.calls), "want", want_calls)
+        # NON-EMPTINESS FIRST, as its own claim (DECISIONS §79.1). A per-call assertion over an
+        # empty list passes while measuring nothing, which is how this file's rider B71-N3 passed
+        # round 1 reading nothing at all.
+        assert self.calls, (
+            f"{label}: the probe recorded NO indexer call, so every per-call assertion below would "
+            f"be a statement about an empty list and would pass having measured nothing. Either the "
+            f"probe was not installed inside the measured window or the case never reached the "
+            f"indexer"
+        )
+        assert len(self.calls) == want_calls, (
+            f"{label}: the probe recorded {len(self.calls)} indexer calls where the case owes "
+            f"{want_calls}. The count is a reading in its own right: a seam hoisted out of the "
+            f"layer loop reads the same per call and a different number of times"
+        )
+        for idx, (method, nki, fallback) in enumerate(self.calls):
+            say(
+                label, "indexer_call", idx, method,
+                "nki_dispatch", nki, "want", PROJECTION_PER_INDEXER_CALL,
+                "torch_fallback", fallback, "want", 0,
+            )
+            assert nki == PROJECTION_PER_INDEXER_CALL, (
+                f"{label}: indexer call {idx} ({method}) dispatched {nki} projections where "
+                f"project_stage owes exactly {PROJECTION_PER_INDEXER_CALL} -- one per site at "
+                f"model_fp8.py:3093, :3106, :3113, :3120. A short count means a site was served by "
+                f"mla_projection_torch_oracle (which moves no counter) or was not reached at all; "
+                f"a long one means a site projects more than once"
+            )
+            assert fallback == 0, (
+                f"{label}: indexer call {idx} ({method}) recorded {fallback} torch fallbacks. This "
+                f"counter has no code path that increments it today (mla_projections.py:151-155), "
+                f"so a non-zero reading here means a torch projection route was added and the "
+                f"substrate declaration for this increment must be re-derived, not this number"
+            )
+
+
+def projection_closed_form(
+    label: str, table: tuple[tuple[str, str, int, str], ...], *, layers: int, phases: int
+) -> int:
+    """Print the closed form TERM BY TERM with each term's source, and return the total it declares.
+
+    Printed rather than only asserted because a bare total tells a reader nothing about which term
+    moved when it changes. Every row carries the caller and the seam lines that make its figure.
+    """
+    per_layer_per_phase = sum(count for _key, _what, count, _cite in table)
+    total = 0
+    for key, what, count, cite in table:
+        owed = count * layers * phases
+        total += owed
+        say(
+            label, "projection_term", key, what,
+            f"{count} x {layers} layers x {phases} phases = {owed}", cite,
+        )
+    say(
+        label, "projection_closed_form",
+        " + ".join(str(count) for _key, _what, count, _cite in table),
+        f"= {per_layer_per_phase} per layer per phase",
+        f"x {layers} layers x {phases} phases = {total}",
+    )
+    return total
 
 
 # --------------------------------------------------------------------------- #
@@ -604,6 +894,33 @@ def test_the_declared_table_is_internally_consistent() -> None:
     # would mean the arm had quietly become a second layer case.
     assert all(p == 0 for p, _ in DECLARED_PER_LAYER_RAGGED_ARM.values())
 
+    # THE PROJECTION CLOSED FORM, checked here as a DECLARATION and measured in the two counted runs.
+    # These figures are the predictions file's prediction 6 -- "9 per layer per phase, four in the
+    # indexer's project_stage, one in the layer's own project_query_latent, three inside
+    # project_query_and_latent, one in project_output" -- so the file and the predictions agree by an
+    # assertion rather than by two readers hoping they match. Editing a term without re-deriving the
+    # closed form fails HERE, before any run reads a counter.
+    terms = projection_terms(DECLARED_PROJECTION_TERMS)
+    arm_terms = projection_terms(DECLARED_PROJECTION_TERMS_RAGGED_ARM)
+    say("projection", "terms", "|".join(f"{k}={v}" for k, v in sorted(terms.items())))
+    say("projection", "per_layer_per_phase", PROJECTION_PER_LAYER_PER_PHASE,
+        "indexer", PROJECTION_PER_INDEXER_CALL,
+        "non_indexer", PROJECTION_NON_INDEXER_PER_LAYER_PER_PHASE,
+        "arm_case", PROJECTION_PER_ARM_CASE, "phases", len(PHASES))
+    assert sorted(terms) == [
+        "attend_output", "attend_query_and_latent", "indexer", "layer_query_latent"
+    ], sorted(terms)
+    assert PROJECTION_PER_LAYER_PER_PHASE == 9, PROJECTION_PER_LAYER_PER_PHASE
+    assert PROJECTION_PER_INDEXER_CALL == 4, PROJECTION_PER_INDEXER_CALL
+    assert PROJECTION_NON_INDEXER_PER_LAYER_PER_PHASE == 5
+    assert len(PHASES) == 2, PHASES
+
+    # THE ARM'S ONLY TERM IS THE INDEXER'S, at the same figure, because the arm calls the indexer
+    # directly with no layer and no attend around it. So the arm reads FOUR for its one call.
+    assert sorted(arm_terms) == ["indexer"], sorted(arm_terms)
+    assert arm_terms["indexer"] == PROJECTION_PER_INDEXER_CALL
+    assert PROJECTION_PER_ARM_CASE == PROJECTION_PER_INDEXER_CALL
+
 
 def test_the_counter_api_is_discovered_and_not_spelled_out() -> None:
     """Each family exposes exactly one reset and one reader, and a fresh reset reads (0, 0).
@@ -617,6 +934,27 @@ def test_the_counter_api_is_discovered_and_not_spelled_out() -> None:
         say("counters", family, readings[family])
     assert set(readings) == set(FAMILIES)
     assert all(v == (0, 0) for v in readings.values()), readings
+
+    # THE EIGHTH FAMILY, discovered by the SAME rule out of a DIFFERENT package -- and its pair does
+    # not follow its module name either: ``mla_projections.py`` exposes
+    # ``reset_mla_projection_dispatch_counters``, singular where the module is plural. That is a
+    # second reason the rule is discovery and not spelling.
+    reset_fn, read_fn = _projection_counter_api()
+    say("counters", "projection_api", reset_fn.__name__, read_fn.__name__)
+    reset_projection_counter()
+    projection = read_projection_counter()
+    say("counters", PROJECTION_MODULE, projection)
+    assert projection == (0, 0), projection
+
+    # THE COUNTER IS ITS OWN, and this is the reading that matters rather than a restatement of the
+    # import path. If the projection seam shared a counter object with any dsa family, the per-call
+    # readings below would be that family's dispatches as well and every figure would be double.
+    # Distinct reset functions is what says they are distinct counters.
+    for family in FAMILIES:
+        assert _counter_api(family)[0] is not reset_fn, family
+        assert _counter_api(family)[1] is not read_fn, family
+    # And the seven-family walk cannot reach it, which is WHY its reading was missing until now.
+    assert not PROJECTION_MODULE.startswith("vllm_neuron.functional.dsa."), PROJECTION_MODULE
 
 
 # --------------------------------------------------------------------------- #
@@ -711,16 +1049,33 @@ def _reach(indexer, method: str, *, max_seq_len: int, pool_rows: int | None = No
 
 
 def _refuses(method: str, indexer, *, max_seq_len: int, pool_rows: int | None = None) -> str:
-    """Run one entry point, require a named refusal, and require that NOTHING dispatched."""
+    """Run one entry point, require a named refusal, and require that NOTHING dispatched.
+
+    THE PROJECTION SEAM IS READ HERE TOO, and this is the one class of indexer call whose declared
+    reading is ZERO rather than four. A refusal fires inside ``require_dials()`` and
+    ``_require_serviceable()``, both of which run before ``project_stage`` is reached, so a
+    refusing call that had already projected would have spent four kernel dispatches on operands it
+    then declared unserviceable -- the wrong answer, already computed. Every OTHER indexer call in
+    this file owes exactly four; these eight owe none, and both figures are the same claim about
+    where the refusal sits.
+    """
     reset_all_counters()
+    reset_projection_counter()
     with pytest.raises(_impl().Glm5NextDSAIndexerError) as caught:
         _reach(indexer, method, max_seq_len=max_seq_len, pool_rows=pool_rows)
     readings = read_all_counters()
+    projection = read_projection_counter()
     for family in FAMILIES:
         say("refusal", method, family, readings[family])
+    say("refusal", method, "mla_projection", projection, "want", (0, 0))
     assert all(v == (0, 0) for v in readings.values()), (
         f"a precondition refused AFTER dispatching: {readings}. The refusal exists to keep the "
         f"wrong answer unreachable, so anything it lets run first is already the wrong answer"
+    )
+    assert projection == (0, 0), (
+        f"a precondition refused AFTER projecting: the projection seam read {projection}. "
+        f"require_dials() and _require_serviceable() both run before project_stage, so a non-zero "
+        f"reading here means the refusal moved and now fires downstream of four kernel dispatches"
     )
     return str(caught.value)
 
@@ -870,7 +1225,23 @@ def test_rider_B71_N3_the_indexer_hands_the_pooling_seam_bf16_keys() -> None:
     hidden = torch.randn(tokens, int(indexer.hidden_size), generator=gen, dtype=torch.float32)
     q_latent = torch.randn(tokens, int(indexer.q_lora_rank), generator=gen, dtype=torch.float32)
 
+    # THE RESET/READ PAIR AROUND THIS CALL. It is the third class of indexer call in this file and
+    # the only one that reaches ``project_stage`` directly, so the pair sits here literally rather
+    # than through the probe the two counted runs install on ``forward``/``forward_ragged``. Four
+    # dispatches for four sites, and the rider's own claim depends on it: the dtypes below are what
+    # the KERNELS returned only if the kernels ran, and a torch oracle serving all four would return
+    # the same shapes with no other symptom.
+    reset_projection_counter()
     query, key, weights, gate_score = indexer.project_stage(hidden, q_latent)
+    projection = read_projection_counter()
+    say("B71-N3", "project_stage", "mla_projection", projection,
+        "want", (PROJECTION_PER_INDEXER_CALL, 0))
+    assert projection == (PROJECTION_PER_INDEXER_CALL, 0), (
+        f"project_stage read {projection} where it owes "
+        f"({PROJECTION_PER_INDEXER_CALL}, 0) -- one dispatch per site at model_fp8.py:3093, :3106, "
+        f":3113, :3120. Without this the dtypes asserted below could be a torch oracle's, and this "
+        f"rider is about the ROUTE the seam takes"
+    )
     for name, tensor, want in (
         ("query", query, torch.bfloat16),
         ("key", key, torch.bfloat16),
@@ -1691,6 +2062,13 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
     pool cache, the latent cache and the tail ring all are -- so sharing them would compare a run
     against itself. And the reset sits AFTER the reference because a reference is allowed to move a
     counter; what the route predicate measures is the IMPLEMENTATION's dispatches alone.
+
+    THE PROJECTION COUNTER IS THE ONE EXCEPTION TO STEP 3, and it is deliberate rather than an
+    inconsistency. It is reset ONCE before the phase loop instead of per phase, because its per-case
+    total is the second instrument that the per-call probe is checked against, and a reset inside the
+    loop would leave nothing to check. That is only sound if the reference dispatches nothing, so
+    each leg READS the counter after its own reference and asserts it did not move -- which turns the
+    thing step 3 ASSUMES for the seven families into a measurement for the eighth.
     """
     if not gate_live():
         pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
@@ -1710,7 +2088,19 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
     ref_caches = per_layer_caches(cfg, int(layers))
 
     spy = SeamSpy()
-    for phase in ("prefill", "decode"):
+    # THE PROJECTION COUNTER IS RESET ONCE FOR THE WHOLE CASE, not once per phase, and that is the
+    # difference between one reading and two instruments. The probe below reads each indexer call's
+    # DELTA; this running total reads the case; after the loop the two are checked against each
+    # other and against the closed form. A reset inside the loop would leave only per-phase numbers
+    # and nothing to cross-check them with. The seven family counters keep their per-phase reset --
+    # their declared tables are per phase.
+    projection_probe = IndexerProjectionProbe()
+    reset_projection_counter()
+    assert read_projection_counter() == (0, 0), (
+        "the projection counter did not reset to zero, so every reading below would be partly some "
+        "earlier test's dispatches"
+    )
+    for phase in PHASES:
         if phase == "prefill":
             step_hidden = hidden
             start = 0
@@ -1725,6 +2115,11 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
                 "position": PREFILL_TOKENS,
                 "seq_lens": torch.tensor([PREFILL_TOKENS + 1], dtype=torch.int32),
             }
+
+        # The running projection total at the START of this phase, so both the reference check and
+        # the phase delta below are DIFFERENCES rather than absolute numbers that would each have to
+        # know what the previous phase left behind.
+        projection_mark = read_projection_counter()
 
         # (2) THE REFERENCE, on its own per-layer caches.
         candidates = (PREFILL_TOKENS if phase == "prefill" else PREFILL_TOKENS + 1) // pool
@@ -1759,6 +2154,22 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
                 scores, int(stack[idx].attention.indexer.select_k()), f"{phase}-layer{idx}"
             )
 
+        # THE REFERENCE MOVED NO PROJECTION COUNTER, read rather than assumed. The seven family
+        # counters are reset AFTER the reference precisely because a reference is ALLOWED to move
+        # one; the projection counter is deliberately NOT reset here, because the case total has to
+        # survive both phases. That is only sound if the reference is torch-only, so it is measured
+        # rather than trusted: the reference projects through `_ref_projection`, a plain matmul in
+        # this file, and reaches no seam. If it ever did, the case total would be part reference and
+        # the closed form below would read high for a reason no assertion could name.
+        after_reference = read_projection_counter()
+        say(phase, "projection_after_reference", after_reference, "at_phase_start", projection_mark)
+        assert after_reference == projection_mark, (
+            f"the torch reference moved the projection counter from {projection_mark} to "
+            f"{after_reference} on the {phase} leg. The reference and the implementation have to be "
+            f"computed by different means, and a reference that dispatches the seam under test is "
+            f"comparing the seam against itself"
+        )
+
         # (3) RESET, and prove the reset landed before anything is measured against it.
         reset_all_counters()
         after_reset = read_all_counters()
@@ -1770,6 +2181,10 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         # (4) THE IMPLEMENTATION, on the originals, with the spy installed.
         spy_here = SeamSpy()
         spy_here.install(monkeypatch)
+        # The projection probe is installed in the SAME window as the spy and is undone by the same
+        # `monkeypatch.undo()`, so it can only ever see the implementation's calls. The probe OBJECT
+        # outlives the loop, so its recorded calls accumulate over both phases.
+        projection_probe.install(monkeypatch)
         got = step_hidden
         for layer, caches in zip(stack, impl_caches):
             got = layer.forward(
@@ -1802,6 +2217,24 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
             f"a torch fallback ran on the {phase} leg: {readings}. Every DSA seam here is "
             f"kernel-class (P13), so a fallback is a route failure and not a slow path"
         )
+        # THE PHASE'S PROJECTION DELTA, against the closed form for this many layers and one phase.
+        phase_reading = read_projection_counter()
+        phase_nki = phase_reading[0] - projection_mark[0]
+        phase_fallback = phase_reading[1] - projection_mark[1]
+        want_phase = PROJECTION_PER_LAYER_PER_PHASE * int(layers)
+        say(phase, "projection_phase_delta", phase_nki, "want", want_phase,
+            "torch_fallback", phase_fallback, "running", phase_reading)
+        assert phase_nki == want_phase, (
+            f"the {phase} leg dispatched {phase_nki} projections where {layers} layer(s) owe "
+            f"{want_phase}, at {PROJECTION_PER_LAYER_PER_PHASE} per layer per phase. The terms and "
+            f"their source lines are printed after the loop; a miss is a finding about the closed "
+            f"form or about the layer, and not a number to edit"
+        )
+        assert phase_fallback == 0, (
+            f"the {phase} leg recorded {phase_fallback} projection torch fallbacks, which no code "
+            f"path can produce today (mla_projections.py:151-155), so the substrate declaration for "
+            f"this increment must be re-derived rather than this number relaxed"
+        )
         spy_here.report(f"{phase}-L{layers}")
         report_close(f"item-1-{phase}-L{layers}", got, reference)
 
@@ -1816,6 +2249,46 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         f"the spy's per-family totals {per_family} do not match the declared table {expected}. "
         f"The table is the prediction and the spy is the measurement, so a mismatch is a finding "
         f"about one of them and not a number to edit"
+    )
+
+    # THE PROJECTION SUBSTRATE READING FOR THIS CASE, WITH ITS TERMS -- the reading this file did not
+    # take for twelve attempts. `mla_projection` is the EIGHTH counter family and the seven-family
+    # walk above structurally cannot reach it, because it lives under `functional.attention` while
+    # `FAMILIES` is built from entry points under `functional.dsa`. Review item B86.
+    label = f"item-1-L{layers}"
+    want_total = projection_closed_form(
+        label, DECLARED_PROJECTION_TERMS, layers=int(layers), phases=len(PHASES)
+    )
+    total_nki, total_fallback = read_projection_counter()
+    say(label, "projection_total", total_nki, "want", want_total, "torch_fallback", total_fallback)
+    assert total_nki == want_total, (
+        f"the case dispatched {total_nki} projections where the closed form owes {want_total}. Every "
+        f"term and its source lines are printed above, so a mismatch names itself: a short count is "
+        f"a call served by mla_projection_torch_oracle or not made at all, and a long one is a term "
+        f"the closed form does not know about -- Glm5NextMLAAttention.project_qkv holds four more "
+        f"dispatch sites and is dead on this path, so wiring it in would read here first"
+    )
+    assert total_fallback == 0, f"the case recorded {total_fallback} projection torch fallbacks"
+
+    # TWO INSTRUMENTS OVER THE SAME EVENTS, AND THE RESIDUAL IS THE CHECK. The probe read each
+    # indexer call's delta; the counter read the whole case. So the case total MINUS the indexer's
+    # share must be exactly the non-indexer terms. A probe that double-counted, or an indexer that
+    # projected three times while something else projected five, agrees with neither.
+    projection_probe.check(label, want_calls=int(layers) * len(PHASES))
+    indexer_share = projection_probe.dispatched
+    want_indexer = PROJECTION_PER_INDEXER_CALL * int(layers) * len(PHASES)
+    want_rest = PROJECTION_NON_INDEXER_PER_LAYER_PER_PHASE * int(layers) * len(PHASES)
+    say(label, "projection_indexer_share", indexer_share, "want", want_indexer,
+        "residual", total_nki - indexer_share, "want", want_rest)
+    assert indexer_share == want_indexer, (
+        f"the probe read {indexer_share} projections across the indexer calls where "
+        f"{int(layers) * len(PHASES)} calls at {PROJECTION_PER_INDEXER_CALL} each owe {want_indexer}"
+    )
+    assert total_nki - indexer_share == want_rest, (
+        f"the case total {total_nki} less the indexer's {indexer_share} leaves "
+        f"{total_nki - indexer_share} for the layer's own projections, where the non-indexer terms "
+        f"owe {want_rest}. The two instruments read the same events by different means, so this is "
+        f"where one of them being wrong shows up"
     )
 
     # RIDER B71-N3, read on the PRODUCTION PATH rather than reconstructed. The standalone rider test
@@ -1914,6 +2387,12 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     # Scored first for EVERY request, then read, then expanded. Round 1 asserted inside one loop and
     # aborted at request 0, so request 1's gap never reached the transcript and nobody could tell
     # whether one row was unlucky or the whole draw was bad. The three passes cost one extra list.
+    # Reset the projection counter BEFORE the reference, so the next reading says whether the
+    # reference dispatched the seam under test. The arm's reference calls `_ref_project_stage` once
+    # per request, which is this file's own torch matmul and should reach no seam at all.
+    reset_projection_counter()
+    projection_probe = IndexerProjectionProbe()
+
     select_k = int(indexer.select_k())
     scored: list[tuple[int, torch.Tensor]] = []
     for b, n in enumerate(lengths):
@@ -1937,12 +2416,24 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
         offset += n
     reference = torch.cat(ref_rows, dim=0)
 
+    # THE REFERENCE DISPATCHED NOTHING, read rather than assumed -- the same claim run 1 makes on
+    # each of its legs, for the same reason: the two sides have to be computed by different means.
+    after_reference = read_projection_counter()
+    say("arm", "projection_after_reference", after_reference, "want", (0, 0))
+    assert after_reference == (0, 0), (
+        f"the arm's torch reference moved the projection counter to {after_reference}; the reference "
+        f"projects through `_ref_projection` in this file and must reach no seam"
+    )
+
     reset_all_counters()
+    reset_projection_counter()
     after_reset = read_all_counters()
     assert all(v == (0, 0) for v in after_reset.values()), f"reset did not land: {after_reset}"
+    assert read_projection_counter() == (0, 0), "the projection reset did not land"
 
     spy = SeamSpy()
     spy.install(monkeypatch)
+    projection_probe.install(monkeypatch)
     got = indexer.forward_ragged(
         hidden, q_latent, pool_cache, seq_lens, lengths,
         max_seq_len=max_seq_len, page_size=PAGE_SIZE,
@@ -1958,6 +2449,30 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     assert readings["ragged_pack"][0] > 0, (
         "the ragged arm did not move the pack family, which is the ONLY reason this second run "
         "exists -- part 1 reads 7/7 over the union of the two runs and this is the seventh"
+    )
+
+    # THE ARM'S PROJECTION READING, WITH ITS TERMS. One term, because the arm calls the indexer
+    # directly, and the term is the indexer's four. The probe's per-call reading and this total are
+    # the SAME number here, and that is not a duplication: they arrive by different means, so a
+    # probe that missed the call reads zero calls while the total still reads four.
+    want_arm = projection_closed_form(
+        "arm", DECLARED_PROJECTION_TERMS_RAGGED_ARM, layers=1, phases=1
+    )
+    arm_nki, arm_fallback = read_projection_counter()
+    say("arm", "projection_total", arm_nki, "want", want_arm, "torch_fallback", arm_fallback)
+    assert arm_nki == want_arm, (
+        f"the arm dispatched {arm_nki} projections where it owes {want_arm}. The arm projects the "
+        f"PADDED GRID ONCE rather than once per request -- that commutation is the claim this run "
+        f"exists to test (model_fp8.py:3824-3827) -- so a reading of "
+        f"{PROJECTION_PER_INDEXER_CALL * len(lengths)} would mean it projected per request and the "
+        f"bit-exact comparison below is passing for the wrong reason"
+    )
+    assert arm_fallback == 0, f"the arm recorded {arm_fallback} projection torch fallbacks"
+    projection_probe.check("arm", want_calls=1)
+    assert projection_probe.dispatched == arm_nki, (
+        f"the probe read {projection_probe.dispatched} projections across the arm's indexer calls "
+        f"where the counter read {arm_nki} for the case; the arm makes ONE indexer call and nothing "
+        f"else projects, so the two instruments must agree exactly"
     )
     spy.report("arm")
 
