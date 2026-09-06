@@ -50,6 +50,8 @@ from vllm_neuron.model.glm5_next.utils.vision_preprocessing import (
     REGIME_ABOVE_CEILING,
     REGIME_BELOW_FLOOR,
     REGIME_PLAIN,
+    SMART_RESIZE_MODULE,
+    SMART_RESIZE_NAME,
     Glm5NextDummyInputsBuilder,
     Glm5NextMultiModalProcessor,
     Glm5NextProcessingInfo,
@@ -57,6 +59,8 @@ from vllm_neuron.model.glm5_next.utils.vision_preprocessing import (
     build_mm_fields_config,
     describe_resample,
     image_grid_spec,
+    require_transformers_smart_resize,
+    resolve_canvas,
     video_grid_spec,
 )
 
@@ -83,6 +87,31 @@ PADDING_CONTROL = ("B06_padding_control", 800, 1000)
 #: mid-range so neither can be confused with the zero padding.
 CONTENT_VALUE_A = 200
 CONTENT_VALUE_B = 100
+
+# ---------------------------------------------------------------------------
+# The R2 grid (ruling design-20260906-au). Every integer below was READ from
+# ``derive-056r2-divergence.out``, the record filed with this repair, and is quoted here by case name rather
+# than recomputed, so this file cannot become a transcription of its own answer.
+#
+# (case name, height, width, regime, count at patch_expand_factor 1, count at 2, HF's public counter)
+#
+# HF's public counter appears once, not twice, because it drops ``patch_expand_factor`` -- it answers the same
+# number whatever the factor is, and that is the whole point of the divergence item below.
+# ---------------------------------------------------------------------------
+R2_CASES = (
+    ("aligned_to_both_factors", 448, 448, REGIME_PLAIN, 1024, 1024, 1024),
+    ("aligned_to_28_only", 420, 336, REGIME_PLAIN, 720, 768, 720),
+    ("tiny_floor_bound", 60, 40, REGIME_BELOW_FLOOR, 80, 320, 80),
+    ("tiny_square", 32, 32, REGIME_BELOW_FLOOR, 64, 256, 64),
+    ("odd_mid_size", 500, 333, REGIME_PLAIN, 864, 864, 864),
+    ("huge_ceiling_bound", 8000, 6000, REGIME_ABOVE_CEILING, 31724, 126896, 31724),
+    ("wide_strip", 1400, 56, REGIME_PLAIN, 400, 400, 400),
+)
+
+#: The one R2 case whose real-pixel arm is skipped: an 8000x6000 uint8 image is 144 million pixels and
+#: resampling it on CPU costs more than the reading is worth. Its ARITHMETIC arm still runs, and regime C is
+#: already measured against the real processor by B03 at 2800x2800.
+R2_TOO_BIG_FOR_REAL_PIXELS = "huge_ceiling_bound"
 
 
 # ---------------------------------------------------------------------------
@@ -477,3 +506,358 @@ def test_c06_report_the_measured_readings(image_consts, video_consts, image_orac
     lines.append(f"  padding-control pad = {record.pad_bottom} bottom, {record.pad_right} right")
     with capsys.disabled():
         print("\n" + "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# The R2 items (ruling design-20260906-au). Two things are measured here that C01-C06 could not measure: that
+# the canvas arithmetic is CONSUMED from transformers rather than re-derived, and that the vLLM bridge has a
+# failing path at all -- before R2 the four bridge methods were only checked by name.
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def offline_tokenizer():
+    """A real tokenizer, built in memory, because the HF processor refuses a duck type.
+
+    ``Glm5NextProcessor.__init__`` type-checks its tokenizer argument and rejects anything that is not a
+    ``PreTrainedTokenizerBase``, so the bridge cannot be exercised with a stub. This builds the smallest real
+    fast tokenizer that round-trips the tokens the bridge cares about, with no checkpoint and no network: the
+    fixture directory carries no tokenizer files, and downloading one would make this suite need a network.
+    """
+    from tokenizers import Regex, Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    words = [
+        "text",
+        "<|image|>",
+        "<|video|>",
+        "<|begin_of_video|>",
+        "<|end_of_video|>",
+        "<|begin_of_image|>",
+        "<|end_of_image|>",
+    ]
+    vocab = {word: index for index, word in enumerate(words)}
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="text"))
+    backend.pre_tokenizer = pre_tokenizers.Split(
+        pattern=Regex(r"<\|[a-z_]+\|>|[a-z]+"), behavior="isolated"
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="text")
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": [word for word in words if word.startswith("<|")]}
+    )
+    tokenizer.image_token = "<|image|>"
+    tokenizer.image_token_id = vocab["<|image|>"]
+    tokenizer.video_token = "<|video|>"
+    tokenizer.video_token_id = vocab["<|video|>"]
+    return tokenizer
+
+
+@pytest.fixture(scope="module")
+def hf_processor(glm5_next_pkg, offline_tokenizer):
+    """The real transformers processor, holding the real image and video sub-processors."""
+    return glm5_next_pkg.Glm5NextProcessor(
+        image_processor=glm5_next_pkg.Glm5NextImageProcessor(),
+        tokenizer=offline_tokenizer,
+        video_processor=glm5_next_pkg.Glm5NextVideoProcessor(),
+    )
+
+
+@pytest.fixture
+def bridge(hf_processor, offline_tokenizer, monkeypatch):
+    """The bridge under test, wired to the real transformers processor.
+
+    vLLM resolves an HF processor from a model config and a checkpoint on disk, which this suite does not have.
+    The ONE seam is therefore vLLM's own ``BaseProcessingInfo.get_hf_processor``, replaced by the real processor
+    above. No fork method is replaced: the bridge methods below run their own code, and every grid they read is
+    produced by transformers.
+    """
+    from vllm.config.multimodal import MultiModalConfig
+    from vllm.multimodal.processing import context as vllm_context
+
+    multimodal_config = MultiModalConfig()
+
+    class _OfflineModelConfig:
+        model = "glm5-next-offline-fixture"
+        tokenizer = model
+        trust_remote_code = False
+        hf_config = None
+        dtype = torch.float32
+
+        def get_multimodal_config(self):
+            return multimodal_config
+
+    _OfflineModelConfig.multimodal_config = multimodal_config
+    monkeypatch.setattr(
+        vllm_context.BaseProcessingInfo,
+        "get_hf_processor",
+        lambda self, **kwargs: hf_processor,
+    )
+    ctx = vllm_context.InputProcessingContext(_OfflineModelConfig(), offline_tokenizer)
+    info = Glm5NextProcessingInfo(ctx)
+    return info, Glm5NextMultiModalProcessor(info, Glm5NextDummyInputsBuilder(info))
+
+
+def test_m01_the_consumed_canvas_function_resolves_and_refuses_by_name(glm5_next_pkg, monkeypatch):
+    """The canvas arithmetic is imported from transformers, and the import is guarded by a named refusal.
+
+    The function is not on the package surface -- that is measured here rather than assumed, because it is the
+    whole reason the fork names a private submodule -- so the refusal is what turns a moved private name into a
+    message naming the module, the symbol and the remedy, instead of an ``AttributeError`` from inside a grid
+    computation. The planted control deletes the symbol and checks the refusal actually fires: without it, a
+    refusal that could never trigger would read exactly like a working one.
+    """
+    import importlib
+
+    assert not hasattr(glm5_next_pkg, SMART_RESIZE_NAME), (
+        f"transformers.models.glm5_next now exposes {SMART_RESIZE_NAME} on its package surface. The fork can "
+        "stop naming the private submodule -- update the helper and delete this assertion's reason."
+    )
+
+    module = importlib.import_module(SMART_RESIZE_MODULE)
+    resolved = require_transformers_smart_resize()
+    assert resolved is getattr(module, SMART_RESIZE_NAME)
+    assert callable(resolved)
+
+    monkeypatch.delattr(module, SMART_RESIZE_NAME)
+    with pytest.raises(RuntimeError) as excinfo:
+        require_transformers_smart_resize()
+    message = str(excinfo.value)
+    assert SMART_RESIZE_MODULE in message and SMART_RESIZE_NAME in message, message
+
+
+@pytest.mark.parametrize("case", R2_CASES, ids=[case[0] for case in R2_CASES])
+def test_m02_the_consumed_canvas_and_the_fork_count_agree_with_transformers(
+    image_oracle, image_consts, case
+):
+    """At this checkpoint's factor the fork's count equals transformers' own, on all seven sizes.
+
+    Two oracles, because they answer different questions. ``get_number_of_image_patches`` is arithmetic and
+    runs on every case including the huge one. The real processor is pixels, and its ``image_grid_thw`` and
+    row count are what the served path actually produces.
+    """
+    name, height, width, _regime, count_at_factor_1, _count_at_factor_2, hf_count = case
+    assert image_consts.patch_expand_factor == 1, (
+        "this item states the agreeing case, which is patch_expand_factor 1; the divergence is m03"
+    )
+
+    spec = image_grid_spec(image_consts, height, width)
+    assert spec.grid_h * spec.grid_w == count_at_factor_1, (
+        f"{name}: the fork counts {spec.grid_h * spec.grid_w} patches where the filed derivation recorded "
+        f"{count_at_factor_1}."
+    )
+    assert image_oracle.get_number_of_image_patches(height, width, {}) == hf_count
+    assert spec.grid_h * spec.grid_w == image_oracle.get_number_of_image_patches(height, width, {})
+
+    if name != R2_TOO_BIG_FOR_REAL_PIXELS:
+        out = _run_image_oracle(image_oracle, height, width)
+        assert out["image_grid_thw"].tolist() == [list(spec.thw)], name
+        assert int(out["pixel_values"].shape[0]) == spec.num_patch_rows, name
+
+
+def test_m03_the_fork_count_keeps_patch_expand_factor_where_transformers_drops_it(
+    image_oracle, image_consts
+):
+    """The divergence, case by case, with the integers the filed derivation recorded.
+
+    Transformers' public counter computes its alignment as ``patch_size * merge_size`` while its own
+    preprocessing path multiplies by ``patch_expand_factor``. Consuming that counter would import the
+    inconsistency, so the fork divides over the consumed canvas instead. This item is what makes that visible:
+    at factor 2 the counter answers as though the factor were 1 -- it is handed the factor and ignores it --
+    and four of the seven cases move while three do not. Both lists are asserted, so neither "they always
+    differ" nor "they always agree" can satisfy this item.
+
+    EVERY CASE IS PINNED WITH ITS REGIME, and the regime is read back from the fork's own answer rather than
+    trusted from the table: the two moving-by-scale cases are regime B, the ceiling case is regime C, and the
+    alignment-rounding case is regime A. A case that quietly changed regime would otherwise keep its integers
+    and slide between the two lists unnoticed, which is the one way this item could go stale while passing.
+    """
+    doubled = GridConstants(
+        patch_size=image_consts.patch_size,
+        merge_size=image_consts.merge_size,
+        temporal_patch_size=image_consts.temporal_patch_size,
+        patch_expand_factor=2,
+        min_image_tokens=image_consts.min_image_tokens,
+        max_image_tokens=image_consts.max_image_tokens,
+    )
+    differing, agreeing = [], []
+    for name, height, width, regime, _count_1, count_at_factor_2, hf_count in R2_CASES:
+        spec = image_grid_spec(doubled, height, width)
+        assert spec.regime == regime, (
+            f"{name}: the filed derivation recorded regime {regime} at patch_expand_factor 2 and the fork now "
+            f"answers {spec.regime}. A case that changed regime is not the case this item pinned."
+        )
+        assert spec.grid_h * spec.grid_w == count_at_factor_2, (
+            f"{name} (regime {regime}): at patch_expand_factor 2 the fork counts "
+            f"{spec.grid_h * spec.grid_w} where the filed derivation recorded {count_at_factor_2}."
+        )
+        assert (
+            image_oracle.get_number_of_image_patches(height, width, {"patch_expand_factor": 2}) == hf_count
+        ), (
+            f"{name} (regime {regime}): transformers' counter changed its answer when handed the factor it "
+            "used to ignore."
+        )
+        (differing if count_at_factor_2 != hf_count else agreeing).append((name, regime))
+
+    assert differing == [
+        ("aligned_to_28_only", REGIME_PLAIN),
+        ("tiny_floor_bound", REGIME_BELOW_FLOOR),
+        ("tiny_square", REGIME_BELOW_FLOOR),
+        ("huge_ceiling_bound", REGIME_ABOVE_CEILING),
+    ], differing
+    assert agreeing == [
+        ("aligned_to_both_factors", REGIME_PLAIN),
+        ("odd_mid_size", REGIME_PLAIN),
+        ("wide_strip", REGIME_PLAIN),
+    ], agreeing
+
+
+@pytest.mark.parametrize("case", R2_CASES, ids=[case[0] for case in R2_CASES])
+def test_m04_the_regime_label_names_the_branch_transformers_would_take(image_consts, case):
+    """The label the fork still owns, checked against this test's own statement of the rule.
+
+    ``smart_resize`` returns a canvas and never says which branch produced it, so the label cannot be consumed
+    and is pinned instead. The expected value is computed here, in the test, from the plainly aligned canvas
+    and the two budgets -- which is what transformers compares against -- so the label is measured against a
+    second statement of the rule rather than against the code that produces it.
+    """
+    name, height, width, regime, *_rest = case
+    factor = image_consts.factor
+
+    def rounded_up(value: int) -> int:
+        return -(-value // factor) * factor
+
+    plain_budget = image_consts.temporal_patch_size * rounded_up(height) * rounded_up(width)
+    if plain_budget < image_consts.floor_pixels:
+        expected = REGIME_BELOW_FLOOR
+    elif plain_budget > image_consts.ceiling_pixels:
+        expected = REGIME_ABOVE_CEILING
+    else:
+        expected = REGIME_PLAIN
+
+    _canvas_height, _canvas_width, got = resolve_canvas(
+        image_consts, num_frames=image_consts.temporal_patch_size, height=height, width=width
+    )
+    assert got == expected, f"{name}: plain budget {plain_budget} says {expected}, the fork says {got}"
+    assert got == regime, f"{name}: the filed derivation recorded {regime}"
+
+
+@pytest.mark.parametrize("num_frames", [1, 2, 3, 4, 5, 7, 8])
+def test_m05_the_video_grid_frame_count_is_the_padding_transformers_patchifies(
+    video_oracle, video_consts, num_frames
+):
+    """The video grid stays the fork's arithmetic, because transformers exposes no video counter, so it is
+    pinned against the real video processor's own ``video_grid_thw`` across a frame sweep."""
+    spec = video_grid_spec(video_consts, num_frames, 112, 112)
+    out = _run_video_oracle(video_oracle, num_frames, 112, 112)
+    assert out["video_grid_thw"].tolist() == [list(spec.thw)], f"F={num_frames}"
+
+
+def test_m05_the_budget_rounding_and_the_grid_padding_are_different_rules(video_consts):
+    """The firing control for the pair above: the two frame roundings must not be one function.
+
+    The pixel budget rounds to the NEAREST whole temporal patch, as ``smart_resize`` does; the grid pads UP,
+    as ``patchify`` does. At five frames they disagree, and a single shared helper would make this item fail.
+    """
+    padded = video_grid_spec(video_consts, 5, 112, 112).grid_t * video_consts.temporal_patch_size
+    assert padded == 6
+    assert video_consts.aligned_frames(5) == 4
+    assert video_consts.aligned_frames(5) != padded
+
+
+def test_m06_the_bridge_token_count_equals_the_processors_own_grid(bridge, image_oracle):
+    """``get_num_image_tokens`` against the real processor's grid, which is what vLLM budgets against.
+
+    A count that is too small truncates the placeholder run and the image is silently cropped; too large and
+    vLLM raises on the mismatch. Neither had a failing path before this item.
+    """
+    info, _processor = bridge
+    merge_length = image_oracle.merge_size**2
+    for name, height, width, _regime, *_rest in R2_CASES:
+        if name == R2_TOO_BIG_FOR_REAL_PIXELS:
+            continue
+        out = _run_image_oracle(image_oracle, height, width)
+        expected = int(out["image_grid_thw"].prod()) // merge_length
+        assert info.get_num_image_tokens(image_width=width, image_height=height) == expected, name
+
+
+def test_m07_the_profiling_size_is_the_largest_that_fits_and_the_next_step_does_not(bridge):
+    """``get_image_size_with_most_features`` bounded from BOTH sides, so an off-by-one either way fails.
+
+    vLLM profiles memory with this size. Too small and the server under-reserves and can be killed under load;
+    too large and it over-reserves and refuses requests it could have served.
+    """
+    info, _processor = bridge
+    consts = info.get_grid_constants()
+    size = info.get_image_size_with_most_features()
+    frames = consts.temporal_patch_size
+
+    assert frames * size.height * size.width <= consts.ceiling_pixels
+    assert (
+        frames * (size.height + consts.factor) * (size.width + consts.factor) > consts.ceiling_pixels
+    ), "one more alignment step still fits, so this is not the largest size"
+    assert size.height % consts.factor == 0 and size.width % consts.factor == 0
+    assert size.height == size.width
+
+
+def test_m08_the_placeholder_replacement_is_the_items_own_token_count(bridge, image_oracle):
+    """``_get_prompt_updates`` builds one replacement per image, sized by that image's own grid.
+
+    The replacement callable is driven with the grid the real processor produced for one item. A wrong merge
+    length or a grid read off the wrong item changes the length, and the length is asserted exactly.
+    """
+    from vllm.multimodal.parse import MultiModalDataParser
+
+    info, processor = bridge
+    height, width = 784, 1036
+    out = _run_image_oracle(image_oracle, height, width)
+    grid = out["image_grid_thw"]
+    expected = int(grid.prod()) // image_oracle.merge_size**2
+
+    class _Item:
+        data = grid[0]
+
+    mm_items = MultiModalDataParser().parse_mm_data(
+        {"image": [torch.full((3, height, width), CONTENT_VALUE_A, dtype=torch.uint8)]}
+    )
+    updates = processor._get_prompt_updates(mm_items, {}, {"image": [{"image_grid_thw": _Item()}]})
+    assert len(updates) == 1
+    replacement = updates[0].replacement(0)
+    assert len(replacement) == expected
+    assert set(replacement) == {info.get_hf_processor().image_token_id}
+    assert len(replacement) != int(grid.prod()), (
+        "the replacement is as long as the PATCH count, so the 2x2 merge was never applied"
+    )
+
+
+def test_m09_apply_expands_one_image_to_its_own_token_run(bridge, image_oracle):
+    """vLLM's own ``apply`` end to end, which is the path a served request takes.
+
+    The fork overrides only the field config and the prompt updates, so this item is what shows the two of them
+    compose correctly inside the base implementation: one image, one placeholder in the prompt, and a token run
+    exactly as long as the grid says.
+    """
+    from vllm.multimodal.parse import MultiModalDataParser
+    from vllm.multimodal.processing.context import TimingContext
+    from vllm.multimodal.processing.inputs import ProcessorInputs
+
+    info, processor = bridge
+    height, width = 784, 1036
+    image = torch.full((3, height, width), CONTENT_VALUE_A, dtype=torch.uint8)
+    image_token = info.get_hf_processor().image_token
+    image_token_id = info.get_hf_processor().image_token_id
+
+    out = processor.apply(
+        ProcessorInputs(
+            prompt=f"text {image_token} text",
+            mm_data_items=MultiModalDataParser().parse_mm_data({"image": [image]}),
+            mm_uuid_items=None,
+            hf_processor_mm_kwargs={},
+            tokenization_kwargs={},
+        ),
+        TimingContext(),
+    )
+
+    oracle_grid = _run_image_oracle(image_oracle, height, width)["image_grid_thw"]
+    expected_tokens = int(oracle_grid.prod()) // image_oracle.merge_size**2
+    ids = out["prompt_token_ids"]
+    assert sum(1 for token_id in ids if token_id == image_token_id) == expected_tokens
+    assert out["mm_kwargs"]["image"][0]["image_grid_thw"].data.tolist() == oracle_grid[0].tolist()
+    assert len(ids) > expected_tokens, "the text around the placeholder was dropped"

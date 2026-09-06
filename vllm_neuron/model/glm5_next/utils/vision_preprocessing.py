@@ -2,11 +2,19 @@
 """Vision preprocessing bridge for GLM-5.3-Flash (``glm5_next``).
 
 WHAT THIS FILE IS FOR. vLLM 0.24.0 has no ``glm5_next`` multimodal processor, so an image handed to this
-architecture never reaches the vision tower. Transformers 5.16.1 already has the patch-grid arithmetic and
-this file does not re-derive it: a second implementation of the same rule is a place for the two to drift
-apart. What is missing, and what this file supplies, is the vLLM-side bridge -- the processing-info,
-dummy-inputs and multimodal-processor triple that vLLM asks a model for -- plus a closed form for the grid
-that a test can compare against the transformers path.
+architecture never reaches the vision tower. What is missing, and what this file supplies, is the vLLM-side
+bridge -- the processing-info, dummy-inputs and multimodal-processor triple that vLLM asks a model for.
+
+WHAT IS CONSUMED, AND WHAT IS NOT. Every canvas is transformers' own answer: ``resolve_canvas`` calls
+``smart_resize`` through the one helper below that names its private submodule. Three things transformers does
+not offer stay here, and each is pinned by a test against the transformers path rather than trusted. The
+REGIME LABEL, because ``smart_resize`` returns a canvas and never says which of its three branches produced
+it. The VIDEO grid, because ``Glm5NextVideoProcessor`` at 5.16.1 carries no ``get_number_of_video_patches``
+and the processor method that calls it raises before reaching it. The RESAMPLE RECORD, because the same
+arithmetic lives inside the image processor's ``resize``, which needs real pixels and hands back pixels rather
+than numbers. The patch COUNT is this file's own division over the consumed canvas, and deliberately not
+transformers' ``get_number_of_image_patches``: that method drops ``patch_expand_factor`` where the real
+preprocessing path applies it, so consuming it would import an inconsistency instead of avoiding one.
 
 THE GRID, IN WORDS. The processor pads an image out to a canvas whose sides are multiples of
 ``patch_size * merge_size`` (28 for this checkpoint), then cuts the canvas into 14-pixel patches and merges
@@ -89,6 +97,51 @@ def require_transformers_glm5_next():
     return glm5_next_pkg
 
 
+#: Where transformers keeps the canvas arithmetic, and what it is called there. Named once, in constants, so
+#: the refusal below and the acceptance item that checks the symbol read the same two strings.
+SMART_RESIZE_MODULE = "transformers.models.glm5_next.image_processing_glm5_next"
+SMART_RESIZE_NAME = "smart_resize"
+
+
+def require_transformers_smart_resize():
+    """Return transformers' own ``smart_resize``, refusing by name when it is not reachable.
+
+    This is the ONE place in the fork that names a private transformers path, and it is here because the
+    function is not on the package's public surface: ``transformers.models.glm5_next`` is a lazy module built
+    from each submodule's ``__all__``, and those name the classes only. So ``from transformers.models.glm5_next
+    import smart_resize`` raises ``AttributeError`` and the submodule above is the only route.
+
+    A private name can move inside the declared version range. The trade was made deliberately -- consuming
+    the arithmetic is worth more than the stability of a public name, because a second implementation drifts
+    silently while a moved import fails loudly -- and this refusal is what makes it fail loudly, with the
+    remedy named. Do not answer a raised refusal by reinstating the arithmetic.
+    """
+    require_transformers_glm5_next()
+
+    import importlib
+
+    import transformers
+
+    try:
+        module = importlib.import_module(SMART_RESIZE_MODULE)
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{SMART_RESIZE_MODULE} is not importable in the installed transformers "
+            f"{transformers.__version__}. GLM-5.3-Flash consumes its canvas arithmetic from that module and "
+            "does not re-derive it. Port this one helper to wherever the function now lives."
+        ) from exc
+
+    smart_resize = getattr(module, SMART_RESIZE_NAME, None)
+    if smart_resize is None:
+        raise RuntimeError(
+            f"{SMART_RESIZE_MODULE} carries no {SMART_RESIZE_NAME} in the installed transformers "
+            f"{transformers.__version__}. It is a private name, so a release inside the declared range "
+            f"(>={GLM5_NEXT_TRANSFORMERS_FLOOR},<6.0.0) can move or rename it. Port this one helper to the "
+            "new name rather than reinstating the arithmetic here."
+        )
+    return smart_resize
+
+
 @dataclass(frozen=True)
 class GridConstants:
     """The six numbers the patch grid depends on, read off a processor rather than typed.
@@ -139,6 +192,20 @@ class GridConstants:
     def merge_length(self) -> int:
         """Patch rows per merged token, 4 for this checkpoint."""
         return self.merge_size**2
+
+    def aligned_frames(self, num_frames: int) -> int:
+        """Frames the PIXEL BUDGET is measured over, aligned to whole temporal patches.
+
+        This is not the grid's frame count, and the difference is deliberate. The budget rounds to the NEAREST
+        multiple, which is what transformers' ``smart_resize`` does before it compares against the floor; the
+        grid pads UP by ``-num_frames % temporal_patch_size``, which is what its ``patchify`` does. Two
+        roundings of the same quantity, so they are two methods rather than one shared helper that would have
+        to be right for both.
+        """
+        return max(
+            self.temporal_patch_size,
+            round(num_frames / self.temporal_patch_size) * self.temporal_patch_size,
+        )
 
 
 @dataclass(frozen=True)
@@ -214,67 +281,62 @@ class ResampleRecord:
         )
 
 
-def _align(value: int, factor: int) -> int:
-    """Round up to the next multiple of ``factor``."""
-    return math.ceil(value / factor) * factor
-
-
-def _largest_canvas_within_budget(
-    aligned_frames: int, height: int, width: int, factor: int, ceiling_pixels: int
-) -> tuple[int, int]:
-    """The regime C search: the largest aligned canvas whose budget fits under the ceiling.
-
-    This walks the same bounded search the transformers path walks, on the content height, keeping the
-    aspect ratio. It is a search rather than one division because the alignment makes the budget a step
-    function of the content height, so the largest admissible height cannot be divided out directly.
-    """
-    low, high = 1, height
-    best_height, best_width = factor, factor
-    while low <= high:
-        content_height = (low + high) // 2
-        content_width = max(1, math.floor(width * content_height / height))
-        candidate_height = _align(content_height, factor)
-        candidate_width = _align(content_width, factor)
-        if aligned_frames * candidate_height * candidate_width <= ceiling_pixels:
-            best_height, best_width = candidate_height, candidate_width
-            low = content_height + 1
-        else:
-            high = content_height - 1
-    return best_height, best_width
-
-
 def resolve_canvas(
     consts: GridConstants, *, num_frames: int, height: int, width: int, ceiling_pixels: int | None = None
 ) -> tuple[int, int, str]:
     """The canvas an input is padded or scaled onto, and which regime decided it.
 
+    The canvas is transformers' answer, not a second implementation of it. What is derived here is the REGIME
+    LABEL, because ``smart_resize`` hands back two numbers and never says which of its branches produced them,
+    while this fork's resample record and its tests name the branch.
+
+    The label is decided by transformers' own condition, evaluated on a canvas transformers produced: calling
+    the same function with the floor switched off returns the plainly aligned canvas, which is exactly what
+    transformers tests its floor against. Above the ceiling is then the remaining case on the same budget. This
+    reads the branch rather than re-walking it, so the label cannot disagree with the canvas beside it.
+
     ``num_frames`` is what the caller hands the resizer: ``temporal_patch_size`` for a still image, the real
     frame count for a video. Getting that wrong moves regime B's answer, which is why it is a parameter here
     and not an assumption.
+
+    The ceiling is expressed to transformers in TOKENS, so an override that is not a whole number of tokens is
+    truncated down to one. The default is ``max_image_tokens`` tokens exactly and no caller overrides it today.
+
+    One configuration is out of scope by construction: a processor whose ``min_image_tokens`` exceeds its
+    ``max_image_tokens`` could take the floor branch and still land above the ceiling, and the label would read
+    the floor. Both numbers are read off the processor, whose defaults are 16 and 8000.
     """
+    smart_resize = require_transformers_smart_resize()
     factor = consts.factor
     ceiling = consts.ceiling_pixels if ceiling_pixels is None else ceiling_pixels
-    aligned_frames = max(
-        consts.temporal_patch_size,
-        round(num_frames / consts.temporal_patch_size) * consts.temporal_patch_size,
-    )
 
-    canvas_height, canvas_width = _align(height, factor), _align(width, factor)
-    budget = aligned_frames * canvas_height * canvas_width
-    regime = REGIME_PLAIN
-
-    if budget < consts.floor_pixels:
-        regime = REGIME_BELOW_FLOOR
-        scale = math.sqrt(consts.floor_pixels / (num_frames * height * width))
-        canvas_height = _align(max(1, math.ceil(height * scale)), factor)
-        canvas_width = _align(max(1, math.ceil(width * scale)), factor)
-        budget = aligned_frames * canvas_height * canvas_width
-
-    if budget > ceiling:
-        regime = REGIME_ABOVE_CEILING
-        canvas_height, canvas_width = _largest_canvas_within_budget(
-            aligned_frames, height, width, factor, ceiling
+    def canvas(min_tokens: int, max_tokens: int) -> tuple[int, int]:
+        return smart_resize(
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            temporal_factor=consts.temporal_patch_size,
+            factor=factor,
+            min_pixels=min_tokens,
+            max_pixels=max_tokens,
         )
+
+    # A token count the plainly aligned canvas cannot reach, so passing it switches the ceiling OFF without a
+    # magic number: alignment adds under one factor to each side, and the budget's frame count exceeds the
+    # input's by at most one temporal patch.
+    unreachable_tokens = (
+        (num_frames + consts.temporal_patch_size) * (height + factor) * (width + factor)
+    ) // consts.pixels_per_token + 1
+
+    plain_height, plain_width = canvas(0, unreachable_tokens)
+    canvas_height, canvas_width = canvas(consts.min_image_tokens, ceiling // consts.pixels_per_token)
+
+    plain_budget = consts.aligned_frames(num_frames) * plain_height * plain_width
+    regime = REGIME_PLAIN
+    if plain_budget < consts.floor_pixels:
+        regime = REGIME_BELOW_FLOOR
+    elif plain_budget > ceiling:
+        regime = REGIME_ABOVE_CEILING
 
     return canvas_height, canvas_width, regime
 
@@ -516,6 +578,8 @@ __all__ = [
     "REGIME_ABOVE_CEILING",
     "REGIME_BELOW_FLOOR",
     "REGIME_PLAIN",
+    "SMART_RESIZE_MODULE",
+    "SMART_RESIZE_NAME",
     "Glm5NextDummyInputsBuilder",
     "Glm5NextMultiModalProcessor",
     "Glm5NextProcessingInfo",
@@ -527,6 +591,7 @@ __all__ = [
     "image_grid_spec",
     "register_glm5_next_multimodal",
     "require_transformers_glm5_next",
+    "require_transformers_smart_resize",
     "resolve_canvas",
     "video_grid_spec",
 ]
