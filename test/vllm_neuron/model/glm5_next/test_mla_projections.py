@@ -67,6 +67,22 @@ DECLARED_SITES = (
 #: round also added the 20-line `swiglu_limit` block between `mla_use_nope` and
 #: it. `13 + 20 = 33`, and the file grew by exactly 33 lines, so the two causes
 #: account for the whole drift with nothing left over.
+#:
+#: RE-PINNED AT `inc-glm53f-051`. Again not one VALUE moved, and this time eight of
+#: the nine LINES did not move either: `rms_norm_eps` alone went `221 -> 256`, which
+#: is `+35`. This block inserted the DSA indexer's section between `mla_use_nope`
+#: and it -- `config.py:184-218`, the seven dials and their prose -- and that
+#: insertion is the whole of this increment's change to `config.py`: git reads one
+#: hunk, `@@ -183,0 +184,35 @@`, and `35 0` for the file. So `221 + 35 = 256`
+#: accounts for the drift with nothing left over, and the eight fields ABOVE the
+#: insertion are unmoved for exactly the same reason. The old number is kept in this
+#: prose rather than only in the tuple, which is the file's own precedent above.
+#:
+#: AND THE LINE NUMBERS STAY TYPED LITERALS. Conjunct 1 reads each field's line from
+#: the AST in order to CHECK it, so typing the number here is what gives it something
+#: to check. Deriving the pin from the same AST would make `got_line ==
+#: expected_line` true by construction, and a pin that cannot fail is not a pin --
+#: which is the point of pinning it that the note at the top of this block makes.
 DECLARED_CONFIG_FIELDS = (
     ("hidden_size", 4096, 151),
     ("num_attention_heads", 64, 153),
@@ -76,7 +92,7 @@ DECLARED_CONFIG_FIELDS = (
     ("qk_rope_head_dim", 0, 180),
     ("v_head_dim", 256, 181),
     ("mla_use_nope", True, 182),
-    ("rms_norm_eps", 1e-05, 221),
+    ("rms_norm_eps", 1e-05, 256),
 )
 
 #: The sequence length every case runs at. Above the sub-kernel-selection
