@@ -3681,7 +3681,24 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     )
     print(f"CONJUNCT4_PARAMETERS_COMPARED={len(left)}")
 
-    declared = {f"{path}.{leaf}" for path, _, leaf, _, _ in _sharded_leaves(whole)}
+    # ``inc-glm53f-101``, the FIFTH moved number (DECISIONS §83 ruling 2). The
+    # routed bank's three families join the declared-sharded set here. They were
+    # counted in the REPLICATED set at ``-094`` -- "replicated-in-effect,
+    # attachment deferred to inc-glm53f-101" in the ratified table's own words --
+    # and this reading ends that count, because `-101` attached them: at world 2
+    # with expert-parallel degree 1 the bank's experts are all local and its
+    # intermediate width divides across the whole world, so every one of its
+    # leaves differs between the two world sizes. Measured before the edit:
+    # ``CONJUNCT4_MOVED=48`` against ``CONJUNCT4_DECLARED_SHARDED=39``, the nine
+    # names being the bank's three leaves in the three MoE layers
+    # (``accept-101-r9-host.out``). ``declared`` now reads 48.
+    declared = {
+        f"{path}.{leaf}" for path, _, leaf, _, _ in _sharded_leaves(whole)
+    } | {
+        f"{path}.{leaf}"
+        for path, module, leaf, _, _ in _deferred_leaves(whole)
+        if type(module).__name__ in DEFERRED_EP_GROUP_CLASSES
+    }
     identical = {
         name
         for name in left
@@ -3708,6 +3725,14 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     for name in sorted(identical):
         owner = type(whole.get_submodule(name.rpartition(".")[0])).__name__
         by_owner.setdefault(owner, set()).add(name.rpartition(".")[2])
+    # The same tally over the set that MOVED, needed because the routed clause is
+    # now a counted zero: an empty replicated tally reads the same whether the bank
+    # left the replicated set or was never built, and D1.5 wants the reading to
+    # move. This is the side that must be non-empty.
+    by_owner_moved: dict[str, set[str]] = {}
+    for name in sorted(moved):
+        owner = type(whole.get_submodule(name.rpartition(".")[0])).__name__
+        by_owner_moved.setdefault(owner, set()).add(name.rpartition(".")[2])
     mla = sorted(by_owner.get("Glm5NextMLAAttention", ()))
     routed = sorted(by_owner.get("Glm5NextRoutedExperts", ()))
     shared = sorted(by_owner.get("Glm5NextSharedExperts", ()))
@@ -3718,9 +3743,31 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
         "no MLA parameter stayed identical, so the three families deferred to "
         "inc-glm53f-100 cannot be counted replicated-in-effect here"
     )
-    assert routed, (
-        "no routed-expert parameter stayed identical, so the families deferred to "
-        "inc-glm53f-101 cannot be counted replicated-in-effect here"
+    # ── THE ROUTED CLAUSE, INVERTED BY ``inc-glm53f-101`` ─────────────────────
+    # DECISIONS §83 ruling 2. The clause this replaces read, in these words:
+    #
+    #     assert routed, (
+    #         "no routed-expert parameter stayed identical, so the families
+    #         deferred to inc-glm53f-101 cannot be counted replicated-in-effect
+    #         here")
+    #
+    # It asserted the bank stayed REPLICATED, and the message named this
+    # increment as the one that would end that reading. `-101` attached the
+    # bank's three families, so the assertion now says the opposite of what it
+    # said, and the old text is quoted rather than deleted so the reversal is
+    # legible -- the form the (v) replacement below already uses.
+    routed_that_moved = sorted(by_owner_moved.get("Glm5NextRoutedExperts", ()))
+    print(f"CONJUNCT4_ROUTED_LEAVES_THAT_MOVED={routed_that_moved}")
+    assert routed == [], (
+        f"a routed-expert parameter stayed identical across the two world sizes: "
+        f"{routed}. inc-glm53f-101 attached the bank's three families, so at world "
+        f"2 with expert-parallel degree 1 every one of its leaves must differ -- "
+        f"the experts are all local and the intermediate width divides across the "
+        f"whole world. A leaf that did not move is a family the attachment missed"
+    )
+    assert routed_that_moved, (
+        "no routed-expert parameter MOVED either, so this configuration built no "
+        "bank at all and the inverted reading above is empty rather than true"
     )
     assert shared == [], (
         "this fixture built a shared-expert module. The load is only known to "
@@ -3916,6 +3963,30 @@ DEFERRED_WHOLE_WORLD_CLASSES = ("Glm5NextDenseMLP", "Glm5NextSharedExperts")
 DEFERRED_EP_GROUP_CLASSES = ("Glm5NextRoutedExperts",)
 
 
+#: The extent no family in THIS fixture shards, and the reason it is 256 rather
+#: than :data:`SHARD_NARROW`'s 8. These items load a model that HAS a shared
+#: expert, so the load path runs the landed
+#: ``Glm5NextSharedExperts.prepare_scale_operands`` (``model_fp8.py:1857``), which
+#: goes through the consumer's own ``scale_grid_shape`` -- and that function
+#: refuses an extent that is not a whole number of 256 x 256 blocks on EITHER
+#: dimension (``functional/blockwise_fp8_mm.py:284``). At narrow width 8 every one
+#: of these items died there, measured at ``accept-101-r8-host.out``
+#: (``weight extent [512,8] is not a whole number of 256x256 blocks``). 256 is the
+#: smallest width the consumer admits, ruled at DECISIONS §83 ruling 1.
+#:
+#: A NEW NAME, NOT A REBINDING. :data:`SHARD_NARROW` stays 8 and stays
+#: ``inc-glm53f-094``'s constant; that fixture has no shared expert and needs no
+#: consumer-valid width. Two fixtures, two widths, each stated where it is used.
+DEFERRED_NARROW = 256
+
+
+def _deferred_full_shape(leaf: str, shard_dim: int, full: int) -> tuple[int, ...]:
+    """:func:`_shard_full_shape`'s form at this fixture's own narrow width."""
+    if leaf in SHARD_ONE_DIMENSIONAL:
+        return (full,)
+    return (full, DEFERRED_NARROW) if shard_dim == 0 else (DEFERRED_NARROW, full)
+
+
 def _padded_shard_extent(full: int, num_shards: int, block: int) -> int:
     """One rank's extent after the width is rounded up to ``num_shards x block``.
 
@@ -3962,11 +4033,19 @@ def _deferred_key_overrides(
     Nothing here spells a checkpoint key: the keys come from the map and the shapes
     from :data:`DEFERRED_FAMILIES`, the same discipline
     :func:`_shard_key_overrides` follows.
+
+    EVERY FAMILY THIS FIXTURE WRITES TAKES ONE NARROW WIDTH, :data:`DEFERRED_NARROW`.
+    ``inc-glm53f-094``'s writer is not reused for the fifteen, because a fixture
+    holding two narrow widths would give the consumer's grid check a different
+    answer per family and the reason for a refusal would stop being legible. The
+    fifteen keep their SHARD extents and their dims exactly as
+    :data:`SHARD_FAMILIES` states them -- only the extent no family shards changes.
     """
-    overrides = dict(_shard_key_overrides(model, mappings))
+    overrides: dict[str, torch.Tensor] = {}
+    every_family = {**SHARD_FAMILIES, **DEFERRED_FAMILIES}
     for path, module in model.named_modules():
         cls = type(module).__name__
-        for (family, leaf), (shard_dim, full) in DEFERRED_FAMILIES.items():
+        for (family, leaf), (shard_dim, full) in every_family.items():
             if cls != family:
                 continue
             param = f"{path}.{leaf}"
@@ -3975,7 +4054,12 @@ def _deferred_key_overrides(
             keys = _keys_of(mappings, param)
             scales = scale_keys(keys)
             weights = [key for key in keys if key not in scales]
-            shape = _shard_full_shape(leaf, shard_dim, full)
+            shape = _deferred_full_shape(leaf, shard_dim, full)
+            if not scales:
+                # The map answers "is this family quantised", not a name list here.
+                for key in weights:
+                    overrides[key] = _shard_pattern(shape, shard_dim, torch.bfloat16)
+                continue
             grid_shape = block_grid_shape(shape, DEFAULT_WEIGHT_BLOCK_SIZE)
             for key in weights:
                 overrides[key] = _shard_pattern(
