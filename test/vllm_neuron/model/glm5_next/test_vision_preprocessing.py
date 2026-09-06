@@ -130,23 +130,42 @@ def _run_video_oracle(oracle, num_frames, height, width, value=CONTENT_VALUE_A):
 # C00 -- the module under test is the candidate, not the venv's editable checkout.
 # ---------------------------------------------------------------------------
 def test_c00_the_module_under_test_is_the_scratch_candidate():
-    """The import must resolve under the candidate tree this run is meant to measure.
+    """The import must resolve under the tree this run is measuring.
 
-    The venv holds an editable install pointing at a different checkout, and importing vllm already imports
-    this plugin through its platform entry point, so PYTHONPATH has to be set before the first import rather
-    than checked afterwards. This asserts the outcome of that, and refuses to pass quietly when the runner
-    did not say which tree it meant.
+    An editable install can point at a different checkout than the one the tests live in, and importing vllm
+    already imports this plugin through its platform entry point, so which tree answers ``import
+    vllm_neuron`` is a property of the run rather than of the source. This names that tree and checks it.
+
+    Two arms, and never a skip, because a skip here would hide exactly the mix-up it is looking for:
+
+    * ``GLM53F_CANDIDATE_ROOT`` set -- the runner declared which tree it meant, and the import must resolve
+      under that declaration. This is the arm the campaign's own acceptance runs.
+    * unset -- a plain ``pytest`` from a checkout, which is how a maintainer, CI or a reviewer's clone runs
+      this suite. The tree is then derived from this file's own location, so the run is still pinned to a
+      named directory instead of passing whatever the interpreter happened to import.
     """
     import vllm_neuron
 
-    declared_root = os.environ.get("GLM53F_CANDIDATE_ROOT")
     resolved = Path(vllm_neuron.__file__).resolve()
-    assert declared_root, (
-        "GLM53F_CANDIDATE_ROOT is unset, so this run cannot say which tree it measured. Set it to the "
-        f"candidate root before pytest; vllm_neuron currently resolves to {resolved}."
+    declared_root = os.environ.get("GLM53F_CANDIDATE_ROOT")
+    if declared_root:
+        root = Path(declared_root).resolve()
+        source = "GLM53F_CANDIDATE_ROOT"
+    else:
+        # test/vllm_neuron/model/glm5_next/<this file> -- four parents up is the repository root.
+        root = Path(__file__).resolve().parents[4]
+        source = "this test file's own location"
+    # The marker is pyproject.toml and NOT the package directory: the test tree mirrors the package, so
+    # test/vllm_neuron/ is also a directory called vllm_neuron and a package-only marker would accept the
+    # test directory as a repository root and hide an off-by-one in the derivation above.
+    assert (root / "pyproject.toml").is_file() and (root / "vllm_neuron" / "__init__.py").is_file(), (
+        f"{root}, taken from {source}, is not a repository root -- it holds no pyproject.toml beside a "
+        "vllm_neuron package, so the check below would be asserting something about the wrong directory."
     )
-    root = Path(declared_root).resolve()
-    assert root in resolved.parents, f"vllm_neuron resolved to {resolved}, which is not under {root}"
+    assert root in resolved.parents, (
+        f"vllm_neuron resolved to {resolved}, which is not under {root} (taken from {source}). Some other "
+        "checkout answered the import, so this run measured a tree it did not mean to."
+    )
 
 
 # ---------------------------------------------------------------------------
