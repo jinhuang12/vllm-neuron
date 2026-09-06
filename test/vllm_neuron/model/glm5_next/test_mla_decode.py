@@ -949,3 +949,529 @@ def test_item_d_route_predicate_five_counter_readings_on_every_arm() -> None:
         assert len(reading) == 2
     say("D_TORCH_FALLBACK_CANNOT_BE_MADE_TO_FIRE",
         "no torch path exists in either seam module; disclosed, not staged")
+
+
+# =========================================================================== #
+# `inc-glm53f-100` -- MLA PER-RANK HEAD PARTITIONING. Three items, one per
+# conjunct of the plan block, added to THIS file because all three read the same
+# geometry, the same module builder and the same registered comparison pair the
+# items above already use.
+#
+# WHAT THE INCREMENT CHANGED, in one sentence: `Glm5NextMLAAttention` now computes
+# on THIS RANK's heads, the three projections whose width carries the head count
+# load sharded, and `project_output` -- the row-parallel site -- sums its partial
+# across the tensor-parallel group.
+#
+# THE COMPARISON PAIR IS NOT RE-AUTHORED HERE. Item (2) below reuses
+# `report_and_check`, and therefore `RTOL` and `atol_for`, exactly as item (b-ii)
+# does. That pair is registered and frozen; this increment does not choose one.
+#
+# WHY WORLD SIZE 1 IS THE CONTROL ARM EVERYWHERE. `_shard_geometry_for` returns
+# `None` for every family at world size 1 and `_resolve_tp_group` returns `None`
+# there too, so a single-rank run takes exactly the path it took before this
+# increment -- which is what makes the eight items above the control that the
+# sharded path is what changed.
+# =========================================================================== #
+
+PERRANK_WORLD = 2
+#: 64 heads over 2 ranks. An EXACT split, asserted below rather than assumed: a
+#: world size that did not divide the head count would floor, and then no rank's
+#: heads would sum back to the model's.
+PERRANK_HEADS = DECLARED_HEADS // PERRANK_WORLD
+
+#: A world size that does NOT divide 64, for the flooring control in item (1).
+PERRANK_UNEVEN_WORLD = 3
+
+
+def _patch_world(monkeypatch, world_size: int) -> None:
+    """Run the module at a synthetic world size, at the resolver the code reads.
+
+    The same injection point `-094`'s load items use
+    (``test_load_weights.py:3180``), so this file adds no second way to say
+    "pretend there are two ranks".
+    """
+    monkeypatch.setattr(_model_module(), "_resolve_world_size", lambda: world_size)
+
+
+def _bare_attention():
+    """One MLA layer with NO weights installed, at the checkpoint's real geometry.
+
+    ``build_attention`` above generates weights AT ``projection_widths()``, which is
+    the right thing for the items above and the wrong thing for item (2): a sharded
+    arm needs each rank to hold a SLICE of one full weight set, not fresh random
+    numbers of the per-rank shape. So the two builders are separate, and this one
+    installs nothing.
+    """
+    return _model_module().Glm5NextMLAAttention(declared_config())
+
+
+def _install(module, weights: dict, gains: dict) -> None:
+    """Install a given weight set and run the two load-time preparations.
+
+    ``prepare_projection_weights`` checks every installed weight against
+    ``projection_widths()`` and refuses a mismatch with the site named, so this
+    helper is also the production width check: a slice at the wrong geometry stops
+    here rather than computing the wrong function at plausible shapes.
+    """
+    for name, weight in weights.items():
+        setattr(module, f"{name}_weight", torch.nn.Parameter(weight))
+    for name, gain in gains.items():
+        setattr(module, name, torch.nn.Parameter(gain))
+    module.prepare_projection_weights()
+    assert module.prepare_absorb_weights() == 2
+
+
+def _rank_slices(raw: dict, rank: int, world_size: int) -> dict:
+    """One rank's share of a FULL weight set, cut at the ratified geometry.
+
+    The cuts are the ratified shard table's (``increments/shard-table-094.md``
+    Part 5, Group B), written out here as this file's own statement of them rather
+    than read from ``_SHARD_GEOMETRY`` -- so the table and the code CAN disagree,
+    and if they do item (3) goes red.
+
+      ``q_b_proj``   dim 0, ``heads * (nope + rope)`` rows per rank
+      ``kv_b_proj``  dim 0, ``heads * (nope + v)``    rows per rank
+      ``o_proj``     dim 1, ``heads * v``             columns per rank
+
+    ALL THREE CUTS MUST NAME THE SAME HEADS, and that is the property the
+    arithmetic below guarantees: every offset is ``rank * (this rank's heads) *
+    (that family's per-head width)``, so rank 0 is heads 0..31 in all three. A
+    rank holding one family's heads and another family's would mix heads at
+    exactly the right total width, which no shape check could see.
+
+    Each slice is CLONED rather than kept as a view. Item (2)'s doctored arm
+    mutates one rank's slice, and a view would write that through into the
+    reference's own weights.
+    """
+    heads = DECLARED_HEADS // world_size
+    q_rows = heads * (NOPE_WIDTH + ROPE_WIDTH)
+    kv_rows = heads * (NOPE_WIDTH + V_WIDTH)
+    o_cols = heads * V_WIDTH
+    return {
+        # Replicated: MLA keeps ONE compressed latent per token, not one per head,
+        # so neither latent projection has a head axis to split.
+        "q_a_proj": raw["q_a_proj"].clone(),
+        "kv_a_proj_with_mqa": raw["kv_a_proj_with_mqa"].clone(),
+        "q_b_proj": raw["q_b_proj"][rank * q_rows : (rank + 1) * q_rows, :].clone(),
+        "kv_b_proj": raw["kv_b_proj"][rank * kv_rows : (rank + 1) * kv_rows, :].clone(),
+        "o_proj": raw["o_proj"][:, rank * o_cols : (rank + 1) * o_cols].clone(),
+    }
+
+
+def _reset_projection_counters() -> None:
+    """Reset the projection seam's own dispatch counters.
+
+    THIS FILE DID NOT READ THEM BEFORE. `read_counters` above covers the sparse and
+    absorb seams, which is what items (b) and (d) need; the PROJECTION seam's pair is
+    what this increment's route predicate names, so it is taken explicitly here rather
+    than inherited. That gap is the one recorded against `-051` as §87 M1.
+    """
+    from vllm_neuron.functional.attention import mla_projections
+
+    mla_projections.reset_mla_projection_dispatch_counters()
+
+
+def _read_projection_counters() -> tuple[int, int]:
+    """``(nki_dispatch, torch_fallback)`` for the projection seam since the reset.
+
+    The fallback member can only ever read 0 -- the module has no torch path, by its
+    own accessor's docstring -- so it is reported as a reading whose zero is
+    structural, never staged as a control that could fire.
+    """
+    from vllm_neuron.functional.attention import mla_projections
+
+    return mla_projections.mla_projection_dispatch_counters()
+
+
+class _CountedTwoRankGroup:
+    """The injected tensor-parallel coordinator: it COUNTS, and it really sums.
+
+    WHAT IT STANDS FOR. In production ``project_output`` calls ``all_reduce`` on
+    ``get_tp_group()``'s coordinator and the two ranks' partials meet inside the
+    collective. A pytest item has one process, so the two ranks run one after the
+    other and this object is what makes their partials meet: on the FIRST pass it
+    records each partial and leaves the tensor alone, and on the SECOND pass it
+    adds the recorded partial back in place. Rank 1's returned value is therefore
+    the fully reduced one, which is exactly what rank 1 would return on hardware.
+    Rank 0's is not, and is not compared against anything.
+
+    IT HONOURS THE CONTRACT THE PRODUCTION LINE ASSUMES. ``project_output`` calls
+    ``all_reduce`` as a statement and discards the return, the form all 18 shipped
+    row-parallel sites use, so it depends on the sum being written THROUGH the
+    argument. ``add_`` does that, and the tensor is also returned, so the
+    production line would be correct under either reading of vLLM's contract.
+
+    ``world_size`` is a plain attribute because that is all the production code
+    reads off the group besides ``all_reduce``.
+    """
+
+    def __init__(self, world_size: int = PERRANK_WORLD) -> None:
+        self.world_size = world_size
+        self.calls = 0
+        self.shapes: list[tuple[int, ...]] = []
+        self.recording = True
+        self._recorded: list[torch.Tensor] = []
+        self._replayed = 0
+
+    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        self.shapes.append(tuple(tensor.shape))
+        if self.recording:
+            self._recorded.append(tensor.detach().clone())
+        else:
+            tensor.add_(self._recorded[self._replayed])
+            self._replayed += 1
+        return tensor
+
+
+def _run_sharded(group, raw, gains, cache, hidden, selection, scale,
+                 *, doctor_rank_1_o_proj_by_one_head: bool = False):
+    """Both ranks, in order, through the PRODUCTION decode path. Returns rank 1's.
+
+    Rank 0 first so its partials are on record before rank 1 reduces. Each rank
+    gets its own clone of the cache: the KV latent is replicated, so both ranks
+    write the same latent to the same slot, and a shared cache would only hide a
+    write that differed.
+
+    Returns ``(rank 1's output, [(nki, fallback) per rank])`` -- the second value is
+    the route predicate's reading, taken per rank because that is what the predicate
+    compares.
+    """
+    outputs = {}
+    counters = []
+    for rank in range(PERRANK_WORLD):
+        group.recording = rank == 0
+        module = _bare_attention()
+        assert module._heads_per_rank() == PERRANK_HEADS
+        weights = _rank_slices(raw, rank, PERRANK_WORLD)
+        if doctor_rank_1_o_proj_by_one_head and rank == 1:
+            # THE DOCTORED SLICE: the right shape, taken ONE HEAD too early. This
+            # is the defect head partitioning actually risks -- a rank that
+            # computes head 32's values and multiplies them by head 31's output
+            # columns -- and no shape check can see it, which is why the numeric
+            # criterion has to.
+            cols = PERRANK_HEADS * V_WIDTH
+            low = rank * cols - V_WIDTH
+            weights["o_proj"] = raw["o_proj"][:, low : low + cols].clone()
+        _install(module, weights, gains)
+        _reset_projection_counters()
+        outputs[rank] = run_decode_steps(
+            module, cache.clone(), hidden, selection, scale
+        )
+        counters.append(_read_projection_counters())
+    return outputs[PERRANK_WORLD - 1], counters
+
+
+# --------------------------------------------------------------------------- #
+def test_perrank_widths_only_the_head_bearing_projections_narrow(monkeypatch) -> None:
+    """Conjunct (1): the three head-width projections halve, the other widths do not.
+
+    THE EXPECTATION IS COMPUTED FROM THE DECLARED CONSTANTS, never asked of the
+    code: the three head-bearing widths are ``PERRANK_HEADS`` times their own
+    per-head width, and the remaining widths are the config's own scalars. Reading
+    them from ``projection_widths()`` and dividing would have passed whatever that
+    method said.
+    """
+    model_fp8 = _model_module()
+    cfg = declared_config()
+    module = _bare_attention()
+    q_head_width = NOPE_WIDTH + ROPE_WIDTH
+    kv_head_width = NOPE_WIDTH + V_WIDTH
+
+    def widths() -> dict[str, tuple[int, int]]:
+        return {name: (idim, odim) for name, idim, odim in module.projection_widths()}
+
+    # -- world size 1: byte-identical to what this file measured before -100.
+    assert module._heads_per_rank() == DECLARED_HEADS
+    at_one = widths()
+    expected_one = {
+        "q_a_proj": (int(cfg.hidden_size), int(cfg.q_lora_rank)),
+        "q_b_proj": (int(cfg.q_lora_rank), DECLARED_HEADS * q_head_width),
+        "kv_a_proj_with_mqa": (int(cfg.hidden_size), LATENT_RANK + ROPE_WIDTH),
+        "kv_b_proj": (LATENT_RANK, DECLARED_HEADS * kv_head_width),
+        "o_proj": (DECLARED_HEADS * V_WIDTH, int(cfg.hidden_size)),
+    }
+    say("PERRANK_1_WIDTHS_AT_WORLD_1", at_one)
+    assert at_one == expected_one
+
+    # -- world size 2: the three head-bearing widths halve and nothing else moves.
+    _patch_world(monkeypatch, PERRANK_WORLD)
+    assert PERRANK_HEADS * PERRANK_WORLD == DECLARED_HEADS, (
+        "the declared head count does not divide by the declared world size, so "
+        "no rank's heads would sum back to the model's"
+    )
+    assert module._heads_per_rank() == PERRANK_HEADS
+    at_two = widths()
+    expected_two = {
+        "q_a_proj": (int(cfg.hidden_size), int(cfg.q_lora_rank)),
+        "q_b_proj": (int(cfg.q_lora_rank), PERRANK_HEADS * q_head_width),
+        "kv_a_proj_with_mqa": (int(cfg.hidden_size), LATENT_RANK + ROPE_WIDTH),
+        "kv_b_proj": (LATENT_RANK, PERRANK_HEADS * kv_head_width),
+        "o_proj": (PERRANK_HEADS * V_WIDTH, int(cfg.hidden_size)),
+    }
+    say("PERRANK_1_WIDTHS_AT_WORLD_2", at_two)
+    assert at_two == expected_two
+
+    # Which widths moved, stated as a reading rather than left to the dicts above.
+    moved = sorted(name for name in at_one if at_one[name] != at_two[name])
+    say("PERRANK_1_WIDTHS_THAT_MOVED", moved)
+    assert moved == ["kv_b_proj", "o_proj", "q_b_proj"]
+    assert at_one["q_a_proj"] == at_two["q_a_proj"]
+    assert at_one["kv_a_proj_with_mqa"] == at_two["kv_a_proj_with_mqa"]
+
+    # RANK INVARIANT. A width is a function of the world size alone; if it read the
+    # rank, two ranks would expect different shapes from one checkpoint.
+    monkeypatch.setattr(model_fp8, "_resolve_rank", lambda: 1)
+    say("PERRANK_1_WIDTHS_AT_RANK_1", widths() == at_two)
+    assert widths() == at_two
+
+    # FIRING CONTROL: the halving is not a hard-coded halving. At a world size that
+    # does not divide the head count the widths FLOOR, and the floored answer is
+    # not the divided one -- so an implementation that simply halved would be
+    # caught here.
+    _patch_world(monkeypatch, PERRANK_UNEVEN_WORLD)
+    uneven_heads = DECLARED_HEADS // PERRANK_UNEVEN_WORLD
+    at_three = widths()
+    say("PERRANK_1_UNEVEN_WORLD", PERRANK_UNEVEN_WORLD, uneven_heads, at_three)
+    assert module._heads_per_rank() == uneven_heads
+    assert at_three["q_b_proj"][1] == uneven_heads * q_head_width
+    assert at_three["q_b_proj"][1] != DECLARED_HEADS * q_head_width // PERRANK_UNEVEN_WORLD
+    assert at_three != at_two
+
+    # CROSS-CHECK: the width a LOADER slices to is the width this class expects.
+    # Both floor through ``_per_rank``, so they agree by construction -- asserted
+    # rather than assumed, because a divergence would refuse a correct checkpoint.
+    _patch_world(monkeypatch, PERRANK_WORLD)
+    for leaf, name, axis in (
+        ("q_b_proj_weight", "q_b_proj", 1),
+        ("kv_b_proj_weight", "kv_b_proj", 1),
+        ("o_proj_weight", "o_proj", 0),
+    ):
+        geometry = model_fp8._shard_geometry_for(module, leaf, PERRANK_WORLD)
+        say("PERRANK_1_LOADER_AGREES_WITH_ACCESSOR", leaf,
+            geometry.shard_size, at_two[name][axis])
+        assert geometry.shard_size == at_two[name][axis]
+
+
+# --------------------------------------------------------------------------- #
+def test_perrank_numerics_the_reduced_sharded_decode_equals_the_unsharded_output(
+    monkeypatch,
+) -> None:
+    """Conjunct (2): two ranks' reduced decode output equals the unsharded output.
+
+    THE PRODUCTION REDUCTION SITE IS WHAT RUNS. Nothing in ``project_output`` is
+    replaced: the group it resolves is injected, its ``all_reduce`` is counted, and
+    the assertion is on the value that call wrote. So this item measures the
+    collective's PLACE in the chain -- after the projection, before the cast back
+    to the model dtype -- and not just that a sum was available somewhere.
+
+    WHY THE REFERENCE IS THE RIGHT ONE. Each rank contracts its own heads against
+    its own slice of ``o_proj``'s columns and produces a partial sum at the full
+    output width. Their sum is the same 16,384-term contraction the unsharded path
+    performs, reassociated -- so the two agree to the registered pair, and a
+    partitioning that mixed heads does not.
+
+    THE PAIR IS THE REGISTERED ONE, reused through ``report_and_check`` exactly as
+    item (b-ii) does. This increment registers no tolerance of its own.
+    """
+    import time
+
+    model_fp8 = _model_module()
+
+    # -- ARM 1: the unsharded reference, at world size 1, with the REAL guard.
+    reference_module, raw, gains, gen = build_attention()
+    assert reference_module._heads_per_rank() == DECLARED_HEADS
+    cache = seeded_cache(reference_module, gen)
+    hidden, selection, scale = decode_inputs(reference_module, gen)
+
+    # The guard, read directly: at world size 1 there is no group, so the
+    # production line below cannot reduce and no vllm symbol is imported. This is
+    # the reading that makes the eight items above a control rather than a hope.
+    say("PERRANK_2_GUARD_AT_WORLD_1", model_fp8._resolve_tp_group())
+    assert model_fp8._resolve_tp_group() is None
+
+    started = time.perf_counter()
+    _reset_projection_counters()
+    reference = run_decode_steps(
+        reference_module, cache.clone(), hidden, selection, scale
+    )
+    whole_counters = _read_projection_counters()
+    say("PERRANK_2_REFERENCE_SECONDS", f"{time.perf_counter() - started:.3f}",
+        "shape", tuple(reference.shape), reference.dtype)
+    say("PERRANK_2_R2_PROJECTION_COUNTERS_AT_WORLD_1", whole_counters)
+
+    # -- ARM 2: two ranks, each on its own heads, reducing through the real site.
+    group = _CountedTwoRankGroup()
+    _patch_world(monkeypatch, PERRANK_WORLD)
+    monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: group)
+
+    started = time.perf_counter()
+    reduced, per_rank_counters = _run_sharded(
+        group, raw, gains, cache, hidden, selection, scale
+    )
+    say("PERRANK_2_SHARDED_SECONDS", f"{time.perf_counter() - started:.3f}")
+
+    # THE ROUTE PREDICATE (D13 form R-2), which this block declares and which no item
+    # in this file read before: partitioning changes WIDTHS, never the number of
+    # projection dispatches, so each rank's count equals the unsharded count. The
+    # number itself is printed rather than typed -- an expectation typed here would be
+    # a transcription of whatever the chain happens to do.
+    say("PERRANK_2_R2_PROJECTION_COUNTERS_PER_RANK", per_rank_counters)
+    for rank, (nki, fallback) in enumerate(per_rank_counters):
+        assert nki == whole_counters[0], (
+            f"rank {rank} dispatched {nki} projections against {whole_counters[0]} "
+            f"unsharded; partitioning must change widths, not the call count"
+        )
+        assert fallback == 0
+    assert whole_counters[1] == 0
+    say("PERRANK_2_R2_TORCH_FALLBACK_ZERO_IS_STRUCTURAL",
+        "the projection module has no torch path; its accessor's own docstring says "
+        "this counter can only ever read 0, so it is reported, not staged")
+
+    # THE COUNTED READING. Once per decode step per rank, and not once more: a
+    # reduction inside the per-head loop, or one left in a helper that runs twice,
+    # would not read 6.
+    say("PERRANK_2_REDUCE_CALLS", group.calls,
+        "expected", DECODE_STEPS * PERRANK_WORLD, "shapes", set(group.shapes))
+    assert group.calls == DECODE_STEPS * PERRANK_WORLD
+    assert set(group.shapes) == {(BATCH, int(declared_config().hidden_size))}
+
+    for step in range(DECODE_STEPS):
+        report_and_check(
+            f"PERRANK_2_STEP_{step}",
+            reduced[step : step + 1],
+            reference[step : step + 1],
+        )
+    say("PERRANK_2_STEPS_AGREEING", f"{DECODE_STEPS}/{DECODE_STEPS}")
+
+    # -- THE DOCTORED CONTROL. One rank's ``o_proj`` slice, right shape, taken one
+    #    head too early. ONE step rather than three, because the control's job is
+    #    to show the criterion can fail and a second and third step would only pay
+    #    for the same demonstration twice.
+    doctored_group = _CountedTwoRankGroup()
+    monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: doctored_group)
+    doctored, _ = _run_sharded(
+        doctored_group, raw, gains, cache,
+        hidden[:1], selection[:1], scale,
+        doctor_rank_1_o_proj_by_one_head=True,
+    )
+    one_step_reference = reference[:1]
+    gap = (
+        doctored.to(torch.float32) - one_step_reference.to(torch.float32)
+    ).abs().max().item()
+    fired = not torch.allclose(
+        doctored.to(torch.float32),
+        one_step_reference.to(torch.float32),
+        rtol=RTOL,
+        atol=atol_for(one_step_reference),
+    )
+    say("PERRANK_2_CONTROL_REJECTS_A_ONE_HEAD_SHIFT", fired,
+        f"max_abs_diff={gap:.10g}",
+        f"allowance_atol={atol_for(one_step_reference):.10g}",
+        "reduce_calls", doctored_group.calls)
+    assert doctored_group.calls == PERRANK_WORLD
+    assert fired
+
+
+# --------------------------------------------------------------------------- #
+def test_perrank_load_the_shard_table_cuts_the_five_mla_families(monkeypatch) -> None:
+    """Conjunct (3): the three families carry a declared shard, the two latents none.
+
+    THE ATTACHMENT SITE IS WHAT IS ASKED. ``_shard_geometry_for`` is the one reader
+    of the shard table and is what ``_materialise_declared_parameters`` calls for
+    every declared parameter, so asking it -- with a real module instance and a
+    real world size -- is asking the code path the load takes, not the table.
+
+    AND THE CUT IS FOLLOWED THROUGH. Declaring a geometry proves nothing on its own,
+    so the second half of this item slices a full weight set at the declared extents
+    and hands the slices to the production preparation, which checks every one
+    against ``projection_widths()`` and refuses a mismatch. The wrong-slice arm
+    shows that check can refuse.
+    """
+    model_fp8 = _model_module()
+    cfg = declared_config()
+    module = _bare_attention()
+    leaves = (
+        "q_a_proj_weight",
+        "q_b_proj_weight",
+        "kv_a_proj_with_mqa_weight",
+        "kv_b_proj_weight",
+        "o_proj_weight",
+    )
+
+    def geometry_at(world_size: int) -> dict:
+        return {
+            leaf: model_fp8._shard_geometry_for(module, leaf, world_size)
+            for leaf in leaves
+        }
+
+    # -- world size 1: nothing is sharded, which is the control arm. The SAME call
+    #    distinguishes rather than agrees: five Nones here, three geometries below.
+    at_one = geometry_at(1)
+    say("PERRANK_3_GEOMETRY_AT_WORLD_1", {k: v for k, v in at_one.items()})
+    assert list(at_one.values()) == [None] * len(leaves)
+
+    # -- world size 2: three declared cuts, two replicated families.
+    at_two = geometry_at(PERRANK_WORLD)
+    triples = {
+        leaf: None if g is None else (g.shard_dim, g.shard_size, g.num_shards)
+        for leaf, g in at_two.items()
+    }
+    expected = {
+        # Replicated: one latent per token, so no head axis to cut.
+        "q_a_proj_weight": None,
+        "kv_a_proj_with_mqa_weight": None,
+        # Column-parallel on the output rows, in checkpoint orientation.
+        "q_b_proj_weight": (0, PERRANK_HEADS * (NOPE_WIDTH + ROPE_WIDTH), PERRANK_WORLD),
+        "kv_b_proj_weight": (0, PERRANK_HEADS * (NOPE_WIDTH + V_WIDTH), PERRANK_WORLD),
+        # Row-parallel: the head width is this projection's INPUT.
+        "o_proj_weight": (1, PERRANK_HEADS * V_WIDTH, PERRANK_WORLD),
+    }
+    say("PERRANK_3_GEOMETRY_AT_WORLD_2", triples)
+    assert triples == expected
+    say("PERRANK_3_SHARDED_FAMILIES",
+        sorted(k for k, v in triples.items() if v is not None),
+        "replicated",
+        sorted(k for k, v in triples.items() if v is None))
+
+    # THE SHARDS TILE THE TENSOR EXACTLY. ``shard_size * num_shards`` is the full
+    # extent, so the two ranks' slices cover the checkpoint's dimension with no gap
+    # and no overlap -- the property an off-by-one extent breaks and a shape check
+    # on one rank alone would not notice.
+    for leaf, full_extent in (
+        ("q_b_proj_weight", DECLARED_HEADS * (NOPE_WIDTH + ROPE_WIDTH)),
+        ("kv_b_proj_weight", DECLARED_HEADS * (NOPE_WIDTH + V_WIDTH)),
+        ("o_proj_weight", DECLARED_HEADS * V_WIDTH),
+    ):
+        geometry = at_two[leaf]
+        say("PERRANK_3_TILES", leaf, geometry.shard_size, geometry.num_shards,
+            full_extent)
+        assert geometry.shard_size * geometry.num_shards == full_extent
+
+    # -- THE CUT, FOLLOWED THROUGH. A full weight set, sliced at those extents, is
+    #    accepted by the production preparation for both ranks.
+    _, raw, gains, _ = build_attention()
+    _patch_world(monkeypatch, PERRANK_WORLD)
+    for rank in range(PERRANK_WORLD):
+        sharded = _bare_attention()
+        weights = _rank_slices(raw, rank, PERRANK_WORLD)
+        shapes = {name: tuple(w.shape) for name, w in weights.items()}
+        say("PERRANK_3_INSTALLED_SHAPES", rank, shapes)
+        _install(sharded, weights, gains)
+        assert tuple(sharded._prepared_weight("o_proj").shape) == (
+            PERRANK_HEADS * V_WIDTH,
+            int(cfg.hidden_size),
+        )
+        for name, expected_heads, contraction, out_features in sharded.absorb_widths():
+            say("PERRANK_3_ABSORB_WIDTH", rank, name, expected_heads, contraction,
+                out_features)
+            assert expected_heads == PERRANK_HEADS
+
+    # FIRING CONTROL: the preparation can refuse. A rank handed the FULL weight --
+    # the shape it would have had before this increment -- is rejected by name.
+    wrong = _bare_attention()
+    with pytest.raises(ValueError) as refusal:
+        _install(wrong, {**_rank_slices(raw, 0, PERRANK_WORLD),
+                         "q_b_proj": raw["q_b_proj"].clone()}, gains)
+    say("PERRANK_3_CONTROL_REFUSES_A_FULL_WIDTH_SLICE", str(refusal.value)[:120])
+    assert "q_b_proj_weight is" in str(refusal.value)

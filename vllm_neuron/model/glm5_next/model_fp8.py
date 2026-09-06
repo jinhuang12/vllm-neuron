@@ -67,6 +67,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -99,6 +100,16 @@ from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader
+
+if TYPE_CHECKING:
+    # -- inc-glm53f-100 -- ANNOTATION ONLY, and that is the whole point. This
+    #    module imports no vllm symbol at runtime and this block keeps it that
+    #    way: the guard is false at import time, so nothing here can make the
+    #    module fail to import on a lane without vllm, while the return type of
+    #    ``_resolve_tp_group`` below still names the real class rather than
+    #    ``object``. The type is the one this fork's own parallel layer names
+    #    for it (``parallel/neuron_parallel_state.py:38-42``).
+    from vllm.distributed.parallel_state import GroupCoordinator
 
 # ---------------------------------------------------------------------------
 # Parameter declaration -- the mechanism that makes a name exist without
@@ -204,6 +215,59 @@ def _per_rank(count: int, world_size: int) -> int:
     return max(1, count // max(world_size, 1))
 
 
+def _resolve_tp_group() -> GroupCoordinator | None:
+    """The tensor-parallel group to reduce a row-parallel partial across.
+
+    ``None`` means there is nothing to reduce -- one rank, so the "partial" sum
+    is already the whole sum. Returning ``None`` rather than a one-rank group is
+    the same reading :func:`_shard_geometry_for` makes one screen below: at world
+    size 1 nothing about this increment may change the path a landed single-rank
+    test takes.
+
+    ``inc-glm53f-100``. The third of the module's ``_resolve_*`` twins and
+    deliberately their shape: read the process state, treat its absence as "not
+    distributed" rather than as an error, and be the ONE place in the file that
+    knows how. Tests already inject world size by monkeypatching
+    :func:`_resolve_world_size` (``test/vllm_neuron/model/glm5_next/
+    test_load_weights.py:3180``), so a reduction group that arrives the same way
+    keeps one injection convention in the file instead of two.
+
+    WHY THE GROUP AND NOT A SECOND CONVENTION. ``get_tp_group`` is what all eight
+    shipped model files use for exactly this -- ``llama3``, ``gpt_oss``,
+    ``qwen3``, ``qwen3_vl`` each bind ``self.tp_group = get_tp_group()`` in a
+    constructor and call ``all_reduce`` on it after a row-parallel matmul, e.g.
+    ``qwen3/model.py:170`` and ``:535-537``, the convention written down at
+    ``parallel/DESIGN.md:149-151``. This package's classes are built before any
+    world size is known (``_declare_parameters`` / ``_materialise_declared_
+    parameters``, the reason ``-094``'s geometry is a table rather than a line in
+    each ``__init__``), so the group is resolved at the call site instead of
+    bound in a constructor. Same group, same call, later lookup.
+
+    THE IMPORT IS LOCAL because this module imports no vllm symbol at runtime,
+    and the guard comes FIRST so a single-rank run never performs the import at
+    all. Both readings have a first-hand precedent in this fork's own parallel
+    layer: ``tp_barrier`` imports ``get_tp_group`` inside the function body and
+    then tests ``group.world_size > 1`` before using it
+    (``parallel/neuron_parallel_state.py:1584-1597``). The group's own
+    ``world_size`` is re-checked here for the same reason it is checked there --
+    it, not the global degree, is the authority on how many ranks the collective
+    would span.
+
+    D14 BOUNDARY, recorded because this is a new module-level helper: it sits in
+    the module-level helper block ``inc-glm53f-013`` owns, after its twins and
+    after ``_per_rank`` -- AFTER on purpose, so ``_per_rank`` keeps the lines
+    ``weight_loaders_fp8.py:1499`` cites it by. It adds no runtime import; the
+    annotation's ``GroupCoordinator`` arrives through the ``TYPE_CHECKING`` block
+    in the header, which is false at import time.
+    """
+    if _resolve_world_size() <= 1:
+        return None
+    from vllm.distributed.parallel_state import get_tp_group
+
+    group = get_tp_group()
+    return group if group.world_size > 1 else None
+
+
 # --------------------------------------------------------------------------- #
 # inc-glm53f-094 -- WHICH PARAMETER FAMILIES ARE SHARDED, AND ON WHICH DIM.
 #
@@ -305,6 +369,84 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # entry ``design-20260905-ap``, remedy part 2.
 
 
+# -- inc-glm53f-100 -- the MLA families' three widths. ---------------------- #
+#
+# WHICH PATTERN THESE FOLLOW, and why it is NOT the KDA's.
+# ``Glm5NextMLAAttention`` keeps ``num_attention_heads`` as the MODEL's head
+# count at every world size -- the attribute is never overwritten with a per-rank
+# value -- so the division happens HERE, and NOT the way ``_kda_head_count``
+# deliberately refuses to divide a second time by reading an attribute that is
+# already per-rank.
+#
+# THE DENSE MLP WAS THIS COMMENT'S EXAMPLE AND IS NO LONGER ONE. Its width
+# function was deleted by ``inc-glm53f-101`` -- the reason is recorded a few
+# lines above this table -- and its three leaves now declare ``width=None`` and
+# let the loader read the extent off the checkpoint tensor. So of the five
+# declaring families, three defer and only KDA and MLA resolve a width in this
+# file. Pointing at a deleted function as the pattern to follow would be a
+# dangling reference; naming the current split is the fact that survives the
+# next table change.
+# The class's own per-rank reader is :meth:`Glm5NextMLAAttention._heads_per_rank`,
+# which floors through the same ``_per_rank``, so the width a loader slices to and
+# the width ``projection_widths`` expects are the same expression on the same two
+# inputs. They also read the same world size in production: the root binds
+# ``self.world_size = _resolve_world_size()`` (``:4945``) and passes exactly that
+# to ``_shard_geometry_for`` (``:5154``, ``:5445``), which is what the class's
+# reader resolves too. If a caller ever made the two disagree the load would stop
+# at ``prepare_projection_weights``'s width check with the site named, rather
+# than compute the wrong function at plausible shapes -- and conjunct (1) of this
+# increment's acceptance asserts the agreement rather than assuming it.
+#
+# WHAT IS NOT HERE IS A DECLARATION. ``q_a_proj``, ``kv_a_proj_with_mqa`` and both
+# latent layernorms take no entry in the table below because they are REPLICATED:
+# they read or write the compressed latent, of which MLA keeps one per token
+# rather than one per head (``NUM_LATENT_KV_HEADS = 1``), so there is no head axis
+# to split. ``increments/shard-table-094.md`` Part 5 records that per family.
+
+
+def _mla_head_count(module: nn.Module, world_size: int) -> int:
+    """This rank's MLA head count. The one divisor the three widths below share."""
+    return _per_rank(int(module.num_attention_heads), world_size)
+
+
+def _mla_q_b_width(module: nn.Module, world_size: int) -> int:
+    """This rank's ``q_b_proj`` output width: its heads at the full query width.
+
+    The query head width is ``qk_nope_head_dim + qk_rope_head_dim``, summed rather
+    than taken from the nope width alone for the reason ``projection_widths``
+    states: the rotary slice is 0 on this checkpoint and that 0 is a value, so a
+    config that had one would be short by exactly that slice.
+    """
+    return _mla_head_count(module, world_size) * (
+        int(module.qk_nope_head_dim) + int(module.qk_rope_head_dim)
+    )
+
+
+def _mla_kv_b_width(module: nn.Module, world_size: int) -> int:
+    """This rank's ``kv_b_proj`` output width: its heads' key AND value halves.
+
+    Both halves are one weight and are sharded as one, because the absorb split
+    cuts this same weight per head (``prepare_absorb_weights``) -- a rank that
+    held the keys of its heads and the values of another's would mix heads at
+    exactly the right total width.
+    """
+    return _mla_head_count(module, world_size) * (
+        int(module.qk_nope_head_dim) + int(module.v_head_dim)
+    )
+
+
+def _mla_o_proj_width(module: nn.Module, world_size: int) -> int:
+    """This rank's ``o_proj`` INPUT width: its heads' value width.
+
+    Row-parallel, so what each rank computes is a partial sum over its own heads
+    and the cross-rank sum is the consumer's business -- here that consumer is
+    :meth:`Glm5NextMLAAttention.project_output`, which performs it, unlike the KDA
+    sibling's ``o_proj`` (a gap this increment does not close; it is recorded as
+    ``inc-glm53f-094`` debt against ``inc-glm53f-054``'s design read).
+    """
+    return _mla_head_count(module, world_size) * int(module.v_head_dim)
+
+
 #: Declaring class name -> declared leaf -> its shard. Keyed by NAME rather than by
 #: the class object so this table can sit above every class it names.
 _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
@@ -332,6 +474,31 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
         "b_proj_weight": _DeclaredShard(0, _kda_head_count, "one row per head"),
         "A_log": _DeclaredShard(0, _kda_head_count, "one decay per head"),
         "dt_bias": _DeclaredShard(0, _kda_head_count, "one bias per head"),
+    },
+    # -- inc-glm53f-100 -- the MLA families the ratified table defers to it
+    #    (``increments/shard-table-094.md`` Part 5, Group B). THREE leaves, one per
+    #    projection whose declared width carries the head count; the two latent
+    #    projections are absent because they are replicated, which Part 5 records
+    #    as a declaration rather than a default.
+    "Glm5NextMLAAttention": {
+        # Column-parallel: each rank owns whole heads of the projection's output.
+        # ``q_b_proj`` expands the query latent into per-head queries, so its
+        # OUTPUT carries the head axis and dim 0 is that axis in the checkpoint
+        # orientation ``[out_features, in_features]``.
+        "q_b_proj_weight": _DeclaredShard(
+            0, _mla_q_b_width, "column-parallel over whole heads"
+        ),
+        # Also column-parallel, and its head axis carries the key and value halves
+        # together -- the absorb split cuts the same weight per head, so splitting
+        # the two halves across ranks would mix heads at the right total width.
+        "kv_b_proj_weight": _DeclaredShard(
+            0, _mla_kv_b_width, "column-parallel over whole heads, keys with values"
+        ),
+        # Row-parallel: the head width is o_proj's INPUT, so each rank computes a
+        # partial sum and ``project_output`` reduces it across the group.
+        "o_proj_weight": _DeclaredShard(
+            1, _mla_o_proj_width, "row-parallel -- the head width is its input"
+        ),
     },
     "Glm5NextDenseMLP": {
         "gate_proj_weight": _DeclaredShard(
@@ -4149,6 +4316,49 @@ class Glm5NextMLAAttention(nn.Module):
         )
         self.indexer = Glm5NextDSAIndexer(text_config)
 
+    # -- inc-glm53f-100 -- THE ONE PLACE THIS CLASS TURNS HEADS INTO ITS HEADS.
+    #
+    # It sits here, in the class preamble ahead of both section banners, because
+    # both sections below read it: the projections' widths and the absorb
+    # operands' widths are the same head count seen from two sides. Putting it in
+    # either section would make the other section's reader cross a boundary to
+    # find out what a head count means.
+
+    def _heads_per_rank(self) -> int:
+        """This rank's share of the attention heads. Floored at 1.
+
+        WHY THIS IS A METHOD AND NOT A CONSTRUCTOR VALUE. ``self.num_attention_
+        heads`` stays the MODEL's count for the life of the module -- it is what
+        the checkpoint, the config and every closed-form comment mean by "heads" --
+        and this is the per-rank view of it. Overwriting the attribute instead
+        would have made every remaining reader of it silently per-rank, including
+        the ones in other increments' sections, and would have needed the world
+        size in ``__init__``, which this class is not given: it is constructed at
+        ``Glm5NextDSALayer.__init__`` with the text config alone, and that call
+        site belongs to another increment.
+
+        WHERE THE WORLD SIZE COMES FROM. :func:`_resolve_world_size`, the module's
+        own reader, which is also what the root binds ``self.world_size`` to
+        (``:4945``) and therefore what the shard table's width callbacks are
+        handed. One source, so the width a rank's weight is sliced to and the
+        width this class expects cannot come from two different answers. It is
+        read per call rather than cached because tests inject the world size by
+        monkeypatching that function (``test_load_weights.py:3180``) and a value
+        cached in ``__init__`` would have frozen the answer before the injection.
+
+        FLOORED AT 1 by ``_per_rank``, reused rather than re-derived so this class
+        and the shard table floor identically: the table's three MLA widths all go
+        through ``_mla_head_count``, which calls that same function on the same two
+        inputs.
+
+        ``_per_rank`` HAS EXACTLY THREE CALLERS IN THIS FILE, read rather than
+        assumed -- this method, ``_mla_head_count``, and ``Glm5NextKDAAttention``'s
+        ``__init__``, which divides ONCE into ``num_kv_heads_per_rank``. That third
+        caller is why the KDA width functions divide nowhere: their attribute is
+        already per-rank. MLA needs the division here because its attribute is not.
+        """
+        return _per_rank(self.num_attention_heads, _resolve_world_size())
+
     # -- the PROJECTIONS section -- D14 owner: ``inc-glm53f-039b`` (M3) -------
     #
     # WHAT THIS SECTION IS FOR. The five low-rank projections had no substrate
@@ -4191,8 +4401,18 @@ class Glm5NextMLAAttention(nn.Module):
         sums are written out anyway: on a config that had a rotary slice the
         bare value would be short by exactly that slice, which is the same
         reason ``_resolve_mla_head_size`` sums rather than takes the rank.
+
+        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``), so these are the five
+        widths of the weights THIS rank holds, which is what they have to be: a
+        checkpoint's projection is sliced to the rank's heads at load time, and
+        this method is what ``prepare_projection_weights`` checks the loaded weight
+        against. The three widths that carry the head count therefore narrow with
+        the world size and the other two do not -- the latent projections are
+        replicated, because MLA compresses KV to one latent per token rather than
+        one per head. At world size 1 every width is byte-identical to what it was
+        before that increment.
         """
-        heads = self.num_attention_heads
+        heads = self._heads_per_rank()
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         return (
             ("q_a_proj", self.hidden_size, self.q_lora_rank),
@@ -4366,8 +4586,18 @@ class Glm5NextMLAAttention(nn.Module):
         Closed form from the config and never read off a weight's shape, so a
         mis-shaped checkpoint is caught rather than adopted -- the rule
         ``projection_widths`` states for the five projections, applied here.
+
+        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``, a second writer in this
+        section BY CONCERN: it moves widths and touches no absorb algebra and no
+        numeric). It has to be, and not as a convenience: both operands are split
+        from the prepared ``kv_b_proj``, which under tensor parallelism holds only
+        this rank's heads, so an expectation written in the model's full head count
+        would refuse a correctly loaded weight. The two contraction extents --
+        ``qk_nope_head_dim`` and ``kv_lora_rank`` -- are NOT touched, because
+        neither is per-head: the latent is replicated across ranks and the head
+        width is a property of one head.
         """
-        heads = self.num_attention_heads
+        heads = self._heads_per_rank()
         latent = self.kv_lora_rank
         return (
             ("W_UK", heads, self.qk_nope_head_dim, latent),
@@ -4396,9 +4626,17 @@ class Glm5NextMLAAttention(nn.Module):
         glm-5.3-flash-port/approvals/DECISIONS.md`` §15a.5, which is what makes
         "the split picks the right bytes for the right head" a measurement
         instead of a claim.
+
+        ``inc-glm53f-100`` MOVES ONE BINDING AND NOTHING ELSE IN THIS METHOD: the
+        head count below is now this rank's. Every line after it is untouched --
+        the closed form, the reshape, the two permutes, the width comparison -- and
+        that is the point: the split is per head, so once "heads" means this rank's
+        heads the whole chain is already per-rank arithmetic. The refusal it raises
+        is the one that matters under tensor parallelism, because a full-count
+        expectation against a rank's weight would stop a correct load.
         """
         prepared = self._prepared_weight("kv_b_proj")
-        heads = self.num_attention_heads
+        heads = self._heads_per_rank()
         nope = self.qk_nope_head_dim
         vdim = self.v_head_dim
         latent = self.kv_lora_rank
@@ -4475,6 +4713,17 @@ class Glm5NextMLAAttention(nn.Module):
         rank, normalise the latent, expand to the head width. The key and value
         come out of ONE expansion and are split, which is why this is four
         dispatches and not five.
+
+        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``). This method has no
+        production caller -- it is the DENSE path, kept as the oracle the absorbed
+        decode path is compared against, which is why ``inc-glm53f-042`` wrote a
+        sibling rather than reuse it -- so it needs no reduction and gets no
+        acceptance item of its own. The binding still moves, for two reasons that
+        are not tidiness: it reads ``projection_widths`` two lines above, so a
+        full-count head here against per-rank widths would make ONE method
+        internally inconsistent; and the key-value reshape below would then refuse
+        a correctly loaded weight under tensor parallelism, turning the class's
+        comparison oracle into the one thing that cannot run.
         """
         from vllm_neuron.functional.attention.mla_projections import mla_projection
 
@@ -4486,7 +4735,7 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{tuple(hidden_states.shape)}"
             )
         tokens = int(x.shape[0])
-        heads = self.num_attention_heads
+        heads = self._heads_per_rank()
 
         q_latent = mla_projection(x, self._prepared_weight("q_a_proj"))
         q_latent = self._latent_norm(q_latent, self.q_a_layernorm_weight)
@@ -4604,6 +4853,16 @@ class Glm5NextMLAAttention(nn.Module):
         dispatches -- the extracted method performs the first of the three. The
         extraction exists because the DSA indexer needs that intermediate value
         and no caller could reach it while it was a local here.
+
+        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``), so the returned query
+        is ``[tokens, heads_on_this_rank, qk_nope_head_dim]``. This was the one
+        site in the class where a full-count head reshape would NOT have raised:
+        the reshape below divides the projection's own output width by the head
+        count, so on two ranks of a 64-head model a rank's ``[tokens, 8192]``
+        query would have reshaped cleanly to ``[tokens, 64, 128]`` instead of
+        ``[tokens, 32, 256]`` -- right element count, wrong heads, no error, and a
+        head width of 128 the config never mentions. Reading the count from the
+        same reader the widths use is what removes that.
         """
         from vllm_neuron.functional.attention.mla_projections import mla_projection
 
@@ -4615,7 +4874,7 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{tuple(hidden_states.shape)}"
             )
         tokens = int(x.shape[0])
-        heads = self.num_attention_heads
+        heads = self._heads_per_rank()
 
         q_latent = self.project_query_latent(hidden_states)
         query = mla_projection(q_latent, self._prepared_weight("q_b_proj"))
@@ -4635,20 +4894,56 @@ class Glm5NextMLAAttention(nn.Module):
         hidden_size]``. Both input forms are accepted because the decode path
         that calls this is another increment's and its layout is its own choice,
         not something this section should dictate.
+
+        THIS IS THE ROW-PARALLEL SITE, AND IT REDUCES (``inc-glm53f-100``). Under
+        tensor parallelism the head width is this projection's INPUT, so each rank
+        holds a slice of the weight's columns, contracts it against its own heads,
+        and produces a PARTIAL SUM at the full output width -- every rank's result
+        is the same shape and none of them is the answer. The answer is their sum,
+        so the collective is not an optimisation here: without it the model returns
+        one rank's fraction of every attention output, at exactly the right shape,
+        which is the failure mode that does not announce itself.
+
+        THE GROUP AND THE FORM ARE THE FORK'S, not a second convention. All eight
+        shipped model files reduce a row-parallel result by calling ``all_reduce``
+        on ``get_tp_group()``'s coordinator, in the statement form used below
+        (``qwen3/model.py:535-537``, and 18 sites across ``llama3``, ``gpt_oss``,
+        ``qwen3`` and ``qwen3_vl``); the convention is written down at
+        ``parallel/DESIGN.md:149-151``. :func:`_resolve_tp_group` is where this
+        file resolves it, and it returns ``None`` at world size 1, so a
+        single-rank run takes exactly the path it took before this increment --
+        no collective, no import of vllm, no behaviour change.
+
+        TWO READINGS WORTH STATING, because both could be wrong in a way tests
+        would not catch. First, the reduction is IN PLACE: the statement form
+        discards a return value, so it assumes ``all_reduce`` writes through its
+        argument. That assumption is inherited rather than invented -- all 18
+        shipped row-parallel sites make it -- and it is safe against aliasing here
+        because ``mla_projection`` returns a fresh tensor rather than a view of a
+        cached weight. Second, the sum happens BEFORE the cast back to the input
+        dtype: partial sums are reduced in the float32 the seam computed them in,
+        because rounding each rank's fraction to bfloat16 first and adding after
+        would round the parts instead of the whole.
         """
         from vllm_neuron.functional.attention.mla_projections import mla_projection
 
-        expected_width = self.num_attention_heads * self.v_head_dim
+        heads = self._heads_per_rank()
+        expected_width = heads * self.v_head_dim
         x = attn_out.to(torch.float32)
         if x.ndim == 3:
             x = x.reshape(int(x.shape[0]), -1)
         if x.ndim != 2 or int(x.shape[1]) != expected_width:
             raise ValueError(
-                f"attn_out must be [tokens, {self.num_attention_heads}, "
+                f"attn_out must be [tokens, {heads}, "
                 f"{self.v_head_dim}] or [tokens, {expected_width}]; got "
                 f"{tuple(attn_out.shape)}"
             )
         projected = mla_projection(x.contiguous(), self._prepared_weight("o_proj"))
+        # Sum this rank's partial with every other rank's. ``None`` means one
+        # rank, where the partial already is the whole sum.
+        group = _resolve_tp_group()
+        if group is not None:
+            group.all_reduce(projected)
         return projected.to(attn_out.dtype)
 
     # -- the DECODE section -- D14 owner: ``inc-glm53f-042`` -------------------

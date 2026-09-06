@@ -3010,13 +3010,42 @@ SHARD_NARROW = 8
 _KDA_FULL = SHARD_LINEAR_ATTN["num_heads"] * SHARD_LINEAR_ATTN["head_dim"]
 _KDA_HEADS = SHARD_LINEAR_ATTN["num_heads"]
 
+#: The suffix that makes a declared leaf a WEIGHT leaf, so a sibling scale grid
+#: can be named from it. The production rule is ``model_fp8.py``'s
+#: ``_WEIGHT_LEAF_SUFFIX`` with ``_sibling_scale_grid_name`` on top of it; this is
+#: that rule stated once here rather than spelled inline at the one place below
+#: that needs it.
+_LEAF_WEIGHT_SUFFIX = "_weight"
+
+#: The MLA head-width three, in the miniature's own numbers. Derived from
+#: ``MINI_MLA_WIDTHS`` rather than typed, because that dict is what the fixture
+#: builds the module from -- a width changed there moves these with it instead of
+#: leaving a second set of numbers to drift.
+_MLA_HEADS = MINI_MLA_WIDTHS["num_attention_heads"]
+_MLA_Q_B_FULL = _MLA_HEADS * (
+    MINI_MLA_WIDTHS["qk_nope_head_dim"] + MINI_MLA_WIDTHS["qk_rope_head_dim"]
+)
+_MLA_KV_B_FULL = _MLA_HEADS * (
+    MINI_MLA_WIDTHS["qk_nope_head_dim"] + MINI_MLA_WIDTHS["v_head_dim"]
+)
+_MLA_O_PROJ_FULL = _MLA_HEADS * MINI_MLA_WIDTHS["v_head_dim"]
+
 #: ``(declaring class, declared leaf) -> (shard dim, full extent on that dim)``.
-#: The FIFTEEN families the ratified table calls sharded at this increment:
-#: twelve on ``Glm5NextKDAAttention`` and three on ``Glm5NextDenseMLP``. The nine
-#: deferred families -- the MLA head-width three to ``inc-glm53f-100``, the shared
-#: expert's three and the routed bank's three to ``inc-glm53f-101`` -- are absent
+#: The EIGHTEEN families the ratified table calls sharded once ``inc-glm53f-100``
+#: has landed: twelve on ``Glm5NextKDAAttention``, three on ``Glm5NextDenseMLP``
+#: and the MLA head-width three. The six still deferred -- the shared expert's
+#: three and the routed bank's three, both to ``inc-glm53f-101`` -- are absent
 #: here exactly as they are absent from the code's table, which is what conjunct
 #: (4) counts.
+#:
+#: THE MLA THREE ARE ``inc-glm53f-100``'s ADDITION, and this is the deferral
+#: above being kept rather than a new claim. The text this replaces read: "The
+#: FIFTEEN families the ratified table calls sharded at this increment: twelve on
+#: ``Glm5NextKDAAttention`` and three on ``Glm5NextDenseMLP``. The nine deferred
+#: families -- the MLA head-width three to ``inc-glm53f-100``, the shared
+#: expert's three and the routed bank's three to ``inc-glm53f-101`` -- are absent
+#: here exactly as they are absent from the code's table, which is what conjunct
+#: (4) counts."
 SHARD_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
     ("Glm5NextKDAAttention", "q_proj_weight"): (0, _KDA_FULL),
     ("Glm5NextKDAAttention", "k_proj_weight"): (0, _KDA_FULL),
@@ -3033,6 +3062,26 @@ SHARD_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
     ("Glm5NextDenseMLP", "gate_proj_weight"): (0, SHARD_INTERMEDIATE),
     ("Glm5NextDenseMLP", "up_proj_weight"): (0, SHARD_INTERMEDIATE),
     ("Glm5NextDenseMLP", "down_proj_weight"): (1, SHARD_INTERMEDIATE),
+    ("Glm5NextMLAAttention", "q_b_proj_weight"): (0, _MLA_Q_B_FULL),
+    ("Glm5NextMLAAttention", "kv_b_proj_weight"): (0, _MLA_KV_B_FULL),
+    ("Glm5NextMLAAttention", "o_proj_weight"): (1, _MLA_O_PROJ_FULL),
+}
+
+#: The extent on the dimension a family is NOT sharded on, for the families where
+#: that extent is not the arbitrary :data:`SHARD_NARROW`.
+#:
+#: The MLA three are the only entries, and they are here because their shape is
+#: CHECKED rather than arbitrary: ``prepare_projection_weights`` compares each MLA
+#: projection against the module's own closed form, and every item on this fixture
+#: reaches it through ``load_weights``. Written at ``SHARD_NARROW`` the three would
+#: refuse the load instead of being sharded by it. ``_mla_key_overrides`` writes
+#: the same closed form for the same reason; this table is what lets the shard
+#: writer agree with it while still writing position-identifying values, which a
+#: constant tensor cannot do (see :func:`_shard_pattern`).
+SHARD_OTHER_EXTENT: dict[tuple[str, str], int] = {
+    ("Glm5NextMLAAttention", "q_b_proj_weight"): MINI_MLA_WIDTHS["q_lora_rank"],
+    ("Glm5NextMLAAttention", "kv_b_proj_weight"): MINI_MLA_WIDTHS["kv_lora_rank"],
+    ("Glm5NextMLAAttention", "o_proj_weight"): MINI_MLA_WIDTHS["hidden_size"],
 }
 
 #: The two KDA leaves that are one number per head rather than a matrix.
@@ -3096,11 +3145,21 @@ def _shard_config(first_k_dense: int) -> Glm5NextConfig:
     )
 
 
-def _shard_full_shape(leaf: str, shard_dim: int, full: int) -> tuple[int, ...]:
-    """The FULL (unsharded) shape this family's checkpoint tensor is written at."""
+def _shard_full_shape(
+    family: str, leaf: str, shard_dim: int, full: int
+) -> tuple[int, ...]:
+    """The FULL (unsharded) shape this family's checkpoint tensor is written at.
+
+    The other extent is the arbitrary :data:`SHARD_NARROW` unless the family
+    declares a real one in :data:`SHARD_OTHER_EXTENT`. ``family`` is a parameter
+    rather than derived from ``leaf`` because a leaf name alone does not identify
+    a family: ``o_proj_weight`` is declared by both ``Glm5NextKDAAttention`` and
+    ``Glm5NextMLAAttention``, and only the second has a checked closed form.
+    """
     if leaf in SHARD_ONE_DIMENSIONAL:
         return (full,)
-    return (full, SHARD_NARROW) if shard_dim == 0 else (SHARD_NARROW, full)
+    other = SHARD_OTHER_EXTENT.get((family, leaf), SHARD_NARROW)
+    return (full, other) if shard_dim == 0 else (other, full)
 
 
 def _shard_pattern(
@@ -3150,6 +3209,19 @@ def _shard_key_overrides(
     the same closed form the loader divides by. The dtype question, "is this
     family quantised", is answered by asking the map whether the entry carries a
     scale key, not from a list of family names kept here.
+
+    A SPLIT MAP ENTRY IS ASKED THAT QUESTION A SECOND WAY, and that is
+    ``inc-glm53f-100``'s change here. The DSA half's scaled projections carry the
+    grid as a mapped parameter of their OWN -- ``weight_loaders_fp8.py:529-540``
+    adds ``<leaf>_weight`` and ``<leaf>_weight_scale_inv`` as two entries -- so for
+    them a one-key entry does NOT mean unquantised. Asking only about the entry's
+    own keys would have written the MLA three as bf16 and silently dropped the fp8
+    reading ``_mla_key_overrides`` already gave them, which is a fixture that no
+    longer resembles the checkpoint. A lone weight key therefore also asks whether
+    the map carries its sibling grid, by the same name rule the reader uses
+    (``model_fp8.py``'s ``_sibling_scale_grid_name``). ``kv_b_proj`` has no
+    sibling in this checkpoint and stays bf16, which is the reading
+    ``inc-glm53f-078`` recorded.
     """
     overrides: dict[str, torch.Tensor] = {}
     for path, module in model.named_modules():
@@ -3163,7 +3235,13 @@ def _shard_key_overrides(
             keys = _keys_of(mappings, param)
             scales = scale_keys(keys)
             weight_key = next(key for key in keys if key not in scales)
-            shape = _shard_full_shape(leaf, shard_dim, full)
+            shape = _shard_full_shape(family, leaf, shard_dim, full)
+            if not scales and leaf.endswith(_LEAF_WEIGHT_SUFFIX):
+                grid_param = (
+                    f"{param[: -len(_LEAF_WEIGHT_SUFFIX)]}_{FP8_SCALE_SUFFIX}"
+                )
+                if grid_param in mappings:
+                    scales = _keys_of(mappings, grid_param)
             if scales:
                 overrides[weight_key] = _shard_pattern(
                     shape, shard_dim, torch.float8_e4m3fn
@@ -3320,7 +3398,9 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
     for rank, sharded in sorted(per_rank.items()):
         for path, module, leaf, shard_dim, full in _sharded_leaves(sharded):
             dotted = f"{path}.{leaf}"
-            full_shape = _shard_full_shape(leaf, shard_dim, full)
+            full_shape = _shard_full_shape(
+                type(module).__name__, leaf, shard_dim, full
+            )
             expected = list(full_shape)
             expected[shard_dim] = full // SHARD_WORLD
             got = tuple(_loaded(sharded, dotted).shape)
@@ -3741,9 +3821,21 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     print(f"CONJUNCT4_MLA_LEAVES_REPLICATED_IN_EFFECT={mla}")
     print(f"CONJUNCT4_ROUTED_LEAVES_REPLICATED_IN_EFFECT={routed}")
     print(f"CONJUNCT4_SHARED_EXPERT_LEAVES_PRESENT={shared}")
+    # ``inc-glm53f-100`` REVISED THIS CLAUSE, and the old text is kept beside the
+    # new because the reading changed rather than the code drifting. It read: "no
+    # MLA parameter stayed identical, so the three families deferred to
+    # inc-glm53f-100 cannot be counted replicated-in-effect here". The three
+    # head-width families are no longer deferred -- they are declared above and
+    # they MOVE, counted by ``moved == declared``. What stays identical on this
+    # module is the LATENT side: ``q_a_proj``, ``kv_a_proj_with_mqa``, the two
+    # layernorms and the scale grids. Those are replicated by the architecture and
+    # not by deferral -- MLA compresses one latent per TOKEN, not per head, so
+    # there is no head axis to split them on -- and the clause now holds them.
     assert mla, (
-        "no MLA parameter stayed identical, so the three families deferred to "
-        "inc-glm53f-100 cannot be counted replicated-in-effect here"
+        "no MLA parameter stayed identical. The head-width three are sharded from "
+        "inc-glm53f-100 on, but the LATENT projections and layernorms have no head "
+        "axis to shard and must still be replicated, so an empty list here means "
+        "something sharded that this architecture cannot shard"
     )
     # ── THE ROUTED CLAUSE, INVERTED BY ``inc-glm53f-101`` ─────────────────────
     # DECISIONS §83 ruling 2. The clause this replaces read, in these words:
