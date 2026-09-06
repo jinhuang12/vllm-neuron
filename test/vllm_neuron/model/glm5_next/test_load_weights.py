@@ -40,6 +40,7 @@ import logging
 import math
 import textwrap
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -63,6 +64,7 @@ from vllm_neuron.model.glm5_next.model_fp8 import (
     _is_fp8_dtype,
     _scale_prep_leaves,
 )
+from vllm_neuron.functional.blockwise_fp8_mm import BlockwiseFp8MmError
 from vllm_neuron.model.glm5_next.quantization import DEFAULT_WEIGHT_BLOCK_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     DSA_SCALED_PROJECTIONS,
@@ -3756,18 +3758,46 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     # bank's three families, so the assertion now says the opposite of what it
     # said, and the old text is quoted rather than deleted so the reversal is
     # legible -- the form the (v) replacement below already uses.
+    # THE THREE PROJECTIONS, NOT EVERY LEAF THE CLASS DECLARES. The two routers
+    # are frozen REPLICATED by the ratified table (§54 Part 3, "both routers
+    # replicated") and they are declared on this same module, so a clause over the
+    # whole class would demand the routers move too. Measured: a first draft of
+    # this inversion failed on `['router_bias', 'router_weight']`
+    # (`selftest-101-r10-host.out`), which is the table's answer and not a defect.
+    bank_projections = {
+        leaf
+        for (family, leaf) in DEFERRED_FAMILIES
+        if family in DEFERRED_EP_GROUP_CLASSES
+    }
     routed_that_moved = sorted(by_owner_moved.get("Glm5NextRoutedExperts", ()))
+    projections_still_replicated = sorted(set(routed) & bank_projections)
+    routers_still_replicated = sorted(set(routed) - bank_projections)
     print(f"CONJUNCT4_ROUTED_LEAVES_THAT_MOVED={routed_that_moved}")
-    assert routed == [], (
-        f"a routed-expert parameter stayed identical across the two world sizes: "
-        f"{routed}. inc-glm53f-101 attached the bank's three families, so at world "
-        f"2 with expert-parallel degree 1 every one of its leaves must differ -- "
-        f"the experts are all local and the intermediate width divides across the "
-        f"whole world. A leaf that did not move is a family the attachment missed"
+    print(
+        "CONJUNCT4_ROUTED_PROJECTIONS_STILL_REPLICATED="
+        f"{projections_still_replicated}"
     )
-    assert routed_that_moved, (
-        "no routed-expert parameter MOVED either, so this configuration built no "
-        "bank at all and the inverted reading above is empty rather than true"
+    print(f"CONJUNCT4_ROUTERS_STILL_REPLICATED={routers_still_replicated}")
+    assert projections_still_replicated == [], (
+        f"a routed-expert PROJECTION stayed identical across the two world sizes: "
+        f"{projections_still_replicated}. inc-glm53f-101 attached the bank's three "
+        f"families, so at world 2 with expert-parallel degree 1 every one of them "
+        f"must differ -- the experts are all local and the intermediate width "
+        f"divides across the whole world. A leaf that did not move is a family the "
+        f"attachment missed"
+    )
+    assert sorted(set(routed_that_moved) & bank_projections) == sorted(
+        bank_projections
+    ), (
+        f"the three bank projections did not all move: moved "
+        f"{sorted(set(routed_that_moved) & bank_projections)} of "
+        f"{sorted(bank_projections)}. An empty replicated reading above would then "
+        f"mean this configuration built no bank rather than that -101 attached it"
+    )
+    assert routers_still_replicated, (
+        "no router stayed identical. The ratified table freezes both routers "
+        "REPLICATED (§54 Part 3), so the inversion above has widened past the "
+        "three families inc-glm53f-101 attached"
     )
     assert shared == [], (
         "this fixture built a shared-expert module. The load is only known to "
@@ -3997,19 +4027,24 @@ def _padded_shard_extent(full: int, num_shards: int, block: int) -> int:
     return (math.ceil(full / step) * step) // num_shards
 
 
-def _deferred_config() -> Glm5NextConfig:
+def _deferred_config(shared_experts: int = MINI_SHARED_EXPERTS) -> Glm5NextConfig:
     """:func:`_shard_config`'s fixture with the shared expert switched ON.
 
     ``n_shared_experts`` is 1 here where :func:`_shard_config` sets 0, and that is
     the whole difference. ``-094`` set it to 0 because the shared expert's three
     families were REPLICATED-IN-EFFECT at that increment and its own conjunct (4)
     said so; this block attaches them, so they have to be observed by a real load.
+
+    ``shared_experts`` IS THE FIRING CONTROL'S ONE VARYING FIELD. At 0 the load
+    completes and records no refusal, which is what makes the recorded gap below a
+    reading of the shared expert's prep rather than of the fixture at large
+    (DECISIONS §84 ruling (ii)).
     """
     return Glm5NextConfig(
         text_config=Glm5NextTextConfig(
             num_hidden_layers=MINI_LAYERS,
             n_routed_experts=MINI_ROUTED_EXPERTS,
-            n_shared_experts=MINI_SHARED_EXPERTS,
+            n_shared_experts=shared_experts,
             first_k_dense_replace=MINI_FIRST_K_DENSE,
             tie_word_embeddings=False,
             linear_attn_config=SHARD_LINEAR_ATTN,
@@ -4116,19 +4151,37 @@ def _mesh_answers(world_size: int, ep_degree: int, rank: int) -> tuple[int, int]
     )
 
 
+class _DeferredLoad(NamedTuple):
+    """One load's outcome: the model with its shards attached, and the refusal.
+
+    ``refusal`` is the ``BlockwiseFp8MmError`` text when the shared expert's
+    ``-054``-owned prep refused the checkpoint-tile grid, and ``None`` for the
+    firing control that carries no shared expert. Both are readings; neither is a
+    failure of this file.
+    """
+
+    model: Glm5NextForConditionalGeneration
+    refusal: str | None
+
+
 def _load_at_ep(
     directory: Path,
     world_size: int,
     rank: int,
     ep_degree: int,
     monkeypatch,
-) -> Glm5NextForConditionalGeneration:
+    shared_experts: int = MINI_SHARED_EXPERTS,
+) -> _DeferredLoad:
     """Load at a synthetic world size, rank AND expert-parallel degree.
 
     THE EP ANSWERS COME FROM THE PACKAGE'S MESH, not from arithmetic here. The two
     getters the loader reads are patched to report what ``_build_ep_group_ranks``
     says for this rank, so a test that agreed with a wrong loader would have to
     disagree with the shipped mesh builder to do it.
+
+    THE MODEL COMES BACK EVEN WHEN THE PREP REFUSES, and that is the point: the
+    shards are attached before the prep runs, so every shape and byte these items
+    read is on the module the real ``load_weights`` populated.
     """
     ep_rank, column = _mesh_answers(world_size, ep_degree, rank)
     monkeypatch.setattr(_MODEL_FP8, "_resolve_world_size", lambda: world_size)
@@ -4140,14 +4193,59 @@ def _load_at_ep(
         "get_neuron_ep_tp_group",
         lambda: _FixtureGroup(column, world_size // ep_degree),
     )
-    model = Glm5NextForConditionalGeneration(_deferred_config())
+    model = Glm5NextForConditionalGeneration(_deferred_config(shared_experts))
     assert model.world_size == world_size, (
         f"the model resolved world size {model.world_size}, not the patched "
         f"{world_size}"
     )
     _seed_page_cache_signal()
-    model.load_weights(str(directory), torch.device("cpu"), None)
-    return model
+    if shared_experts == 0:
+        # THE FIRING CONTROL. Same fixture, same narrow width, no shared expert --
+        # so the load runs to the end and records NO refusal. Without this side the
+        # recorded gap below would read the same whether the prep refused or the
+        # fixture could not load at all.
+        model.load_weights(str(directory), torch.device("cpu"), None)
+        return _DeferredLoad(model, None)
+
+    # THE RECORDED GAP, OBSERVED RATHER THAN AVOIDED. DECISIONS §84: nothing on the
+    # shared expert's load path retiles its scale grid from the checkpoint's
+    # (128, 128) tiles onto the 256-granularity PUBLIC grid that the landed
+    # ``prepare_scale_operands`` demands (``model_fp8.py:1820-1824``), and placing
+    # that retile is ``inc-glm53f-054``'s by design entry x. So this load ATTACHES
+    # every shard and then refuses inside the prep, which runs after attachment
+    # (``load_weights``: shards at :4143, preps at :4154).
+    #
+    # WHEN ``-054`` LANDS THE RETILE THIS READING FLIPS to "the prep built 3" and
+    # the capture below becomes a completing load. That is the expected change,
+    # named here so the flip is a recorded move rather than a surprise.
+    with pytest.raises(BlockwiseFp8MmError) as raised:
+        model.load_weights(str(directory), torch.device("cpu"), None)
+    refusal = str(raised.value)
+
+    # THE TWO GRIDS ARE THIS FILE'S OWN ARITHMETIC, not read back from the message.
+    # The prep's loop takes gate_proj first, so the refusal is the shared expert's
+    # gate: its per-rank rows by this fixture's narrow width.
+    block = _WL_FP8.consumer_block_quant_size()
+    rows = _padded_shard_extent(SHARED_INTERMEDIATE, world_size, block)
+    cols = DEFERRED_NARROW
+    tile_grid = (
+        rows // DEFAULT_WEIGHT_BLOCK_SIZE[0],
+        cols // DEFAULT_WEIGHT_BLOCK_SIZE[1],
+    )
+    public_grid = (rows // block, cols // block)
+    assert f"shape {tile_grid}" in refusal, (
+        f"the refusal does not name the checkpoint-tile grid {tile_grid} the loader "
+        f"attached: {refusal}"
+    )
+    assert f"expected {public_grid}" in refusal, (
+        f"the refusal does not name the public grid {public_grid} the prep demands: "
+        f"{refusal}"
+    )
+    assert f"[K={rows}, N={cols}]" in refusal, (
+        f"the refusal does not name the weight extents [K={rows}, N={cols}] this "
+        f"world size produces: {refusal}"
+    )
+    return _DeferredLoad(model, refusal)
 
 
 def _deferred_leaves(
@@ -4190,13 +4288,57 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     print(f"CONJUNCT1D_WORLD={SHARD_EP_WORLD} EP_DEGREE={SHARD_EP_DEGREE}")
     print(f"CONJUNCT1D_TP_PER_EP={SHARD_TP_PER_EP}")
 
-    models = {
+    loads = {
         rank: _load_at_ep(
             directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
         )
         for rank in range(SHARD_EP_WORLD)
     }
-    whole = _load_at_ep(directory, 1, 0, 1, monkeypatch)
+    # The RECORDED GAP is read on every rank before anything else: each load
+    # attached its shards and then the -054-owned prep refused the checkpoint-tile
+    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
+    # counted, so an item cannot read shards from a load that refused for some
+    # other reason.
+    models = {rank: load.model for rank, load in loads.items()}
+    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
+    print(f"CONJUNCT1D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
+    # The gap's own words, so the transcript carries the refusal verbatim and a
+    # later reader can see WHICH refusal these items recorded.
+    print(f"CONJUNCT1D_RECORDED_GAP_REFUSAL={loads[0].refusal}")
+    assert sorted(gap_refusals) == sorted(models), (
+        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
+        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
+        f"(so -054 landed and this reading flips) or never reached the prep"
+    )
+    whole_load = _load_at_ep(directory, 1, 0, 1, monkeypatch)
+    whole = whole_load.model
+    assert whole_load.refusal is not None, (
+        "the world-size-1 load did not refuse inside the prep, so the recorded gap "
+        "is not a property of the shared expert's grid granularity after all"
+    )
+
+    # THE FIRING CONTROL (DECISIONS §84 ruling (ii)). The same fixture at the same
+    # narrow width with NO shared expert loads to the end and records no refusal, so
+    # the readings above are of the shared expert's prep and not of a fixture that
+    # cannot load at all.
+    control = _load_at_ep(
+        directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch, shared_experts=0
+    )
+    print(f"CONJUNCT1D_CONTROL_REFUSAL={control.refusal}")
+    assert control.refusal is None, (
+        f"the no-shared-expert control ALSO refused: {control.refusal}. Then the "
+        f"refusal is not the shared expert's prep and the recorded gap is misnamed"
+    )
+    control_shards = _sharded_leaves(control.model) + [
+        row
+        for row in _deferred_leaves(control.model)
+        if type(row[1]).__name__ in DEFERRED_EP_GROUP_CLASSES
+    ]
+    print(f"CONJUNCT1D_CONTROL_FAMILIES_LOADED={len(control_shards)}")
+    assert control_shards, (
+        "the control load attached no sharded family, so it is not a load of the "
+        "same fixture and cannot control anything"
+    )
 
     expected_local_experts = MINI_ROUTED_EXPERTS // SHARD_EP_DEGREE
     checked = 0
@@ -4210,19 +4352,20 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
                 # A bank carries a LEADING expert axis, so its declared dim moves
                 # one place right and the leading extent is this EP rank's experts.
                 per_rank = _padded_shard_extent(full, SHARD_TP_PER_EP, block)
-                base = list(_shard_full_shape(leaf, shard_dim, full))
+                base = list(_deferred_full_shape(leaf, shard_dim, full))
                 base[shard_dim] = per_rank
                 expected = (expected_local_experts, *base)
+                divisor = f"tp_per_ep {SHARD_TP_PER_EP}"
             else:
                 per_rank = _padded_shard_extent(full, SHARD_EP_WORLD, block)
-                expected = list(_shard_full_shape(leaf, shard_dim, full))
+                expected = list(_deferred_full_shape(leaf, shard_dim, full))
                 expected[shard_dim] = per_rank
                 expected = tuple(expected)
+                divisor = f"world {SHARD_EP_WORLD}"
             assert got == expected, (
                 f"{dotted} loaded {got} at rank {rank}; this file's rule says "
                 f"{expected} -- full extent {full} on dim {shard_dim}, divided by "
-                f"{'tp_per_ep ' + str(SHARD_TP_PER_EP) if cls in DEFERRED_EP_GROUP_CLASSES else 'world ' + str(SHARD_EP_WORLD)}"
-                f" after rounding up to a multiple of {block} per rank"
+                f"{divisor} after rounding up to a multiple of {block} per rank"
             )
             checked += 1
             if rank == 0:
@@ -4231,6 +4374,14 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     print(
         f"CONJUNCT1D_PER_RANK_SHAPES_AS_DECLARED={checked}/"
         f"{SHARD_EP_WORLD * len(_deferred_leaves(models[0]))}"
+    )
+    # ATTACHMENT BEFORE REFUSAL (DECISIONS §84 ruling (ii)). Every shape above was
+    # read off a module whose load REFUSED, and each rank in ``models`` is a rank in
+    # ``gap_refusals`` by the assertion at the top of this item. So the attachment
+    # completed and the refusal came after it. Item (2) reads the same shards' BYTES.
+    print(
+        f"CONJUNCT1D_ATTACHED_ON_REFUSING_RANKS={checked} on ranks "
+        f"{sorted(gap_refusals)}"
     )
     assert checked == SHARD_EP_WORLD * len(_deferred_leaves(models[0]))
     # Section 79.1: a subset reading over a measured set also asserts non-empty.
@@ -4245,7 +4396,7 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     for path, module, leaf, shard_dim, full in _deferred_leaves(whole):
         dotted = f"{path}.{leaf}"
         got = tuple(_loaded(whole, dotted).shape)
-        base = list(_shard_full_shape(leaf, shard_dim, full))
+        base = list(_deferred_full_shape(leaf, shard_dim, full))
         expected = (
             (MINI_ROUTED_EXPERTS, *base)
             if type(module).__name__ in DEFERRED_EP_GROUP_CLASSES
@@ -4282,12 +4433,25 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
     against exactly 0.0, so nothing is being called close.
     """
     directory, overrides, mappings = _deferred_checkpoint(tmp_path)
-    models = {
+    loads = {
         rank: _load_at_ep(
             directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
         )
         for rank in range(SHARD_EP_WORLD)
     }
+    # The RECORDED GAP is read on every rank before anything else: each load
+    # attached its shards and then the -054-owned prep refused the checkpoint-tile
+    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
+    # counted, so an item cannot read shards from a load that refused for some
+    # other reason.
+    models = {rank: load.model for rank, load in loads.items()}
+    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
+    print(f"CONJUNCT2D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
+    assert sorted(gap_refusals) == sorted(models), (
+        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
+        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
+        f"(so -054 landed and this reading flips) or never reached the prep"
+    )
 
     reassembled = 0
     for path, module, leaf, shard_dim, full in _deferred_leaves(models[0]):
@@ -4396,12 +4560,25 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     """
     directory, overrides, mappings = _deferred_checkpoint(tmp_path)
     block = _WL_FP8.consumer_block_quant_size()
-    models = {
+    loads = {
         rank: _load_at_ep(
             directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
         )
         for rank in range(SHARD_EP_WORLD)
     }
+    # The RECORDED GAP is read on every rank before anything else: each load
+    # attached its shards and then the -054-owned prep refused the checkpoint-tile
+    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
+    # counted, so an item cannot read shards from a load that refused for some
+    # other reason.
+    models = {rank: load.model for rank, load in loads.items()}
+    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
+    print(f"CONJUNCT3D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
+    assert sorted(gap_refusals) == sorted(models), (
+        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
+        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
+        f"(so -054 landed and this reading flips) or never reached the prep"
+    )
 
     dense_paths = sorted(
         {
@@ -4538,8 +4715,15 @@ def test_sharedshard_the_six_families_left_the_replicated_set_both_directions(
     empty sets holds, and would hold if the load had read nothing at all.
     """
     directory, _overrides, _mappings = _deferred_checkpoint(tmp_path)
-    rank0 = _load_at_ep(directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch)
-    rank1 = _load_at_ep(directory, SHARD_EP_WORLD, 1, SHARD_EP_DEGREE, monkeypatch)
+    load0 = _load_at_ep(directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch)
+    load1 = _load_at_ep(directory, SHARD_EP_WORLD, 1, SHARD_EP_DEGREE, monkeypatch)
+    rank0, rank1 = load0.model, load1.model
+    recorded = [load0.refusal is not None, load1.refusal is not None]
+    print(f"CONJUNCT4D_BOTH_RANKS_RECORDED_THE_GAP={recorded}")
+    assert load0.refusal is not None and load1.refusal is not None, (
+        "one of the two loads did not record the -054 prep refusal, so the two are "
+        "not the same kind of load and their difference is not a shard reading"
+    )
 
     declared_sharded = {
         f"{path}.{leaf}"
