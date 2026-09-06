@@ -386,7 +386,41 @@ C080_QUANT_CONFIG_KEYS = 4
 # checkpoint clamps both shared-expert projections with. The count is the constant
 # below and conjunct (c)'s derivation, not a third copy in this prose -- and
 # `swiglu_limit` is now absent from the log, which conjunct (c) asserts BY NAME.
-C080_DROPPED_KEYS = 25
+#
+# 25 -> 18 AT `inc-glm53f-051`, BECAUSE THAT BLOCK MODELLED SEVEN MORE KEYS: the
+# indexer's dials at `config.py:204-210` -- `index_topk`, `index_n_heads`,
+# `index_head_dim`, `index_kpool`, `index_kpool_compress`,
+# `index_kpool_always_select_tail` and `index_share_for_mtp_iteration`. All seven
+# are declared in the vendor's own `text_config`, so all seven were dropped keys
+# before that block and are dataclass fields after it: 25 - 7 = 18. The old value
+# is quoted here rather than replaced silently, because a typed guard that moves
+# without saying so is a guard no reader can audit.
+#
+# `indexer_rope_interleave` is NOT one of the seven and stays dropped, which is
+# what makes this a movement of seven rather than eight: it is spelled `indexer_`,
+# not `index_`, and `config.py:212-215` records why it is deliberately unmodelled.
+#
+# AND THIS CONSTANT STAYS TYPED ON PURPOSE. Conjunct (c) DERIVES the expected set
+# from the dataclass and the vendor config and asserts the log equals it, so that
+# arm moves by itself whenever a field is added and cannot notice a field
+# disappearing. The typed count is the arm that fails when the population moves for
+# a reason nobody declared. Deriving it as well would make the pair tautological
+# and leave nothing watching the derivation.
+C080_DROPPED_KEYS = 18
+
+#: The seven keys `inc-glm53f-051` moved out of the drop log, asserted BY NAME below
+#: for the reason conjunct (c)'s own docstring gives: a count cannot say WHICH key
+#: left, and a dataclass that dropped one field while adding another would keep the
+#: count and break the model.
+C080_MODELLED_BY_051 = (
+    "index_topk",
+    "index_n_heads",
+    "index_head_dim",
+    "index_kpool",
+    "index_kpool_compress",
+    "index_kpool_always_select_tail",
+    "index_share_for_mtp_iteration",
+)
 
 # The checkpoint's two epsilons. They are DIFFERENT numbers, which is the whole
 # point of the repair: one field cannot carry both.
@@ -594,8 +628,9 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     assert "dtype" not in logged
     # The two lifted keys: the vendor declares both, the dataclass models both,
     # and neither is dropped. `rms_norm_eps` is this block's own repair;
-    # `swiglu_limit` is `inc-glm53f-033` repair round 2's, and it is the reason
-    # the count above reads 25 rather than 26.
+    # `swiglu_limit` is `inc-glm53f-033` repair round 2's. Both are movements of
+    # C080_DROPPED_KEYS, and that constant's own comment carries each movement with
+    # the keys that caused it rather than leaving a reader to subtract.
     assert in_vendor == sorted(lifted), (
         f"the vendor config does not declare {sorted(set(lifted) - set(in_vendor))}, "
         f"so this claim would be about a key the checkpoint never had"
@@ -606,6 +641,41 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     assert "rms_norm_eps" in field_names
     assert "swiglu_limit" not in logged
     assert "swiglu_limit" in field_names
+
+    # THE SEVEN `inc-glm53f-051` KEYS, THE SAME THREE WAYS. This is the by-name half
+    # of the 25 -> 18 movement: the count above says seven keys left the log, and
+    # these say WHICH seven. Without them a later block could model one indexer dial,
+    # drop another, and keep 18 -- the exact failure this conjunct's docstring warns
+    # about. Printed with the population so a reader sees what each claim is over.
+    by_051_in_vendor = sorted(k for k in C080_MODELLED_BY_051 if k in real)
+    by_051_in_fields = sorted(k for k in C080_MODELLED_BY_051 if k in field_names)
+    by_051_in_log = sorted(k for k in C080_MODELLED_BY_051 if k in logged)
+    print(f"[C080-c] -051 keys the vendor declares={len(by_051_in_vendor)} {by_051_in_vendor}")
+    print(f"[C080-c] -051 keys the dataclass models={len(by_051_in_fields)} {by_051_in_fields}")
+    print(f"[C080-c] -051 keys still in the drop log={by_051_in_log}")
+    assert len(C080_MODELLED_BY_051) == 7, C080_MODELLED_BY_051
+    assert by_051_in_vendor == sorted(C080_MODELLED_BY_051), (
+        f"the vendor config does not declare "
+        f"{sorted(set(C080_MODELLED_BY_051) - set(by_051_in_vendor))}, so those keys were never "
+        f"dropped keys and the 25 -> 18 movement is not seven keys wide"
+    )
+    assert by_051_in_fields == sorted(C080_MODELLED_BY_051), (
+        f"Glm5NextTextConfig does not model "
+        f"{sorted(set(C080_MODELLED_BY_051) - set(by_051_in_fields))}; the indexer reads its dials "
+        f"off this dataclass, so an unmodelled dial is a default the checkpoint never set"
+    )
+    assert by_051_in_log == [], (
+        f"{by_051_in_log} are still named in the drop log while the dataclass declares them, which "
+        f"means the filter and the fields disagree about the same key"
+    )
+    # `indexer_rope_interleave` is the near miss and stays dropped, so this movement
+    # is seven keys wide and not eight. Named because a reader who sees seven
+    # `index_*` fields land will look for the eighth `indexer_*` key next.
+    assert "indexer_rope_interleave" in logged, (
+        "indexer_rope_interleave left the drop log, but config.py:212-215 records it as "
+        "deliberately unmodelled -- if it is modelled now, that decision moved and this count owes "
+        "an eighth key"
+    )
     # And the count really is the complement's size, recomputed from the two
     # sides rather than trusted from the constant.
     assert len(logged) == len(real) - len(set(real) & (field_names | remapped))
