@@ -5541,3 +5541,187 @@ def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
         f"this item's loads, and this increment's registered acceptance states 0 "
         f"dispatches: weight loading dequantises and shards, it does not project"
     )
+
+
+# =========================================================================== #
+# inc-glm53f-105b -- the condition that lets inc-glm53f-105 decline to pad.
+#
+# WHY THIS ITEM EXISTS. inc-glm53f-101 added ``_DeclaredShard.pad_to_consumer_block``,
+# which rounds a family's full width UP to a multiple of ``world_size`` times the
+# consumer's block extent so that every rank's shard is a whole block. The MLA
+# entries inc-glm53f-100 declares do NOT set it, and that is a decision rather than
+# an omission: the axis those three projections shard carries WHOLE HEADS, so padding
+# it would add columns belonging to no head, which is the thing head partitioning
+# exists to prevent. The dense MLP's intermediate width has no such structure, which
+# is why the same flag is right there and wrong here.
+#
+# Declining to pad is only safe because of a config fact: each MLA head width is
+# ITSELF a whole number of blocks, so any whole-head split inherits that and no
+# rank can be handed a part-tile. That fact is not a law. A checkpoint with a
+# DeepSeek-style split -- 128 nope plus 64 rope, 192 to a head -- breaks it, and then
+# ``shard_geometry_for_grid`` REFUSES the load rather than corrupting it. The refusal
+# is the right behaviour and a stopped load is still a stopped load.
+#
+# So the reason is paired with a gate on the condition it rests on. If a future
+# config moves a head width off the block extent, this item fails and names the leaf,
+# instead of the failure surfacing as a refused load nobody predicted.
+# =========================================================================== #
+
+
+def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> None:
+    """inc-glm53f-105b. Why -105 does not pad, and the gate that expires the reason.
+
+    Two readings, the second being the first one's control:
+
+    1. every MLA head width that inc-glm53f-100 shards is a whole number of the
+       consumer's quantisation blocks, measured on the dimension each family is
+       actually sharded on -- dim 0 for the two column-parallel projections, dim 1
+       for the row-parallel one, because a block is not square in principle even
+       though this consumer's is;
+    2. the same predicate run over a DeepSeek-style split that is NOT a whole
+       number of blocks, printed in the same output, so reading 1's zero is a
+       reading of the predicate rather than a claim about it.
+
+    NOTHING IS TYPED. The head widths come from ``Glm5NextTextConfig``'s own
+    defaults and the block extent from ``DEFAULT_WEIGHT_BLOCK_SIZE``, so a config
+    change moves this item's subject with it rather than leaving a second set of
+    numbers behind to drift. That is also why the item asserts a PROPERTY and not
+    the numbers 256, 512 and 256: the numbers are today's answer, the property is
+    the claim.
+    """
+    config = Glm5NextTextConfig()
+
+    #: leaf -> (dim it shards on, its per-head width along that dim). The widths
+    #: are summed the way ``projection_widths`` sums them: the rotary slice is 0 on
+    #: this checkpoint and that 0 is a value, so a config that had one would
+    #: otherwise be short by exactly that slice.
+    head_widths = {
+        "q_b_proj_weight": (0, config.qk_nope_head_dim + config.qk_rope_head_dim),
+        "kv_b_proj_weight": (0, config.qk_nope_head_dim + config.v_head_dim),
+        "o_proj_weight": (1, config.v_head_dim),
+    }
+
+    def part_tile(shard_dim: int, head_width: int) -> int:
+        """The remainder a single head leaves in the consumer's block. 0 is whole."""
+        return head_width % DEFAULT_WEIGHT_BLOCK_SIZE[shard_dim]
+
+    print(f"GRIDSHARD_B_BLOCK_SIZE={DEFAULT_WEIGHT_BLOCK_SIZE}")
+    print(
+        "GRIDSHARD_B_HEAD_WIDTHS="
+        f"{ {leaf: width for leaf, (_, width) in sorted(head_widths.items())} }"
+    )
+    print(f"GRIDSHARD_B_HEADS={config.num_attention_heads}")
+
+    offenders = {
+        leaf: width
+        for leaf, (dim, width) in head_widths.items()
+        if part_tile(dim, width)
+    }
+    print(f"GRIDSHARD_B_HEAD_WIDTHS_LEAVING_A_PART_TILE={offenders}")
+
+    # READING 2, THE CONTROL, in this same output. A DeepSeek-style split of 128
+    # nope plus 64 rope gives 192 to a head, which is one and a half blocks. It is
+    # run through the SAME predicate, so a predicate that had stopped discriminating
+    # would show up here rather than being reported as reading 1's clean result.
+    control_widths = {"q_b_proj_weight": (0, 128 + 64)}
+    control_offenders = {
+        leaf: width
+        for leaf, (dim, width) in control_widths.items()
+        if part_tile(dim, width)
+    }
+    print(f"GRIDSHARD_B_CONTROL_PART_TILE_WIDTHS={control_offenders}")
+    assert control_offenders, (
+        "the part-tile predicate did not flag a 192-wide head against a "
+        f"{DEFAULT_WEIGHT_BLOCK_SIZE} block, so it cannot detect a violation and "
+        "reading 1's empty result below says nothing"
+    )
+
+    assert offenders == {}, (
+        f"an MLA head width is not a whole number of quantisation blocks: "
+        f"{offenders}, against a block size of {DEFAULT_WEIGHT_BLOCK_SIZE}. "
+        f"inc-glm53f-100 shards these three on whole heads, so a head that leaves "
+        f"a part tile means some rank's shard ends inside a block whose single "
+        f"scale cannot be divided between two ranks, and "
+        f"``shard_geometry_for_grid`` refuses the load. inc-glm53f-105 declines "
+        f"``pad_to_consumer_block`` because padding a head-bearing axis invents "
+        f"columns belonging to no head; that decision rested on this condition, so "
+        f"this failure means the decision needs revisiting rather than the widths "
+        f"being wrong"
+    )
+
+
+# ---------------------------------------------------------------------------
+# inc-glm53f-105b, second premise: the one reachable block size
+# ---------------------------------------------------------------------------
+# WHY THIS ITEM EXISTS. ``inc-glm53f-101`` gave its ``sharded_scale_grid_loader`` a
+# third parameter, ``block_size``, and forwards it into ``shard_geometry_for_grid``.
+# ``inc-glm53f-105``'s compensating sibling takes no such parameter, so it always
+# uses the default. That asymmetry is safe for ONE reason and it is a reason that
+# can stop being true: the build supports exactly one block size, and the default
+# IS that value. ``block_size`` is not a label -- inside
+# ``shard_geometry_for_grid`` it picks ``extent``, the divisor the sharded grid's
+# width is computed from -- so if a second shape ever became reachable, the sibling
+# would honour a caller's choice and this one would silently keep 128x128.
+#
+# This item is that premise written as a gate rather than as a comment. It fails the
+# day someone adds a second supported block size, and the failure names the function
+# that must then grow the parameter. It is the same shape as the part-tile gate
+# above: a decision recorded with the condition it rests on, so the decision expires
+# loudly instead of quietly becoming wrong.
+def test_gridshard_b_one_reachable_block_size_is_why_105_omits_the_parameter() -> None:
+    from vllm_neuron.model.glm5_next import quantization as _quant
+
+    supported = _quant.SUPPORTED_WEIGHT_BLOCK_SIZES
+    default = _quant.DEFAULT_WEIGHT_BLOCK_SIZE
+    print(f"GRIDSHARD_B_SUPPORTED_BLOCK_SIZES={sorted(supported)}")
+    print(f"GRIDSHARD_B_DEFAULT_BLOCK_SIZE={default}")
+    print(f"GRIDSHARD_B_SUPPORTED_COUNT={len(supported)}")
+
+    # Which of the two loaders can be handed a block size, read off the live
+    # signatures rather than restated, so a signature change moves this reading.
+    def takes_block_size(fn: object) -> bool:
+        return "block_size" in inspect.signature(fn).parameters  # type: ignore[arg-type]
+
+    sibling_takes = takes_block_size(_WL_FP8.sharded_scale_grid_loader)
+    mine_takes = takes_block_size(_WL_FP8.compensating_sharded_scale_grid_loader)
+    geom_default = inspect.signature(
+        _WL_FP8.shard_geometry_for_grid
+    ).parameters["block_size"].default
+    print(f"GRIDSHARD_B_SIBLING_TAKES_BLOCK_SIZE={sibling_takes}")
+    print(f"GRIDSHARD_B_MINE_TAKES_BLOCK_SIZE={mine_takes}")
+    print(f"GRIDSHARD_B_GEOMETRY_DEFAULT_BLOCK_SIZE={geom_default}")
+
+    # CONTROL, FIRST. The predicate below is "more than one reachable shape", and a
+    # reading of 1 from it means nothing until it has been shown saying 2 about a set
+    # that really holds two. Without this, a predicate that always answered "one"
+    # would pass this item forever.
+    control_set = frozenset({default, (64, 64)})
+    print(f"GRIDSHARD_B_CONTROL_SET={sorted(control_set)}"
+          f" CONTROL_COUNT={len(control_set)}")
+    assert len(control_set) > 1, (
+        "the two-shape control set did not read as more than one shape, so the "
+        "count below cannot detect a second supported block size and its reading "
+        "of 1 says nothing"
+    )
+
+    assert len(supported) == 1 and supported == frozenset({default}), (
+        f"this build now supports {sorted(supported)} rather than exactly "
+        f"[{default}]. inc-glm53f-105's compensating_sharded_scale_grid_loader "
+        f"takes no block_size parameter and so always uses the default; that was "
+        f"safe only while the default was the one reachable value. Give it the "
+        f"parameter and forward it into shard_geometry_for_grid, the way "
+        f"inc-glm53f-101's sharded_scale_grid_loader already does, before a "
+        f"checkpoint with another shape can reach this path"
+    )
+    assert geom_default == default, (
+        f"shard_geometry_for_grid defaults block_size to {geom_default}, not "
+        f"{default}. inc-glm53f-105 omits the argument, so the default is what its "
+        f"path actually uses; a default that is not the supported shape means the "
+        f"omission now picks the wrong divisor"
+    )
+    assert sibling_takes and not mine_takes, (
+        f"the two loaders' signatures moved: sibling takes block_size="
+        f"{sibling_takes}, this increment's takes block_size={mine_takes}. This "
+        f"item exists to explain that exact asymmetry, so a change to either "
+        f"signature means the explanation needs rewriting rather than re-asserting"
+    )
