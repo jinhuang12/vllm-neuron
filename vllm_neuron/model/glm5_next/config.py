@@ -393,6 +393,21 @@ class Glm5NextVisionConfig:
     hidden_act: str = "silu"
     swiglu_limit: float = 10.0
 
+    # -- The tower's own RMSNorm epsilon, and why it is not the decoder's ----
+    # The vision tower ends with an RMSNorm before the patch-merge adapter
+    # (``post_layernorm``, built as
+    # ``Glm5NextRMSNorm(hidden_size, eps=config.rms_norm_eps)`` at
+    # ``modeling_glm5_next.py:1763``). That epsilon is the VISION config's, and
+    # the checkpoint declares it separately from the decoder's: the same file
+    # carries ``rms_norm_eps`` twice, at ``configuration_glm5_next.py:255`` for
+    # ``Glm5NextVisionConfig`` and at ``:124`` for ``Glm5NextTextConfig``. Both
+    # read ``1e-05`` in this checkpoint, so reading the wrong one happens to
+    # give the right number today -- which is exactly why the field is declared
+    # here by its own line rather than borrowed from the text config, where a
+    # later checkpoint that moves one of the two would silently change what the
+    # tower computes. Added by ``inc-glm53f-104``.
+    rms_norm_eps: float = 1e-05
+
     neuron_config: VisionNeuronConfig | None = None
 
     @classmethod
