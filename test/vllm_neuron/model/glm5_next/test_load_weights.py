@@ -4601,7 +4601,12 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     zero_ranks = 0
     for path in dense_paths:
         for leaf in SHARD_DENSE_LEAVES:
-            shard_dim, _full = SHARD_FAMILIES[("Glm5NextDenseMLP", leaf)]
+            # The shard dim is unpacked and unused here: this item reads the PAD,
+            # which item (1) already located on the declared dim. Named with a
+            # leading underscore rather than deleted -- the deletion this line
+            # replaced sat inside the rank loop below, so the second padded rank
+            # re-deleted an already-deleted name.
+            _shard_dim, _full = SHARD_FAMILIES[("Glm5NextDenseMLP", leaf)]
             attribute = SHARD_GRID_ATTRIBUTES[SHARD_DENSE_LEAVES.index(leaf)]
             for rank in range(real_ranks, SHARD_EP_WORLD):
                 weight = _loaded(models[rank], f"{path}.{leaf}")
@@ -4618,8 +4623,8 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
                     f"{grid.min().item()} to {grid.max().item()}"
                 )
                 zero_ranks += 1
-                del shard_dim
     print(f"CONJUNCT3D_PADDED_RANK_READINGS={zero_ranks}")
+    print(f"CONJUNCT3D_PADDED_RANKS_EXPECTED={SHARD_EP_WORLD - real_ranks} per leaf")
     assert zero_ranks > 0, "no padded rank was read"
 
     # THE SHARED THREE NEED NO PAD AT THIS WORLD, and that is read rather than said.
