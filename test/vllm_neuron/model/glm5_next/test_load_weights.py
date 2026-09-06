@@ -5093,3 +5093,451 @@ def test_sharedshard_the_column_comes_from_the_group_and_refuses_a_disagreement(
         f"at expert-parallel degree 1 the group is the whole world, so each rank's "
         f"column is its own rank; the reader returned {at_degree_one}"
     )
+
+
+# =========================================================================== #
+# inc-glm53f-105 -- WP7: the sharded projections' FP8 scale grids shard too.
+#
+# WHY THIS NEEDS ITS OWN WIDTHS. Everything above runs on MINI_MLA_WIDTHS, whose
+# q_b_proj is 64 rows -- less than one 128-row quantisation block. A grid of one
+# tile describes a rank's half exactly as well as it describes the whole tensor,
+# so on that fixture the defect this item measures CANNOT occur and its control
+# cannot fire. These widths give the grid a block to lose along each shard
+# dimension, which is what makes both readings real, AND leave every per-rank
+# shard a whole number of the CONSUMER's blocks, without which the load is
+# refused for a reason that has nothing to do with this item.
+# =========================================================================== #
+
+#: MLA widths whose scale grids have rows to divide. ``qk_nope_head_dim`` and
+#: ``v_head_dim`` are the real checkpoint's per-head width, because TWO block
+#: sizes rule here and the smaller one is not the binding one:
+#:
+#: * ``DEFAULT_WEIGHT_BLOCK_SIZE`` is the 128-row CHECKPOINT tile. It fixes how
+#:   many entries a grid holds, so it is what gives a grid anything to divide.
+#: * ``consumer_block_quant_size()`` reads ``BLOCK_QUANT_SIZE``, the 256-row
+#:   block the block-FP8 kernel indexes its scales by. ``inc-glm53f-101``
+#:   already refuses a shard that is not a whole number of THOSE, and that
+#:   refusal is upstream of everything this item measures.
+#:
+#: An earlier version of these widths used 64 and reasoned only about the tile:
+#: at world size 2 each rank took 128 rows, which clears the 128-row tile and is
+#: refused by the consumer rule, so the item failed on its own fixture instead of
+#: on the code it measures. 64 is also a per-head width the production checkpoint
+#: cannot have. The item that measures the real ones,
+#: ``test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block``,
+#: lands in the SAME changeset and reads 256 and up, so a fixture carrying 64
+#: asks a question the model never answers.
+#:
+#: At 256 each rank of two takes two whole consumer blocks of q_b_proj's rows
+#: and two of o_proj's columns, and each per-rank grid still holds fewer tiles
+#: than the unsharded one, which is the reading this item exists for. Every
+#: expected value below is still computed from the loaded shape by
+#: ``block_grid_shape``; nothing here is typed into an assertion.
+GRID_SHARD_MLA_WIDTHS = dict(
+    hidden_size=128,
+    num_attention_heads=4,
+    qk_nope_head_dim=256,
+    qk_rope_head_dim=0,
+    v_head_dim=256,
+    q_lora_rank=32,
+    kv_lora_rank=32,
+)
+
+#: The two DSA scaled projections ``inc-glm53f-100`` shards. ``q_a_proj`` and
+#: ``kv_a_proj_with_mqa`` are latent-side and replicated; ``kv_b_proj`` is bf16 in
+#: this checkpoint and carries no grid at all.
+GRID_SHARD_LEAVES = ("q_b_proj", "o_proj")
+
+
+def _grid_shard_config() -> Glm5NextConfig:
+    """:func:`_shard_config` with the wider MLA widths and nothing else changed."""
+    return Glm5NextConfig(
+        text_config=Glm5NextTextConfig(
+            num_hidden_layers=MINI_LAYERS,
+            n_routed_experts=MINI_ROUTED_EXPERTS,
+            n_shared_experts=0,
+            first_k_dense_replace=MINI_ALL_DENSE_FIRST_K,
+            tie_word_embeddings=False,
+            linear_attn_config=SHARD_LINEAR_ATTN,
+            intermediate_size=SHARD_INTERMEDIATE,
+            **GRID_SHARD_MLA_WIDTHS,
+        )
+    )
+
+
+def _grid_shard_checkpoint(tmp_path: Path) -> Path:
+    """A checkpoint written at the CLOSED FORM, grids included.
+
+    ``_mla_key_overrides`` supplies both -- the weight at ``(odim, idim)`` from the
+    module's own ``projection_widths()`` and the grid at ``block_grid_shape`` of
+    that -- so nothing here states a shape. The reference model is built BEFORE any
+    world size is patched, which is what makes those the whole tensors' shapes.
+
+    EVERY OTHER DECLARED-SHARDED FAMILY IS STORED SHARDABLY TOO, and that is this
+    fixture's repair. Passing ``grids`` as the only override left every family
+    outside the MLA three to the writer's plain branch at
+    :data:`MINI_PLAIN_SHAPE`, a 1-D placeholder; the pin's ``sharding_weight_loader``
+    then sharded ``model.layers.0.self_attn.o_proj_weight`` on dim 1 and raised
+    ``IndexError: list assignment index out of range`` at world size 2, before any
+    reading of this item could run.
+    """
+    config = _grid_shard_config()
+    mappings = _mappings_for(config)
+    reference = Glm5NextForConditionalGeneration(config)
+
+    # THE GRIDS CARRY POSITION-IDENTIFYING VALUES, and without this the offset
+    # reading below would be vacuous: this writer's own default grid is
+    # ``torch.full(..., 0.5)``, and against a constant any block passes for any
+    # other, so rank 1 could be handed rank 0's tile scales and no assertion in
+    # this item would notice. Same reason ``_shard_key_overrides`` exists for the
+    # weights. The shape comes from the module's closed form through
+    # ``block_grid_shape`` and the dimension from the production table, so nothing
+    # here states a number of its own.
+    grids: dict[str, torch.Tensor] = {}
+    for path, module in reference.named_modules():
+        if type(module).__name__ != "Glm5NextMLAAttention":
+            continue
+        widths = {
+            name: (idim, odim) for name, idim, odim in module.projection_widths()
+        }
+        for leaf in GRID_SHARD_LEAVES:
+            grid_param = f"{path}.{leaf}_{FP8_SCALE_SUFFIX}"
+            if grid_param not in mappings:
+                continue
+            idim, odim = widths[leaf]
+            shape = block_grid_shape((odim, idim), DEFAULT_WEIGHT_BLOCK_SIZE)
+            dim = _mla_grid_shard_dim(leaf)
+            for key in _keys_of(mappings, grid_param):
+                grids[key] = _shard_pattern(shape, dim, torch.float32)
+    assert len(grids) == len(GRID_SHARD_LEAVES), (
+        f"wrote position-identifying values for {len(grids)} grids, not the "
+        f"{len(GRID_SHARD_LEAVES)} this item measures, so one of them is absent "
+        f"from the map and would be read against a constant"
+    )
+
+    # THE SHARD TABLE'S OWN TENSORS, MINUS WHATEVER THE MODULE ALREADY ANSWERS FOR.
+    # A wholesale merge of ``_shard_key_overrides`` would be wrong, not merely
+    # redundant: it builds the MLA fulls out of :data:`MINI_MLA_WIDTHS`, which are
+    # NOT this fixture's widths, so it would rewrite the three MLA projections at
+    # 16-wide heads and destroy the grid-to-weight pairing this item exists to
+    # measure -- turning a loud IndexError into a quiet wrong number. So its keys
+    # are subtracted wherever ``_mla_key_overrides`` already speaks.
+    #
+    # DEFERRING TO THAT HELPER IS THE POINT, AND IT IS SELF-MAINTAINING. It covers
+    # every module that publishes ``projection_widths()``, not literally the MLA
+    # classes, so a future family that starts publishing widths is deferred to
+    # automatically and the module stays the single source of those shapes. A
+    # hand-listed set of class names here would drift from it.
+    #
+    # ONLY KEYS ARE SUBTRACTED, NEVER VALUES. The two helpers share a key space but
+    # not a value type -- ``(shape, dtype)`` there, a tensor here -- and the writer
+    # assigns an ``extra_overrides`` value straight into the checkpoint, so a tuple
+    # leaking into this merge would be written as if it were a tensor.
+    module_shapes = _mla_key_overrides(reference, mappings)
+    shard_over = {
+        key: tensor
+        for key, tensor in _shard_key_overrides(reference, mappings).items()
+        if key not in module_shapes
+    }
+    # ``grids`` last: the position-identifying grids must win over the shard
+    # table's, which is also why the MLA grid keys are inside the subtraction above.
+    extra_overrides = {**shard_over, **grids}
+
+    # PRESENCE AND RANK, over every key a declared-sharded family maps here. This
+    # states the CLASS of the defect rather than the one instance of it: a key no
+    # override governs falls to the writer's own default, and a store whose rank
+    # does not exceed its declared shard dim cannot be sharded at all. The check is
+    # fixture-local on purpose -- the shared writer has landed callers that
+    # legitimately store plain placeholders, and a blanket guard there would fire on
+    # them.
+    #
+    # ``governed`` mirrors the writer's precedence (``extra_overrides`` first, then
+    # ``_mla_key_overrides``), so it answers what the file will actually hold rather
+    # than what this function happens to have built.
+    governed: dict[str, tuple[int, ...]] = {
+        key: tuple(tensor.shape) for key, tensor in extra_overrides.items()
+    }
+    for key, (module_shape, _dtype) in module_shapes.items():
+        governed.setdefault(key, tuple(module_shape))
+    ungoverned: list[str] = []
+    unshardable: list[str] = []
+    walked = 0
+    mla_walked = 0
+    rows: list[tuple[str, tuple[int, ...], int, int, str]] = []
+    for path, module in reference.named_modules():
+        cls = type(module).__name__
+        for (family, leaf), (shard_dim, _full) in SHARD_FAMILIES.items():
+            if cls != family:
+                continue
+            param = f"{path}.{leaf}"
+            if param not in mappings:
+                continue
+            for key in _keys_of(mappings, param):
+                walked += 1
+                if key in module_shapes:
+                    mla_walked += 1
+                if key not in governed:
+                    ungoverned.append(f"{key} ({family}.{leaf}, dim {shard_dim})")
+                    continue
+                shape = governed[key]
+                if len(shape) <= shard_dim:
+                    unshardable.append(
+                        f"{key} ({family}.{leaf}) is stored {shape}, rank "
+                        f"{len(shape)}, but is declared sharded on dim {shard_dim}"
+                    )
+                    continue
+                extent = shape[shard_dim]
+                rows.append(
+                    (
+                        key,
+                        shape,
+                        shard_dim,
+                        extent // SHARD_WORLD,
+                        "yes" if extent % SHARD_WORLD == 0 else "NO",
+                    )
+                )
+    assert not ungoverned, (
+        f"{len(ungoverned)} checkpoint key(s) belong to a family SHARD_FAMILIES "
+        "declares sharded but no override governs them, so the writer would store "
+        "each at MINI_PLAIN_SHAPE and the load would shard a placeholder: "
+        f"{ungoverned}"
+    )
+    assert not unshardable, (
+        f"{len(unshardable)} store(s) are sharded on a dimension they do not have, "
+        f"which is the IndexError this fixture was repaired for: {unshardable}"
+    )
+    # THE POPULATION, MEASURED RATHER THAN ASSUMED. Both assertions above are presence
+    # checks, and a presence check over an EMPTY key set passes in silence. This one
+    # cannot be exercised on a machine without torch, so the run itself carries the
+    # evidence that the walk reached something: the walked count must be non-zero, and
+    # every key the walk reached must have ended as a row rather than vanishing between
+    # the two refusals.
+    assert walked > 0, (
+        "the SHARD_FAMILIES walk reached no checkpoint key at all, so both assertions "
+        "above passed over an empty set and proved nothing about this fixture"
+    )
+    assert len(rows) == walked, (
+        f"the walk reached {walked} checkpoint key(s) but {len(rows)} produced a row, "
+        "so a key was neither measured nor refused"
+    )
+    for key, shape, shard_dim, per_rank, exact in sorted(rows):
+        print(
+            f"STORESHAPE_ROW={key} shape={tuple(shape)} dim={shard_dim} "
+            f"per_rank={per_rank} divides={exact}"
+        )
+    print(f"STORESHAPE_ROWS={len(rows)} GOVERNED_KEYS={len(governed)}")
+    print(f"STORESHAPE_COUNT={walked} {walked - mla_walked} {mla_walked}")
+    print(
+        "STORESHAPE_COUNT_FIELDS=governed changed unchanged_mla  (unchanged_mla are "
+        "the keys _mla_key_overrides already answers for, which this fixture "
+        "deliberately leaves at the module's own closed form)"
+    )
+
+    directory = tmp_path / "grid-shard"
+    written = _write_miniature_checkpoint(
+        directory, mappings, reference, extra_overrides=extra_overrides
+    )
+    assert written, "the grid fixture wrote no tensors"
+    return directory
+
+
+def _load_grid_at_world(
+    directory: Path, world_size: int, rank: int, monkeypatch
+) -> Glm5NextForConditionalGeneration:
+    """:func:`_load_at_world` on the grid config -- patch first, build second."""
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_world_size", lambda: world_size)
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_rank", lambda: rank)
+    model = Glm5NextForConditionalGeneration(_grid_shard_config())
+    assert model.world_size == world_size, (
+        f"the model resolved world size {model.world_size}, not the patched "
+        f"{world_size}"
+    )
+    _seed_page_cache_signal()
+    model.load_weights(str(directory), torch.device("cpu"), None)
+    return model
+
+
+def _mla_grid_shard_dim(leaf: str) -> int:
+    """The dimension the production table shards this projection's weight on.
+
+    Read out of ``_SHARD_GEOMETRY`` rather than restated, so this item cannot
+    disagree with the table it is measuring.
+    """
+    declared = _MODEL_FP8._SHARD_GEOMETRY["Glm5NextMLAAttention"][
+        f"{leaf}{_LEAF_WEIGHT_SUFFIX}"
+    ]
+    return declared.shard_dim
+
+
+def _mla_grids(
+    model: Glm5NextForConditionalGeneration,
+) -> dict[str, tuple[tuple[int, ...], torch.Tensor]]:
+    """``dotted leaf -> (weight shape, grid tensor)`` per sharded scaled projection.
+
+    The grid of a DECLARED parameter is a parameter, so ``getattr`` finds it under
+    the name ``_sibling_scale_grid_name`` builds -- which is what this reads. (The
+    dense-MLP grids are NOT declared parameters and land as plain attributes
+    through the out-of-band reader; that is a different path and not this one.)
+    """
+    found: dict[str, tuple[tuple[int, ...], torch.Tensor]] = {}
+    for path, module in model.named_modules():
+        if type(module).__name__ != "Glm5NextMLAAttention":
+            continue
+        for leaf in GRID_SHARD_LEAVES:
+            weight = getattr(module, f"{leaf}{_LEAF_WEIGHT_SUFFIX}", None)
+            grid = getattr(module, f"{leaf}_{FP8_SCALE_SUFFIX}", None)
+            if weight is None or grid is None:
+                continue
+            found[f"{path}.{leaf}"] = (tuple(weight.shape), grid.data)
+    return found
+
+
+def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
+    tmp_path: Path, monkeypatch, single_rank_process_group
+) -> None:
+    """inc-glm53f-105. A sharded FP8 weight's grid describes THIS RANK's blocks.
+
+    ``inc-glm53f-100`` shards ``q_b_proj`` and ``o_proj``, both of which carry a
+    ``weight_scale_inv`` grid. Left whole, such a grid describes the unsharded
+    tensor while the weight is this rank's half, so ``dequantise_blockwise``
+    refuses the pair and the load fails at real widths. That is the defect this
+    increment repairs. Five readings, each printed before it is asserted:
+
+    1. the unsharded grid spans MORE blocks along the shard dimension than one
+       rank's does, so every reading below is distinguishable at all;
+    2. at world size 2 the load COMPLETES -- the point, because
+       ``prepare_projection_weights`` and ``dequantise_blockwise`` run inside
+       ``load_weights`` -- and each grid holds exactly the block count its own
+       loaded weight implies, computed with ``block_grid_shape``, never typed;
+    3. each rank's grid is the CORRECT slice of the unsharded grid, by value and
+       at the right offset, which is what says the shard is indexed rather than
+       merely the right size;
+    4. THE CONTROL: with the grid's geometry resolved back to ``None`` -- the
+       behaviour before this increment, weights left sharded, nothing else changed
+       -- the same load raises ``Glm5NextWeightMapError``.
+    5. the projection seam's dispatch counters read ``(0, 0)`` across every load
+       this item performs, the control's included, which is the ``0`` dispatches
+       this increment's registered acceptance states.
+
+    ON READING (5), HONESTLY: NO FIRING CONTROL IS STAGED FOR ITS ZERO INSIDE THIS
+    ITEM. The zero is not structural -- the seam has a real NKI route that does
+    increment ``nki_dispatch`` -- so the reading claims something falsifiable: the
+    weight-loading path never enters that seam. What this item does not do is
+    demonstrate the instrument firing, because the only way to fire it here would
+    be to dispatch the tiled NKI matmul inside a load test, a dependency this item
+    does not otherwise carry. The same accessor is read NONZERO, at world size 2,
+    by ``test_mla_decode.py``'s ``inc-glm53f-100`` route-predicate item, which
+    lands in the SAME changeset; a reviewer wanting the firing half of this
+    reading should read it there. Note also WHY the zero holds, which is checkable
+    without running anything: ``model_fp8`` imports the seam lazily, inside the
+    projection methods themselves, so a load that never projects never imports it
+    -- this item's own import is what brings the module in.
+
+    ON READING (2), HONESTLY: its assertion is DOMINATED and cannot fail on its
+    own. ``_require_grid`` raises inside ``load_weights`` for a mismatched pair, so
+    a wrong grid shape surfaces as reading (2)'s load raising, never as its
+    assert. It is kept because it states the criterion in the criterion's own
+    words; the measuring is done by (1), (3) and (4). Reading (3) is the one that
+    would catch a grid sharded at the wrong OFFSET -- a shape check cannot, and
+    without it this item would accept rank 1 being handed rank 0's block.
+    """
+    from vllm_neuron.functional.attention import mla_projections
+
+    # Reset BEFORE the fixture, so reading (5) below covers every load this item
+    # performs rather than a suffix of them.
+    mla_projections.reset_mla_projection_dispatch_counters()
+
+    directory = _grid_shard_checkpoint(tmp_path)
+
+    whole = _load_grid_at_world(directory, 1, 0, monkeypatch)
+    whole_grids = _mla_grids(whole)
+    assert whole_grids, (
+        "no MLA module reported both a weight and a scale grid, so this item has "
+        "no subject; the fixture or the declared names have moved"
+    )
+    print(f"GRIDSHARD_1_SUBJECTS={sorted(whole_grids)}")
+    print(
+        "GRIDSHARD_1_WHOLE="
+        f"{sorted((k, w, tuple(g.shape)) for k, (w, g) in whole_grids.items())}"
+    )
+
+    per_rank = {
+        rank: _mla_grids(_load_grid_at_world(directory, SHARD_WORLD, rank, monkeypatch))
+        for rank in range(SHARD_WORLD)
+    }
+    print(
+        "GRIDSHARD_2_PER_RANK="
+        f"{sorted((r, k, w, tuple(g.shape)) for r, f in per_rank.items() for k, (w, g) in f.items())}"
+    )
+    for rank, found in sorted(per_rank.items()):
+        assert set(found) == set(whole_grids), (
+            f"rank {rank} reported different subjects from the world-1 load: only "
+            f"whole {sorted(set(whole_grids) - set(found))}, only rank "
+            f"{sorted(set(found) - set(whole_grids))}"
+        )
+
+    narrowed = 0
+    sliced = 0
+    for dotted, (whole_shape, whole_grid) in sorted(whole_grids.items()):
+        leaf = dotted.rpartition(".")[2]
+        dim = _mla_grid_shard_dim(leaf)
+        for rank, found in sorted(per_rank.items()):
+            weight_shape, grid = found[dotted]
+            expected = block_grid_shape(weight_shape, DEFAULT_WEIGHT_BLOCK_SIZE)
+            assert tuple(grid.shape) == expected, (
+                f"{dotted} loaded a {weight_shape} weight at rank {rank} of world "
+                f"size {SHARD_WORLD} with a {tuple(grid.shape)} grid; a blockwise "
+                f"grid holds one value per tile, so this weight's grid is "
+                f"{expected}. A grid describing the unsharded tensor scales the "
+                f"wrong blocks"
+            )
+            extent = expected[dim]
+            mine = whole_grid.narrow(dim, rank * extent, extent)
+            difference = _max_abs_diff(grid, mine)
+            assert difference == 0.0, (
+                f"{dotted} at rank {rank} is not blocks "
+                f"[{rank * extent}:{(rank + 1) * extent}] of dim {dim} of the "
+                f"unsharded grid: they differ by {difference}. The shape is right, "
+                f"so this is an OFFSET defect -- the rank is being handed another "
+                f"rank's tile scales"
+            )
+            sliced += 1
+        if tuple(whole_grid.shape) != tuple(per_rank[0][dotted][1].shape):
+            narrowed += 1
+    print(f"GRIDSHARD_2_GRIDS_CHECKED={len(whole_grids) * SHARD_WORLD}")
+    print(f"GRIDSHARD_3_SLICE_READINGS={sliced}")
+    print(f"GRIDSHARD_1_GRIDS_THAT_NARROWED={narrowed}")
+    assert narrowed == len(whole_grids), (
+        f"only {narrowed} of {len(whole_grids)} grids differ from their unsharded "
+        f"shape, so for the rest this item would pass whether or not the grid was "
+        f"sharded. These widths exist to prevent exactly that"
+    )
+
+    # ── THE CONTROL. Resolve a GRID leaf's geometry back to None -- what
+    # ``_shard_geometry_for`` did before inc-glm53f-105 -- and leave the weights'
+    # geometry alone, so the ONLY difference is the thing this increment added.
+    landed = _MODEL_FP8._shard_geometry_for
+
+    def without_grid_geometry(module, leaf, world_size):
+        if leaf.endswith(f"_{FP8_SCALE_SUFFIX}"):
+            return None
+        return landed(module, leaf, world_size)
+
+    monkeypatch.setattr(_MODEL_FP8, "_shard_geometry_for", without_grid_geometry)
+    with pytest.raises(Glm5NextWeightMapError) as refusal:
+        _load_grid_at_world(directory, SHARD_WORLD, 0, monkeypatch)
+    message = str(refusal.value)
+    print(f"GRIDSHARD_4_CONTROL_REFUSAL={message!r}")
+    assert "scale grid shape" in message, (
+        f"the control raised Glm5NextWeightMapError for some other reason, so it "
+        f"does not show that the whole grid is what this increment fixes: "
+        f"{message}"
+    )
+
+    dispatches = mla_projections.mla_projection_dispatch_counters()
+    print(f"GRIDSHARD_5_DISPATCHES={dispatches}")
+    assert dispatches == (0, 0), (
+        f"the projection seam counted {dispatches} (nki, torch_fallback) across "
+        f"this item's loads, and this increment's registered acceptance states 0 "
+        f"dispatches: weight loading dequantises and shards, it does not project"
+    )

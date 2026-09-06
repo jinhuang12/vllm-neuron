@@ -598,10 +598,29 @@ def _shard_geometry_for(
     ``tp_per_ep = world_size // ep_degree``. At ``tp_per_ep == 1`` the bank is
     whole inside its group and ``None`` comes back, which is also this campaign's
     production route at expert-parallel degree 1.
+
+    A SCALE GRID ANSWERS WITH ITS WEIGHT'S GEOMETRY, and that is
+    ``inc-glm53f-105``'s addition. A blockwise grid holds one value per weight
+    tile, so it has no shard of its own to declare -- it is sharded if and only if
+    its weight is, on the same dimension. The table therefore keeps one row per
+    WEIGHT and a grid leaf is resolved back to it, rather than the table carrying
+    near-duplicate rows that could disagree with the weights they describe.
+    ``weight_loaders_fp8.py`` converts weight rows to grid rows on arrival
+    (``shard_geometry_for_grid``), which is why what crosses this boundary is the
+    weight's geometry and not the grid's.
     """
     if world_size <= 1:
         return None
-    declared = _SHARD_GEOMETRY.get(type(module).__name__, {}).get(leaf)
+    family = _SHARD_GEOMETRY.get(type(module).__name__, {})
+    declared = family.get(leaf)
+    if declared is None and leaf.endswith(f"_{FP8_SCALE_SUFFIX}"):
+        # ``q_b_proj_weight_scale_inv`` -> ``q_b_proj_weight``, the inverse of
+        # ``_sibling_scale_grid_name``. Only a grid whose weight the table names
+        # resolves; every other declared grid still answers ``None``.
+        weight_leaf = (
+            f"{leaf[: -len(f'_{FP8_SCALE_SUFFIX}')]}{_WEIGHT_LEAF_SUFFIX}"
+        )
+        declared = family.get(weight_leaf)
     if declared is None:
         return None
     num_shards = world_size

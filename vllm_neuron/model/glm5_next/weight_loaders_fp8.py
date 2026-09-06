@@ -1826,6 +1826,83 @@ def _weight_slice_only(
     return SafetensorsWeightLoader(transform=transform)
 
 
+def _grid_spans_more_blocks_whole_than_per_rank(
+    geometry: ShardGeometry,
+    block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+) -> bool:
+    """Whether this weight's grid actually has rows to divide between ranks.
+
+    ``inc-glm53f-105``. A grid holds one value per weight TILE, so a weight can be
+    sharded while its grid is not: when the whole weight fits inside one block
+    along the shard dimension, both ranks' rows live in the same tile and the
+    whole grid ALREADY describes each rank's shard exactly. ``_require_grid``
+    agrees, because ``ceil(shard / block) == ceil(full / block) == 1`` there.
+
+    This is asked BEFORE :func:`shard_geometry_for_grid`, and the order is the
+    point. That function refuses a shard whose boundary splits a tile, which is
+    the right answer when the grid has tiles to divide and the wrong one here --
+    the miniature fixture's MLA projections are 64 rows at a 128-row block, so
+    asking it first would refuse a load that needs no sharding at all. A geometry
+    that both splits tiles AND spans several of them still reaches that refusal
+    and is still refused by name.
+    """
+    extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
+    full = geometry.shard_size * geometry.num_shards
+    return -(-full // extent) != -(-geometry.shard_size // extent)
+
+
+def compensating_sharded_scale_grid_loader(
+    geometry: ShardGeometry, param_name: str | None = None
+) -> SafetensorsWeightLoader:
+    """This rank's rows of a DECLARED scale grid, compensated as the landed loader is.
+
+    ``inc-glm53f-105``, and it is the loader ``inc-glm53f-094`` deleted rather than
+    a new idea. That increment wrote a compensating sharded-grid loader on the
+    ``MAPPED_KEY_SCALE_GRID`` branch of :func:`loader_for_mapped_keys`, measured
+    that no geometry could reach the branch -- "the only scale grids declared as
+    parameters are ``Glm5NextMLAAttention``'s four, deferred to ``-100``" -- and
+    removed it as dead code (``increments/shard-table-094.md`` Part 7).
+    ``inc-glm53f-100`` declared the MLA head-width three sharded, which is what
+    makes a geometry arrive here, so the branch needs its loader back.
+
+    IT COMPENSATES, AND :func:`sharded_scale_grid_loader` DOES NOT. That is not an
+    inconsistency between the two: they serve different readers. The out-of-band
+    reader stores a grid raw and leaves compensation to the prep that consumes it,
+    so its loader must not compensate. A grid that is a DECLARED PARAMETER is
+    consumed by ``_dequantised_projection_weight`` instead, which expects the same
+    compensated, floored value :func:`blockwise_scale_loader` has always produced
+    for it. Sharding must not change what a grid MEANS, so the compensation and
+    its floor report are the landed ones, applied to this rank's rows.
+    """
+    if not _grid_spans_more_blocks_whole_than_per_rank(geometry):
+        return blockwise_scale_loader(param_name)
+    # THE NAME IS PASSED ON, and it has to be passed explicitly. ``_sharding_loader``
+    # gained a second parameter in ``inc-glm53f-101``; it is optional, so this call
+    # compiled without it and lost the name silently. The name is not decoration on
+    # this path: ``shard_geometry_for_grid`` can return a ``DeferredShardGeometry``
+    # (two of its three returns do), which is the ONE branch of
+    # ``_sharding_loader`` that forwards the name, and ``tensor_width_sharding_loader``
+    # spends it on ``who = param_name or "<unnamed parameter>"`` -- the label on every
+    # width refusal it raises. Omitting it costs no number and every failure message.
+    # Measured: this was the only call of ``_sharding_loader`` in this file that did
+    # not pass it, and the only one this increment added.
+    inner = _sharding_loader(
+        shard_geometry_for_grid(geometry, param_name), param_name
+    ).transform
+    if inner is None:  # pragma: no cover -- _sharding_loader always sets one
+        raise Glm5NextWeightMapError(
+            "compensating_sharded_scale_grid_loader wraps a loader that HAS a "
+            "transform; a grid with no shard takes the whole-grid loader above"
+        )
+
+    def transform(slices, rank):
+        compensation = compensate_block_scales(inner(slices, rank))
+        report_floored_blocks(compensation, param_name)
+        return compensation.scale_inv
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def sharded_scale_grid_loader(
     geometry: AnyShardGeometry,
     param_name: str | None = None,
@@ -1965,14 +2042,24 @@ def loader_for_mapped_keys(
     keys = _as_key_list(checkpoint_keys)
     kind = classify_mapped_keys(keys)
     if kind == MAPPED_KEY_SCALE_GRID:
-        # NO GEOMETRY REACHES THIS BRANCH AT THIS INCREMENT EITHER, and it is the
-        # same reading as the bank's below rather than a second rule. The only
-        # scale grids this package DECLARES as parameters are
+        # A GEOMETRY REACHES THIS BRANCH FROM ``inc-glm53f-100`` ON, and that is
+        # ``inc-glm53f-105``'s change here. The reading this replaces was true when
+        # it was written: "NO GEOMETRY REACHES THIS BRANCH AT THIS INCREMENT
+        # EITHER ... The only scale grids this package DECLARES as parameters are
         # ``Glm5NextMLAAttention``'s four, and their geometry is deferred to
-        # ``inc-glm53f-100``. A sharded weight's grid travels the out-of-band
-        # reader instead, which composes ``sharded_scale_grid_loader`` itself, so
-        # this branch stays byte-for-byte the one ``-091`` measured.
-        return blockwise_scale_loader(param_name)
+        # ``inc-glm53f-100``." ``-100`` declared the head-width three sharded, so
+        # two of those four grids -- ``q_b_proj``'s and ``o_proj``'s, the two of
+        # the DSA scaled projections that ``-100`` shards -- now belong to a
+        # sharded weight and arrive here with its geometry.
+        #
+        # WITHOUT THIS the weight is this rank's half and its grid still describes
+        # the whole tensor, so ``_require_grid`` refuses the load at real widths --
+        # measured, and kept as this increment's falsifier. ``None`` still means a
+        # replicated grid or world size 1 and still takes the landed whole-grid
+        # loader, so every path ``-091`` measured is unchanged.
+        if geometry is None:
+            return blockwise_scale_loader(param_name)
+        return compensating_sharded_scale_grid_loader(geometry, param_name)
     if kind == MAPPED_KEY_STACKED_BANK:
         # THE BANK'S GEOMETRY REACHES IT SINCE ``inc-glm53f-101``, which is what
         # ``-094``'s note here handed forward by name. It is a
