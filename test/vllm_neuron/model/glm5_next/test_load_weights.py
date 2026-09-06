@@ -4643,6 +4643,32 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     torch.manual_seed(0)
     x = torch.randn(hidden, dtype=torch.float32)
 
+    # WHICH SCALE CONVENTION THE MODULE ACTUALLY CARRIES, read before either side
+    # is computed, with the compensated form as the control that MOVES. If both
+    # branches below matched, this reading would prove nothing.
+    _gate_keys = _keys_of(mappings, f"{path}.gate_proj_weight")
+    _gate_scale = scale_keys(_gate_keys)[0]
+    _raw_grid = overrides[_gate_scale]
+    _compensated = compensate_block_scales(_raw_grid).scale_inv
+    _on_module = getattr(models[0].get_submodule(path), SHARD_GRID_ATTRIBUTES[0])
+    _rows = _on_module.shape[0]
+    print(
+        f"CONJUNCT3D_MODULE_GRID_IS_THE_RAW_CHECKPOINT="
+        f"{bool(torch.equal(_on_module, _raw_grid[:_rows]))}"
+    )
+    print(
+        f"CONJUNCT3D_MODULE_GRID_IS_THE_COMPENSATED_FORM="
+        f"{bool(torch.equal(_on_module, _compensated[:_rows]))}"
+    )
+    assert not torch.equal(_raw_grid[:_rows], _compensated[:_rows]), (
+        "compensation is a no-op on this fixture's grid, so the two readings above "
+        "cannot tell the conventions apart and the reference below is unguarded"
+    )
+    assert torch.equal(_on_module, _raw_grid[:_rows]), (
+        "the module's grid is not the checkpoint's own rows, so the reference below "
+        "must not use them either -- see weight_loaders_fp8.py:1840"
+    )
+
     def _dequantised(rank: int, leaf: str) -> torch.Tensor:
         module = models[rank].get_submodule(path)
         attribute = SHARD_GRID_ATTRIBUTES[SHARD_DENSE_LEAVES.index(leaf)]
@@ -4668,12 +4694,29 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     y_padded = down_padded @ h_padded
 
     def _reference(leaf: str) -> torch.Tensor:
+        """The same three tensors whole, at the SAME scale convention.
+
+        THE GRID IS NOT COMPENSATED HERE, and that is read off the loader rather
+        than chosen. A sharded weight's grid travels the non-compensating loader,
+        whose own words are "IT DOES NOT COMPENSATE, AND THAT IS THE WHOLE REASON
+        IT EXISTS SEPARATELY ... leaves ``compensate_block_scales`` to the
+        load-time prep that consumes it" (``weight_loaders_fp8.py:1840-1848``). So
+        the grid on the module above is the checkpoint's own, and a reference that
+        compensated would compare two different conventions.
+
+        The first version of this reference DID compensate. The instrument caught
+        it: both sides came out uniform and their ratio was exactly
+        ``(448/240) ** 3``, one factor per leaf
+        (``probe-101-r11c-pad-repair.out``). It is the same defect this seat keeps
+        making -- the reference named "the checkpoint's own tensors" and then
+        applied a transformation the load path does not apply at that point.
+        """
         keys = _keys_of(mappings, f"{path}.{leaf}")
         scales = scale_keys(keys)
         weight_key = next(key for key in keys if key not in scales)
         return dequantise_blockwise(
             downscale_fp8_weight_bytes(overrides[weight_key]),
-            compensate_block_scales(overrides[scales[0]]).scale_inv,
+            overrides[scales[0]],
             DEFAULT_WEIGHT_BLOCK_SIZE,
         ).to(torch.float32)
 
