@@ -3838,7 +3838,93 @@ class Glm5NextDSAIndexer(nn.Module):
         )
         pool_ids = self.select_pools(bounded)
         selected = bounded.gather(1, pool_ids.to(torch.int64))
-        return dsa_causal_sentinel(selected, pool_ids)
+        sentinelised = dsa_causal_sentinel(selected, pool_ids)
+        return self._canonical_sentinel_order(sentinelised)
+
+    @staticmethod
+    def _canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
+        """Sentinels to the trailing columns; real ids keep their relative order.
+
+        ``inc-glm53f-103``, REPAIR ROUND (label ``103r2``). This exists because the
+        composition above is otherwise NOT A FUNCTION OF ITS INPUTS ALONE, and
+        ``test_run_2`` caught it: the packed ragged arm and the same requests run alone
+        disagreed on ``276 of 572`` meaningful expanded indices while every seam counter
+        read one dispatch and zero fallbacks, so the chain RAN and the disagreement was
+        content (``rowm-103-host-r1.out`` under lease 029, longrepr fetched under 031).
+
+        WHY THE COMPOSITION WAS PACK-DEPENDENT, which is the whole reason for this method.
+        ``dsa_topk_select`` promises its results ``"highest first"`` (``topk_select.py:302-317``)
+        and pins NOTHING about the order among EQUAL values -- there was no reason for it
+        to, because until this increment no caller handed it ties. The causal bound
+        manufactures ties on purpose: every column a row may not see becomes the SAME
+        ``-inf``. So which masked column the selector returns, and in which position, is
+        unspecified. Two further facts make that unspecified choice vary with the PACK
+        rather than with the row: ``can_run_dsa_topk_select`` requires ``0 < k < width``
+        strictly and then asks ``_config_builds(n_rows, width, k, dtype)``
+        (``topk_select.py:285-300``), and BOTH ``n_rows`` and ``width`` are properties of
+        the batch a row is packed into, not of the row. So one and the same query row can
+        take the NKI route packed and the torch route alone -- finding F10, quoted in
+        :meth:`select_pools`, names the ``k == width`` half of that -- and the two routes
+        need not break a tie the same way.
+
+        WHY THE VALUES WERE NEVER WRONG, only their places. Every masked column the
+        selector picks is turned into ``-1`` by :func:`dsa_causal_sentinel`, so the SET the
+        row reports is already deterministic. The real ids are pinned too, because their
+        scores are distinct -- ``test_run_2`` measures exactly that and reads a
+        ``kth_place_gap_min`` of ``2.927e-04`` and ``3.199e-04`` on its two requests. What
+        leaked was the POSITION of the sentinels among the ``select_k`` columns, and the
+        expansion is positional, so a row whose ``-1`` moved re-lays its whole 11-column
+        span. That is the shape of the 276.
+
+        SO THE FIX IS TO PIN THE ONE THING THAT WAS FREE. After this method the output is a
+        function of ``(scores, seq_lens, pool_size, select_k)`` and of nothing about the
+        batch: real ids first in the selector's own descending order, sentinels after them.
+        The packed arm and the row run alone now agree by construction rather than by luck,
+        which is what ``test_run_2``'s commutation claim asks for
+        (``test_dsa_layer.py:2407-2411``; the arm's own ``seq_lens`` contract was never the
+        defect -- :meth:`forward_ragged` already refuses anything but one length per packed
+        row, by the guard whose message reads ``"seq_lens must be [tokens] = …, one per
+        PACKED row, which is what the lengths sum to"``).
+
+        THAT LAST CITATION NAMES A MESSAGE AND NOT A LINE, DELIBERATELY. The first draft of
+        this docstring cited that guard as ``model_fp8.py:4236-4240``, which this very
+        method's 70-odd lines then pushed to ``:4311``. The same rot is already recorded
+        against this file: ``test_run_2``'s own assertion points at
+        ``model_fp8.py:3679-3682`` for the commutation claim and has been wrong since
+        before this increment existed -- on the parent those lines are ``require_dials``,
+        and the claim it means sits ~500 lines later. A pointer nothing gates is a pointer
+        that rots, so anything durable here is named by the bytes a reader can grep for.
+
+        WHY THIS IS NOT THE "no compaction" CLAUSE BEING BROKEN. That clause belongs to
+        :meth:`expand_indices` and governs the EXPANDED tensor handed to ``attend()`` --
+        no filler, no compaction, no clamp, no mask on the token indices. This method
+        orders POOL IDS before the expansion runs, and it neither adds nor removes one: it
+        is a permutation within each row, and the multiset of every row is unchanged.
+
+        WHY NOT THE OTHER REPAIR. Selecting on the UNBOUNDED scores would remove the ties
+        at the source and would also be deterministic -- and it is refused, because it
+        reverses the order the plan declares for this seam, ``the bound runs between
+        dsa_score_gemm and dsa_topk_select, the sentinel runs on dsa_topk_select's output``
+        (``increment-plan.md:889-900``). A row would then spend its ``k`` slots on pools it
+        may not see and blank them afterwards, instead of choosing among the pools it may
+        see. That is a different seam, and it is not the seat's to redefine.
+
+        TORCH, NOT NKI, and the same P13 note as the gather above covers it: this is index
+        plumbing on already-selected ids, not an indexer value. It reads no scores.
+
+        The key is stable BY CONSTRUCTION rather than by a ``stable=`` keyword: a real id at
+        column ``i`` sorts at ``i`` and a sentinel at column ``i`` sorts at ``k + i``, so the
+        two groups cannot interleave and neither group is reordered within itself.
+        """
+        if pool_ids.ndim != 2:
+            raise Glm5NextDSAIndexerError(
+                f"pool_ids must be [rows, select_k] from the sentinel; got "
+                f"{tuple(pool_ids.shape)}"
+            )
+        k = int(pool_ids.shape[1])
+        position = torch.arange(k, device=pool_ids.device, dtype=torch.int64)
+        key = (pool_ids < 0).to(torch.int64) * k + position
+        return pool_ids.gather(1, key.argsort(dim=1))
 
     def expand_indices(
         self, pool_ids: torch.Tensor, seq_lens: torch.Tensor
