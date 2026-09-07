@@ -4102,11 +4102,22 @@ DEFERRED_EP_GROUP_CLASSES = ("Glm5NextRoutedExperts",)
 DEFERRED_NARROW = 256
 
 
-def _deferred_full_shape(leaf: str, shard_dim: int, full: int) -> tuple[int, ...]:
-    """:func:`_shard_full_shape`'s form at this fixture's own narrow width."""
+def _deferred_full_shape(
+    family: str, leaf: str, shard_dim: int, full: int
+) -> tuple[int, ...]:
+    """:func:`_shard_full_shape`'s form at this fixture's own narrow width.
+
+    ``family`` is a parameter for the reason :func:`_shard_full_shape` gives: a
+    leaf name alone does not identify a family, and ``o_proj_weight`` is declared
+    by both ``Glm5NextKDAAttention`` and ``Glm5NextMLAAttention``. The three MLA
+    head-width families declare a real other extent in
+    :data:`SHARD_OTHER_EXTENT` and take it; every other family falls back to
+    :data:`DEFERRED_NARROW`, which is what the six deferred families do.
+    """
     if leaf in SHARD_ONE_DIMENSIONAL:
         return (full,)
-    return (full, DEFERRED_NARROW) if shard_dim == 0 else (DEFERRED_NARROW, full)
+    other = SHARD_OTHER_EXTENT.get((family, leaf), DEFERRED_NARROW)
+    return (full, other) if shard_dim == 0 else (other, full)
 
 
 def _padded_shard_extent(full: int, num_shards: int, block: int) -> int:
@@ -4181,7 +4192,7 @@ def _deferred_key_overrides(
             keys = _keys_of(mappings, param)
             scales = scale_keys(keys)
             weights = [key for key in keys if key not in scales]
-            shape = _deferred_full_shape(leaf, shard_dim, full)
+            shape = _deferred_full_shape(family, leaf, shard_dim, full)
             if not scales:
                 # The map answers "is this family quantised", not a name list here.
                 for key in weights:
@@ -4444,13 +4455,13 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
                 # A bank carries a LEADING expert axis, so its declared dim moves
                 # one place right and the leading extent is this EP rank's experts.
                 per_rank = _padded_shard_extent(full, SHARD_TP_PER_EP, block)
-                base = list(_deferred_full_shape(leaf, shard_dim, full))
+                base = list(_deferred_full_shape(cls, leaf, shard_dim, full))
                 base[shard_dim] = per_rank
                 expected = (expected_local_experts, *base)
                 divisor = f"tp_per_ep {SHARD_TP_PER_EP}"
             else:
                 per_rank = _padded_shard_extent(full, SHARD_EP_WORLD, block)
-                expected = list(_deferred_full_shape(leaf, shard_dim, full))
+                expected = list(_deferred_full_shape(cls, leaf, shard_dim, full))
                 expected[shard_dim] = per_rank
                 expected = tuple(expected)
                 divisor = f"world {SHARD_EP_WORLD}"
@@ -4488,7 +4499,9 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     for path, module, leaf, shard_dim, full in _deferred_leaves(whole):
         dotted = f"{path}.{leaf}"
         got = tuple(_loaded(whole, dotted).shape)
-        base = list(_deferred_full_shape(leaf, shard_dim, full))
+        base = list(
+            _deferred_full_shape(type(module).__name__, leaf, shard_dim, full)
+        )
         expected = (
             (MINI_ROUTED_EXPERTS, *base)
             if type(module).__name__ in DEFERRED_EP_GROUP_CLASSES
@@ -4502,6 +4515,68 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     assert whole_checked > 0, "the world-size-1 control measured nothing"
     assert whole_checked == len(_deferred_leaves(whole))
     assert len(overrides) > 0 and len(mappings) > 0
+
+
+def test_deferredwidth_the_mla_three_take_their_other_extent_from_the_table() -> None:
+    """The three MLA head-width families resolve their real other extent.
+
+    WHY A DIRECT READ RATHER THAN A SHAPE ASSERTION. This fixture's writer and
+    its expectations share one function, :func:`_deferred_full_shape`, so a wrong
+    width agrees with itself and the per-rank shape assertions in this section
+    cannot see it. Reading the function itself is the only place the
+    disagreement shows.
+
+    THE KDA CONTROL IS THE FIRING HALF. ``o_proj_weight`` is declared by both
+    ``Glm5NextKDAAttention`` and ``Glm5NextMLAAttention``, and only the second
+    declares an other extent, so a lookup keyed on the leaf alone would hand the
+    KDA row the MLA row's ``hidden_size``. The resolved extent is asserted on its
+    own and not only through the whole tuple, because ``_KDA_FULL`` and
+    :data:`DEFERRED_NARROW` are both 256 in this fixture and a tuple comparison
+    alone could not say which of the two it had read.
+    """
+    expected_other = {
+        ("Glm5NextMLAAttention", "q_b_proj_weight"): MINI_MLA_WIDTHS["q_lora_rank"],
+        ("Glm5NextMLAAttention", "kv_b_proj_weight"): MINI_MLA_WIDTHS["kv_lora_rank"],
+        ("Glm5NextMLAAttention", "o_proj_weight"): MINI_MLA_WIDTHS["hidden_size"],
+        ("Glm5NextKDAAttention", "o_proj_weight"): DEFERRED_NARROW,
+    }
+    readings: list[str] = []
+    others: dict[tuple[str, str], int] = {}
+    for (family, leaf), want_other in expected_other.items():
+        shard_dim, full = SHARD_FAMILIES[(family, leaf)]
+        shape = _deferred_full_shape(family, leaf, shard_dim, full)
+        assert len(shape) == 2, (
+            f"{family}.{leaf} is not a two-dimensional leaf here, so the other "
+            f"extent has no place to be read: {shape}"
+        )
+        other = shape[1 - shard_dim]
+        assert shape[shard_dim] == full, (
+            f"{family}.{leaf} put {shape[shard_dim]} on its shard dim {shard_dim} "
+            f"rather than the full extent {full}"
+        )
+        assert other == want_other, (
+            f"{family}.{leaf} resolved its other extent to {other}; this file's "
+            f"table says {want_other}. Were the lookup keyed on the leaf alone, "
+            f"both o_proj_weight rows would take "
+            f"{MINI_MLA_WIDTHS['hidden_size']} and this reading would go red"
+        )
+        others[(family, leaf)] = other
+        readings.append(f"{family}.{leaf}={shape}")
+    print(f"CONJUNCT1E_DEFERRED_OTHER_EXTENTS={sorted(readings)}")
+    assert len(readings) == len(expected_other) > 0
+
+    # AND NOT ALL THROUGH THE FALLBACK. Without this, a function that ignored the
+    # table entirely could still satisfy every assertion above on a fixture whose
+    # declared widths happened to equal DEFERRED_NARROW.
+    fell_back = sorted(
+        key
+        for key, value in others.items()
+        if key[0] == "Glm5NextMLAAttention" and value == DEFERRED_NARROW
+    )
+    assert not fell_back, (
+        f"an MLA row still reads the {DEFERRED_NARROW} fallback instead of its "
+        f"declared extent: {fell_back}"
+    )
 
 
 # --------------------------------------------------------------------------- #
