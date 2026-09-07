@@ -42,6 +42,20 @@ first draft of this file put the negated block on a small output scale, where de
 the lower clamp moved the result by about 0.9% against a 1% tolerance -- it would have
 passed with the branch missing.
 
+EVERY ITEM ALSO CARRIES THE REGISTERED ROUTE PREDICATE, D13 form R-3, and it is the
+reason a green item means anything. Each forward completes, and matches a torch
+reference, whether or not one NKI kernel ran -- so each item reads the seam counters
+around its own forward call and asserts that its own seam dispatched the number of times
+it declares, that the torch-fallback total across every seam this campaign owns is 0, and
+that the set of seams which fired is non-empty. An item that ran torch end to end fails
+twice over: 0 dispatches on its own seam and a non-zero fallback.
+
+THE FIRED SET IS ASSERTED PER ITEM RATHER THAN ACCUMULATED ACROSS THE SEVEN, because
+``pytestmark`` below carries ``pytest.mark.forked``: every item runs in its own forked
+process, so module-level state cannot survive from one item to the next and accumulating
+would assert nothing. The union over the seven is read from this run's transcript, which
+is what the registered wording's "reported" asks for.
+
 Run::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 \\
@@ -137,6 +151,100 @@ def _impl():
     from vllm_neuron.model.glm5_next import model_fp8
 
     return model_fp8
+
+
+# --------------------------------------------------------------------------- #
+# THE REGISTERED ROUTE PREDICATE, D13 form R-3, registered at plan §4b.2.       #
+# --------------------------------------------------------------------------- #
+#: The seams this campaign owns that these seven forwards reach, keyed by the
+#: kernel entry point a reader would grep for. Both modules spell their
+#: accessors identically, so they are reached through module aliases and never
+#: imported by bare name -- two ``dispatch_counters`` in one namespace would
+#: silently shadow.
+_SEAMS = ("blockwise_fp8_mm", "blockwise_fp8_moe")
+
+
+def _seam_modules() -> dict:
+    """``{seam: module}`` for the seams this campaign owns.
+
+    Imported inside a call, like :func:`_impl`, so this file's import time does
+    not depend on the plugin being importable.
+    """
+    from vllm_neuron.functional import blockwise_fp8_mm as dense
+    from vllm_neuron.functional.moe import moe_blockwise_fp8 as moe
+
+    return {"blockwise_fp8_mm": dense, "blockwise_fp8_moe": moe}
+
+
+def _read_seam_counters() -> dict:
+    """``{seam: (nki_dispatch, torch_fallback)}`` as each seam reports itself."""
+    return {name: tuple(mod.dispatch_counters())
+            for name, mod in _seam_modules().items()}
+
+
+def _reset_seam_counters() -> None:
+    """Zero every seam this campaign owns, so a reading is this item's own."""
+    for mod in _seam_modules().values():
+        mod.reset_dispatch_counters()
+
+
+def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict) -> None:
+    """The registered predicate, over one item's own forward call.
+
+    ``expected`` is ``{seam: dispatches}`` and names ONLY the seams this item's
+    forward should reach, so a forward that quietly took a different seam fails
+    on the comparison rather than passing on a total.
+
+    Three conjuncts, each from the registered wording:
+
+    1. ``can_run_kernel()`` is True. Under ``VLLM_NEURON_CPU_MODE=1`` this reads
+       the ``NKI_SIMULATOR`` flag (``utils/neuron_utils.py:20-21``), so a run
+       launched without the simulator is refused here instead of passing on the
+       torch oracle.
+    2. the torch-fallback total across every seam reads exactly 0.
+    3. the set of seams that fired is non-empty, and equals ``expected``.
+
+    Raises:
+        VacuousControlError: on any conjunct, named so the transcript says which.
+    """
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    gate = bool(can_run_kernel(torch.zeros(1)))
+    fired = {}
+    fallbacks = 0
+    for name in _SEAMS:
+        dispatched = after[name][0] - before[name][0]
+        fell_back = after[name][1] - before[name][1]
+        fallbacks += fell_back
+        if dispatched:
+            fired[name] = dispatched
+    print(
+        f"TINYFWD|route|item={item}|can_run_kernel={gate}"
+        f"|fired={sorted(fired.items())}|expected={sorted(expected.items())}"
+        f"|torch_fallback={fallbacks}"
+    )
+    if not gate:
+        raise VacuousControlError(
+            f"item {item}: can_run_kernel() is False, so this forward ran on the "
+            f"torch oracle rather than the NKI route. The comparison would pass "
+            f"either way, which is what this predicate exists to refuse. Run with "
+            f"VLLM_NEURON_CPU_MODE=1 and NKI_SIMULATOR=1"
+        )
+    if fallbacks != 0:
+        raise VacuousControlError(
+            f"item {item}: the torch-fallback counters total {fallbacks} across "
+            f"{list(_SEAMS)}; the registered predicate declares exactly 0"
+        )
+    if not fired:
+        raise VacuousControlError(
+            f"item {item}: no seam this campaign owns dispatched at all, so this "
+            f"item certifies torch composed end to end and not the kernel"
+        )
+    if fired != expected:
+        raise VacuousControlError(
+            f"item {item}: the seams that fired were {sorted(fired.items())} and "
+            f"this item declares {sorted(expected.items())}"
+        )
 
 
 def _pinned_raw_config() -> dict:
@@ -435,7 +543,18 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
                 f"the module"
             )
 
+    # ---- THE REGISTERED ROUTE PREDICATE, around this item's own call. The
+    # reset sits immediately before the forward and the read immediately after,
+    # so nothing the reference computed above is inside the window.
+    _reset_seam_counters()
+    before = _read_seam_counters()
     got = module.forward(operands["hidden"], quant_config=_quant_config())
+    after = _read_seam_counters()
+    # THREE dispatches on the dense seam and nothing on the routed one: the
+    # forward's gate, up and down projections. The dense MLP reaches no MoE
+    # kernel at all, so naming only its own seam here is what makes a forward
+    # that took the wrong route fail rather than pass on a total.
+    _assert_route_predicate("1 dense MLP", {"blockwise_fp8_mm": 3}, before, after)
 
     if tuple(got.shape) != (TOKENS, HIDDEN_SIZE):
         raise ReferenceShapeError(
