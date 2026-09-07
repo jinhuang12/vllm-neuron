@@ -1362,6 +1362,40 @@ class Glm5NextRoutedExperts(nn.Module):
         )
         # Uniform by the gate above, so rank 0's count is every rank's count.
         self.num_local_experts = self.expert_partition.counts[0]
+        # THE CHECKPOINT'S SwiGLU BOUND -- hand-off item (v), ruled in scope for
+        # ``inc-glm53f-054a`` at DECISIONS 409.
+        #
+        # The reference clamps the ROUTED bank, not only the MLP: its
+        # ``Glm5NextTextExperts`` stores this bound at
+        # ``modeling_glm5_next.py:118`` and clamps ``gate`` from above and ``up``
+        # on both sides at ``:139-140``, BEFORE ``F.silu(gate) * up`` at ``:142``.
+        # The bank's own compute path had no route to the value at all -- not one
+        # line of this class mentioned it -- so the kernel ran an UNCLAMPED SwiGLU
+        # and computed a different function from the reference's on every token
+        # whose projection left the box. On the published checkpoint that is a
+        # bound of ``10.0`` and 42 MoE layers, with no shape moving and nothing
+        # raising: the routed half of
+        # ``B22-M1-shared-expert-swiglu-clamp-omitted``, whose SHARED half
+        # ``inc-glm53f-033`` repaired. Measured in
+        # ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-054a-swiglu-clamp-r2.out``.
+        #
+        # IT REFUSES RATHER THAN DEFAULTING. A literal here would be a bound this
+        # code invented, and a ``None`` reaching the kernel is exactly the silent
+        # omission being closed -- all four of its limit parameters default to
+        # ``None``. The read is at construction, like the shared expert's
+        # (``Glm5NextSharedExperts.__init__``, named rather than numbered because
+        # this file cites in-file lines by number and every insertion shifts
+        # every number below it), so no call site can hand this path a bound the
+        # checkpoint never declared.
+        limit = getattr(text_config, "swiglu_limit", None)
+        if limit is None:
+            raise Glm5NextBlockQuantRouteError(
+                "text_config carries no swiglu_limit, so the routed bank has no "
+                "checkpoint bound to clamp its SwiGLU with. Refusing to build: "
+                "running unclamped is what computed a different function from "
+                "the reference, and defaulting would invent a bound."
+            )
+        self.swiglu_limit = float(limit)
         _declare_parameters(
             self,
             "router_weight",
@@ -1809,6 +1843,50 @@ class Glm5NextRoutedExperts(nn.Module):
             block_to_expert=block_to_expert.reshape(-1, 1),
             gate_up_proj_scale=gate_up_proj_scale,
             down_proj_scale=down_proj_scale,
+            # THE CHECKPOINT'S SwiGLU BOUND, hand-off item (v), DECISIONS 409.
+            #
+            # THE ASYMMETRY IS THE REFERENCE'S. ``gate`` is bounded from ABOVE
+            # only (``modeling_glm5_next.py:139`` passes ``min=None``) and ``up``
+            # on BOTH sides (``:140``). Making both two-sided would be a second
+            # wrong function rather than a tidier one, which is the reasoning
+            # ``Glm5NextSharedExperts.shared_expert_mm``'s own transliteration
+            # note records for the shared half of the same defect.
+            #
+            # THE CLAMP IS THE KERNEL'S ALREADY, so this is configuration and not
+            # new kernel-class work (P13 is not engaged and no torch fallback is
+            # introduced). The four parameters are declared at
+            # ``moe_blockwise_fp8.py:340-343``, on the traced shim
+            # ``_torch_compatible_blockwise_mm_baseline_shard_intermediate``
+            # (``:314``), which forwards them to the nkilib kernel at ``:372``.
+            # They travel there as ``blockwise_fp8_moe``'s ``**kernel_kwargs``,
+            # which that seam forwards VERBATIM on BOTH of its routes: the NKI
+            # launch at ``:462`` and the torch oracle at ``:445``, whose own
+            # forward into the vendor's torch reference is at ``:519``.
+            #
+            # THE CPU LANE EXERCISES THE KERNEL'S OWN CLAMP, not a torch copy of
+            # it. Under ``VLLM_NEURON_CPU_MODE=1`` with ``NKI_SIMULATOR=1``, this
+            # campaign's CPU-lane environment, ``can_run_kernel`` returns True
+            # (``utils/neuron_utils.py:20-21``), so the seam takes the NKI route
+            # and these four keywords land on the shim that declares them by
+            # name. The torch-oracle route is reached only when there is no
+            # simulator or NKI is disabled.
+            #
+            # AND THIS IS THE REPOSITORY'S FIRST CALLER to send a clamp limit
+            # through this seam. No other call site and no test passes one, so
+            # nothing landed covers the keywords' onward journey. That is what
+            # makes the routed item's FAIL/PASS pair an instrument rather than
+            # ceremony: with these four keywords removed the item must go RED,
+            # and a keyword some route accepted and then ignored would leave it
+            # green.
+            #
+            # WHY EXPLICIT ``None``. The lower bound on ``gate`` is a positive
+            # declaration that the reference has none there, in a call whose four
+            # limits all default to ``None`` -- the default that made the omission
+            # silent for every increment before this one.
+            gate_clamp_upper_limit=self.swiglu_limit,
+            gate_clamp_lower_limit=None,
+            up_clamp_upper_limit=self.swiglu_limit,
+            up_clamp_lower_limit=-self.swiglu_limit,
         )
         return output[:tokens]
 
