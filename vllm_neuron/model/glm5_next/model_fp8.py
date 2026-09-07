@@ -1946,13 +1946,13 @@ class Glm5NextRoutedExperts(nn.Module):
         of them is a mis-wiring no shape check would see.
 
         Args:
-            gate_proj_weight: ``[E_local, H, I_TP]`` fp8-e4m3, this rank's slice.
-            up_proj_weight: ``[E_local, H, I_TP]`` fp8-e4m3.
-            down_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3.
-            gate_proj_scale: ``[E_local, H//128, I_TP//128]`` fp32, the
+            gate_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3, this rank's slice.
+            up_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3.
+            down_proj_weight: ``[E_local, H, I_TP]`` fp8-e4m3.
+            gate_proj_scale: ``[E_local, I_TP//128, H//128]`` fp32, the
                 checkpoint's own block grid.
             up_proj_scale: the same, for ``up_proj_weight``.
-            down_proj_scale: ``[E_local, I_TP//128, H//128]`` fp32.
+            down_proj_scale: ``[E_local, H//128, I_TP//128]`` fp32.
 
         Returns:
             How many operands were built -- ``4`` on every successful call:
@@ -1970,6 +1970,26 @@ class Glm5NextRoutedExperts(nn.Module):
                 properties of a particular checkpoint's scales, so a refusal
                 here would turn a reportable measurement into a load failure on
                 a case no test has run.
+
+        THOSE ARE THE LOADER'S ORIENTATIONS AND NOT THE KERNEL'S, which is why
+        the body below transposes two of the three banks on the way in and one on
+        the way out. The registered parameter layout IS the checkpoint layout:
+        ``weight_loaders_fp8.py`` passes ``is_storage_transposed=False`` and says
+        in its own words that every consumer transposes at compute time instead,
+        and each bank is that checkpoint's per-expert slices stacked on a new
+        LEADING axis with no transpose (``_stack_local_expert_weights``,
+        ``_stack_local_expert_scales``). The checkpoint stores one ``nn.Linear``
+        weight per expert, ``[out, in]``, which the reference confirms at
+        ``../../../artifacts/campaigns/glm-5.3-flash-port/design/reference/modeling_glm5_next.py:116-117``:
+        gate and up are ``[I, H]``, down is ``[H, I]``.
+
+        AN EARLIER REVISION OF THIS BLOCK NAMED THE KERNEL'S ORIENTATIONS HERE,
+        and that was worse than merely wrong. It would have led a reader to
+        transpose DOWN, whose consumer scale shape is the PRODUCT of the two block
+        counts and so identical either way -- the wrong repair passes every shape
+        check anything could write and mis-assigns every scale. The gate for this
+        increment therefore measures which axis arrives as the producer's ``rows``,
+        and plants that exact pair to show the check rejects it.
 
         THE MERGE IS CHECKED RATHER THAN ASSUMED. ``block_quant_expert_mm``
         requires both fusion halves present and says the producer writes one per
@@ -2025,10 +2045,40 @@ class Glm5NextRoutedExperts(nn.Module):
                     f"rank's router columns"
                 )
 
+        # ---- THE PRODUCER'S VIEW. ``retile_block_scales`` reads its weight as
+        # ``(E, rows, cols)`` where ROWS IS THE H AXIS and COLS THE I AXIS, for
+        # BOTH projections: its own refusal text is ``weights must be (E, H, I)``
+        # and ``test_moe_path.py``'s landed call site states the same convention in
+        # words before doing it. So gate and up, registered ``[E, I_TP, H]``, are
+        # handed over in the ``(E, H, I_TP)`` view; down, registered
+        # ``[E, H, I_TP]``, is already in that view and is passed unchanged.
+        #
+        # EACH GRID MOVES WITH ITS WEIGHT, never alone. The producer derives the
+        # grid it expects from the weight it received --
+        # ``want_scales = (experts, rows // TILE_SIZE, cols // TILE_SIZE)`` -- so a
+        # weight transposed by itself is refused where it happens. The dangerous
+        # pair is the opposite one: a weight and its grid transposed TOGETHER where
+        # neither should be, which for DOWN changes no shape anywhere and every
+        # value everywhere.
+        #
+        # ``.contiguous()`` IS THE FORM THE PRODUCER IS KNOWN TO WORK ON. Every
+        # landed call of it hands a freshly built contiguous tensor, and this file
+        # already uses ``.t().contiguous()`` for the same job in both
+        # ``prepare_projection_weights`` methods. The copy is bounded by what the
+        # producer does next anyway: it upcasts its weight to fp32 internally,
+        # four times the size of the fp8 copy made here.
         gate = retile_block_scales(
-            gate_proj_weight, gate_proj_scale, GATE_UP, gate_half
+            gate_proj_weight.transpose(1, 2).contiguous(),
+            gate_proj_scale.transpose(1, 2).contiguous(),
+            GATE_UP,
+            gate_half,
         )
-        up = retile_block_scales(up_proj_weight, up_proj_scale, GATE_UP, up_half)
+        up = retile_block_scales(
+            up_proj_weight.transpose(1, 2).contiguous(),
+            up_proj_scale.transpose(1, 2).contiguous(),
+            GATE_UP,
+            up_half,
+        )
         down = retile_block_scales(down_proj_weight, down_proj_scale, DOWN)
 
         # ---- THE FUSION MERGE, and its completeness check.
@@ -2045,8 +2095,11 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"not tile the same space"
             )
 
-        # ---- THE FUSED WEIGHT. ``[E, H, I]`` twice, stacked on a new axis 2,
-        # which is the ``[E, H, 2, I_TP]`` the kernel's extent check demands.
+        # ---- THE FUSED WEIGHT. Each half returns in the ``(E, H, I_TP)`` view
+        # it was handed above, so stacking on a new axis 2 gives the
+        # ``[E, H, 2, I_TP]`` the kernel's extent check demands. Without those
+        # transposes this line produced ``[E, I_TP, 2, H]`` and the consumer's
+        # ``gate_up_proj_weight.shape[1] != hidden`` refused it.
         gate_up_weight = torch.stack(
             (gate.retiled_weights, up.retiled_weights), dim=2
         )
@@ -2054,7 +2107,14 @@ class Glm5NextRoutedExperts(nn.Module):
         prepared = {
             "gate_up_proj_weight": gate_up_weight,
             "gate_up_consumer_scales": gate_up_scales,
-            "down_proj_weight": down.retiled_weights,
+            # BACK TO THE KERNEL'S ORIENTATION. The producer returns its retiled
+            # weight in the view it was handed, so down comes back
+            # ``(E, H, I_TP)`` and ``block_quant_expert_mm`` requires exactly
+            # ``(E, I_TP, H)``. The landed ``test_moe_path.py`` call site performs
+            # this same transpose for this same reason. Only the WEIGHT moves: the
+            # consumer scales are already in the producer's flat kernel layout and
+            # are not a picture of the weight's axes.
+            "down_proj_weight": down.retiled_weights.transpose(1, 2).contiguous(),
             "down_consumer_scales": down.consumer_scales,
         }
         setattr(self, self.PREPARED_KERNEL_OPERANDS_ATTR, prepared)
