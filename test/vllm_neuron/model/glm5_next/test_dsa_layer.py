@@ -1492,6 +1492,80 @@ def _ref_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
     return torch.topk(scores, int(k), dim=-1).indices.to(torch.int32)
 
 
+# --------------------------------------------------------------------------- #
+# THE CAUSAL BOUND, IN THE REFERENCE. `inc-glm53f-103`, declared as an amendment to a LANDED test
+# in the block's Surface bullet at plan revision 260 -- not discovered at review.
+#
+# WHY THE REFERENCE HAD TO CHANGE AT ALL. `_ref_indexer` below selects pools from unbounded scores,
+# so before this increment it agreed with the implementation and after it, it cannot: the bound
+# changes WHICH pools a row selects, which is the whole point of the increment. Measured, not
+# argued: the first counted run read `Mismatched elements: 5601 / 8960` and `8910 / 8960` on the two
+# `test_run_1` arms. A reference that does not know about the bound disagrees BY CONSTRUCTION, and a
+# stale reference is a wrong expectation rather than a finding.
+#
+# THESE THREE FUNCTIONS ARE TORCH AND STAY TORCH, AND THAT IS LOAD-BEARING TWICE OVER. The reference
+# must reach NO seam -- `:2182-2196` MEASURES that it moves no projection counter and says the
+# arrangement "is only sound if the reference is torch-only" -- so calling `dsa_causal_bound` here
+# would make the reference compare the seam against itself and would fire that reading. And P13 is
+# not in play: this is the test's own oracle, never a production path.
+#
+# WHAT THEY DO NOT BUY. Because the reference now transcribes the same declared semantics as the
+# implementation, `test_run_1` can no longer catch a defect in the ORDER of the sentinel columns --
+# both sides pin it the same way. That defect class is caught by `test_run_2`, which compares a row
+# against ITSELF run alone and needs no reference at all. The separation is deliberate: a reference
+# checks the values, and the pack-commutation item checks that a row's answer does not depend on its
+# neighbours.
+# --------------------------------------------------------------------------- #
+
+
+def _ref_causal_bound(
+    scores: torch.Tensor, seq_lens: torch.Tensor, pool_size: int, width: int
+) -> torch.Tensor:
+    """``dsa_causal_bound``: ``-inf`` at every pool column the row does not complete.
+
+    Pool ``p`` completes at token ``(p + 1) * pool_size - 1`` and is attendable exactly when that
+    token is ``< causal_len``, which is the same statement as ``p < causal_len // pool_size`` --
+    the block's Surface bullet's predicate, written here as the inequality on the token so a reader
+    can check it against upstream's ``[cu_seqlen_ks, cu_seqlen_ke)`` without re-deriving the floor
+    division.
+
+    ``causal_len`` IS ``seq_lens``, the same column the expansion receives -- one producer, two
+    consumers, exactly as ``select_bounded_pools`` says of itself (``model_fp8.py:3783-3785``).
+    """
+    causal = seq_lens.to(torch.int64).reshape(-1, 1)
+    columns = torch.arange(int(width), dtype=torch.int64).reshape(1, -1)
+    completes = (columns + 1) * int(pool_size) - 1 < causal
+    return scores.masked_fill(~completes, float("-inf"))
+
+
+def _ref_causal_sentinel(bounded: torch.Tensor, pool_ids: torch.Tensor) -> torch.Tensor:
+    """``dsa_causal_sentinel``: ``-1`` at every selection whose score was bounded away.
+
+    The value is read back by gathering the BOUNDED scores at the selected ids, which is what the
+    implementation does and for the reason it records (``model_fp8.py:3787-3794``). ``isinf`` with a
+    sign test rather than ``== float("-inf")``: the two agree here, and the predicate says what it
+    means without depending on how the comparison treats an infinity.
+    """
+    selected = bounded.gather(1, pool_ids.to(torch.int64))
+    struck = torch.isinf(selected) & (selected < 0)
+    return torch.where(struck, torch.full_like(pool_ids, -1), pool_ids)
+
+
+def _ref_canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
+    """Sentinels to the trailing columns; real ids keep their relative order.
+
+    Mirrors ``Glm5NextDSAIndexer._canonical_sentinel_order``. It exists in the reference for the
+    same reason it exists in the implementation: the selector promises "highest first" and promises
+    NOTHING about the order among EQUAL values (``topk_select.py:312``), and the bound manufactures
+    equal values in bulk at ``-inf``. Without this the two sides would differ on the PLACES of
+    identical contents, which is not a numeric disagreement and would read like one.
+    """
+    k = int(pool_ids.shape[1])
+    position = torch.arange(k, dtype=torch.int64)
+    key = (pool_ids < 0).to(torch.int64) * k + position
+    return pool_ids.gather(1, key.argsort(dim=1))
+
+
 def _ref_expand(pool_ids: torch.Tensor, seq_lens: torch.Tensor, pool_size: int) -> torch.Tensor:
     """``dsa_index_expand``: pool ids become token indices, with a raw-token tail appended.
 
@@ -1714,9 +1788,25 @@ def _ref_indexer(
 
     candidate_keys = _ref_candidate_keys(pool_cache, candidates)
     scores = _ref_score(query, candidate_keys, weights)
+    # THE PROBE KEEPS THE UNBOUNDED SCORES, ON PURPOSE. Its one consumer is the tie control, which
+    # asserts the selection was not decided by a tie. The bound below writes `-inf` into every column
+    # a row does not complete, so handing it BOUNDED scores would make the tie control fire on every
+    # row that completes fewer than `select_k` pools -- reporting the behaviour under test as a
+    # fixture problem. The control still does its job on these scores and the reasoning is short: for
+    # a row completing at least `select_k` pools the selection is made among finite columns, and "no
+    # two of all columns tie" implies "no two of those tie"; for a row completing fewer, every
+    # remaining pick is a `-inf` sentinel whose PLACE is pinned by `_ref_canonical_sentinel_order`
+    # rather than chosen. Both cases are therefore decided, and neither is decided by a tie.
     if probe is not None:
         probe.append(scores.detach())
-    pool_ids = _ref_topk(scores, int(indexer.select_k()))
+    # inc-glm53f-103: bound, select, sentinelise, then pin the sentinel places -- the same four steps
+    # in the same order as `select_bounded_pools` (`model_fp8.py:3801-3807`), transcribed rather than
+    # called. The order is the plan's declared order and is not free to vary: selecting on unbounded
+    # scores and masking afterwards would answer a different question.
+    bounded = _ref_causal_bound(scores, seq_lens, pool, candidates)
+    pool_ids = _ref_topk(bounded, int(indexer.select_k()))
+    pool_ids = _ref_causal_sentinel(bounded, pool_ids)
+    pool_ids = _ref_canonical_sentinel_order(pool_ids)
     return _ref_expand(pool_ids, seq_lens, pool)
 
 
@@ -3156,15 +3246,41 @@ def test_softmaxscale_control_the_retired_latent_rank_value_fails_that_item() ->
 # block's own predicate, `causal_len = position + 1` -- which is upstream's formula and which this
 # file's own fixtures already use, `seq_lens = arange(1, n + 1)`. Under it the rows reading one are
 # 3, 4, 5 and 6. Ruled at DECISIONS section 332, plan rev 257: ":889 becomes 'rows 3-6 one each'".
+# CARRIED FORWARD UNCHANGED to the 32-token case at plan rev 260 (entry `design-20260907-bd`): rows 3
+# to 6 still read one, rows 0 to 2 still read two, and the rows the longer case adds -- 7 through 31 --
+# all read zero, because every one of them completes at least `select_k` pools. The ruling's own words
+# still describe the vector; the case moved because the selector could not run the shorter one.
 # NOTHING HERE IS TYPED FROM THAT RULING: the vector is computed from this item's own inputs by
 # :func:`_expected_sentinel_counts`, and the superseded reading is PLANTED as the control, so an
 # implementation that used `position` instead of `position + 1` fails this item rather than passing
 # it.
 
-#: The shortest length that SELECTS at this file's dials: one pool past the bypass boundary.
-#: DERIVED from the two dials, so a dial change moves the case instead of quietly turning it back
-#: into a bypass case that would read every counter below as a zero and pass for the wrong reason.
-SELECTING_SEQ_LEN = BYPASS_SEQ_LEN + POOL_SIZE
+#: The 8 fixed lanes ``nisa.max8`` emits. THIS FILE ALREADY ARGUES THIS FLOOR at :138-166, where it
+#: is why ``PREFILL_TOKENS`` is 35 and not 19; it is named here so the tiny case and the boundary case
+#: below cite ONE floor instead of two, and so the reason a shorter case cannot run is readable in the
+#: file rather than only in a run record.
+MAX8_LANES = 8
+
+#: The shortest length that SELECTS at this file's dials AND that the selector can actually run.
+#: DERIVED from the dials and the lane floor, so a dial change moves the case instead of quietly
+#: turning it back into a bypass case that would read every counter below as a zero and pass for the
+#: wrong reason.
+#:
+#: WHY 32 AND NOT 12, which is what this constant read until plan revision 260. Twelve is one pool
+#: past the bypass boundary and is the shorter, sharper case -- and it CANNOT EXECUTE. At
+#: ``POOL_SIZE`` 4 it gives 3 candidate pools, and the vendored selector asserts at least 8 on the
+#: non-partition axis: ``rotational_topk.py:180`` -> ``rotational_topk_utils.py:994``
+#: ``naive_scanning_topk`` -> ``:1036`` ``nisa.max8`` -> ``nki/isa/_validation.py:1608``
+#: ``assert n >= 8``. Measured on the host, not inferred: the item raised
+#: ``AssertionError: max8 requires at least 8 elements per partition, got 3`` before it reached its
+#: own subject. 32 tokens give 8 pools, so one ``nisa.max8`` can run, and 32 is the SMALLEST length
+#: that clears the floor -- 28 gives 7 and misses it by one.
+#:
+#: THE CLAIM DID NOT MOVE WITH THE CASE. The formula below is unchanged, the vector is still computed
+#: from this item's own inputs, its first eight entries are what the 12-token case read, every row 32
+#: adds is a zero, and the superseded control still differs at rows 3 and 7. Ruled at plan revision
+#: 260, entry ``design-20260907-bd``.
+SELECTING_SEQ_LEN = POOL_SIZE * max(MAX8_LANES, TOPK_POOLS + 1)
 
 #: The families the SELECTING decision governs, each owing exactly one dispatch on one prefill leg.
 #: `causal_fill` is deliberately NOT here: it is inc-glm53f-099's bypass seam and owes a ZERO on
@@ -3284,8 +3400,18 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
         f"{select_k}; this item must sit ABOVE the strict bound or the bypass serves it and every "
         f"counter below reads zero for a reason that has nothing to do with the causal bound"
     )
-    assert SELECTING_SEQ_LEN == 12, (
-        f"the block declares a 12-token case and this file's dials now derive "
+    # THE LANE FLOOR, READ BEFORE THE CASE IDENTITY. This is the reading whose ABSENCE let the
+    # 12-token case be ruled and land: the item asserted `candidates > select_k` and never that the
+    # selector could run the width it was handed, so it raised inside `nisa.max8` before reaching its
+    # own subject and reported nothing about the causal bound at all.
+    assert candidates >= MAX8_LANES, (
+        f"{SELECTING_SEQ_LEN} token(s) yields {candidates} candidate pool(s), under the "
+        f"{MAX8_LANES} lanes nisa.max8 emits; the selector refuses with 'max8 requires at least 8 "
+        f"elements per partition' (rotational_topk_utils.py:1036 -> nki/isa/_validation.py:1608) and "
+        f"this item never reaches the bound it exists to read"
+    )
+    assert SELECTING_SEQ_LEN == 32, (
+        f"the block declares a 32-token case and this file's dials now derive "
         f"{SELECTING_SEQ_LEN}; the figures below are computed, but the case identity is declared"
     )
     assert select_k == TOPK_POOLS == 2 and pool == POOL_SIZE == 4, (select_k, pool)
@@ -3372,8 +3498,10 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
         "item cannot tell them apart and the control is not a control"
     )
     assert differing == [3, 7], (
-        f"the two predicates differ at rows {differing}; on a 12-token case at these dials they "
-        f"differ at exactly rows 3 and 7, which is what makes this control able to fire"
+        f"the two predicates differ at rows {differing}; on a 32-token case at these dials they "
+        f"differ at exactly rows 3 and 7 -- the two pool boundaries the off-by-one moves -- which is "
+        f"what makes this control able to fire. The wider case did not weaken it: the width cap does "
+        f"not reach these rows, so the differing set is the one the 12-token case read"
     )
     assert per_row != struck, (
         f"the chain reproduced the STRUCK predicate {struck} rather than the ruled one {want}: the "
