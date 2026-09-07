@@ -2157,12 +2157,82 @@ class Glm5NextRoutedExperts(nn.Module):
             )
         return prepared[name]
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextRoutedExperts.forward is a stub created by "
-            "inc-glm53f-013; expert partitioning lands with inc-glm53f-031, "
-            "the router call site with inc-glm53f-032, and the block-quant "
-            "kernel call site with inc-glm53f-027"
+    # ── the bank's forward -- ``inc-glm53f-054a`` item 2 of 7 ────────────
+    #
+    # WHAT THIS METHOD IS: the composition, and nothing else. Every piece it
+    # needs is already landed. ``block_quant_expert_mm`` above does the route
+    # dispatch, the global-to-local expert mapping, the padding slot and the
+    # kernel call; ``prepare_scale_operands`` built the four operands that method
+    # takes, once, at load time. So this method looks those four up by the names
+    # that method declares and calls it. It authors no numerics, no layout and no
+    # refusal of its own -- a refusal here would be a second authority on an
+    # extent the callee already checks, and two refusals on one extent is how
+    # they come to disagree.
+    #
+    # WHY THE AFFINITIES ARE AN ARGUMENT RATHER THAN ROUTED HERE. ``route_tokens``
+    # above returns the GLOBAL router columns and needs the router norm's gamma
+    # and the text config, neither of which this bank retains -- ``-032``'s own
+    # section note records that the config is threaded in at the call for exactly
+    # that reason. Routing inside this method would make it need both and would
+    # put the router's call site in two places. The MoE block's forward is where
+    # the router and this bank meet, and that is a later item.
+    #
+    # WHY THERE IS NO CAST. ``block_quant_expert_mm``'s docstring says the return
+    # dtype is the seam's own and that the layer forward decides the residual
+    # dtype. Casting here would take that decision away from the method the
+    # design gives it to.
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_affinities: torch.Tensor,
+        quant_config: Glm5NextQuantConfig,
+        *,
+        block_size: int | None = None,
+        moe_group: object | None = None,
+        tp_degree: int = 1,
+        expert_parallel_rank: int = 0,
+    ) -> torch.Tensor:
+        """Run this rank's routed experts over ``[T, H]`` tokens.
+
+        Args:
+            hidden_states: ``[T, H]`` real tokens only.
+            expert_affinities: ``[T, E]`` scattered router scores over ALL
+                ``n_routed_experts`` -- what :meth:`route_tokens` returns, handed
+                straight through.
+            quant_config: the resolved quantisation policy, the route selector.
+            block_size: tokens per block; defaults to ``BLOCK_QUANT_SIZE``.
+            moe_group: the MoE ``GroupCoordinator``, unread at ``tp_degree`` 1.
+            tp_degree: ranks sharding each expert's intermediate dimension.
+            expert_parallel_rank: which rank's expert slice to select.
+
+        Returns:
+            ``[T, H]`` in the seam's own dtype.
+
+        Raises:
+            Glm5NextBlockQuantRouteError: if the load-time prep has not run, and
+                on any extent disagreement :meth:`block_quant_expert_mm`
+                refuses. Both are raised by the methods that own them, which is
+                why this one raises nothing.
+        """
+        return self.block_quant_expert_mm(
+            hidden_states=hidden_states,
+            expert_affinities=expert_affinities,
+            gate_up_proj_weight=self._prepared_kernel_operand(
+                "gate_up_proj_weight"
+            ),
+            down_proj_weight=self._prepared_kernel_operand("down_proj_weight"),
+            gate_up_consumer_scales=self._prepared_kernel_operand(
+                "gate_up_consumer_scales"
+            ),
+            down_consumer_scales=self._prepared_kernel_operand(
+                "down_consumer_scales"
+            ),
+            quant_config=quant_config,
+            block_size=block_size,
+            moe_group=moe_group,
+            tp_degree=tp_degree,
+            expert_parallel_rank=expert_parallel_rank,
         )
 
 
