@@ -1,0 +1,653 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Acceptance for the selecting-regime causal bound -- ``inc-glm53f-103``.
+
+WHAT IS BEING ASSERTED. A query row must select only key pools that are COMPLETE at or before its
+own position, and a selection that reached no such pool must read the ``-1`` sentinel. The bound
+writes ``-inf``; the sentinel writes ``-1``; nothing else in either output moves.
+
+FOUR ITEMS, ONE PER COUNTED CONJUNCT, NO ``parametrize`` -- section 6 rule 6, so the declared count
+is derivable before a line runs. Controls live INSIDE the item whose zero or whose comparison they
+protect, on the ``design-20260905`` §63 precedent: a strengthening under the same id never moves a
+declared item count.
+
+WHAT EACH READING IS WORTH, AND WHERE A TOLERANCE IS AND IS NOT SPENT.
+  * Items 1, 2 and 4 are BIT COMPARISONS. The bound moves a column to ``-inf`` or leaves it alone,
+    and the sentinel moves an index to ``-1`` or leaves it alone; neither computes a new number, so
+    there is nothing for a tolerance to absorb and none is authored. Item 1 reads the kept columns
+    through ``.view(torch.int32)`` -- the RAW BITS -- because ``==`` on floats cannot tell ``-0.0``
+    from ``+0.0`` and an arithmetic mask would silently rewrite exactly that.
+  * Item 3's LAST reading is the only one with a tolerance, because it runs a float attention kernel.
+    That pair is NOT authored here: ``RTOL`` and ``ATOL`` are IMPORTED from ``inc-glm53f-098``'s
+    acceptance file, which is what "the pair ``-098``'s item (1) carries (cited, not restated)"
+    asks for. A second spelling of a registered comparator value is a place for it to drift (P9).
+
+TWO REFERENCES ARE IMPORTED RATHER THAN RE-IMPLEMENTED, and the block names both.
+  * ``_precondition_violations`` from ``inc-glm53f-048``'s acceptance file, which is the reader that
+    DEFINES the precondition this block exists to restore. Re-spelling it here would let this file
+    pass against its own idea of ``-048``'s rule instead of against ``-048``'s rule.
+  * ``sentinel_reference`` and the ``RTOL``/``ATOL`` pair from ``inc-glm53f-098``'s acceptance file.
+
+THE ZEROS AND THE COMPARISONS OWN FIRING CONTROLS.
+  * item 1's bit equality is shown able to FAIL by a doctored oracle off by one at each row's LAST
+    COMPLETE pool -- the single boundary column a wrong inequality would move;
+  * item 1 PLANTS a ``-0.0`` in a kept column, so the bit-identity reading is taken on the one value
+    that separates "left alone" from "added to zero";
+  * item 2 reads the selector's returned VALUE for a bounded slot before reading the sentinel, so a
+    sentinel that fired for the wrong reason cannot pass (see that item on why this is not pedantry);
+  * item 3's precondition zero is read beside the UNBOUNDED chain on the same inputs, which must
+    violate;
+  * item 4 moves BOTH entry points' ``torch_fallback`` off 0 by forcing ``can_run_kernel`` False,
+    so the zeros items 1 to 3 read are readings and not decoration (D1.5).
+
+WHY THE ORACLES ARE REAL ORACLES. The kernel never divides -- it compares
+``(p + 1) * pool_size > causal_len`` -- and the bound oracle uses upstream's own
+``masked_fill`` over ``p >= causal_len // pool_size``. The kernel detects ``-inf`` by negating and
+comparing against the largest finite float32; the sentinel oracle uses ``torch.isinf``. Two
+different mechanisms arriving at the same bits is an agreement; one mechanism written twice would
+only prove the module agrees with itself.
+"""
+
+import os
+from pathlib import Path
+
+import pytest
+import torch
+
+from vllm_neuron.functional.attention.mla_sparse import (
+    can_run_mla_sparse_attention,
+    mla_sparse_attention,
+)
+from vllm_neuron.functional.dsa import causal_bound as mod
+from vllm_neuron.functional.dsa.causal_bound import (
+    NEG_INF,
+    SENTINEL,
+    DsaCausalBoundError,
+    can_run_dsa_causal_bound,
+    can_run_dsa_causal_sentinel,
+    causal_bound_dispatch_counters,
+    causal_bound_kernel_identity,
+    causal_sentinel_dispatch_counters,
+    causal_sentinel_kernel_identity,
+    dsa_causal_bound,
+    dsa_causal_bound_torch_oracle,
+    dsa_causal_sentinel,
+    dsa_causal_sentinel_torch_oracle,
+    reset_causal_bound_dispatch_counters,
+    reset_causal_sentinel_dispatch_counters,
+)
+from vllm_neuron.functional.dsa.index_expand import (
+    can_run_dsa_index_expand,
+    dsa_index_expand,
+    index_expand_dispatch_counters,
+    index_expand_width,
+    reset_index_expand_dispatch_counters,
+)
+from vllm_neuron.functional.dsa.topk_select import (
+    can_run_dsa_topk_select,
+    dsa_topk_select,
+    reset_topk_select_dispatch_counters,
+    topk_select_dispatch_counters,
+)
+from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+# `-048`'s OWN precondition reader and `-098`'s OWN reference and tolerance pair. Imported, never
+# re-implemented -- see this file's docstring.
+from test.vllm_neuron.functional.attention.test_mla_sparse import (
+    ATOL,
+    RTOL,
+    make_case,
+    sentinel_reference,
+)
+from test.vllm_neuron.functional.dsa.test_index_expand import (
+    _precondition_violations,
+)
+
+ROWS = 5
+"""Query rows in the declared small shape -- the block's own figure."""
+
+POOL_COLUMNS = 16
+"""Candidate pool columns in the declared small shape -- the block's own figure."""
+
+POOL_SIZE = 4
+"""Tokens per pool in the declared small shape -- the block's own figure."""
+
+CAUSAL_LENS = [1, 4, 9, 33, 64]
+"""The declared causal lengths -- the block's own set, and every one earns its place.
+
+``1`` is shorter than one pool, so NO pool is complete and the whole row is bounded -- the case a
+closed form that assumed at least one live column would get wrong. ``4`` is exactly one pool, the
+boundary where the inequality is tight. ``9`` is one token past two pools, so the third pool is
+incomplete and must be bounded even though the row reaches into it. ``33`` is interior. ``64`` is
+``POOL_COLUMNS * POOL_SIZE``, the saturated row where NOTHING is bounded and the count must read
+exactly zero -- so a bound that fired unconditionally could not pass."""
+
+SELECT_K = 2
+"""The block's declared ``k`` for the sentinel and integration items."""
+
+MLA_CASE = dict(seq=ROWS, heads=4, latent=128, topk=128, s_kv=256, rope=0)
+"""The geometry item 3's chain ends in, taken from ``-098``'s own declared sentinel family.
+
+``topk=128`` is not a free choice: it is ``index_expand_width(SELECT_K, POOL_SIZE)``, which item 3
+ASSERTS rather than assumes, so this dict cannot drift from what the chain actually emits. ``s_kv``
+only has to exceed the largest token index the chain can produce, which is ``max(CAUSAL_LENS) - 1``;
+item 3 reads that too."""
+
+
+def _emit(tag: str, **values: object) -> None:
+    """Print one MACHINE-READABLE reading line, for the driver to re-check independently.
+
+    The pattern is the landed one at ``test_index_expand.py:110-118``: the item asserts, and then
+    PRINTS the value it asserted on, so the driver that owns the transcript can check the same
+    number without trusting this file's own verdict.
+
+    Note for whoever greps the transcript: pytest writes a progress marker with NO trailing newline
+    after each test, so the first line printed by every test after the first can be prefixed by it.
+    Match with ``grep -o``, never with a ``^`` anchor.
+    """
+    body = " ".join(f"{k}={v}" for k, v in values.items())
+    print(f"S103|{tag}|{body}", flush=True)
+
+
+def _scores(seed: int) -> torch.Tensor:
+    """One case's scores at the declared shape: ``[ROWS, POOL_COLUMNS]`` float32.
+
+    Seeded from the caller so a failure reproduces from its own item. Scaled small for the same
+    reason ``-098``'s fixture is: it feeds a softmax in item 3.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(ROWS, POOL_COLUMNS, generator=gen, dtype=torch.float32) * 0.05
+
+
+def _causal_len() -> torch.Tensor:
+    """The declared lengths at the shape the seam documents: ``[ROWS, 1]`` int32."""
+    return torch.tensor(CAUSAL_LENS, dtype=torch.int32).reshape(ROWS, 1)
+
+
+def _complete_pools() -> list[int]:
+    """Complete pools per row, COMPUTED from this file's own dials and never typed.
+
+    Every expected count in items 1 and 2 is derived from this, so changing a dial moves the reading
+    instead of leaving it accidentally true.
+    """
+    return [c // POOL_SIZE for c in CAUSAL_LENS]
+
+
+def _assert_module_under_test_is_the_candidate() -> str:
+    """Assert the module being measured is the candidate tree, and return where it resolved.
+
+    §78.1's obligation in the form ``inc-glm53f-056``'s repair settled (DECISIONS §88, §91 i): the
+    declared-root arm binds when ``GLM53F_CANDIDATE_ROOT`` is set, and the root is DERIVED from this
+    file's own tree when it is not. A test that requires the campaign harness's environment variable
+    is red by construction on every plain ``pytest`` run of the fork, which is the landed defect
+    that repair exists to remove.
+    """
+    resolved = Path(mod.__file__).resolve()
+    declared = os.environ.get("GLM53F_CANDIDATE_ROOT")
+    if declared:
+        root = Path(declared).resolve()
+        origin = "declared"
+    else:
+        root = Path(__file__).resolve().parents[4]
+        origin = "derived-from-this-file"
+    assert resolved.is_relative_to(root), (
+        f"the module under test must come from the candidate tree {root}; it resolved to {resolved}"
+    )
+    assert (root / "vllm_neuron" / "__init__.py").is_file(), (
+        f"the candidate root {root} must contain the vllm_neuron package being measured"
+    )
+    _emit("IMPORT_ORIGIN", origin=origin, root=root, module=resolved)
+    return origin
+
+
+# =========================================================================== #
+# CONJUNCT 1 -- THE EXACT BOUND
+# =========================================================================== #
+
+
+def test_the_bound_fills_exactly_the_incomplete_pools_and_a_doctored_oracle_fails() -> None:
+    """Conjunct 1. ``-inf`` at exactly the pools the row does not complete, nothing else touched.
+
+    FOUR READINGS IN ONE ITEM, because each alone leaves a hole. Bit equality against the oracle
+    certifies the rearranged inequality against upstream's floor-division spelling. The per-row
+    ``-inf`` COUNT, computed from this file's dials, fails on an off-by-one that both spellings could
+    share. The KEPT-COLUMN bit identity certifies that the mask is a select and not arithmetic. The
+    doctored oracle certifies the COMPARISON, so a pass means the comparison was able to fail.
+
+    Certifying component (D1.4): ``causal_bound._causal_bound_nki`` through the
+    ``causal_bound.dsa_causal_bound`` seam.
+    """
+    _assert_module_under_test_is_the_candidate()
+    scores = _scores(103)
+    causal_len = _causal_len()
+
+    # THE PLANTED `-0.0`. Row 4 is the saturated row, so column 0 there is KEPT -- and `-0.0` is the
+    # one value an additive mask would rewrite while every `==` comparison still passed. Planted
+    # BEFORE the call so the kernel sees it, and read back through the raw bits below.
+    scores[4, 0] = -0.0
+    planted_bits = int(scores[4, 0].view(torch.int32))
+    assert planted_bits == -2147483648, planted_bits  # 0x80000000, the sign bit alone
+    _emit("C1_PLANTED_NEGATIVE_ZERO", row=4, column=0, bits=planted_bits)
+
+    reset_causal_bound_dispatch_counters()
+    admitted = can_run_dsa_causal_bound(scores, causal_len, POOL_SIZE)
+    assert admitted is True, (
+        "the declared case must take the NKI route, or no reading below is one. Under the Tier N "
+        "harness a False here means NKI_SIMULATOR=1 is unset"
+    )
+    got = dsa_causal_bound(scores, causal_len, POOL_SIZE)
+    want = dsa_causal_bound_torch_oracle(scores, causal_len, POOL_SIZE)
+    nki_n, fallback_n = causal_bound_dispatch_counters()
+
+    assert tuple(got.shape) == (ROWS, POOL_COLUMNS), tuple(got.shape)
+    assert got.dtype is torch.float32, got.dtype
+    assert want.dtype is torch.float32, want.dtype
+
+    # BIT EQUALITY, not `assert_close`. `torch.equal` compares `-inf` to `-inf` as equal and would
+    # see a `+0.0` where a `-0.0` belongs -- which `assert_close` at any tolerance would not.
+    assert torch.equal(got.view(torch.int32), want.view(torch.int32)), (
+        "the kernel and the oracle must agree BIT FOR BIT; the first differing entry is "
+        f"{(got.view(torch.int32) != want.view(torch.int32)).nonzero()[:1].tolist()}"
+    )
+    _emit("C1_BIT_EQUALITY", rows=ROWS, columns=POOL_COLUMNS, entries=got.numel(),
+          differing_bits=0)
+
+    # THE PER-ROW `-inf` COUNT, computed from the dials. This is the reading a shared off-by-one
+    # cannot survive: it compares the kernel against ARITHMETIC, not against another spelling.
+    complete = _complete_pools()
+    per_row = (got == NEG_INF).sum(dim=1).to(torch.int64)
+    expected = torch.tensor(
+        [POOL_COLUMNS - min(POOL_COLUMNS, c) for c in complete], dtype=torch.int64
+    )
+    assert torch.equal(per_row, expected), (per_row.tolist(), expected.tolist())
+    _emit("C1_BOUNDED_COUNT", lengths=CAUSAL_LENS, complete_pools=complete,
+          counts=per_row.tolist(), computed=expected.tolist())
+
+    # AND AGAINST THE BLOCK'S OWN DECLARED FIGURE, which is a second, independent source for the
+    # same five numbers. If the computation above drifted from the design, this disagrees.
+    assert per_row.tolist() == [16, 15, 14, 8, 0], per_row.tolist()
+    _emit("C1_MATCHES_BLOCK_FIGURE", declared=[16, 15, 14, 8, 0], read=per_row.tolist())
+
+    # THE SATURATED ROW carries ZERO. §79.1: the subset is asserted NON-EMPTY as well as correct, so
+    # a selector that matched nothing cannot pass as a vacuous truth.
+    saturated = [r for r, c in enumerate(CAUSAL_LENS) if c >= POOL_COLUMNS * POOL_SIZE]
+    assert len(saturated) == 1, saturated
+    assert saturated == [4], saturated
+    assert int(per_row[4]) == 0, int(per_row[4])
+    assert CAUSAL_LENS[4] == POOL_COLUMNS * POOL_SIZE, CAUSAL_LENS[4]
+    _emit("C1_SATURATED", row=4, causal_len=CAUSAL_LENS[4],
+          width_times_pool=POOL_COLUMNS * POOL_SIZE, bounded=int(per_row[4]))
+
+    # The complement is non-empty too, or the saturated reading would be the only one taken.
+    bounded_rows = [r for r in range(ROWS) if r not in saturated]
+    assert len(bounded_rows) == 4, bounded_rows
+    assert all(int(per_row[r]) > 0 for r in bounded_rows), per_row.tolist()
+    _emit("C1_BOUNDED_ROWS", rows=len(bounded_rows), which=bounded_rows)
+
+    # THE KEPT COLUMNS ARE BIT-IDENTICAL TO THE INPUT. This is what `tensor_copy_predicated` buys
+    # over an arithmetic mask, and it is read on RAW BITS so the planted `-0.0` is in scope.
+    kept_mask = torch.zeros(ROWS, POOL_COLUMNS, dtype=torch.bool)
+    for r, c in enumerate(complete):
+        kept_mask[r, : min(POOL_COLUMNS, c)] = True
+    assert int(kept_mask.sum()) == sum(min(POOL_COLUMNS, c) for c in complete)
+    assert int(kept_mask.sum()) > 0, "the kept set must be non-empty for this reading to exist"
+    assert torch.equal(
+        got.view(torch.int32)[kept_mask], scores.view(torch.int32)[kept_mask]
+    ), "a kept column was rewritten; the mask is not a select"
+    read_back = int(got[4, 0].view(torch.int32))
+    assert read_back == planted_bits, (read_back, planted_bits)
+    _emit("C1_KEPT_BIT_IDENTICAL", kept=int(kept_mask.sum()), population=got.numel(),
+          negative_zero_survived=int(read_back == planted_bits))
+
+    # THE DOCTORED-ORACLE CONTROL. Off by one at each row's LAST COMPLETE pool: exactly the column a
+    # `>=` written as a `>` would move. One entry per row that HAS a complete pool.
+    doctored = want.clone()
+    moved = 0
+    for r, c in enumerate(complete):
+        if c > 0:
+            doctored[r, min(POOL_COLUMNS, c) - 1] = NEG_INF
+            moved += 1
+    assert moved == 4, moved  # every row but the wholly-bounded row 0
+    differing = int((doctored != got).sum())
+    assert not torch.equal(doctored, got), (
+        "the doctored oracle must DISAGREE, or the equality assertion above proves nothing"
+    )
+    assert differing == moved, (differing, moved)
+    _emit("C1_DOCTORED_CONTROL", doctored_rows=moved, differing=differing,
+          population=got.numel())
+
+    identity = causal_bound_kernel_identity()
+    assert identity is not None, "the identity must be derived by TAKING the dispatch branch (D13.1)"
+    assert identity[1] == "_causal_bound_nki", identity
+    assert (nki_n, fallback_n) == (1, 0), (nki_n, fallback_n)
+    _emit("C1_ROUTE", can_run=admitted, nki_dispatch=nki_n, torch_fallback=fallback_n,
+          kernel=identity[1])
+
+
+# =========================================================================== #
+# CONJUNCT 2 -- THE SENTINEL
+# =========================================================================== #
+
+
+def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None:
+    """Conjunct 2. ``-1`` where the selected value is ``-inf``, and the index untouched elsewhere.
+
+    THE READING THIS ITEM TAKES FIRST, AND WHY IT IS NOT PEDANTRY. The sentinel keys on the selected
+    VALUE, so this conjunct depends on the landed selector returning ``-inf`` VERBATIM for a bounded
+    slot. That is not obviously true: ``dsa_topk_select`` wraps the vendored ``rotational_topk``,
+    which uses ``nc_match_replace8(imm=float("-inf"))`` to strike out each value it has already
+    taken (``rotational_topk_utils.py:1065``, ``:1109``, ``:1116``) -- so ``-inf`` is the selector's
+    OWN already-taken marker and an all-``-inf`` row is fed the selector's own sentinel. The design
+    survives that on purpose: this block does not care WHICH index comes back for a bounded slot,
+    only that its value is ``-inf``. But "the returned value is exactly ``-inf``" is then a
+    LOAD-BEARING fact about someone else's kernel, so it is READ HERE, before the sentinel is read,
+    and named in the transcript. If it fails, the finding is about the selector's contract and not
+    about this module's arithmetic -- report it as such rather than widening anything.
+
+    Certifying component (D1.4): ``causal_bound._causal_sentinel_nki`` through the
+    ``causal_bound.dsa_causal_sentinel`` seam.
+    """
+    scores = _scores(203)
+    causal_len = _causal_len()
+    complete = _complete_pools()
+
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    reset_topk_select_dispatch_counters()
+
+    bounded = dsa_causal_bound(scores, causal_len, POOL_SIZE)
+    assert can_run_dsa_topk_select(bounded, SELECT_K) is True, (
+        "the landed selector must serve the declared shape, or this conjunct has no chain to read"
+    )
+    values, indices = dsa_topk_select(bounded, SELECT_K)
+    assert tuple(values.shape) == (ROWS, SELECT_K), tuple(values.shape)
+
+    # THE LOAD-BEARING FACT, read before anything depends on it. A bounded slot is one the row had
+    # no complete pool for; its count per row is `max(0, k - complete)`, which is the block's own
+    # formula and is computed here rather than typed.
+    want_counts = [max(0, SELECT_K - c) for c in complete]
+    assert want_counts == [2, 1, 0, 0, 0], want_counts  # the block's declared figure, cross-checked
+    is_neg_inf = torch.isinf(values) & (values < 0)
+    got_neg_inf = is_neg_inf.sum(dim=1).to(torch.int64)
+    assert torch.equal(got_neg_inf, torch.tensor(want_counts, dtype=torch.int64)), (
+        f"the selector did not return -inf verbatim for every bounded slot: got "
+        f"{got_neg_inf.tolist()} against the computed {want_counts}. This is a reading about "
+        f"dsa_topk_select's returned VALUES, not about this module's mask -- see this item's "
+        f"docstring before changing anything here"
+    )
+    _emit("C2_SELECTOR_RETURNS_NEG_INF_VERBATIM", per_row=got_neg_inf.tolist(),
+          computed=want_counts, total=int(is_neg_inf.sum()))
+
+    # THE SENTINEL. `dsa_topk_select` returns int64 indices to match `torch.topk`; the consumer
+    # `dsa_index_expand` reads int32, so the cast is the dispatch site's transport and is spelled
+    # the same way here. It is dtype plumbing, not a torch implementation of anything.
+    idx32 = indices.to(torch.int32)
+    assert can_run_dsa_causal_sentinel(values, idx32) is True
+    got = dsa_causal_sentinel(values, idx32)
+    want = dsa_causal_sentinel_torch_oracle(values, idx32)
+    sent_nki, sent_fb = causal_sentinel_dispatch_counters()
+
+    assert got.dtype is torch.int32, got.dtype
+    assert torch.equal(got, want), (
+        f"the kernel and the oracle must agree element for element; first differing "
+        f"{(got != want).nonzero()[:1].tolist()}"
+    )
+    _emit("C2_ORACLE_AGREEMENT", entries=got.numel(), differing=0)
+
+    per_row = (got == SENTINEL).sum(dim=1).to(torch.int64)
+    assert torch.equal(per_row, torch.tensor(want_counts, dtype=torch.int64)), (
+        per_row.tolist(), want_counts
+    )
+    assert int(per_row.numel()) == ROWS, per_row.numel()
+    _emit("C2_SENTINEL_COUNT", rows=ROWS, of=ROWS, counts=per_row.tolist(),
+          computed=want_counts)
+
+    # "AND NOWHERE ELSE", as two halves. Every sentinel position is a `-inf` position, and every
+    # non-sentinel index is the selector's own index unchanged.
+    assert torch.equal(got == SENTINEL, is_neg_inf), (
+        "a sentinel was written at a position whose value was finite, or withheld at one whose "
+        "value was -inf"
+    )
+    kept = ~is_neg_inf
+    assert int(kept.sum()) > 0, "the kept set must be non-empty for this reading to exist"
+    assert torch.equal(got[kept], idx32[kept]), "a kept index was rewritten"
+    _emit("C2_NOWHERE_ELSE", sentinel_positions=int(is_neg_inf.sum()),
+          kept_positions=int(kept.sum()), kept_unchanged=1)
+
+    # THE WHOLLY-BOUNDED ROW. Row 0 has no complete pool, so both of its selections are sentinels --
+    # the case `-098`'s consumer settles as exact zeros, and the one a formula that assumed at least
+    # one live column would get wrong.
+    assert complete[0] == 0, complete[0]
+    assert int(per_row[0]) == SELECT_K, int(per_row[0])
+    assert bool((got[0] == SENTINEL).all()), got[0].tolist()
+    _emit("C2_WHOLLY_BOUNDED_ROW", row=0, causal_len=CAUSAL_LENS[0], sentinels=int(per_row[0]),
+          k=SELECT_K)
+
+    identity = causal_sentinel_kernel_identity()
+    assert identity is not None and identity[1] == "_causal_sentinel_nki", identity
+    bound_nki, bound_fb = causal_bound_dispatch_counters()
+    topk_nki, topk_fb = topk_select_dispatch_counters()
+    assert (bound_nki, bound_fb) == (1, 0), (bound_nki, bound_fb)
+    assert (sent_nki, sent_fb) == (1, 0), (sent_nki, sent_fb)
+    assert (topk_nki, topk_fb) == (1, 0), (topk_nki, topk_fb)
+    _emit("C2_ROUTE", bound=(bound_nki, bound_fb), sentinel=(sent_nki, sent_fb),
+          topk_047=(topk_nki, topk_fb), kernel=identity[1])
+
+
+# =========================================================================== #
+# CONJUNCT 3 -- INTEGRATION, computed not typed
+# =========================================================================== #
+
+
+def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_reference() -> None:
+    """Conjunct 3. The chain's pool ids satisfy ``-048``'s precondition, and attention agrees.
+
+    THIS IS THE ITEM THE WHOLE BLOCK EXISTS FOR. ``-048``'s expansion declares a caller
+    precondition -- every non-negative pool id is below ``seq_len // pool_size`` -- and the landed
+    chain had nothing that enforced it. So the reading is taken with ``-048``'s OWN reader, imported
+    rather than re-spelled, on the bounded chain and then on the UNBOUNDED chain as the control. If
+    the control did not violate, this block would be enforcing a precondition nothing broke.
+
+    Certifying component (D1.4): the two seams composed -- the bound before the selector and the
+    sentinel after it -- as the dispatch site will compose them.
+    """
+    scores = _scores(303)
+    causal_len = _causal_len()
+    seq_lens = torch.tensor(CAUSAL_LENS, dtype=torch.int32)
+
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    reset_index_expand_dispatch_counters()
+
+    bounded = dsa_causal_bound(scores, causal_len, POOL_SIZE)
+    values, indices = dsa_topk_select(bounded, SELECT_K)
+    pool_ids = dsa_causal_sentinel(values, indices.to(torch.int32))
+
+    # `-048`'S OWN READER, on `-048`'s own argument shapes (python lists). ZERO violations.
+    violations = _precondition_violations(pool_ids.tolist(), CAUSAL_LENS, POOL_SIZE)
+    _emit("C3_PRECONDITION", violations=len(violations), detail=violations,
+          rows=ROWS, population=pool_ids.numel())
+    assert violations == [], (
+        f"the bounded chain still breaks -048's precondition at {violations}"
+    )
+    legal_rows = ROWS - len({r for r, _ in violations})
+    assert legal_rows == ROWS, legal_rows
+    _emit("C3_LEGAL_ROWS", legal=legal_rows, of=ROWS)
+
+    # THE CONTROL: the UNBOUNDED chain on the SAME scores. Row 0 completes no pool, so any
+    # non-negative id it selects is a violation -- which is the gap this block closes.
+    raw_values, raw_indices = dsa_topk_select(scores, SELECT_K)
+    unbounded_ids = raw_indices.to(torch.int32)
+    control = _precondition_violations(unbounded_ids.tolist(), CAUSAL_LENS, POOL_SIZE)
+    _emit("C3_UNBOUNDED_CONTROL", violations=len(control), detail=control,
+          fires=int(len(control) >= 1))
+    assert len(control) >= 1, (
+        "the UNBOUNDED chain satisfied -048's precondition on these inputs, so this item cannot "
+        "see whether the bound did anything. Choose inputs the unbounded chain breaks"
+    )
+    assert any(r == 0 for r, _ in control), control
+    assert bool((raw_values > NEG_INF).all()), "the control must run on unbounded scores"
+
+    # THE EMITTED WIDTH COMES FROM `-048`'s OWN FUNCTION, never typed. This is what pins MLA_CASE.
+    width = index_expand_width(SELECT_K, POOL_SIZE)
+    assert width == MLA_CASE["topk"], (width, MLA_CASE["topk"])
+    _emit("C3_WIDTH", derived=width, mla_case_topk=MLA_CASE["topk"], n_groups=SELECT_K,
+          pool_size=POOL_SIZE)
+
+    assert can_run_dsa_index_expand(pool_ids, seq_lens, POOL_SIZE) is True
+    token_idx = dsa_index_expand(pool_ids, seq_lens, POOL_SIZE)
+    assert tuple(token_idx.shape) == (ROWS, width), tuple(token_idx.shape)
+    expand_nki, expand_fb = index_expand_dispatch_counters()
+    assert (expand_nki, expand_fb) == (1, 0), (expand_nki, expand_fb)
+
+    # EVERY EMITTED TOKEN INDEX IS INSIDE ITS OWN ROW, which is the precondition's whole purpose
+    # restated at the token level rather than the pool level -- and the reading a reviewer can check
+    # without following the pool arithmetic.
+    live = token_idx >= 0
+    assert int(live.sum()) > 0, "the expansion must emit at least one live token index"
+    row_of = torch.arange(ROWS).reshape(ROWS, 1).expand_as(token_idx)
+    limit = seq_lens.to(torch.int64).reshape(ROWS, 1).expand_as(token_idx)
+    out_of_row = int((live & (token_idx.to(torch.int64) >= limit)).sum())
+    _emit("C3_TOKENS_INSIDE_ROW", live=int(live.sum()), out_of_row=out_of_row,
+          max_token=int(token_idx.max()), s_kv=MLA_CASE["s_kv"])
+    assert out_of_row == 0, (
+        f"{out_of_row} live token indices point past their own row's causal length"
+    )
+    assert int(token_idx.max()) < MLA_CASE["s_kv"], int(token_idx.max())
+    assert int(row_of.max()) == ROWS - 1
+
+    # AND THE CHAIN'S TAIL: `-098`'s consumer, against `-098`'s own float64 reference at `-098`'s
+    # own tolerance pair, both IMPORTED. The scale is derived from the case's latent rank, the way
+    # `-098`'s `case_scale` derives it, so it cannot drift from the width.
+    q_lift, c_kv, _discarded_idx, q_pe, k_pe = make_case(**MLA_CASE, seed=403)
+    assert q_pe is None and k_pe is None, "the declared geometry is at R == 0"
+    scale = float(MLA_CASE["latent"]) ** -0.5
+    assert can_run_mla_sparse_attention(
+        q_lift, MLA_CASE["seq"], MLA_CASE["heads"], MLA_CASE["latent"], MLA_CASE["rope"],
+        MLA_CASE["topk"], MLA_CASE["s_kv"], scale,
+    ) is True, "the sparse kernel must admit the emitted width, or the chain has no tail to read"
+    out = mla_sparse_attention(q_lift, c_kv, token_idx, scale)
+    ref = sentinel_reference(q_lift, c_kv, token_idx, scale)
+    err = float((out - ref).abs().max())
+    _emit("C3_ATTENTION_MAXABS_VS_IMPORTED_REFERENCE", err=f"{err:.3e}", rtol=RTOL, atol=ATOL,
+          pair_source="test_mla_sparse.py (inc-glm53f-098), imported not authored")
+    assert bool(torch.isfinite(out).all()), (
+        "the chain produced a non-finite value -- what a -inf column reaching the softmax as a NaN "
+        "looks like"
+    )
+    torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+
+    bound_nki, bound_fb = causal_bound_dispatch_counters()
+    sent_nki, sent_fb = causal_sentinel_dispatch_counters()
+    assert (bound_nki, bound_fb) == (1, 0), (bound_nki, bound_fb)
+    assert (sent_nki, sent_fb) == (1, 0), (sent_nki, sent_fb)
+    _emit("C3_ROUTE", bound=(bound_nki, bound_fb), sentinel=(sent_nki, sent_fb),
+          index_expand_048=(expand_nki, expand_fb))
+
+
+# =========================================================================== #
+# CONJUNCT 4 -- REFUSAL, and the fallback firing controls
+# =========================================================================== #
+
+
+def test_three_malformed_bound_calls_are_refused_by_name_and_the_fallback_can_fire() -> None:
+    """Conjunct 4. The three declared refusals raise by name; both fallback zeros are shown to move.
+
+    THESE ARE RAISES, NOT GATE DECLINES, and that is a ruling rather than a style choice. Serving a
+    non-power-of-two ``pool_size`` or a mismatched ``causal_len`` through the torch oracle would hand
+    the caller a correct-looking answer for a call that cannot be right -- which is the silent
+    fallback this increment exists to make unreachable.
+
+    THE ITEM ALSO CARRIES THE FIRING CONTROL FOR BOTH FALLBACK ZEROS (D1.5). Because every malformed
+    call RAISES, the only way either gate declines is NKI being unavailable -- so that is the
+    control: force ``can_run_kernel`` False and watch each seam route to its oracle and its counter
+    move off 0. Without it, the ``torch_fallback == 0`` of conjuncts 1 to 3 would be decoration.
+
+    Certifying component (D1.4): ``causal_bound._validate_bound``,
+    ``causal_bound.can_run_dsa_causal_bound`` and ``causal_bound.can_run_dsa_causal_sentinel``.
+    """
+    scores = _scores(403)
+    causal_len = _causal_len()
+
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+
+    # (i) a non-power-of-two pool_size
+    with pytest.raises(DsaCausalBoundError) as caught_pool:
+        dsa_causal_bound(scores, causal_len, 6)
+    pool_message = str(caught_pool.value)
+    assert "pool_size" in pool_message, pool_message
+    assert "power of two" in pool_message, pool_message
+    assert "pool_size=6" in pool_message, pool_message
+    _emit("C4_REFUSAL_POOL_SIZE", pool_size=6, message=pool_message.split(".")[0])
+
+    # (ii) a causal_len that is not int32
+    with pytest.raises(DsaCausalBoundError) as caught_dtype:
+        dsa_causal_bound(scores, causal_len.to(torch.float32), POOL_SIZE)
+    dtype_message = str(caught_dtype.value)
+    assert "causal_len" in dtype_message, dtype_message
+    assert "int32" in dtype_message, dtype_message
+    assert "torch.float32" in dtype_message, dtype_message
+    _emit("C4_REFUSAL_DTYPE", dtype="torch.float32", message=dtype_message.split(";")[0])
+
+    # (iii) a causal_len whose row count differs from scores
+    with pytest.raises(DsaCausalBoundError) as caught_rows:
+        dsa_causal_bound(scores, causal_len[: ROWS - 1], POOL_SIZE)
+    rows_message = str(caught_rows.value)
+    assert "one length per score row" in rows_message, rows_message
+    assert f"{ROWS - 1} lengths" in rows_message, rows_message
+    assert f"{ROWS} score rows" in rows_message, rows_message
+    _emit("C4_REFUSAL_ROW_COUNT", lengths=ROWS - 1, score_rows=ROWS,
+          message=rows_message.split(";")[0])
+
+    # AND THE SENTINEL'S OWN DTYPE REFUSAL, which protects the int64-to-int32 cast the dispatch site
+    # performs. A strengthening inside an existing item under the same increment id, so the declared
+    # count of four items stays four (§63 precedent, cited in this file's docstring).
+    with pytest.raises(DsaCausalBoundError) as caught_idx:
+        dsa_causal_sentinel(
+            torch.zeros(ROWS, SELECT_K, dtype=torch.float32),
+            torch.zeros(ROWS, SELECT_K, dtype=torch.int64),
+        )
+    idx_message = str(caught_idx.value)
+    assert "int32" in idx_message and "torch.int64" in idx_message, idx_message
+    _emit("C4_REFUSAL_SENTINEL_DTYPE", dtype="torch.int64", message=idx_message.split(";")[0])
+
+    refused = (causal_bound_dispatch_counters(), causal_sentinel_dispatch_counters())
+    assert refused == ((0, 0), (0, 0)), (
+        f"a refusal that dispatched first has already produced the wrong answer; got {refused}"
+    )
+    _emit("C4_NOTHING_DISPATCHED", bound=refused[0], sentinel=refused[1])
+
+    # THE FIRING CONTROL, both entry points. `can_run_kernel` is read as a module global by both
+    # gates, so replacing it on the module under test is what a call in a no-NKI process sees.
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    values = torch.zeros(ROWS, SELECT_K, dtype=torch.float32)
+    values[0, 0] = NEG_INF
+    idx32 = torch.zeros(ROWS, SELECT_K, dtype=torch.int32)
+    saved = mod.can_run_kernel
+    try:
+        mod.can_run_kernel = lambda: False
+        assert can_run_dsa_causal_bound(scores, causal_len, POOL_SIZE) is False
+        assert can_run_dsa_causal_sentinel(values, idx32) is False
+        served_bound = dsa_causal_bound(scores, causal_len, POOL_SIZE)
+        served_sentinel = dsa_causal_sentinel(values, idx32)
+    finally:
+        mod.can_run_kernel = saved
+    control = (causal_bound_dispatch_counters(), causal_sentinel_dispatch_counters())
+    assert control == ((0, 1), (0, 1)), (
+        f"both fallback zeros must be able to MOVE; got {control}"
+    )
+    assert torch.equal(
+        served_bound.view(torch.int32),
+        dsa_causal_bound_torch_oracle(scores, causal_len, POOL_SIZE).view(torch.int32),
+    )
+    assert torch.equal(served_sentinel, dsa_causal_sentinel_torch_oracle(values, idx32))
+    assert int((served_sentinel == SENTINEL).sum()) == 1, served_sentinel.tolist()
+    _emit("C4_FALLBACK_CONTROL", bound=control[0], sentinel=control[1],
+          oracle_sentinels=int((served_sentinel == SENTINEL).sum()))
+
+    # and both gates are live again afterwards, so the control did not leak into the process
+    assert mod.can_run_kernel is can_run_kernel
+    assert can_run_dsa_causal_bound(scores, causal_len, POOL_SIZE) is True
+    assert can_run_dsa_causal_sentinel(values, idx32) is True
+    _emit("C4_GATES_RESTORED", bound=1, sentinel=1)

@@ -3803,6 +3803,43 @@ class Glm5NextDSAIndexer(nn.Module):
         _values, indices = dsa_topk_select(scores, self.select_k())
         return indices.to(torch.int32)
 
+    def select_bounded_pools(
+        self, scores: torch.Tensor, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        """``inc-glm53f-103``. Bound each row to its own position, select, sentinelise.
+
+        THE ONE DISPATCH SITE FOR THE CAUSAL BOUND, and both entry points route through
+        it for the reason :meth:`_require_serviceable` gives for itself: ``forward`` and
+        ``forward_ragged`` must agree about what a row may see, and two copies of that
+        rule are two things that can disagree. ``select_pools`` above is UNTOUCHED --
+        this composes it rather than widening it, so its single-cast-site claim still
+        holds.
+
+        ``causal_len`` IS ``seq_lens``, THE SAME COLUMN :meth:`expand_indices` ALREADY
+        RECEIVES. One producer, two consumers, nothing minted -- which is what makes the
+        bound and the expansion incapable of disagreeing about a row's length.
+
+        WHY THE SELECTED VALUE IS READ BACK FROM THE BOUNDED SCORES rather than taken
+        from ``dsa_topk_select``'s first return: ``select_pools`` discards that return at
+        one site and reading it here would need a second one. The two are the same number
+        by the selector's own contract -- ``values[r, g]`` is the value at
+        ``indices[r, g]`` -- and that contract is not assumed: it is READ, in
+        ``test_causal_bound.py``'s conjunct 2, which compares this gather against the
+        selector's returned values on the declared shape. The gather is index plumbing,
+        not an indexer value, so it is torch under this class's own P13 note.
+        """
+        from vllm_neuron.functional.dsa.causal_bound import (
+            dsa_causal_bound,
+            dsa_causal_sentinel,
+        )
+
+        bounded = dsa_causal_bound(
+            scores, seq_lens.to(torch.int32).reshape(-1, 1), self.index_kpool
+        )
+        pool_ids = self.select_pools(bounded)
+        selected = bounded.gather(1, pool_ids.to(torch.int64))
+        return dsa_causal_sentinel(selected, pool_ids)
+
     def expand_indices(
         self, pool_ids: torch.Tensor, seq_lens: torch.Tensor
     ) -> torch.Tensor:
@@ -4093,7 +4130,8 @@ class Glm5NextDSAIndexer(nn.Module):
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
         scores = self.score_pools(query, candidate_keys, weights)
-        pool_ids = self.select_pools(scores)
+        # inc-glm53f-103: the causal bound and the sentinel, one dispatch site.
+        pool_ids = self.select_bounded_pools(scores, seq_lens)
         return self.expand_indices(pool_ids, seq_lens)
 
     def forward_ragged(
@@ -4276,7 +4314,8 @@ class Glm5NextDSAIndexer(nn.Module):
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
         scores = self.score_pools(packed_query, candidate_keys, packed_weights)
-        pool_ids = self.select_pools(scores)
+        # inc-glm53f-103: the causal bound and the sentinel, one dispatch site.
+        pool_ids = self.select_bounded_pools(scores, seq_lens)
         return self.expand_indices(pool_ids, seq_lens)
 
 
