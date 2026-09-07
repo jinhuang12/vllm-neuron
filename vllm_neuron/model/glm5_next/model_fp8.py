@@ -2467,15 +2467,216 @@ class Glm5NextDenseMLP(nn.Module):
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
         self.intermediate_size = int(text_config.intermediate_size)
+        # The checkpoint's SwiGLU bound, resolved HERE and not at the call --
+        # the same construction-time read ``inc-glm53f-033`` repair round 2 made
+        # for :class:`Glm5NextSharedExperts` (``:1857``), on the same scalar,
+        # from the same config field.
+        #
+        # WHY THE DENSE MLP CARRIES IT TOO, read off the reference rather than
+        # off a comment about the reference. The reference has ONE MLP class,
+        # ``Glm5NextTextMLP`` (``modeling_glm5_next.py:86``), and it is
+        # CONSTRUCTED at exactly two sites: ``self.shared_experts`` at ``:196``
+        # and the dense ``else`` arm of ``self.mlp`` at ``:1271``. That one class
+        # stores the bound at ``:96`` and clamps with it at ``:102-103``, so the
+        # dense MLP clamps with the same value from the same field -- there is no
+        # separate dense reading to get wrong. Measured against the reference at
+        # the digest this campaign pins, 56 of 56 checks, in
+        # ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-054a-swiglu-clamp-r2.out``.
+        #
+        # AN UNCLAMPED DENSE MLP WOULD BE THE ``-033`` DEFECT AGAIN. That repair
+        # (``B22-M1-shared-expert-swiglu-clamp-omitted``) was for a path that
+        # computed a different function from the checkpoint's on every token
+        # leaving the bound's box, with no shape moving and nothing raising.
+        # ONE LINE IS ADDED AND NOTHING ABOVE IT CHANGES, so no landed reading of
+        # ``intermediate_size`` or of the three declared parameters can move.
+        self.swiglu_limit = float(text_config.swiglu_limit)
         _declare_parameters(
             self, "gate_proj_weight", "up_proj_weight", "down_proj_weight"
         )
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextDenseMLP.forward is a stub created by inc-glm53f-013; "
-            "the dense-MLP compute path lands with inc-glm53f-054's forward"
+    # ── the dense-MLP compute path -- D14 owner: ``inc-glm53f-054a`` ───────
+    #
+    # SCOPE. This section replaces ``forward`` below and adds the one
+    # ``__init__`` line above. It adds no method, touches no other class, and
+    # calls no landed method of another class -- the shared expert's
+    # ``shared_expert_mm`` is the same arithmetic on the same seam, and it is
+    # NOT called from here because it reads that class's prepared scale
+    # operands off ``self`` (``_prepared_scale_operand``, ``:2053``) and this
+    # class has no prep. Reaching into it would either move that landed method
+    # or bind this forward to another module's instance state.
+    #
+    # WHY NO PREBUILT SCALE OPERAND HERE. ``blockwise_fp8_mm``'s
+    # ``prebuilt_scale_t`` is optional and keyword-only, and omitting it makes
+    # the call behave exactly as it did before ``inc-glm53f-090``
+    # (``blockwise_fp8_mm.py:441``, ``:449-456``). ``-090``'s load-time prep is
+    # reached by ``_run_load_time_preps`` through
+    # ``hasattr(type(module), "prepare_scale_operands")`` (``:5999``), which is
+    # a per-class opt-in this class does not take. Adding that prep is a
+    # separate decision with its own acceptance, and NOT something to smuggle
+    # into a forward: it would change what the load path does.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        quant_config: Glm5NextQuantConfig,
+    ) -> torch.Tensor:
+        """One dense layer's MLP. THREE dispatches, and a clamped SwiGLU.
+
+        ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where ``L`` is
+        ``self.swiglu_limit``, the checkpoint's own bound resolved from the
+        config when this object was built. Each of the three projections is a
+        separate entry into
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`, which
+        is the dense blockwise route this campaign registered for the dense MLP
+        and the shared expert alike (DECISIONS §77).
+
+        Args:
+            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
+                whole number of ``TILE_SIZE`` rows -- the seam tiles ``M`` over
+                the PSUM partition axis and does not pad
+                (``blockwise_fp8_mm.py:239-245``), so padding is the caller's,
+                exactly as it is for the shared expert.
+            quant_config: the resolved per-model quantisation policy, and the
+                route selector. An ARGUMENT rather than a field, because that is
+                what all three landed methods of this family do (``:1539``,
+                ``:2078``, ``:2373``) and no module in this file holds a policy.
+
+        Returns:
+            ``[T, H]`` **fp32** -- the seam's own return dtype, not re-cast here.
+            The layer forward decides the residual dtype, which is the same
+            division :meth:`Glm5NextSharedExperts.shared_expert_mm` records.
+
+        Raises:
+            Glm5NextDenseMLPRouteError: when ``quant_config`` resolved no
+                block-quant method, when its block shape is not the one this
+                route consumes, when a scale grid the loader should have
+                attached is absent, or when two operand extents contradict each
+                other. Named rather than coerced, so a mis-wired call site fails
+                where it is wrong instead of computing a different function.
+        """
+        from torch.nn.functional import silu
+
+        from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm
+        from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
+
+        # ---- ROUTE SELECTION, the same two refusals the shared expert makes.
+        # There is no unquantised dense-MLP path at this site, and continuing
+        # anyway is what would reach the substrate's ``QuantizationType.NONE``
+        # default by omission.
+        if not quant_config.is_block_quantized:
+            raise Glm5NextDenseMLPRouteError(
+                "Glm5NextDenseMLP.forward is the block-quant dense route and "
+                f"quant_config resolved method={quant_config.method!r}. "
+                "Refusing to run: there is no unquantised dense-MLP path at "
+                "this site."
+            )
+        block_shape = quant_config.block_shape
+        if block_shape is None or tuple(block_shape) != (TILE_SIZE, TILE_SIZE):
+            raise Glm5NextDenseMLPRouteError(
+                f"quant_config declares weight_block_size={block_shape!r}; this "
+                f"route consumes scales retiled from ({TILE_SIZE}, {TILE_SIZE}) "
+                f"checkpoint blocks onto BLOCK_QUANT_SIZE granularity and has "
+                f"no path for any other checkpoint block shape."
+            )
+
+        # ---- THE OPERANDS. The grid name is DERIVED by the rule the landed
+        # prep loop uses (``_sibling_scale_grid_name``, ``:5542``) rather than
+        # spelled out here, so the two cannot drift. The grids are plain
+        # attributes and not declared parameters, for the reason recorded on
+        # ``_load_out_of_band_scales``, which is why this is a ``getattr``.
+        def scale_grid(leaf: str) -> torch.Tensor:
+            name = f"{leaf[: -len(_WEIGHT_LEAF_SUFFIX)]}_{FP8_SCALE_SUFFIX}"
+            grid = getattr(self, name, None)
+            if grid is None:
+                raise Glm5NextDenseMLPRouteError(
+                    f"{name} is not on this module. The block-scale grids are "
+                    f"plain attributes the weight loader attaches beside each "
+                    f"declared weight, and this route consumes the PUBLIC grid "
+                    f"blockwise_fp8_mm declares. Refusing rather than running "
+                    f"an unscaled matmul, which returns plausible numbers."
+                )
+            return grid
+
+        # ---- EXTENTS. Only the agreements the seam cannot see: it reads its
+        # own extents off each pair of operands separately, so nothing checks
+        # that gate and up are the same shape or that down transposes them.
+        if hidden_states.dim() != 2:
+            raise Glm5NextDenseMLPRouteError(
+                f"hidden_states must be [T, H], got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        hidden = int(hidden_states.shape[1])
+        gate_proj_weight = self.gate_proj_weight
+        up_proj_weight = self.up_proj_weight
+        down_proj_weight = self.down_proj_weight
+        if tuple(gate_proj_weight.shape) != tuple(up_proj_weight.shape):
+            raise Glm5NextDenseMLPRouteError(
+                f"gate_proj_weight {tuple(gate_proj_weight.shape)} and "
+                f"up_proj_weight {tuple(up_proj_weight.shape)} must have the "
+                f"same [H, I] extents; they are multiplied elementwise after "
+                f"the activation"
+            )
+        if gate_proj_weight.dim() != 2 or int(gate_proj_weight.shape[0]) != hidden:
+            raise Glm5NextDenseMLPRouteError(
+                f"gate_proj_weight must be [H={hidden}, I], got shape "
+                f"{tuple(gate_proj_weight.shape)}"
+            )
+        intermediate = int(gate_proj_weight.shape[1])
+        if tuple(down_proj_weight.shape) != (intermediate, hidden):
+            raise Glm5NextDenseMLPRouteError(
+                f"down_proj_weight must be [I={intermediate}, H={hidden}], got "
+                f"shape {tuple(down_proj_weight.shape)}"
+            )
+
+        # ---- THE TWO PARALLEL PROJECTIONS. Two entries, two dispatches.
+        gate = blockwise_fp8_mm(
+            hidden_states, gate_proj_weight, scale_grid("gate_proj_weight")
         )
+        up = blockwise_fp8_mm(
+            hidden_states, up_proj_weight, scale_grid("up_proj_weight")
+        )
+
+        # ---- THE CLAMP. The checkpoint's, not a guard this code invented:
+        # ``modeling_glm5_next.py:102`` clamps gate from ABOVE ONLY and ``:103``
+        # clamps up on BOTH SIDES, and only then are they multiplied. The
+        # asymmetry is the reference's and copying it as a two-sided clamp on
+        # both would be a second wrong function, not a tidier one -- the note
+        # at ``:2238`` records that reasoning for the shared expert.
+        gate = gate.clamp(min=None, max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+
+        # ---- THE SwiGLU WIRING. Call-site plumbing, not authored numerics:
+        # ``silu`` is torch's own, the product is elementwise, and both run in
+        # the seam's fp32 return dtype so no precision is thrown away between
+        # the projections. This is also why the dispatch count cannot be 2 --
+        # ``silu`` is non-linear, so ``down`` folds into neither predecessor.
+        activated = silu(gate) * up
+
+        # ---- THE DOWN PROJECTION re-enters the seam, whose declared input
+        # dtype is ``bfloat16`` (``blockwise_fp8_mm.py:446``), so the fp32
+        # intermediate is cast back to the caller's activation dtype here.
+        return blockwise_fp8_mm(
+            activated.to(hidden_states.dtype),
+            down_proj_weight,
+            scale_grid("down_proj_weight"),
+        )
+
+
+class Glm5NextDenseMLPRouteError(ValueError):
+    """A dense-MLP call this route refuses, named rather than coerced.
+
+    ``inc-glm53f-054a``. At module level, and not nested in the class that
+    raises it, because an exception a caller catches belongs in the module
+    namespace -- the shape ``inc-glm53f-027`` set for
+    :class:`Glm5NextBlockQuantRouteError` and ``-033`` for
+    :class:`Glm5NextSharedExpertRouteError`.
+
+    Raised in preference to continuing, because each failure it closes returns
+    plausible numbers rather than an error: an unquantised route reaches the
+    substrate's ``QuantizationType.NONE`` default by omission, a missing scale
+    grid runs an unscaled matmul, and contradicting extents multiply tensors
+    the reference never multiplies.
+    """
 
 
 def _build_mlp(text_config: Glm5NextTextConfig, layer_idx: int) -> nn.Module:
