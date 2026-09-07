@@ -67,6 +67,7 @@ Expected: exactly 7 collected, 7 passed, 0 failed, exit 0.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from pathlib import Path
 
@@ -157,23 +158,54 @@ def _impl():
 # THE REGISTERED ROUTE PREDICATE, D13 form R-3, registered at plan §4b.2.       #
 # --------------------------------------------------------------------------- #
 #: The seams this campaign owns that these seven forwards reach, keyed by the
-#: kernel entry point a reader would grep for. Both modules spell their
-#: accessors identically, so they are reached through module aliases and never
-#: imported by bare name -- two ``dispatch_counters`` in one namespace would
-#: silently shadow.
-_SEAMS = ("blockwise_fp8_mm", "blockwise_fp8_moe")
+#: kernel entry point a reader would grep for, and valued by the FULL DOTTED PATH
+#: of the module that owns the accessors. The path is spelled out because
+#: :func:`_seam_modules` resolves it with :func:`importlib.import_module`, and the
+#: docstring there is where the reason lives.
+_SEAM_MODULE_PATHS = {
+    "blockwise_fp8_mm": "vllm_neuron.functional.blockwise_fp8_mm",
+    "blockwise_fp8_moe": "vllm_neuron.functional.moe.moe_blockwise_fp8",
+}
+#: Derived rather than written a second time: a seam listed in one and missing
+#: from the other would make the route predicate iterate a name nothing resolves.
+_SEAMS = tuple(_SEAM_MODULE_PATHS)
 
 
 def _seam_modules() -> dict:
     """``{seam: module}`` for the seams this campaign owns.
 
-    Imported inside a call, like :func:`_impl`, so this file's import time does
+    Resolved inside a call, like :func:`_impl`, so this file's import time does
     not depend on the plugin being importable.
-    """
-    from vllm_neuron.functional import blockwise_fp8_mm as dense
-    from vllm_neuron.functional.moe import moe_blockwise_fp8 as moe
 
-    return {"blockwise_fp8_mm": dense, "blockwise_fp8_moe": moe}
+    WHY ``import_module`` AND NOT A FROM-IMPORT -- load-bearing, not stylistic
+    (``inc-glm53f-054a``, review finding M1). ``functional/__init__.py:8`` reads
+    ``from .blockwise_fp8_mm import blockwise_fp8_mm``: it re-exports the seam
+    FUNCTION under the name of the submodule that defines it. The import
+    machinery sets that submodule as an attribute of the package first, and the
+    statement then overwrites it. So ``from vllm_neuron.functional import
+    blockwise_fp8_mm`` binds a function, and every accessor read below raises
+    ``AttributeError`` on the first line of :func:`_reset_seam_counters` -- which
+    is the first line of every item's route predicate, before any forward runs.
+
+    ``import x.y as z`` is not a fix. That form performs the same attribute
+    lookup on the parent package. Only ``importlib.import_module``, or a
+    ``sys.modules`` read, hands back the module itself.
+
+    THE MOE SEAM IS RESOLVED THE SAME WAY THOUGH IT DOES NOT COLLIDE TODAY. Its
+    submodule is ``moe_blockwise_fp8`` and its export ``blockwise_fp8_moe``, two
+    different words, so that attribute survives. But that is an accident of
+    naming which a rename would take away in silence, and six of the parent
+    package's twenty-one submodules are already shadowed this way -- the form is
+    the package's convention rather than one slip to route around.
+
+    The previous form's ALIASING was not the mistake, and its reason still holds:
+    both seam modules spell their accessors identically, so a bare ``from ...
+    import dispatch_counters`` would resolve to whichever module was imported
+    last. Naming the module is what avoids that collision. An alias simply was
+    not enough to make the bound object a module.
+    """
+    return {name: importlib.import_module(path)
+            for name, path in _SEAM_MODULE_PATHS.items()}
 
 
 def _read_seam_counters() -> dict:
