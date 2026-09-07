@@ -3133,3 +3133,304 @@ def test_softmaxscale_control_the_retired_latent_rank_value_fails_that_item() ->
     assert SOFTMAX_SCALE != retired, (
         f"SOFTMAX_SCALE still reads the retired latent-rank value {retired!r}"
     )
+
+
+# =============================================================================================== #
+# THE SELECTING-REGIME CAUSAL BOUND -- inc-glm53f-103's dispatch half.
+#
+# WHAT THE BOUND IS, in one sentence. Above the bypass bound the selector runs, and a query row must
+# not select a key pool whose tokens finish AFTER the row's own position -- so every such pool's
+# score is pushed to `-inf` before selection and any selection that comes back holding `-inf` is
+# replaced by the `-1` sentinel.
+#
+# WHY THE READING BELONGS IN THIS FILE and not only in `test_causal_bound.py`. That file measures
+# the two kernels against their oracles on a synthetic shape. This item measures the DISPATCH SITE:
+# that the indexer's own forward composes the bound, the landed selector and the sentinel in the
+# right order, on operands the indexer built itself, with the counters that prove which route ran.
+# A kernel that is correct and never called would pass there and fail here.
+#
+# ONE ITEM, per plan section 6 rule 6. The block declares one item in this file and this is it.
+#
+# THE FIGURES THIS ITEM READS WERE CORRECTED BEFORE IT WAS WRITTEN. The plan's first spelling of
+# them at rev 256 named rows 4-7 as the rows reading one sentinel. That does not follow from the
+# block's own predicate, `causal_len = position + 1` -- which is upstream's formula and which this
+# file's own fixtures already use, `seq_lens = arange(1, n + 1)`. Under it the rows reading one are
+# 3, 4, 5 and 6. Ruled at DECISIONS section 332, plan rev 257: ":889 becomes 'rows 3-6 one each'".
+# NOTHING HERE IS TYPED FROM THAT RULING: the vector is computed from this item's own inputs by
+# :func:`_expected_sentinel_counts`, and the superseded reading is PLANTED as the control, so an
+# implementation that used `position` instead of `position + 1` fails this item rather than passing
+# it.
+
+#: The shortest length that SELECTS at this file's dials: one pool past the bypass boundary.
+#: DERIVED from the two dials, so a dial change moves the case instead of quietly turning it back
+#: into a bypass case that would read every counter below as a zero and pass for the wrong reason.
+SELECTING_SEQ_LEN = BYPASS_SEQ_LEN + POOL_SIZE
+
+#: The families the SELECTING decision governs, each owing exactly one dispatch on one prefill leg.
+#: `causal_fill` is deliberately NOT here: it is inc-glm53f-099's bypass seam and owes a ZERO on
+#: this case, which is a different claim and is read as such below.
+SELECTING_ONE_FAMILIES: tuple[str, ...] = (
+    "paged_gather", "score_gemm", "topk_select", "index_expand",
+)
+
+
+def _causal_bound_apis():
+    """``{"bound": (reset, read), "sentinel": (reset, read)}`` for inc-glm53f-103's two seams.
+
+    A SIBLING OF :func:`_discover_counter_api`, NOT A SECOND CONVENTION. Same suffix rule, same
+    `reset_` prefix rule; the only difference is the arity it admits. It exists because
+    `causal_bound.py` carries TWO pairs -- the block requires "accessors and reset per entry point"
+    so that "exactly 1 per call, per entry point" is readable at all, where one summed pair could not
+    tell a bound call and a sentinel call apart from two bound calls.
+
+    THE SINGLE-PAIR HELPER'S REFUSAL IS ASSERTED HERE rather than described, because that helper
+    documents itself as failing loudly "if a module ever grows a second pair" and this is the first
+    module that has. If it ever stopped refusing, this rule would be redundant and a reader should
+    find that out from a failure, not from reading two helpers side by side.
+    """
+    module = _seam_module("causal_bound")
+    names = [n for n in dir(module) if n.endswith("_dispatch_counters")]
+    resets = sorted(n for n in names if n.startswith("reset_"))
+    reads = sorted(n for n in names if not n.startswith("reset_"))
+    assert len(resets) == 2 and len(reads) == 2, (module.__name__, resets, reads)
+    with pytest.raises(AssertionError):
+        _discover_counter_api(module)
+    out = {}
+    for key, token in (("bound", "causal_bound"), ("sentinel", "causal_sentinel")):
+        reset = [n for n in resets if token in n]
+        read = [n for n in reads if token in n]
+        assert len(reset) == 1 and len(read) == 1, (key, reset, read)
+        out[key] = (getattr(module, reset[0]), getattr(module, read[0]))
+    return out
+
+
+def _expected_sentinel_counts(seq_lens: torch.Tensor, select_k: int, pool: int,
+                              width: int, *, offset: int = 0) -> list[int]:
+    """Sentinels per row, COMPUTED from the predicate, the dials and this case's own lengths.
+
+    ``offset`` exists ONLY so the superseded reading can be produced by the same function as the
+    ruled one: ``offset=0`` is ``causal_len = seq_len = position + 1``, the block's predicate and
+    upstream's; ``offset=-1`` is ``causal_len = position``, the reading DECISIONS section 332 struck.
+    Producing both from one function is the point -- if the control came from a second expression the
+    two could drift and the control would stop being a control.
+
+    A row completes ``causal_len // pool`` pools, capped by the candidate width, and the selector
+    takes ``select_k`` of them, so the selections that reached no complete pool number
+    ``max(0, select_k - min(complete, width))``.
+    """
+    return [
+        max(0, int(select_k) - min((int(s) + int(offset)) // int(pool), int(width)))
+        for s in seq_lens
+    ]
+
+
+def _selecting_operands(cfg, *, seed: int) -> dict:
+    """Operands for ``forward``'s prefill leg one pool ABOVE the bypass boundary.
+
+    ``seq_lens = arange(1, n + 1)`` is this file's own prefill convention, unchanged -- which is also
+    the evidence that ``causal_len`` is ``position + 1`` here and not ``position``.
+    """
+    gen = torch.Generator().manual_seed(int(seed))
+    return {
+        "hidden": torch.randn(
+            SELECTING_SEQ_LEN, int(cfg.hidden_size), generator=gen, dtype=torch.float32
+        ),
+        "q_latent": torch.randn(
+            SELECTING_SEQ_LEN, int(cfg.q_lora_rank), generator=gen, dtype=torch.float32
+        ),
+        "pool_cache": torch.zeros(
+            PAGES * PAGE_SIZE, int(cfg.index_head_dim), dtype=torch.bfloat16
+        ),
+        "seq_lens": torch.arange(1, SELECTING_SEQ_LEN + 1, dtype=torch.int32),
+        "slot_mapping": prefill_slot_mapping(SELECTING_SEQ_LEN, int(cfg.index_kpool)),
+    }
+
+
+def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``forward`` above the bypass bound: every row selects only pools it completes.
+
+    FOUR READINGS, and they fail for four different reasons.
+      1. THE REGIME SELECTS. Read first, because every reading below is about the selecting chain and
+         would pass vacuously on the bypass -- where the two new counters, like every other one,
+         read zero.
+      2. THE POOL IDS CARRY THE RIGHT SENTINELS, per row, against a vector computed from this case's
+         own lengths and dials. This is the block's declared figure and the reason the item exists.
+      3. THE SUPERSEDED PREDICATE FAILS. The struck reading (`causal_len = position`) is computed by
+         the same function and asserted to DISAGREE, naming the rows where it differs -- so a
+         regression to it fails here instead of passing.
+      4. THE ROUTE RAN IN NKI. Each of this block's two entry points reads exactly one dispatch and
+         no fallback, `-047`'s selector reads exactly one, and `-099`'s bypass seam reads ZERO --
+         which is what says the two regimes are exclusive rather than both firing.
+
+    Certifying component (D1.4): `Glm5NextDSAIndexer.select_bounded_pools`, composing
+    `dsa_causal_bound`, the landed `dsa_topk_select` and `dsa_causal_sentinel`.
+    """
+    if not gate_live():
+        pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
+
+    stack, cfg, _gen = build_layer_stack(layers=1)
+    indexer = stack[0].attention.indexer
+    pool = int(cfg.index_kpool)
+    select_k = int(indexer.select_k())
+
+    # 1. THE REGIME SELECTS, read from the closed form before anything else.
+    candidates = SELECTING_SEQ_LEN // pool
+    say("D4", "regime", "seq_len", SELECTING_SEQ_LEN, "candidates", candidates,
+        "select_k", select_k, "bypass_bound", BYPASS_SEQ_LEN)
+    assert candidates > select_k, (
+        f"{SELECTING_SEQ_LEN} token(s) yields {candidates} complete pool(s) against select_k="
+        f"{select_k}; this item must sit ABOVE the strict bound or the bypass serves it and every "
+        f"counter below reads zero for a reason that has nothing to do with the causal bound"
+    )
+    assert SELECTING_SEQ_LEN == 12, (
+        f"the block declares a 12-token case and this file's dials now derive "
+        f"{SELECTING_SEQ_LEN}; the figures below are computed, but the case identity is declared"
+    )
+    assert select_k == TOPK_POOLS == 2 and pool == POOL_SIZE == 4, (select_k, pool)
+
+    bound_api, sentinel_api = _causal_bound_apis()["bound"], _causal_bound_apis()["sentinel"]
+    fill_reset, fill_read = _causal_fill_api()
+    ops = _selecting_operands(cfg, seed=9_103_001)
+
+    # The pool ids are the block's subject and `forward` returns the EXPANDED token indices, so the
+    # sentinel seam's own output is recorded as it passes. The recorder DELEGATES to the real seam,
+    # so it moves no counter of its own -- which the (1, 0) reading below then confirms.
+    recorded: list[torch.Tensor] = []
+    causal_bound_mod = _seam_module("causal_bound")
+    real_sentinel = causal_bound_mod.dsa_causal_sentinel
+
+    def recording_sentinel(values, indices):
+        out = real_sentinel(values, indices)
+        recorded.append(out.clone())
+        return out
+
+    reset_all_counters()
+    bound_api[0]()
+    sentinel_api[0]()
+    fill_reset()
+    spy = SeamSpy()
+    spy.install(monkeypatch)
+    monkeypatch.setattr(causal_bound_mod, "dsa_causal_sentinel", recording_sentinel)
+    try:
+        got = indexer.forward(
+            ops["hidden"], ops["q_latent"], ops["pool_cache"], ops["seq_lens"],
+            max_seq_len=SELECTING_SEQ_LEN, page_size=PAGE_SIZE,
+            slot_mapping=ops["slot_mapping"],
+        )
+    finally:
+        monkeypatch.undo()
+    readings = read_all_counters()
+    bound_count = tuple(int(v) for v in bound_api[1]())
+    sentinel_count = tuple(int(v) for v in sentinel_api[1]())
+    fill_count = tuple(int(v) for v in fill_read())
+
+    assert len(recorded) == 1, (
+        f"the sentinel seam ran {len(recorded)} time(s) on one prefill leg; the dispatch site "
+        f"composes it exactly once"
+    )
+    pool_ids = recorded[0]
+    assert pool_ids.dtype == torch.int32, pool_ids.dtype
+    assert tuple(pool_ids.shape) == (SELECTING_SEQ_LEN, select_k), tuple(pool_ids.shape)
+
+    # 2. THE POOL IDS CARRY THE RIGHT SENTINELS, per row, computed and not typed.
+    want = _expected_sentinel_counts(ops["seq_lens"], select_k, pool, candidates)
+    per_row = (pool_ids == -1).sum(dim=1).to(torch.int64).tolist()
+    say("D4", "sentinels_per_row", per_row, "computed", want,
+        "lengths", ops["seq_lens"].tolist())
+    assert per_row == want, (
+        f"the bounded chain read {per_row} sentinel(s) per row where the predicate computes {want}"
+    )
+    ones = [r for r, n in enumerate(want) if n == 1]
+    twos = [r for r, n in enumerate(want) if n == 2]
+    zeros = [r for r, n in enumerate(want) if n == 0]
+    say("D4", "rows_with_two", twos, "rows_with_one", ones, "rows_with_zero", zeros)
+    assert twos[0] == 0 and per_row[0] == 2, (twos, per_row[0])
+    assert ones == [3, 4, 5, 6], (
+        f"the rows reading one sentinel computed to {ones}; DECISIONS section 332 ruled the plan's "
+        f"figure to 'rows 3-6 one each' on exactly this arithmetic"
+    )
+    assert per_row[-1] == 0 and (SELECTING_SEQ_LEN - 1) in zeros, (per_row[-1], zeros)
+
+    # EVERY NON-SENTINEL POOL ID IS ONE THE ROW COMPLETES, which is inc-glm53f-048's precondition
+    # restated per row -- the property the whole increment exists to restore, read directly.
+    complete = [min(int(s) // pool, candidates) for s in ops["seq_lens"]]
+    illegal = [
+        (r, int(p)) for r in range(SELECTING_SEQ_LEN) for p in pool_ids[r]
+        if int(p) != -1 and not (0 <= int(p) < complete[r])
+    ]
+    say("D4", "illegal_pool_ids", len(illegal), "detail", illegal, "complete_pools", complete)
+    assert illegal == [], f"a row selected a pool it does not complete: {illegal}"
+
+    # 3. THE SUPERSEDED PREDICATE FAILS, from the same function at offset -1.
+    struck = _expected_sentinel_counts(ops["seq_lens"], select_k, pool, candidates, offset=-1)
+    differing = [r for r in range(SELECTING_SEQ_LEN) if struck[r] != want[r]]
+    say("D4", "struck_predicate", struck, "differs_at_rows", differing)
+    assert struck != want, (
+        "the struck reading (causal_len = position) agrees with the ruled one on this case, so this "
+        "item cannot tell them apart and the control is not a control"
+    )
+    assert differing == [3, 7], (
+        f"the two predicates differ at rows {differing}; on a 12-token case at these dials they "
+        f"differ at exactly rows 3 and 7, which is what makes this control able to fire"
+    )
+    assert per_row != struck, (
+        f"the chain reproduced the STRUCK predicate {struck} rather than the ruled one {want}: the "
+        f"dispatch site is passing position where it owes position + 1"
+    )
+
+    # 4. THE ROUTE RAN IN NKI, form R-1, per entry point.
+    for family in FAMILIES:
+        say("D4", "counter", family, readings[family])
+    say("D4", "causal_bound", bound_count, "causal_sentinel", sentinel_count,
+        "causal_fill_099", fill_count)
+    assert bound_count == (1, 0), (
+        f"the bound seam read {bound_count} and owes exactly one NKI dispatch with no fallback; a "
+        f"torch masked_fill would read (0, 1) here and P13 forbids it"
+    )
+    assert sentinel_count == (1, 0), (
+        f"the sentinel seam read {sentinel_count} and owes exactly one NKI dispatch with no fallback"
+    )
+    assert fill_count == (0, 0), (
+        f"inc-glm53f-099's bypass seam read {fill_count} on a SELECTING case; the two regimes are "
+        f"exclusive and a non-zero here means both fired"
+    )
+    for family in SELECTING_ONE_FAMILIES:
+        assert readings[family] == (1, 0), (
+            f"{family} read {readings[family]} where the selecting chain owes exactly one dispatch "
+            f"and no fallback on one prefill leg"
+        )
+    assert all(v[1] == 0 for v in readings.values()), (
+        f"a torch fallback ran on the selecting path: {readings}"
+    )
+    control = readings["kpool_hadamard"]
+    assert control[0] > 0, (
+        f"kpool_hadamard read {control} on a call that must rotate the indexer query, so the counter "
+        f"instrument is not reading this call and the zeros above measure nothing"
+    )
+    spy.report("D4")
+    _check_two_instruments_agree("D4", spy, readings)
+    identity = causal_bound_mod.causal_bound_kernel_identity()
+    sentinel_identity = causal_bound_mod.causal_sentinel_kernel_identity()
+    say("D4", "kernel", identity, "sentinel_kernel", sentinel_identity)
+    assert identity is not None and identity[1].endswith("_causal_bound_nki"), identity
+    assert sentinel_identity is not None and sentinel_identity[1].endswith(
+        "_causal_sentinel_nki"
+    ), sentinel_identity
+
+    # AND THE EXPANSION STILL EMITS THE SHAPE EVERY CONSUMER READS, unchanged by the bound.
+    width = _bypass_width(indexer, pool)
+    say("D4", "shape", tuple(got.shape), "want", (SELECTING_SEQ_LEN, width),
+        "dtype", str(got.dtype))
+    assert got.dtype == torch.int32, got.dtype
+    assert tuple(got.shape) == (SELECTING_SEQ_LEN, width), tuple(got.shape)
+    live = got >= 0
+    limit = ops["seq_lens"].to(torch.int64).reshape(SELECTING_SEQ_LEN, 1).expand_as(got)
+    out_of_row = int((live & (got.to(torch.int64) >= limit)).sum())
+    say("D4", "live_tokens", int(live.sum()), "out_of_row", out_of_row,
+        "max_token", int(got.max()))
+    assert out_of_row == 0, (
+        f"{out_of_row} live token index(es) point past their own row's causal length, which is the "
+        f"defect the bound removes seen at the token level"
+    )
