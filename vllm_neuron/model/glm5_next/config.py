@@ -383,6 +383,18 @@ class Glm5NextVisionConfig:
     hidden_size: int = 1024
     num_heads: int = 16
     intermediate_size: int = 4096
+
+    # -- The tower's input channel count ------------------------------------
+    # The patch embedding convolves over this many channels
+    # (``Glm5NextVisionPatchEmbed.__init__`` reads ``config.in_channels`` at
+    # ``modeling_glm5_next.py:1717``), and the field sets the width of every
+    # patch row: ``patch_dim = in_channels * temporal_patch_size *
+    # patch_size ** 2``. It is declared here rather than assumed because the
+    # tower computes that width and refuses a row that disagrees. Added by
+    # ``inc-glm53f-060``, the first block that needs it, under the block's own
+    # revision-231 rider.
+    in_channels: int = 3
+
     image_size: int = 448
     patch_size: int = 14
     temporal_patch_size: int = 2
