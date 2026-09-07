@@ -1890,6 +1890,213 @@ class Glm5NextRoutedExperts(nn.Module):
         )
         return output[:tokens]
 
+    # ── load-time operand prep -- hand-off item (i) of ``inc-glm53f-054a`` ──
+    #
+    # WHAT THIS SECTION IS FOR. ``block_quant_expert_mm`` above takes the fused
+    # ``[E_local, H, 2, I_TP]`` gate/up bank, the retiled ``[E_local, I_TP, H]``
+    # down bank, and the two FLAT consumer scale emissions. The checkpoint
+    # stores none of those: ``__init__`` declares three per-projection weights
+    # and no scale parameter at all. This section builds all four, ONCE, at load
+    # time, and holds them on the module.
+    #
+    # IT ENROLLS IN A LANDED LOOP AND EDITS NO LINE OF IT.
+    # ``Glm5NextForConditionalGeneration._run_load_time_preps`` is the single
+    # production caller of either prep and enrols a module by
+    # ``hasattr(type(module), "prepare_scale_operands")``. It derives the operand
+    # names from this module's OWN declaration tuple through
+    # ``_scale_prep_leaves``, whose docstring names this bank as the reason it
+    # exists: the bank declares ``router_weight`` and no
+    # ``router_weight_scale_inv`` exists anywhere in this tree, so a
+    # declaration-only derivation yielded four leaves and eight operands while
+    # the presence-reading one yields the three leaves that have grids. The loop
+    # therefore hands exactly the six operands below, by keyword.
+    #
+    # WHY ONE METHOD BUILDS THE WEIGHTS AS WELL, though it is named for scales.
+    # The ``-024`` producer emits ``consumer_scales`` and ``retiled_weights``
+    # from ONE pass over a bank. Splitting them across the loop's two hooks
+    # would retile every bank twice and leave two answers to one question, and
+    # the other hook needs ``projection_widths()``, which is the attention
+    # section's 2-D contract rather than an expert bank's. The hook contract is
+    # unchanged: same name, six keyword operands, an int return.
+
+    #: Where :meth:`prepare_scale_operands` leaves its four operands. A class
+    #: attribute for the reason the shared expert's own is one: the name is part
+    #: of the contract between the builder and the reader, and neither should
+    #: spell it twice.
+    PREPARED_KERNEL_OPERANDS_ATTR = "_prepared_kernel_operands"
+
+    #: Where the producer's three health counts are left, for the acceptance to
+    #: read. Recorded rather than refused on -- see the method's Raises note.
+    RETILE_HEALTH_ATTR = "_retile_health"
+
+    def prepare_scale_operands(
+        self,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        gate_proj_scale: torch.Tensor,
+        up_proj_scale: torch.Tensor,
+        down_proj_scale: torch.Tensor,
+    ) -> int:
+        """Build this rank's four kernel operands ONCE. Returns how many.
+
+        Hand-off item (i) of ``inc-glm53f-054a``. The argument list mirrors the
+        shared expert's own -- same names, same order -- because both are called
+        by the same loop from the same derivation, and a divergent order at one
+        of them is a mis-wiring no shape check would see.
+
+        Args:
+            gate_proj_weight: ``[E_local, H, I_TP]`` fp8-e4m3, this rank's slice.
+            up_proj_weight: ``[E_local, H, I_TP]`` fp8-e4m3.
+            down_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3.
+            gate_proj_scale: ``[E_local, H//128, I_TP//128]`` fp32, the
+                checkpoint's own block grid.
+            up_proj_scale: the same, for ``up_proj_weight``.
+            down_proj_scale: ``[E_local, I_TP//128, H//128]`` fp32.
+
+        Returns:
+            How many operands were built -- ``4`` on every successful call:
+            the fused gate/up bank, its merged consumer scales, the retiled down
+            bank and its consumer scales.
+
+        Raises:
+            Glm5NextBlockQuantRouteError: on a missing operand, a weight that is
+                not 3-D, an expert count that disagrees with this rank's
+                partition, or a fusion merge that left a slot unwritten. Those
+                four are structural. The producer's own health counts --
+                ``emitted_unsupplied``, ``input_scales_dropped`` and
+                ``inexact_rescales`` -- are RECORDED on this module instead of
+                refused on, and the acceptance reads them: they are numeric
+                properties of a particular checkpoint's scales, so a refusal
+                here would turn a reportable measurement into a load failure on
+                a case no test has run.
+
+        THE MERGE IS CHECKED RATHER THAN ASSUMED. ``block_quant_expert_mm``
+        requires both fusion halves present and says the producer writes one per
+        call, leaving the other ``NaN``. The producer fills its emission with
+        ``NaN`` and writes only the slots of its own half, whose flat index is
+        ``(h_block * 2 + gate_or_up) * i_256 + i_block``, so the halves are
+        disjoint by construction. This takes the gate emission, fills its
+        ``NaN`` slots from the up emission, and refuses if one survives -- which
+        is what makes that requirement something a load can fail on instead of a
+        sentence in a docstring.
+        """
+        from vllm_neuron.functional.moe.blockwise_fp8_retile import (
+            DOWN,
+            GATE_UP,
+            retile_block_scales,
+        )
+
+        #: The producer's fusion selector is an ``int``: its own flat index is
+        #: ``(h_block * 2 + gate_or_up) * i_256 + i_block``, so 0 is the gate
+        #: half and 1 the up half.
+        gate_half, up_half = 0, 1
+
+        supplied = {
+            "gate_proj_weight": gate_proj_weight,
+            "up_proj_weight": up_proj_weight,
+            "down_proj_weight": down_proj_weight,
+            "gate_proj_scale": gate_proj_scale,
+            "up_proj_scale": up_proj_scale,
+            "down_proj_scale": down_proj_scale,
+        }
+        missing = sorted(name for name, value in supplied.items() if value is None)
+        if missing:
+            raise Glm5NextBlockQuantRouteError(
+                f"prepare_scale_operands needs all six operands and {missing} "
+                f"are absent; load the checkpoint before preparing the kernel "
+                f"operands"
+            )
+        for name in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            weight = supplied[name]
+            if weight.dim() != 3:
+                raise Glm5NextBlockQuantRouteError(
+                    f"{name} must be [E_local, ., .] to give the retile its "
+                    f"bank extents, got shape {tuple(weight.shape)}"
+                )
+            experts = int(weight.shape[0])
+            if experts != int(self.num_local_experts):
+                raise Glm5NextBlockQuantRouteError(
+                    f"{name} carries {experts} experts but this rank owns "
+                    f"{self.num_local_experts}; the bank and the partition must "
+                    f"agree. A global bank reaching this rank is a load-time "
+                    f"error, not something to slice here, because slicing it "
+                    f"quietly would put a different rank's experts behind this "
+                    f"rank's router columns"
+                )
+
+        gate = retile_block_scales(
+            gate_proj_weight, gate_proj_scale, GATE_UP, gate_half
+        )
+        up = retile_block_scales(up_proj_weight, up_proj_scale, GATE_UP, up_half)
+        down = retile_block_scales(down_proj_weight, down_proj_scale, DOWN)
+
+        # ---- THE FUSION MERGE, and its completeness check.
+        gate_up_scales = torch.where(
+            torch.isnan(gate.consumer_scales), up.consumer_scales, gate.consumer_scales
+        )
+        unwritten = int(torch.isnan(gate_up_scales).sum())
+        if unwritten:
+            raise Glm5NextBlockQuantRouteError(
+                f"the fused gate/up consumer scales have {unwritten} slots that "
+                f"neither half wrote. The producer writes one half per call and "
+                f"leaves the other NaN, so every slot must come from exactly one "
+                f"of the two calls above; a survivor means the two emissions do "
+                f"not tile the same space"
+            )
+
+        # ---- THE FUSED WEIGHT. ``[E, H, I]`` twice, stacked on a new axis 2,
+        # which is the ``[E, H, 2, I_TP]`` the kernel's extent check demands.
+        gate_up_weight = torch.stack(
+            (gate.retiled_weights, up.retiled_weights), dim=2
+        )
+
+        prepared = {
+            "gate_up_proj_weight": gate_up_weight,
+            "gate_up_consumer_scales": gate_up_scales,
+            "down_proj_weight": down.retiled_weights,
+            "down_consumer_scales": down.consumer_scales,
+        }
+        setattr(self, self.PREPARED_KERNEL_OPERANDS_ATTR, prepared)
+        setattr(
+            self,
+            self.RETILE_HEALTH_ATTR,
+            {
+                "gate": (
+                    gate.emitted_unsupplied,
+                    gate.input_scales_dropped,
+                    gate.inexact_rescales,
+                ),
+                "up": (
+                    up.emitted_unsupplied,
+                    up.input_scales_dropped,
+                    up.inexact_rescales,
+                ),
+                "down": (
+                    down.emitted_unsupplied,
+                    down.input_scales_dropped,
+                    down.inexact_rescales,
+                ),
+            },
+        )
+        return len(prepared)
+
+    def _prepared_kernel_operand(self, name: str) -> torch.Tensor:
+        """One prebuilt kernel operand, or a refusal naming what was not done.
+
+        The shared expert's form, for its reason: refusing is what makes "built
+        once at load time, never per forward step" checkable. Building on demand
+        instead would put a whole-bank retile inside the per-token path and
+        nothing would report it.
+        """
+        prepared = getattr(self, self.PREPARED_KERNEL_OPERANDS_ATTR, None)
+        if not prepared:
+            raise Glm5NextBlockQuantRouteError(
+                "prepare_scale_operands() has not run; this bank's kernel "
+                "operands are retiled once at load time, never per forward step"
+            )
+        return prepared[name]
+
     def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
         raise NotImplementedError(
             "Glm5NextRoutedExperts.forward is a stub created by "
