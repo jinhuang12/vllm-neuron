@@ -335,6 +335,20 @@ class _DeclaredShard:
     #: that way and ``functional/moe/moe_blockwise.py:55-56`` divides the same two
     #: numbers. Ruled at design entry ``design-20260905-ap``, remedy part 3(a).
     shards_within_expert_parallel_group: bool = False
+    #: This family's per-rank shard must ALREADY be a whole consumer block, and the
+    #: load REFUSES BY NAME when it is not. ``inc-glm53f-106``, and it is the other
+    #: half of dropping ``pad_to_consumer_block`` from the routed bank: the two flags
+    #: are the two answers to one question -- an inadmissible width is either PADDED
+    #: up to admissibility or REFUSED -- and the bank's answer is refuse, because its
+    #: sharded axis carries per-expert structure that a pad silently inflates (ruled
+    #: at DECISIONS 162: "a pad that is right on an unstructured axis is wrong on an
+    #: axis that carries structure"). Declaring the two separately, rather than
+    #: inferring refuse-when-not-padded, is DECISIONS 296-298: the inference is a
+    #: proxy for "is consumed by the block-FP8 kernel" that holds only while the bank
+    #: is the sole family of its kind, and it would wrongly refuse a future
+    #: unquantised deferred family. Mutually exclusive with the pad, enforced in
+    #: ``DeferredShardGeometry.__post_init__`` rather than trusted here.
+    require_consumer_block: bool = False
 
 
 def _kda_head_width(module: nn.Module, world_size: int) -> int:
@@ -544,27 +558,36 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
     # loader actually slices -- it selects each expert's columns BEFORE stacking
     # (``weight_loaders_fp8.py``'s ``_stack_local_expert_weights``), so a dim
     # counted in the stacked shape would slice the wrong axis of every expert.
+    # THE THREE ROWS BELOW SPELL THEIR FLAGS AS KEYWORDS, and that is deliberate
+    # rather than a style preference (``inc-glm53f-106``). They used to pass
+    # ``True, True`` positionally for the pad and the EP divisor; dropping the pad
+    # would have shifted the SECOND ``True`` into the pad's place and defaulted
+    # ``shards_within_expert_parallel_group`` to False, which divides the bank by the
+    # world instead of by its group and would have been a silent behaviour change in a
+    # repair whose whole subject is a silent behaviour. Naming them also makes them
+    # findable: a keyword grep over this table could not see the old positional value,
+    # which is how the defect review B90-101 found survived thirteen rounds.
     "Glm5NextRoutedExperts": {
         "gate_proj_weight": _DeclaredShard(
             0,
             None,
             "column-parallel on the intermediate width, inside the EP group",
-            True,
-            True,
+            shards_within_expert_parallel_group=True,
+            require_consumer_block=True,
         ),
         "up_proj_weight": _DeclaredShard(
             0,
             None,
             "column-parallel on the intermediate width, inside the EP group",
-            True,
-            True,
+            shards_within_expert_parallel_group=True,
+            require_consumer_block=True,
         ),
         "down_proj_weight": _DeclaredShard(
             1,
             None,
             "row-parallel -- the intermediate width is its input, inside the EP group",
-            True,
-            True,
+            shards_within_expert_parallel_group=True,
+            require_consumer_block=True,
         ),
     },
 }
@@ -596,8 +619,13 @@ def _shard_geometry_for(
     of which that is true. Its experts are divided across the expert-parallel
     groups already, so what one group divides is the intermediate width, by
     ``tp_per_ep = world_size // ep_degree``. At ``tp_per_ep == 1`` the bank is
-    whole inside its group and ``None`` comes back, which is also this campaign's
-    production route at expert-parallel degree 1.
+    whole inside its group and ``None`` comes back -- and that happens when the world
+    size EQUALS the degree, one rank per group, NOT at degree 1. Corrected by
+    ``inc-glm53f-106`` (review B90-101, finding B1): at degree 1 with a world above 1,
+    ``tp_per_ep`` is the whole world, so a deferred geometry comes back and the bank's
+    intermediate width is sharded across every rank. The old sentence named degree 1
+    as the case that returns ``None``, which is the opposite of what the branch below
+    computes.
 
     A SCALE GRID ANSWERS WITH ITS WEIGHT'S GEOMETRY, and that is
     ``inc-glm53f-105``'s addition. A blockwise grid holds one value per weight
@@ -643,6 +671,10 @@ def _shard_geometry_for(
             # path is the right one.
             return None
     if declared.width is None:
+        # Both flags read the SAME number from the consumer and mean opposite things
+        # about an inadmissible width: pad it up, or refuse it. ``inc-glm53f-106`` adds
+        # the second. The number is imported either way, never typed here, for the
+        # reason ``consumer_block_quant_size``'s own docstring gives.
         return DeferredShardGeometry(
             shard_dim=declared.shard_dim,
             num_shards=num_shards,
@@ -650,6 +682,9 @@ def _shard_geometry_for(
                 consumer_block_quant_size() if declared.pad_to_consumer_block else None
             ),
             expert_parallel_degree=ep_degree,
+            require_multiple_of=(
+                consumer_block_quant_size() if declared.require_consumer_block else None
+            ),
         )
     if declared.shards_within_expert_parallel_group:
         # No family declares both today, and this refusal is what keeps it that
