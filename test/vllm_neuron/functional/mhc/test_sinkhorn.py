@@ -105,8 +105,10 @@ cases use.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import os
+import pathlib
 import sys
 
 import pytest
@@ -1384,3 +1386,157 @@ def test_the_batched_form_has_no_declared_token_ceiling() -> None:
         )
         assert isinstance(verdict, bool)
         assert sum(height for _start, height in tiles) == tokens
+
+
+# --------------------------------------------------------------------------- #
+# The trace-refusal guard. A simulator pass is not a compile.                  #
+# --------------------------------------------------------------------------- #
+_TRACE_HOSTILE_COMPREHENSIONS = (
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
+def _module_functions(source: str) -> dict[str, ast.FunctionDef]:
+    """Every top-level-visible function in ``source``, by name."""
+    return {
+        node.name: node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+    }
+
+
+def _traced_callees(functions: dict[str, ast.FunctionDef], entry: str) -> set[str]:
+    """The functions NKI would trace into from ``entry``, transitively.
+
+    A kernel body is not the whole traced program: the tracer follows every plain
+    Python call it can resolve, so the closure is what has to be clean, not just
+    the decorated function.
+    """
+    seen: set[str] = set()
+    frontier = {entry}
+    while frontier:
+        name = frontier.pop()
+        if name in seen or name not in functions:
+            continue
+        seen.add(name)
+        for node in ast.walk(functions[name]):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in functions
+            ):
+                frontier.add(node.func.id)
+    seen.discard(entry)
+    return seen
+
+
+def _trace_hostile_sites(
+    functions: dict[str, ast.FunctionDef], names: set[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """``(raises, comprehensions, min_calls)`` as ``function:line`` strings."""
+    raises: list[str] = []
+    comprehensions: list[str] = []
+    min_calls: list[str] = []
+    for name in sorted(names):
+        for node in ast.walk(functions[name]):
+            if isinstance(node, ast.Raise):
+                raises.append(f"{name}:{node.lineno}")
+            elif isinstance(node, _TRACE_HOSTILE_COMPREHENSIONS):
+                comprehensions.append(f"{name}:{node.lineno}")
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "min"
+            ):
+                min_calls.append(f"{name}:{node.lineno}")
+    return raises, comprehensions, min_calls
+
+
+_TRACE_FIXTURE = '''
+def helper_with_a_raise(x):
+    if x < 1:
+        raise ValueError("no")
+    return x
+
+
+def helper_with_a_comprehension(n):
+    return [(i, min(i, n)) for i in range(n)]
+
+
+def fake_kernel(a):
+    return helper_with_a_raise(a) + len(helper_with_a_comprehension(a))
+'''
+
+
+def test_no_kernel_traces_into_a_raise_or_a_comprehension() -> None:
+    """Neither kernel's traced call graph carries a construct NKI refuses.
+
+    WHY THIS IS A TEST AND NOT A CONVENTION. Both kernels compiled cleanly under
+    the simulator and then failed to specialize on hardware, on all eleven
+    declared Tier C shapes, with the compiler saying "NKI does not support 'raise'
+    statements" plus one "unsupported expression" -- because the tracer follows a
+    kernel's plain Python callees, and this module's tile-geometry helpers raised.
+    The simulator cannot see that: it executes the helper, and a branch not taken
+    is nothing. So the property is read here, off the module's own source, at a
+    cost of no device and no compile.
+
+    THREE CONSTRUCTS ARE REFUSED, and the third is a live question rather than
+    caution. The ``raise`` count is settled -- the compiler counted two on the
+    square path and three on the batched one, exactly the statements the helpers
+    held. The single "unsupported expression" was one on BOTH paths, which rules
+    out the ``f``-strings (two and three) and leaves the two constructs that
+    appeared exactly once each in the shared helper: a list comprehension and a
+    ``min`` call. Which one it was is not settled, so both are refused, and this
+    docstring is the record of that open question rather than a claim it is
+    closed.
+
+    The reading is armed on a planted fixture whose answer is known by
+    construction, because a walker that found nothing would pass this module
+    whatever it contained.
+    """
+    module = importlib.import_module(_MODULE)
+    source = pathlib.Path(module.__file__).read_text()
+    functions = _module_functions(source)
+
+    for entry in ("sinkhorn_kernel", "sinkhorn_blocks_kernel"):
+        assert entry in functions, entry
+        callees = _traced_callees(functions, entry)
+        raises, comprehensions, min_calls = _trace_hostile_sites(functions, callees)
+        print(
+            f"[trace-guard] {entry} traced_callees={sorted(callees)} "
+            f"raise={raises} comprehension={comprehensions} min={min_calls}"
+        )
+        assert callees, (
+            f"{entry} resolved no traced callees, so this reading covers nothing"
+        )
+        assert raises == [], (
+            f"{entry} traces into a raise at {raises}; NKI refuses a traced "
+            "raise, and the seam is where an inadmissible shape is refused"
+        )
+        assert comprehensions == [], (
+            f"{entry} traces into a comprehension at {comprehensions}, one of the "
+            "two candidates for the compiler's unsupported expression"
+        )
+        assert min_calls == [], (
+            f"{entry} traces into a min call at {min_calls}, the other candidate "
+            "for the compiler's unsupported expression"
+        )
+
+    # THE WALKER MUST BE ABLE TO FIND ALL THREE, or the zeros above say nothing.
+    fixture = _module_functions(_TRACE_FIXTURE)
+    fixture_callees = _traced_callees(fixture, "fake_kernel")
+    f_raises, f_comprehensions, f_mins = _trace_hostile_sites(fixture, fixture_callees)
+    print(
+        f"[trace-guard-control] traced_callees={sorted(fixture_callees)} "
+        f"raise={f_raises} comprehension={f_comprehensions} min={f_mins}"
+    )
+    assert fixture_callees == {
+        "helper_with_a_raise",
+        "helper_with_a_comprehension",
+    }, fixture_callees
+    assert len(f_raises) == 1, f_raises
+    assert len(f_comprehensions) == 1, f_comprehensions
+    assert len(f_mins) == 1, f_mins

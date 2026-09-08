@@ -270,6 +270,26 @@ def row_target() -> float:
     return 1.0
 
 
+def _column_target_unchecked(rows: int, cols: int) -> float:
+    """:func:`column_target`'s arithmetic with no refusal in it, for the kernels.
+
+    WHY THIS EXISTS, and it is not a style choice. NKI traces INTO every plain
+    Python helper a kernel body calls, and its tracer rejects ``raise``: the
+    compiler's own words are "NKI does not support 'raise' statements; use
+    'if/else' control flow within kernels, or 'assert' for fatal errors". A
+    kernel that called :func:`column_target` therefore failed to specialize --
+    measured, not predicted, on all eleven declared Tier C shapes under lease
+    grant 083 (``increments/run028b-r2-trn2-1-at-8de8b588-20260908T161823Z.out``,
+    where the compiler counted exactly the raises this module's traced helpers
+    hold). So the arithmetic lives here, the refusal stays in the public wrapper,
+    and the two cannot drift because the wrapper computes nothing of its own.
+
+    A caller outside a kernel body wants :func:`column_target`. This function
+    trusts its arguments completely.
+    """
+    return rows / cols
+
+
 def column_target(rows: int, cols: int) -> float:
     """Every column's target sum: ``rows / cols``.
 
@@ -278,15 +298,30 @@ def column_target(rows: int, cols: int) -> float:
     columns puts ``rows / cols`` in each -- and the two readings agree on the
     total, which is what makes them a consistent pair of targets rather than two
     independent wishes. For the declared ``[64, 4]`` case this is ``16.0``.
+
+    This is the checked path, for the seam and for tests. Kernel bodies call
+    :func:`_column_target_unchecked` instead, for the tracer reason written
+    there; the number both return is the same number.
     """
     if cols <= 0:
         raise SinkhornError(f"cols={cols} must be positive")
-    return rows / cols
+    return _column_target_unchecked(rows, cols)
 
 
 # --------------------------------------------------------------------------- #
 # The row tiling, written once and read by the kernel, the refusals and a test. #
 # --------------------------------------------------------------------------- #
+def _row_tile_extent_unchecked(block: int) -> int:
+    """:func:`row_tile_extent`'s arithmetic with no refusal in it, for the kernels.
+
+    Same reason as :func:`_column_target_unchecked`: both of
+    :func:`row_tile_extent`'s refusals are ``raise`` statements, and a kernel that
+    traced them did not compile. The rounding is written once, here, and the
+    checked wrapper returns exactly what this returns.
+    """
+    return (PARTITION_MAX // block) * block
+
+
 def row_tile_extent(block: int = MHC_STREAMS) -> int:
     """How many rows one tile carries: ``PARTITION_MAX`` rounded down to ``block``.
 
@@ -312,7 +347,37 @@ def row_tile_extent(block: int = MHC_STREAMS) -> int:
             f"block must fit inside a single row tile, and no tile can be taller "
             f"than the partition axis"
         )
-    return (PARTITION_MAX // block) * block
+    return _row_tile_extent_unchecked(block)
+
+
+def _row_tiles_unchecked(rows: int, block: int) -> list[tuple[int, int]]:
+    """:func:`row_tiles`'s tile list with no refusal in it, for the kernels.
+
+    TWO THINGS ARE DELIBERATELY ABSENT and both were named by the compiler. The
+    ``raise`` statements are gone because they reach here through
+    :func:`row_tile_extent`, and the list comprehension is gone because the same
+    refusal carried one "unsupported expression" on every shape -- one, on both
+    kernels, where the ``f``-strings would have given two on the square path and
+    three on the batched one. The loop below therefore uses only forms the tracer
+    accepted in the kernel bodies themselves on that same run -- ``for`` over
+    ``range``, ``append``, a tuple, and the ``if``/``else`` the compiler's own
+    error text recommends -- and it uses no ``min``, which appeared exactly once
+    in this module and only inside that comprehension. Which of the two was the
+    unsupported expression is not settled here; neither survives, so neither can
+    refuse the trace again.
+
+    The arithmetic is unchanged: ``min(height, rows - start)`` and the branch
+    below agree for every input.
+    """
+    height = _row_tile_extent_unchecked(block)
+    tiles = []
+    for start in range(0, rows, height):
+        remaining = rows - start
+        if remaining < height:
+            tiles.append((start, remaining))
+        else:
+            tiles.append((start, height))
+    return tiles
 
 
 def row_tiles(rows: int, block: int = MHC_STREAMS) -> list[tuple[int, int]]:
@@ -323,9 +388,15 @@ def row_tiles(rows: int, block: int = MHC_STREAMS) -> list[tuple[int, int]]:
     tile is short whenever ``rows`` is not a multiple of the tile height -- which
     is admitted, because ``M`` need not be a whole number of blocks either
     (``M = 129`` is one of the declared acceptance cases).
+
+    This is the checked path. The call to :func:`row_tile_extent` below is here
+    for its two refusals: a caller on the seam or in a test that asks for an
+    impossible ``block`` is told so, exactly as before. Kernel bodies call
+    :func:`_row_tiles_unchecked`, which computes the same list from the same
+    core.
     """
-    height = row_tile_extent(block)
-    return [(start, min(height, rows - start)) for start in range(0, rows, height)]
+    row_tile_extent(block)
+    return _row_tiles_unchecked(rows, block)
 
 
 # --------------------------------------------------------------------------- #
@@ -364,7 +435,11 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
     m_extent, n_extent = affinity.shape
     col_goal = m_extent / n_extent
     row_goal = 1.0
-    tiles = row_tiles(int(m_extent), block)
+    # The UNCHECKED core, because the tracer follows this call. The checked
+    # `row_tiles` raises, and NKI refuses a traced `raise`: the seam's
+    # `_require_admissible` is where an inadmissible shape is refused, before any
+    # dispatch reaches here.
+    tiles = _row_tiles_unchecked(int(m_extent), block)
 
     out = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.shared_hbm)
 
@@ -498,7 +573,9 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     """
     t_extent, rows_per_block, cols_per_block = affinity_blocks.shape
     row_goal = row_target()
-    col_goal = column_target(int(rows_per_block), int(cols_per_block))
+    # Both of these take the UNCHECKED cores, for the tracer reason written on
+    # them. `_require_blocks_admissible` on the seam is what refuses a bad shape.
+    col_goal = _column_target_unchecked(int(rows_per_block), int(cols_per_block))
 
     out = nl.ndarray(
         (t_extent, rows_per_block, cols_per_block),
@@ -510,7 +587,7 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     # in the two FREE axes, a token is ONE partition row, so no alignment is
     # needed and the tile is the whole partition extent. The arithmetic is
     # `row_tiles`'s so that both kernels tile the partition axis one way.
-    tiles = row_tiles(int(t_extent), 1)
+    tiles = _row_tiles_unchecked(int(t_extent), 1)
 
     # Per token tile: one working tile per block ROW, plus that row's own
     # denominator and scale, plus one column accumulator for the whole tile. All
