@@ -1321,3 +1321,441 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
             f"{missing.value}"
         )
     print(f"TINYFWD|shared_control|missing_grid={removed}|named=True")
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 4's OWN ADDITIONS. It runs the routed bank and a shared expert TOGETHER,  #
+# so it reuses item 2's bank fixture whole and needs a shared expert at the      #
+# bank's own hidden size, which item 1's 256-wide one is not.                    #
+# --------------------------------------------------------------------------- #
+#: The shared expert's scale exponents at ``ROUTED_HIDDEN_SIZE``, one per 256-block
+#: of I. The magnitudes follow item 2's lattice reading, which is the same
+#: arithmetic on the same axis: with weights on the fp8 ``1/8`` grid and hidden
+#: states scaled by ``2**HIDDEN_SCALE_EXPONENT``, a block's pre-activation at
+#: H=512 is exactly ``16 * 2**e``. Against the checkpoint's bound of 10 that puts
+#:
+#:   gate  ``2**0, 2**-3, 2**0, 2**-3``   ->  16,  2, 16,  2   above and inside
+#:   up    ``2**-3, 2**0, 2**-3, 2**0``   ->   2, 16,  2, -16  the last one negated
+#:
+#: so both projections have a block the upper clamp binds on and one strictly
+#: inside the bound, and ``up``'s negated block is below the negated bound. The
+#: clamp DISCRIMINATION controls stay in items 1 and 3, which own that reading;
+#: this item needs the regimes populated only so its shared half is not a
+#: degenerate one.
+SHARED_AT_ROUTED_GATE_EXPONENTS = (0, -3, 0, -3)
+SHARED_AT_ROUTED_UP_EXPONENTS = (-3, 0, -3, 0)
+SHARED_AT_ROUTED_UP_NEGATED_BLOCK = 3
+#: One exponent per 256-column of H, uniform down the rows, so no single row block
+#: dominates the output and the sum stays well conditioned.
+SHARED_AT_ROUTED_DOWN_EXPONENT = -3
+
+SEED_SHARED_GATE = 5421
+SEED_SHARED_UP = 5422
+SEED_SHARED_DOWN = 5423
+SEED_MOE_HIDDEN = 5424
+SEED_MOE_ROUTER = 5425
+
+#: The FFN norm's gain, and it is deliberately NOT ones. RMSNorm is not
+#: idempotent, but a gain of ones on hidden states whose RMS is already 1 comes
+#: close enough to it that applying the norm twice would move almost nothing --
+#: and "the pre-norm tensor reaches the router, the normed one reaches the
+#: experts" is exactly what this item has to be able to see. These four values
+#: repeat along H, are exact in bf16, and give the normed states an RMS near 1.4,
+#: so a second application is a measurable change rather than a rounding one.
+MOE_GAMMA_VALUES = (1.0, 1.25, 1.5, 1.75)
+
+#: The router's own scale, following the landed fixture this item copies
+#: (``test_moe_path.py:1899-1905``): a small normal draw for the weight and a
+#: smaller one for the correction bias.
+MOE_ROUTER_WEIGHT_SCALE = 0.1
+MOE_ROUTER_BIAS_SCALE = 0.05
+
+
+def _shared_at_routed_operands() -> dict:
+    """A shared expert's three weights and PUBLIC grids at the bank's hidden size.
+
+    The shared route consumes the 256-granularity grid directly -- that is what
+    ``prepare_scale_operands`` takes and what the load-path retile publishes -- so
+    unlike the bank's fixture this one supplies no ``TILE_SIZE`` grid and nothing
+    is coarsened. Item 1's builder is untouched: it is 256 wide by its own
+    declared reading and this item needs 512.
+    """
+    h = ROUTED_HIDDEN_SIZE
+    i = ROUTED_INTERMEDIATE_SIZE
+    blocks = i // BLOCK_QUANT_SIZE
+    if blocks != len(SHARED_AT_ROUTED_GATE_EXPONENTS):
+        raise VacuousControlError(
+            f"this fixture declares {len(SHARED_AT_ROUTED_GATE_EXPONENTS)} gate "
+            f"regimes for {blocks} blocks of I"
+        )
+
+    gate_w = _fp8_grid_values(SEED_SHARED_GATE, h, i)
+    up_w = _fp8_grid_values(SEED_SHARED_UP, h, i)
+    columns = slice(
+        SHARED_AT_ROUTED_UP_NEGATED_BLOCK * BLOCK_QUANT_SIZE,
+        (SHARED_AT_ROUTED_UP_NEGATED_BLOCK + 1) * BLOCK_QUANT_SIZE,
+    )
+    up_w[:, columns] = -up_w[:, columns]
+    down_w = _fp8_grid_values(SEED_SHARED_DOWN, i, h)
+
+    h_blocks = h // BLOCK_QUANT_SIZE
+    i_blocks = i // BLOCK_QUANT_SIZE
+    return {
+        "gate_proj_weight": (
+            gate_w.to(_FP8),
+            _pow2_scales(SHARED_AT_ROUTED_GATE_EXPONENTS, h_blocks),
+        ),
+        "up_proj_weight": (
+            up_w.to(_FP8),
+            _pow2_scales(SHARED_AT_ROUTED_UP_EXPONENTS, h_blocks),
+        ),
+        "down_proj_weight": (
+            down_w.to(_FP8),
+            _pow2_scales((SHARED_AT_ROUTED_DOWN_EXPONENT,) * h_blocks, i_blocks),
+        ),
+    }
+
+
+def _ffn_gamma() -> torch.Tensor:
+    """``[H]`` the FFN norm's gain, repeating :data:`MOE_GAMMA_VALUES` along H."""
+    row = torch.tensor(MOE_GAMMA_VALUES, dtype=torch.float32)
+    return row.repeat(ROUTED_HIDDEN_SIZE // len(MOE_GAMMA_VALUES))
+
+
+def _ffn_norm(hidden: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
+    """The layer's FFN RMSNorm, the body the two landed layers already carry.
+
+    ``x / sqrt(mean(x**2) + eps) * gain``, computed in fp32 and cast back, which
+    is ``Glm5NextDSALayer._input_norm``'s own arithmetic. It lives here because
+    the MoE block's forward takes the normalised tensor as an argument: the norm
+    is the LAYER's, and the layer forward is a later item. This item is the caller
+    and so it normalises.
+    """
+    x = hidden.to(torch.float32)
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    normed = x * torch.rsqrt(variance + eps)
+    normed = normed * gamma.to(torch.float32)
+    return normed.to(hidden.dtype)
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 4 of 7 -- ``Glm5NextMoEBlock.forward``.                                 #
+# Certifying component: ``model_fp8.Glm5NextMoEBlock.forward``.                #
+#                                                                              #
+# WHAT IT CERTIFIES, AND WHAT IT DELIBERATELY LEAVES TO ITS NEIGHBOURS. This   #
+# forward is a composition: the fused router, then this rank's routed bank,     #
+# then the one add of the shared contribution. So the item measures the         #
+# COMPOSITION -- that the shared half is added exactly once, that the router    #
+# reads the PRE-norm activations while the experts read the normalised ones,    #
+# and that a block with no shared expert returns the routed half untouched.     #
+# The clamp discrimination belongs to items 1, 2 and 3, which own those paths.  #
+#                                                                              #
+# THE ROUTER IS EXECUTED RATHER THAN IMITATED, which is the landed convention   #
+# for this path (``test_moe_path.py:1890-1895``: "the router is executed rather #
+# than imitated, so the form the call site consumes is the form the producer    #
+# actually emits"). Its affinities are an INPUT to the reference. Re-deriving   #
+# them here would put this item in the business of certifying the router, which #
+# ``inc-glm53f-032``'s own acceptance owns, and would make the comparison       #
+# hostage to a near-tie flipping one token's expert set.                        #
+#                                                                              #
+# THE ROUTER'S OWN SEAM CARRIES NO DISPATCH COUNTERS, disclosed rather than     #
+# papered over: ``functional/moe/router.py`` defines none, so the route         #
+# predicate below reads the two seams that do. A router fallback on this        #
+# fixture cannot pass quietly even so, and that is measured rather than hoped:  #
+# its torch oracle selects ``NOAUX_TC_K`` = 8 columns regardless of the         #
+# caller's ``top_k`` (``router.py:1736-1738``), and this fixture has 4 experts, #
+# so a fallback raises out of ``torch.topk`` instead of returning a plausible   #
+# answer.                                                                       #
+# --------------------------------------------------------------------------- #
+def test_tiny_moe_block_forward_matches_the_reference() -> None:
+    """One sparse layer's MLP: route, run the experts, add the shared expert once.
+
+    ``inc-glm53f-054a`` item 4 of 7. ONE dispatch on the MoE seam for the bank and
+    THREE on the dense seam for the shared expert.
+    """
+    model_fp8 = _impl()
+    text_config = _routed_text_config()
+    quant_config = _quant_config()
+
+    if int(text_config.n_shared_experts) < 1:
+        raise VacuousControlError(
+            f"this item needs a shared expert and the config declares "
+            f"n_shared_experts={text_config.n_shared_experts}"
+        )
+
+    # ---- THE GROUP STAGE OF THE REFERENCE'S ROUTER IS AN IDENTITY ON THIS
+    # CHECKPOINT, read from the pinned config rather than assumed. The reference
+    # masks all but the top ``topk_group`` of ``n_group`` expert groups
+    # (``modeling_glm5_next.py:163-176``) and this fork's seam takes no group
+    # arguments at all. With one group of which one is kept, the mask is every
+    # column, so the two agree. A checkpoint with more groups would make this
+    # item's reference wrong, which is why it is checked here and not believed.
+    raw = _pinned_raw_config()
+    raw_text = raw.get("text_config", raw)
+    groups = int(raw_text.get("n_group", 1))
+    kept = int(raw_text.get("topk_group", 1))
+    print(f"TINYFWD|moe_groups|n_group={groups}|topk_group={kept}")
+    if groups != kept:
+        raise VacuousControlError(
+            f"the pinned checkpoint declares n_group={groups} and "
+            f"topk_group={kept}, so the reference's group mask is not an identity "
+            f"and this fork's router, which takes no group arguments, computes a "
+            f"different selection"
+        )
+
+    block = model_fp8.Glm5NextMoEBlock(text_config, world_size=1, ep_degree=1)
+    if getattr(block, "shared_experts", None) is None:
+        raise VacuousControlError(
+            "the block built no shared expert, so this item's one add is not on "
+            "its route at all"
+        )
+
+    # ---- THE BANK, item 2's fixture whole, and its load-time prep.
+    routed = _routed_operands()
+    for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+        _attach(block.experts, leaf, *routed[leaf])
+    bank_built = block.experts.prepare_scale_operands(
+        gate_proj_weight=routed["gate_proj_weight"][0],
+        up_proj_weight=routed["up_proj_weight"][0],
+        down_proj_weight=routed["down_proj_weight"][0],
+        gate_proj_scale=routed["gate_proj_weight"][1],
+        up_proj_scale=routed["up_proj_weight"][1],
+        down_proj_scale=routed["down_proj_weight"][1],
+    )
+
+    # ---- THE SHARED EXPERT at the bank's hidden size, and its own prep.
+    shared = _shared_at_routed_operands()
+    for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+        _attach(block.shared_experts, leaf, *shared[leaf])
+    shared_built = block.shared_experts.prepare_scale_operands(
+        *block.shared_experts.scale_route_operands()
+    )
+
+    # ---- THE ROUTER's two parameters, in the orientation the seam consumes:
+    # ``[H, E]`` for the weight, which ``noaux_tc_rmsnorm_router_topk`` reads its
+    # expert count off (``router.py:1615``), and one bias per expert. The landed
+    # fixture this copies is ``test_moe_path.py:1899-1905``.
+    generator = torch.Generator().manual_seed(SEED_MOE_ROUTER)
+    block.experts.router_weight = torch.nn.Parameter(
+        (
+            torch.randn(
+                ROUTED_HIDDEN_SIZE, ROUTED_EXPERTS, generator=generator
+            )
+            * MOE_ROUTER_WEIGHT_SCALE
+        ).to(torch.bfloat16),
+        requires_grad=False,
+    )
+    block.experts.router_bias = torch.nn.Parameter(
+        (
+            torch.randn(ROUTED_EXPERTS, generator=generator)
+            * MOE_ROUTER_BIAS_SCALE
+        ).to(torch.bfloat16),
+        requires_grad=False,
+    )
+
+    parameters = sum(int(p.numel()) for p in block.parameters() if p is not None)
+    print(
+        f"TINYFWD|moe_prep|bank_operands={bank_built}|shared_operands={shared_built}"
+        f"|params={parameters}"
+    )
+    if bank_built != 4 or shared_built != 3:
+        raise VacuousControlError(
+            f"the load-time preps built {bank_built} bank and {shared_built} "
+            f"shared operands; the two forwards look up 4 and 3"
+        )
+    if parameters >= MAX_PARAMETERS:
+        raise VacuousControlError(
+            f"the tiny MoE block holds {parameters} parameters, at or above the "
+            f"adopted bound of {MAX_PARAMETERS}"
+        )
+
+    # ---- THE TWO ACTIVATION TENSORS. The block takes both because the router's
+    # RMSNorm is fused inside the kernel while the experts consume the normalised
+    # states; the section note on the forward is where that reading lives.
+    pre_norm = (
+        _fp8_grid_values(SEED_MOE_HIDDEN, TOKENS, ROUTED_HIDDEN_SIZE)
+        * float(2.0**HIDDEN_SCALE_EXPONENT)
+    ).to(torch.bfloat16)
+    gamma = _ffn_gamma()
+    eps = float(text_config.rms_norm_eps)
+    normed = _ffn_norm(pre_norm, gamma, eps)
+
+    # ---- THE ROUTER, EXECUTED, and its output checked for reproducibility before
+    # it is used as a reference input. The forward calls it a third time on the
+    # same operands, so a router that did not return the same affinities twice
+    # would make every comparison below meaningless.
+    _logits_a, _index_a, affinities = block.experts.route_tokens(
+        pre_norm.unsqueeze(0), gamma, text_config
+    )
+    _logits_b, _index_b, again = block.experts.route_tokens(
+        pre_norm.unsqueeze(0), gamma, text_config
+    )
+    if not torch.equal(affinities, again):
+        raise VacuousControlError(
+            "route_tokens returned different affinities for the same operands, so "
+            "the reference cannot be built from one call and compared against "
+            "another"
+        )
+    selected = int((affinities != 0).sum(dim=1).min())
+    print(
+        f"TINYFWD|moe_router|affinities={tuple(affinities.shape)}"
+        f"|min_selected={selected}|top_k={int(text_config.num_experts_per_tok)}"
+    )
+    if tuple(affinities.shape) != (TOKENS, ROUTED_EXPERTS):
+        raise ReferenceShapeError(
+            f"route_tokens returned {tuple(affinities.shape)}, expected "
+            f"{(TOKENS, ROUTED_EXPERTS)}"
+        )
+    if selected != int(text_config.num_experts_per_tok):
+        raise VacuousControlError(
+            f"a token carries {selected} nonzero router columns and the config "
+            f"declares top-{int(text_config.num_experts_per_tok)}"
+        )
+
+    # ---- THE REFERENCE, the two halves separately so the add can be measured.
+    limit = float(text_config.swiglu_limit)
+    routed_reference = _routed_output(
+        {**routed, "hidden": normed, "expert_affinities": affinities},
+        mode=_POST_SCALE,
+        gate_max=limit,
+        gate_min=None,
+        up_max=limit,
+        up_min=-limit,
+    )
+    shared_reference = _dense_output(
+        {**shared, "hidden": normed}, limit, -limit, limit
+    )
+    expected = routed_reference["out"] + shared_reference["out"]
+
+    # ---- PRECONDITION: THE SHARED HALF IS NOT NEGLIGIBLE. If it were, "added
+    # exactly once" would be inside the tolerance and controls A and B below would
+    # both pass with the add missing.
+    share = float(shared_reference["out"].abs().max() / expected.abs().max())
+    print(
+        f"TINYFWD|moe|limit={limit}|shared_share={share:.4f}"
+        f"|routed_max={float(routed_reference['out'].abs().max()):.4f}"
+        f"|shared_max={float(shared_reference['out'].abs().max()):.4f}"
+    )
+
+    # ---- CONTROLS A and B: the shared contribution enters ONCE. Omitting it and
+    # doubling it must both fall outside the tolerance this item passes inside, or
+    # the item cannot tell one add from none or from two.
+    for name, variant in (
+        ("shared half omitted", routed_reference["out"]),
+        ("shared half added twice", expected + shared_reference["out"]),
+    ):
+        moved = not torch.allclose(variant, expected, rtol=RTOL, atol=ATOL)
+        gap = float((variant - expected).abs().max() / expected.abs().max())
+        print(
+            f"TINYFWD|moe_control|branch={name}|outside_tolerance={moved}"
+            f"|gap={gap:.4f}"
+        )
+        if not moved:
+            raise VacuousControlError(
+                f"with the {name} the result is still inside rtol={RTOL}, "
+                f"atol={ATOL}; this item cannot tell the one add from the wrong "
+                f"count"
+            )
+
+    # ---- THE REGISTERED ROUTE PREDICATE, around this item's own call.
+    _reset_seam_counters()
+    before = _read_seam_counters()
+    got = block.forward(
+        pre_norm,
+        normed,
+        router_gamma=gamma,
+        text_config=text_config,
+        quant_config=quant_config,
+    )
+    after = _read_seam_counters()
+    # ONE MoE dispatch for the bank and THREE dense ones for the shared expert.
+    # Both seams by name, so a block that ran the shared half through the expert
+    # kernel, or the bank through three dense calls, fails instead of passing on a
+    # total.
+    _assert_route_predicate(
+        "4 MoE block", {"blockwise_fp8_moe": 1, "blockwise_fp8_mm": 3}, before, after
+    )
+
+    if tuple(got.shape) != (TOKENS, ROUTED_HIDDEN_SIZE):
+        raise ReferenceShapeError(
+            f"the forward returned {tuple(got.shape)}, expected "
+            f"{(TOKENS, ROUTED_HIDDEN_SIZE)}"
+        )
+    torch.testing.assert_close(got.float(), expected.float(), rtol=RTOL, atol=ATOL)
+
+    # ---- CONTROL C: THE ROUTER READS THE PRE-NORM TENSOR. Handing the normalised
+    # states in both positions normalises twice inside the fused kernel, which is
+    # a different router and so a different set of affinities. It must move the
+    # answer outside the tolerance, or this item would pass with the two arguments
+    # swapped and the defect would be invisible.
+    doubled = block.forward(
+        normed,
+        normed,
+        router_gamma=gamma,
+        text_config=text_config,
+        quant_config=quant_config,
+    )
+    moved = not torch.allclose(doubled.float(), expected.float(), rtol=RTOL, atol=ATOL)
+    gap = float((doubled.float() - expected.float()).abs().max() / expected.abs().max())
+    print(
+        f"TINYFWD|moe_control|branch=router fed the normalised tensor"
+        f"|outside_tolerance={moved}|gap={gap:.4f}"
+    )
+    if not moved:
+        raise VacuousControlError(
+            f"normalising twice leaves the result inside rtol={RTOL}, atol={ATOL}; "
+            f"this item cannot tell the pre-norm argument from the normalised one"
+        )
+
+    # ---- CONTROL D: A BLOCK WITH NO SHARED EXPERT returns the routed half and
+    # reaches no dense projection at all. The landed add refuses such a call by
+    # name, so the branch that avoids it is what this measures -- against the
+    # reference control A already computed.
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    # BUILT with the keyword rather than assigned afterwards, so the config's own
+    # validator sees the value this control depends on.
+    dense_free_config = Glm5NextTextConfig(
+        hidden_size=ROUTED_HIDDEN_SIZE,
+        intermediate_size=ROUTED_INTERMEDIATE_SIZE,
+        num_key_value_heads=NUM_KEY_VALUE_HEADS,
+        n_routed_experts=ROUTED_EXPERTS,
+        num_experts_per_tok=ROUTED_EXPERTS_PER_TOKEN,
+        n_shared_experts=0,
+    )
+    bare = model_fp8.Glm5NextMoEBlock(dense_free_config, world_size=1, ep_degree=1)
+    if getattr(bare, "shared_experts", None) is not None:
+        raise VacuousControlError(
+            "the block still built a shared expert at n_shared_experts=0, so this "
+            "control does not exercise the branch it names"
+        )
+    for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+        _attach(bare.experts, leaf, *routed[leaf])
+    bare.experts.prepare_scale_operands(
+        gate_proj_weight=routed["gate_proj_weight"][0],
+        up_proj_weight=routed["up_proj_weight"][0],
+        down_proj_weight=routed["down_proj_weight"][0],
+        gate_proj_scale=routed["gate_proj_weight"][1],
+        up_proj_scale=routed["up_proj_weight"][1],
+        down_proj_scale=routed["down_proj_weight"][1],
+    )
+    bare.experts.router_weight = block.experts.router_weight
+    bare.experts.router_bias = block.experts.router_bias
+
+    _reset_seam_counters()
+    before = _read_seam_counters()
+    bare_got = bare.forward(
+        pre_norm,
+        normed,
+        router_gamma=gamma,
+        text_config=dense_free_config,
+        quant_config=quant_config,
+    )
+    after = _read_seam_counters()
+    _assert_route_predicate(
+        "4 MoE block, no shared expert", {"blockwise_fp8_moe": 1}, before, after
+    )
+    print("TINYFWD|moe_control|branch=no shared expert|dense_dispatches=0")
+    torch.testing.assert_close(
+        bare_got.float(), routed_reference["out"].float(), rtol=RTOL, atol=ATOL
+    )

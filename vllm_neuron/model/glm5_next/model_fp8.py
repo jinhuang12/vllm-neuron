@@ -3062,9 +3062,48 @@ class Glm5NextSharedExperts(nn.Module):
                 have attached is absent. Refusing rather than running an
                 unscaled matmul, which returns plausible numbers.
         """
-        operands: list[torch.Tensor] = []
+        return self.shared_expert_mm(
+            hidden_states, *self.scale_route_operands(), quant_config
+        )
+
+    #: The three projections this module routes, in the order
+    #: :meth:`shared_expert_mm` and :meth:`prepare_scale_operands` both declare.
+    #: A class attribute for the reason the two operand-attribute names above are
+    #: class attributes: the order is part of a contract between several readers
+    #: and none of them should spell it a second time.
+    SCALE_ROUTE_LEAVES = ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
+
+    def scale_route_operands(self) -> tuple[torch.Tensor, ...]:
+        """The six operands the shared route takes: three weights, then three grids.
+
+        ``inc-glm53f-054a``. ONE definition of the lookup, because two callers
+        need it: this module's own :meth:`forward` above, and
+        :meth:`Glm5NextMoEBlock.forward`, which must hand the same six to the
+        landed :meth:`Glm5NextMoEBlock.combine_routed_and_shared` -- the single
+        place in this file where a shared contribution is added to a routed one.
+        A second copy of the lookup in the parent is how the two come to disagree
+        about which grid belongs to which weight.
+
+        THE ORDER IS THE TWO LANDED METHODS' OWN -- weights first, then grids,
+        each triple in declaration order -- so a caller can splat this straight
+        into either signature. A divergent order at one call site is a mis-wiring
+        no shape check would see, which is the reason
+        :meth:`prepare_scale_operands` gives for mirroring the same list.
+
+        Returns:
+            ``(gate_w, up_w, down_w, gate_grid, up_grid, down_grid)``.
+
+        Raises:
+            Glm5NextSharedExpertRouteError: when a scale grid the loader should
+                have attached is absent. The grid names are DERIVED from the
+                weight leaves by ``_sibling_scale_grid_name``, which is the single
+                definition of that convention; spelling one here would be a
+                second copy of a rule the loader, the prep loop and the retile all
+                read from that one place.
+        """
+        weights: list[torch.Tensor] = []
         grids: list[torch.Tensor] = []
-        for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+        for leaf in self.SCALE_ROUTE_LEAVES:
             grid_name = (
                 Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
             )
@@ -3079,18 +3118,9 @@ class Glm5NextSharedExperts(nn.Module):
                     f"than running an unscaled matmul, which returns plausible "
                     f"numbers."
                 )
-            operands.append(getattr(self, leaf))
+            weights.append(getattr(self, leaf))
             grids.append(grid)
-        return self.shared_expert_mm(
-            hidden_states,
-            operands[0],
-            operands[1],
-            operands[2],
-            grids[0],
-            grids[1],
-            grids[2],
-            quant_config,
-        )
+        return (*weights, *grids)
 
 
 # ``inc-glm53f-033``'s named refusal, at module level for the same reason
@@ -3254,10 +3284,111 @@ class Glm5NextMoEBlock(nn.Module):
         # nowhere else in this file.
         return routed_output + shared_output
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextMoEBlock.forward is a stub created by inc-glm53f-013; "
-            "its sections land with inc-glm53f-031, -032, -027 and -033"
+    # ── the sparse MLP's forward -- ``inc-glm53f-054a`` item 4 of 7 ───────
+    #
+    # WHAT THIS METHOD IS: the three landed pieces in the reference's own order,
+    # and nothing else. The router is ``route_tokens`` on the bank, the routed
+    # half is the bank's own forward, and the add is
+    # :meth:`combine_routed_and_shared` above. This method authors no numerics
+    # and no refusal: every extent is checked by the method that owns it.
+    #
+    # WHY IT TAKES THE ACTIVATIONS TWICE, and this is the load-bearing reading of
+    # the whole method. The reference's MoE block receives ONE tensor, already
+    # normalised by the layer, and hands that same tensor to the router and to
+    # both expert halves (``modeling_glm5_next.py:200-207``: ``self.gate(hidden_states)``
+    # and ``self.experts(...)`` and ``self.shared_experts(residuals)``, where
+    # ``residuals`` is this block's own input). This fork's router is FUSED: the
+    # RMSNorm is inside ``inc-glm53f-032``'s kernel, so ``route_tokens`` must be
+    # handed the PRE-norm activations together with the norm's gain
+    # (``route_tokens``'s own signature and docstring). Handing it the normalised
+    # tensor would normalise twice and compute a different router; computing the
+    # norm here for the experts instead would put a second authority on the
+    # layer's own FFN norm. So the layer normalises once, and passes both what it
+    # started with and what it produced.
+    #
+    # WHY THE ROUTER'S GAIN IS AN ARGUMENT AND NOT A PARAMETER HERE. It is the
+    # decoder layer's ``post_attention_layernorm_weight``: the checkpoint declares
+    # no router-norm tensor at all (``weight_loaders_fp8.py:660-665`` maps the
+    # router's weight and its correction bias and nothing else), so the gain the
+    # fused kernel needs belongs to the layer, which is where this block's caller
+    # sits.
+    #
+    # WHY ``text_config`` ARRIVES AT THE CALL. ``-031``'s ``__init__`` retains no
+    # config and ``route_tokens`` needs the routing hyperparameters, so ``-032``
+    # threads it in at the call; this method is a caller and follows that.
+    #
+    # THE NO-SHARED-EXPERT BRANCH IS THE LANDED METHOD'S OWN WORDS. A block built
+    # with ``n_shared_experts == 0`` declares no shared module, and
+    # :meth:`combine_routed_and_shared` refuses such a call by name because "the
+    # routed output is already the layer output on such a block". So this method
+    # returns the routed half directly there rather than calling into a refusal.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        normed_hidden_states: torch.Tensor,
+        *,
+        router_gamma: torch.Tensor,
+        text_config: Glm5NextTextConfig,
+        quant_config: Glm5NextQuantConfig,
+        block_size: int | None = None,
+        moe_group: object | None = None,
+        tp_degree: int = 1,
+        expert_parallel_rank: int = 0,
+    ) -> torch.Tensor:
+        """One sparse layer's MLP: route, run this rank's experts, add the shared.
+
+        Args:
+            hidden_states: ``[T, H]`` the layer's PRE-norm activations, for the
+                fused router only. See the section note above for why both forms
+                arrive.
+            normed_hidden_states: ``[T, H]`` the same activations after the
+                layer's FFN norm -- what both expert halves consume.
+            router_gamma: ``[H]`` or ``[1, H]`` the FFN norm's gain, which the
+                fused router applies itself.
+            text_config: the decoder config the routing hyperparameters live on,
+                including the RMSNorm epsilon ``route_tokens`` resolves from it.
+            quant_config: the resolved quantisation policy, the route selector.
+            block_size: tokens per block, forwarded to the bank unread.
+            moe_group: the MoE ``GroupCoordinator``, forwarded unread.
+            tp_degree: ranks sharding each expert's intermediate dimension.
+            expert_parallel_rank: which rank's expert slice to select.
+
+        Returns:
+            ``[T, H]`` in the seams' own dtype. The residual dtype is the layer
+            forward's decision, not this method's.
+
+        Raises:
+            Glm5NextBlockQuantRouteError: whatever the bank refuses.
+            Glm5NextSharedExpertRouteError: whatever the shared route refuses,
+                including the extent disagreement the add checks.
+        """
+        # THE ROUTER. ``route_tokens`` declares ``[B, S, H]`` and the seam
+        # flattens ``B`` and ``S`` into one token axis, so a 2-D activation
+        # tensor is spelled ``[1, T, H]`` here rather than reshaped inside the
+        # callee. Only the affinities are consumed: the logits are the oracle's
+        # and the index set is the affinities' own support.
+        _logits, _expert_index, expert_affinities = self.experts.route_tokens(
+            hidden_states.unsqueeze(0), router_gamma, text_config
+        )
+
+        routed_output = self.experts(
+            normed_hidden_states,
+            expert_affinities,
+            quant_config,
+            block_size=block_size,
+            moe_group=moe_group,
+            tp_degree=tp_degree,
+            expert_parallel_rank=expert_parallel_rank,
+        )
+
+        shared_experts = getattr(self, "shared_experts", None)
+        if shared_experts is None:
+            return routed_output
+        return self.combine_routed_and_shared(
+            routed_output,
+            normed_hidden_states,
+            *shared_experts.scale_route_operands(),
+            quant_config,
         )
 
 
