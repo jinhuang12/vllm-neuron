@@ -622,192 +622,152 @@ def test_kv_spec_declared_parameters_are_reserved_and_unmaterialised(model) -> N
     assert model.state_dict() == {}
 
 
-#: The sentence every stub in ``model_fp8.py`` raises with. It is the marker the
-#: retirement reading below scans for, and it is exact rather than a pattern: the
-#: seven stubbed forwards each spell it identically, so a count of it is a reading
-#: of how many stubs the module still has.
+#: The sentence every stub in ``model_fp8.py`` USED TO raise with. It is still the
+#: marker this census scans for and it is exact rather than a pattern: while stubs
+#: existed, each spelled it identically, so a count of it is a reading of how many
+#: stubs the module still has. That count is now ZERO.
 STUB_SENTENCE = "is a stub created by"
 
 
 def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
-    """Forward raises everywhere -- the substrate declaration's own ground.
+    """Every compute site COMPUTES -- the census this node id names has inverted.
 
-    This increment is declared NON-KERNEL-CLASS because every compute site is
-    a stub, so "a stub computes nothing" is a property worth measuring rather
-    than promising: a later increment that quietly implemented a torch
-    forward here would change that declaration and this test would fail.
+    ``inc-glm53f-054a`` implemented the last seven raising forwards in
+    ``model_fp8.py``, so the property this test measured no longer exists to
+    measure. The reading is inverted rather than deleted: the same eleven forwards
+    are still walked, in ``inc-glm53f-051``'s source-reading form, and each must now
+    carry NO stub sentence and raise no ``NotImplementedError``; the module-wide
+    sentence count must be 0.
+
+    THE NODE ID IS KEPT ON PURPOSE, though the name now reads backwards. 108 files
+    in this campaign's records join on this node id -- the increment plan, ``-013``'s
+    own acceptance transcripts and the ``-051``, ``-056``, ``-057`` and ``-101``
+    acceptance runs among them -- and renaming it would break every one of those
+    joins to buy a truer sentence. The docstring carries the correction instead.
+
+    ``inc-glm53f-013``'S SUBSTRATE GROUND NO LONGER HOLDS, disclosed here and not
+    quietly dropped. ``evidence-013.md:30`` grounds that block's NON-KERNEL-CLASS
+    declaration on the rationale *"module tree and cache-spec declaration; every
+    compute site is a stub"*, and after this increment not one of the seven is.
+    ``-013``'s landed record is NOT re-opened -- a later increment does not edit a
+    landed acceptance -- and ``-054a`` carries its own NON-KERNEL-CLASS declaration
+    on its own rationale: it composes numeric paths each separately declared at
+    ``-025``...``-050`` and writes no kernel of its own.
     """
     impl = _impl()
-    # Counted, not asserted against a literal: two retirements landed here for
-    # ``inc-glm53f-038a`` and the number this census still guards belongs in the
-    # transcript, where a later retirement that quietly emptied the walk would
-    # show up as a smaller reading rather than as a still-green test.
-    asserted = 0
-    for model_level in (model, model.model):
-        with pytest.raises(NotImplementedError):
-            model_level.forward()
-        asserted += 1
-
-    # NO LAYER-LEVEL ARM IS LEFT. ``layers[0]`` was retired by ``inc-glm53f-038a``
-    # and ``layers[3]`` is retired below by ``inc-glm53f-051``, so both families'
-    # layer forwards now compute and neither belongs in a stub census.
-    #
-    # ``.attention`` rather than a family attribute name: ``inc-glm53f-082``
-    # moved the KDA module onto the map's ``self_attn`` path, and the property
-    # is the access that survives such a move. ``layers[0].attention`` itself is
-    # retired below; the ``.mlp`` beside it is not.
-    modules = [model.model.layers[0].mlp]
-    modules += [
+    # ---- THE WALK. The same eleven forwards this census has always reached, in the
+    # same access form. Seven were implemented by ``inc-glm53f-054a`` and four by
+    # ``inc-glm53f-038a`` and ``inc-glm53f-051`` before it, and the walk keeps them
+    # together because the reading is now the same for all eleven. ``.attention``
+    # rather than a family attribute name: ``inc-glm53f-082`` moved the KDA module
+    # onto the map's ``self_attn`` path, and the property is the access that survives
+    # such a move.
+    walked = [
+        model,
+        model.model,
+        model.model.layers[0].mlp,
         model.model.layers[3].self_attn,
         model.model.layers[3].mlp,
         model.model.layers[3].mlp.experts,
         model.model.layers[3].mlp.shared_experts,
+        model.model.layers[0],
+        model.model.layers[0].attention,
+        model.model.layers[3],
+        model.model.layers[3].self_attn.indexer,
     ]
-    for module in modules:
-        with pytest.raises(NotImplementedError):
-            module.forward()
-        asserted += 1
+    assert len(walked) == 11, f"the walk drifted to {len(walked)} modules"
 
-    assert len(modules) == 5, f"module arms drifted to {len(modules)}"
-    _record(stub_forwards_asserted=asserted)
-    assert asserted == 7
-
-    # THE RETIREMENT IS MEASURED, NOT ANNOUNCED. The two retired forwards must
-    # really be implemented, or this retirement would be hiding a stub instead of
-    # handing one over. The property checked is the one being handed over and
-    # nothing more: calling it no longer says NotImplementedError. Deliberately
-    # NOT a match on the new signature -- a later increment that gives
-    # ``hidden_states`` a default would then redden this census for a reason that
-    # has nothing to do with a quiet stub, and a working forward must be allowed
-    # to simply succeed.
-    #
-    # THE SECOND CLAUSE IS NARROW, and `B40 N7` is why. It used to read
-    # ``except Exception``, which also swallowed a forward that failed for an
-    # unrelated reason -- a shape bug or a typo then read as a retirement. The
-    # class is not guessed: both retired forwards were measured through this
-    # file's own fixture to raise ``TypeError`` for a missing ``hidden_states``
-    # (``probe-R13-retired-forward-classes.out``), which is the outcome the
-    # paragraph above already describes. Success is still allowed, because no
-    # clause catches it, and anything else now propagates instead of passing.
-    retired = [model.model.layers[0], model.model.layers[0].attention]
-    still_stubbed = []
-    for module in retired:
-        try:
-            module.forward()
-        except NotImplementedError:
-            still_stubbed.append(type(module).__name__)
-        except TypeError:
-            pass  # implemented; it merely wants its arguments (`B40 N7`)
-    _record(retired_forwards_still_stubbed=still_stubbed)
-    assert still_stubbed == [], (
-        f"retired as handed over to inc-glm53f-038a, but still a stub: "
-        f"{still_stubbed}"
+    # ---- THE SEVEN ARE NAMED, and the names are checked against the tree rather
+    # than trusted. This is the plan's own Surface census for ``inc-glm53f-054a``
+    # (increment plan, the block's Surface bullet), and the tree is what has to
+    # produce them: a class the tree stopped instantiating would leave this list
+    # unread and the census silently narrower.
+    seven = (
+        "Glm5NextRoutedExperts",
+        "Glm5NextSharedExperts",
+        "Glm5NextMoEBlock",
+        "Glm5NextDenseMLP",
+        "Glm5NextMLAAttention",
+        "Glm5NextModel",
+        "Glm5NextForConditionalGeneration",
     )
-    assert len(retired) == 2
+    reached = {type(module).__name__ for module in walked}
+    missing = sorted(set(seven) - reached)
+    assert not missing, (
+        f"this fixture's tree instantiates none of {missing}, so the census cannot "
+        f"read the forwards inc-glm53f-054a implemented"
+    )
 
-    # THE FIFTH AND SIXTH RETIREMENTS, `inc-glm53f-051`, MEASURED A DIFFERENT WAY ON
-    # PURPOSE. `layers[3].forward()` (`Glm5NextDSALayer`) and
-    # `layers[3].self_attn.indexer.forward()` (`Glm5NextDSAIndexer`) are gone from the
-    # walk above, and the `TypeError` clause used for the `-038a` pair is NOT how they
-    # are settled. That clause reads "it wanted arguments" as "it is implemented",
-    # which is true of a working forward and equally true of a STUB whose signature
-    # demands arguments. And these two cannot simply be called for real here: this
-    # fixture's model is an unmaterialised skeleton whose parameters are all `None`.
-    # So the property is read off the SOURCE instead -- an implemented forward carries
-    # no stub sentence and raises no `NotImplementedError` anywhere in its body.
-    #
-    # The reading runs over all FOUR retired modules, not only the two new ones. It is
-    # strictly stronger than the `TypeError` clause and costs nothing, and a census
-    # whose retirements are measured two different ways invites a reader to trust the
-    # weaker one.
-    retired_051 = [model.model.layers[3], model.model.layers[3].self_attn.indexer]
-    implemented = retired + retired_051
-    for module in implemented:
-        source = inspect.getsource(type(module).forward)
-        name = f"{type(module).__name__}.forward"
+    # ---- THE READING, in ``inc-glm53f-051``'s form: an implemented forward carries
+    # no stub sentence and raises no ``NotImplementedError`` anywhere in its body.
+    # Read off the SOURCE rather than by calling, for the reason ``-051`` recorded:
+    # this fixture's model is an unmaterialised skeleton whose parameters are all
+    # ``None``, so a real call cannot reach the numerics, and a ``TypeError`` from a
+    # missing argument is equally true of a working forward and of a stub whose
+    # signature demands arguments.
+    read: list[str] = []
+    for module in walked:
+        cls = type(module)
+        name = f"{cls.__name__}.forward"
+        # THE INSTRUMENT IS POINTED AT THE RIGHT FUNCTION, checked before its answer
+        # is used: an inherited or wrapped ``forward`` would have another qualified
+        # name, and reading someone else's source would make every absence below a
+        # statement about the wrong function.
+        assert cls.forward.__qualname__ == name, (
+            f"{cls.__name__}'s forward is defined as "
+            f"{cls.forward.__qualname__}, so this census would read another "
+            f"class's source"
+        )
+        source = inspect.getsource(cls.forward)
         assert STUB_SENTENCE not in source, (
-            f"{name} is retired from the census above, but its source still carries the stub "
-            f"sentence -- so the retirement is hiding a stub rather than handing one over"
+            f"{name} still carries the stub sentence, so a compute site this "
+            f"campaign has declared landed is still a stub"
         )
         assert "NotImplementedError" not in source, (
-            f"{name} is retired from the census above, but its source still raises "
-            f"NotImplementedError"
+            f"{name} still raises NotImplementedError"
         )
-    _record(retired_forwards_read_as_implemented=[type(m).__name__ for m in implemented])
-    assert len(retired_051) == 2
-    assert len(implemented) == 4
+        read.append(name)
 
-    # THE POSITIVE CONTROL FOR THAT READING. An absence is not a measurement until the
-    # instrument is shown to find the thing when it IS there -- this increment has
-    # already shipped an absence gate that read four legitimate lines and reported
-    # nothing wrong. So the same scan runs over a forward the census still asserts,
-    # where the sentence must be present.
-    control = model.model.layers[3].mlp
-    control_source = inspect.getsource(type(control).forward)
-    assert STUB_SENTENCE in control_source, (
-        f"the stub-sentence scan cannot find the sentence in {type(control).__name__}.forward, "
-        f"which the census asserts IS a stub -- so every absence read above says nothing"
-    )
-
-    # AND THE POPULATION, so the two halves of this census are counted against one
-    # another rather than each on its own. `model_fp8.py` carries one stub sentence per
-    # stubbed forward, and every one of them is an arm above: two model-level plus five
-    # module-level. An increment that retired an arm WITHOUT its implementation landing
-    # would leave a sentence with no arm, and this is the reading where that shows.
+    # ---- THE POPULATION, so the walk and the module are counted against one
+    # another rather than each on its own. While stubs existed this count had to
+    # equal the number of arms; now it has to be ZERO, and a sentence left anywhere
+    # in the module is a stub no arm above reaches.
     sentences = inspect.getsource(impl).count(STUB_SENTENCE)
     _record(stub_sentences_in_module=sentences)
-    assert sentences == asserted, (
-        f"model_fp8.py carries {sentences} stub sentences while this census asserts {asserted} stub "
-        f"forwards. Every sentence owes an arm and every arm owes a sentence, so a mismatch is "
-        f"either an arm retired before its implementation landed or a stub nothing guards"
+    # The two keys ``inc-glm53f-013``'s acceptance script reads out of this item's
+    # JSON sink (``accept-013-r1-host.sh:84``) are still written, so that record's
+    # join survives the inversion; both now report the emptied census.
+    _record(stub_forwards_asserted=0)
+    _record(retired_forwards_still_stubbed=[])
+    _record(forwards_read_as_implemented=read)
+    assert sentences == 0, (
+        f"model_fp8.py carries {sentences} stub sentences while this census "
+        f"asserts every compute site is implemented; every sentence owes an arm, "
+        f"so a leftover is a stub nothing above guards"
     )
 
-    # NO reserved-name arm is left in this census, and every retirement was a
-    # declared handover rather than a loss of coverage. `Glm5NextQuantConfig()`
-    # was retired by `inc-glm53f-023` and `Glm5NextHyperConnection().forward()`
-    # by `inc-glm53f-030`, each the DECLARED lander of that D14 section -- this
-    # census is a tripwire against a QUIET implementation, and a declared lander
-    # is the opposite of quiet. `-030` implements the mHC wiring its section
-    # reserved, so the constructor now takes the config the layer is sized from
-    # and `forward` computes instead of raising.
-    #
-    # THIRD AND FOURTH RETIREMENT, `inc-glm53f-038a`, same form and same reason.
-    # `layers[0].forward()` (`Glm5NextKDALayer`) and `layers[0].attention.forward()`
-    # (`Glm5NextKDAAttention`) are gone from the walk above. `-038a` is the
-    # DECLARED lander of both, and both now take `hidden_states` positionally plus
-    # three keyword-only carriers -- so a zero-argument call raises `TypeError`,
-    # which `pytest.raises(NotImplementedError)` does not catch. Keeping the arms
-    # would have made this census fail on the very implementation it exists to
-    # announce. Retiring them costs no coverage that matters here: the census
-    # guards against a QUIET forward, and `-038a` declared both.
-    #
-    # FIFTH AND SIXTH RETIREMENT, `inc-glm53f-051`, the DECLARED lander of the DSA
-    # layer and of its indexer. Both forwards now compute, so keeping either arm
-    # would have made this census fail on the very implementation it exists to
-    # announce -- the same reason the `-038a` pair was retired. They are settled by a
-    # reading of the forward's SOURCE rather than by the `TypeError` clause, and the
-    # code above states why that clause is too weak to carry them.
-    #
-    # WHAT STILL HOLDS EACH RETIRED MODULE IN THIS FILE, so none disappears from the
-    # file's reach along with its arm:
-    #   * `layers[0]` -- `test_kv_spec_the_tree_carries_every_d14_section_name`
-    #     asserts it is a `Glm5NextKDALayer`, and five other arms read it.
-    #   * `layers[0].attention` -- the `.attention` property access is exercised
-    #     on a KDA layer at line 870 of this file, which is the access
-    #     `inc-glm53f-082`'s move made load-bearing.
-    #   * `layers[3]` -- the same tree test asserts it is a `Glm5NextDSALayer`, and
-    #     the four remaining `layers[3].*` arms above are reached THROUGH it.
-    #   * `layers[3].self_attn.indexer` -- nothing else in this file reached it, so
-    #     the tree test now asserts it is a `Glm5NextDSAIndexer`. That assertion is a
-    #     real addition and not a note: without it the attribute path would have left
-    #     this file along with its arm, which is the loss this list exists to prevent.
-    #     Its behaviour is held by `test_dsa_layer.py`, the declared lander's own
-    #     acceptance file.
-    #
-    # `-013`'s four declared counts (45 / 11 / 34 / 0) are untouched, as is every
-    # other arm. The two model-level arms and the FIVE remaining module arms stand, so
-    # this census now asserts SEVEN stub forwards -- and the seven stub sentences left
-    # in `model_fp8.py` are counted AGAINST that number rather than trusted beside it.
+    # ---- THE POSITIVE CONTROL, RE-GROUNDED ON A REAL FORWARD. An absence is not a
+    # measurement until the instrument is shown to find the thing when it IS there,
+    # and this census used to ground that on a forward it asserted WAS a stub -- a
+    # ground that disappeared with the last stub. So the control now takes a real
+    # forward's own source, splices the sentence into a copy of it, and requires the
+    # same scan to fire: same instrument, same text, one planted marker.
+    probe = model.model.layers[3].mlp
+    probe_source = inspect.getsource(type(probe).forward)
+    assert len(probe_source.splitlines()) > 20, (
+        f"{type(probe).__name__}.forward reads as "
+        f"{len(probe_source.splitlines())} lines; a near-empty read would make "
+        f"every absence above vacuous"
+    )
+    planted = probe_source + f"\n    # {STUB_SENTENCE} a control\n"
+    assert STUB_SENTENCE in planted, (
+        "the stub-sentence scan cannot find the sentence in a source that "
+        "carries it, so every absence read above says nothing"
+    )
+    assert STUB_SENTENCE not in probe_source, (
+        "the control's own source already carries the sentence, so the planted "
+        "marker proves nothing"
+    )
 
 
 def test_kv_spec_the_tree_carries_every_d14_section_name(model) -> None:

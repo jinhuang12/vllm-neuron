@@ -980,23 +980,33 @@ def _coarsen_to_256(grid: torch.Tensor) -> torch.Tensor:
     return coarse
 
 
-def _routed_tile_grid(exponents: tuple[int, ...], *, i_first: bool) -> torch.Tensor:
+def _routed_tile_grid(
+    exponents: tuple[int, ...],
+    *,
+    i_first: bool,
+    intermediate: int = ROUTED_INTERMEDIATE_SIZE,
+    hidden: int = ROUTED_HIDDEN_SIZE,
+    experts: int = ROUTED_EXPERTS,
+) -> torch.Tensor:
     """``[E, I/128, H/128]`` powers of two, one exponent per 256-block of I.
 
     ``i_first=False`` returns the ``[E, H/128, I/128]`` transpose, which is the
     orientation the checkpoint stores ``down``'s grid in. Uniform along H and across
     both ``TILE_SIZE`` halves of each 256-block, which is what :func:`_coarsen_to_256`
     then measures rather than trusts.
+
+    THE THREE EXTENTS DEFAULT TO ITEM 2's, so items 2 and 4 call this exactly as they
+    did. Item 6 runs a bank at a narrower ``I`` and passes its own.
     """
     step = BLOCK_QUANT_SIZE // TILE_SIZE
-    i_tiles = ROUTED_INTERMEDIATE_SIZE // TILE_SIZE
-    h_tiles = ROUTED_HIDDEN_SIZE // TILE_SIZE
+    i_tiles = intermediate // TILE_SIZE
+    h_tiles = hidden // TILE_SIZE
     per_tile = [float(2.0 ** exponents[tile // step]) for tile in range(i_tiles)]
     grid = torch.tensor(per_tile, dtype=torch.float32).reshape(i_tiles, 1)
     grid = grid.repeat(1, h_tiles)
     if not i_first:
         grid = grid.t().contiguous()
-    return grid.unsqueeze(0).repeat(ROUTED_EXPERTS, 1, 1).contiguous()
+    return grid.unsqueeze(0).repeat(experts, 1, 1).contiguous()
 
 
 def _routed_affinities() -> torch.Tensor:
@@ -1128,12 +1138,20 @@ def _routed_output(
     gate_w, gate_grid = operands["gate_proj_weight"]
     up_w, up_grid = operands["up_proj_weight"]
     down_w, down_grid = operands["down_proj_weight"]
-    blocks = ROUTED_INTERMEDIATE_SIZE // BLOCK_QUANT_SIZE
+    # EVERY EXTENT IS READ OFF THE OPERANDS, not off this section's constants, and
+    # that changed in ``inc-glm53f-054a`` item 6 rather than at item 2. The four
+    # values are the same numbers at items 2 and 4 -- their operands are built from
+    # those constants -- so no landed reading moves. Item 6 runs a bank at a
+    # narrower ``I`` inside a residual stack, and one reference read by three items
+    # is what stops a second copy of this arithmetic from drifting from it.
+    tokens, hidden_size = hidden.shape[0], hidden.shape[1]
+    experts = int(affinities.shape[1])
+    blocks = down_w.shape[2] // BLOCK_QUANT_SIZE
 
-    terms = [torch.zeros(TOKENS, ROUTED_HIDDEN_SIZE, dtype=torch.float32)
+    terms = [torch.zeros(tokens, hidden_size, dtype=torch.float32)
              for _ in range(blocks)]
     gates, ups = [], []
-    for expert in range(ROUTED_EXPERTS):
+    for expert in range(experts):
         weight = affinities[:, expert:expert + 1]
         activations = hidden * weight if mode == _PRE_SCALE else hidden
         # ``[I, H]`` dequantised, so the projection is ``x @ W.t()``.
@@ -1596,7 +1614,7 @@ MOE_ROUTER_WEIGHT_SCALE = 0.1
 MOE_ROUTER_BIAS_SCALE = 0.05
 
 
-def _shared_at_routed_operands() -> dict:
+def _shared_at_routed_operands(*, seed_offset: int = 0) -> dict:
     """A shared expert's three weights and PUBLIC grids at the bank's hidden size.
 
     The shared route consumes the 256-granularity grid directly -- that is what
@@ -1604,6 +1622,12 @@ def _shared_at_routed_operands() -> dict:
     unlike the bank's fixture this one supplies no ``TILE_SIZE`` grid and nothing
     is coarsened. Item 1's builder is untouched: it is 256 wide by its own
     declared reading and this item needs 512.
+
+    ``seed_offset`` DEFAULTS TO ZERO, so item 4's call draws exactly what it drew.
+    Item 6 builds two DENSE MLPs from this same shape at two offsets, because two
+    layers holding identical weights cannot show that each layer read its own -- and
+    the offset moves only the draw, never the scale regimes the conditioning
+    arguments above rest on.
     """
     h = ROUTED_HIDDEN_SIZE
     i = ROUTED_INTERMEDIATE_SIZE
@@ -1614,14 +1638,14 @@ def _shared_at_routed_operands() -> dict:
             f"regimes for {blocks} blocks of I"
         )
 
-    gate_w = _fp8_grid_values(SEED_SHARED_GATE, h, i)
-    up_w = _fp8_grid_values(SEED_SHARED_UP, h, i)
+    gate_w = _fp8_grid_values(SEED_SHARED_GATE + seed_offset, h, i)
+    up_w = _fp8_grid_values(SEED_SHARED_UP + seed_offset, h, i)
     columns = slice(
         SHARED_AT_ROUTED_UP_NEGATED_BLOCK * BLOCK_QUANT_SIZE,
         (SHARED_AT_ROUTED_UP_NEGATED_BLOCK + 1) * BLOCK_QUANT_SIZE,
     )
     up_w[:, columns] = -up_w[:, columns]
-    down_w = _fp8_grid_values(SEED_SHARED_DOWN, i, h)
+    down_w = _fp8_grid_values(SEED_SHARED_DOWN + seed_offset, i, h)
 
     h_blocks = h // BLOCK_QUANT_SIZE
     i_blocks = i // BLOCK_QUANT_SIZE
@@ -1683,14 +1707,18 @@ def _ffn_norm(hidden: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Te
 # ``inc-glm53f-032``'s own acceptance owns, and would make the comparison       #
 # hostage to a near-tie flipping one token's expert set.                        #
 #                                                                              #
-# THE ROUTER'S OWN SEAM CARRIES NO DISPATCH COUNTERS, disclosed rather than     #
-# papered over: ``functional/moe/router.py`` defines none, so the route         #
-# predicate below reads the two seams that do. A router fallback on this        #
-# fixture cannot pass quietly even so, and that is measured rather than hoped:  #
-# its torch oracle selects ``NOAUX_TC_K`` = 8 columns regardless of the         #
-# caller's ``top_k`` (``router.py:1736-1738``), and this fixture has 4 experts, #
-# so a fallback raises out of ``torch.topk`` instead of returning a plausible   #
-# answer.                                                                       #
+# THE ROUTER'S OWN SEAM IS COUNTED, and this paragraph used to say the opposite. #
+# ``functional/moe/router.py`` defines ``noaux_tc_dispatch_counters``           #
+# (``router.py:1017``) and increments it once per call (``:1664``), and         #
+# ``route_tokens`` is what this forward enters -- so the earlier claim that the #
+# seam "carries no dispatch counters" was false of the tree and this item's     #
+# fallback aggregate omitted the one seam its own control D argues about.       #
+# Repaired in ``inc-glm53f-054a`` repair R; the predicate below now reads it.   #
+# A router fallback on this fixture could not pass quietly even before that,    #
+# and that is measured rather than hoped: its torch oracle selects              #
+# ``NOAUX_TC_K`` = 8 columns regardless of the caller's ``top_k``               #
+# (``router.py:1736-1738``), and this fixture has 4 experts, so a fallback      #
+# raises out of ``torch.topk`` instead of returning a plausible answer.         #
 # --------------------------------------------------------------------------- #
 def test_tiny_moe_block_forward_matches_the_reference() -> None:
     """One sparse layer's MLP: route, run the experts, add the shared expert once.
@@ -2068,8 +2096,15 @@ MLA_SOFTMAX_SCALE = float(
 MLA_RETIRED_SOFTMAX_SCALE = float(MLA_KV_LORA_RANK ** -0.5)
 
 
-def _mla_text_config():
+def _mla_text_config(**overrides):
     """The checkpoint's config narrowed to item 5's geometry.
+
+    ``**overrides`` WINS OVER THE DIALS BELOW and exists so item 6 has ONE authority
+    for the attention geometry rather than a second copy of the dial list. Item 5
+    calls this with no arguments and gets exactly what it got before; item 6 adds the
+    stack's own fields -- its layer schedule, its dense/sparse split, its expert
+    count, its vocabulary -- and widens ``hidden_size``, which the MoE seam forces
+    (:data:`STACK_HIDDEN_SIZE` records that measurement).
 
     ``dataclasses.replace`` on a default construction, which is the landed
     attention fixture's idiom (``test_dsa_layer.py:1002-1009``): every field this
@@ -2084,21 +2119,22 @@ def _mla_text_config():
 
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 
-    return replace(
-        Glm5NextTextConfig(),
-        hidden_size=MLA_HIDDEN_SIZE,
-        num_key_value_heads=NUM_KEY_VALUE_HEADS,
-        num_attention_heads=MLA_HEADS,
-        q_lora_rank=MLA_Q_LORA_RANK,
-        kv_lora_rank=MLA_KV_LORA_RANK,
-        qk_nope_head_dim=MLA_QK_NOPE_HEAD_DIM,
-        qk_rope_head_dim=MLA_QK_ROPE_HEAD_DIM,
-        v_head_dim=MLA_V_HEAD_DIM,
-        index_n_heads=MLA_INDEX_N_HEADS,
-        index_head_dim=MLA_INDEX_HEAD_DIM,
-        index_kpool=MLA_INDEX_KPOOL,
-        index_topk=MLA_TOPK_POOLS * MLA_INDEX_KPOOL,
-    )
+    dials = {
+        "hidden_size": MLA_HIDDEN_SIZE,
+        "num_key_value_heads": NUM_KEY_VALUE_HEADS,
+        "num_attention_heads": MLA_HEADS,
+        "q_lora_rank": MLA_Q_LORA_RANK,
+        "kv_lora_rank": MLA_KV_LORA_RANK,
+        "qk_nope_head_dim": MLA_QK_NOPE_HEAD_DIM,
+        "qk_rope_head_dim": MLA_QK_ROPE_HEAD_DIM,
+        "v_head_dim": MLA_V_HEAD_DIM,
+        "index_n_heads": MLA_INDEX_N_HEADS,
+        "index_head_dim": MLA_INDEX_HEAD_DIM,
+        "index_kpool": MLA_INDEX_KPOOL,
+        "index_topk": MLA_TOPK_POOLS * MLA_INDEX_KPOOL,
+    }
+    dials.update(overrides)
+    return replace(Glm5NextTextConfig(), **dials)
 
 
 def _mla_contract(x: torch.Tensor, weight_out_in: torch.Tensor) -> torch.Tensor:
@@ -2125,24 +2161,37 @@ def _mla_latent_norm(
     return x * torch.rsqrt(variance + float(eps)) * gain.to(torch.float32)
 
 
-def _mla_attention_fixture(*, seed: int = SEED_MLA):
-    """One MLA attention module, every leaf materialised and both preps run.
+def _materialise_mla_attention(
+    attention, cfg, *, seed: int, output_damping: float = 1.0
+) -> tuple[dict, dict]:
+    """Every leaf of ONE ALREADY-BUILT attention module, both preps run, indexer too.
 
-    Returns ``(attention, raw, gains, config)`` where ``raw`` holds the five
-    projection leaves in the checkpoint's ``[out, in]`` orientation and ``gains``
-    the two latent-norm gains -- the operands the reference reads.
+    Returns ``(raw, gains)`` -- the five projection leaves in the checkpoint's
+    ``[out, in]`` orientation and the two latent-norm gains, which are the operands
+    the reference reads.
+
+    FACTORED OUT OF :func:`_mla_attention_fixture` BY ITEM 6 for one reason: item 6's
+    three attention modules are built by ``Glm5NextModel``'s own constructor, inside
+    its layers, so the fixture cannot be the thing that constructs them. Everything
+    here is that function's landed body, unmoved; what stays behind is the pair of
+    tiny-bound assertions, which are a statement about a STANDALONE module and would
+    be the wrong statement about one layer of a stack.
+
+    One generator, drawn in ``projection_widths()`` order, then the two gains, then
+    the indexer -- so a caller that passes two different seeds gets two modules that
+    share no value.
 
     THE WEIGHTS ARE ``randn * in_features ** -0.5``, the scaling both landed
     attention fixtures use (``test_mla_decode.py:139-143``), so activations stay
-    order one instead of growing until the comparison measures overflow. The fp8
-    ``1/8``-grid conditioning items 1 to 4 need is NOT used here and its absence is
-    deliberate: those items compare a blockwise-quantised matmul, where a signed
-    draw makes every dot product a near-cancelling sum, while this path is fp32
-    end to end and has no block scales to line up.
+    order one instead of growing until the comparison measures overflow.
+
+    ``output_damping`` SCALES ``o_proj`` AND DEFAULTS TO 1.0, so item 5 draws exactly
+    what it drew. Item 6 passes an exact power of two, and its reason is in
+    :data:`STACK_ATTENTION_DAMPING`: it needs the attention half to be a measurable
+    but MINORITY share of a residual stream whose sign it must not flip. The scaling
+    happens before the load-time prep, because the prep caches a transposed copy and
+    a leaf edited afterwards would leave the two disagreeing.
     """
-    model_fp8 = _impl()
-    cfg = _mla_text_config()
-    attention = model_fp8.Glm5NextMLAAttention(cfg)
     gen = torch.Generator().manual_seed(int(seed))
 
     raw: dict = {}
@@ -2150,6 +2199,8 @@ def _mla_attention_fixture(*, seed: int = SEED_MLA):
         weight = torch.randn(
             out_features, in_features, generator=gen, dtype=torch.float32
         ) * (in_features ** -0.5)
+        if name == "o_proj":
+            weight = weight * float(output_damping)
         raw[name] = weight
         setattr(attention, f"{name}_weight", torch.nn.Parameter(weight))
 
@@ -2170,6 +2221,28 @@ def _mla_attention_fixture(*, seed: int = SEED_MLA):
             f"absorb operand(s); this geometry declares five and two"
         )
     _materialise_mla_indexer(attention.indexer, gen)
+    return raw, gains
+
+
+def _mla_attention_fixture(*, seed: int = SEED_MLA):
+    """One MLA attention module, every leaf materialised and both preps run.
+
+    Returns ``(attention, raw, gains, config)`` where ``raw`` holds the five
+    projection leaves in the checkpoint's ``[out, in]`` orientation and ``gains``
+    the two latent-norm gains -- the operands the reference reads.
+
+    THE WEIGHTS ARE ``randn * in_features ** -0.5``, the scaling both landed
+    attention fixtures use (``test_mla_decode.py:139-143``), so activations stay
+    order one instead of growing until the comparison measures overflow. The fp8
+    ``1/8``-grid conditioning items 1 to 4 need is NOT used here and its absence is
+    deliberate: those items compare a blockwise-quantised matmul, where a signed
+    draw makes every dot product a near-cancelling sum, while this path is fp32
+    end to end and has no block scales to line up.
+    """
+    model_fp8 = _impl()
+    cfg = _mla_text_config()
+    attention = model_fp8.Glm5NextMLAAttention(cfg)
+    raw, gains = _materialise_mla_attention(attention, cfg, seed=seed)
 
     parameters = sum(int(p.numel()) for p in attention.parameters())
     print(f"TINYFWD|mla_fixture|parameters={parameters}|bound={MAX_PARAMETERS}"
@@ -2238,8 +2311,16 @@ def _materialise_mla_indexer(indexer, gen: torch.Generator) -> None:
         )
 
 
-def _mla_selection_operands() -> dict:
+def _mla_selection_operands(
+    *, tokens: int = MLA_TOKENS, pages: int = MLA_PAGES
+) -> dict:
     """The operands the selection stage needs, each derived from its own rule.
+
+    BOTH EXTENTS DEFAULT TO ITEM 5's, so item 5's call is unchanged. Item 6 runs the
+    same rules at its own token count and its own page count, and the two
+    preconditions below are what make that safe rather than assumed: they are
+    inequalities in these two numbers, so a token count that outgrew the pooled-key
+    store fails as a control instead of selecting a row that is not there.
 
     ``slot_mapping`` is pool-granular: a position carries its pool's id where a
     pool COMPLETES and ``-1`` where it does not, which is how a position says "my
@@ -2248,12 +2329,12 @@ def _mla_selection_operands() -> dict:
     tokens, so each token's own context length is its own -- which makes the tail
     each token's own incomplete pool.
     """
-    slots = torch.full((MLA_TOKENS,), -1, dtype=torch.int32)
-    for position in range(MLA_TOKENS):
+    slots = torch.full((tokens,), -1, dtype=torch.int32)
+    for position in range(tokens):
         if (position + 1) % MLA_INDEX_KPOOL == 0:
             slots[position] = position // MLA_INDEX_KPOOL
-    candidates = MLA_TOKENS // MLA_INDEX_KPOOL
-    rows = MLA_PAGES * MLA_PAGE_SIZE
+    candidates = tokens // MLA_INDEX_KPOOL
+    rows = pages * MLA_PAGE_SIZE
     if candidates <= MLA_TOPK_POOLS:
         raise VacuousControlError(
             f"{candidates} candidate pool(s) is not more than the "
@@ -2267,20 +2348,20 @@ def _mla_selection_operands() -> dict:
         )
     return {
         "slot_mapping": slots,
-        "seq_lens": torch.arange(1, MLA_TOKENS + 1, dtype=torch.int32),
+        "seq_lens": torch.arange(1, tokens + 1, dtype=torch.int32),
         "candidates": candidates,
         "pool_rows": rows,
     }
 
 
-def _mla_pool_cache() -> torch.Tensor:
+def _mla_pool_cache(*, pages: int = MLA_PAGES) -> torch.Tensor:
     """The pooled-key store, ``[rows, index_head_dim]`` bf16, written in place."""
     return torch.zeros(
-        MLA_PAGES * MLA_PAGE_SIZE, MLA_INDEX_HEAD_DIM, dtype=torch.bfloat16
+        pages * MLA_PAGE_SIZE, MLA_INDEX_HEAD_DIM, dtype=torch.bfloat16
     )
 
 
-def _mla_latent_cache(attention) -> torch.Tensor:
+def _mla_latent_cache(attention, *, tokens: int = MLA_TOKENS) -> torch.Tensor:
     """The latent cache at the layer's OWN declared spec, one latent per token.
 
     ``head_size`` is read off the module rather than typed, because the module
@@ -2296,7 +2377,7 @@ def _mla_latent_cache(attention) -> torch.Tensor:
     ``inc-glm53f-042``'s own items.
     """
     return torch.zeros(
-        MLA_TOKENS, attention.NUM_LATENT_KV_HEADS, int(attention.head_size),
+        tokens, attention.NUM_LATENT_KV_HEADS, int(attention.head_size),
         dtype=torch.float32,
     )
 
@@ -2669,3 +2750,1421 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
             slot_mapping=operands["slot_mapping"],
         )
     print("TINYFWD|mla_control|branch=forward before the absorb split|refused=True")
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 6's OWN GEOMETRY -- the decoder STACK. The five items above each run ONE  #
+# module; this one runs a whole tree, so it is the first item that has to choose #
+# a geometry every seam on the stack admits at once. Each number below is        #
+# forced by a seam's own refusal or by the adopted parameter bound, and says     #
+# which.                                                                        #
+# --------------------------------------------------------------------------- #
+#: 512, NOT item 5's 256, and the MoE seam is what forces it. ``_require_blocked``
+#: refuses any hidden size below ``MIN_HIDDEN`` and any that is not a multiple of
+#: ``PSUM_SIZE``, and both constants are 512 on this image
+#: (``moe_blockwise_fp8.py:109``, ``:115``, checked against the seam's own module by
+#: :func:`_stack_geometry_preconditions` rather than trusted here). The refusal is an
+#: ERROR and not a fallback by that function's own design, so a 256-wide stack with
+#: one MoE layer would raise before any numerics ran. Item 2 already runs its bank at
+#: 512 and this is the same number for the same reason.
+STACK_HIDDEN_SIZE = ROUTED_HIDDEN_SIZE
+
+#: Three layers, all ``deepseek_sparse_attention``. THREE is the smallest count that
+#: measures an ORDER: with two, a stack that ran its layers backwards is the same
+#: multiset, and with one there is no order at all. The checkpoint's 45-layer 3:1
+#: hybrid schedule is NOT reproduced here, and that is a declared exclusion with a
+#: cost: the linear-attention family's own state is ``inc-glm53f-038``'s, its fixture
+#: declares fifteen parameters and two vLLM state calculators, and none of that is
+#: this item's to certify. What this item certifies is that the loop is FAMILY-BLIND
+#: -- it hands each layer its own mapping and holds no per-family branch -- and a
+#: stack of one family measures that property exactly as well as a hybrid does.
+STACK_LAYERS = 3
+
+#: Two dense MLP layers then one sparse. ``_build_mlp`` is monotone -- dense strictly
+#: below ``first_k_dense_replace``, sparse at and above -- so a split of 2 in a stack
+#: of 3 is the only arrangement that reaches BOTH branches of the FFN half AND gives
+#: two layers on one branch, which is what makes per-layer weight binding measurable.
+#: The parameter bound is the reason the majority branch is the dense one: a bank
+#: costs ``E * 3 * I * H`` and two banks do not fit under 10 M at this hidden size.
+STACK_FIRST_K_DENSE = 2
+STACK_DENSE_LAYERS = STACK_FIRST_K_DENSE
+STACK_MOE_LAYERS = STACK_LAYERS - STACK_FIRST_K_DENSE
+
+#: 128 tokens, and the dense seam forces it rather than the fixture choosing it:
+#: ``_require_blocked`` refuses ``M`` that is not a positive multiple of
+#: ``TILE_SIZE`` = 128 and says why -- "the kernel tiles M over the PSUM partition
+#: axis and does not pad" (``blockwise_fp8_mm.py:238-243``). 128 is therefore the
+#: SMALLEST admissible token count, and item 5's 35 is inadmissible the moment a
+#: dense MLP is on the same stack.
+STACK_TOKENS = TOKENS
+
+#: A tiny vocabulary, because the embedding table is ``vocab x hidden`` and the
+#: checkpoint's 154,880 rows alone would be 79 M parameters at this hidden size. The
+#: item embeds by INDEXING that table, so a small row count changes nothing about the
+#: lookup being certified.
+STACK_VOCAB_SIZE = 256
+
+#: 16 pages of :data:`MLA_PAGE_SIZE`, so 64 pooled-key rows for the 32 candidate
+#: pools 128 tokens produce. :func:`_mla_selection_operands` asserts the inequality
+#: this has to satisfy (a trash row above every candidate), so the slack is measured
+#: there rather than argued here. Pages cost no parameters -- the pool cache is a
+#: carrier, not a weight -- so the headroom is free.
+STACK_PAGES = 16
+
+#: The dense MLP's intermediate extent, item 4's shared-expert shape reused whole:
+#: 512 wide by 1024, which is four ``BLOCK_QUANT_SIZE`` column blocks and exactly what
+#: :func:`_shared_at_routed_operands` builds. Reused rather than re-derived because
+#: ``Glm5NextSharedExperts`` and ``Glm5NextDenseMLP`` consume the SAME three leaves in
+#: the same orientation at the same 256-granularity grid.
+STACK_DENSE_INTERMEDIATE_SIZE = ROUTED_INTERMEDIATE_SIZE
+
+#: The bank's intermediate extent, and 512 is the SMALLEST the MoE seam admits: it
+#: refuses any ``I_TP`` that is not a multiple of ``BLOCK_QUANT_SIZE * NUM_SHARDS``
+#: (``moe_blockwise_fp8.py:249-254``), which is 512 on this image. It is also the
+#: constraint set's own ``intermediate_size >= 512`` floor, met exactly. Item 2's 1024
+#: is not reused here for one measured reason: at this hidden size a 1024-wide bank
+#: costs 6.3 M parameters on its own (:data:`ROUTED_EXPERTS`' note records that
+#: figure), and this stack carries three attention layers and two dense MLPs beside
+#: it.
+STACK_MOE_INTERMEDIATE_SIZE = 512
+
+STACK_EXPERTS = ROUTED_EXPERTS
+STACK_EXPERTS_PER_TOKEN = ROUTED_EXPERTS_PER_TOKEN
+
+#: ``o_proj`` is scaled by this before the load-time prep, so the attention half is a
+#: MINORITY share of the residual stream. It is an exact power of two, so the scaling
+#: itself rounds nothing away, and the reference reads the scaled leaf -- this is a
+#: conditioning choice about the fixture, not a change to the function under test.
+#:
+#: TWO REASONS, both about this being the first item that composes the two halves.
+#: (a) THE SIGN OF THE RESIDUAL. The embedding table is drawn on the unsigned fp8
+#: grid, so the residual stream starts positive, and every MLP weight on this stack is
+#: unsigned too; that is the premise this whole file's conditioning rests on (see the
+#: module docstring: signed operands make each dot product a near-cancelling sum and a
+#: relative tolerance then measures cancellation). The attention weights are SIGNED --
+#: item 5's draw, kept, because the absorb algebra is what item 5 measures -- so an
+#: undamped attention half would drive the FFN's input through zero and put every
+#: downstream fp8 comparison back into the cancelling regime.
+#: (b) PRECISION. This stack runs in bf16, which is the checkpoint's activation dtype
+#: and the dtype every seam on it declares, and ``attend()`` rounds its latent-space
+#: result to that dtype mid-chain (``model_fp8.py``, ``attend``'s
+#: ``attended.to(hidden_states.dtype)``) while the dense reference stays in fp32.
+#: Item 5 never sees that rounding because item 5 hands the forward fp32. One bf16
+#: rounding is 2**-8 relative, which is 39% of this item's ``rtol``; damping the half
+#: that carries it to an eighth of the stream leaves it under 5% of the budget.
+STACK_ATTENTION_DAMPING = 0.125
+
+#: One exponent per 256-block of I for the bank's three projections. ALL AT 2**-3 and
+#: uniform, which is a deliberate difference from item 2's four straddling regimes:
+#: item 2 owns the clamp discrimination and needs its pre-activations either side of
+#: the SwiGLU bound, while this item owns the COMPOSITION and needs a bank whose
+#: output is well conditioned against a residual stream it did not choose. The item
+#: RECORDS which clamps bind rather than declaring none does -- both sides clamp with
+#: the same bound from the same config field, so a binding clamp is exercised
+#: identically and is not this item's to discriminate.
+STACK_BANK_GATE_EXPONENTS = (-3, -3)
+STACK_BANK_UP_EXPONENTS = (-3, -3)
+STACK_BANK_DOWN_EXPONENTS = (-3, -3)
+
+#: The bank's conditioning tripwire, in the max-norm item 2's own bounds use. Looser
+#: than item 2's 4.0 and deliberately so: item 2 feeds its bank a fixture it
+#: conditioned itself, while this one feeds it whatever the two layers above produced.
+#: The bound's job is to catch near-cancellation, where the output is a small residue
+#: of large opposing terms and every reading is inflated by a vanishing denominator.
+#: IT IS A TRIPWIRE AND NOT A MEASURED TARGET: no run of this file exists yet, so the
+#: first counted run is what says where the reading actually sits.
+STACK_MAX_CONDITION = 32.0
+
+#: Distinct from every seed above, and distinct per site, so no two tensors on this
+#: stack can pass on a shared draw. The attention seed is a BASE and each layer adds
+#: its index, which is what makes "each layer read its own weights" measurable.
+SEED_STACK_EMBED = 5441
+SEED_STACK_IDS = 5442
+SEED_STACK_ATTENTION = 5443
+SEED_STACK_BANK_GATE = 5461
+SEED_STACK_BANK_UP = 5462
+SEED_STACK_BANK_DOWN = 5463
+SEED_STACK_ROUTER = 5464
+
+#: Added to :func:`_shared_at_routed_operands`' three seeds, one offset per dense
+#: layer. 100 and 200 rather than 0 and 1 so neither offset can land on another
+#: fixture's seed.
+STACK_DENSE_SEED_OFFSETS = (100, 200)
+
+#: The norm gains, as a rotating pattern of exact eighths near 1. EIGHT values for
+#: SEVEN sites -- two per layer plus the stack's final norm -- so every site gets a
+#: DIFFERENT rotation and a forward that applied one layer's gain at another layer's
+#: norm fails the comparison. Exact in bf16, so the stack's own dtype rounds none of
+#: them, and near 1 so the RMSNorm they follow keeps the stream order one. NOT ONES:
+#: a gain of ones on states whose RMS is already 1 makes the norm nearly an identity,
+#: and "this norm ran with this gain" is exactly what has to be visible
+#: (:data:`MOE_GAMMA_VALUES` records the same reasoning for item 4).
+_STACK_GAIN_VALUES = (1.0, 1.25, 1.5, 1.75, 0.75, 1.125, 0.875, 1.375)
+
+
+def _stack_gain(site: int) -> torch.Tensor:
+    """``[H]`` the norm gain for one site, its own rotation of the eight values."""
+    row = torch.tensor(_STACK_GAIN_VALUES, dtype=torch.float32).roll(int(site))
+    return row.repeat(STACK_HIDDEN_SIZE // len(_STACK_GAIN_VALUES))
+
+
+def _stack_text_config(**overrides):
+    """The tiny stack's config -- item 5's attention dials plus the tree's own fields.
+
+    ``overrides`` reaches :func:`_mla_text_config` last, so item 7 can turn one
+    field -- ``tie_word_embeddings`` -- without a second copy of this dial set.
+
+    Built through :func:`_mla_text_config`, so the attention geometry has ONE
+    authority in this file and a dial that moves there moves here too. The overrides
+    are the fields a TREE has and a single attention module does not.
+
+    ``num_hidden_layers`` AND ``layer_types`` ARE BOTH PASSED, and that is required
+    rather than belt-and-braces: ``dataclasses.replace`` copies the source instance's
+    already-defaulted 45-entry schedule, and ``__post_init__`` then refuses a schedule
+    whose length disagrees with the layer count (``config.py:337-341``).
+    """
+    from vllm_neuron.model.glm5_next.config import DSA_LAYER_TYPE
+
+    return _mla_text_config(
+        hidden_size=STACK_HIDDEN_SIZE,
+        intermediate_size=STACK_DENSE_INTERMEDIATE_SIZE,
+        moe_intermediate_size=STACK_MOE_INTERMEDIATE_SIZE,
+        num_hidden_layers=STACK_LAYERS,
+        layer_types=[DSA_LAYER_TYPE] * STACK_LAYERS,
+        first_k_dense_replace=STACK_FIRST_K_DENSE,
+        n_routed_experts=STACK_EXPERTS,
+        num_experts_per_tok=STACK_EXPERTS_PER_TOKEN,
+        n_shared_experts=0,
+        vocab_size=STACK_VOCAB_SIZE,
+        **overrides,
+    )
+
+
+def _stack_geometry_preconditions() -> None:
+    """Every extent this stack chose, checked against the seam that constrains it.
+
+    THE NUMBERS COME FROM THE SEAMS' OWN MODULES, not from this file. The three
+    constants that forced :data:`STACK_HIDDEN_SIZE` and
+    :data:`STACK_MOE_INTERMEDIATE_SIZE` are read out of ``moe_blockwise_fp8`` and the
+    token rule out of the ``TILE_SIZE`` this file already imports, so an image whose
+    seam moved a bound fails here by name instead of raising from inside a kernel.
+
+    Resolved inside the call, like :func:`_impl`, so this file's import time does not
+    depend on the MoE kernel being importable.
+    """
+    from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+        MAX_HIDDEN,
+        MIN_HIDDEN,
+        NUM_SHARDS,
+        PSUM_SIZE,
+    )
+
+    print(f"TINYFWD|stack_geometry|hidden={STACK_HIDDEN_SIZE}"
+          f"|min_hidden={MIN_HIDDEN}|max_hidden={MAX_HIDDEN}|psum={PSUM_SIZE}"
+          f"|moe_intermediate={STACK_MOE_INTERMEDIATE_SIZE}"
+          f"|i_tp_step={BLOCK_QUANT_SIZE * NUM_SHARDS}"
+          f"|tokens={STACK_TOKENS}|tile={TILE_SIZE}")
+    problems = []
+    if not MIN_HIDDEN <= STACK_HIDDEN_SIZE <= MAX_HIDDEN:
+        problems.append(
+            f"hidden {STACK_HIDDEN_SIZE} outside the MoE seam's "
+            f"[{MIN_HIDDEN}, {MAX_HIDDEN}]"
+        )
+    if STACK_HIDDEN_SIZE % PSUM_SIZE or STACK_HIDDEN_SIZE % BLOCK_QUANT_SIZE:
+        problems.append(
+            f"hidden {STACK_HIDDEN_SIZE} is not a multiple of PSUM_SIZE={PSUM_SIZE} "
+            f"and of BLOCK_QUANT_SIZE={BLOCK_QUANT_SIZE}"
+        )
+    if STACK_MOE_INTERMEDIATE_SIZE % (BLOCK_QUANT_SIZE * NUM_SHARDS):
+        problems.append(
+            f"bank I_TP {STACK_MOE_INTERMEDIATE_SIZE} is not a multiple of "
+            f"BLOCK_QUANT_SIZE * NUM_SHARDS = {BLOCK_QUANT_SIZE * NUM_SHARDS}"
+        )
+    if STACK_TOKENS % TILE_SIZE:
+        problems.append(
+            f"tokens {STACK_TOKENS} is not a whole number of TILE_SIZE={TILE_SIZE} "
+            f"rows, which the dense seam refuses and does not pad"
+        )
+    if STACK_HIDDEN_SIZE % len(_STACK_GAIN_VALUES):
+        problems.append(
+            f"hidden {STACK_HIDDEN_SIZE} is not a multiple of "
+            f"{len(_STACK_GAIN_VALUES)}, so the gain pattern does not tile it"
+        )
+    if problems:
+        raise VacuousControlError(
+            "this stack's geometry is inadmissible: " + "; ".join(problems)
+        )
+
+
+def _stack_bank_operands() -> dict:
+    """The bank's three weights and three ``TILE_SIZE`` grids at the stack's widths.
+
+    The checkpoint's orientations, which is what ``prepare_scale_operands`` declares
+    it takes: gate and up ``[E, I, H]``, down ``[E, H, I]``. Item 2's builder is not
+    reused because its exponent regimes are written for four column blocks of I and
+    this bank has two -- and its 1024-wide bank does not fit this stack's parameter
+    budget. Nothing here is negated: the clamp discrimination is items 1 to 3's, and
+    an unsigned draw is what keeps the sums out of the cancelling regime.
+    """
+    h = STACK_HIDDEN_SIZE
+    i = STACK_MOE_INTERMEDIATE_SIZE
+    e = STACK_EXPERTS
+    blocks = i // BLOCK_QUANT_SIZE
+    for label, exponents in (
+        ("gate", STACK_BANK_GATE_EXPONENTS),
+        ("up", STACK_BANK_UP_EXPONENTS),
+        ("down", STACK_BANK_DOWN_EXPONENTS),
+    ):
+        if len(exponents) != blocks:
+            raise VacuousControlError(
+                f"the bank's {label} projection declares {len(exponents)} scale "
+                f"regimes for {blocks} blocks of I={i}"
+            )
+    grid_extents = dict(intermediate=i, hidden=h, experts=e)
+    return {
+        "gate_proj_weight": (
+            _fp8_grid_values(SEED_STACK_BANK_GATE, e, i, h).to(_FP8),
+            _routed_tile_grid(
+                STACK_BANK_GATE_EXPONENTS, i_first=True, **grid_extents),
+        ),
+        "up_proj_weight": (
+            _fp8_grid_values(SEED_STACK_BANK_UP, e, i, h).to(_FP8),
+            _routed_tile_grid(
+                STACK_BANK_UP_EXPONENTS, i_first=True, **grid_extents),
+        ),
+        "down_proj_weight": (
+            _fp8_grid_values(SEED_STACK_BANK_DOWN, e, h, i).to(_FP8),
+            _routed_tile_grid(
+                STACK_BANK_DOWN_EXPONENTS, i_first=False, **grid_extents),
+        ),
+    }
+
+
+def _stack_fixture(model=None) -> dict:
+    """The whole tiny stack, every mapped tensor bound and every load-time prep run.
+
+    Returns the model, its config, the per-layer attention operands, the per-layer
+    MLP operands, the embedding table and the final gain -- everything the reference
+    reads. Nothing here is read back out of the implementation: each operand is the
+    tensor this function drew and then bound.
+
+    THE MLP PARTITION IS MEASURED OFF THE BUILT TREE, not declared. ``_build_mlp`` is
+    the single authority for which layers carry experts, and an item that assumed the
+    split would still pass if the split moved -- while every reference below would be
+    computing the wrong branch.
+
+    ``model`` LETS ITEM 7 BIND THE SAME WEIGHTS ONTO THE STACK THE ROOT BUILT, rather
+    than onto one this function builds. Item 7 cannot hand its root a stack -- the
+    root's ``__init__`` builds its own -- so the direction is inverted here instead of
+    duplicating 130 lines of materialisation. Passed ``None``, this function builds the
+    stack exactly as it did for item 6, and its config comes from
+    :func:`_stack_text_config` either way; a caller supplying a model supplies one
+    built from that same config, which the layer-count check below enforces.
+    """
+    model_fp8 = _impl()
+    from vllm_neuron.model.glm5_next.config import Glm5NextConfig
+
+    _stack_geometry_preconditions()
+    cfg = _stack_text_config()
+    if model is None:
+        model = model_fp8.Glm5NextModel(Glm5NextConfig(text_config=cfg), 1)
+    layers = list(model.layers)
+    if len(layers) != STACK_LAYERS:
+        raise VacuousControlError(
+            f"the config declares {STACK_LAYERS} layers and the tree built "
+            f"{len(layers)}"
+        )
+
+    dense_at = [
+        index for index, layer in enumerate(layers)
+        if isinstance(layer.mlp, model_fp8.Glm5NextDenseMLP)
+    ]
+    moe_at = [
+        index for index, layer in enumerate(layers)
+        if isinstance(layer.mlp, model_fp8.Glm5NextMoEBlock)
+    ]
+    print(f"TINYFWD|stack_partition|dense_layers={dense_at}|moe_layers={moe_at}"
+          f"|first_k_dense_replace={int(cfg.first_k_dense_replace)}")
+    if dense_at != list(range(STACK_DENSE_LAYERS)) or moe_at != list(
+        range(STACK_DENSE_LAYERS, STACK_LAYERS)
+    ):
+        raise VacuousControlError(
+            f"_build_mlp put dense MLPs at {dense_at} and expert blocks at "
+            f"{moe_at}; this item's references are written for the first "
+            f"{STACK_DENSE_LAYERS} dense and the rest sparse"
+        )
+    if len(dense_at) != len(STACK_DENSE_SEED_OFFSETS):
+        raise VacuousControlError(
+            f"{len(dense_at)} dense layers and {len(STACK_DENSE_SEED_OFFSETS)} "
+            f"seed offsets; two layers sharing a draw cannot show that each read "
+            f"its own weights"
+        )
+
+    # ---- THE TWO MAPPED ROOT TENSORS. The table is drawn on the unsigned fp8 grid
+    # and scaled down by a power of two, so the residual stream starts POSITIVE and
+    # every value is exact in bf16 -- the stack's own dtype rounds nothing on entry.
+    table = (
+        _fp8_grid_values(SEED_STACK_EMBED, STACK_VOCAB_SIZE, STACK_HIDDEN_SIZE)
+        * float(2.0**HIDDEN_SCALE_EXPONENT)
+    ).to(torch.bfloat16)
+    model.embed_tokens_weight = torch.nn.Parameter(table, requires_grad=False)
+    final_gain = _stack_gain(2 * STACK_LAYERS)
+    model.norm_weight = torch.nn.Parameter(final_gain, requires_grad=False)
+
+    attention_operands = []
+    mlp_operands: dict = {}
+    for index, layer in enumerate(layers):
+        layer.input_layernorm_weight = torch.nn.Parameter(
+            _stack_gain(2 * index), requires_grad=False
+        )
+        layer.post_attention_layernorm_weight = torch.nn.Parameter(
+            _stack_gain(2 * index + 1), requires_grad=False
+        )
+        attention_operands.append(
+            _materialise_mla_attention(
+                layer.self_attn,
+                cfg,
+                seed=SEED_STACK_ATTENTION + index,
+                output_damping=STACK_ATTENTION_DAMPING,
+            )
+        )
+        if index in dense_at:
+            operands = _shared_at_routed_operands(
+                seed_offset=STACK_DENSE_SEED_OFFSETS[dense_at.index(index)]
+            )
+            for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+                _attach(layer.mlp, leaf, *operands[leaf])
+            mlp_operands[index] = operands
+            continue
+
+        # ---- THE EXPERT BLOCK. Item 4's recipe with the shared half absent: the
+        # config declares ``n_shared_experts=0``, so no shared expert is built and
+        # the block's forward returns the routed half. That add is item 4's own
+        # certification and re-running it here would cost 1.5 M parameters.
+        operands = _stack_bank_operands()
+        for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            _attach(layer.mlp.experts, leaf, *operands[leaf])
+        built = layer.mlp.experts.prepare_scale_operands(
+            gate_proj_weight=operands["gate_proj_weight"][0],
+            up_proj_weight=operands["up_proj_weight"][0],
+            down_proj_weight=operands["down_proj_weight"][0],
+            gate_proj_scale=operands["gate_proj_weight"][1],
+            up_proj_scale=operands["up_proj_weight"][1],
+            down_proj_scale=operands["down_proj_weight"][1],
+        )
+        if built != 4:
+            raise VacuousControlError(
+                f"the bank's load-time prep built {built} operands; its forward "
+                f"looks up 4"
+            )
+        if getattr(layer.mlp, "shared_experts", None) is not None:
+            raise VacuousControlError(
+                "the block built a shared expert at n_shared_experts=0, so this "
+                "item's reference for the sparse layer is missing a term"
+            )
+        generator = torch.Generator().manual_seed(SEED_STACK_ROUTER)
+        layer.mlp.experts.router_weight = torch.nn.Parameter(
+            (
+                torch.randn(
+                    STACK_HIDDEN_SIZE, STACK_EXPERTS, generator=generator
+                )
+                * MOE_ROUTER_WEIGHT_SCALE
+            ).to(torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.mlp.experts.router_bias = torch.nn.Parameter(
+            (
+                torch.randn(STACK_EXPERTS, generator=generator)
+                * MOE_ROUTER_BIAS_SCALE
+            ).to(torch.bfloat16),
+            requires_grad=False,
+        )
+        mlp_operands[index] = operands
+
+    parameters = sum(int(p.numel()) for p in model.parameters() if p is not None)
+    widths = {
+        "qk_nope_head_dim": int(cfg.qk_nope_head_dim),
+        "qk_rope_head_dim": int(cfg.qk_rope_head_dim),
+        "v_head_dim": int(cfg.v_head_dim),
+        "index_head_dim": int(cfg.index_head_dim),
+    }
+    print(f"TINYFWD|stack_fixture|parameters={parameters}|bound={MAX_PARAMETERS}"
+          f"|layers={STACK_LAYERS}|hidden={STACK_HIDDEN_SIZE}"
+          f"|tokens={STACK_TOKENS}|head_widths={sorted(widths.items())}"
+          f"|head_bound={MAX_HEAD_DIM}")
+    if parameters >= MAX_PARAMETERS:
+        raise VacuousControlError(
+            f"the tiny stack holds {parameters} parameters, at or past the adopted "
+            f"bound of {MAX_PARAMETERS}"
+        )
+    over = {name: width for name, width in widths.items() if width > MAX_HEAD_DIM}
+    if over:
+        raise VacuousControlError(
+            f"{sorted(over.items())} exceeds the adopted tiny bound "
+            f"head_dim <= {MAX_HEAD_DIM}"
+        )
+    return {
+        "model": model,
+        "cfg": cfg,
+        "layers": layers,
+        "table": table,
+        "final_gain": final_gain,
+        "attention_operands": attention_operands,
+        "mlp_operands": mlp_operands,
+        "dense_at": dense_at,
+        "moe_at": moe_at,
+    }
+
+
+def _stack_carriers(layers, selection: dict) -> list:
+    """One carrier mapping per layer, in stack order, each with its OWN caches.
+
+    Both caches are written in place by the path, so two layers sharing one would
+    have the second reading the first's latents. The eight keys are exactly
+    ``Glm5NextDSALayer.forward``'s required keyword set plus ``slot_mapping``;
+    ``tail`` and ``position`` are the decode leg's and are left at their defaults,
+    which is what makes this the PREFILL leg.
+    """
+    return [
+        {
+            "latent_cache": _mla_latent_cache(
+                layer.self_attn, tokens=STACK_TOKENS
+            ),
+            "pool_cache": _mla_pool_cache(pages=STACK_PAGES),
+            "seq_lens": selection["seq_lens"],
+            "start_position": 0,
+            "softmax_scale": MLA_SOFTMAX_SCALE,
+            "max_seq_len": STACK_TOKENS,
+            "page_size": MLA_PAGE_SIZE,
+            "slot_mapping": selection["slot_mapping"],
+        }
+        for layer in layers
+    ]
+
+
+def _stack_attention_half(layer, raw, gains, hidden, cfg, selection):
+    """One layer's attention half in torch, from the tensor that layer RECEIVED.
+
+    Returns ``(normed, topk_indices, attended)`` where ``attended`` is fp32 and
+    carries no residual -- the add is the caller's, exactly as it is in the layer.
+
+    THE INDEXER IS EXECUTED, item 4's and item 5's convention on selectors, and here
+    it also removes this item's only real fragility. A pool selection is a
+    DISCONTINUOUS function of its input: two candidate scores within float noise of
+    each other can swap, and then both sides compute a different -- individually
+    correct -- attention. Executing the indexer on the very tensor the layer was
+    handed makes the reference's selection the layer's own selection by construction,
+    so this item measures the composition instead of tie-breaking.
+
+    ``normed.float()`` REACHES THE DENSE REFERENCE while the bf16 ``normed`` reaches
+    the indexer. Same values either way -- bf16 to fp32 is exact -- and it keeps the
+    reference in fp32 so the comparison absorbs exactly ONE bf16 rounding, the
+    forward's own, rather than two.
+    """
+    normed = _ffn_norm(
+        hidden, layer.input_layernorm_weight, float(cfg.rms_norm_eps)
+    )
+    attention = layer.self_attn
+    q_latent = attention.project_query_latent(normed)
+    topk_indices = attention.indexer(
+        normed,
+        q_latent,
+        _mla_pool_cache(pages=STACK_PAGES),
+        selection["seq_lens"],
+        max_seq_len=STACK_TOKENS,
+        page_size=MLA_PAGE_SIZE,
+        slot_mapping=selection["slot_mapping"],
+    )
+    attended = _mla_dense_reference(
+        attention,
+        raw,
+        gains,
+        normed.float(),
+        _mla_latent_cache(attention, tokens=STACK_TOKENS),
+        topk_indices,
+        softmax_scale=MLA_SOFTMAX_SCALE,
+    )
+    return normed, topk_indices, attended
+
+
+def _stack_ffn_half(layer, hidden, cfg, operands, *, routed: bool, gain=None,
+                    router_input=None) -> dict:
+    """One layer's FFN half in torch, from the tensor that layer's MLP RECEIVED.
+
+    Returns whichever of :func:`_dense_output`'s or :func:`_routed_output`'s mappings
+    applies; both carry ``out``, ``gate`` and ``up``, so the caller reads one shape.
+    The residual add is the caller's.
+
+    ``gain`` DEFAULTS TO THE LAYER'S POST-ATTENTION GAIN, which is the gain the FFN
+    norm uses, and is an argument only so a control can recompute this half with the
+    layer's INPUT gain and require the answer to leave the band.
+
+    ``router_input`` DEFAULTS TO THE PRE-NORM TENSOR, which is what the fused router
+    consumes: it applies the FFN RMSNorm itself, inside the kernel, so it takes the
+    un-normalised states together with the norm's gain. It is an argument for the same
+    reason -- a control feeds it the normalised tensor, which normalises twice and is
+    a different router.
+    """
+    limit = float(cfg.swiglu_limit)
+    if gain is None:
+        gain = layer.post_attention_layernorm_weight
+    normed = _ffn_norm(hidden, gain, float(cfg.rms_norm_eps))
+    if not routed:
+        return _dense_output({**operands, "hidden": normed}, limit, -limit, limit)
+    if router_input is None:
+        router_input = hidden
+    _logits, _index, affinities = layer.mlp.experts.route_tokens(
+        router_input.unsqueeze(0), gain, cfg
+    )
+    return _routed_output(
+        {**operands, "hidden": normed, "expert_affinities": affinities},
+        mode=_POST_SCALE,
+        gate_max=limit,
+        gate_min=None,
+        up_max=limit,
+        up_min=-limit,
+    )
+
+
+def _stack_outside_tolerance(label: str, moved: torch.Tensor,
+                             base: torch.Tensor) -> None:
+    """One control: ``moved`` must fall OUTSIDE this item's band.
+
+    This file's declared control form -- recompute the reference with one branch
+    changed and require the result to leave the tolerance the item passes inside, so
+    a fixture that stopped discriminating fails as a control instead of passing as an
+    item.
+    """
+    outside = not torch.allclose(moved.float(), base.float(), rtol=RTOL, atol=ATOL)
+    gap = float((moved.float() - base.float()).abs().max() / base.abs().max())
+    print(f"TINYFWD|stack_control|branch={label}|outside_tolerance={outside}"
+          f"|gap={gap:.6f}")
+    if not outside:
+        raise VacuousControlError(
+            f"{label}: the change leaves the reference inside rtol={RTOL}, "
+            f"atol={ATOL}, so this item cannot tell the two apart"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 6 of 7 -- ``Glm5NextModel.forward``.                                    #
+# Certifying component: ``model_fp8.Glm5NextModel.forward`` together with its   #
+# two private helpers, ``_ffn_half`` and ``_rms_norm``.                         #
+#                                                                              #
+# WHAT IT CERTIFIES. Four things, and nothing a callee already owns: the        #
+# embedding is an INDEX into the mapped table; every layer runs once, in config #
+# order, on the previous layer's output; each layer receives EXACTLY its own    #
+# carrier mapping; each layer's FFN half normalises with that layer's own       #
+# post-attention gain and takes the MLP branch ``_build_mlp`` gave it; and the  #
+# stack's final norm closes the chain. The attention numerics are item 5's, the #
+# expert bank's are items 2 and 4's, the dense MLP's are item 1's.              #
+#                                                                              #
+# THE COMPARISON IS MADE AT THE LAYER BOUNDARIES THE FORWARD ITSELF PRODUCED,   #
+# and that is what makes this item sound rather than merely convenient. Two     #
+# torch forward hooks record what each layer was handed and what it returned;   #
+# the reference for each half is then built from the recorded tensor and         #
+# compared against the next recorded tensor. An end-to-end comparison against a #
+# reference that carried its OWN hidden states would be hostage to a pool       #
+# selection flipping between the two chains -- the selection is a discontinuous #
+# function of its input and the two chains differ by kernel noise -- so it      #
+# would measure tie-breaking rather than composition. The end-to-end equality   #
+# FOLLOWS from the chain below and is stated rather than separately measured.   #
+#                                                                              #
+# THE HOOKS NEED ``with_kwargs``, torch 2.0's. An older torch raises            #
+# ``TypeError`` at registration, which is a red run and not a quiet pass, and   #
+# both hooks are asserted to have fired once per layer before anything is read  #
+# out of them.                                                                  #
+#                                                                              #
+# THE PRECISION BUDGET, STATED SO IT CAN BE CHECKED RATHER THAN TRUSTED. This   #
+# stack runs in bf16 -- the checkpoint's activation dtype and the dtype every    #
+# seam on it declares -- while every reference below stays in fp32. So each      #
+# comparison carries the forward's OWN roundings and none of its own. The        #
+# attention boundary carries one: half an ulp, 2**-9 = 0.20% of a value, 20% of  #
+# this item's 1% ``rtol``. The FFN boundary carries two, the sublayer output and  #
+# the residual sum, so at most 0.39% or 39% of the budget. ``attend()`` also     #
+# rounds its latent-space result to the stream dtype mid-chain, which item 5     #
+# never sees because item 5 hands the forward fp32; damping ``o_proj`` by an     #
+# eighth (:data:`STACK_ATTENTION_DAMPING`) is what keeps that term under 5%.     #
+# NONE OF THESE FIGURES IS MEASURED YET: no run of this file exists, so the      #
+# transcript of the first counted run is what adjudicates the arithmetic above.  #
+#                                                                              #
+# THE STACK IS ONE FAMILY AND ONE PHASE, disclosed rather than implied. Every   #
+# layer is ``deepseek_sparse_attention`` and every carrier is a prefill         #
+# carrier; the linear-attention family is ``inc-glm53f-038``'s and the decode   #
+# leg is ``inc-glm53f-042``'s and ``inc-glm53f-051``'s. What this item measures #
+# about the loop -- that it holds no per-family branch and hands each layer its #
+# own mapping -- is measured exactly as well by one family as by two.           #
+#                                                                              #
+# THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC    #
+# carrier is ``inc-glm53f-030b``'s. The reference implementation carries        #
+# ``hc_mult`` parallel residual streams between layers and mixes each sublayer  #
+# output back through a hyper-connection at both sites                          #
+# (``modeling_glm5_next.py:1477``, ``:1316-1318``, ``:1325-1327``, ``:1493``,   #
+# ``:302``). This item certifies the ONE-STREAM add and nothing about the       #
+# four-stream carrier; at ``hc_mult`` 1 the reference does not degenerate to an #
+# add either, because its gates are sigmoids plus an epsilon.                    #
+# --------------------------------------------------------------------------- #
+def test_tiny_model_forward_matches_the_reference() -> None:
+    """The decoder stack equals its torch composition, layer boundary by boundary.
+
+    ``inc-glm53f-054a`` item 6 of 7. D1.4 certifying component:
+    ``Glm5NextModel.forward`` with ``_ffn_half`` and ``_rms_norm`` -- the embedding
+    index, the per-layer loop and its two residual adds, the FFN branch and its gain,
+    and the final norm.
+    """
+    fixture = _stack_fixture()
+    model, cfg, layers = fixture["model"], fixture["cfg"], fixture["layers"]
+    quant_config = _quant_config()
+    selection = _mla_selection_operands(tokens=STACK_TOKENS, pages=STACK_PAGES)
+    carriers = _stack_carriers(layers, selection)
+
+    input_ids = torch.randint(
+        0, STACK_VOCAB_SIZE, (STACK_TOKENS,),
+        generator=torch.Generator().manual_seed(SEED_STACK_IDS),
+        dtype=torch.int64,
+    )
+    if int(input_ids.unique().numel()) < STACK_LAYERS:
+        raise VacuousControlError(
+            f"the token ids take only {int(input_ids.unique().numel())} distinct "
+            f"values; a near-constant embedding makes every row of the residual "
+            f"stream alike and the comparison stops discriminating"
+        )
+
+    # ---- THE HOOKS. One pre-hook and one post-hook per layer, recording the tensor
+    # and the mapping each layer was handed and the tensor it returned.
+    recorded_in: list = []
+    recorded_out: list = []
+
+    def _record_input(module, args, kwargs):
+        recorded_in.append((module, args, kwargs))
+
+    def _record_output(module, args, kwargs, output):
+        recorded_out.append((module, output))
+
+    handles = []
+    for layer in layers:
+        handles.append(
+            layer.register_forward_pre_hook(_record_input, with_kwargs=True)
+        )
+        handles.append(
+            layer.register_forward_hook(_record_output, with_kwargs=True)
+        )
+
+    try:
+        _reset_seam_counters()
+        before = _read_seam_counters()
+        got = model.forward(
+            input_ids,
+            layer_carriers=carriers,
+            quant_config=quant_config,
+        )
+        after = _read_seam_counters()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # ---- THE REGISTERED ROUTE PREDICATE, around this item's own forward. EVERY
+    # FIGURE IS ITEM 5's PER-LAYER SET TIMES THE LAYER COUNT, plus item 1's three
+    # dense dispatches per dense layer and item 4's two per sparse layer. The
+    # per-layer figures are not re-derived here: item 5 reads them off
+    # ``test_dsa_layer.py``'s landed closed form, and that table is per layer per
+    # PHASE (``DECLARED_PER_LAYER``), so it does not move with the token count.
+    _assert_route_predicate(
+        "6 the decoder stack",
+        {
+            "mla_projection": 9 * STACK_LAYERS,
+            "mla_absorb": 2 * STACK_LAYERS,
+            "mla_sparse": 1 * STACK_LAYERS,
+            "dsa_kpool_hadamard": 2 * STACK_LAYERS,
+            "dsa_paged_gather": 1 * STACK_LAYERS,
+            "dsa_score_gemm": 1 * STACK_LAYERS,
+            "dsa_topk_select": 1 * STACK_LAYERS,
+            "dsa_index_expand": 1 * STACK_LAYERS,
+            "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
+            "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+            "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+        },
+        before,
+        after,
+    )
+
+    # ---- THE HOOKS FIRED ONCE PER LAYER, IN STACK ORDER. Read before anything is
+    # taken out of them: a loop that skipped a layer, ran one twice or ran them out
+    # of order is a different list here, and every comparison below stands on this.
+    print(f"TINYFWD|stack_trace|recorded_in={len(recorded_in)}"
+          f"|recorded_out={len(recorded_out)}|layers={len(layers)}")
+    if len(recorded_in) != len(layers) or len(recorded_out) != len(layers):
+        raise VacuousControlError(
+            f"the hooks recorded {len(recorded_in)} entries and "
+            f"{len(recorded_out)} exits for {len(layers)} layers, so the forward "
+            f"did not run each layer exactly once"
+        )
+    for index, layer in enumerate(layers):
+        if recorded_in[index][0] is not layer or recorded_out[index][0] is not layer:
+            raise VacuousControlError(
+                f"position {index} of the recorded order is not layer {index} of "
+                f"the stack, so the loop did not run the layers in config order"
+            )
+
+    # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX. Exact equality, not a tolerance:
+    # the lookup copies rows and computes nothing, so a difference of any size is a
+    # different function.
+    first_input = recorded_in[0][1][0]
+    if not torch.equal(first_input, fixture["table"][input_ids]):
+        raise VacuousControlError(
+            "the first layer was handed a tensor that is not "
+            "embed_tokens_weight[input_ids], so the embedding is not the index "
+            "this forward's docstring declares"
+        )
+
+    # ---- CONJUNCT 2: EACH LAYER RECEIVED EXACTLY ITS OWN CARRIER. Identity, not
+    # equality: ``**mapping`` hands the callee the very objects the caller put in the
+    # mapping, so ``is`` is the sharp test and a carrier built for another layer --
+    # another layer's latent cache above all -- fails it.
+    for index, carrier in enumerate(carriers):
+        got_kwargs = recorded_in[index][2]
+        if set(got_kwargs) != set(carrier):
+            raise VacuousControlError(
+                f"layer {index} was handed the keywords {sorted(got_kwargs)} and "
+                f"its carrier declares {sorted(carrier)}"
+            )
+        wrong = [key for key in carrier if got_kwargs[key] is not carrier[key]]
+        if wrong:
+            raise VacuousControlError(
+                f"layer {index} received {wrong} from some other object than its "
+                f"own carrier mapping, so the per-layer state is not bound to the "
+                f"layer that owns it"
+            )
+    print(f"TINYFWD|stack_carriers|layers={len(carriers)}"
+          f"|keys={sorted(carriers[0])}|bound_by_identity=True")
+
+    # ---- CONJUNCT 3: THE ATTENTION HALF AND ITS RESIDUAL ADD, per layer. The
+    # reference reads the recorded input, so its selection is that layer's own.
+    for index, layer in enumerate(layers):
+        raw, gains = fixture["attention_operands"][index]
+        hidden = recorded_in[index][1][0]
+        _normed, topk_indices, attended = _stack_attention_half(
+            layer, raw, gains, hidden, cfg, selection
+        )
+        expected = hidden.float() + attended.float()
+        produced = recorded_out[index][1].float()
+        print(f"TINYFWD|stack_attention|layer={index}"
+              f"|selected={tuple(topk_indices.shape)}"
+              f"|sentinels={int((topk_indices < 0).sum())}"
+              f"|attention_share="
+              f"{float(attended.abs().max() / expected.abs().max()):.6f}"
+              f"|max_abs_diff={float((produced - expected).abs().max()):.10g}"
+              f"|peak_reference={float(expected.abs().max()):.10g}")
+        torch.testing.assert_close(produced, expected, rtol=RTOL, atol=ATOL)
+
+    # ---- CONJUNCT 4: THE FFN HALF, ITS GAIN, ITS BRANCH AND ITS RESIDUAL ADD. For
+    # every layer but the last the next recorded input is the answer; for the last
+    # one the stack's final norm is, which is conjunct 5.
+    ffn = []
+    for index, layer in enumerate(layers):
+        hidden = recorded_out[index][1]
+        routed = index in fixture["moe_at"]
+        half = _stack_ffn_half(
+            layer, hidden, cfg, fixture["mlp_operands"][index], routed=routed
+        )
+        ffn.append(half)
+        limit = float(cfg.swiglu_limit)
+        print(f"TINYFWD|stack_ffn|layer={index}"
+              f"|branch={'routed' if routed else 'dense'}|limit={limit}"
+              f"|gate_peak={float(half['gate'].abs().max()):.4f}"
+              f"|up_peak={float(half['up'].abs().max()):.4f}"
+              f"|clamp_binds={bool(float(half['gate'].abs().max()) > limit or float(half['up'].abs().max()) > limit)}"
+              f"|ffn_share={float(half['out'].abs().max() / hidden.abs().max()):.6f}")
+        if routed:
+            print(f"TINYFWD|stack_conditioning|layer={index}"
+                  f"|condition={half['condition']:.4f}"
+                  f"|block_share={half['share']:.4f}"
+                  f"|bound={STACK_MAX_CONDITION}")
+            if half["condition"] > STACK_MAX_CONDITION:
+                raise VacuousControlError(
+                    f"layer {index}'s bank output has condition "
+                    f"{half['condition']:.4f} against a bound of "
+                    f"{STACK_MAX_CONDITION}: the output is a small residue of "
+                    f"large opposing terms, so every reading here is inflated by "
+                    f"a vanishing denominator"
+                )
+        expected = hidden.float() + half["out"].float()
+        if index + 1 < len(layers):
+            torch.testing.assert_close(
+                recorded_in[index + 1][1][0].float(), expected,
+                rtol=RTOL, atol=ATOL,
+            )
+
+    # ---- CONJUNCT 5: THE FINAL NORM CLOSES THE CHAIN, on the last layer's own
+    # output rather than on any earlier one.
+    last = recorded_out[-1][1]
+    final_input = last.float() + ffn[-1]["out"].float()
+    expected = _ffn_norm(final_input, fixture["final_gain"], float(cfg.rms_norm_eps))
+    if tuple(got.shape) != (STACK_TOKENS, STACK_HIDDEN_SIZE):
+        raise ReferenceShapeError(
+            f"the forward returned {tuple(got.shape)}, expected "
+            f"{(STACK_TOKENS, STACK_HIDDEN_SIZE)}"
+        )
+    print(f"TINYFWD|stack_compare|max_abs_diff="
+          f"{float((got.float() - expected.float()).abs().max()):.10g}"
+          f"|peak_reference={float(expected.abs().max()):.10g}")
+    torch.testing.assert_close(got.float(), expected.float(), rtol=RTOL, atol=ATOL)
+
+    # ---- CONTROL A: EACH LAYER READ ITS OWN MLP WEIGHTS. The two dense layers'
+    # references are swapped and the answer must leave the band, or two layers
+    # holding different weights would be indistinguishable from two sharing one set.
+    first_dense, second_dense = fixture["dense_at"]
+    _stack_outside_tolerance(
+        f"layer {second_dense}'s FFN recomputed with layer {first_dense}'s weights",
+        _stack_ffn_half(
+            layers[second_dense], recorded_out[second_dense][1], cfg,
+            fixture["mlp_operands"][first_dense], routed=False,
+        )["out"],
+        ffn[second_dense]["out"],
+    )
+
+    # ---- CONTROL B: THE FFN NORM USES THE POST-ATTENTION GAIN. Recomputed with the
+    # same layer's INPUT gain, which is the neighbouring mapped tensor and the one a
+    # transposed read would reach.
+    _stack_outside_tolerance(
+        f"layer {first_dense}'s FFN normalised with its INPUT gain",
+        _stack_ffn_half(
+            layers[first_dense], recorded_out[first_dense][1], cfg,
+            fixture["mlp_operands"][first_dense], routed=False,
+            gain=layers[first_dense].input_layernorm_weight,
+        )["out"],
+        ffn[first_dense]["out"],
+    )
+
+    # ---- CONTROL C: THE ROUTER READS THE PRE-NORM TENSOR. ``_ffn_half`` passes two
+    # activation tensors to the block and their ORDER is this forward's decision;
+    # item 4 owns what the block does with them. Feeding the router the normalised
+    # states normalises twice inside the fused kernel, which is a different router.
+    moe_layer = fixture["moe_at"][0]
+    moe_input = recorded_out[moe_layer][1]
+    _stack_outside_tolerance(
+        f"layer {moe_layer}'s router fed the FFN-normalised tensor",
+        _stack_ffn_half(
+            layers[moe_layer], moe_input, cfg,
+            fixture["mlp_operands"][moe_layer], routed=True,
+            router_input=_ffn_norm(
+                moe_input,
+                layers[moe_layer].post_attention_layernorm_weight,
+                float(cfg.rms_norm_eps),
+            ),
+        )["out"],
+        ffn[moe_layer]["out"],
+    )
+
+    # ---- CONTROL D: A CARRIER LIST THAT DOES NOT MATCH THE STACK REFUSES BY NAME,
+    # and it refuses before any layer runs. A short sequence would otherwise run a
+    # prefix of the stack and return a plausible tensor.
+    with pytest.raises(ValueError, match="one mapping per layer"):
+        model.forward(
+            input_ids,
+            layer_carriers=carriers[:-1],
+            quant_config=quant_config,
+        )
+    print(f"TINYFWD|stack_control|branch={len(carriers) - 1} carriers for "
+          f"{len(layers)} layers|refused=True")
+
+    # ---- CONTROL E: A MAPPED TENSOR THAT WAS NEVER LOADED REFUSES BY NAME AND BY
+    # MAP LINE, and no seam moves -- which is what tells a named refusal from a
+    # forward that ran and produced zeros.
+    model.embed_tokens_weight = None
+    _reset_seam_counters()
+    unloaded_before = _read_seam_counters()
+    with pytest.raises(ValueError, match="weight_loaders_fp8.py:378"):
+        model.forward(
+            input_ids,
+            layer_carriers=carriers,
+            quant_config=quant_config,
+        )
+    unloaded_after = _read_seam_counters()
+    moved = {
+        seam: unloaded_after[seam][0] - unloaded_before[seam][0]
+        for seam in _SEAMS
+        if unloaded_after[seam][0] != unloaded_before[seam][0]
+    }
+    print(f"TINYFWD|stack_control|branch=forward with no embedding table"
+          f"|refused=True|seams_that_moved={sorted(moved.items())}")
+    if moved:
+        raise VacuousControlError(
+            f"the refusal ran after {sorted(moved.items())} dispatched, so it is "
+            f"not reached before the stack starts"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Item 7's own fixture geometry. The root adds exactly two things to item 6's   #
+# stack -- a head tensor and a row selection -- so everything else below is     #
+# item 6's, reused rather than redrawn.                                         #
+# --------------------------------------------------------------------------- #
+#: The head weight's power-of-two scale. Chosen so the logits land near 1.0:
+#: each logit sums ``STACK_HIDDEN_SIZE`` = 512 products of a post-norm activation
+#: (order 1) with a head value on the unsigned fp8 grid (mean 1/2), so the sum is
+#: about ``512 * 0.5 * 2**e``, which is about 1 at ``e = -8``. A number near 1 is
+#: what keeps ``ATOL`` and ``RTOL`` both meaningful in the same comparison.
+ROOT_HEAD_SCALE_EXPONENT = -8
+
+SEED_ROOT_HEAD = 5481
+
+#: The rows this item asks for, and every property of this tuple is load-bearing.
+#: It is OUT OF ORDER (the last token first), so a slice or a sort cannot produce
+#: it; it REPEATS one row, so a de-duplicating implementation returns the wrong
+#: shape; and it is SHORTER than the token count, so a forward that projected
+#: every row would fail on shape. The repeat is not contrived: the runner pads
+#: its own ``logits_indices`` by repeating the last real index
+#: (``neuron_model_runner.py:3896-3900``), and builds them ``dtype=torch.long``
+#: (``:2941``), which is the dtype this item passes.
+ROOT_SAMPLING_POSITIONS = (STACK_TOKENS - 1, 0, 7, 7)
+
+#: The same conditioning bound item 6 uses on the bank, applied to the head's
+#: dot products. All-positive terms give exactly 1.0; a cancelling sum inflates
+#: every reading taken from it.
+ROOT_MAX_CONDITION = STACK_MAX_CONDITION
+
+
+def _root_config(**overrides):
+    """The root's ``Glm5NextConfig``: the tiny stack plus the PINNED quantisation fields.
+
+    THE QUANTISATION FIELDS ARE THE CHECKPOINT'S, not this dataclass's defaults, and
+    that matters because the root resolves the policy ITSELF from this object -- there
+    is no ``quant_config`` argument to hand it. ``Glm5NextConfig``'s defaults happen to
+    agree with the pinned checkpoint on ``quant_method``, ``activation_scheme`` and
+    ``weight_block_size`` (``config.py:437-441`` against the fixture's
+    ``quantization_config``), so an item that took the defaults would pass today and
+    stop measuring the campaign's registered policy the moment either side moved.
+    Lifting them from the digest-verified fixture is what ties this item to it.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextConfig
+
+    raw = _pinned_raw_config()["quantization_config"]
+    text = _stack_text_config(**overrides)
+    return Glm5NextConfig(
+        text_config=text,
+        tie_word_embeddings=bool(text.tie_word_embeddings),
+        quant_method=raw["quant_method"],
+        activation_scheme=raw["activation_scheme"],
+        weight_block_size=list(raw["weight_block_size"]),
+        modules_to_not_convert=list(raw["modules_to_not_convert"]),
+        fmt=raw["fmt"],
+    )
+
+
+def _root_head_weight() -> torch.Tensor:
+    """``[vocab, hidden]`` head weight, on the unsigned fp8 grid and exact in bf16.
+
+    UNSIGNED for the reason this module's docstring gives and this item measures: a
+    logit is a 512-term dot product, and a signed draw against a positive residual
+    stream would make each one a small residue of large opposing terms, so the
+    conditioning check below would report a large number and every tolerance reading
+    would be inflated by a vanishing denominator.
+    """
+    return (
+        _fp8_grid_values(SEED_ROOT_HEAD, STACK_VOCAB_SIZE, STACK_HIDDEN_SIZE)
+        * float(2.0**ROOT_HEAD_SCALE_EXPONENT)
+    ).to(torch.bfloat16)
+
+
+def _root_fixture(**overrides) -> dict:
+    """The root module with item 6's stack bound inside it, plus its head tensor.
+
+    The root builds its OWN ``Glm5NextModel`` in ``__init__``, so the weights are bound
+    onto that stack rather than onto one this file built -- :func:`_stack_fixture` takes
+    the model for exactly this reason. Everything item 6's fixture returns is returned
+    here too, so the references below are item 6's references.
+
+    ``world_size`` IS ASSERTED, not assumed. The root resolves it from the process
+    group (``model_fp8.py:179-182``) and every per-rank width in this fixture is
+    written for one rank, so a distributed session would shard the tree while this
+    file's references stayed whole.
+    """
+    model_fp8 = _impl()
+    config = _root_config(**overrides)
+    root = model_fp8.Glm5NextForConditionalGeneration(config)
+    if int(root.world_size) != 1:
+        raise VacuousControlError(
+            f"the root resolved world_size={root.world_size}; every width in this "
+            f"fixture is written for a single rank"
+        )
+    fixture = _stack_fixture(model=root.model)
+    cfg = fixture["cfg"]
+    mismatched = {
+        name: (getattr(root.text_config, name), getattr(cfg, name))
+        for name in ("hidden_size", "num_hidden_layers", "vocab_size",
+                     "first_k_dense_replace")
+        if getattr(root.text_config, name) != getattr(cfg, name)
+    }
+    if mismatched:
+        raise VacuousControlError(
+            f"the root's text config and this fixture's disagree on "
+            f"{sorted(mismatched.items())}, so the references are written for a "
+            f"different tree than the one that ran"
+        )
+
+    tied = bool(root.text_config.tie_word_embeddings)
+    declared = root.declared_parameter_names()
+    if tied:
+        head = fixture["table"]
+    else:
+        if "lm_head_weight" not in declared:
+            raise VacuousControlError(
+                "the untied root declares no lm_head_weight, so this item has no "
+                "head tensor to bind and the arm it means to measure is absent"
+            )
+        head = _root_head_weight()
+        root.lm_head_weight = torch.nn.Parameter(head, requires_grad=False)
+
+    parameters = sum(int(p.numel()) for p in root.parameters() if p is not None)
+    print(f"TINYFWD|root_fixture|tied={tied}|head={tuple(head.shape)}"
+          f"|head_peak={float(head.abs().max()):.6f}"
+          f"|parameters={parameters}|bound={MAX_PARAMETERS}"
+          f"|declares_lm_head={'lm_head_weight' in declared}"
+          f"|world_size={int(root.world_size)}")
+    if parameters >= MAX_PARAMETERS:
+        raise VacuousControlError(
+            f"the root holds {parameters} parameters with its head bound, at or "
+            f"past the adopted bound of {MAX_PARAMETERS}"
+        )
+    fixture.update(root=root, config=config, head=head, tied=tied)
+    return fixture
+
+
+def _root_reference(hidden: torch.Tensor, head: torch.Tensor,
+                    positions) -> torch.Tensor:
+    """``[rows, vocab]`` logits in fp32: gather the named rows, then project.
+
+    THE GATHER IS A PYTHON LOOP OVER THE DECLARED POSITIONS, deliberately not
+    ``torch.index_select``. ``index_select`` is the operation under test, and a
+    reference built from it would agree with a forward that selected the wrong rows in
+    the same wrong way.
+    """
+    rows = torch.stack([hidden[int(index)].float() for index in positions])
+    return rows @ head.float().t()
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 7 of 7 -- ``Glm5NextForConditionalGeneration.forward``.                  #
+# Certifying component: ``model_fp8.Glm5NextForConditionalGeneration.forward``   #
+# together with its one private helper, ``_head_weight``.                       #
+#                                                                              #
+# WHAT IT CERTIFIES, and nothing a callee already owns. The root resolves the    #
+# quantisation policy from its OWN config and threads it down; it runs the stack #
+# exactly once on the arguments it was given; it SELECTS the caller's rows out   #
+# of the stack's output BEFORE projecting them; it projects them through the     #
+# head tensor its tied/untied arm chooses; and it refuses an unloaded head       #
+# BEFORE spending the stack. The stack's numerics are item 6's, the attention's  #
+# item 5's, the experts' items 2 and 4's, the dense MLP's item 1's.              #
+#                                                                              #
+# THE COMPARISON IS MADE AGAINST THE HIDDEN STATES THE ROOT'S OWN STACK          #
+# RETURNED, captured with one forward hook on ``root.model``, for item 6's       #
+# reason: a reference that re-ran the stack would be hostage to a pool selection #
+# flipping between two chains that differ by kernel noise, and would measure     #
+# tie-breaking rather than the projection. Item 6 certifies that those hidden    #
+# states are the stack's correct output; this item certifies what the root does  #
+# with them.                                                                    #
+#                                                                              #
+# THE HEAD IS A ``torch`` PROJECTION AND THAT IS THE CHECKPOINT'S OWN            #
+# DECLARATION, NOT A FALLBACK (P13). ``lm_head`` is one of the nine bare entries #
+# in this checkpoint's 1,509-entry ``modules_to_not_convert`` list, so the head  #
+# ships BF16 and no block-FP8 kernel applies to it -- read off the same          #
+# digest-verified fixture this item's quantisation fields come from, not         #
+# recalled. So this item's dispatch figures are item 6's, UNCHANGED: the root    #
+# adds no seam. The predicate's fallback aggregate is a statement about seams    #
+# and the head is not one, which is why the checkpoint's skip list, and not a    #
+# counter, is what makes the projection legitimate.                              #
+#                                                                              #
+# THE TIED ARM IS CERTIFIED AT ``_head_weight``, NOT WITH A SECOND FORWARD. The  #
+# two arms differ in exactly one thing -- which tensor ``_head_weight`` returns  #
+# -- and everything after it is shared code that the untied arm already runs. So #
+# the tied arm is measured by object IDENTITY against the embedding table, which #
+# is the sharp test for "reads the table itself rather than a copy", and a second #
+# 3-layer forward is not spent to re-measure shared code.                        #
+#                                                                              #
+# THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC     #
+# carrier is ``inc-glm53f-030b``'s. The logits this item compares are taken from #
+# a ONE-stream residual carrier. The reference keeps ``hc_mult`` parallel        #
+# streams and collapses them with an unweighted mean before the final norm       #
+# (``modeling_glm5_next.py:1493``, ``:302``), so at ``hc_mult`` > 1 the tensor    #
+# projected here is not the reference's tensor; that is a declared exclusion and #
+# not an approximation, and at ``hc_mult`` 1 the reference does not degenerate   #
+# to an add either.                                                              #
+#                                                                              #
+# WHAT IT DOES NOT TOUCH. On-device sampling: ``sampling_params``,               #
+# ``logit_mask`` and ``spec_decode_metadata`` are runner keys this tree          #
+# implements nowhere, and control D measures that the forward REFUSES them by    #
+# name rather than swallowing them. Threading the runner's own dicts into this    #
+# signature is ``inc-glm53f-054b``'s work.                                       #
+#                                                                              #
+# NOTHING BELOW HAS BEEN RUN. Every expected count and every tolerance claim in  #
+# this section is a prediction the first counted run adjudicates.                #
+# --------------------------------------------------------------------------- #
+def test_tiny_root_forward_matches_the_reference() -> None:
+    """The root equals the head projection of the rows it was asked to sample.
+
+    ``inc-glm53f-054a`` item 7 of 7. D1.4 certifying component:
+    ``Glm5NextForConditionalGeneration.forward`` with ``_head_weight`` -- the policy
+    resolution, the single stack call, the row selection before the projection, and
+    the tied/untied head arm.
+    """
+    fixture = _root_fixture()
+    root, cfg, layers = fixture["root"], fixture["cfg"], fixture["layers"]
+    head = fixture["head"]
+    selection = _mla_selection_operands(tokens=STACK_TOKENS, pages=STACK_PAGES)
+    carriers = _stack_carriers(layers, selection)
+    positions = torch.tensor(ROOT_SAMPLING_POSITIONS, dtype=torch.long)
+
+    input_ids = torch.randint(
+        0, STACK_VOCAB_SIZE, (STACK_TOKENS,),
+        generator=torch.Generator().manual_seed(SEED_STACK_IDS),
+        dtype=torch.int64,
+    )
+
+    # ---- ONE HOOK ON THE STACK. It records what the root handed the stack and what
+    # the stack returned; every conjunct below reads it rather than re-running.
+    recorded: list = []
+
+    def _record(module, args, kwargs, output):
+        recorded.append((args, kwargs, output))
+
+    handle = root.model.register_forward_hook(_record, with_kwargs=True)
+    try:
+        _reset_seam_counters()
+        before = _read_seam_counters()
+        got = root.forward(
+            input_ids,
+            layer_carriers=carriers,
+            sampling_positions=positions,
+        )
+        after = _read_seam_counters()
+    finally:
+        handle.remove()
+
+    # ---- THE REGISTERED ROUTE PREDICATE. Item 6's figures, declared again here
+    # rather than shared, so a root that smuggled in one extra dispatch fails this
+    # item on its own declaration.
+    _assert_route_predicate(
+        "7 the root",
+        {
+            "mla_projection": 9 * STACK_LAYERS,
+            "mla_absorb": 2 * STACK_LAYERS,
+            "mla_sparse": 1 * STACK_LAYERS,
+            "dsa_kpool_hadamard": 2 * STACK_LAYERS,
+            "dsa_paged_gather": 1 * STACK_LAYERS,
+            "dsa_score_gemm": 1 * STACK_LAYERS,
+            "dsa_topk_select": 1 * STACK_LAYERS,
+            "dsa_index_expand": 1 * STACK_LAYERS,
+            "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
+            "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+            "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+        },
+        before,
+        after,
+    )
+
+    # ---- CONJUNCT 1: THE STACK RAN ONCE, ON THE ROOT'S OWN ARGUMENTS. Read before
+    # anything is taken out of the recording, and by identity where identity is the
+    # claim: the ids and the carrier sequence are forwarded, not rebuilt.
+    print(f"TINYFWD|root_stack_calls|calls={len(recorded)}")
+    if len(recorded) != 1:
+        raise VacuousControlError(
+            f"the root called its stack {len(recorded)} times; the forward it "
+            f"certifies calls it exactly once"
+        )
+    args, kwargs, hidden = recorded[0]
+    expected_keys = {
+        "layer_carriers", "quant_config", "block_size", "moe_group", "tp_degree",
+        "expert_parallel_rank",
+    }
+    print(f"TINYFWD|root_stack_call|positional={len(args)}"
+          f"|keywords={sorted(kwargs)}"
+          f"|input_ids_forwarded={args[0] is input_ids if args else False}"
+          f"|carriers_forwarded={kwargs.get('layer_carriers') is carriers}")
+    if len(args) != 1 or args[0] is not input_ids:
+        raise VacuousControlError(
+            f"the stack was handed {len(args)} positional arguments and the first "
+            f"is not the caller's input_ids, so the ids were rebuilt on the way "
+            f"down"
+        )
+    if set(kwargs) != expected_keys:
+        raise VacuousControlError(
+            f"the stack was handed the keywords {sorted(kwargs)} and this item "
+            f"declares {sorted(expected_keys)}"
+        )
+    if kwargs["layer_carriers"] is not carriers:
+        raise VacuousControlError(
+            "the stack received some other object than the caller's carrier "
+            "sequence, so the per-layer state is not the caller's"
+        )
+    defaults = {"block_size": None, "moe_group": None, "tp_degree": 1,
+                "expert_parallel_rank": 0}
+    wrong = {
+        name: kwargs[name] for name, value in defaults.items()
+        if kwargs[name] != value
+    }
+    if wrong:
+        raise VacuousControlError(
+            f"the root forwarded {sorted(wrong.items())} where its own declared "
+            f"defaults are {sorted(defaults.items())}"
+        )
+
+    # ---- CONJUNCT 2: THE POLICY IS THE ROOT'S OWN RESOLUTION, and it is the pinned
+    # checkpoint's. The root takes no quant_config argument, so this is the only
+    # place the resolution can be read; it is compared against the same fixture's
+    # policy on the two fields every call site in this file reads.
+    resolved = kwargs["quant_config"]
+    pinned = _quant_config()
+    print(f"TINYFWD|root_policy|type={type(resolved).__name__}"
+          f"|is_block_quantized={resolved.is_block_quantized}"
+          f"|block_shape={resolved.block_shape}"
+          f"|pinned_block_shape={pinned.block_shape}"
+          f"|method={type(resolved.method).__name__}")
+    if not isinstance(resolved, _impl().Glm5NextQuantConfig):
+        raise VacuousControlError(
+            f"the root threaded down a {type(resolved).__name__}, not a "
+            f"Glm5NextQuantConfig, so the MLPs' route selector is not the "
+            f"resolved policy"
+        )
+    if not resolved.is_block_quantized or resolved.block_shape != pinned.block_shape:
+        raise VacuousControlError(
+            f"the root resolved is_block_quantized={resolved.is_block_quantized}, "
+            f"block_shape={resolved.block_shape}; the pinned checkpoint's policy "
+            f"is block-quantised at {pinned.block_shape}"
+        )
+
+    # ---- CONJUNCT 3: THE HEAD ARM. The untied root projects with its own mapped
+    # tensor, by identity.
+    if fixture["tied"] or root._head_weight() is not root.lm_head_weight:
+        raise VacuousControlError(
+            "the untied root's head tensor is not lm_head_weight, so this item is "
+            "not measuring the arm it declares"
+        )
+
+    # ---- CONJUNCT 4: THE LOGITS ARE THE PROJECTION OF THE SELECTED ROWS. Shape
+    # first -- a forward that projected every token, or de-duplicated the repeated
+    # row, is a different shape and not a small numeric difference.
+    rows = len(ROOT_SAMPLING_POSITIONS)
+    if tuple(got.shape) != (rows, STACK_VOCAB_SIZE):
+        raise ReferenceShapeError(
+            f"the root returned {tuple(got.shape)}, expected "
+            f"{(rows, STACK_VOCAB_SIZE)}: {rows} requested rows by the "
+            f"{STACK_VOCAB_SIZE}-wide vocabulary"
+        )
+    expected = _root_reference(hidden, head, ROOT_SAMPLING_POSITIONS)
+    terms = torch.stack(
+        [hidden[int(index)].abs().float() for index in ROOT_SAMPLING_POSITIONS]
+    ) @ head.abs().float().t()
+    condition = float((terms / expected.abs().clamp_min(1e-12)).max())
+    print(f"TINYFWD|root_logits|dtype={got.dtype}|rows={rows}"
+          f"|positions={list(ROOT_SAMPLING_POSITIONS)}"
+          f"|hidden={tuple(hidden.shape)}"
+          f"|max_abs_diff={float((got.float() - expected).abs().max()):.10g}"
+          f"|peak_reference={float(expected.abs().max()):.10g}"
+          f"|condition={condition:.4f}|bound={ROOT_MAX_CONDITION}")
+    if condition > ROOT_MAX_CONDITION:
+        raise VacuousControlError(
+            f"the logits' dot products have condition {condition:.4f} against a "
+            f"bound of {ROOT_MAX_CONDITION}: each logit is a small residue of "
+            f"large opposing terms, so every reading here is inflated by a "
+            f"vanishing denominator"
+        )
+    torch.testing.assert_close(got.float(), expected, rtol=RTOL, atol=ATOL)
+
+    # ---- CONJUNCT 5: THE REPEATED ROW IS PRESERVED EXACTLY. Two requests for the
+    # same row must return the same bytes, which no tolerance is needed to state and
+    # which a de-duplicate-then-scatter implementation cannot fake.
+    first, second = (
+        index for index, value in enumerate(ROOT_SAMPLING_POSITIONS)
+        if value == ROOT_SAMPLING_POSITIONS[-1]
+    )
+    print(f"TINYFWD|root_repeat|rows=({first}, {second})"
+          f"|identical={bool(torch.equal(got[first], got[second]))}")
+    if not torch.equal(got[first], got[second]):
+        raise VacuousControlError(
+            f"rows {first} and {second} ask for the same position and came back "
+            f"different, so the selection is not the index the caller gave"
+        )
+
+    # ---- CONTROL A: THE TIED ARM READS THE EMBEDDING TABLE ITSELF. A separate tiny
+    # root, built with the flag turned on: it must declare NO head parameter and its
+    # head tensor must BE the table object, not a tensor equal to it.
+    tied_root = _impl().Glm5NextForConditionalGeneration(
+        _root_config(tie_word_embeddings=True)
+    )
+    table = _fp8_grid_values(
+        SEED_STACK_EMBED, STACK_VOCAB_SIZE, STACK_HIDDEN_SIZE
+    ).to(torch.bfloat16)
+    tied_root.model.embed_tokens_weight = torch.nn.Parameter(
+        table, requires_grad=False
+    )
+    tied_declared = tied_root.declared_parameter_names()
+    tied_head = tied_root._head_weight()
+    print(f"TINYFWD|root_control|branch=tied head"
+          f"|declares_lm_head={'lm_head_weight' in tied_declared}"
+          f"|is_embedding_table="
+          f"{tied_head is tied_root.model.embed_tokens_weight}")
+    if "lm_head_weight" in tied_declared:
+        raise VacuousControlError(
+            "the tied root declares lm_head_weight; the weight map adds no "
+            "lm_head.weight entry in that case (weight_loaders_fp8.py:382-383), "
+            "so there is no checkpoint tensor to fill it"
+        )
+    if tied_head is not tied_root.model.embed_tokens_weight:
+        raise VacuousControlError(
+            "the tied root's head tensor is not the embedding table object, so "
+            "the two can drift apart"
+        )
+
+    # ---- CONTROL B: AN UNLOADED HEAD REFUSES BY NAME AND BY MAP LINE, BEFORE THE
+    # STACK RUNS. No seam may move -- that is what tells a named refusal from a
+    # forward that ran a whole stack and then discovered it had no head.
+    root.lm_head_weight = None
+    _reset_seam_counters()
+    unloaded_before = _read_seam_counters()
+    with pytest.raises(ValueError, match="weight_loaders_fp8.py:383"):
+        root.forward(
+            input_ids,
+            layer_carriers=carriers,
+            sampling_positions=positions,
+        )
+    unloaded_after = _read_seam_counters()
+    moved = {
+        seam: unloaded_after[seam][0] - unloaded_before[seam][0]
+        for seam in _SEAMS
+        if unloaded_after[seam][0] != unloaded_before[seam][0]
+    }
+    print(f"TINYFWD|root_control|branch=forward with no head tensor"
+          f"|refused=True|seams_that_moved={sorted(moved.items())}")
+    if moved:
+        raise VacuousControlError(
+            f"the refusal ran after {sorted(moved.items())} dispatched, so the "
+            f"head is resolved after the stack instead of before it"
+        )
+
+    # ---- CONTROL C: THE ROW SELECTION IS REQUIRED. No default, so a caller that
+    # forgets it gets a TypeError at the call rather than a whole-prefill projection.
+    with pytest.raises(TypeError, match="sampling_positions"):
+        root.forward(input_ids, layer_carriers=carriers)
+
+    # ---- CONTROL D: THERE IS NO ``**kwargs`` SINK. ``sampling_params`` is a real
+    # runner key (``neuron_model_runner.py:7036``) that this tree implements nowhere;
+    # it must be refused at the call, not accepted and dropped.
+    with pytest.raises(TypeError, match="sampling_params"):
+        root.forward(
+            input_ids,
+            layer_carriers=carriers,
+            sampling_positions=positions,
+            sampling_params=None,
+        )
+    print("TINYFWD|root_control|branch=unnamed runner key|refused=True")
+
+    # ---- CONTROL E: THE ROWS ARE MEASURED, NOT INCIDENTAL. The reference recomputed
+    # on rolled positions must leave the band, or a forward that projected some other
+    # rows would be indistinguishable from this one.
+    rolled = tuple(ROOT_SAMPLING_POSITIONS[1:]) + (ROOT_SAMPLING_POSITIONS[0],)
+    _stack_outside_tolerance(
+        f"the logits recomputed on rolled positions {list(rolled)}",
+        _root_reference(hidden, head, rolled),
+        expected,
+    )
