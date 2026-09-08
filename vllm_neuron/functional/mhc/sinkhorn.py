@@ -368,6 +368,11 @@ def _row_tiles_unchecked(rows: int, block: int) -> list[tuple[int, int]]:
 
     The arithmetic is unchanged: ``min(height, rows - start)`` and the branch
     below agree for every input.
+
+    The list this returns is still built here, but the kernels no longer WALK it.
+    They read it by index under ``for idx in range(...)``, because walking it
+    needs a tuple loop variable and that is what the compiler refused next. This
+    function's own loop is over ``range`` and was never named in any diagnostic.
     """
     height = _row_tile_extent_unchecked(block)
     tiles = []
@@ -378,6 +383,27 @@ def _row_tiles_unchecked(rows: int, block: int) -> list[tuple[int, int]]:
         else:
             tiles.append((start, height))
     return tiles
+
+
+def _row_tile_count_unchecked(rows: int, block: int) -> int:
+    """How many row tiles :func:`_row_tiles_unchecked` returns, by arithmetic.
+
+    WHY THIS EXISTS AT ALL: it is a kernel loop BOUND. The kernels used to walk
+    the tile list directly, and the compiler refused every shape with
+    ``expecting simple variable`` -- five times on the square kernel and three on
+    the batched one, exactly the number of ``for`` statements in each whose loop
+    variable is a tuple. The kernels now count with ``for idx in range(bound)``,
+    which is the only loop form the 50 NKI kernels already in this repository use,
+    and a bound has to be a plain name to match those exemplars: 79 of their loop
+    bounds are a name, 16 a constant, 4 an expression, and none is a call. So the
+    count is computed here rather than written ``len(tiles)`` at the call site.
+
+    The arithmetic is the ceiling division that matches the list's own length for
+    every input, which :mod:`test_sinkhorn` proves exhaustively rather than by
+    argument.
+    """
+    height = _row_tile_extent_unchecked(block)
+    return (rows + height - 1) // height
 
 
 def row_tiles(rows: int, block: int = MHC_STREAMS) -> list[tuple[int, int]]:
@@ -440,13 +466,18 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
     # `_require_admissible` is where an inadmissible shape is refused, before any
     # dispatch reaches here.
     tiles = _row_tiles_unchecked(int(m_extent), block)
+    # The loop BOUND, as a plain name. Every tile loop below counts rather than
+    # walking `tiles`, because a `for` whose variable is a tuple is what the
+    # compiler refused on this kernel five times.
+    tile_count = _row_tile_count_unchecked(int(m_extent), block)
 
     out = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.shared_hbm)
 
     # The ones vector that turns a partition-axis reduction into a matmul. Built
     # once at the tallest tile's height and sliced per tile: it is loop-invariant
     # and every entry is 1, so a short tile contracts a prefix of it.
-    ones_col = nl.ndarray((tiles[0][1], 1), dtype=nl.float32, buffer=nl.sbuf)
+    first_tile = tiles[0]
+    ones_col = nl.ndarray((first_tile[1], 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones_col, value=1.0)
 
     # One working tile per row tile, upcast to fp32 on the load. These stay live
@@ -455,7 +486,10 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
     working = []
     row_den = []
     row_scale = []
-    for start, height in tiles:
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
         tile = nl.ndarray((height, n_extent), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(
             dst=tile,
@@ -477,7 +511,7 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
     for _ in nl.sequential_range(iters):
         # ---- row pass: reduce along the FREE axis, scale rows to row_goal ----
         # Per row, so per tile, and the tiles do not interact here.
-        for idx, (_start, _height) in enumerate(tiles):
+        for idx in range(tile_count):
             row_sum = nl.sum(working[idx], axis=1, keepdims=True, dtype=nl.float32)
             nisa.tensor_scalar(
                 dst=row_den[idx], data=row_sum, op0=nl.add,
@@ -502,7 +536,9 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
         # for a contraction longer than the partition axis. False on the first
         # tile is also what clears the previous iteration's sums: this PSUM tile
         # is reused across all 20 iterations.
-        for idx, (_start, height) in enumerate(tiles):
+        for idx in range(tile_count):
+            tile_geom = tiles[idx]
+            height = tile_geom[1]
             nisa.nc_matmul(
                 dst=col_psum,
                 stationary=ones_col[0:height, 0:1],
@@ -521,14 +557,19 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
         # by its own column sums instead would normalise 128 rows at a time and
         # compute a different matrix. `nl.broadcast_to` is the member that
         # broadcasts on the PARTITION axis (moe/router.py:1268-1269).
-        for idx, (_start, height) in enumerate(tiles):
+        for idx in range(tile_count):
+            tile_geom = tiles[idx]
+            height = tile_geom[1]
             col_scale_b = nl.broadcast_to(col_scale, (height, n_extent))
             nisa.tensor_tensor(
                 dst=working[idx], data1=working[idx], data2=col_scale_b,
                 op=nl.multiply,
             )
 
-    for idx, (start, height) in enumerate(tiles):
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
         nl.store(out[start:start + height, 0:n_extent], value=working[idx])
     return out
 
@@ -588,6 +629,9 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     # needed and the tile is the whole partition extent. The arithmetic is
     # `row_tiles`'s so that both kernels tile the partition axis one way.
     tiles = _row_tiles_unchecked(int(t_extent), 1)
+    # The loop BOUND, as a plain name, for the reason written on the square
+    # kernel's own bound: three of this kernel's `for` statements took a tuple.
+    tile_count = _row_tile_count_unchecked(int(t_extent), 1)
 
     # Per token tile: one working tile per block ROW, plus that row's own
     # denominator and scale, plus one column accumulator for the whole tile. All
@@ -597,7 +641,10 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     row_scale: list[list] = []
     col_sum = []
     col_scale = []
-    for start, height in tiles:
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
         tile_rows = []
         den_rows = []
         scale_rows = []
@@ -630,7 +677,7 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
         )
 
     for _ in nl.sequential_range(iters):
-        for idx, (_start, _height) in enumerate(tiles):
+        for idx in range(tile_count):
             # ---- row pass. Block row i of every token in this tile is one
             # [tokens, S] tile, so its row sum is a FREE-axis reduction and the
             # reciprocal broadcasts back along the free axis -- the same
@@ -680,7 +727,10 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
                     op=nl.multiply,
                 )
 
-    for idx, (start, height) in enumerate(tiles):
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
         for i in range(rows_per_block):
             nl.store(
                 out[start:start + height, i, 0:cols_per_block], value=work[idx][i]

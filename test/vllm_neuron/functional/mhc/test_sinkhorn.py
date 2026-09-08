@@ -1021,6 +1021,37 @@ def test_row_tiles_are_cut_on_block_boundaries() -> None:
         assert all(0 < height <= PARTITION_MAX for height in heights), heights
 
 
+def test_the_kernels_tile_count_equals_the_tile_lists_length() -> None:
+    """The loop bound the kernels count with is the tile list's own length.
+
+    WHY A SEPARATE CORE EXISTS TO BE CHECKED. The kernels cannot walk the tile
+    list -- the compiler refused a ``for`` whose loop variable is a tuple eight
+    times -- so they count with ``for idx in range(tile_count)`` instead, and
+    ``tile_count`` comes from arithmetic rather than from ``len``. Arithmetic that
+    disagreed with the list by one would silently drop the last token tile or read
+    past the end, so it is read here against the list itself at every block and
+    row extent in range, not argued for in a comment.
+    """
+    module = importlib.import_module(_MODULE)
+    tile_list = module._row_tiles_unchecked
+    tile_count = module._row_tile_count_unchecked
+    extent = module._row_tile_extent_unchecked
+
+    blocks = [b for b in range(1, PARTITION_MAX + 1) if extent(b) >= 1]
+    rows_grid = list(range(1, 301)) + list(TILED_ROWS) + [PARTITION_MAX + 1, 16384]
+    pairs = 0
+    for block in blocks:
+        for rows in rows_grid:
+            tiles = tile_list(rows, block)
+            pairs += 1
+            assert tile_count(rows, block) == len(tiles), (block, rows)
+    print(
+        f"[tile-count] blocks={len(blocks)} rows={len(rows_grid)} pairs={pairs} "
+        "disagreements=0"
+    )
+    assert pairs > 10000, pairs
+
+
 def test_the_moved_bound_admits_the_serving_extent() -> None:
     """``can_run_sinkhorn`` no longer refuses ``M`` above one partition tile.
 
@@ -1433,26 +1464,53 @@ def _traced_callees(functions: dict[str, ast.FunctionDef], entry: str) -> set[st
     return seen
 
 
+_TRACE_HOSTILE_CLASSES = (
+    "raise",
+    "comprehension",
+    "min_call",
+    "tuple_for_target",
+    "container_loop",
+    "computed_loop_bound",
+)
+
+
 def _trace_hostile_sites(
     functions: dict[str, ast.FunctionDef], names: set[str]
-) -> tuple[list[str], list[str], list[str]]:
-    """``(raises, comprehensions, min_calls)`` as ``function:line`` strings."""
-    raises: list[str] = []
-    comprehensions: list[str] = []
-    min_calls: list[str] = []
+) -> dict[str, list[str]]:
+    """Every refused construct found in ``names``, by class, as ``function:line``.
+
+    ONE CLASS THAT IS DELIBERATELY ABSENT: reading a subscript of a subscript,
+    ``work[idx][i]``. The batched kernel does it fourteen times to reach a tensor
+    in a list of lists, and the compiler named it in no diagnostic on any of the
+    eleven shapes. A guard that refused it would report correct work as a defect,
+    which is the failure this campaign has already hit twice in its own
+    instruments. Only forms the compiler actually named, or forms no kernel in
+    this repository uses, are refused here.
+    """
+    found: dict[str, list[str]] = {name: [] for name in _TRACE_HOSTILE_CLASSES}
     for name in sorted(names):
         for node in ast.walk(functions[name]):
+            where = f"{name}:{getattr(node, 'lineno', 0)}"
             if isinstance(node, ast.Raise):
-                raises.append(f"{name}:{node.lineno}")
+                found["raise"].append(where)
             elif isinstance(node, _TRACE_HOSTILE_COMPREHENSIONS):
-                comprehensions.append(f"{name}:{node.lineno}")
+                found["comprehension"].append(where)
             elif (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "min"
             ):
-                min_calls.append(f"{name}:{node.lineno}")
-    return raises, comprehensions, min_calls
+                found["min_call"].append(where)
+            elif isinstance(node, ast.For):
+                if not isinstance(node.target, ast.Name):
+                    found["tuple_for_target"].append(where)
+                if isinstance(node.iter, ast.Call):
+                    for arg in node.iter.args:
+                        if isinstance(arg, (ast.Call, ast.Attribute, ast.Subscript)):
+                            found["computed_loop_bound"].append(where)
+                else:
+                    found["container_loop"].append(where)
+    return found
 
 
 _TRACE_FIXTURE = '''
@@ -1466,32 +1524,62 @@ def helper_with_a_comprehension(n):
     return [(i, min(i, n)) for i in range(n)]
 
 
-def fake_kernel(a):
-    return helper_with_a_raise(a) + len(helper_with_a_comprehension(a))
+def helper_with_a_computed_loop_bound(items):
+    total = 0
+    for i in range(len(items)):
+        total = total + i
+    return total
+
+
+def fake_kernel(a, pairs):
+    total = 0
+    for lo, hi in pairs:
+        total = total + lo + hi
+    return (
+        helper_with_a_raise(a)
+        + helper_with_a_comprehension(a)[0][0]
+        + helper_with_a_computed_loop_bound(pairs)
+        + total
+    )
 '''
 
 
-def test_no_kernel_traces_into_a_raise_or_a_comprehension() -> None:
-    """Neither kernel's traced call graph carries a construct NKI refuses.
+def test_no_kernel_traces_into_a_form_the_compiler_refused() -> None:
+    """Neither kernel's traced program carries a construct NKI refuses.
 
-    WHY THIS IS A TEST AND NOT A CONVENTION. Both kernels compiled cleanly under
-    the simulator and then failed to specialize on hardware, on all eleven
-    declared Tier C shapes, with the compiler saying "NKI does not support 'raise'
-    statements" plus one "unsupported expression" -- because the tracer follows a
-    kernel's plain Python callees, and this module's tile-geometry helpers raised.
-    The simulator cannot see that: it executes the helper, and a branch not taken
-    is nothing. So the property is read here, off the module's own source, at a
-    cost of no device and no compile.
+    WHY THIS IS A TEST AND NOT A CONVENTION. Both kernels passed under the
+    simulator and were then refused by the compiler on all eleven declared Tier C
+    shapes -- twice, for different reasons, and the simulator saw neither. The
+    first refusal named ``raise``; the second named ``expecting simple variable``.
+    So the property is read here, off the module's own source, at a cost of no
+    device and no compile.
 
-    THREE CONSTRUCTS ARE REFUSED, and the third is a live question rather than
-    caution. The ``raise`` count is settled -- the compiler counted two on the
-    square path and three on the batched one, exactly the statements the helpers
-    held. The single "unsupported expression" was one on BOTH paths, which rules
-    out the ``f``-strings (two and three) and leaves the two constructs that
-    appeared exactly once each in the shared helper: a list comprehension and a
-    ``min`` call. Which one it was is not settled, so both are refused, and this
-    docstring is the record of that open question rather than a claim it is
-    closed.
+    EVERY CLASS BELOW IS HERE BECAUSE THE WORLD PUT IT HERE, not out of caution:
+
+    * ``raise`` -- the compiler counted two on the square path and three on the
+      batched one, exactly the statements the tile helpers held.
+    * a comprehension, and a ``min`` call -- the single "unsupported expression"
+      was one on BOTH paths, which rules out the ``f``-strings (two and three) and
+      leaves these two, one each in the shared helper. Which one it was is still
+      not settled; neither survives, so neither can refuse a trace again.
+    * a ``for`` whose loop variable is a tuple -- the second refusal counted five
+      on the square kernel and three on the batched one, exactly the number of
+      such statements in each traced program. Two readings that cannot influence
+      each other, matching on both numbers.
+    * iterating a container directly, and a computed loop bound -- no diagnostic
+      names these, and they are refused on a different ground: of the fifty NKI
+      kernels already in this repository, every loop is over ``range``,
+      ``nl.sequential_range`` or ``nl.affine_range``, and every bound is a plain
+      name, a constant or an expression. None iterates a Python container and none
+      computes its bound with a call. These kernels are the only forms with a
+      hardware-passed exemplar, so they are the forms these two kernels use.
+
+    THE ENTRY IS SCANNED, NOT JUST ITS CALLEES, and that is a correction rather
+    than a detail. The first version of this guard read only the traced callees,
+    because the ``raise`` sites were in helpers. The tuple loop variables were in
+    the kernel bodies themselves, so that version would have read zero on code
+    the compiler refused eight times. The fixture below plants its tuple loop
+    variable in the fake ENTRY for exactly that reason.
 
     The reading is armed on a planted fixture whose answer is known by
     construction, because a walker that found nothing would pass this module
@@ -1504,39 +1592,38 @@ def test_no_kernel_traces_into_a_raise_or_a_comprehension() -> None:
     for entry in ("sinkhorn_kernel", "sinkhorn_blocks_kernel"):
         assert entry in functions, entry
         callees = _traced_callees(functions, entry)
-        raises, comprehensions, min_calls = _trace_hostile_sites(functions, callees)
+        traced = callees | {entry}
+        found = _trace_hostile_sites(functions, traced)
         print(
-            f"[trace-guard] {entry} traced_callees={sorted(callees)} "
-            f"raise={raises} comprehension={comprehensions} min={min_calls}"
+            f"[trace-guard] {entry} traced={sorted(traced)} "
+            + " ".join(f"{cls}={found[cls]}" for cls in _TRACE_HOSTILE_CLASSES)
         )
         assert callees, (
             f"{entry} resolved no traced callees, so this reading covers nothing"
         )
-        assert raises == [], (
-            f"{entry} traces into a raise at {raises}; NKI refuses a traced "
-            "raise, and the seam is where an inadmissible shape is refused"
-        )
-        assert comprehensions == [], (
-            f"{entry} traces into a comprehension at {comprehensions}, one of the "
-            "two candidates for the compiler's unsupported expression"
-        )
-        assert min_calls == [], (
-            f"{entry} traces into a min call at {min_calls}, the other candidate "
-            "for the compiler's unsupported expression"
-        )
+        for cls in _TRACE_HOSTILE_CLASSES:
+            assert found[cls] == [], (
+                f"{entry}'s traced program carries {cls} at {found[cls]}; the "
+                "compiler refuses that form, or no kernel in this repository "
+                "uses it, and the seam is where an inadmissible shape is refused"
+            )
 
-    # THE WALKER MUST BE ABLE TO FIND ALL THREE, or the zeros above say nothing.
+    # THE WALKER MUST FIND ONE OF EVERY CLASS, or the empty lists say nothing.
     fixture = _module_functions(_TRACE_FIXTURE)
     fixture_callees = _traced_callees(fixture, "fake_kernel")
-    f_raises, f_comprehensions, f_mins = _trace_hostile_sites(fixture, fixture_callees)
+    fixture_traced = fixture_callees | {"fake_kernel"}
+    planted = _trace_hostile_sites(fixture, fixture_traced)
     print(
-        f"[trace-guard-control] traced_callees={sorted(fixture_callees)} "
-        f"raise={f_raises} comprehension={f_comprehensions} min={f_mins}"
+        f"[trace-guard-control] traced={sorted(fixture_traced)} "
+        + " ".join(f"{cls}={planted[cls]}" for cls in _TRACE_HOSTILE_CLASSES)
     )
     assert fixture_callees == {
         "helper_with_a_raise",
         "helper_with_a_comprehension",
+        "helper_with_a_computed_loop_bound",
     }, fixture_callees
-    assert len(f_raises) == 1, f_raises
-    assert len(f_comprehensions) == 1, f_comprehensions
-    assert len(f_mins) == 1, f_mins
+    for cls in _TRACE_HOSTILE_CLASSES:
+        assert len(planted[cls]) == 1, (cls, planted[cls])
+    # and the planted tuple target is in the ENTRY, which is what proves the
+    # entry is scanned at all.
+    assert planted["tuple_for_target"][0].startswith("fake_kernel:"), planted
