@@ -50,11 +50,22 @@ it declares, that the torch-fallback total across every seam this campaign owns 
 that the set of seams which fired is non-empty. An item that ran torch end to end fails
 twice over: 0 dispatches on its own seam and a non-zero fallback.
 
-THE FIRED SET IS ASSERTED PER ITEM RATHER THAN ACCUMULATED ACROSS THE SEVEN, because
-``pytestmark`` below carries ``pytest.mark.forked``: every item runs in its own forked
-process, so module-level state cannot survive from one item to the next and accumulating
-would assert nothing. The union over the seven is read from this run's transcript, which
-is what the registered wording's "reported" asks for.
+THE FIRED SET IS ASSERTED PER ITEM RATHER THAN ACCUMULATED, and what makes that sound is
+in this file rather than in a plugin. Each item calls :func:`_reset_seam_counters` and
+then reads the counters immediately before and immediately after its own forward, and
+:func:`_assert_route_predicate` compares the DIFFERENCE against the seams that item
+declares. A difference taken across one call cannot be reached by anything an earlier
+item did, so module-level state surviving between items changes no assertion here.
+
+THIS FILE THEREFORE NEEDS NO PROCESS ISOLATION, and it no longer asks for any. An earlier
+draft of this paragraph said the per-item reading was possible *because* ``pytestmark``
+carried ``pytest.mark.forked``, which was never the reason the code worked: the reset and
+the difference were already doing that job, and they do it more strictly than a fresh
+process would, because they compare against an exact expected set rather than merely
+finding the set non-empty. The marker asked the run for a ``pytest-forked`` plugin that
+is not installed in the campaign venv and that no lease authorises installing, so it
+could only ever have turned a sound run red. The union over the items is read from this
+run's transcript, which is what the registered wording's "reported" asks for.
 
 Run::
 
@@ -76,7 +87,11 @@ import torch
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE, TILE_SIZE
 
-pytestmark = [pytest.mark.fast, pytest.mark.forked]
+#: ``fast`` only. ``forked`` is deliberately absent -- see the paragraph on process
+#: isolation in this module's docstring: the reset-and-difference around each forward
+#: already gives every item a clean reading, and the marker would have required a
+#: ``pytest-forked`` plugin the campaign venv does not have.
+pytestmark = [pytest.mark.fast]
 
 _FP8 = torch.float8_e4m3fn
 
