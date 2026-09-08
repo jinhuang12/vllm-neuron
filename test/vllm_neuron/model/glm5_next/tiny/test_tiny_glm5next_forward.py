@@ -119,9 +119,20 @@ INTERMEDIATE_SIZE = 1024
 #: items further down this file; the MLP items do not read them.
 NUM_KEY_VALUE_HEADS = 2
 MAX_HEAD_DIM = 128
-#: < 10 M parameters. Asserted per item against the module actually built, so the
+#: < 32 M parameters. Asserted per item against the module actually built, so the
 #: bound is measured rather than declared.
-MAX_PARAMETERS = 10_000_000
+#:
+#: THE BOUND MOVED FROM 10 M, and it is the only member of the adopted constraint set
+#: that moved. The production router refuses any top-k that is not 8 and any expert
+#: count below 8 (``router.py:1037-1051``), so the bank needs at least 8 experts. At the
+#: expert width this file's clamp controls are built from, 8 experts cost 12.6 M
+#: parameters and 16 cost 25.2 M, so NO layout satisfies both the router and 10 M. The
+#: alternative was to narrow the expert intermediate extent, which deletes the very
+#: blocks the controls live in. Counted in
+#: ``increments/probe-054a-topk-feasibility-mac-r1-20260908T213254Z.out``, ruled in
+#: ``approvals/LEAD-LOG.md`` §738 against the constraint set at
+#: ``design/increment-plan.md:1147``.
+MAX_PARAMETERS = 32_000_000
 
 #: A whole number of ``TILE_SIZE`` rows -- the dense seam tiles ``M`` over the PSUM
 #: partition axis and does not pad (``blockwise_fp8_mm.py:239-245``), so padding is
@@ -987,26 +998,50 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
 ROUTED_HIDDEN_SIZE = 512
 #: Four ``BLOCK_QUANT_SIZE`` blocks of I, one per clamp regime below.
 ROUTED_INTERMEDIATE_SIZE = 1024
-#: Four experts and top-2. Four divides any expert-parallel degree this run uses,
-#: which is what ``require_uniform_expert_partition`` refuses on, and the bank costs
-#: ``E * 3 * I * H`` = 6.3 M parameters against the adopted 10 M cap.
-ROUTED_EXPERTS = 4
-ROUTED_EXPERTS_PER_TOKEN = 2
-
-#: The two router weights each token's top-2 carries. They sum to the pinned config's
-#: ``routed_scaling_factor`` of 2.5, which is what ``norm_topk_prob=True`` with that
-#: factor produces, and both are exact binary fractions so no cast loses anything.
+#: Sixteen experts and top-8, which is what the production router accepts and nothing
+#: less: it refuses a top-k that is not exactly 8 and an expert count below 8
+#: (``router.py:1037-1051``), because ``nisa.max8`` emits 8 values per partition and
+#: ``nisa.nc_find_index8`` consumes exactly 8.
 #:
-#: NEITHER IS 1.0, AND THAT IS THE POINT. ``PRE_SCALE`` and ``POST_SCALE`` agree
-#: EXACTLY at affinity 1.0 -- the router weight is then the identity wherever it is
-#: applied -- so a fixture whose affinities sat at 1 would carry a mode control that
-#: could not fail. Measured across four candidate pairs in section F of
-#: ``increments/probe-054a-item2-clamp-feasibility-r5d.out``: ``(1.5, 1.0)`` separates
-#: the two modes by 0.68%, inside the tolerance this item passes at, while this pair
-#: separates them by 63.9%. The stronger-looking ``(2.25, 0.25)`` was REJECTED: it
-#: sends the PRE_SCALE result NEGATIVE against a positive reference, a 775% "gap"
-#: that is a different answer rather than a measured sensitivity.
-ROUTED_AFFINITIES = (2.0, 0.5)
+#: SIXTEEN RATHER THAN EIGHT, so the selection stays REAL. Top-8 of 8 selects every
+#: expert for every token, and a mask that selects everything cannot show a wrong expert
+#: mapping -- the defect the rotating roles below exist to catch. Sixteen also divides
+#: any expert-parallel degree this run uses, which is what
+#: ``require_uniform_expert_partition`` refuses on, and it stays inside the router's own
+#: ceiling of 512 (``router.py:1049``).
+#:
+#: The bank costs ``E * 3 * I * H`` = 25.2 M parameters, and the MoE block that adds a
+#: shared expert and a router reaches 26.7 M, the worst item in this file, against the
+#: 32 M cap. Counted in
+#: ``increments/probe-054a-e16k8-invariants-mac-r1-20260908T213943Z.out``.
+ROUTED_EXPERTS = 16
+ROUTED_EXPERTS_PER_TOKEN = 8
+
+#: The eight router weights each token's top-8 carries. They sum to the pinned config's
+#: ``routed_scaling_factor`` of 2.5, which is what ``norm_topk_prob=True`` with that
+#: factor produces, and every one is an exact binary fraction that survives the
+#: ``bfloat16`` cast the router weights take, so no cast loses anything.
+#:
+#: NONE IS 1.0, AND THAT IS THE POINT. ``PRE_SCALE`` and ``POST_SCALE`` agree EXACTLY at
+#: affinity 1.0 -- the router weight is then the identity wherever it is applied -- so a
+#: fixture whose affinities sat at 1 would carry a mode control that could not fail.
+#: That was MEASURED for the two-value set these replace, across four candidate pairs in
+#: section F of ``increments/probe-054a-item2-clamp-feasibility-r5d.out``: ``(1.5, 1.0)``
+#: separated the two modes by 0.68%, inside the tolerance this item passes at, while
+#: ``(2.0, 0.5)`` separated them by 63.9%, and ``(2.25, 0.25)`` was REJECTED for sending
+#: the PRE_SCALE result negative against a positive reference -- a different answer
+#: rather than a measured sensitivity.
+#:
+#: THESE EIGHT CARRY EVERY CHECKABLE PROPERTY ACROSS, AND THEIR MODE SEPARATION IS NOT
+#: YET MEASURED. Stated rather than implied: the spread is wider than the pair they
+#: replace, 24x against 4x, so the separation should be stronger, but no probe has run at
+#: eight values because it needs torch on the bank. A weak separation REDDENS this item
+#: instead of passing it, since the mode control asserts a difference OUTSIDE the
+#: tolerance, so the run adjudicates this choice rather than inheriting it. The four
+#: properties that ARE checkable -- eight values, exact sum of 2.5, all exact in
+#: ``bfloat16``, none equal to 1.0 -- are gated in
+#: ``increments/probe-054a-e16k8-invariants-mac-r1-20260908T213943Z.out``.
+ROUTED_AFFINITIES = (0.75, 0.5, 0.375, 0.3125, 0.25, 0.1875, 0.09375, 0.03125)
 
 #: One scale exponent per 256-column block of I, per projection, and the block whose
 #: weights are negated. THE VALUES ARE ON A LATTICE, not chosen freely: with weights
@@ -1142,22 +1177,23 @@ def _routed_tile_grid(
 
 
 def _routed_affinities() -> torch.Tensor:
-    """``[T, E]`` scattered top-2 router scores -- what ``route_tokens`` returns.
+    """``[T, E]`` scattered top-8 router scores -- what ``route_tokens`` returns.
 
     The gate weight at each selected expert's column and zero elsewhere, at the GLOBAL
     router width, which is the form ``block_quant_expert_mm`` declares and refuses
     anything else.
 
-    THE TWO ROLES ROTATE ACROSS TOKENS so every expert carries the high weight on some
-    token and the low weight on another. A bank that put one expert's weights behind
-    another's router column would otherwise be able to agree on a fixture where each
-    expert always had the same weight.
+    THE EIGHT ROLES ROTATE ACROSS TOKENS so every expert carries every one of the eight
+    weights on some token. A bank that put one expert's weights behind another's router
+    column would otherwise be able to agree on a fixture where each expert always had
+    the same weight. With 128 tokens over 16 experts the rotation closes eight whole
+    cycles, so that coverage is exact rather than nearly so, and the count below is what
+    refuses a weight list that has drifted out of step with the declared top-k.
     """
-    high, low = ROUTED_AFFINITIES
     affinities = torch.zeros(TOKENS, ROUTED_EXPERTS, dtype=torch.float32)
     for token in range(TOKENS):
-        affinities[token, token % ROUTED_EXPERTS] = high
-        affinities[token, (token + 1) % ROUTED_EXPERTS] = low
+        for role, weight in enumerate(ROUTED_AFFINITIES):
+            affinities[token, (token + role) % ROUTED_EXPERTS] = weight
     selected = int((affinities != 0).sum(dim=1).min())
     if selected != ROUTED_EXPERTS_PER_TOKEN:
         raise VacuousControlError(
@@ -3041,10 +3077,10 @@ STACK_DENSE_INTERMEDIATE_SIZE = ROUTED_INTERMEDIATE_SIZE
 #: refuses any ``I_TP`` that is not a multiple of ``BLOCK_QUANT_SIZE * NUM_SHARDS``
 #: (``moe_blockwise_fp8.py:249-254``), which is 512 on this image. It is also the
 #: constraint set's own ``intermediate_size >= 512`` floor, met exactly. Item 2's 1024
-#: is not reused here for one measured reason: at this hidden size a 1024-wide bank
-#: costs 6.3 M parameters on its own (:data:`ROUTED_EXPERTS`' note records that
-#: figure), and this stack carries three attention layers and two dense MLPs beside
-#: it.
+#: is not reused here for one measured reason: at this hidden size and sixteen experts a
+#: 1024-wide bank costs 25.2 M parameters on its own (:data:`ROUTED_EXPERTS`' note
+#: records that figure), and this stack carries three attention layers and two dense
+#: MLPs beside it. At 512 the stack reaches 17.6 M against the 32 M cap.
 STACK_MOE_INTERMEDIATE_SIZE = 512
 
 STACK_EXPERTS = ROUTED_EXPERTS
