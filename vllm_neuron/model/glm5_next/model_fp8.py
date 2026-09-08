@@ -1645,6 +1645,7 @@ class Glm5NextRoutedExperts(nn.Module):
             TILE_SIZE,
         )
         from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+            ExpertAffinityScaleMode,
             blockwise_fp8_moe,
         )
         from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
@@ -1843,6 +1844,79 @@ class Glm5NextRoutedExperts(nn.Module):
             block_to_expert=block_to_expert.reshape(-1, 1),
             gate_up_proj_scale=gate_up_proj_scale,
             down_proj_scale=down_proj_scale,
+            # WHERE THE ROUTER WEIGHT MULTIPLIES -- ``inc-glm53f-054a``, review
+            # finding recorded at DECISIONS 449.
+            #
+            # THIS LINE CHANGES THE MEANING OF LANDED ``-027``/R5 CODE. The call
+            # below used to pass no scaling mode at all, so it inherited the
+            # seam shim's default of ``PRE_SCALE``
+            # (``moe_blockwise_fp8.py:337-339``), which multiplies the router
+            # weight into the HIDDEN STATES before the gate and up projections.
+            # The checkpoint's reference multiplies it after the DOWN projection
+            # instead: ``modeling_glm5_next.py:132-133`` projects
+            # ``hidden_states[token_idx]`` unscaled and then writes
+            # ``F.linear(current, down_proj[e]) * top_k_weights[...]``. That is
+            # ``POST_SCALE``, and it is a different function, not a rearranged
+            # one -- this repository's own torch implementation says so in its
+            # own words at ``moe_cte.py:490-492``: "this is NOT mathematically
+            # equivalent to POST_SCALE because the nonlinear activation breaks
+            # the linearity: act(a * x) != a * act(x)".
+            #
+            # AND IT WAS NOT A SMALL DIFFERENCE. The pinned config normalises the
+            # top-8 gate weights and scales them by 2.5, so every affinity
+            # averages 0.3125 and none reaches 1. Two consequences, measured in
+            # ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-054a-affinity-scaling-mode-r1.out``:
+            # the per-token contribution was wrong by up to 76.9% against a 1%
+            # acceptance tolerance, and the SwiGLU bound three paragraphs below
+            # bound ``affinity * gate`` rather than ``gate``, so it bit above
+            # 32.0 instead of the checkpoint's 10.0. That second one is the
+            # routed half of ``B22-M1-shared-expert-swiglu-clamp-omitted``
+            # reopened one layer underneath the repair: on every token whose
+            # projection landed between 10 and 32 the kernel ran the SwiGLU
+            # UNCLAMPED where the reference clamps it. Naming the mode here is
+            # what closes that half.
+            #
+            # EXPLICIT RATHER THAN INHERITED, WHICH IS THE FORK'S OWN
+            # CONVENTION. Every one of the five landed MoE call sites in this
+            # repository names this parameter and chooses the other value, all
+            # five on the gpt_oss expert bank: ``GptOssExperts._run_moe_block_tkg``
+            # (``:1339`` quantised, ``:1257`` bf16),
+            # ``GptOssExperts._run_moe_tkg`` (``:1390``) and
+            # ``GptOssExperts.forward_prefill`` (``:1567`` quantised, ``:1409``
+            # bf16). A default carried silently is what let a whole-function
+            # divergence land with no shape moving and nothing raising.
+            #
+            # THE ENUM COMES FROM THE SEAM MODULE, NOT FROM ``nkilib``
+            # DIRECTLY, and that is deliberate. ``nkilib`` exports this name
+            # from two paths -- ``core.moe.moe_cte.moe_cte``, which
+            # ``moe_blockwise_fp8.py:83-87`` imports, and
+            # ``core.utils.common_types``, which the gpt_oss quantised model's
+            # module-level import block imports at its ``:59-65`` -- and the
+            # consuming code compares members with ``==``
+            # (``moe_cte.py:537``, ``:570``, ``:595``). If those two paths ever
+            # resolve to distinct enum classes, an equality against the wrong one
+            # is False on every branch and the router weight is dropped
+            # ENTIRELY rather than misplaced. Importing from the seam this call
+            # enters means the member compared is the member that module holds,
+            # so the question cannot arise.
+            #
+            # THE TWO PATHS ARE IN FACT ONE OBJECT, read live on the installed
+            # ``nkilib`` under lease grant 037
+            # (``../increments/record-054a-nkilib-probe-037.md`` §5):
+            # ``ENUM_SAME_OBJECT=True``, with both paths reporting
+            # ``nkilib.core.utils.common_types`` as the defining module and the
+            # class carrying four members, not two. The import above is kept as
+            # it stands: it was arranged not to depend on the answer, and an
+            # arrangement that survives either answer is still the right one.
+            #
+            # CONFIGURATION, NOT KERNEL-CLASS WORK. The mode is a parameter the
+            # kernel already declares and both of the seam's routes already
+            # forward -- ``blockwise_fp8_moe`` passes ``**kernel_kwargs``
+            # verbatim to the NKI launch and to the torch oracle alike
+            # (``moe_blockwise_fp8.py:414``, ``:429``, ``:455``, ``:473``). No
+            # torch fallback is introduced and no new kernel is written, so P13
+            # is not engaged.
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             # THE CHECKPOINT'S SwiGLU BOUND, hand-off item (v), DECISIONS 409.
             #
             # THE ASYMMETRY IS THE REFERENCE'S. ``gate`` is bounded from ABOVE
@@ -1887,6 +1961,92 @@ class Glm5NextRoutedExperts(nn.Module):
             gate_clamp_lower_limit=None,
             up_clamp_upper_limit=self.swiglu_limit,
             up_clamp_lower_limit=-self.swiglu_limit,
+            # ---- EVERY REMAINING KERNEL PARAMETER, STATED -- DECISIONS 459/464 ----
+            #
+            # WHY EACH ONE IS WRITTEN even where its value equals the kernel's own
+            # default. A default is only safe to inherit if there is one default.
+            # Grant 037 read the installed kernel and found that is not the case
+            # here: the wrapper this call enters defaults
+            # ``expert_affinities_scaling_mode`` to ``PRE_SCALE``
+            # (``moe_blockwise_fp8.py:337-339``), which is the WRONG scaling point
+            # for this checkpoint, and the vendor's own two torch layers disagree
+            # with each other on the same parameter -- ``PRE_SCALE`` at
+            # ``bwmm_shard_on_I_torch.py:55`` against ``POST_SCALE`` at
+            # ``moe_cte_torch.py:49``. This seam's oracle already records that
+            # divergence in its own docstring (``moe_blockwise_fp8.py:500-503``).
+            # A value two vendor layers read differently is a value the caller
+            # must state, so every parameter this bank's arithmetic depends on is
+            # named here with the reason the MODEL requires it.
+            #
+            # THE REFERENCE COMPUTES BOTH PROJECTIONS AND MULTIPLIES THEM:
+            # ``modeling_glm5_next.py:142`` is ``return F.silu(gate) * up``, over
+            # the two halves ``:138`` chunks out of the fused bank. Skipping the
+            # gate projection would drop the ``silu`` factor altogether.
+            skip_gate_proj=False,
+            # THE AFFINITY MULTIPLIES THE OUTPUT, NOT THE INTERMEDIATE. This is
+            # the same line that fixes ``POST_SCALE`` above -- at
+            # ``modeling_glm5_next.py:133`` the router weight multiplies the
+            # ``[tokens, H]`` result of the down projection, so it is not applied
+            # on the ``I`` dimension. One reading of one line settles both
+            # parameters, which is why they cite the same place.
+            expert_affinity_multiply_on_I=False,
+            # NO ACTIVATION SCALE IS HANDED OVER -- DECISIONS 464 (1).
+            #
+            # This checkpoint quantises WEIGHTS per block and declares
+            # ``"activation_scheme": "dynamic"``
+            # (``test/vllm_neuron/model/glm5_next/fixtures/hf-config.json``;
+            # modelled at ``config.py:439`` and admitted only as ``"dynamic"`` at
+            # ``quantization.py:116``), so there is no static per-token activation
+            # scale in the checkpoint to hand over. The kernel consumes these two
+            # only under ``ActivationQuantMode.PER_TOKEN`` or ``PER_TENSOR``
+            # (``bwmm_shard_on_I.py:1033``, ``:1055``, ``:1084``, ``:1086``) --
+            # a mode that is NOT a caller parameter, being absent from the
+            # kernel's signature -- and no site in this repository has ever passed
+            # a non-``None`` one (``moe_blockwise_fp8.py:326-327`` declares them,
+            # ``:384-385`` forwards them, and those are the only sites).
+            #
+            # THIS IS AN OPEN READING, NOT A SETTLED NUMERICS CLAIM. Under a
+            # dynamic scheme something has to compute the per-token scale, and
+            # whether the kernel does it is unread -- the branch at
+            # ``bwmm_shard_on_I.py:318`` needs a host grant to see. Carried as
+            # debt ``D-054a-ACTQ``.
+            gate_up_hidden_scale=None,
+            down_hidden_scale=None,
+            # EXECUTION STRATEGY, NOT SEMANTICS. These three are written at the
+            # kernel's own defaults, read off the installed kernel under grant 037
+            # (``../increments/record-054a-nkilib-probe-037.md`` §7 rows ``:201``,
+            # ``:202``, ``:207``): ``accumulation_dtype`` at
+            # ``bwmm_shard_on_I.py:129``, ``checkpoint_activation`` at ``:127``,
+            # ``is_tensor_update_accumulating`` at ``:121``. Stating them means a
+            # vendor bump that moves a default cannot move this model's numbers
+            # without moving this line too. ``accumulation_dtype=None`` is a
+            # declaration that the kernel resolves the accumulation dtype itself,
+            # not an omission.
+            accumulation_dtype=None,
+            checkpoint_activation=False,
+            is_tensor_update_accumulating=True,
+            # ``compute_dtype`` IS DELIBERATELY NOT A KEYWORD HERE -- DECISIONS
+            # 464 (2), and it is cited rather than passed.
+            #
+            # The value the kernel needs is the checkpoint's own dtype,
+            # ``bfloat16`` (``fixtures/hf-config.json``, ``text_config.dtype``),
+            # and the kernel already receives exactly that: the wrapper defaults
+            # ``compute_dtype`` to ``nl.bfloat16`` (``moe_blockwise_fp8.py:335``).
+            # It is not written as a keyword because ONE ``kernel_kwargs`` mapping
+            # feeds BOTH of this seam's routes verbatim -- ``:455`` to the torch
+            # oracle, ``:473`` to the NKI launch -- so a single keyword cannot
+            # carry the two different objects the two routes need:
+            # ``nl.bfloat16`` would hand the oracle an NKI object,
+            # ``torch.bfloat16`` would reach the kernel, and ``nl`` is not on this
+            # module's imports at all. The oracle therefore keeps the vendor
+            # default ``None`` (``bwmm_shard_on_I_torch.py:53``,
+            # ``moe_cte_torch.py:47``): a KNOWN seam divergence, recorded rather
+            # than discovered later. The per-route translation belongs to the
+            # seam and is filed as its own increment; this call's surface is
+            # ``model_fp8.py`` alone. The oracle route is reached only when
+            # ``can_run_blockwise_fp8_moe`` is False
+            # (``moe_blockwise_fp8.py:439-445``), which the CPU lane does not
+            # take, so no acceptance run depends on the divergence.
         )
         return output[:tokens]
 
