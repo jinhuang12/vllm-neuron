@@ -694,6 +694,31 @@ def _dense_operands() -> dict:
     }
 
 
+def _clamped(
+    tensor: torch.Tensor, low: float | None, high: float | None
+) -> torch.Tensor:
+    """``tensor`` with the bounds that were GIVEN, and no clamp at all when neither was.
+
+    WHY THIS EXISTS, and it is the first hardware run's own finding. These references
+    take each bound as an argument so a control arm can remove one and show the branch
+    matters, and the convention is that ``None`` omits a bound -- the way the reference
+    model's own gate clamp omits its lower one (``modeling_glm5_next.py:102``). But
+    ``Tensor.clamp(min=None, max=None)`` does not return the tensor: it raises
+    ``RuntimeError: torch.clamp: At least one of 'min' or 'max' must not be None``. So
+    the arm that removes BOTH bounds -- the one that asks what the clamp is worth at all
+    -- could not be expressed, and three of the seven acceptance items died in their
+    reference rather than in the code under test
+    (``increments/fetch-054a-r6-step1-host-20260908T205349Z.out``, this file's ``:720``
+    and ``:1271`` at the time).
+
+    It is a pass-through and not a tolerance: with a bound present the clamp is exactly
+    the one torch would have applied, and with none present there is nothing to apply.
+    """
+    if low is None and high is None:
+        return tensor
+    return tensor.clamp(min=low, max=high)
+
+
 def _dense_output(
     operands: dict,
     gate_max: float | None,
@@ -709,7 +734,10 @@ def _dense_output(
 
     The bounds are ARGUMENTS so the item can rebuild this with one branch removed
     and prove the branch matters. Passing ``None`` for a bound omits it, which is
-    also how ``:102`` expresses its missing lower bound.
+    also how ``:102`` expresses its missing lower bound. Omitting BOTH bounds is a
+    control arm asking for no clamp at all, and :func:`_clamped` is what makes that
+    expressible -- ``Tensor.clamp(min=None, max=None)`` raises rather than returning
+    the tensor, which is the defect the first hardware run of this file found.
     """
     from torch.nn.functional import silu
 
@@ -717,8 +745,8 @@ def _dense_output(
     gate = x @ _dequantise(*operands["gate_proj_weight"])
     up = x @ _dequantise(*operands["up_proj_weight"])
 
-    gate_c = gate.clamp(min=None, max=gate_max)
-    up_c = up.clamp(min=up_min, max=up_max)
+    gate_c = _clamped(gate, None, gate_max)
+    up_c = _clamped(up, up_min, up_max)
     activated = silu(gate_c) * up_c
 
     # The module casts the activation back to the caller's dtype before the down
@@ -1268,8 +1296,8 @@ def _routed_output(
         gates.append(gate)
         ups.append(up)
 
-        clamped = silu(gate.clamp(min=gate_min, max=gate_max)) * up.clamp(
-            min=up_min, max=up_max
+        clamped = silu(_clamped(gate, gate_min, gate_max)) * _clamped(
+            up, up_min, up_max
         )
         # The kernel's declared activation dtype is bf16, so the reference casts too.
         # Skipping it would compare against a function the shipped path never computes.
@@ -3927,18 +3955,34 @@ def _root_config(**overrides):
     ``quantization_config``), so an item that took the defaults would pass today and
     stop measuring the campaign's registered policy the moment either side moved.
     Lifting them from the digest-verified fixture is what ties this item to it.
+
+    ONE FIELD IS ABSENT FROM THE PINNED CHECKPOINT, and it is read the way the shipped
+    loader reads it. The fixture's ``quantization_config`` holds exactly four keys --
+    ``activation_scheme``, ``fmt``, ``quant_method``, ``weight_block_size`` -- and no
+    ``modules_to_not_convert``. ``config.py`` declares that field optional
+    (``:462``, ``list[str] | None = None``) and lifts it with ``.get`` (``:524``), so a
+    bracket read here demanded a key the checkpoint does not carry and the item died
+    before it reached the model
+    (``increments/fetch-054a-r6-step1-host-20260908T205349Z.out``). The absence is now
+    REPORTED rather than defaulted silently: a checkpoint that starts carrying the field
+    changes this reading, and the reading is what the item ties itself to.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextConfig
 
     raw = _pinned_raw_config()["quantization_config"]
     text = _stack_text_config(**overrides)
+    exempt = raw.get("modules_to_not_convert")
+    print(
+        f"TINYFWD|root_quant_policy|keys={sorted(raw)}"
+        f"|modules_to_not_convert={exempt}"
+    )
     return Glm5NextConfig(
         text_config=text,
         tie_word_embeddings=bool(text.tie_word_embeddings),
         quant_method=raw["quant_method"],
         activation_scheme=raw["activation_scheme"],
         weight_block_size=list(raw["weight_block_size"]),
-        modules_to_not_convert=list(raw["modules_to_not_convert"]),
+        modules_to_not_convert=None if exempt is None else list(exempt),
         fmt=raw["fmt"],
     )
 
