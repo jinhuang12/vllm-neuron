@@ -5800,3 +5800,210 @@ def test_gridshard_b_one_reachable_block_size_is_why_105_omits_the_parameter() -
         f"item exists to explain that exact asymmetry, so a change to either "
         f"signature means the explanation needs rewriting rather than re-asserting"
     )
+
+
+# --------------------------------------------------------------------------- #
+# ``inc-glm53f-054a`` hand-off item (iii): the first COMPLETING load in this file
+# that carries a shared-expert module.
+#
+# WHY IT IS NEEDED. The landed shared-expert scale prep had never run through
+# ``load_weights`` in any item here. Of the seven completing loads this file had,
+# one carried a routed bank and none carried a shared expert -- every fixture that
+# completes either sets ``n_shared_experts=0`` (``_stacked_config``,
+# ``_shard_config``, ``_grid_shard_config``; ``_shard_config``'s docstring records
+# that it is not a convenience) or is all-dense and so builds no MoE block at all
+# (``_dense_config``). The two fixtures that do build the module both refused.
+#
+# NO NEW CHECKPOINT WRITER IS MINTED, and that is a measurement rather than a
+# shortcut. Item (iii) asks for a 256-blocked checkpoint carrying a shared expert,
+# and ``_deferred_checkpoint`` already writes one: its six MoE families come from
+# :data:`DEFERRED_FAMILIES` at :data:`SHARED_INTERMEDIATE` and
+# :data:`BANK_INTERMEDIATE` by :data:`DEFERRED_NARROW` -- 2048 and 512 by 256, all
+# whole multiples of the consumer's block. A second writer differing only in the
+# shared expert's width would be a copy of 200 lines with nothing new to say. What
+# was missing was a LOAD that completes through it, so that is what this section
+# adds: the same checkpoint at world size 1, where nothing shards and the only
+# thing standing between the load and the prep was the retile.
+#
+# THE 128-BLOCK GRID IS THE POINT, not an accident of the fixture. The checkpoint
+# holds one scale per 128-tile, exactly as the published one does, and the prep
+# consumes the 256 public grid. So a completing load here is evidence that the
+# load-path retile ran; without it this same load is ``-101``'s recorded refusal.
+# --------------------------------------------------------------------------- #
+
+#: World size 1 and expert-parallel degree 1, so every family loads whole and no
+#: padding or column arithmetic stands between the checkpoint and the prep. The
+#: sharded readings are ``-094``'s and ``-101``'s and are not repeated here.
+BLOCKED_WORLD = 1
+BLOCKED_EP_DEGREE = 1
+
+
+def _load_blocked(
+    directory: Path,
+    monkeypatch,
+    shared_experts: int = MINI_SHARED_EXPERTS,
+) -> Glm5NextForConditionalGeneration:
+    """Load the 256-blocked checkpoint at world 1, where nothing shards.
+
+    ``shared_experts`` IS THE FIRING CONTROL'S ONE VARYING FIELD, the same field
+    :func:`_deferred_config` varies for the same reason: at 0 no module of the
+    class exists, so a reading taken at 1 is a reading of the shared expert and
+    not of the fixture at large.
+    """
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_world_size", lambda: BLOCKED_WORLD)
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_rank", lambda: 0)
+    monkeypatch.setattr(
+        _FACTORY, "_resolve_ep_degree", lambda given: BLOCKED_EP_DEGREE
+    )
+    monkeypatch.setattr(_NPS, "get_neuron_ep_rank", lambda: 0)
+    monkeypatch.setattr(
+        _NPS,
+        "get_neuron_ep_tp_group",
+        lambda: _FixtureGroup(0, BLOCKED_WORLD // BLOCKED_EP_DEGREE),
+    )
+    model = Glm5NextForConditionalGeneration(_deferred_config(shared_experts))
+    assert model.world_size == BLOCKED_WORLD, (
+        f"the model resolved world size {model.world_size}, not the patched "
+        f"{BLOCKED_WORLD}, so this is not the load this item means to measure"
+    )
+    _seed_page_cache_signal()
+    model.load_weights(str(directory), torch.device("cpu"), None)
+    return model
+
+
+def _modules_named(
+    model: Glm5NextForConditionalGeneration, class_name: str
+) -> list[tuple[str, torch.nn.Module]]:
+    """Every ``(path, module)`` whose type has this name, from the tree itself.
+
+    The class name is a STRING because that is what the prep loop's own gate
+    compares (``model_fp8.py``'s ``hasattr`` on the type, read per module), and
+    because importing the bank's class here would add an import for a count the
+    tree already answers.
+    """
+    return [
+        (path, module)
+        for path, module in model.named_modules()
+        if type(module).__name__ == class_name
+    ]
+
+
+def test_blocked_the_shared_expert_prep_completes_a_load_and_the_retile_ran(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Item (iii). The shared expert's prep runs inside a COMPLETING load.
+
+    Five conjuncts, and the firing control that makes them readings.
+
+    (1) The load completes. Until the load-path retile landed, this same
+        checkpoint refused inside the prep, and ``-101`` attempt 2 recorded the
+        refusal by name -- so completion is the evidence the retile ran, not a
+        restatement of it.
+    (2) Every shared-expert module carries three prepared scale operands, read
+        through the class's own attribute name rather than a string here.
+    (3) The retile's health record says all three projections were retiled, and
+        the public grid it published is the one the weight's own extents imply,
+        computed here from the consumer's block size rather than read back from
+        the record.
+    (4) Both losslessness counters read zero on this fixture. They are counters,
+        not assertions: ``-095b``'s pattern writes a distinct value per index, so
+        a layout that dropped or invented a scale would move them.
+    (5) Every routed bank carries its prepared kernel operands. This is the plan's
+        own sentence for this item -- the prep's arrival makes the loop visit the
+        bank -- read on the module the loop visited.
+
+    THE CONTROL: the same fixture with no shared expert. The load still
+    completes and no module of the class exists, so conjuncts (2) to (4) are
+    readings of the shared expert rather than of a load that would pass anyway.
+    """
+    directory, _overrides, _mappings = _deferred_checkpoint(tmp_path)
+    block = _WL_FP8.consumer_block_quant_size()
+
+    model = _load_blocked(directory, monkeypatch)
+
+    shared = _modules_named(model, "Glm5NextSharedExperts")
+    assert shared, (
+        "this configuration built no Glm5NextSharedExperts module, so there is "
+        "nothing here to read and the conjuncts below would pass vacuously"
+    )
+
+    for path, module in shared:
+        # (2) the prep built three operands.
+        prepared = getattr(module, Glm5NextSharedExperts.PREPARED_SCALE_OPERANDS_ATTR)
+        assert len(prepared) == 3, (
+            f"{path} carries {len(prepared)} prepared scale operands, not 3; the "
+            f"prep builds one per projection and the load completed, so a "
+            f"shortfall means a projection was skipped rather than refused"
+        )
+
+        # (3) the retile ran on all three, and published the implied grid.
+        health = getattr(module, Glm5NextSharedExperts.SHARED_RETILE_HEALTH_ATTR)
+        leaves = _scale_prep_leaves(module)
+        assert len(leaves) == 3, (
+            f"{path} offers {leaves} to the prep loop, not three leaves; this "
+            f"item's arithmetic below is per projection"
+        )
+        for leaf in leaves:
+            record = health[leaf]
+            assert record["retiled"] is True, (
+                f"{path}.{leaf} was NOT retiled: {record.get('reason')}. On this "
+                f"fixture every MoE extent is a whole {block} block, so a skip "
+                f"here means the retile could not read the extents it was given"
+            )
+            weight = getattr(module, leaf)
+            rows, cols = int(weight.shape[0]), int(weight.shape[1])
+            implied = (rows // block, cols // block)
+            grid_name = f"{leaf[: -len(_WEIGHT_LEAF_SUFFIX)]}_{FP8_SCALE_SUFFIX}"
+            grid = getattr(module, grid_name)
+            assert tuple(grid.shape) == implied, (
+                f"{path}.{grid_name} is {tuple(grid.shape)} after the load; a "
+                f"[{rows},{cols}] weight implies the public grid {implied} at "
+                f"the consumer's {block}-block granularity. A grid that survived "
+                f"at checkpoint granularity is the refusal -101 recorded"
+            )
+            assert grid.dtype is torch.float32, (
+                f"{path}.{grid_name} is {grid.dtype}; the scale grids stay fp32 "
+                f"through the retile, which is what -091's own item pins"
+            )
+
+            # (4) the two counters, which can move.
+            assert record["emitted_unsupplied"] == 0, (
+                f"{path}.{leaf} emitted {record['emitted_unsupplied']} slots the "
+                f"input did not supply, so the retiled layout does not decode "
+                f"back to the grid it was given"
+            )
+            assert record["input_scales_dropped"] == 0, (
+                f"{path}.{leaf} dropped {record['input_scales_dropped']} input "
+                f"scales, so the coarser grid cannot reproduce them bit-exactly"
+            )
+
+    # (5) the loop visited every bank, which is what item (i)'s arrival changed.
+    banks = _modules_named(model, "Glm5NextRoutedExperts")
+    assert banks, (
+        "this configuration built no routed bank, so conjunct (5) has nothing "
+        "to read; first_k_dense_replace must leave at least one MoE layer"
+    )
+    bank_class = type(banks[0][1])
+    for path, module in banks:
+        prepared = getattr(module, bank_class.PREPARED_KERNEL_OPERANDS_ATTR, None)
+        assert prepared, (
+            f"{path} carries no prepared kernel operands after a completing "
+            f"load. The prep loop's gate is a type test and this class now "
+            f"defines prepare_scale_operands, so the loop must have visited it"
+        )
+        assert len(prepared) == 4, (
+            f"{path} carries {len(prepared)} prepared kernel operands, not the "
+            f"four block_quant_expert_mm takes: {sorted(prepared)}"
+        )
+
+    # THE CONTROL. Same checkpoint, same widths, no shared expert.
+    control = _load_blocked(directory, monkeypatch, shared_experts=0)
+    assert not _modules_named(control, "Glm5NextSharedExperts"), (
+        "the control built a shared-expert module at n_shared_experts=0, so the "
+        "field this control varies is not the field the tree reads and the "
+        "readings above are not attributable to the shared expert"
+    )
+    assert _modules_named(control, "Glm5NextRoutedExperts"), (
+        "the control built no routed bank either, so it varies more than the one "
+        "field it declares and cannot isolate anything"
+    )
