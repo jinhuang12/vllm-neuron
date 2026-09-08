@@ -1858,14 +1858,22 @@ class Glm5NextRoutedExperts(nn.Module):
             # ``F.linear(current, down_proj[e]) * top_k_weights[...]``. That is
             # ``POST_SCALE``, and it is a different function, not a rearranged
             # one -- this repository's own torch implementation says so in its
-            # own words at ``moe_cte.py:490-492``: "this is NOT mathematically
+            # own words at ``vllm_neuron/functional/moe/moe_cte.py:490-492``
+            # (the DIRECTORY matters: ``nkilib`` ships a ``moe_cte.py`` of its
+            # own, whose lines there are different): "this is NOT mathematically
             # equivalent to POST_SCALE because the nonlinear activation breaks
             # the linearity: act(a * x) != a * act(x)".
             #
             # AND IT WAS NOT A SMALL DIFFERENCE. The pinned config normalises the
-            # top-8 gate weights and scales them by 2.5, so every affinity
-            # averages 0.3125 and none reaches 1. Two consequences, measured in
-            # ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-054a-affinity-scaling-mode-r1.out``:
+            # top-8 gate weights and scales them by 2.5, so the eight affinities
+            # sum to 2.5 and average 0.3125. That is a statement about the MEAN
+            # and about nothing else: the router divides by its own sum and then
+            # multiplies by the scaling factor
+            # (``modeling_glm5_next.py:179-182``), so a single weight lies
+            # anywhere in ``(0, 2.5)`` and DOES exceed 1 when one expert
+            # dominates a token. Two consequences, measured in
+            # ``increments/probe-054a-affinity-scaling-mode-r1.out`` under the
+            # campaign artifacts root:
             # the per-token contribution was wrong by up to 76.9% against a 1%
             # acceptance tolerance, and the SwiGLU bound three paragraphs below
             # bound ``affinity * gate`` rather than ``gate``, so it bit above
@@ -1878,8 +1886,10 @@ class Glm5NextRoutedExperts(nn.Module):
             #
             # EXPLICIT RATHER THAN INHERITED, WHICH IS THE FORK'S OWN
             # CONVENTION. Every one of the five landed MoE call sites in this
-            # repository names this parameter and chooses the other value, all
-            # five on the gpt_oss expert bank: ``GptOssExperts._run_moe_block_tkg``
+            # repository names this parameter and chooses ``POST_SCALE`` -- the
+            # SAME value this call chooses, and the opposite of the shim default
+            # they were all declining to inherit. All five sit on the gpt_oss
+            # expert bank: ``GptOssExperts._run_moe_block_tkg``
             # (``:1339`` quantised, ``:1257`` bf16),
             # ``GptOssExperts._run_moe_tkg`` (``:1390``) and
             # ``GptOssExperts.forward_prefill`` (``:1567`` quantised, ``:1409``
@@ -1891,9 +1901,12 @@ class Glm5NextRoutedExperts(nn.Module):
             # from two paths -- ``core.moe.moe_cte.moe_cte``, which
             # ``moe_blockwise_fp8.py:83-87`` imports, and
             # ``core.utils.common_types``, which the gpt_oss quantised model's
-            # module-level import block imports at its ``:59-65`` -- and the
-            # consuming code compares members with ``==``
-            # (``moe_cte.py:537``, ``:570``, ``:595``). If those two paths ever
+            # module-level import block imports at its ``:60-66``
+            # (``ExpertAffinityScaleMode`` on ``:62``) -- and the consuming code
+            # compares members with ``==``
+            # (``vllm_neuron/functional/moe/moe_cte.py:537``, ``:570``,
+            # ``:595``, and the kernel this call actually reaches, at
+            # ``bwmm_shard_on_I.py:1157`` and ``:1176``). If those two paths ever
             # resolve to distinct enum classes, an equality against the wrong one
             # is False on every branch and the router weight is dropped
             # ENTIRELY rather than misplaced. Importing from the seam this call
@@ -1902,7 +1915,8 @@ class Glm5NextRoutedExperts(nn.Module):
             #
             # THE TWO PATHS ARE IN FACT ONE OBJECT, read live on the installed
             # ``nkilib`` under lease grant 037
-            # (``../increments/record-054a-nkilib-probe-037.md`` §5):
+            # (``increments/record-054a-nkilib-probe-037.md`` §5 under the campaign
+            # artifacts root):
             # ``ENUM_SAME_OBJECT=True``, with both paths reporting
             # ``nkilib.core.utils.common_types`` as the defining module and the
             # class carrying four members, not two. The import above is kept as
@@ -2014,7 +2028,7 @@ class Glm5NextRoutedExperts(nn.Module):
             down_hidden_scale=None,
             # EXECUTION STRATEGY, NOT SEMANTICS. These three are written at the
             # kernel's own defaults, read off the installed kernel under grant 037
-            # (``../increments/record-054a-nkilib-probe-037.md`` §7 rows ``:201``,
+            # (``increments/record-054a-nkilib-probe-037.md`` §7 rows ``:201``,
             # ``:202``, ``:207``): ``accumulation_dtype`` at
             # ``bwmm_shard_on_I.py:129``, ``checkpoint_activation`` at ``:127``,
             # ``is_tensor_update_accumulating`` at ``:121``. Stating them means a
@@ -2042,7 +2056,9 @@ class Glm5NextRoutedExperts(nn.Module):
             # default ``None`` (``bwmm_shard_on_I_torch.py:53``,
             # ``moe_cte_torch.py:47``): a KNOWN seam divergence, recorded rather
             # than discovered later. The per-route translation belongs to the
-            # seam and is filed as its own increment; this call's surface is
+            # seam and is TO BE FILED at this increment's fold -- no such increment
+            # exists on disk yet, and this comment does not claim one does. This
+            # call's surface is
             # ``model_fp8.py`` alone. The oracle route is reached only when
             # ``can_run_blockwise_fp8_moe`` is False
             # (``moe_blockwise_fp8.py:439-445``), which the CPU lane does not
