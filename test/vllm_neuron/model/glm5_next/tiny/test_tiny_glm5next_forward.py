@@ -1165,3 +1165,159 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
     torch.testing.assert_close(
         got.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
     )
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 3 of 7 -- ``Glm5NextSharedExperts.forward``.                            #
+# Certifying component: ``model_fp8.Glm5NextSharedExperts.forward``.           #
+#                                                                              #
+# IT REUSES ITEM 1's FIXTURE AND ITS REFERENCE, and that is a reading rather    #
+# than a shortcut. The shared expert and the dense MLP compute the SAME         #
+# function -- three dense-seam projections and the checkpoint's clamped SwiGLU  #
+# -- from the same reference class (``modeling_glm5_next.py:86``'s one          #
+# ``Glm5NextTextMLP``, built at ``:196`` as ``shared_experts`` and at ``:1271`` #
+# as the dense ``mlp``). Two references for one function would be two things to #
+# keep in step. What THIS item adds is everything the two paths do differently: #
+# the load-time scale-operand prep, the forward's lookup of the three grids off #
+# the module, and the refusals that stand where the dense path has none.        #
+# --------------------------------------------------------------------------- #
+def test_tiny_shared_experts_forward_matches_the_reference() -> None:
+    """The always-on shared expert on one MoE layer, against the same reference.
+
+    ``inc-glm53f-054a`` item 3 of 7. THREE dispatches: gate, up, down.
+    """
+    model_fp8 = _impl()
+    text_config = _tiny_text_config()
+    module = model_fp8.Glm5NextSharedExperts(text_config)
+
+    limit = float(module.swiglu_limit)
+    if limit != float(text_config.swiglu_limit):
+        raise VacuousControlError(
+            f"the module resolved swiglu_limit={limit} but the config declares "
+            f"{text_config.swiglu_limit}; the bound under test would not be the "
+            f"checkpoint's"
+        )
+
+    operands = _dense_operands()
+    leaves = ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
+    for leaf in leaves:
+        _attach(module, leaf, *operands[leaf])
+
+    parameters = sum(int(p.numel()) for p in module.parameters() if p is not None)
+    if parameters >= MAX_PARAMETERS:
+        raise VacuousControlError(
+            f"the tiny shared expert holds {parameters} parameters, at or above "
+            f"the adopted bound of {MAX_PARAMETERS}"
+        )
+
+    # ---- CONTROL A: THE PREP IS REQUIRED, and the forward says so by name.
+    # ``shared_expert_mm`` reads three operands ``prepare_scale_operands`` builds
+    # at load time and refuses to build them per forward step. Calling the forward
+    # first is how this item proves the shipped path really reads those operands
+    # rather than quietly rebuilding them -- a lazy rebuild would make this call
+    # succeed and would put the per-call scatter back with nothing reporting it.
+    with pytest.raises(model_fp8.Glm5NextSharedExpertRouteError) as unprepared:
+        module.forward(operands["hidden"], quant_config=_quant_config())
+    print(f"TINYFWD|shared_control|unprepared={str(unprepared.value)[:60]!r}")
+
+    # ---- THE LOAD-TIME PREP, run the way ``_run_load_time_preps`` runs it: off
+    # this module's own attributes, in the declaration order the two methods
+    # share. The count is the method's own return, not a length this item counts.
+    built = module.prepare_scale_operands(
+        *(getattr(module, leaf) for leaf in leaves),
+        *(getattr(module, _scale_grid_attribute(leaf)) for leaf in leaves),
+    )
+    if built != 3:
+        raise VacuousControlError(
+            f"the load-time prep reported {built} operands, not the 3 the shared "
+            f"expert's three projections need"
+        )
+
+    reference = _dense_output(operands, limit, -limit, limit)
+
+    # ---- PRECONDITION 1: every clamp branch has elements to act on.
+    above_gate = int((reference["gate"] > limit).sum())
+    below_gate = int((reference["gate"] <= limit).sum())
+    above_up = int((reference["up"] > limit).sum())
+    within_up = int(((reference["up"] >= -limit) & (reference["up"] <= limit)).sum())
+    below_up = int((reference["up"] < -limit).sum())
+    print(
+        f"TINYFWD|shared|limit={limit}|prepared={built}"
+        f"|shared_experts={int(module.num_shared_experts)}"
+        f"|gate_above={above_gate}|gate_below={below_gate}|up_above={above_up}"
+        f"|up_within={within_up}|up_below={below_up}|params={parameters}"
+    )
+    for name, count in (
+        ("gate above the bound", above_gate),
+        ("gate at or below the bound", below_gate),
+        ("up above the bound", above_up),
+        ("up inside the bound", within_up),
+        ("up below the negated bound", below_up),
+    ):
+        if count == 0:
+            raise VacuousControlError(
+                f"no element has {name}, so this item cannot tell the reference's "
+                f"clamp from its absence"
+            )
+
+    # ---- PRECONDITION 2: and each branch MOVES THE OUTPUT further than the
+    # tolerance this item passes inside. Item 1's reason, and item 1's measurement:
+    # its first fixture had every regime populated and still let a missing lower
+    # clamp through at 0.9% against a 1% tolerance.
+    for name, variant in (
+        ("gate upper clamp", _dense_output(operands, None, -limit, limit)),
+        ("up upper clamp", _dense_output(operands, limit, -limit, None)),
+        ("up lower clamp", _dense_output(operands, limit, None, limit)),
+    ):
+        moved = not torch.allclose(
+            variant["out"], reference["out"], rtol=RTOL, atol=ATOL
+        )
+        gap = float(
+            (variant["out"] - reference["out"]).abs().max()
+            / reference["out"].abs().max()
+        )
+        print(
+            f"TINYFWD|shared_control|branch={name}|outside_tolerance={moved}"
+            f"|gap={gap:.4f}"
+        )
+        if not moved:
+            raise VacuousControlError(
+                f"removing the {name} leaves the result inside rtol={RTOL}, "
+                f"atol={ATOL}; this item would pass with that branch deleted from "
+                f"the module"
+            )
+
+    # ---- THE REGISTERED ROUTE PREDICATE, around this item's own call.
+    _reset_seam_counters()
+    before = _read_seam_counters()
+    got = module.forward(operands["hidden"], quant_config=_quant_config())
+    after = _read_seam_counters()
+    # THREE dispatches on the dense seam and nothing on the MoE one. The shared
+    # expert is the DENSE blockwise route at its own width (DECISIONS §77), so a
+    # forward that reached the expert kernel fails here rather than passing on a
+    # total.
+    _assert_route_predicate("3 shared experts", {"blockwise_fp8_mm": 3}, before, after)
+
+    if tuple(got.shape) != (TOKENS, HIDDEN_SIZE):
+        raise ReferenceShapeError(
+            f"the forward returned {tuple(got.shape)}, expected "
+            f"{(TOKENS, HIDDEN_SIZE)}"
+        )
+    torch.testing.assert_close(
+        got.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
+    )
+
+    # ---- CONTROL B: THE GRID LOOKUP IS THE FORWARD'S OWN, and a missing grid is
+    # refused by name rather than reaching an unscaled matmul. Taken AFTER the
+    # comparison so the item's own reading is never taken on a mutated module:
+    # ``down_proj``'s grid is removed from a module that has already been read.
+    removed = _scale_grid_attribute("down_proj_weight")
+    delattr(module, removed)
+    with pytest.raises(model_fp8.Glm5NextSharedExpertRouteError) as missing:
+        module.forward(operands["hidden"], quant_config=_quant_config())
+    if removed not in str(missing.value):
+        raise VacuousControlError(
+            f"the refusal for a missing grid does not name {removed}: "
+            f"{missing.value}"
+        )
+    print(f"TINYFWD|shared_control|missing_grid={removed}|named=True")
