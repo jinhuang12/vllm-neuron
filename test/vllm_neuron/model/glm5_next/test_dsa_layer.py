@@ -3687,8 +3687,21 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
 #:
 #: 8 WOULD STRIKE AND WOULD STILL PROVE NOTHING. The factory's stage count is
 #: `div_ceil(min(k, vocab), 8)` (`:417`), so `k = 8` gives ONE stage: no folding, hence no pad column,
-#: and no rotation, hence no matmul. 16 is the smallest `select_k` that puts the kernel on the
-#: rotational path, and this file asserts that from the config rather than from this sentence.
+#: and no rotation, hence no matmul.
+#:
+#: 16 IS NOT THE SMALLEST SUCH `k`, AND THIS FILE WILL NOT CLAIM IT IS. That claim is exactly what
+#: review finding R2 struck from the sibling test file, and the arithmetic here says the same thing:
+#: the stage count reaches 2 as soon as `min(k, vocab) >= 9`, so `k = 9` over a width of 11 is already
+#: rotational, already striking (`local_top_k_per_stage` aligns up to 8), and already padded. It would
+#: run on a 44-token leg instead of a 68-token one.
+#:
+#: 16 IS CHOSEN FOR A DIFFERENT AND SMALLER REASON: it is the smallest ROTATIONAL `k` for which
+#: `padded_k == orig_k` -- `local_top_k_per_stage * n_stages` is `8 * 2` (`:428-431`) -- which is also
+#: true of production's `k = 512`. (`k = 8` also has `padded_k == orig_k` and also strikes, but on the
+#: scanning branch, which is the branch this case exists to leave.) At `k = 9` the kernel would return its padded 16 and trim, adding one
+#: behaviour between the selector and the marker that production does not have. The cost is 24 extra
+#: token rows, and every property the case needs is READ from the config below either way, so a future
+#: lap may move this dial down without touching a single reading.
 STRIKING_SELECT_K = 16
 
 #: The candidate width: strictly above ``select_k`` -- `can_run_dsa_topk_select` refuses `k == width`
