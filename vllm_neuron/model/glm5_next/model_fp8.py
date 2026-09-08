@@ -3043,10 +3043,88 @@ class Glm5NextSharedExperts(nn.Module):
             prebuilt_scale_t=self._prepared_scale_operand("down_proj"),
         )
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextSharedExperts.forward is a stub created by "
-            "inc-glm53f-013; the shared-expert path lands with inc-glm53f-033"
+    # ── the shared expert's forward -- ``inc-glm53f-054a`` item 3 of 7 ────
+    #
+    # WHAT THIS METHOD IS: the operand lookup, and nothing else.
+    # :meth:`shared_expert_mm` above is the whole compute path and is landed and
+    # separately accepted; it takes its six operands as arguments, on the
+    # recorded ground that a weight-loader product is threaded in at the call.
+    # This method is the ``nn.Module`` entry point, so it is where "at the call"
+    # resolves to "off this module": it reads the three weights the
+    # declaration tuple names and the three grids the loader attached beside
+    # them, and hands them over.
+    #
+    # WHY THE GRID NAMES ARE DERIVED AND NOT SPELLED. The rule lives once, in
+    # ``_sibling_scale_grid_name``, and the retile above already reaches it that
+    # way. Spelling ``gate_proj_weight_scale_inv`` here would be a second copy of
+    # a naming convention that the loader, the prep loop and the retile all read
+    # from that one definition.
+    #
+    # WHY IT RAISES ON A MISSING GRID AND ON NOTHING ELSE. A missing grid is not
+    # something the callee can check -- it receives grids, so an absent attribute
+    # reaches it as ``AttributeError`` from inside a path that is not at fault,
+    # and the dense MLP's forward refuses on exactly this for exactly this
+    # reason. Every EXTENT agreement is the callee's, which checks each one
+    # already; a second check here is how two authorities on one extent come to
+    # disagree.
+    #
+    # WHAT IT DOES NOT DO. It does not add a residual, which is
+    # :meth:`Glm5NextMoEBlock.combine_routed_and_shared`'s one add, and it does
+    # not cast the seam's fp32 return -- the layer forward decides the residual
+    # dtype, which is this block's later item and not this one.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        quant_config: Glm5NextQuantConfig,
+    ) -> torch.Tensor:
+        """This module's always-on contribution to one MoE layer.
+
+        Args:
+            hidden_states: ``[T, H]`` activations, ``bfloat16``. The padding
+                contract is :meth:`shared_expert_mm`'s and is documented there.
+            quant_config: the resolved per-model quantisation policy, and the
+                route selector. An ARGUMENT rather than a field, matching the
+                three landed methods of this family and
+                :meth:`Glm5NextDenseMLP.forward`; no module in this file holds a
+                policy.
+
+        Returns:
+            ``[T, H]`` **fp32**, exactly what :meth:`shared_expert_mm` returns.
+
+        Raises:
+            Glm5NextSharedExpertRouteError: when a scale grid the loader should
+                have attached is absent. Refusing rather than running an
+                unscaled matmul, which returns plausible numbers.
+        """
+        operands: list[torch.Tensor] = []
+        grids: list[torch.Tensor] = []
+        for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            grid_name = (
+                Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+            )
+            grid = getattr(self, grid_name, None)
+            if grid is None:
+                raise Glm5NextSharedExpertRouteError(
+                    f"{grid_name} is not on this module. The block-scale grids "
+                    f"are plain attributes the weight loader attaches beside "
+                    f"each declared weight, and this route consumes the PUBLIC "
+                    f"grid at BLOCK_QUANT_SIZE granularity that "
+                    f"retile_checkpoint_scale_grids publishes. Refusing rather "
+                    f"than running an unscaled matmul, which returns plausible "
+                    f"numbers."
+                )
+            operands.append(getattr(self, leaf))
+            grids.append(grid)
+        return self.shared_expert_mm(
+            hidden_states,
+            operands[0],
+            operands[1],
+            operands[2],
+            grids[0],
+            grids[1],
+            grids[2],
+            quant_config,
         )
 
 
