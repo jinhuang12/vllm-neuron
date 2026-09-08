@@ -156,12 +156,9 @@ ATOL = 1e-5
 #: Order named inline, per design law D3: the pin holds two tolerance maps in OPPOSITE
 #: orders, so a bare pair is ambiguous. This one is ``(rtol, atol)``.
 #:
-#: WHY THE bf16 PAIR CANNOT SERVE THESE SITES, and it is arithmetic rather than taste.
-#: bfloat16 carries 8 significant bits, so its unit roundoff is ``2**-9``; accumulating
-#: ``n`` terms bounds the pointwise relative error near ``n * 2**-9``. At ``n = 8`` that is
-#: 1.5625%, and ``rtol=1e-2`` admits at most 5.12 terms. The eight terms are NOT a fixture
-#: choice: the landed router refuses ``top_k != 8`` (``router.py:1037``). The same bound at
-#: the two experts this fixture used before is 0.39%, which is why these sites passed then.
+#: THE PRECEDENT IS THE WHOLE GROUND HERE. A bf16 unit-roundoff argument agrees with this
+#: pair, but its premise -- which dtype the seam accumulates in -- is OWED and unmeasured,
+#: so it is not offered as a reason. No hardware run has passed these sites at any band.
 MOE_RTOL = 3e-2
 MOE_ATOL = 1e-5
 
@@ -3875,17 +3872,17 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 )
         expected = hidden.float() + half["out"].float()
         if index + 1 < len(layers):
-            # THE BAND FOLLOWS THE SEAM THIS LAYER'S FFN HALF CROSSED. A routed layer's
-            # output carries the eight-expert MoE sum and takes the MoE band; a dense
-            # layer's crossed one fp8 matmul and stays on the tighter pair. ``routed`` is
-            # the loop's own branch flag above, so the two cannot drift apart.
-            layer_rtol, layer_atol = (MOE_RTOL, MOE_ATOL) if routed else (RTOL, ATOL)
-            print(f"TINYFWD|stack_ffn_band|layer={index}"
-                  f"|branch={'routed' if routed else 'dense'}"
-                  f"|rtol={layer_rtol}|atol={layer_atol}")
+            # THIS COMPARISON NEVER SEES THE ROUTED LAYER, so it stays on the bf16 pair.
+            # The guard above runs it for every layer except the last, and this fixture's
+            # only routed layer IS the last (``STACK_LAYERS = 3``, ``STACK_FIRST_K_DENSE
+            # = 2``), so it compares dense outputs alone. The eight-expert sum reaches a
+            # comparison only through conjunct 5's final norm below, which is frozen at
+            # ``RTOL``/``ATOL``. DO NOT SWITCH THIS TO THE MoE BAND: at this fixture's
+            # shape the routed branch cannot execute, so it would widen nothing today and
+            # arm an unruled widening the moment the layer count or the dense split moves.
             torch.testing.assert_close(
                 recorded_in[index + 1][1][0].float(), expected,
-                rtol=layer_rtol, atol=layer_atol,
+                rtol=RTOL, atol=ATOL,
             )
 
     # ---- CONJUNCT 5: THE FINAL NORM CLOSES THE CHAIN, on the last layer's own
@@ -4471,15 +4468,17 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # ---- CONTROL E: THE ROWS ARE MEASURED, NOT INCIDENTAL. The reference recomputed
     # on rolled positions must leave the band, or a forward that projected some other
     # rows would be indistinguishable from this one.
-    # ROLLED BY TWO, NOT BY ONE, and the positions themselves do not move. Rolling by
-    # one leaves row 2 mapping position 7 to position 7 -- ``(127, 0, 7, 7)`` becomes
-    # ``(0, 7, 7, 127)`` -- so that row's logits cannot change by construction and the
-    # control is diluted by a row that can never discriminate. Rolling by two gives
-    # ``(7, 7, 127, 0)``: four changing rows of four, with the tuple, its runner-faithful
-    # repeat and conjunct 5's byte-identity check all exactly as declared. Measured over
-    # every roll amount and both bracketing controls in
-    # ``increments/probe-054a-root-roll-fixedpoint-mac-r1-20260908T222838Z.out``.
-    rolled = tuple(ROOT_SAMPLING_POSITIONS[2:]) + tuple(ROOT_SAMPLING_POSITIONS[:2])
+    # ROLLED BY ONE, and the positions do not move. Row 2 of ``(127, 0, 7, 7)`` maps
+    # position 7 to position 7, so its logits cannot change and this control reads as
+    # DEGENERATE ON PURPOSE instead of being quietly repaired. Rolling by two does not
+    # repair it: it compares a subset of the position pairs rolling by one already
+    # compares, so its gap is <= this one's by construction, and it drops the
+    # first-token-versus-last-token pair this control exists to exercise. The fix is the
+    # fixture's POSITIONS, proposed in
+    # ``increments/proposal-054a-root-positions-r1.md`` and not yet ruled; until it is,
+    # ``VacuousControlError`` reddens this item honestly rather than passing on a
+    # comparison that cannot discriminate.
+    rolled = tuple(ROOT_SAMPLING_POSITIONS[1:]) + (ROOT_SAMPLING_POSITIONS[0],)
     _stack_outside_tolerance(
         f"the logits recomputed on rolled positions {list(rolled)}",
         _root_reference(hidden, head, rolled),
