@@ -2571,6 +2571,142 @@ class Glm5NextSharedExperts(nn.Module):
     #: and the reader, and neither should spell it twice.
     PREPARED_SCALE_OPERANDS_ATTR = "_prepared_scale_operands"
 
+    #: Where :meth:`retile_checkpoint_scale_grids` records what the coarsening
+    #: cost, per projection, and which projections it left alone. This block's
+    #: acceptance reads it; no consumer does.
+    SHARED_RETILE_HEALTH_ATTR = "_shared_expert_retile_health"
+
+    # ── the load-path retile -- ``inc-glm53f-054a`` hand-off item (iv) ─────
+    #
+    # WHAT IT FIXES. The checkpoint stores one scale per ``128 x 128`` tile and
+    # :meth:`prepare_scale_operands` above consumes the PUBLIC grid, one scale per
+    # ``256 x 256`` block. Nothing on this module's load path bridged the two, so a
+    # real load reached the prep with a ``(4, 2)`` grid where it wanted ``(2, 1)``
+    # and refused. ``inc-glm53f-101`` attempt 2 recorded that refusal by name
+    # (``BlockwiseFp8MmError: weight_scale has shape (4, 2), expected (2, 1) for a
+    # [K=512, N=256] weight``) and DECISIONS §84 placed the bridge here.
+    #
+    # THE WEIGHT MOVES WITH THE GRID, and that is the whole reason this is a
+    # retile and not a grid rewrite. Coarsening keeps ONE of the four tile scales
+    # per block, so the other three tiles' values are wrong against the retained
+    # scale until they are rescaled by their own ratio -- which is what
+    # ``retile_block_scales`` does to the weight it returns
+    # (``blockwise_fp8_retile.py:414-424``). Publishing the coarser grid beside the
+    # original weight would change no shape and every number, and the seam's
+    # element-count check would pass it. So both are replaced or neither is.
+    #
+    # IT MOVES NO LANDED COUNT, and that is measured rather than hoped. A module of
+    # this class exists only where a MoE block does, and of the fixtures in
+    # ``test_load_weights.py`` that complete a load, every one either sets
+    # ``n_shared_experts=0`` (``_stacked_config``, ``_shard_config``,
+    # ``_grid_shard_config`` -- ``_shard_config``'s docstring records why) or is
+    # all-dense and so builds no MoE block at all (``_dense_config``). The two
+    # fixtures that DO build this module both refuse today, and ``-101``'s records
+    # the flip in its own words. So no green load changes what it reports.
+    #
+    # THE SKIP IS RECORDED, NEVER SILENT. A weight whose extents are not whole
+    # ``256`` blocks has no public grid to build, so this method leaves that
+    # projection exactly as the loader left it and says so in the health record.
+    # Skipping quietly is how a missing retile would look like a working one.
+
+    def retile_checkpoint_scale_grids(self) -> int:
+        """Coarsen this module's checkpoint grids onto the public grid, ONCE.
+
+        Returns how many projections were retiled -- ``3`` on a checkpoint whose
+        extents are whole ``256`` blocks, ``0`` on a miniature that has no public
+        grid to build.
+
+        Raises:
+            Glm5NextSharedExpertRouteError: if a weight or grid is not 2-D, or a
+                grid is not at the checkpoint's own ``128``-tile granularity. An
+                already-public grid is refused rather than passed over, because a
+                second retile of an already-retiled grid would rescale the weight
+                twice and no shape would object.
+        """
+        from vllm_neuron.functional.moe.blockwise_fp8_retile import (
+            BLOCK_QUANT_SIZE,
+            DOWN,
+            TILE_SIZE,
+            retile_block_scales,
+        )
+
+        health: dict[str, dict[str, object]] = {}
+        retiled = 0
+        for leaf in _scale_prep_leaves(self):
+            grid_name = Glm5NextForConditionalGeneration._sibling_scale_grid_name(
+                leaf
+            )
+            weight = getattr(self, leaf)
+            grid = getattr(self, grid_name)
+            if weight.dim() != 2:
+                raise Glm5NextSharedExpertRouteError(
+                    f"{leaf} must be 2-D to give the retile its extents, got "
+                    f"shape {tuple(weight.shape)}"
+                )
+            if grid.dim() != 2:
+                raise Glm5NextSharedExpertRouteError(
+                    f"{grid_name} must be 2-D, got shape {tuple(grid.shape)}"
+                )
+            rows, cols = int(weight.shape[0]), int(weight.shape[1])
+            if rows % BLOCK_QUANT_SIZE or cols % BLOCK_QUANT_SIZE:
+                # No public grid exists for these extents. Recorded, not silent.
+                health[leaf] = {
+                    "retiled": False,
+                    "extents": (rows, cols),
+                    "reason": (
+                        f"[{rows},{cols}] is not a whole number of "
+                        f"{BLOCK_QUANT_SIZE}x{BLOCK_QUANT_SIZE} blocks"
+                    ),
+                }
+                continue
+            checkpoint_grid = (rows // TILE_SIZE, cols // TILE_SIZE)
+            if tuple(grid.shape) != checkpoint_grid:
+                raise Glm5NextSharedExpertRouteError(
+                    f"{grid_name} has shape {tuple(grid.shape)}; this retile "
+                    f"consumes the checkpoint's own {TILE_SIZE}-tile grid "
+                    f"{checkpoint_grid} for a [{rows},{cols}] weight. A grid "
+                    f"already at {BLOCK_QUANT_SIZE} granularity is refused here "
+                    f"rather than passed over: retiling twice rescales the "
+                    f"weight twice and no shape check would see it."
+                )
+            # ``DOWN`` selects the CONSUMER flattening, and this method reads
+            # neither consumer field -- only ``block_scales`` (the retained scale
+            # per block) and ``retiled_weights``. DOWN is named because its
+            # flattening writes every emitted slot exactly once, so the two health
+            # counters below stay readable; GATE_UP leaves half its slots NaN by
+            # design and would make them say nothing here.
+            result = retile_block_scales(
+                weight.data.unsqueeze(0).contiguous(),
+                grid.unsqueeze(0).contiguous(),
+                DOWN,
+            )
+            # ``block_scales`` is ``(E, i_256, h_256)``
+            # (``blockwise_fp8_retile.py:371``, written at ``:382``), so the
+            # transpose puts it back in the weight's own ``(rows, cols)`` frame,
+            # which is the frame ``to_kernel_scale_layout`` compares against.
+            public = result.block_scales[0].t().contiguous()
+            # ``.data`` ASSIGNMENT, not a rebind. ``setattr(self, leaf, tensor)``
+            # would drop the ``nn.Parameter`` and with it every landed reading
+            # that counts ``named_parameters()``. The device is carried over
+            # explicitly because the producer allocates its grid with
+            # ``torch.full`` and no device (``:371``), which lands on the CPU.
+            weight.data = result.retiled_weights[0].to(
+                device=weight.device, dtype=weight.dtype
+            )
+            setattr(self, grid_name, public.to(device=grid.device))
+            health[leaf] = {
+                "retiled": True,
+                "extents": (rows, cols),
+                "checkpoint_grid": checkpoint_grid,
+                "public_grid": tuple(public.shape),
+                "emitted_unsupplied": result.emitted_unsupplied,
+                "input_scales_dropped": result.input_scales_dropped,
+                "inexact_rescales": result.inexact_rescales,
+            }
+            retiled += 1
+        setattr(self, self.SHARED_RETILE_HEALTH_ATTR, health)
+        return retiled
+
     def prepare_scale_operands(
         self,
         gate_proj_weight: torch.Tensor,
@@ -6788,6 +6924,26 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # module. So the signature stays exactly as it landed.
                 if hasattr(type(module), "prepare_absorb_weights"):
                     module.prepare_absorb_weights()
+            # ``inc-glm53f-054a`` hand-off item (iv). The checkpoint's grids are
+            # at 128-tile granularity and the shared expert's prep consumes the
+            # 256 public grid, so the bridge runs HERE -- on the load path, after
+            # the shards are attached and BEFORE the prep reads the grid two
+            # branches below. Gated by the same ``hasattr`` test this loop already
+            # uses on the preps, so a module that declares no retile is skipped and
+            # the routed bank -- which retiles inside its own prep -- is untouched.
+            #
+            # IT ADDS NO RETURN VALUE, on the precedent recorded for
+            # ``prepare_absorb_weights`` above: this method returns
+            # ``(projection calls, scale calls)`` and ``inc-glm53f-091``'s items
+            # read that pair, so the signature stays exactly as it landed. What the
+            # retile did is on the module, in its own health record.
+            if hasattr(type(module), "retile_checkpoint_scale_grids"):
+                names = [
+                    leaf[: -len(_WEIGHT_LEAF_SUFFIX)]
+                    for leaf in _scale_prep_leaves(module)
+                ]
+                self._require_prep_operands_on_device(path, module, names, device)
+                module.retile_checkpoint_scale_grids()
             if hasattr(type(module), "prepare_scale_operands"):
                 # The projection names come off the module's OWN declaration
                 # tuple, so this call cannot ask for a projection the shared
