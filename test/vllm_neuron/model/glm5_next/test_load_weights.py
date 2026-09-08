@@ -3552,7 +3552,9 @@ def _in_the_loader_frame(
 ) -> torch.Tensor:
     """``_as_the_loader_left_it`` for a reading that holds only the dotted name."""
     path, leaf = dotted.rsplit(".", 1)
-    return _as_the_loader_left_it(model.get_submodule(path), leaf, _loaded(model, dotted))
+    return _as_the_loader_left_it(
+        model.get_submodule(path), leaf, _loaded(model, dotted)
+    )
 
 
 def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
@@ -5115,6 +5117,22 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     row contributes exactly nothing to the down projection's contraction. So the
     padded emulation must equal the unpadded reference at max abs diff 0.0 and no
     numeric pair is authored.
+
+    ``inc-glm53f-054a`` REPAIR ROUND 1 CHANGED HOW THE MODULE SIDE IS READ, and not
+    what is claimed (DECISIONS §706-§707). The claim above is frozen. What moved is
+    one assertion that had described the pre-republish design -- that the module's
+    grid IS the checkpoint's own rows -- which the republish makes false by design,
+    because it coarsens that grid onto the consumer's 256 and turns it together with
+    its weight. The module side is now dequantised at the grid the module actually
+    carries, in the loader's frame, and the reference stays the checkpoint's own
+    unpadded tensors at the raw grid and the checkpoint's 128 granularity: the
+    model's semantics, re-implementing no part of the republish. THREE readings were
+    added rather than removed: the republish's own losslessness counter is asserted at
+    zero for these projections, so a red run names the cause; the convention is read
+    at the numbers per projection, with the compensated form as the control that
+    moves; and the pad is read once on its own, against the same module tensors with
+    the padded ranks left out, so a republish finding and a pad defect cannot be
+    mistaken for each other.
     """
     directory, overrides, mappings = _deferred_checkpoint(tmp_path)
     block = _WL_FP8.consumer_block_quant_size()
@@ -5197,44 +5215,108 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     # order, and run gate * up through down. Then do the same from the checkpoint's
     # own unpadded tensors. The two must agree exactly.
     path = dense_paths[0]
-    hidden = int(_loaded(models[0], f"{path}.gate_proj_weight").shape[1])
+    # READ IN THE LOADER'S FRAME. Since the republish the module stores gate as
+    # [H, I_per_rank], so the stored second extent is the per-rank intermediate and
+    # not the hidden size this vector has to be as long as.
+    hidden = int(_in_the_loader_frame(models[0], f"{path}.gate_proj_weight").shape[1])
     torch.manual_seed(0)
     x = torch.randn(hidden, dtype=torch.float32)
 
-    # WHICH SCALE CONVENTION THE MODULE ACTUALLY CARRIES, read before either side
-    # is computed, with the compensated form as the control that MOVES. If both
-    # branches below matched, this reading would prove nothing.
+    # WHAT THE MODULE CARRIES SINCE THE REPUBLISH, printed rather than asserted
+    # (DECISIONS §706-§707). This block used to assert that the module's grid IS the
+    # checkpoint's own rows. That described the pre-republish design and is now false
+    # BY DESIGN: the republish coarsens the checkpoint's 128-tile grid onto the
+    # consumer's 256 and turns it together with its weight. So the layout is REPORTED
+    # here, at both frames and with the block size it implies, and the thing the old
+    # equality existed to protect -- that the module's NUMBERS are the checkpoint's
+    # numbers at the checkpoint's own convention -- is read at the values further
+    # down, where the compensated form is the control that moves.
     _gate_keys = _keys_of(mappings, f"{path}.gate_proj_weight")
     _gate_scale = scale_keys(_gate_keys)[0]
     _raw_grid = overrides[_gate_scale]
     _compensated = compensate_block_scales(_raw_grid).scale_inv
-    _on_module = getattr(models[0].get_submodule(path), SHARD_GRID_ATTRIBUTES[0])
-    _rows = _on_module.shape[0]
-    print(
-        f"CONJUNCT3D_MODULE_GRID_IS_THE_RAW_CHECKPOINT="
-        f"{bool(torch.equal(_on_module, _raw_grid[:_rows]))}"
+    _module = models[0].get_submodule(path)
+    _on_module = getattr(_module, SHARD_GRID_ATTRIBUTES[0])
+    _published = _as_the_loader_left_it(_module, SHARD_GRID_ATTRIBUTES[0], _on_module)
+    _weight_lf = _in_the_loader_frame(models[0], f"{path}.gate_proj_weight")
+    _stored = _loaded(models[0], f"{path}.gate_proj_weight")
+    print(f"CONJUNCT3D_MODULE_WEIGHT_AS_STORED={tuple(_stored.shape)}")
+    print(f"CONJUNCT3D_MODULE_WEIGHT_IN_THE_LOADER_FRAME={tuple(_weight_lf.shape)}")
+    print(f"CONJUNCT3D_MODULE_GRID_AS_STORED={tuple(_on_module.shape)}")
+    print(f"CONJUNCT3D_MODULE_GRID_IN_THE_LOADER_FRAME={tuple(_published.shape)}")
+    print(f"CONJUNCT3D_CHECKPOINT_GRID={tuple(_raw_grid.shape)}")
+    print(f"CONJUNCT3D_CHECKPOINT_GRID_BLOCK={tuple(DEFAULT_WEIGHT_BLOCK_SIZE)}")
+    _implied_block = (
+        _weight_lf.shape[0] // _published.shape[0],
+        _weight_lf.shape[1] // _published.shape[1],
     )
-    print(
-        f"CONJUNCT3D_MODULE_GRID_IS_THE_COMPENSATED_FORM="
-        f"{bool(torch.equal(_on_module, _compensated[:_rows]))}"
+    print(f"CONJUNCT3D_MODULE_GRID_IMPLIED_BLOCK={_implied_block}")
+    assert not torch.equal(_raw_grid, _compensated), (
+        "compensation is a no-op on this fixture's grid, so the convention control "
+        "further down cannot tell the two conventions apart and the reference is "
+        "unguarded"
     )
-    assert not torch.equal(_raw_grid[:_rows], _compensated[:_rows]), (
-        "compensation is a no-op on this fixture's grid, so the two readings above "
-        "cannot tell the conventions apart and the reference below is unguarded"
+
+    # THE REPUBLISH'S OWN LOSSLESSNESS COUNTER, read off its health record and
+    # asserted at zero for these projections (DECISIONS §706 item 4). The coarsening
+    # keeps one scale per 256 block and rescales the other three 128 tiles into it, so
+    # it is exact only where each ratio is a power of two; the counter is the
+    # republish's own report of how often it was not. Asserting it here means a red
+    # run names the CAUSE, not only the moved number, and it is a finding on the
+    # landed retile rather than a tolerance to widen.
+    inexact: dict[tuple[int, str], int] = {}
+    for rank in range(SHARD_EP_WORLD):
+        module = models[rank].get_submodule(path)
+        health = getattr(module, module.DENSE_RETILE_HEALTH_ATTR, None)
+        assert health is not None, (
+            f"{path} at rank {rank} carries no republish health record after a real "
+            f"load, so the load-time prep loop never reached Glm5NextDenseMLP"
+        )
+        for leaf, record in health.items():
+            if not record.get("retiled"):
+                continue
+            inexact[(rank, leaf)] = int(record["inexact_rescales"])
+    print(f"CONJUNCT3D_RETILED_PROJECTIONS={len(inexact)}")
+    print(f"CONJUNCT3D_RETILE_INEXACT_RESCALES={sorted(inexact.values())}")
+    assert inexact, (
+        f"no dense projection was coarsened at world size {SHARD_EP_WORLD}, so this "
+        f"reading is vacuous and the exactness below is not testing the coarsening "
+        f"at all"
     )
-    assert torch.equal(_on_module, _raw_grid[:_rows]), (
-        "the module's grid is not the checkpoint's own rows, so the reference below "
-        "must not use them either -- see weight_loaders_fp8.py:1840"
+    _worst_inexact = max(inexact.values())
+    assert _worst_inexact == 0, (
+        f"the republish rescaled {_worst_inexact} 128 tiles inexactly on this "
+        f"fixture, so the coarsening changed weight NUMBERS and not just the layout: "
+        f"{sorted(key for key, count in inexact.items() if count)}. That is a finding "
+        f"against the landed retile, to be handed back with this count -- never a "
+        f"tolerance and never a fixture retuned to pass (DECISIONS §706 item 4)"
     )
 
     def _dequantised(rank: int, leaf: str) -> torch.Tensor:
+        """One rank's shard, dequantised AT THE GRID THE MODULE ACTUALLY CARRIES.
+
+        The block size is derived from the weight and its grid rather than named as a
+        constant, because the republish leaves a whole-block weight at the consumer's
+        256 granularity and leaves any other extent at the checkpoint's 128. A
+        constant would be right for one of those and silently wrong for the other;
+        derived, a grid that does not divide its weight is refused by
+        ``dequantise_blockwise`` itself.
+
+        Both tensors are put back in the loader's frame first, so what this returns
+        is the checkpoint's own layout and the concatenations below still join on the
+        checkpoint's declared shard dim.
+        """
         module = models[rank].get_submodule(path)
         attribute = SHARD_GRID_ATTRIBUTES[SHARD_DENSE_LEAVES.index(leaf)]
-        return dequantise_blockwise(
-            _loaded(models[rank], f"{path}.{leaf}"),
-            getattr(module, attribute),
-            DEFAULT_WEIGHT_BLOCK_SIZE,
-        ).to(torch.float32)
+        weight = _as_the_loader_left_it(
+            module, leaf, _loaded(models[rank], f"{path}.{leaf}")
+        )
+        grid = _as_the_loader_left_it(module, attribute, getattr(module, attribute))
+        block = (
+            weight.shape[0] // grid.shape[0],
+            weight.shape[1] // grid.shape[1],
+        )
+        return dequantise_blockwise(weight, grid, block).to(torch.float32)
 
     gate_padded = torch.cat(
         [_dequantised(rank, "gate_proj_weight") for rank in range(SHARD_EP_WORLD)],
@@ -5251,8 +5333,15 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     h_padded = (gate_padded @ x) * (up_padded @ x)
     y_padded = down_padded @ h_padded
 
-    def _reference(leaf: str) -> torch.Tensor:
+    def _reference(leaf: str, *, compensated: bool = False) -> torch.Tensor:
         """The same three tensors whole, at the SAME scale convention.
+
+        ``compensated=True`` is the CONTROL ARM and never the reference: it builds
+        the same tensor at the other convention, so a reading that cannot tell the
+        two apart fails instead of passing quietly (DECISIONS §706-§707). The
+        reference itself is the checkpoint's own tensors at the checkpoint's own raw
+        grid and the checkpoint's own 128 granularity -- the model's semantics -- and
+        it re-implements no part of the republish.
 
         THE GRID IS NOT COMPENSATED HERE, and that is read off the loader rather
         than chosen. A sharded weight's grid travels the non-compensating loader,
@@ -5272,14 +5361,82 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         keys = _keys_of(mappings, f"{path}.{leaf}")
         scales = scale_keys(keys)
         weight_key = next(key for key in keys if key not in scales)
+        grid = overrides[scales[0]]
+        if compensated:
+            grid = compensate_block_scales(grid).scale_inv
         return dequantise_blockwise(
             downscale_fp8_weight_bytes(overrides[weight_key]),
-            overrides[scales[0]],
+            grid,
             DEFAULT_WEIGHT_BLOCK_SIZE,
         ).to(torch.float32)
 
     h_whole = (_reference("gate_proj_weight") @ x) * (_reference("up_proj_weight") @ x)
     y_whole = _reference("down_proj_weight") @ h_whole
+
+    # WHICH CONVENTION THE MODULE CARRIES, read at the NUMBERS, per projection
+    # (DECISIONS §706-§707). Each padded stack's real rows -- real columns, for the
+    # down projection -- are compared against the checkpoint's own tensor at the raw
+    # convention, which must agree exactly, and against the compensated form, which
+    # must NOT: if both agreed, neither reading could tell the conventions apart.
+    # This is per projection so that a red run names which one moved.
+    stacks = {
+        "gate_proj_weight": gate_padded,
+        "up_proj_weight": up_padded,
+        "down_proj_weight": down_padded,
+    }
+    conventions: dict[str, tuple[float, float]] = {}
+    for leaf, stack in stacks.items():
+        whole = _reference(leaf)
+        other = _reference(leaf, compensated=True)
+        real = (
+            stack[:, : whole.shape[1]]
+            if leaf == "down_proj_weight"
+            else stack[: whole.shape[0]]
+        )
+        raw_diff = _max_abs_diff(real, whole)
+        compensated_diff = _max_abs_diff(real, other)
+        conventions[leaf] = (raw_diff, compensated_diff)
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_CHECKPOINT_RAW={raw_diff}")
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_COMPENSATED={compensated_diff}")
+    for leaf, (raw_diff, compensated_diff) in conventions.items():
+        assert compensated_diff != 0.0, (
+            f"{leaf} matches the compensated form as well as the raw one, so this "
+            f"item cannot tell the two conventions apart and its reference is "
+            f"unguarded"
+        )
+        assert raw_diff == 0.0, (
+            f"{leaf}'s real rows differ from the checkpoint's own tensor by "
+            f"{raw_diff} at the checkpoint's own convention. The load path is meant "
+            f"to change this tensor's LAYOUT and not its numbers, so a non-zero "
+            f"reading here is a finding against the republish -- most likely its 256 "
+            f"coarsening requantising a block whose four 128 tiles do not share a "
+            f"power-of-two scale ratio. It is never a tolerance to widen and never a "
+            f"fixture to retune (DECISIONS §706 item 4): hand it back with this "
+            f"number"
+        )
+
+    # THE PAD, ON ITS OWN (DECISIONS §707 item 5). The same module tensors with and
+    # without the padded ranks. Both sides come from the module, so whatever the
+    # republish did to the numbers cancels and what is left is the pad's own
+    # contribution -- which tells a republish finding and a pad defect apart in one
+    # run, instead of leaving one to be blamed for the other.
+    def _stacked(leaf: str, ranks: range, dim: int) -> torch.Tensor:
+        return torch.cat([_dequantised(rank, leaf) for rank in ranks], dim=dim)
+
+    real_only = range(real_ranks)
+    h_real = (
+        _stacked("gate_proj_weight", real_only, 0) @ x
+    ) * (_stacked("up_proj_weight", real_only, 0) @ x)
+    y_real = _stacked("down_proj_weight", real_only, 1) @ h_real
+    pad_only_diff = _max_abs_diff(y_padded, y_real)
+    print(f"CONJUNCT3D_PADDED_VS_REAL_RANKS_ONLY_MAX_ABS_DIFF={pad_only_diff}")
+    print(f"CONJUNCT3D_REAL_RANKS_INTERMEDIATE={tuple(h_real.shape)}")
+    assert pad_only_diff == 0.0, (
+        f"the padded ranks change the output by {pad_only_diff} against the same "
+        f"module tensors with those ranks left out, so the pad itself contributes. "
+        f"This side of the item is independent of the checkpoint's numbers, so a red "
+        f"here is a pad defect and not a republish finding"
+    )
 
     print(f"CONJUNCT3D_PADDED_INTERMEDIATE={tuple(h_padded.shape)}")
     print(f"CONJUNCT3D_WHOLE_INTERMEDIATE={tuple(h_whole.shape)}")
