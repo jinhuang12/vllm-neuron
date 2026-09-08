@@ -80,6 +80,27 @@ rather than quietly computing torch when the simulator is off; and
 ``test_doubly_stochastic_bar_is_armed`` shows the ``1e-3`` bar rejecting a
 truncated iteration count, so arm 2's pass is not a property of the threshold
 being loose.
+
+The batched ``[T, S, S]`` form, and how it is checked
+----------------------------------------------------
+`inc-glm53f-028b`, second form. ``sinkhorn_normalise_blocks`` normalises one
+square block per token instead of the ``block_diag`` matrix of them. Its
+correctness is checked in the way that leaves nothing to a claim: at ``T`` in
+``{1, 3, 33}`` its output is compared BLOCK FOR BLOCK against this module's own
+square kernel run on ``torch.block_diag`` of the same blocks -- the same call
+``model_fp8.py:1147``'s ``mhc_pre`` makes. The two are not merely equal at the
+fixed point; they are equal iteration for iteration, because a row of a
+block-diagonal matrix has nonzeros only inside its own block, so the square
+kernel's row and column sums ARE the per-block sums.
+
+At ``T`` in ``{129, 2048}`` that comparison is not available, and its absence is
+the point of the form rather than a gap in the test:
+``test_the_square_form_cannot_serve_what_the_blocks_form_serves`` shows the
+square seam REFUSING ``T = 129`` by name, because ``N = T * S`` passes the Tensor
+Engine's moving free bound, and prints what the square matrix would have cost at
+2048 tokens. Those two extents are therefore checked against a batched torch
+oracle, which is itself cross-checked against the per-block oracle the landed
+cases use.
 """
 
 from __future__ import annotations
@@ -96,11 +117,14 @@ import nki.simulator
 
 from vllm_neuron.functional.mhc.sinkhorn import (
     MHC_STREAMS,
+    MOVING_FMAX,
     PARTITION_MAX,
     SINKHORN_DENOM_EPS,
     SINKHORN_ITERS,
     SinkhornError,
+    blocks_kernel_identity,
     can_run_sinkhorn,
+    can_run_sinkhorn_blocks,
     column_target,
     dispatch_counters,
     kernel_identity,
@@ -109,6 +133,7 @@ from vllm_neuron.functional.mhc.sinkhorn import (
     row_tile_extent,
     row_tiles,
     sinkhorn_normalise,
+    sinkhorn_normalise_blocks,
     sinkhorn_torch_oracle,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -127,6 +152,19 @@ N = MHC_STREAMS  # 4
 #: written as ``tokens * MHC_STREAMS`` because that is what they are: 512 and 2048
 #: tokens of the target's four streams each.
 TILED_ROWS = (129, 256, 512 * MHC_STREAMS, 2048 * MHC_STREAMS)
+
+#: Token counts for the BATCHED form's equivalence arm. Small on purpose: each
+#: one is also run through the square kernel on ``block_diag`` of the same blocks,
+#: which costs ``(T*S)^2``. ``1`` is the degenerate single block, ``3`` is a
+#: handful, and ``33`` is the first that makes the SQUARE side tile as well
+#: (``33 * 4 = 132`` rows, so two row tiles) -- so the equivalence is read across
+#: the square kernel's tile seam too, not only inside one tile.
+BLOCK_EQUIV_TOKENS = (1, 3, 33)
+
+#: Token counts for the batched form's SCALE arm, where no square comparison
+#: exists: ``129`` is the first ``T`` the square form refuses (``N = 516`` passes
+#: :data:`MOVING_FMAX`), and ``2048`` is the serving extent this form exists for.
+BLOCK_SCALE_TOKENS = (129, 2048)
 
 #: The declared tolerance pair for the oracle arm, from the plan block.
 RTOL = 1e-2
@@ -329,6 +367,116 @@ def _report_stochasticity(result: torch.Tensor, label: str) -> tuple[float, floa
     print(
         f"[{label}] total_mass={float(result.sum()):.9f} expected={float(rows)} "
         f"output_min={float(result.min()):.6e}"
+    )
+    return row_dev, col_dev
+
+
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-028b` -- the BATCHED `[T, S, S]` fixture, oracle and readings.     #
+# --------------------------------------------------------------------------- #
+def _affinity_blocks(tokens: int, seed: int = 21) -> torch.Tensor:
+    """``[T, S, S]`` strictly positive affinities, one square block per token.
+
+    Built by RESHAPING :func:`_affinity_rows`, so the batched fixture is the same
+    draw as every other case in this file rather than a second construction that
+    could be easier: ``T * S`` rows of ``S`` columns hold exactly ``T`` blocks of
+    ``S x S``. Everything :func:`_affinity` claims -- strict positivity, a bounded
+    ``e**2`` dynamic range, not already normalised -- therefore holds here, and
+    the non-vacuity readings below measure the last one per case.
+    """
+    return _affinity_rows(tokens * N, seed).reshape(tokens, N, N)
+
+
+def _block_diag_of(blocks: torch.Tensor) -> torch.Tensor:
+    """``torch.block_diag`` of the blocks -- the matrix the target builds today.
+
+    The same call ``model_fp8.py:1147``'s ``mhc_pre`` makes on its own blocks, so
+    the equivalence arm compares against the form the layer currently produces
+    rather than against a restatement of it.
+    """
+    return torch.block_diag(*blocks.unbind(0))
+
+
+def _diagonal_blocks_of(
+    matrix: torch.Tensor, tokens: int, streams: int
+) -> torch.Tensor:
+    """Cut the ``T`` diagonal ``S x S`` blocks back out of a ``[T*S, T*S]`` matrix.
+
+    Written here rather than imported from ``model_fp8`` on purpose: that module's
+    extractor is private, and this arm should read the diagonal the way the maths
+    defines it, so a change there shows up as a disagreement instead of moving
+    both sides at once.
+    """
+    return torch.stack(
+        [
+            matrix[t * streams : (t + 1) * streams, t * streams : (t + 1) * streams]
+            for t in range(tokens)
+        ]
+    )
+
+
+def _blocks_oracle_authored_here(
+    blocks: torch.Tensor, iters: int = SINKHORN_ITERS
+) -> torch.Tensor:
+    """:func:`_sinkhorn_oracle_authored_here`, batched over the leading axis.
+
+    The same classical Sinkhorn-Knopp formulation -- accumulate per-axis scaling
+    VECTORS in float64 and apply them to the ORIGINAL blocks -- with one extra
+    leading dimension, so the reductions are over axes 2 and 1 of ``[T, S, S]``.
+
+    :func:`test_the_batched_oracle_agrees_with_the_per_block_oracle` measures that
+    this batching did not change the answer, by running the landed per-block
+    oracle block by block over the same input. That control is what lets the scale
+    arm rest on this helper at ``T = 2048``, where a per-block python loop over the
+    oracle would dominate the case's runtime.
+    """
+    base = blocks.to(torch.float64)
+    tokens, rows, cols = (int(v) for v in base.shape)
+    u = torch.ones((tokens, rows, 1), dtype=torch.float64)
+    v = torch.ones((tokens, 1, cols), dtype=torch.float64)
+    row_goal = row_target()
+    col_goal = column_target(rows, cols)
+
+    for _ in range(iters):
+        scaled = base * u * v
+        u = u * (row_goal / (scaled.sum(dim=2, keepdim=True) + SINKHORN_DENOM_EPS))
+        scaled = base * u * v
+        v = v * (col_goal / (scaled.sum(dim=1, keepdim=True) + SINKHORN_DENOM_EPS))
+
+    return (base * u * v).to(torch.float32)
+
+
+def _block_deviations(result: torch.Tensor) -> tuple[float, float]:
+    """``(worst_row_deviation, worst_column_deviation)`` over ALL blocks.
+
+    Per block and per axis, against that axis's own target -- the same reading
+    :func:`_deviations` takes on a matrix, with the worst case over the ``T``
+    blocks rather than an average, so one bad block cannot hide behind 2047 good
+    ones.
+    """
+    _tokens, rows, cols = (int(v) for v in result.shape)
+    row_dev = float((result.sum(dim=2) - row_target()).abs().max())
+    col_dev = float((result.sum(dim=1) - column_target(rows, cols)).abs().max())
+    return row_dev, col_dev
+
+
+def _report_block_stochasticity(
+    result: torch.Tensor, label: str
+) -> tuple[float, float]:
+    """Print the batched per-axis readings and return the two worst deviations."""
+    tokens, rows, cols = (int(v) for v in result.shape)
+    row_dev, col_dev = _block_deviations(result)
+    print(
+        f"[{label}] T={tokens} block=[{rows},{cols}] row_target={row_target()} "
+        f"column_target={column_target(rows, cols)} iters={SINKHORN_ITERS}"
+    )
+    print(
+        f"[{label}] worst_row_deviation={row_dev:.6e} "
+        f"worst_column_deviation={col_dev:.6e} bound={STOCHASTIC_TOL}"
+    )
+    print(
+        f"[{label}] total_mass={float(result.sum()):.6f} "
+        f"expected={float(tokens * rows)} output_min={float(result.min()):.6e}"
     )
     return row_dev, col_dev
 
@@ -938,3 +1086,301 @@ def test_seam_refuses_non_2d_and_non_positive_iters() -> None:
         with pytest.raises(SinkhornError) as excinfo:
             sinkhorn_normalise(_affinity(), iters=bad)
         assert f"iters={bad} must be positive" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-028b` -- THE BATCHED `[T, S, S]` FORM.                            #
+#                                                                               #
+# RUNTIME NOTE, not a criterion: the largest case is 2048 blocks, walked as 16   #
+# token tiles of 128 with 20 iterations over all of them. As with the tiled      #
+# cases above, a `--timeout 60` expiry is reported as the timeout with its        #
+# measured duration -- never a widened timeout and never a dropped case.         #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("tokens", BLOCK_EQUIV_TOKENS)
+def test_blocks_kernel_equals_the_square_kernel_on_the_block_diagonal(
+    tokens: int,
+) -> None:
+    """The batched form gives the square form's answer, block for block.
+
+    THE CLAIM UNDER TEST is the one the batched kernel is built on: normalising
+    ``T`` blocks independently equals normalising ``block_diag`` of them, because
+    a block-diagonal matrix's row and column sums are its blocks' row and column
+    sums and a zero stays zero under any rescaling. If that were false, the mHC
+    layer would compute a different attention mix after `inc-glm53f-030b` switches
+    it over, and no per-block reading of the batched output alone could tell.
+
+    So both kernels run here, on the SAME blocks, in one case: the batched one on
+    ``[T, S, S]`` and the square one on ``torch.block_diag`` of those blocks --
+    two dispatches, which the route instruments read as ``2`` rather than ``1``.
+    The diagonal blocks of the square result are then compared against the batched
+    result at the declared tolerances.
+    """
+    blocks = _affinity_blocks(tokens)
+    matrix = _block_diag_of(blocks)
+    assert tuple(blocks.shape) == (tokens, N, N), tuple(blocks.shape)
+    assert tuple(matrix.shape) == (tokens * N, tokens * N), tuple(matrix.shape)
+
+    reset_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = sinkhorn_normalise_blocks(blocks).to(torch.float32)
+        square = sinkhorn_normalise(matrix).to(torch.float32)
+    reading = _assert_route(sim, 2, f"blocks-equiv-T{tokens}")
+    print(
+        f"[blocks-equiv-T{tokens}] square_rows={tokens * N} "
+        f"square_tiles={len(row_tiles(tokens * N, MHC_STREAMS))} "
+        f"blocks_tiles={len(row_tiles(tokens, 1))} {reading}"
+    )
+
+    # The off-diagonal of the square result must still be exactly zero, which is
+    # the premise of the equivalence rather than a side observation. If the square
+    # kernel had leaked mass off the blocks, the two sides could not agree and the
+    # premise -- not the batched kernel -- would be what failed.
+    mask = torch.ones_like(square, dtype=torch.bool)
+    for t in range(tokens):
+        mask[t * N : (t + 1) * N, t * N : (t + 1) * N] = False
+    off_diagonal_max = float(square[mask].abs().max()) if bool(mask.any()) else 0.0
+    print(f"[blocks-equiv-T{tokens}] off_diagonal_max={off_diagonal_max:.6e}")
+    assert off_diagonal_max == 0.0, off_diagonal_max
+
+    want = _diagonal_blocks_of(square, tokens, N)
+    abs_err = float((got - want).abs().max())
+    signal = float((want - blocks).abs().max())
+    print(
+        f"[blocks-equiv-T{tokens}] max_abs_error={abs_err:.6e} rtol={RTOL} "
+        f"atol={ATOL} distance_from_the_unnormalised_input={signal:.6e}"
+    )
+    if signal <= ATOL:
+        raise VacuousControlError(
+            f"T={tokens}: the normalised blocks are within atol of the raw input, "
+            f"so this comparison would pass on a kernel that returned its input"
+        )
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+    # Arm 2 on the batched output, per block: each block is doubly stochastic on
+    # its own, which is what the layer consumes.
+    row_dev, col_dev = _report_block_stochasticity(got, f"blocks-equiv-T{tokens}")
+    if row_dev > STOCHASTIC_TOL or col_dev > STOCHASTIC_TOL:
+        raise StochasticityError(
+            f"T={tokens}: worst row deviation {row_dev:.6e} and column deviation "
+            f"{col_dev:.6e} against the declared {STOCHASTIC_TOL}"
+        )
+
+
+@pytest.mark.parametrize("tokens", BLOCK_SCALE_TOKENS)
+def test_blocks_kernel_at_serving_scale_matches_the_per_block_oracle(
+    tokens: int,
+) -> None:
+    """The serving extents, against the batched torch oracle. ONE dispatch each.
+
+    No square comparison runs here and none can: ``T = 129`` is refused by the
+    square form (see
+    :func:`test_the_square_form_cannot_serve_what_the_blocks_form_serves`) and
+    ``T = 2048`` would need a 256 MB matrix. That is the whole reason the batched
+    form exists, so these two extents are checked against the oracle instead --
+    arm 2 first, because it does not depend on the oracle being right.
+    """
+    blocks = _affinity_blocks(tokens)
+    tiles = row_tiles(tokens, 1)
+
+    reset_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = sinkhorn_normalise_blocks(blocks).to(torch.float32)
+    reading = _assert_route(sim, 1, f"blocks-scale-T{tokens}")
+    print(
+        f"[blocks-scale-T{tokens}] token_tiles={len(tiles)} first={tiles[0]} "
+        f"last={tiles[-1]} {reading}"
+    )
+    assert tuple(got.shape) == (tokens, N, N), tuple(got.shape)
+
+    row_dev, col_dev = _report_block_stochasticity(got, f"blocks-scale-T{tokens}")
+    if not torch.isfinite(got).all():
+        raise StochasticityError(f"T={tokens}: the kernel returned non-finite values")
+    if row_dev > STOCHASTIC_TOL:
+        raise StochasticityError(
+            f"T={tokens}: worst row deviation {row_dev:.6e} exceeds the declared "
+            f"{STOCHASTIC_TOL} against row target {row_target()}"
+        )
+    if col_dev > STOCHASTIC_TOL:
+        raise StochasticityError(
+            f"T={tokens}: worst column deviation {col_dev:.6e} exceeds the declared "
+            f"{STOCHASTIC_TOL} against column target {column_target(N, N)}"
+        )
+
+    # NON-VACUITY on this case's own input.
+    in_row_dev, in_col_dev = _block_deviations(blocks)
+    print(
+        f"[blocks-scale-T{tokens}] input_row_deviation={in_row_dev:.6e} "
+        f"input_column_deviation={in_col_dev:.6e} bound={STOCHASTIC_TOL}"
+    )
+    if in_row_dev <= STOCHASTIC_TOL and in_col_dev <= STOCHASTIC_TOL:
+        raise VacuousControlError(
+            f"T={tokens}: the fixture already satisfies the doubly-stochastic bar, "
+            f"so this arm would pass on a kernel that did nothing"
+        )
+
+    want = _blocks_oracle_authored_here(blocks)
+    abs_err = float((got - want).abs().max())
+    rel_err = float(((got - want).abs() / (want.abs() + ATOL)).max())
+    print(
+        f"[blocks-scale-T{tokens}] max_abs_error={abs_err:.6e} "
+        f"max_rel_error={rel_err:.6e} rtol={RTOL} atol={ATOL}"
+    )
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+def test_the_square_form_cannot_serve_what_the_blocks_form_serves() -> None:
+    """The square form REFUSES the scale extents; the batched form admits them.
+
+    This is the increment's reason, measured. ``N = T * S`` rides the Tensor
+    Engine's moving free axis in the square kernel, so ``T`` above
+    ``MOVING_FMAX // S`` is refused by name -- and the refusal is quoted here
+    rather than described. The byte counts are printed for the same reason: the
+    square matrix's cost is a number, not an adjective.
+    """
+    for tokens in BLOCK_SCALE_TOKENS:
+        square_side = tokens * N
+        square_bytes = square_side * square_side * 4
+        blocks_bytes = tokens * N * N * 4
+        print(
+            f"[why-blocks] T={tokens} square=[{square_side},{square_side}] "
+            f"square_fp32_bytes={square_bytes} blocks_fp32_bytes={blocks_bytes} "
+            f"ratio={square_bytes // blocks_bytes}x"
+        )
+        with pytest.raises(SinkhornError) as excinfo:
+            can_run_sinkhorn(torch.zeros(1), square_side, square_side)
+        message = str(excinfo.value)
+        print(f"[why-blocks] T={tokens} square_refusal={message!r}")
+        assert f"N={square_side}" in message, message
+        assert f"moving free bound {MOVING_FMAX}" in message, message
+
+        verdict = can_run_sinkhorn_blocks(torch.zeros(1), tokens, N, N)
+        print(f"[why-blocks] T={tokens} can_run_sinkhorn_blocks={verdict}")
+        assert isinstance(verdict, bool)
+
+
+def test_the_batched_oracle_agrees_with_the_per_block_oracle() -> None:
+    """The batched oracle is the landed one, block by block. Not a new algorithm.
+
+    The control that lets the scale arm rest on :func:`_blocks_oracle_authored_here`
+    at 2048 blocks: at ``T = 3`` the landed per-block oracle is run on each block
+    and the two are compared. The tolerance here is tighter than the kernel arm's
+    on purpose -- both sides are float64 torch running the same formulation, so
+    only reduction ORDER can differ, and a real disagreement would mean the
+    batching changed the maths.
+    """
+    blocks = _affinity_blocks(3)
+    batched = _blocks_oracle_authored_here(blocks)
+    per_block = torch.stack(
+        [_sinkhorn_oracle_authored_here(block) for block in blocks.unbind(0)]
+    )
+    abs_err = float((batched - per_block).abs().max())
+    print(f"[oracle-control] batched_vs_per_block_max_abs_error={abs_err:.6e}")
+    torch.testing.assert_close(batched, per_block, rtol=1e-6, atol=1e-7)
+
+
+def test_blocks_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
+    """The batched seam dispatches to THIS module's batched kernel, read off it.
+
+    Read separately from :func:`kernel_identity` so the two kernels are told apart
+    by name rather than inferred from a shape, and so a seam quietly wired to the
+    other one -- which for ``T <= 128`` would return plausible numbers -- shows up
+    as a changed reading.
+    """
+    module, qualname = blocks_kernel_identity()
+    print(f"[identity] blocks_kernel={module}.{qualname}")
+    assert module == _MODULE, module
+    assert qualname == "sinkhorn_blocks_kernel", qualname
+    assert not module.startswith("nkilib"), (
+        "the batched seam dispatches to a vendor kernel, but nkilib has 0 "
+        "sinkhorn/mhc members"
+    )
+    assert blocks_kernel_identity() != kernel_identity(), (
+        "the two seams report the same kernel identity, so neither reading tells "
+        "which kernel ran"
+    )
+
+
+def test_the_blocks_seam_has_no_torch_path_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the route unavailable the batched seam RAISES; it never computes torch.
+
+    The counterpart of :func:`test_route_control_fallback_counter_discriminates`,
+    and the opposite outcome on purpose: kernel-class work ships no torch path
+    (P13), so this seam has none to count. Both counters must read zero -- a
+    dispatch that raised is not a dispatch, and a fallback that does not exist
+    cannot be taken. An mHC layer that silently normalised 2048 tokens in torch
+    would be slow in a way no numeric acceptance could see, which is why the
+    absence is measured here rather than left to the docstring.
+    """
+    blocks = _affinity_blocks(2)
+    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
+    assert can_run_kernel(torch.zeros(1)) is False, (
+        "the gate did not flip with NKI_SIMULATOR=0, so this control is unarmed"
+    )
+
+    reset_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        with pytest.raises(SinkhornError) as excinfo:
+            sinkhorn_normalise_blocks(blocks)
+    nki_dispatch, torch_fallback = dispatch_counters()
+    message = str(excinfo.value)
+    print(
+        f"[blocks-route-control] nki_dispatch={nki_dispatch} "
+        f"torch_fallback={torch_fallback} simulate_kernel_calls={sim.calls} "
+        f"raise={message!r}"
+    )
+    assert "no torch path" in message, message
+    assert nki_dispatch == 0, nki_dispatch
+    assert torch_fallback == 0, torch_fallback
+    assert sim.calls == 0, sim.calls
+
+
+@pytest.mark.parametrize(
+    ("tokens", "rows", "cols", "needle"),
+    [
+        (0, N, N, "T=0 must be positive"),
+        (4, 0, N, "S=0 must be positive"),
+        (4, 3, 4, "must be square"),
+    ],
+)
+def test_blocks_form_refuses_inadmissible_geometry_by_name(
+    tokens: int, rows: int, cols: int, needle: str
+) -> None:
+    """Every batched refusal names the offending extent, and refuses rather than
+    falling back (P13)."""
+    with pytest.raises(SinkhornError) as excinfo:
+        can_run_sinkhorn_blocks(torch.zeros(1), tokens, rows, cols)
+    message = str(excinfo.value)
+    assert needle in message, f"[T={tokens},block={rows}x{cols}] message: {message}"
+
+
+def test_blocks_seam_refuses_non_3d_and_non_positive_iters() -> None:
+    """The batched seam's own argument refusals, named rather than coerced."""
+    with pytest.raises(SinkhornError) as excinfo:
+        sinkhorn_normalise_blocks(_affinity())
+    assert "must be 3-D" in str(excinfo.value)
+
+    for bad in (0, -1):
+        with pytest.raises(SinkhornError) as excinfo:
+            sinkhorn_normalise_blocks(_affinity_blocks(2), iters=bad)
+        assert f"iters={bad} must be positive" in str(excinfo.value)
+
+
+def test_the_batched_form_has_no_declared_token_ceiling() -> None:
+    """No ``T`` is refused for being large, at any extent this run can name.
+
+    The absence of a ceiling is the property, so it is read rather than assumed:
+    the scale extents, the old square ceiling, and one an order of magnitude past
+    serving all pass the geometry check. ``can_run_kernel`` decides the route;
+    this reads only the geometry half.
+    """
+    for tokens in BLOCK_SCALE_TOKENS + (MOVING_FMAX // N, 32768):
+        verdict = can_run_sinkhorn_blocks(torch.zeros(1), tokens, N, N)
+        tiles = row_tiles(tokens, 1)
+        print(
+            f"[no-ceiling] T={tokens} token_tiles={len(tiles)} "
+            f"can_run_sinkhorn_blocks={verdict}"
+        )
+        assert isinstance(verdict, bool)
+        assert sum(height for _start, height in tiles) == tokens

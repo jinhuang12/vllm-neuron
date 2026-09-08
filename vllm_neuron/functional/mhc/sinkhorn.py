@@ -108,6 +108,31 @@ iterations because each iteration reads what the last one wrote, so a geometry
 too large to allocate fails at trace time in the allocator rather than returning
 a wrong answer.
 
+Taking the blocks instead of the block-diagonal matrix
+-----------------------------------------------------
+`inc-glm53f-028b`, second form. The square matrix above is **block-diagonal**, and
+a block-diagonal matrix's row sums and column sums ARE its blocks' row sums and
+column sums -- every off-diagonal entry is zero, and a zero stays zero under any
+row or column scaling. So the global normalisation of ``block_diag(B_1..B_T)`` is
+exactly the ``T`` independent normalisations of ``B_1..B_T``, and the square
+matrix carries no information the blocks do not.
+
+It does carry cost. ``(T*S)^2`` fp32 values is 256 MB at 2048 tokens with
+``S = 4``, against 128 KB for the blocks, and ``N = T * S`` rides the Tensor
+Engine's moving free axis, which caps ``T`` at ``MOVING_FMAX // S`` -- 128 tokens.
+:func:`sinkhorn_blocks_kernel` therefore takes ``[T, S, S]`` directly. ``T`` rides
+the PARTITION axis in tiles walked inside the one dispatch, the block's two axes
+are both FREE, both normalisations become free-axis work, and no extent bound on
+``T`` remains. The equivalence is a test, not a claim: ``T`` in ``{1, 3, 33}`` is
+compared block-for-block against this module's own square kernel run on
+``torch.block_diag`` of the same blocks.
+
+Both kernels stay. The square one is the general ``[M, N]`` normalisation and the
+acceptance case the plan declares; the batched one is what the mHC layer will
+call once `inc-glm53f-030b` switches it over. They share the targets, the
+denominator guard, the oracle and the dispatch counters, so no reading drifts
+between them.
+
 Precision, stated rather than implied
 -------------------------------------
 The working tile, both PSUM tiles and the returned tensor are **fp32**. This is
@@ -202,7 +227,9 @@ __all__ = [
     "SINKHORN_DENOM_EPS",
     "SINKHORN_ITERS",
     "SinkhornError",
+    "blocks_kernel_identity",
     "can_run_sinkhorn",
+    "can_run_sinkhorn_blocks",
     "column_target",
     "dispatch_counters",
     "kernel_identity",
@@ -210,8 +237,10 @@ __all__ = [
     "row_target",
     "row_tile_extent",
     "row_tiles",
+    "sinkhorn_blocks_kernel",
     "sinkhorn_kernel",
     "sinkhorn_normalise",
+    "sinkhorn_normalise_blocks",
     "sinkhorn_torch_oracle",
 ]
 
@@ -430,6 +459,159 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
 
 
 # --------------------------------------------------------------------------- #
+# The BATCHED kernel: T independent S x S Sinkhorns, no square matrix built.     #
+# --------------------------------------------------------------------------- #
+@nki.jit
+def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
+    """Normalise ``[T, S, S]`` blocks, each one doubly stochastic on its own.
+
+    WHY THIS EXISTS ALONGSIDE :func:`sinkhorn_kernel`. The mHC layer holds ``T``
+    blocks of ``S x S`` and used to hand the Sinkhorn one block-diagonal
+    ``[T*S, T*S]`` matrix built with ``torch.block_diag``. Every off-diagonal
+    entry of that matrix is zero, and a zero stays zero under row and column
+    scaling, so the global normalisation IS the ``T`` per-block normalisations --
+    a block-diagonal matrix's row sums and column sums are its blocks' row sums
+    and column sums. The square matrix therefore carried no information and cost
+    ``(T*S)^2`` values: 256 MB of fp32 at 2048 tokens, against 128 KB for the
+    blocks themselves. This kernel takes the blocks.
+
+    It also removes the last extent bound. In the square form ``N = T * S`` rode
+    the Tensor Engine's moving free axis, so ``T`` was capped at
+    ``MOVING_FMAX // S``. Here ``T`` rides the PARTITION axis in tiles of at most
+    :data:`PARTITION_MAX` tokens, walked inside this one dispatch, and the block's
+    two axes are both FREE. So both normalisations are free-axis reductions: no
+    ones-vector matmul, no partition-axis broadcast, and no bound on ``T``.
+
+    Args:
+        affinity_blocks: ``[T, S, S]`` strictly positive affinities in HBM.
+        iters: normalisation iterations, a **trace-time** constant, exactly as in
+            :func:`sinkhorn_kernel`. The loop stays inside this dispatch.
+
+    Returns:
+        ``[T, S, S]`` fp32. Every block has row sums :func:`row_target` and
+        column sums :func:`column_target`, which for a square block is also 1.
+
+    The shape of the code is ``hyper_connection.py:185-232``'s, the sibling
+    combine kernel: one 2-D tile per block row loaded with a middle-index slice
+    (``:202``), ``range(S)`` loops unrolled at trace time so the whole block is
+    one dispatch, and a middle-index store (``:230``).
+    """
+    t_extent, rows_per_block, cols_per_block = affinity_blocks.shape
+    row_goal = row_target()
+    col_goal = column_target(int(rows_per_block), int(cols_per_block))
+
+    out = nl.ndarray(
+        (t_extent, rows_per_block, cols_per_block),
+        dtype=nl.float32,
+        buffer=nl.shared_hbm,
+    )
+
+    # The token tiles. `block=1` is not a special case: with the S x S block held
+    # in the two FREE axes, a token is ONE partition row, so no alignment is
+    # needed and the tile is the whole partition extent. The arithmetic is
+    # `row_tiles`'s so that both kernels tile the partition axis one way.
+    tiles = row_tiles(int(t_extent), 1)
+
+    # Per token tile: one working tile per block ROW, plus that row's own
+    # denominator and scale, plus one column accumulator for the whole tile. All
+    # allocated before the iteration loop, because the iteration is loop-carried.
+    work: list[list] = []
+    row_den: list[list] = []
+    row_scale: list[list] = []
+    col_sum = []
+    col_scale = []
+    for start, height in tiles:
+        tile_rows = []
+        den_rows = []
+        scale_rows = []
+        for i in range(rows_per_block):
+            tile = nl.ndarray(
+                (height, cols_per_block), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_copy(
+                dst=tile,
+                src=nl.load(
+                    affinity_blocks[start:start + height, i, 0:cols_per_block],
+                    dtype=nl.float32,
+                ),
+            )
+            tile_rows.append(tile)
+            den_rows.append(
+                nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
+            )
+            scale_rows.append(
+                nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
+            )
+        work.append(tile_rows)
+        row_den.append(den_rows)
+        row_scale.append(scale_rows)
+        col_sum.append(
+            nl.ndarray((height, cols_per_block), dtype=nl.float32, buffer=nl.sbuf)
+        )
+        col_scale.append(
+            nl.ndarray((height, cols_per_block), dtype=nl.float32, buffer=nl.sbuf)
+        )
+
+    for _ in nl.sequential_range(iters):
+        for idx, (_start, _height) in enumerate(tiles):
+            # ---- row pass. Block row i of every token in this tile is one
+            # [tokens, S] tile, so its row sum is a FREE-axis reduction and the
+            # reciprocal broadcasts back along the free axis -- the same
+            # `tensor_scalar` idiom the square kernel uses for its row pass.
+            for i in range(rows_per_block):
+                r_sum = nl.sum(
+                    work[idx][i], axis=1, keepdims=True, dtype=nl.float32
+                )
+                nisa.tensor_scalar(
+                    dst=row_den[idx][i], data=r_sum, op0=nl.add,
+                    operand0=SINKHORN_DENOM_EPS,
+                )
+                nisa.reciprocal(dst=row_scale[idx][i], data=row_den[idx][i])
+                nisa.tensor_scalar(
+                    dst=row_scale[idx][i], data=row_scale[idx][i],
+                    op0=nl.multiply, operand0=float(row_goal),
+                )
+                nisa.tensor_scalar(
+                    dst=work[idx][i], data=work[idx][i], op0=nl.multiply,
+                    operand0=row_scale[idx][i],
+                )
+
+            # ---- column pass. A block's column sum runs over its ROWS, which
+            # here are separate tiles, so it is an elementwise add of the S
+            # tiles rather than a reduction along any axis: entry j of the
+            # accumulator is column j's sum. The first row INITIALISES the
+            # accumulator, so no memset pass is needed --
+            # `hyper_connection.py:213-216`'s reason for the same shape.
+            nisa.tensor_copy(dst=col_sum[idx], src=work[idx][0])
+            for i in range(1, rows_per_block):
+                nisa.tensor_tensor(
+                    dst=col_sum[idx], data1=col_sum[idx], data2=work[idx][i],
+                    op=nl.add,
+                )
+            nisa.tensor_scalar(
+                dst=col_sum[idx], data=col_sum[idx], op0=nl.add,
+                operand0=SINKHORN_DENOM_EPS,
+            )
+            nisa.reciprocal(dst=col_scale[idx], data=col_sum[idx])
+            nisa.tensor_scalar(
+                dst=col_scale[idx], data=col_scale[idx], op0=nl.multiply,
+                operand0=float(col_goal),
+            )
+            for i in range(rows_per_block):
+                nisa.tensor_tensor(
+                    dst=work[idx][i], data1=work[idx][i], data2=col_scale[idx],
+                    op=nl.multiply,
+                )
+
+    for idx, (start, height) in enumerate(tiles):
+        for i in range(rows_per_block):
+            nl.store(
+                out[start:start + height, i, 0:cols_per_block], value=work[idx][i]
+            )
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Geometry admission.                                                          #
 # --------------------------------------------------------------------------- #
 def _require_admissible(rows: int, cols: int, block: int = MHC_STREAMS) -> None:
@@ -469,6 +651,43 @@ def _require_admissible(rows: int, cols: int, block: int = MHC_STREAMS) -> None:
     if problems:
         raise SinkhornError(
             "sinkhorn normalisation refuses this geometry: " + "; ".join(problems)
+        )
+
+
+def _require_blocks_admissible(tokens: int, rows: int, cols: int) -> None:
+    """Extent conditions for the ``[T, S, S]`` form. Two of them, and no ceiling.
+
+    ``T`` HAS NO UPPER BOUND: it rides the partition axis in tiles walked inside
+    the kernel, so a ceiling here would refuse the serving extents this form
+    exists for. Neither does the block extent carry a declared bound -- it rides
+    two FREE axes and never reaches the Tensor Engine's moving free axis, so
+    :data:`MOVING_FMAX`, which the square kernel's column-sum matmul does hit,
+    has nothing to say about it. What bounds the block is SBUF, and a block too
+    large to allocate fails in the allocator at trace time rather than returning
+    a wrong answer. No byte budget is asserted here because this repository
+    declares none.
+
+    The blocks must be SQUARE. Row target ``1`` and column target
+    ``rows / cols`` describe the same fixed point only when the two extents
+    agree, and mHC's blocks are ``S x S`` by construction, so a non-square block
+    is a caller mistake worth naming rather than a case to generalise.
+    """
+    problems: list[str] = []
+    if tokens <= 0:
+        problems.append(f"T={tokens} must be positive")
+    if rows <= 0:
+        problems.append(f"S={rows} must be positive")
+    elif rows != cols:
+        problems.append(
+            f"the block is [{rows}, {cols}] and must be square; each block is one "
+            f"token's S x S mHC affinity, and a doubly stochastic block needs its "
+            f"row and column extents to agree. This refuses rather than routing "
+            f"to a torch path"
+        )
+    if problems:
+        raise SinkhornError(
+            "batched sinkhorn normalisation refuses this geometry: "
+            + "; ".join(problems)
         )
 
 
@@ -532,6 +751,29 @@ def can_run_sinkhorn(
     return can_run_kernel(affinity)
 
 
+def can_run_sinkhorn_blocks(
+    affinity_blocks: Tensor, tokens: int, rows: int, cols: int
+) -> bool:
+    """Is the NKI route available *and* admissible for ``[T, S, S]`` blocks?
+
+    The same two independent conditions as :func:`can_run_sinkhorn`, over
+    :func:`_require_blocks_admissible`. Extents are taken as arguments rather than
+    read off the tensor so that a caller -- `inc-glm53f-030b`'s layer -- can ask
+    whether ``T`` tokens are servable BEFORE it builds the blocks.
+
+    Args:
+        affinity_blocks: the tensor whose device decides the route.
+        tokens: ``T``, the token extent. No ceiling -- the kernel tiles it.
+        rows: the block's row extent ``S``.
+        cols: the block's column extent, which must equal ``rows``.
+
+    Raises:
+        SinkhornError: if the geometry is inadmissible.
+    """
+    _require_blocks_admissible(tokens, rows, cols)
+    return can_run_kernel(affinity_blocks)
+
+
 def sinkhorn_normalise(
     affinity: Tensor, iters: int = SINKHORN_ITERS, block: int = MHC_STREAMS
 ) -> Tensor:
@@ -580,6 +822,64 @@ def sinkhorn_normalise(
     return wrap_nki(sinkhorn_kernel)(affinity=affinity, iters=iters, block=block)
 
 
+def sinkhorn_normalise_blocks(
+    affinity_blocks: Tensor, iters: int = SINKHORN_ITERS
+) -> Tensor:
+    """Normalise ``[T, S, S]`` blocks. The seam `inc-glm53f-030b` will call.
+
+    THIS SEAM HAS NO TORCH PATH AT ALL, and the difference from
+    :func:`sinkhorn_normalise` is deliberate rather than an oversight. That seam
+    returns the oracle when the route is unavailable, which is why it counts a
+    ``torch_fallback``; this one raises, so ``torch_fallback`` stays zero for it
+    however it is called. Kernel-class work does not ship a torch path (P13, D6),
+    and a route that is absent is a fact worth failing on rather than papering
+    over -- an mHC layer that silently normalised 2048 tokens in torch would be
+    slow in a way no numeric acceptance could see.
+
+    Args:
+        affinity_blocks: ``[T, S, S]`` strictly positive affinities, one square
+            block per token.
+        iters: normalisation iterations, default :data:`SINKHORN_ITERS`, passed to
+            the kernel as a trace-time constant. One call is ONE dispatch however
+            many token tiles ``T`` needs, which is what the route predicate reads.
+
+    Returns:
+        ``[T, S, S]`` fp32. Each block has row sums :func:`row_target` and column
+        sums :func:`column_target`, which for a square block is also ``1``.
+
+    Raises:
+        SinkhornError: on a non-3-D input, a non-positive ``iters``, an
+            inadmissible geometry, or an unavailable NKI route.
+    """
+    if affinity_blocks.dim() != 3:
+        raise SinkhornError(
+            f"affinity_blocks must be 3-D [T, S, S], got shape "
+            f"{tuple(affinity_blocks.shape)}; the kernel maps T onto the partition "
+            f"axis and the block onto the two free axes"
+        )
+    if iters <= 0:
+        raise SinkhornError(
+            f"iters={iters} must be positive; the target declares "
+            f"{SINKHORN_ITERS} normalisation iterations"
+        )
+    tokens = int(affinity_blocks.shape[0])
+    rows = int(affinity_blocks.shape[1])
+    cols = int(affinity_blocks.shape[2])
+
+    if not can_run_sinkhorn_blocks(affinity_blocks, tokens, rows, cols):
+        raise SinkhornError(
+            "the NKI route is unavailable (no device and no simulator), and the "
+            "batched sinkhorn has no torch path to fall back to: normalising "
+            f"{tokens} token blocks is kernel-class work (P13). Enable the NKI "
+            "simulator for a CPU-mode run."
+        )
+
+    _COUNTERS.nki_dispatch += 1
+    return wrap_nki(sinkhorn_blocks_kernel)(
+        affinity_blocks=affinity_blocks, iters=iters
+    )
+
+
 def sinkhorn_torch_oracle(affinity: Tensor, iters: int = SINKHORN_ITERS) -> Tensor:
     """The same algorithm in torch, in fp32. The CPU oracle -- never shipped.
 
@@ -625,4 +925,18 @@ def kernel_identity() -> tuple[str, str]:
     """
     func = getattr(sinkhorn_kernel, "func", None)
     target = func if func is not None else sinkhorn_kernel
+    return target.__module__, target.__qualname__
+
+
+def blocks_kernel_identity() -> tuple[str, str]:
+    """``(module, qualname)`` of the BATCHED kernel, read off the object.
+
+    The same reading as :func:`kernel_identity` for the other kernel, kept
+    separate so a test can tell which of the two a seam dispatched to instead of
+    inferring it from a shape. ``mla_projections.py:290-300`` unwraps ``.func``
+    the same way, because ``nki.jit`` returns a wrapper and the name a substitution
+    would change is the wrapped one.
+    """
+    func = getattr(sinkhorn_blocks_kernel, "func", None)
+    target = func if func is not None else sinkhorn_blocks_kernel
     return target.__module__, target.__qualname__
