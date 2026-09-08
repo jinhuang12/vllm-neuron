@@ -3,13 +3,19 @@
 
 **SEVEN ITEMS, ONE PER REPLACED ``forward``, and no ``parametrize`` decorator in this
 file** (campaign rule D1.2). Each item runs one forward once on the tiny config and
-compares its output against a torch reference built from the same weights, at
-``assert_close(rtol=1e-2, atol=1e-5)``. Each item names the component whose behaviour
-it certifies (D1.4).
+compares its output against a torch reference built from the same weights. Each item
+names the component whose behaviour it certifies (D1.4).
 
-THE TOLERANCE AND THE CONSTRAINT SET ARE ADOPTED, NOT MINTED HERE (P9). ``rtol=1e-2``,
-``atol=1e-5`` and the constraint set below are the end-to-end criterion's own numbers,
-carried unchanged.
+TWO BANDS, EACH ADOPTED AND NEITHER MINTED HERE (P9). ``rtol=1e-2, atol=1e-5`` is the
+end-to-end criterion's own pair and governs every comparison whose value crossed no
+eight-expert sum. ``rtol=3e-2, atol=1e-5`` -- ``MOE_RTOL``/``MOE_ATOL`` below -- governs
+the MoE-seam comparisons, and is the pair ``inc-glm53f-027`` already landed on this same
+layer (``test_moe_path.py:181-182``). Each site's band is named at the site, and the
+constraint set below is the end-to-end criterion's, carried unchanged.
+
+A CONTROL CARRIES ITS OWN ITEM'S BAND. A control must drive the output OUTSIDE the band
+its item passes inside, so a control left on the tighter band under a wider acceptance
+would certify less than the acceptance requires.
 
 THE READINGS ARE PIPE-DELIMITED AND PREFIXED ``TINYFWD|``. That prefix is this file's
 own: `-088`'s readings are bracketed, `-089`'s carry ``PRODUCTION|`` and `-090`'s carry
@@ -142,6 +148,22 @@ TOKENS = 128
 
 RTOL = 1e-2
 ATOL = 1e-5
+
+#: The MoE-seam pair, for the comparisons whose value carries an EIGHT-EXPERT SUM.
+#: A LANDED PRECEDENT, NOT A NUMBER MINTED HERE: ``inc-glm53f-027`` compares this same
+#: MoE layer against a pure-torch reference at exactly this pair -- see
+#: ``test/vllm_neuron/model/glm5_next/test_moe_path.py:181-182`` and the plan's ``:1553``.
+#: Order named inline, per design law D3: the pin holds two tolerance maps in OPPOSITE
+#: orders, so a bare pair is ambiguous. This one is ``(rtol, atol)``.
+#:
+#: WHY THE bf16 PAIR CANNOT SERVE THESE SITES, and it is arithmetic rather than taste.
+#: bfloat16 carries 8 significant bits, so its unit roundoff is ``2**-9``; accumulating
+#: ``n`` terms bounds the pointwise relative error near ``n * 2**-9``. At ``n = 8`` that is
+#: 1.5625%, and ``rtol=1e-2`` admits at most 5.12 terms. The eight terms are NOT a fixture
+#: choice: the landed router refuses ``top_k != 8`` (``router.py:1037``). The same bound at
+#: the two experts this fixture used before is 0.39%, which is why these sites passed then.
+MOE_RTOL = 3e-2
+MOE_ATOL = 1e-5
 
 #: Distinct per operand, so a swapped operand cannot pass on a shared seed.
 SEED_HIDDEN = 5401
@@ -1535,7 +1557,7 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
     for name, keywords in variants.items():
         variant = _routed_output(operands, **keywords)
         moved = not torch.allclose(
-            variant["out"], reference["out"], rtol=RTOL, atol=ATOL
+            variant["out"], reference["out"], rtol=MOE_RTOL, atol=MOE_ATOL
         )
         gap = float(
             (variant["out"] - reference["out"]).abs().max()
@@ -1548,7 +1570,8 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
         if not moved:
             raise VacuousControlError(
                 f"changing the reference so that its {name} leaves the result inside "
-                f"rtol={RTOL}, atol={ATOL}; this item would pass with that branch "
+                f"rtol={MOE_RTOL}, atol={MOE_ATOL}; this item would pass with that "
+                f"branch "
                 f"wrong in the module"
             )
 
@@ -1573,8 +1596,9 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
             f"{(TOKENS, ROUTED_HIDDEN_SIZE)} -- the padding-token row is the callee's "
             f"to slice off"
         )
+    # THE MoE BAND: this output is a per-token sum of EIGHT fp8-quantised expert products.
     torch.testing.assert_close(
-        got.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
+        got.float(), reference["out"].float(), rtol=MOE_RTOL, atol=MOE_ATOL
     )
 
 
@@ -2152,7 +2176,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         ("shared half omitted", routed_reference["out"]),
         ("shared half added twice", expected + shared_reference["out"]),
     ):
-        moved = not torch.allclose(variant, expected, rtol=RTOL, atol=ATOL)
+        moved = not torch.allclose(variant, expected, rtol=MOE_RTOL, atol=MOE_ATOL)
         gap = float((variant - expected).abs().max() / expected.abs().max())
         print(
             f"TINYFWD|moe_control|branch={name}|outside_tolerance={moved}"
@@ -2160,8 +2184,8 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         )
         if not moved:
             raise VacuousControlError(
-                f"with the {name} the result is still inside rtol={RTOL}, "
-                f"atol={ATOL}; this item cannot tell the one add from the wrong "
+                f"with the {name} the result is still inside rtol={MOE_RTOL}, "
+                f"atol={MOE_ATOL}; this item cannot tell the one add from the wrong "
                 f"count"
             )
 
@@ -2199,7 +2223,9 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
             f"the forward returned {tuple(got.shape)}, expected "
             f"{(TOKENS, ROUTED_HIDDEN_SIZE)}"
         )
-    torch.testing.assert_close(got.float(), expected.float(), rtol=RTOL, atol=ATOL)
+    # THE MoE BAND: the block's output carries the routed half's eight-expert sum.
+    torch.testing.assert_close(got.float(), expected.float(),
+                               rtol=MOE_RTOL, atol=MOE_ATOL)
 
     # ---- CONTROL C: THE ROUTER READS THE PRE-NORM TENSOR. Handing the normalised
     # states in both positions normalises twice inside the fused kernel, which is
@@ -2213,7 +2239,8 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         text_config=text_config,
         quant_config=quant_config,
     )
-    moved = not torch.allclose(doubled.float(), expected.float(), rtol=RTOL, atol=ATOL)
+    moved = not torch.allclose(doubled.float(), expected.float(),
+                               rtol=MOE_RTOL, atol=MOE_ATOL)
     gap = float((doubled.float() - expected.float()).abs().max() / expected.abs().max())
     print(
         f"TINYFWD|moe_control|branch=router fed the normalised tensor"
@@ -2221,7 +2248,8 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     )
     if not moved:
         raise VacuousControlError(
-            f"normalising twice leaves the result inside rtol={RTOL}, atol={ATOL}; "
+            f"normalising twice leaves the result inside rtol={MOE_RTOL}, "
+            f"atol={MOE_ATOL}; "
             f"this item cannot tell the pre-norm argument from the normalised one"
         )
 
@@ -2277,8 +2305,10 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         after,
     )
     print("TINYFWD|moe_control|branch=no shared expert|dense_dispatches=0")
+    # THE MoE BAND: the bare block returns the routed half, eight-expert sum and all.
     torch.testing.assert_close(
-        bare_got.float(), routed_reference["out"].float(), rtol=RTOL, atol=ATOL
+        bare_got.float(), routed_reference["out"].float(),
+        rtol=MOE_RTOL, atol=MOE_ATOL
     )
 
 
@@ -3845,9 +3875,17 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 )
         expected = hidden.float() + half["out"].float()
         if index + 1 < len(layers):
+            # THE BAND FOLLOWS THE SEAM THIS LAYER'S FFN HALF CROSSED. A routed layer's
+            # output carries the eight-expert MoE sum and takes the MoE band; a dense
+            # layer's crossed one fp8 matmul and stays on the tighter pair. ``routed`` is
+            # the loop's own branch flag above, so the two cannot drift apart.
+            layer_rtol, layer_atol = (MOE_RTOL, MOE_ATOL) if routed else (RTOL, ATOL)
+            print(f"TINYFWD|stack_ffn_band|layer={index}"
+                  f"|branch={'routed' if routed else 'dense'}"
+                  f"|rtol={layer_rtol}|atol={layer_atol}")
             torch.testing.assert_close(
                 recorded_in[index + 1][1][0].float(), expected,
-                rtol=RTOL, atol=ATOL,
+                rtol=layer_rtol, atol=layer_atol,
             )
 
     # ---- CONJUNCT 5: THE FINAL NORM CLOSES THE CHAIN, on the last layer's own
@@ -4433,7 +4471,15 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # ---- CONTROL E: THE ROWS ARE MEASURED, NOT INCIDENTAL. The reference recomputed
     # on rolled positions must leave the band, or a forward that projected some other
     # rows would be indistinguishable from this one.
-    rolled = tuple(ROOT_SAMPLING_POSITIONS[1:]) + (ROOT_SAMPLING_POSITIONS[0],)
+    # ROLLED BY TWO, NOT BY ONE, and the positions themselves do not move. Rolling by
+    # one leaves row 2 mapping position 7 to position 7 -- ``(127, 0, 7, 7)`` becomes
+    # ``(0, 7, 7, 127)`` -- so that row's logits cannot change by construction and the
+    # control is diluted by a row that can never discriminate. Rolling by two gives
+    # ``(7, 7, 127, 0)``: four changing rows of four, with the tuple, its runner-faithful
+    # repeat and conjunct 5's byte-identity check all exactly as declared. Measured over
+    # every roll amount and both bracketing controls in
+    # ``increments/probe-054a-root-roll-fixedpoint-mac-r1-20260908T222838Z.out``.
+    rolled = tuple(ROOT_SAMPLING_POSITIONS[2:]) + tuple(ROOT_SAMPLING_POSITIONS[:2])
     _stack_outside_tolerance(
         f"the logits recomputed on rolled positions {list(rolled)}",
         _root_reference(hidden, head, rolled),
