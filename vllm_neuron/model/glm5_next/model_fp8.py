@@ -2645,11 +2645,20 @@ class Glm5NextSharedExperts(nn.Module):
     # Skipping quietly is how a missing retile would look like a working one.
 
     def retile_checkpoint_scale_grids(self) -> int:
-        """Coarsen this module's checkpoint grids onto the public grid, ONCE.
+        """Coarsen this module's grids onto the public grid and publish the frame.
 
-        Returns how many projections were retiled -- ``3`` on a checkpoint whose
+        ``inc-glm53f-054a`` repair round 1 moved the body into
+        :func:`_publish_compute_frame_operands`, which the dense MLP now shares,
+        and added a second step there: after the coarsening, each weight and its
+        grid are transposed ONCE into the frame ``blockwise_fp8_mm`` multiplies in.
+        Before that repair this method left the loader's own frame in place and
+        :meth:`shared_expert_mm` refused it at layer 0 of a real load.
+
+        Returns how many projections were RETILED -- ``3`` on a checkpoint whose
         extents are whole ``256`` blocks, ``0`` on a miniature that has no public
-        grid to build.
+        grid to build. The return value is unchanged by the repair, so the landed
+        readings that count it do not move; what the transpose did is in the health
+        record, per projection, under :attr:`SHARED_RETILE_HEALTH_ATTR`.
 
         Raises:
             Glm5NextSharedExpertRouteError: if a weight or grid is not 2-D, or a
@@ -2658,89 +2667,9 @@ class Glm5NextSharedExperts(nn.Module):
                 second retile of an already-retiled grid would rescale the weight
                 twice and no shape would object.
         """
-        from vllm_neuron.functional.moe.blockwise_fp8_retile import (
-            BLOCK_QUANT_SIZE,
-            DOWN,
-            TILE_SIZE,
-            retile_block_scales,
+        return _publish_compute_frame_operands(
+            self, Glm5NextSharedExpertRouteError, self.SHARED_RETILE_HEALTH_ATTR
         )
-
-        health: dict[str, dict[str, object]] = {}
-        retiled = 0
-        for leaf in _scale_prep_leaves(self):
-            grid_name = Glm5NextForConditionalGeneration._sibling_scale_grid_name(
-                leaf
-            )
-            weight = getattr(self, leaf)
-            grid = getattr(self, grid_name)
-            if weight.dim() != 2:
-                raise Glm5NextSharedExpertRouteError(
-                    f"{leaf} must be 2-D to give the retile its extents, got "
-                    f"shape {tuple(weight.shape)}"
-                )
-            if grid.dim() != 2:
-                raise Glm5NextSharedExpertRouteError(
-                    f"{grid_name} must be 2-D, got shape {tuple(grid.shape)}"
-                )
-            rows, cols = int(weight.shape[0]), int(weight.shape[1])
-            if rows % BLOCK_QUANT_SIZE or cols % BLOCK_QUANT_SIZE:
-                # No public grid exists for these extents. Recorded, not silent.
-                health[leaf] = {
-                    "retiled": False,
-                    "extents": (rows, cols),
-                    "reason": (
-                        f"[{rows},{cols}] is not a whole number of "
-                        f"{BLOCK_QUANT_SIZE}x{BLOCK_QUANT_SIZE} blocks"
-                    ),
-                }
-                continue
-            checkpoint_grid = (rows // TILE_SIZE, cols // TILE_SIZE)
-            if tuple(grid.shape) != checkpoint_grid:
-                raise Glm5NextSharedExpertRouteError(
-                    f"{grid_name} has shape {tuple(grid.shape)}; this retile "
-                    f"consumes the checkpoint's own {TILE_SIZE}-tile grid "
-                    f"{checkpoint_grid} for a [{rows},{cols}] weight. A grid "
-                    f"already at {BLOCK_QUANT_SIZE} granularity is refused here "
-                    f"rather than passed over: retiling twice rescales the "
-                    f"weight twice and no shape check would see it."
-                )
-            # ``DOWN`` selects the CONSUMER flattening, and this method reads
-            # neither consumer field -- only ``block_scales`` (the retained scale
-            # per block) and ``retiled_weights``. DOWN is named because its
-            # flattening writes every emitted slot exactly once, so the two health
-            # counters below stay readable; GATE_UP leaves half its slots NaN by
-            # design and would make them say nothing here.
-            result = retile_block_scales(
-                weight.data.unsqueeze(0).contiguous(),
-                grid.unsqueeze(0).contiguous(),
-                DOWN,
-            )
-            # ``block_scales`` is ``(E, i_256, h_256)``
-            # (``blockwise_fp8_retile.py:371``, written at ``:382``), so the
-            # transpose puts it back in the weight's own ``(rows, cols)`` frame,
-            # which is the frame ``to_kernel_scale_layout`` compares against.
-            public = result.block_scales[0].t().contiguous()
-            # ``.data`` ASSIGNMENT, not a rebind. ``setattr(self, leaf, tensor)``
-            # would drop the ``nn.Parameter`` and with it every landed reading
-            # that counts ``named_parameters()``. The device is carried over
-            # explicitly because the producer allocates its grid with
-            # ``torch.full`` and no device (``:371``), which lands on the CPU.
-            weight.data = result.retiled_weights[0].to(
-                device=weight.device, dtype=weight.dtype
-            )
-            setattr(self, grid_name, public.to(device=grid.device))
-            health[leaf] = {
-                "retiled": True,
-                "extents": (rows, cols),
-                "checkpoint_grid": checkpoint_grid,
-                "public_grid": tuple(public.shape),
-                "emitted_unsupplied": result.emitted_unsupplied,
-                "input_scales_dropped": result.input_scales_dropped,
-                "inexact_rescales": result.inexact_rescales,
-            }
-            retiled += 1
-        setattr(self, self.SHARED_RETILE_HEALTH_ATTR, health)
-        return retiled
 
     def prepare_scale_operands(
         self,
@@ -3465,11 +3394,50 @@ class Glm5NextDenseMLP(nn.Module):
             self, "gate_proj_weight", "up_proj_weight", "down_proj_weight"
         )
 
+    #: Where :meth:`retile_checkpoint_scale_grids` records what it did, per
+    #: projection. Its OWN attribute and not the shared expert's, so a reader who
+    #: finds a record knows which module wrote it.
+    DENSE_RETILE_HEALTH_ATTR = "_dense_mlp_retile_health"
+
+    def retile_checkpoint_scale_grids(self) -> int:
+        """Coarsen this module's grids onto the public grid and publish the frame.
+
+        ``inc-glm53f-054a`` repair round 1. THE OPT-IN THIS CLASS TAKES, and the
+        reason it must. The loader delivers the checkpoint's own layout -- gate and
+        up as ``[I, H]``, down as ``[H, I]`` (shard table ``:503-513``) -- at the
+        checkpoint's ``128``-tile scale granularity, and :meth:`forward` consumes
+        the frame and the granularity ``blockwise_fp8_mm`` multiplies in. Before
+        this repair nothing on the dense MLP's load path bridged either gap, so a
+        real ``load_weights`` into this class refused at layer 0 of the first three
+        layers of GLM-5.3-Flash and the tiny fixture could not see it: that fixture
+        binds hand-drawn compute-frame weights and ``256`` grids straight onto the
+        module, which is the loader's job and not the fixture's.
+
+        The whole body is :func:`_publish_compute_frame_operands`, shared with
+        :class:`Glm5NextSharedExperts` -- one definition of the frame rule, not a
+        mirrored copy that can drift. ``_run_load_time_preps`` enrols this class by
+        ``hasattr``, so declaring the method is the whole enrolment.
+
+        Returns how many projections were retiled: ``3`` when the extents are whole
+        ``256`` blocks, ``0`` on a miniature with no public grid to build. The
+        transpose is not conditional on that, and both frames are in the health
+        record under :attr:`DENSE_RETILE_HEALTH_ATTR`.
+
+        Raises:
+            Glm5NextDenseMLPRouteError: if a weight or grid is not 2-D, or a grid
+                is not at the checkpoint's own ``128``-tile granularity.
+        """
+        return _publish_compute_frame_operands(
+            self, Glm5NextDenseMLPRouteError, self.DENSE_RETILE_HEALTH_ATTR
+        )
+
     # ── the dense-MLP compute path -- D14 owner: ``inc-glm53f-054a`` ───────
     #
-    # SCOPE. This section replaces ``forward`` below and adds the one
-    # ``__init__`` line above. It adds no method, touches no other class, and
-    # calls no landed method of another class -- the shared expert's
+    # SCOPE. This section replaces ``forward`` below, adds the one ``__init__``
+    # line above, and -- since repair round 1 -- adds
+    # ``retile_checkpoint_scale_grids`` and its health attribute. It touches no
+    # other class and calls no landed method of another class -- the shared
+    # expert's
     # ``shared_expert_mm`` is the same arithmetic on the same seam, and it is
     # NOT called from here because it reads that class's prepared scale
     # operands off ``self`` (``_prepared_scale_operand``, ``:2053``) and this
@@ -3516,6 +3484,16 @@ class Glm5NextDenseMLP(nn.Module):
             ``[T, H]`` **fp32** -- the seam's own return dtype, not re-cast here.
             The layer forward decides the residual dtype, which is the same
             division :meth:`Glm5NextSharedExperts.shared_expert_mm` records.
+
+        WHICH FRAME THE WEIGHTS ARRIVE IN, and who put them there. This method
+        consumes the frame the kernel multiplies in -- gate and up ``[H, I]``, down
+        ``[I, H]``, each with the ``256`` public grid beside it. That is NOT the
+        frame the loader delivers: the checkpoint's own layout is the transpose of
+        it at the checkpoint's ``128`` granularity. :meth:`retile_checkpoint_scale_grids`
+        bridges both gaps once, on the load path, and this method refuses the
+        loader's frame by name rather than transposing it per token. A caller that
+        binds weights straight onto the module -- a fixture, say -- must bind what
+        the load path would have published, or take the refusal.
 
         Raises:
             Glm5NextDenseMLPRouteError: when ``quant_config`` resolved no
@@ -6817,6 +6795,166 @@ def _scale_prep_leaves(module: nn.Module) -> list[str]:
             Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf),
         )
     ]
+
+
+def _publish_compute_frame_operands(
+    module: nn.Module,
+    error_cls: type[ValueError],
+    health_attr: str,
+) -> int:
+    """Put one module's dense-route weights in the frame the kernel multiplies in.
+
+    ``inc-glm53f-054a`` repair round 1, one definition for the dense MLP and the
+    shared expert, which load the same three projections onto the same seam.
+    Returns how many projections were RETILED -- the number the landed readings of
+    this step already count. The transpose count and both frames go into the health
+    record on ``health_attr``.
+
+    TWO STEPS, INDEPENDENT, IN THIS ORDER.
+
+    1. Coarsen the checkpoint's ``128``-tile scale grid onto the ``256`` public
+       grid, which also requantises the weight. This runs only for extents that
+       are whole ``256`` blocks; a miniature with no public grid to build is
+       RECORDED and skipped, because a silent skip looks exactly like a working
+       retile.
+    2. Transpose the weight and its grid into the compute frame. This is NEVER
+       skipped: a skipped transpose leaves the forward refusing at layer 0.
+
+    WHY THE TRANSPOSE IS HERE AND NOT IN THE FORWARD. The loader delivers the
+    checkpoint's own layout -- ``[I, H]`` for gate and up, ``[H, I]`` for down (the
+    shard table shards gate and up on dim 0, "the intermediate width", ``:503-513``
+    and ``:523-533``) -- while ``blockwise_fp8_mm`` reads its weight as ``[K, N]``
+    with ``K`` the contraction extent (``blockwise_fp8_mm.scale_grid_shape``, whose
+    public grid is ``(K // 256, N // 256)``). The two frames are opposite, so
+    somebody must transpose.
+
+    This package's recorded rule is that every consumer transposes at COMPUTE time
+    (``weight_loaders_fp8.py:1764``), and this step deliberately does not follow
+    it. The reason is not taste. :meth:`Glm5NextSharedExperts.prepare_scale_operands`
+    (``inc-glm53f-090``) builds the kernel scale operand ONCE at load, from the
+    STORED weight's own extents, and ``_run_load_time_preps`` hands it the stored
+    tensors. A forward that transposed would then multiply a transposed weight
+    against an operand built from the other frame: the shapes agree, the numbers
+    are wrong, and no check in this file would see it. Transposing before that prep
+    reads the module keeps ONE frame authority for the whole load path, and costs
+    one copy per projection per LOAD rather than one per token on the served path.
+
+    THE TRANSPOSE RUNS AFTER THE RETILE, so the retile's arithmetic is untouched by
+    this repair: ``retile_block_scales`` sees exactly the operands and the frame it
+    saw before, and what follows it is a relabelling of two axes, not a second
+    requantisation. A ``256`` block of the transposed weight is the transpose of the
+    matching block of the original, so the coarsened scale that block carries is
+    the same number either way.
+
+    Args:
+        module: the loaded module, with all three weights and their sibling grids
+            attached. Its ``declared_param_names`` decides which leaves are
+            visited, through :func:`_scale_prep_leaves`.
+        error_cls: the caller's own route error, so a refusal names the class the
+            reader is looking at rather than a shared one.
+        health_attr: where the per-projection record is written.
+
+    Raises:
+        error_cls: if a weight or a grid is not 2-D, or if a grid is not at the
+            checkpoint's own ``128``-tile granularity. An already-public grid is
+            refused rather than passed over, because retiling twice rescales the
+            weight twice and no shape check would object.
+    """
+    from vllm_neuron.functional.moe.blockwise_fp8_retile import (
+        BLOCK_QUANT_SIZE,
+        DOWN,
+        TILE_SIZE,
+        retile_block_scales,
+    )
+
+    health: dict[str, dict[str, object]] = {}
+    retiled = 0
+    for leaf in _scale_prep_leaves(module):
+        grid_name = Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+        weight = getattr(module, leaf)
+        grid = getattr(module, grid_name)
+        if weight.dim() != 2:
+            raise error_cls(
+                f"{leaf} must be 2-D to give the retile its extents, got shape "
+                f"{tuple(weight.shape)}"
+            )
+        if grid.dim() != 2:
+            raise error_cls(f"{grid_name} must be 2-D, got shape {tuple(grid.shape)}")
+        rows, cols = int(weight.shape[0]), int(weight.shape[1])
+        record: dict[str, object] = {"loader_frame": (rows, cols)}
+        if rows % BLOCK_QUANT_SIZE or cols % BLOCK_QUANT_SIZE:
+            # No public grid exists for these extents. Recorded, not silent. The
+            # transpose below still runs: the frame is wrong for the kernel
+            # whatever the granularity is.
+            record.update(
+                {
+                    "retiled": False,
+                    "reason": (
+                        f"[{rows},{cols}] is not a whole number of "
+                        f"{BLOCK_QUANT_SIZE}x{BLOCK_QUANT_SIZE} blocks"
+                    ),
+                }
+            )
+        else:
+            checkpoint_grid = (rows // TILE_SIZE, cols // TILE_SIZE)
+            if tuple(grid.shape) != checkpoint_grid:
+                raise error_cls(
+                    f"{grid_name} has shape {tuple(grid.shape)}; this retile "
+                    f"consumes the checkpoint's own {TILE_SIZE}-tile grid "
+                    f"{checkpoint_grid} for a [{rows},{cols}] weight. A grid "
+                    f"already at {BLOCK_QUANT_SIZE} granularity is refused here "
+                    f"rather than passed over: retiling twice rescales the weight "
+                    f"twice and no shape check would see it."
+                )
+            # ``DOWN`` selects the CONSUMER flattening, and this function reads
+            # neither consumer field -- only ``block_scales`` (the retained scale
+            # per block) and ``retiled_weights``. DOWN is named because its
+            # flattening writes every emitted slot exactly once, so the two health
+            # counters below stay readable; GATE_UP leaves half its slots NaN by
+            # design and would make them say nothing here.
+            result = retile_block_scales(
+                weight.data.unsqueeze(0).contiguous(),
+                grid.unsqueeze(0).contiguous(),
+                DOWN,
+            )
+            # ``block_scales`` is ``(E, i_256, h_256)``
+            # (``blockwise_fp8_retile.py:371``, written at ``:382``), so the
+            # transpose puts it back in the weight's own ``(rows, cols)`` frame,
+            # which is the frame ``to_kernel_scale_layout`` compares against.
+            public = result.block_scales[0].t().contiguous()
+            # ``.data`` ASSIGNMENT, not a rebind. ``setattr(module, leaf, tensor)``
+            # would drop the ``nn.Parameter`` and with it every landed reading that
+            # counts ``named_parameters()``. The device is carried over explicitly
+            # because the producer allocates its grid with ``torch.full`` and no
+            # device (``blockwise_fp8_retile.py:371``), which lands on the CPU.
+            weight.data = result.retiled_weights[0].to(
+                device=weight.device, dtype=weight.dtype
+            )
+            setattr(module, grid_name, public.to(device=grid.device))
+            record.update(
+                {
+                    "retiled": True,
+                    "checkpoint_grid": checkpoint_grid,
+                    "public_grid": tuple(public.shape),
+                    "emitted_unsupplied": result.emitted_unsupplied,
+                    "input_scales_dropped": result.input_scales_dropped,
+                    "inexact_rescales": result.inexact_rescales,
+                }
+            )
+            retiled += 1
+
+        # ---- STEP 2, unconditional. ``.contiguous()`` and not a bare view: the
+        # seam hands its weight to a kernel that reads it as a dense buffer, and a
+        # transposed view's strides are not that buffer.
+        weight.data = weight.data.t().contiguous()
+        transposed_grid = getattr(module, grid_name).t().contiguous()
+        setattr(module, grid_name, transposed_grid)
+        record["transposed"] = True
+        record["compute_frame"] = tuple(weight.data.shape)
+        record["compute_grid"] = tuple(transposed_grid.shape)
+        health[leaf] = record
+    setattr(module, health_attr, health)
+    return retiled
 
 
 class Glm5NextWeightLoadError(ValueError):
