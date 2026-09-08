@@ -115,7 +115,21 @@ TINY_GEOMETRY: dict[str, int] = {
 #: (``model_fp8.py:407-416``) rather than typed.
 TINY_HEAD_SIZE = TINY_GEOMETRY["kv_lora_rank"] + TINY_GEOMETRY["qk_rope_head_dim"]
 
-SOFTMAX_SCALE = float(TINY_GEOMETRY["kv_lora_rank"] ** -0.5)
+#: The softmax scale, DERIVED THE WAY THE REFERENCE DERIVES IT: the inverse square
+#: root of the QUERY head width ``qk_nope_head_dim + qk_rope_head_dim``, which is
+#: the fork's own ``qk_head_dim`` (``model_fp8.py:4435``, summed for the reason
+#: ``:415-418`` gives -- the 0 rotary slice is a value). It used to read
+#: ``kv_lora_rank ** -0.5``, which is the CONTRACTION width the absorbed score GEMM
+#: uses and not the width the reference scales by; ``kv_lora_rank`` is twice
+#: ``qk_nope_head_dim`` on this geometry, so that value was low by exactly
+#: ``sqrt(2)``. Corrected under ``inc-glm53f-109`` (DECISIONS section 362).
+#:
+#: :data:`TINY_HEAD_SIZE` above legitimately keeps ``kv_lora_rank``: it is the
+#: absorbed head_size the implementation derives at ``model_fp8.py:407-416``, a
+#: different quantity from this scale, and it is unchanged here.
+SOFTMAX_SCALE = float(
+    (TINY_GEOMETRY["qk_nope_head_dim"] + TINY_GEOMETRY["qk_rope_head_dim"]) ** -0.5
+)
 
 #: The seven DSA counter families, one per module, since a counter is per module
 #: (``test_dsa_layer.py:239-257``).
@@ -972,3 +986,31 @@ def test_the_head_threads_exactly_the_blocks_own_keyword_arguments() -> None:
         f"block; a shadowed name would be consumed instead of threaded"
     )
     assert "not_a_block_kwarg" not in accepted, "the control name must not be accepted"
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-109. THE SOFTMAX SCALE, AGAINST THE REFERENCE'S OWN DERIVATION.
+
+
+def test_softmaxscale_is_the_reference_derivation_and_NOT_the_latent_rank() -> None:
+    """Item (a) for this file, read against THIS file's own geometry dict.
+
+    Two files carried the same retired expression, so each asserts over its own dict:
+    a single shared item would leave the other file's constant unread. The gap's size
+    and the sqrt(2) control live once, in ``test_dsa_layer.py``, because the ratio is a
+    property of the geometry both files declare identically and a second copy would be
+    a second place to update.
+    """
+    width = TINY_GEOMETRY["qk_nope_head_dim"] + TINY_GEOMETRY["qk_rope_head_dim"]
+    reference = float(width**-0.5)
+    say("softmaxscale", "query_head_width", width, "reference", repr(reference),
+        "constant", repr(SOFTMAX_SCALE))
+    assert SOFTMAX_SCALE == reference, (
+        f"SOFTMAX_SCALE is {SOFTMAX_SCALE!r}; the reference's derivation over this "
+        f"file's own geometry is {reference!r}. The scale is the inverse square root "
+        f"of the QUERY head width qk_nope_head_dim + qk_rope_head_dim = {width} "
+        f"(model_fp8.py:4435), not of the latent rank the absorbed GEMM contracts over"
+    )
+    assert SOFTMAX_SCALE != float(TINY_GEOMETRY["kv_lora_rank"] ** -0.5), (
+        "SOFTMAX_SCALE still reads the retired latent-rank value"
+    )

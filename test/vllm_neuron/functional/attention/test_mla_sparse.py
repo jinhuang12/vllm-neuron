@@ -223,7 +223,14 @@ def test_geometry_the_no_rope_declared_case_matches_the_torch_oracle() -> None:
         "vllm_neuron/functional/attention/mla_sparse.py")
     say(f"G1_TOLERANCE rtol={RTOL} atol={ATOL} (plan section 3, quoted not authored)")
     say("G1_DECLARED_CASE " + " ".join(f"{k}={v}" for k, v in case.items()))
-    say(f"G1_SOFTMAX_SCALE={scale:.6f} (derived from the case's latent rank)")
+    # inc-glm53f-109 corrects THIS MESSAGE and nothing else in this file. The value is
+    # right for what this test does -- one scale applied identically to the kernel and
+    # the reference, so agreement is measured at whatever scale is chosen -- but the old
+    # text named the latent rank as "the" derivation, and a reader who took that as the
+    # model's softmax scale would adopt a value low by sqrt(2) on the real geometry.
+    say(f"G1_SOFTMAX_SCALE={scale:.6f} (this case's own latent rank, applied "
+        "identically to the kernel and the reference; NOT the model's derivation, "
+        "which is the query head width qk_nope_head_dim + qk_rope_head_dim)")
 
     q_lift, c_kv, idx, q_pe, k_pe = make_case(**case)
     assert q_pe is None and k_pe is None, (

@@ -1840,13 +1840,29 @@ def _ref_layer(
 # THE FIXTURE. A materialised stack at :data:`TINY_GEOMETRY`.
 
 
-#: The softmax scale, DERIVED. ``q_lift`` and the gathered rows both carry the latent width, so the
-#: contraction width is ``kv_lora_rank`` (``qk_rope_head_dim`` is 0 on this checkpoint). ``attend``
-#: takes the scale as a caller's argument on purpose and its own comment says why -- "no block
-#: registers a value for it ... deriving one here would mint a registered value this increment has no
-#: authority to mint" (``model_fp8.py:4480-4482``). So this file derives one for its own run and
-#: registers nothing.
-SOFTMAX_SCALE = float(TINY_GEOMETRY["kv_lora_rank"] ** -0.5)
+#: The softmax scale, DERIVED THE WAY THE REFERENCE DERIVES IT: the inverse square root of the QUERY
+#: head width ``qk_nope_head_dim + qk_rope_head_dim``. That width is the fork's own ``qk_head_dim``
+#: (``model_fp8.py:4435``), summed rather than taken from the nope width alone because "the rotary
+#: slice is 0 on this checkpoint and that 0 is a value" (``:415-418``), and the factor upstream folds
+#: is ``head_dim ** -0.5`` on that same width (``:3333-3336``, quoted there).
+#:
+#: WHY NOT ``kv_lora_rank``, which this line used to read. Absorbing the KV projection makes the score
+#: GEMM contract over the latent width, and that is what the retired comment argued from -- but the
+#: contraction width is not the width the reference scales by. On both fixture geometries
+#: ``kv_lora_rank`` is twice ``qk_nope_head_dim``, so the retired value was low by exactly ``sqrt(2)``
+#: (0.0883883 against 0.125 here, 0.0441942 against 0.0625 on the published config). No landed result
+#: moved when this changed, because :func:`_reference` applies the SAME scale to the torch reference
+#: as the kernel receives (``:1577``) -- which is why the mis-derivation survived landing and why no
+#: existing item can be pointed at as evidence that either value is right. Corrected under
+#: ``inc-glm53f-109`` (DECISIONS section 362, open question ``oq-051-softmax-scale-sqrt2``).
+#:
+#: ``attend`` still takes the scale as a caller's argument on purpose and its own comment says why --
+#: "no block registers a value for it ... deriving one here would mint a registered value this
+#: increment has no authority to mint" (``model_fp8.py:4480-4482``). So this file derives one for its
+#: own run and registers nothing.
+SOFTMAX_SCALE = float(
+    (TINY_GEOMETRY["qk_nope_head_dim"] + TINY_GEOMETRY["qk_rope_head_dim"]) ** -0.5
+)
 
 
 def _materialise_indexer(indexer, gen: torch.Generator) -> None:
@@ -3056,4 +3072,64 @@ def test_the_two_entry_points_read_the_SAME_bypass_governed_families(
         f"the two entry points differ on {differing}; exactly two families may differ on the short "
         f"regime and both are named by the arms' landed tables, so a third difference is either a "
         f"new dispatch on one path or a lost one on the other"
+    )
+
+
+# =========================================================================== #
+# inc-glm53f-109. THE SOFTMAX SCALE, AGAINST THE REFERENCE'S OWN DERIVATION.
+#
+# Why these two items exist when no landed result moved. :func:`_reference` at
+# ``:1577`` applies the SAME scale to the torch reference as ``attend`` receives, so
+# every landed item here measures agreement AT a chosen scale and is blind to which
+# scale was chosen. That blindness is what let ``kv_lora_rank ** -0.5`` land and is
+# why no existing item can be cited as evidence for either value. These two items
+# read the constant against the reference's FORMULA instead.
+
+
+def test_softmaxscale_is_the_reference_derivation_and_NOT_the_latent_rank() -> None:
+    """Item (a): the constant is the QUERY head width's inverse square root.
+
+    The formula is written out again here from this file's own geometry dict, and
+    deliberately not factored into a helper the constant also calls -- a shared helper
+    would make this item compare the constant to itself and pass at any scale.
+    """
+    width = TINY_GEOMETRY["qk_nope_head_dim"] + TINY_GEOMETRY["qk_rope_head_dim"]
+    reference = float(width**-0.5)
+    say("D109", "query_head_width", width, "reference", repr(reference),
+        "constant", repr(SOFTMAX_SCALE))
+    assert SOFTMAX_SCALE == reference, (
+        f"SOFTMAX_SCALE is {SOFTMAX_SCALE!r}; the reference's derivation over this file's "
+        f"own geometry is {reference!r}. The scale is the inverse square root of the QUERY "
+        f"head width qk_nope_head_dim + qk_rope_head_dim = {width}, which is the fork's own "
+        f"qk_head_dim (model_fp8.py:4435), summed for the reason :415-418 gives"
+    )
+
+
+def test_softmaxscale_control_the_retired_latent_rank_value_fails_that_item() -> None:
+    """Item (b), THE CONTROL, and item (a) is only evidence because this one passes.
+
+    Item (a) would also pass on a geometry where the two derivations coincide, and this
+    fixture is not such a geometry: ``kv_lora_rank`` is twice ``qk_nope_head_dim`` here,
+    so the retired value is low by exactly ``sqrt(2)``. This item measures that gap
+    rather than asserting it, and it fails if a future geometry edit collapses it.
+    """
+    retired = float(TINY_GEOMETRY["kv_lora_rank"] ** -0.5)
+    reference = float(
+        (TINY_GEOMETRY["qk_nope_head_dim"] + TINY_GEOMETRY["qk_rope_head_dim"]) ** -0.5
+    )
+    ratio = reference / retired
+    say("D109", "retired", repr(retired), "reference", repr(reference),
+        "ratio", repr(ratio), "sqrt2", repr(2.0**0.5))
+    assert retired != reference, (
+        f"the retired derivation kv_lora_rank ** -0.5 and the reference's derivation both "
+        f"read {reference!r} on this geometry, so item (a) cannot tell them apart and is "
+        f"vacuous here; the two must differ for that item to mean anything"
+    )
+    assert abs(ratio - 2.0**0.5) <= 1e-12, (
+        f"the reference is {ratio!r} times the retired value; the block's ground is that "
+        f"kv_lora_rank is twice qk_nope_head_dim on this fixture, so the ratio is sqrt(2) "
+        f"= {2.0**0.5!r} to within 1e-12. A different ratio means the geometry moved"
+    )
+    assert SOFTMAX_SCALE != retired, (
+        f"SOFTMAX_SCALE still reads the retired latent-rank value {retired!r}"
     )
