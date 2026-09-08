@@ -4454,21 +4454,58 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
             if cls in DEFERRED_EP_GROUP_CLASSES:
                 # A bank carries a LEADING expert axis, so its declared dim moves
                 # one place right and the leading extent is this EP rank's experts.
-                per_rank = _padded_shard_extent(full, SHARD_TP_PER_EP, block)
+                #
+                # THE BANK PADS NOTHING AS OF ``inc-glm53f-106``. Its three routed
+                # rows declare ``require_consumer_block`` instead of
+                # ``pad_to_consumer_block``, so the per-rank extent is a plain
+                # division and an inadmissible one is REFUSED rather than rounded
+                # up. The expectation is changed here to say that, because a
+                # padding rule left in place for a family that no longer pads is a
+                # second writer of the same number -- which is the defect class
+                # review B90-101 opened.
+                #
+                # THE ``family`` ARGUMENT BELOW IS ``inc-glm53f-107``'s AND IS
+                # CARRIED THROUGH THIS REBASE DELIBERATELY. ``-107`` gave
+                # :func:`_deferred_full_shape` a leading ``family`` parameter
+                # because a leaf name alone does not identify a family, and this
+                # increment's own edit sits on the lines either side of that call.
+                # The two changes are orthogonal -- ``-107`` fixes WHICH other
+                # extent the fixture reads, this increment fixes WHETHER the bank
+                # pads -- so both survive, and dropping the argument would
+                # ``TypeError`` rather than fail an assertion.
+                per_rank = full // SHARD_TP_PER_EP
+                padded = _padded_shard_extent(full, SHARD_TP_PER_EP, block)
+                print(
+                    f"CONJUNCT1D_BANK_RULE unpadded={per_rank} padded_would_be="
+                    f"{padded} full={full} tp_per_ep={SHARD_TP_PER_EP} block={block}"
+                )
+                assert per_rank == padded, (
+                    f"this fixture's bank divides {full} over {SHARD_TP_PER_EP} "
+                    f"ranks to {per_rank}, where the old padding rule says {padded}. "
+                    f"They disagree, so switching this expectation to the unpadded "
+                    f"rule MOVES a frozen number and is not a seat's change to make "
+                    f"(design entry 85) -- stop and report instead of editing it"
+                )
                 base = list(_deferred_full_shape(cls, leaf, shard_dim, full))
                 base[shard_dim] = per_rank
                 expected = (expected_local_experts, *base)
-                divisor = f"tp_per_ep {SHARD_TP_PER_EP}"
+                divisor = (
+                    f"tp_per_ep {SHARD_TP_PER_EP} with NO padding -- an "
+                    f"inadmissible extent is refused, not rounded up"
+                )
             else:
                 per_rank = _padded_shard_extent(full, SHARD_EP_WORLD, block)
                 expected = list(_deferred_full_shape(cls, leaf, shard_dim, full))
                 expected[shard_dim] = per_rank
                 expected = tuple(expected)
-                divisor = f"world {SHARD_EP_WORLD}"
+                divisor = (
+                    f"world {SHARD_EP_WORLD} after rounding up to a multiple of "
+                    f"{block} per rank"
+                )
             assert got == expected, (
                 f"{dotted} loaded {got} at rank {rank}; this file's rule says "
                 f"{expected} -- full extent {full} on dim {shard_dim}, divided by "
-                f"{divisor} after rounding up to a multiple of {block} per rank"
+                f"{divisor}"
             )
             checked += 1
             if rank == 0:
@@ -5799,4 +5836,385 @@ def test_gridshard_b_one_reachable_block_size_is_why_105_omits_the_parameter() -
         f"{sibling_takes}, this increment's takes block_size={mine_takes}. This "
         f"item exists to explain that exact asymmetry, so a change to either "
         f"signature means the explanation needs rewriting rather than re-asserting"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# inc-glm53f-106 -- the routed bank REFUSES an inadmissible shard instead of
+# padding one, and the grid conversion keeps the expert-parallel degree.
+#
+# WHY THESE FOUR ITEMS EXIST. Review B90-101 found that `-101`'s acceptance passed
+# 25/25 with two defects present, and it passed because the registered fixture made
+# both defects invisible: BANK_INTERMEDIATE=512 at tp_per_ep=2 makes the pad a no-op,
+# so the ruled behaviour (refuse) and the landed behaviour (pad) produced the SAME
+# number at every tested width. Each item below therefore names the reason it would
+# RED on the pre-repair code, and item 1 carries the falsifier for the rule itself.
+#
+# THE SELECTOR IS `bankpad` AND THAT IS DELIBERATE. It contains neither `stacked`
+# (4 frozen items), `sharedshard` (5) nor `shard` as those selectors match, so no
+# frozen expected count moves -- design entry 85 puts widening one out of a seat's
+# reach.
+# --------------------------------------------------------------------------- #
+
+BANKPAD_PARAM = "layers.0.mlp.experts.gate_proj_weight"
+BANKPAD_SIBLING_PARAM = "layers.0.mlp.gate_proj_weight"
+
+
+class _BankpadSlice:
+    """The two things ``tensor_width_sharding_loader`` asks of a checkpoint slice.
+
+    ``get_shape`` and ``__getitem__``, and nothing else -- read off that function's
+    own body (``utils/weight_loader.py:443``, ``:456``) rather than guessed, so this
+    stub cannot drift into supporting a call the real loader never makes.
+    """
+
+    def __init__(self, shape: tuple[int, ...]) -> None:
+        self._shape = tuple(shape)
+        self._tensor = torch.zeros(self._shape, dtype=torch.float32)
+
+    def get_shape(self) -> list[int]:
+        return list(self._shape)
+
+    def __getitem__(self, key):
+        return self._tensor[key]
+
+
+def _bankpad_bank_geometry(ep_degree: int, world_size: int):
+    """The bank's geometry from the TABLE, never hand-built here.
+
+    ``_shard_geometry_for`` is the single reader of ``_SHARD_GEOMETRY``, and the
+    declaration is what this increment changed -- so an item that constructed a
+    geometry directly would assert its own opinion of the table instead of the
+    table. The owner is synthesised with the DECLARING CLASS NAME because that name
+    is the table's key (``model_fp8.py``'s ``_SHARD_GEOMETRY`` is keyed by name, not
+    by class object, and says so).
+    """
+    from vllm_neuron.model.glm5_next import model_fp8 as _MF8
+
+    owner = type("Glm5NextRoutedExperts", (), {"ep_degree": ep_degree})()
+    return _MF8._shard_geometry_for(owner, "gate_proj_weight", world_size)
+
+
+def test_bankpad_the_bank_refuses_an_inadmissible_extent_and_a_sibling_family_still_loads() -> None:
+    """Item 1. The bank refuses what it used to pad, and the rule stays narrow.
+
+    TWO READINGS IN ONE OUTPUT, and the second is not decoration. The lead's ruling
+    (DECISIONS 296-298) refused the predicate "deferred AND no pad implies whole
+    consumer blocks" precisely because it would refuse a future deferred family that
+    is not consumed by the block-FP8 kernel. Reading B is the falsifier for that
+    risk: a sibling deferred family that declares NO requirement loads an unaligned
+    extent exactly as it did before this increment. Without reading B, reading A is
+    consistent with a rule that refuses everything.
+
+    WHY THIS REDS ON THE PRE-REPAIR CODE. Before this increment the three routed rows
+    passed ``pad_to_consumer_block=True``, so the geometry carried a pad of 256 and
+    ``load_time_shard_size`` rounded 512 up to 1024: every rank got 256 rows, of
+    which 128 were real, and the load SUCCEEDED. Reading A expects a refusal and
+    would fail on that success. After the repair the rows declare
+    ``require_consumer_block`` instead and the load refuses by name.
+    """
+    world = 4
+    block = _WL_FP8.consumer_block_quant_size()
+    geometry = _bankpad_bank_geometry(ep_degree=1, world_size=world)
+    print(
+        f"BANKPAD1_GEOMETRY num_shards={geometry.num_shards} "
+        f"pad={geometry.pad_to_multiple_of} require={geometry.require_multiple_of} "
+        f"degree={geometry.expert_parallel_degree}"
+    )
+    assert geometry.pad_to_multiple_of is None, (
+        f"the bank still declares a pad of {geometry.pad_to_multiple_of}; this "
+        f"increment's first change is that it declares a requirement instead"
+    )
+    assert geometry.require_multiple_of == block, (
+        f"the bank declares require_multiple_of={geometry.require_multiple_of}, not "
+        f"the consumer's own {block}; the number must be imported, never typed"
+    )
+    assert geometry.num_shards == world, (
+        f"at expert-parallel degree 1 the bank must divide by the WORLD ({world}), "
+        f"and this geometry says {geometry.num_shards} -- if this ever reads 1 the "
+        f"case below is not the case this item means to measure"
+    )
+
+    # READING A: the bank refuses, and the per-rank extent it refuses is the one the
+    # unpadded division actually produces.
+    full = 512
+    experts = 2
+    expected_extent = full // world
+    assert expected_extent % block != 0, (
+        f"{full} over {world} ranks is {expected_extent}, which IS a whole {block} "
+        f"block, so this case cannot distinguish a refusal from an acceptance"
+    )
+    stack_whole = lambda _slices, _rank: torch.zeros((experts, full, 8))
+    transform = _WL_FP8._column_of_each_expert(geometry, BANKPAD_PARAM, stack_whole)
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+        transform([], 0)
+    message = str(refusal.value)
+    print(f"BANKPAD1_REFUSAL={message[:260]}")
+    assert message.startswith(f"{BANKPAD_PARAM} "), (
+        f"the refusal does not name the parameter first: {message}"
+    )
+    assert f"loads {expected_extent} rows per rank" in message, (
+        f"the refusal does not say the per-rank extent it refused: {message}"
+    )
+    assert f"{block}-row block" in message, (
+        f"the refusal does not name the consumer's block: {message}"
+    )
+    # THE SUB-BLOCK ARM OF THE MESSAGE, and it is read here on purpose. 128 rows
+    # under a 256-row block puts the largest admissible extent BELOW one whole block
+    # at zero, so a message that named "the nearest admissible extents" would offer
+    # this rank no rows at all as its advice. That defect was found by walking the
+    # message against this very case, so this case is where it is measured.
+    assert below_and_above(expected_extent, block)[0] == 0, (
+        f"{expected_extent} is at least one whole {block} block, so this case reads "
+        f"the other arm of the message and the sub-block arm goes unmeasured"
+    )
+    assert f"narrower than one whole block" in message, (
+        f"the refusal took the nearest-neighbours arm at a sub-block extent: {message}"
+    )
+    assert f"smallest admissible per-rank extent is {block}" in message, (
+        f"the refusal does not name a usable smallest extent: {message}"
+    )
+    assert f"full width of {block * world}" in message, (
+        f"the refusal does not name an admissible full width: {message}"
+    )
+
+    # READING B, THE FALSIFIER: a sibling deferred family declaring NO requirement
+    # loads the same unaligned extent without complaint.
+    sibling = _WL_FP8.DeferredShardGeometry(shard_dim=0, num_shards=world)
+    assert sibling.require_multiple_of is None, (
+        "the default of require_multiple_of moved; a family that declares nothing "
+        "must stay unbound or this reading proves the opposite of what it says"
+    )
+    loaded = _WL_FP8._sharding_loader(sibling, BANKPAD_SIBLING_PARAM).transform(
+        [_BankpadSlice((full, 8))], 0
+    )
+    got = tuple(loaded.shape)
+    print(f"BANKPAD1_SIBLING_LOADED={got} UNALIGNED_BY={got[0] % block}")
+    assert got == (expected_extent, 8), (
+        f"the sibling family loaded {got}, not {(expected_extent, 8)}; this reading "
+        f"only falsifies the over-broad rule if it loads the SAME unaligned extent "
+        f"the bank was just refused for"
+    )
+    assert got[0] % block != 0, (
+        f"the sibling's extent {got[0]} is a whole {block} block, so it was never a "
+        f"candidate for the refusal and falsifies nothing"
+    )
+
+
+def test_bankpad_a_width_the_pad_would_move_still_refuses_at_the_ruled_degree() -> None:
+    """Item 2. A width the pad would move, at the degree that actually reaches the rule.
+
+    WHAT THIS ITEM ADDS THAT ITEM 1 DOES NOT, and it is an arm and not a width. The
+    refusal names the admissible neighbours out of two DIFFERENT arms, and item 1 can
+    only ever reach one of them. Item 1's per-rank extent is narrower than a whole
+    block, so :func:`refuse_inadmissible_shard_extent` takes its "narrower than one
+    whole block" arm and names a SINGLE width (``weight_loaders_fp8.py:1736-1741``).
+    This item's 384 rows floor to 256, so the OTHER arm runs and names BOTH
+    neighbours, 256 and 512 (``:1730-1734``). Without this item that arm never
+    executes, and the assertion below is on the arm rather than on the sentence.
+
+    WHY THE DEGREE IS 1 AND NOT 2, MEASURED RATHER THAN PREFERRED. The first version
+    of this item ran at degree 2 and proved nothing about the extent rule. At any
+    degree above 1 ``_expert_parallel_shard_column`` asks for the EP-TP group, no
+    group is initialised under test, and it refuses for THAT reason first
+    (``:2503-2519``) -- so the extent check never ran and the item would have passed
+    on the wrong refusal. At degree 1 the same function short-circuits at ``:2500``,
+    ``if ep_degree <= 1: return rank % tp_per_ep``, before the group lookup, so the
+    extent rule is what this item can reach. The degree-2 preemption is not a
+    hypothesis: the counted run under grant 019 printed that other refusal.
+
+    THE BANK IS STILL SHARDED AT DEGREE 1, which is why the fixture is not vacuous.
+    ``_shard_geometry_for`` hands back a deferred geometry whose ``num_shards`` is the
+    WORLD at degree 1, and the assertion below reads that back from the table instead
+    of assuming it.
+
+    WHY THIS REDS ON THE PRE-REPAIR CODE. Before this increment the three routed rows
+    declared ``pad_to_consumer_block``, so 1536 rounded up to 2048 and every rank held
+    512 rows -- two whole blocks, of which 384 were real -- and the load SUCCEEDED.
+    This item expects a refusal, so it fails on that success.
+    """
+    world = 4
+    ep_degree = 1
+    block = _WL_FP8.consumer_block_quant_size()
+    geometry = _bankpad_bank_geometry(ep_degree=ep_degree, world_size=world)
+    tp_per_ep = world // ep_degree
+    assert geometry.num_shards == tp_per_ep, (
+        f"the bank's rank count is {geometry.num_shards} where tp_per_ep is "
+        f"{tp_per_ep}; the divisor moved and this case is not the ruled one"
+    )
+
+    full = 1536
+    unpadded = full // tp_per_ep
+    padded = _padded_shard_extent(full, tp_per_ep, block)
+    below, above = below_and_above(unpadded, block)
+    print(
+        f"BANKPAD2_FULL={full} TP_PER_EP={tp_per_ep} UNPADDED={unpadded} "
+        f"PADDED={padded} BLOCK={block}"
+    )
+    print(f"BANKPAD2_NEIGHBOURS={below} and {above}")
+    assert padded != unpadded, (
+        f"padding {full} over {tp_per_ep} ranks gives {padded}, the same as the "
+        f"unpadded {unpadded}: the pad is a NO-OP at this width, which is exactly "
+        f"the masking this item was minted to remove"
+    )
+    assert unpadded % block != 0, (
+        f"{unpadded} is a whole {block} block, so the unpadded shard is admissible "
+        f"and there is nothing here to refuse"
+    )
+    assert below >= block, (
+        f"flooring {unpadded} to a multiple of {block} gives {below}, under one whole "
+        f"block, so this width takes the narrower-than-a-block arm item 1 already "
+        f"owns and the two-neighbour arm this item exists for stays unexecuted"
+    )
+
+    stack_whole = lambda _slices, _rank: torch.zeros((2, full, 8))
+    transform = _WL_FP8._column_of_each_expert(geometry, BANKPAD_PARAM, stack_whole)
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+        transform([], 0)
+    message = str(refusal.value)
+    print(f"BANKPAD2_REFUSAL={message[:260]}")
+    assert f"admissible are {below} and {above}" in message, (
+        f"the refusal does not name BOTH admissible neighbours {below} and {above}, "
+        f"so it did not take the two-neighbour arm this item exists to execute: "
+        f"{message}"
+    )
+
+
+def below_and_above(extent: int, required: int) -> tuple[int, int]:
+    """The two admissible neighbours of ``extent``, computed here independently.
+
+    Deliberately NOT imported from the module under test: an expectation that calls
+    the same helper as the code cannot detect the helper being wrong. Two lines of
+    arithmetic written twice is the point.
+    """
+    below = (extent // required) * required
+    return below, below + required
+
+
+def test_bankpad_a_bank_grid_column_comes_from_the_group_not_the_modulo(
+    monkeypatch,
+) -> None:
+    """Item 3. The bank's GRID reaches its column through the group, not a division.
+
+    WHAT B90 FOUND AND WHY ITEM (5) DID NOT CATCH IT. Conjunct (5) calls
+    ``_expert_parallel_shard_column`` DIRECTLY, so it certifies the reader and never
+    the grid's route to it. The grid's route runs
+    ``stacked_expert_scale_loader`` -> ``shard_geometry_for_grid`` ->
+    ``_column_of_each_expert`` -> the reader, and the conversion in the middle dropped
+    ``expert_parallel_degree``. At degree 1 the reader short-circuits to
+    ``rank % tp_per_ep`` with no group read and no refusal, so every bank GRID at
+    every real degree above 1 took the modulo column the ruling forbids while the
+    WEIGHT half kept the group column.
+
+    WHY THIS REDS ON THE PRE-REPAIR CODE. The converted geometry carried degree 1,
+    so the disagreement below could not be seen and the transform returned quietly.
+    """
+    world = 64
+    disagreeing_degree = 8
+    tp_per_ep = world // disagreeing_degree
+    weight_geometry = _bankpad_bank_geometry(
+        ep_degree=disagreeing_degree, world_size=world
+    )
+    converted = _WL_FP8.shard_geometry_for_grid(
+        weight_geometry, BANKPAD_PARAM, DEFAULT_WEIGHT_BLOCK_SIZE
+    )
+    print(
+        f"BANKPAD3_WEIGHT_DEGREE={weight_geometry.expert_parallel_degree} "
+        f"CONVERTED_DEGREE={converted.expert_parallel_degree}"
+    )
+    assert converted.expert_parallel_degree == disagreeing_degree, (
+        f"the grid conversion carries degree {converted.expert_parallel_degree} "
+        f"where the weight declared {disagreeing_degree}; the column reader will "
+        f"short-circuit and read no group"
+    )
+
+    assert _NPS.uses_noncontiguous_mesh(world, tp_per_ep), (
+        f"the package does not call world {world} with row {tp_per_ep} "
+        f"non-contiguous, so this item's premise is gone"
+    )
+    _row, column_of_4 = _mesh_answers(world, disagreeing_degree, 4)
+    print(f"BANKPAD3_GROUP_COLUMN={column_of_4} MODULO_COLUMN={4 % tp_per_ep}")
+    assert column_of_4 != 4 % tp_per_ep, (
+        f"the group puts rank 4 at column {column_of_4} and the modulo also says "
+        f"{4 % tp_per_ep}; they agree, so there is no disagreement to refuse"
+    )
+    monkeypatch.setattr(
+        _NPS, "get_neuron_ep_tp_group", lambda: _FixtureGroup(column_of_4, tp_per_ep)
+    )
+    stack_whole = lambda _slices, _rank: torch.zeros((2, 2048 // 128, 8))
+    transform = _WL_FP8._column_of_each_expert(converted, BANKPAD_PARAM, stack_whole)
+    with pytest.raises(Glm5NextExpertBankNotLoadableError) as refusal:
+        transform([], 4)
+    message = str(refusal.value)
+    print(f"BANKPAD3_REFUSAL={message[:240]}")
+    assert f"at column {column_of_4}" in message, (
+        f"the refusal does not report the group's column, so the grid path did not "
+        f"reach the group: {message}"
+    )
+
+    # THE BOUNDARY: at the registered degree the two answers agree and the grid path
+    # returns without refusing. Without this the refusal above could be a blanket.
+    registered_degree = 16
+    registered_tp_per_ep = world // registered_degree
+    registered_geometry = _WL_FP8.shard_geometry_for_grid(
+        _bankpad_bank_geometry(ep_degree=registered_degree, world_size=world),
+        BANKPAD_PARAM,
+        DEFAULT_WEIGHT_BLOCK_SIZE,
+    )
+    _r, registered_column = _mesh_answers(world, registered_degree, 12)
+    monkeypatch.setattr(
+        _NPS,
+        "get_neuron_ep_tp_group",
+        lambda: _FixtureGroup(registered_column, registered_tp_per_ep),
+    )
+    rows = 2048 // 128
+    accepted = _WL_FP8._column_of_each_expert(
+        registered_geometry,
+        BANKPAD_PARAM,
+        lambda _slices, _rank: torch.zeros((2, rows, 8)),
+    )([], 12)
+    print(f"BANKPAD3_REGISTERED_ACCEPTED_SHAPE={tuple(accepted.shape)}")
+    assert tuple(accepted.shape) == (2, rows // registered_tp_per_ep, 8), (
+        f"the registered degree loaded {tuple(accepted.shape)}; at "
+        f"{registered_tp_per_ep} ranks the grid's {rows} rows must divide to "
+        f"{rows // registered_tp_per_ep}"
+    )
+
+
+def test_bankpad_the_grid_conversion_carries_the_degree_through_both_returns() -> None:
+    """Item 4. BOTH returns of the conversion, because item 3 reaches only one.
+
+    ``shard_geometry_for_grid``'s deferred branch has two exits -- the pad-is-None
+    exit and the converted-pad exit -- and the repair had to touch both. Item 3
+    drives the first (the bank declares no pad after this increment), so this item
+    exists to read the second, which no behavioural path of the repaired bank takes
+    any more. Exactly two readings, both the declared degree.
+
+    WHY THIS REDS ON THE PRE-REPAIR CODE. Both exits omitted the field, so both
+    returned the dataclass default of 1.
+    """
+    degree = 8
+    block = DEFAULT_WEIGHT_BLOCK_SIZE[0]
+    readings = []
+    for label, pad in (("no_pad", None), ("converted_pad", block * 2)):
+        geometry = _WL_FP8.DeferredShardGeometry(
+            shard_dim=0,
+            num_shards=4,
+            pad_to_multiple_of=pad,
+            expert_parallel_degree=degree,
+        )
+        converted = _WL_FP8.shard_geometry_for_grid(
+            geometry, BANKPAD_PARAM, DEFAULT_WEIGHT_BLOCK_SIZE
+        )
+        readings.append((label, converted.expert_parallel_degree))
+        print(
+            f"BANKPAD4_{label.upper()}_DEGREE={converted.expert_parallel_degree} "
+            f"PAD_IN={pad} PAD_OUT={converted.pad_to_multiple_of}"
+        )
+    assert len(readings) == 2, (
+        f"this item read {len(readings)} of the conversion's two deferred exits"
+    )
+    assert all(value == degree for _label, value in readings), (
+        f"the conversion did not carry the declared degree {degree} through both "
+        f"returns: {readings}"
     )

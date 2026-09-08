@@ -1497,8 +1497,8 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
 # inc-glm53f-094 -- the tensor-parallel shard geometry, as an INPUT.
 #
 # WHAT THIS SECTION IS FOR. The model declares per-rank geometry
-# (``_per_rank()`` ``model_fp8.py:200-202``, ``num_kv_heads_per_rank``
-# ``:2215``) and until this increment no loader shards anything, so at any world
+# (``_per_rank()`` ``model_fp8.py:213-215``, ``num_kv_heads_per_rank``
+# ``:2575``) and until this increment no loader shards anything, so at any world
 # size above one every rank read the WHOLE tensor into a per-rank-shaped
 # consumer. :func:`blockwise_scale_loader`'s own docstring already deferred the
 # answer to "the module that declares that geometry"; this section is the input
@@ -1598,6 +1598,23 @@ class DeferredShardGeometry:
     #: degree-1 load as a missing group and refuse it -- measured at
     #: ``accept-101-r8-host.out``. Only the bank sets this above 1.
     expert_parallel_degree: int = 1
+    #: The extent one rank's shard must ALREADY be a whole multiple of, when this
+    #: geometry pads nothing. ``inc-glm53f-106``, and it exists because dropping
+    #: ``pad_to_consumer_block`` from the routed bank re-armed no refusal: the only
+    #: no-pad check on the load path is EVEN DIVISION
+    #: (``utils/weight_loader.py:330-345``), so a bank at expert-parallel degree 1 on
+    #: 4 ranks divided its 512-wide intermediate into 128-row shards -- an even
+    #: division, and not a whole 256-row consumer block -- and the load SUCCEEDED,
+    #: leaving the failure to surface later at ``blockwise_fp8_mm.scale_grid_shape``.
+    #: This field is what makes it fail on LOAD instead, which is what design entries
+    #: 75 and 77 ruled ("would fail on load, not on the kernel under test").
+    #: DECLARED rather than inferred, on the lead's ruling at DECISIONS 296-298: the
+    #: alternative was to refuse any no-pad deferred family, which is a proxy for "is
+    #: consumed by the block-FP8 kernel" that happens to be true only because the
+    #: bank is today's only such family, and would wrongly refuse a future
+    #: unquantised deferred family. A family that sets this says WHY it is bound; a
+    #: family that leaves it ``None`` is untouched.
+    require_multiple_of: int | None = None
 
     def __post_init__(self) -> None:
         if self.shard_dim not in (0, 1):
@@ -1617,6 +1634,24 @@ class DeferredShardGeometry:
             raise ValueError(
                 f"expert_parallel_degree must be >= 1, got "
                 f"{self.expert_parallel_degree}"
+            )
+        if self.require_multiple_of is not None and self.require_multiple_of < 1:
+            raise ValueError(
+                f"require_multiple_of must be >= 1 or None, got "
+                f"{self.require_multiple_of}"
+            )
+        if self.require_multiple_of is not None and self.pad_to_multiple_of is not None:
+            # Both together would be a contradiction rather than a belt and braces:
+            # padding MAKES the extent a whole multiple, so a requirement beside it
+            # either restates the pad or disagrees with it, and a reader could not
+            # tell which was meant. No family declares both today and this is what
+            # keeps it that way -- the same shape as the width-plus-EP-divisor
+            # refusal in ``model_fp8.py``'s reader.
+            raise ValueError(
+                f"a geometry declares both pad_to_multiple_of "
+                f"{self.pad_to_multiple_of} and require_multiple_of "
+                f"{self.require_multiple_of}; padding already makes every rank's "
+                f"extent a whole multiple, so declare one or the other"
             )
 
 
@@ -1643,6 +1678,79 @@ def consumer_block_quant_size() -> int:
     from vllm_neuron.functional.blockwise_fp8_mm import BLOCK_QUANT_SIZE
 
     return int(BLOCK_QUANT_SIZE)
+
+
+def refuse_inadmissible_shard_extent(
+    extent: int,
+    geometry: DeferredShardGeometry,
+    param_name: str | None = None,
+    *,
+    shard_dim: int,
+) -> None:
+    """Refuse a per-rank extent the geometry's own requirement does not admit.
+
+    ``inc-glm53f-106``, and it is the arming that dropping the routed bank's pad did
+    not do. A deferred geometry that pads gets its whole-multiple property by
+    construction; one that declares :attr:`DeferredShardGeometry.require_multiple_of`
+    instead has to be CHECKED, and the only place the number exists is here, after
+    the tensor arrived and the extent was divided.
+
+    ONE RULE, TWO ARRIVAL SITES, AND THAT IS MEASURED RATHER THAN ASSUMED. A deferred
+    family reaches its extent by one of exactly two routes: the non-bank families
+    through :func:`_sharding_loader`, and the routed bank through
+    :func:`_column_of_each_expert` -- the bank takes ``stacked_expert_bank_loader``
+    from ``loader_for_mapped_keys`` and never passes through ``_sharding_loader`` at
+    all. So a check written at one site would leave the other unguarded, and the bank
+    is the family this rule exists for. Both sites call THIS function so there is one
+    predicate and one message rather than two that can drift apart.
+
+    THE NEAREST ADMISSIBLE FULL WIDTHS ARE NAMED, not just the failure, because the
+    reader of this refusal is someone who chose a degree and a world size: the useful
+    answer is which widths would have worked, and those are what the two neighbouring
+    multiples imply once multiplied back out by the rank count.
+
+    Args:
+        extent: this rank's extent along the sharded dimension, as loaded.
+        geometry: the deferred geometry whose requirement is being enforced.
+        param_name: named first in any refusal, through :func:`_refuse`.
+        shard_dim: the dimension ``extent`` was measured on, named in the message so
+            a refusal cannot be read against the wrong axis.
+    """
+    required = geometry.require_multiple_of
+    if required is None or extent % required == 0:
+        return
+    ranks = geometry.num_shards
+    # The DOWNWARD neighbour is named only when it exists. Flooring an extent that is
+    # already narrower than one block gives 0, and "the nearest admissible extents are
+    # 0 and 256" would offer a rank no rows at all as advice -- found by walking this
+    # message against the acceptance's own 128-row case rather than by reading it.
+    below = (extent // required) * required
+    above = below + required
+    if below >= required:
+        options = (
+            f"The nearest per-rank extents that are admissible are {below} and "
+            f"{above}, which at {ranks} ranks means a full width of {below * ranks} "
+            f"or {above * ranks}."
+        )
+    else:
+        options = (
+            f"This shard is narrower than one whole block, so the smallest "
+            f"admissible per-rank extent is {above}, which at {ranks} ranks means a "
+            f"full width of {above * ranks}. Fewer ranks dividing this width would "
+            f"also do it."
+        )
+    _refuse(
+        param_name,
+        f"loads {extent} rows per rank along dim {shard_dim}, which is NOT a whole "
+        f"multiple of the {required}-row block its consumer requires "
+        f"({extent} % {required} = {extent % required}). Its {ranks} ranks divide the "
+        f"checkpoint width evenly, so nothing above refused it, but the block-FP8 "
+        f"consumer reads whole {required}-row blocks and would refuse this shard "
+        f"later, on the kernel rather than on the load. {options} Refusing here "
+        f"rather than padding: this family declared a requirement instead of a pad, "
+        f"so a pad would be this function inventing a geometry the table did not "
+        f"declare.",
+    )
 
 
 def shard_geometry_for_grid(
@@ -1694,12 +1802,35 @@ def shard_geometry_for_grid(
     if isinstance(geometry, DeferredShardGeometry):
         extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
         pad = geometry.pad_to_multiple_of
+        # ``expert_parallel_degree`` IS CARRIED THROUGH BOTH RETURNS BELOW, and
+        # ``inc-glm53f-106`` adds it because dropping it was a silent hole rather than
+        # a choice. The field exists for one reason (``:1592-1600``): the EP-TP group
+        # only exists above degree 1, so the column reader consults the group when the
+        # geometry says the degree is above 1 and short-circuits to ``rank %
+        # tp_per_ep`` when it says 1 (``_expert_parallel_shard_column``). A converted
+        # grid geometry that let the field fall back to its default of 1 therefore
+        # told the reader "no group" for every bank GRID at every real degree above 1,
+        # while the WEIGHT path kept the true degree -- so the two halves of one bank
+        # read their columns two different ways, and on this platform's non-contiguous
+        # mesh those are different columns. The conversion changes the grid's ROW
+        # arithmetic and has no business changing which rank a column comes from.
+        #
+        # ``require_multiple_of`` IS DELIBERATELY NOT CARRIED, and it is said here so
+        # the next reader does not take it for the same kind of omission this comment
+        # exists to fix. That requirement is the block-FP8 consumer's rule about a
+        # WEIGHT extent, and it is enforced once, on the weight, where the number
+        # applies (``refuse_inadmissible_shard_extent``). A grid is sharded if and only
+        # if its weight is, on the same dimension, so a grid that came from an
+        # admissible weight is admissible by construction -- and a grid row count is
+        # the weight's divided by the tile extent, so carrying the number unconverted
+        # would enforce a bound this rule never meant.
         if pad is None:
             return DeferredShardGeometry(
                 shard_dim=geometry.shard_dim,
                 num_shards=geometry.num_shards,
                 pad_to_multiple_of=None,
                 pad_value=1.0,
+                expert_parallel_degree=geometry.expert_parallel_degree,
             )
         if pad % extent:
             _refuse(
@@ -1715,6 +1846,7 @@ def shard_geometry_for_grid(
             num_shards=geometry.num_shards,
             pad_to_multiple_of=pad // extent,
             pad_value=1.0,
+            expert_parallel_degree=geometry.expert_parallel_degree,
         )
     extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
     if geometry.shard_size % extent:
@@ -1779,13 +1911,39 @@ def _sharding_loader(
     -- so this is the only place that has to know the difference.
     """
     if isinstance(geometry, DeferredShardGeometry):
-        return tensor_width_sharding_loader(
+        inner = tensor_width_sharding_loader(
             shard_dim=geometry.shard_dim,
             num_shards=geometry.num_shards,
             pad_to_multiple_of=geometry.pad_to_multiple_of,
             pad_value=geometry.pad_value,
             param_name=param_name,
         )
+        if geometry.require_multiple_of is None:
+            # Untouched when nothing is declared, and that is the property the
+            # acceptance's second reading falsifies: a deferred family that declares
+            # no requirement still loads an unaligned extent exactly as it did before
+            # ``inc-glm53f-106``. Returning the inner loader itself, rather than a
+            # wrapper that always says yes, keeps that literally true.
+            return inner
+        # ``inc-glm53f-106``: the requirement is checked on the LOADED extent, which is
+        # the first moment it exists -- the width arrives with the tensor, which is why
+        # this geometry is deferred at all. Wrapping rather than editing
+        # ``tensor_width_sharding_loader``: that function lives in a shared utility
+        # (``utils/weight_loader.py``) and the block is a block-FP8 fact reached
+        # through ``consumer_block_quant_size()`` in THIS file, so the rule belongs
+        # where the families are declared. Precedent for wrapping a transform here:
+        # :func:`_weight_slice_only` and :func:`compensating_sharded_scale_grid_loader`.
+        def checked(slices: list, rank: int) -> torch.Tensor:
+            result = inner.transform(slices, rank)
+            refuse_inadmissible_shard_extent(
+                int(result.shape[geometry.shard_dim]),
+                geometry,
+                param_name,
+                shard_dim=geometry.shard_dim,
+            )
+            return result
+
+        return SafetensorsWeightLoader(transform=checked)
     return sharding_weight_loader(
         shard_dim=geometry.shard_dim,
         shard_size=geometry.shard_size,
@@ -2066,9 +2224,15 @@ def loader_for_mapped_keys(
         # ``DeferredShardGeometry``: the width comes off the checkpoint tensor,
         # because ``Glm5NextRoutedExperts`` holds counts and degrees only. Its rank
         # count is ``tp_per_ep`` and not the world size, since the experts are
-        # already divided across the expert-parallel groups -- so at this
-        # campaign's production expert-parallel degree of 1 the reader returns
-        # ``None`` and this branch takes exactly the path ``-095`` measured.
+        # already divided across the expert-parallel groups. AT EXPERT-PARALLEL
+        # DEGREE 1 THE BANK IS STILL SHARDED, corrected by ``inc-glm53f-106`` (review
+        # B90-101, finding B1): at degree 1 ``tp_per_ep`` equals the WORLD, so the
+        # reader hands back a ``DeferredShardGeometry`` and this branch divides the
+        # bank's intermediate width across every rank. ``None`` comes back only when
+        # one rank holds each group whole -- world size equal to the degree, or world
+        # size 1 -- and that is the unsharded path ``-095`` measured. The earlier
+        # wording had it backwards and would have told a reader the production default
+        # loads the bank whole.
         return stacked_expert_bank_loader(
             keys, param_name=param_name, owner=owner, geometry=geometry
         )
@@ -2212,10 +2376,15 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
 
     THE DEFECT IN ONE SENTENCE. The bank's partition is built over ``ep_degree``,
     the expert-parallel degree (``model_fp8.py:1034-1037``), while the load hands
-    this file the global tensor-parallel rank (``model_fp8.py:172-179``). At this
-    campaign's production expert-parallel degree of 1 (``factory.py:204-211``) the
-    partition holds ONE rank, so every global rank above 0 was refused
-    (``factory.py:132-137``) -- 63 of 64 ranks on the target host.
+    this file the global tensor-parallel rank (``model_fp8.py:172-179``). At
+    expert-parallel degree 1 -- the default when ``--enable-expert-parallel`` is
+    omitted (``factory.py:204-211``) -- THIS partition holds ONE rank, so every
+    global rank above 0 was refused (``factory.py:132-137``) -- 63 of 64 ranks on the
+    target host. Read "this partition" strictly: it is the partition over
+    ``ep_degree``, the EXPERT axis. It is not the bank's intermediate width, which at
+    degree 1 is sharded across the whole world -- ``inc-glm53f-106`` corrects three
+    sibling comments that ran the two together and concluded the bank loads whole at
+    degree 1 (review B90-101, finding B1).
 
     AT DEGREE 1 THE MAP IS THE CONSTANT 0, AND THE PACKAGE DECLARES THAT TWICE, so
     this is a read of the shipped geometry rather than a second copy of it:
@@ -2501,7 +2670,7 @@ def _column_of_each_expert(
         # The stacked result carries a LEADING expert axis, so the geometry's
         # per-expert dim sits one place to the right. Stated here because this is
         # the one place the two numberings meet.
-        return shard_tensor_at_load_time(
+        result = shard_tensor_at_load_time(
             whole,
             geometry.shard_dim + 1,
             geometry.num_shards,
@@ -2510,6 +2679,20 @@ def _column_of_each_expert(
             geometry.pad_value,
             param_name,
         )
+        # ``inc-glm53f-106``: the bank's own arrival site for the declared requirement.
+        # It is checked HERE and not in ``_sharding_loader`` because the bank never
+        # reaches that function -- ``loader_for_mapped_keys`` sends a stacked bank to
+        # ``stacked_expert_bank_loader``, which comes straight here -- so a check
+        # written only there would leave the one family this rule exists for
+        # unguarded. Measured, not assumed: ``_sharding_loader``'s callers are the
+        # non-bank deferred families.
+        refuse_inadmissible_shard_extent(
+            int(result.shape[geometry.shard_dim + 1]),
+            geometry,
+            param_name,
+            shard_dim=geometry.shard_dim + 1,
+        )
+        return result
 
     return transform
 
@@ -2611,10 +2794,15 @@ def stacked_expert_bank_loader(
     """
     layout = bank_layout(checkpoint_keys, param_name=param_name)
     resolve = _bank_expert_indices(owner, layout, param_name)
-    # ``inc-glm53f-101``, remedy part 3. ``None`` is the landed path, and it is what
-    # this campaign's production expert-parallel degree of 1 still takes: at that
-    # degree ``tp_per_ep`` is the whole world and the table's reader returns no
-    # geometry, so the bank is whole inside its group.
+    # ``inc-glm53f-101``, remedy part 3, with the degree-1 claim corrected by
+    # ``inc-glm53f-106`` (review B90-101, finding B1). ``None`` is the landed path for
+    # a load that shards nothing, and expert-parallel degree 1 is NOT that load: at
+    # degree 1 ``tp_per_ep`` is the whole world, so the table's reader hands back a
+    # ``DeferredShardGeometry`` and the column path below runs. The old wording said
+    # ``tp_per_ep`` was the whole world AND that no geometry came back, which cannot
+    # both hold -- above one rank the reader always answers with a geometry. ``None``
+    # arrives only at world size 1, or when the world size equals the degree so each
+    # group holds its experts whole.
     stack = _stack_local_expert_weights
     if geometry is not None:
         stack = _column_of_each_expert(geometry, param_name, stack)
