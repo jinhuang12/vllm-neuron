@@ -182,52 +182,111 @@ def _impl():
 #: row, because two of them are DECLARED ZEROS at this geometry and a zero that is
 #: read is worth more than a zero that is not looked at.
 #:
-#: THE READ ACCESSOR IS NAMED AND THE RESET IS DERIVED as ``"reset_" + read``,
-#: which is the convention every seam module in this repository follows -- so the
-#: pair has one declaration and cannot drift apart. Naming the reader rather than
-#: discovering it is deliberate: ``test_dsa_layer.py:380`` discovers the pair by
-#: scanning for the ``_dispatch_counters`` suffix and asserts exactly one pair per
-#: module, which is true of every module below EXCEPT ``mla_sparse``. The coverage
-#: control at :func:`_assert_every_counter_family_is_registered` keeps the naming
-#: honest by refusing a module that grows a family no row claims.
+#: EVERY ACCESSOR IS NAMED -- READ AND RESET BOTH -- AND NOTHING IS DERIVED, and
+#: that changed on a counterexample rather than on taste (``inc-glm53f-054a``,
+#: repair R; ``probe-054a-counter-population-r1``, 21 modules and 24 families read
+#: from the package's own source). The convention IS ``"reset_" + read`` in twenty
+#: of the twenty-one modules, and ``functional/moe/router.py`` breaks it: its
+#: reader is ``noaux_tc_dispatch_counters`` and its reset is
+#: ``reset_noaux_tc_counters``, so a derived name is an ``AttributeError`` on the
+#: first line of every item's route predicate. Naming both costs one string per row
+#: and check 5 of the static gate asserts each name exists.
+#:
+#: THE POPULATION IS THE WHOLE ``vllm_neuron.functional`` TREE, not the subset these
+#: seven forwards were expected to reach, because the registered predicate says
+#: "every seam this campaign owns" and every module below is named in this
+#: campaign's plan. Ten families were unregistered before repair R and one of them
+#: is dispatched by a forward this file already tested: ``route_tokens`` enters
+#: ``functional/moe/router.py`` (``model_fp8.py:1489-1494``), whose family
+#: increments once per call (``router.py:1664``). So item 4's fallback aggregate was
+#: reading thirteen of the fourteen seams its own forward could reach, and the
+#: earlier disclosure that "the router's own seam defines no dispatch counters" was
+#: false of the tree.
+#:
+#: Naming the reader rather than discovering it stays deliberate:
+#: ``test_dsa_layer.py:380`` discovers the pair by scanning for the
+#: ``_dispatch_counters`` suffix and asserts exactly one pair per module, which is
+#: true of every module below EXCEPT ``mla_sparse`` (three families) and
+#: ``kda/chunked_recurrence`` (two). The two coverage controls below keep the naming
+#: honest: one refuses a registered module that grows a family no row claims, the
+#: other refuses a family anywhere in the package that no row claims at all.
 _SEAM_REGISTRY = {
     "blockwise_fp8_mm": (
-        "vllm_neuron.functional.blockwise_fp8_mm", "dispatch_counters"),
+        "vllm_neuron.functional.blockwise_fp8_mm",
+        "dispatch_counters", "reset_dispatch_counters"),
     "blockwise_fp8_moe": (
-        "vllm_neuron.functional.moe.moe_blockwise_fp8", "dispatch_counters"),
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "noaux_tc_router": (
+        "vllm_neuron.functional.moe.router",
+        "noaux_tc_dispatch_counters", "reset_noaux_tc_counters"),
     "mla_projection": (
         "vllm_neuron.functional.attention.mla_projections",
-        "mla_projection_dispatch_counters"),
+        "mla_projection_dispatch_counters",
+        "reset_mla_projection_dispatch_counters"),
     "mla_absorb": (
         "vllm_neuron.functional.attention.mla_absorb",
-        "mla_absorb_dispatch_counters"),
+        "mla_absorb_dispatch_counters", "reset_mla_absorb_dispatch_counters"),
     "mla_sparse": (
         "vllm_neuron.functional.attention.mla_sparse",
-        "mla_sparse_dispatch_counters"),
+        "mla_sparse_dispatch_counters", "reset_mla_sparse_dispatch_counters"),
     "mla_sparse_tiled": (
         "vllm_neuron.functional.attention.mla_sparse",
-        "mla_sparse_tiled_dispatch_counters"),
+        "mla_sparse_tiled_dispatch_counters",
+        "reset_mla_sparse_tiled_dispatch_counters"),
     "mla_sparse_row_tiled": (
         "vllm_neuron.functional.attention.mla_sparse",
-        "mla_sparse_row_tiled_dispatch_counters"),
+        "mla_sparse_row_tiled_dispatch_counters",
+        "reset_mla_sparse_row_tiled_dispatch_counters"),
     "dsa_kpool_hadamard": (
         "vllm_neuron.functional.dsa.kpool_hadamard",
-        "kpool_hadamard_dispatch_counters"),
+        "kpool_hadamard_dispatch_counters",
+        "reset_kpool_hadamard_dispatch_counters"),
     "dsa_paged_gather": (
         "vllm_neuron.functional.dsa.paged_gather",
-        "paged_gather_dispatch_counters"),
+        "paged_gather_dispatch_counters", "reset_paged_gather_dispatch_counters"),
     "dsa_score_gemm": (
-        "vllm_neuron.functional.dsa.score_gemm", "score_gemm_dispatch_counters"),
+        "vllm_neuron.functional.dsa.score_gemm",
+        "score_gemm_dispatch_counters", "reset_score_gemm_dispatch_counters"),
     "dsa_topk_select": (
-        "vllm_neuron.functional.dsa.topk_select", "topk_select_dispatch_counters"),
+        "vllm_neuron.functional.dsa.topk_select",
+        "topk_select_dispatch_counters", "reset_topk_select_dispatch_counters"),
     "dsa_index_expand": (
         "vllm_neuron.functional.dsa.index_expand",
-        "index_expand_dispatch_counters"),
+        "index_expand_dispatch_counters", "reset_index_expand_dispatch_counters"),
     "dsa_decode_tail_update": (
         "vllm_neuron.functional.dsa.decode_tail_update",
-        "decode_tail_dispatch_counters"),
+        "decode_tail_dispatch_counters", "reset_decode_tail_dispatch_counters"),
     "dsa_ragged_pack": (
-        "vllm_neuron.functional.dsa.ragged_pack", "ragged_pack_dispatch_counters"),
+        "vllm_neuron.functional.dsa.ragged_pack",
+        "ragged_pack_dispatch_counters", "reset_ragged_pack_dispatch_counters"),
+    "dsa_causal_fill": (
+        "vllm_neuron.functional.dsa.causal_fill",
+        "causal_fill_dispatch_counters", "reset_causal_fill_dispatch_counters"),
+    "kda_chunked_recurrence": (
+        "vllm_neuron.functional.kda.chunked_recurrence",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "kda_chunked_recurrence_inter": (
+        "vllm_neuron.functional.kda.chunked_recurrence",
+        "inter_dispatch_counters", "reset_inter_dispatch_counters"),
+    "kda_decode_state": (
+        "vllm_neuron.functional.kda.decode_state",
+        "decode_dispatch_counters", "reset_decode_dispatch_counters"),
+    "kda_depthwise_conv1d": (
+        "vllm_neuron.functional.kda.depthwise_conv1d",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "kda_gate_clamp": (
+        "vllm_neuron.functional.kda.gate_clamp",
+        "gate_clamp_dispatch_counters", "reset_gate_clamp_dispatch_counters"),
+    "mhc_hyper_connection": (
+        "vllm_neuron.functional.mhc.hyper_connection",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "mhc_sinkhorn": (
+        "vllm_neuron.functional.mhc.sinkhorn",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "vision_patch_embed": (
+        "vllm_neuron.functional.vision.patch_embed",
+        "dispatch_counters", "reset_dispatch_counters"),
 }
 #: Derived rather than written a second time: a seam listed in one and missing
 #: from the other would make the route predicate iterate a name nothing resolves.
@@ -279,14 +338,14 @@ def _seam_modules() -> dict:
     simply was not enough to make the bound object a module.
     """
     return {name: importlib.import_module(path)
-            for name, (path, _reader) in _SEAM_REGISTRY.items()}
+            for name, (path, _reader, _reset) in _SEAM_REGISTRY.items()}
 
 
 def _seam_counter_api(name: str) -> tuple:
-    """``(read, reset)`` for one registered family. The reset name is DERIVED."""
-    path, reader = _SEAM_REGISTRY[name]
+    """``(read, reset)`` for one registered family. BOTH names come from the row."""
+    path, reader, reset = _SEAM_REGISTRY[name]
     module = importlib.import_module(path)
-    return getattr(module, reader), getattr(module, f"reset_{reader}")
+    return getattr(module, reader), getattr(module, reset)
 
 
 def _read_seam_counters() -> dict:
@@ -312,15 +371,20 @@ def _assert_every_counter_family_is_registered() -> None:
 
     ``dir()`` shows imported names too, so a module that imported another's
     accessor would read as owning a family it does not define. Measured, not
-    assumed: across all twelve registered modules no name ending in the suffix is
-    imported or assigned, only defined (``probe-054a-counter-names-r1``).
+    assumed: across all twenty-one modules that define a family, no name ending in
+    the suffix is imported or assigned, only defined
+    (``probe-054a-counter-names-r1``, ``probe-054a-counter-population-r1``).
+
+    THIS CONTROL CANNOT SEE A MODULE NO ROW NAMES, which is what let ten families
+    sit unregistered until repair R; :func:`_assert_no_unregistered_counter_family`
+    is the other half and reads the package rather than the registry.
 
     Raises:
         VacuousControlError: naming which module and which family is unclaimed.
     """
     claimed: dict[str, set] = {}
     for name in _SEAMS:
-        path, reader = _SEAM_REGISTRY[name]
+        path, reader, _reset = _SEAM_REGISTRY[name]
         claimed.setdefault(path, set()).add(reader)
     for path, readers in claimed.items():
         module = importlib.import_module(path)
@@ -340,6 +404,55 @@ def _assert_every_counter_family_is_registered() -> None:
             )
 
 
+def _assert_no_unregistered_counter_family() -> None:
+    """No counter family anywhere in ``vllm_neuron.functional`` is unregistered.
+
+    The registered predicate's second conjunct is a statement about EVERY seam this
+    campaign owns, so a family in a module no row names shrinks that statement
+    without saying so. This reads the package's own source tree -- one text scan of
+    every ``.py`` under ``functional/``, no per-module import -- and requires the
+    ``(module, reader)`` pairs it finds to be exactly the pairs the registry claims.
+
+    WHY SOURCE AND NOT IMPORTS. Importing every module under ``functional/`` to call
+    ``dir()`` on it would pull in every kernel in the package on the way to counting
+    accessors, on every item. A regex over ``def`` lines needs no import and cannot
+    be defeated by an import-time failure in a module this campaign never calls.
+
+    WHY IT FIRES ON A NEW SEAM RATHER THAN IGNORING IT. A campaign-owned seam that
+    nothing reads is the failure mode this control exists for; a seam this campaign
+    does NOT own would be an exclusion with a reason, and there is none today --
+    every one of the twenty-one modules is named in this campaign's plan.
+
+    Raises:
+        VacuousControlError: naming the module and the family that no row claims.
+    """
+    import re
+
+    package = importlib.import_module("vllm_neuron.functional")
+    root = Path(package.__file__).resolve().parent
+    pattern = re.compile(r"^def (\w*%s)\(" % _COUNTER_SUFFIX, re.M)
+    found: set[tuple[str, str]] = set()
+    for file in sorted(root.rglob("*.py")):
+        dotted = "vllm_neuron.functional." + ".".join(
+            file.relative_to(root).with_suffix("").parts
+        )
+        for reader in pattern.findall(file.read_text(errors="replace")):
+            if reader.startswith("reset_"):
+                continue
+            found.add((dotted, reader))
+    claimed = {(path, reader) for path, reader, _reset in _SEAM_REGISTRY.values()}
+    print(f"TINYFWD|counter_population|found={len(found)}|claimed={len(claimed)}")
+    if found != claimed:
+        unclaimed = sorted(found - claimed)
+        phantom = sorted(claimed - found)
+        raise VacuousControlError(
+            f"the package defines {len(found)} counter families and this file's "
+            f"registry claims {len(claimed)}. Families no row claims: {unclaimed}. "
+            f"Rows the package does not define: {phantom}. An unclaimed family is "
+            f"a seam this campaign owns whose torch fallbacks no predicate totals"
+        )
+
+
 def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict) -> None:
     """The registered predicate, over one item's own forward call.
 
@@ -356,8 +469,10 @@ def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict
     2. the torch-fallback total across every seam reads exactly 0.
     3. the set of seams that fired is non-empty, and equals ``expected``.
 
-    THE POPULATION IS CHECKED FIRST, because conjuncts 2 and 3 are statements
-    about a set and an unclaimed counter family would quietly shrink it.
+    THE POPULATION IS CHECKED FIRST, BOTH WAYS, because conjuncts 2 and 3 are
+    statements about a set and an unclaimed counter family would quietly shrink it:
+    the registry must claim every family in each module it names, and the package
+    must define no family the registry does not name.
 
     Raises:
         VacuousControlError: on any conjunct, named so the transcript says which.
@@ -365,6 +480,7 @@ def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict
     from vllm_neuron.utils.neuron_utils import can_run_kernel
 
     _assert_every_counter_family_is_registered()
+    _assert_no_unregistered_counter_family()
     gate = bool(can_run_kernel(torch.zeros(1)))
     fired = {}
     fallbacks = 0
@@ -1777,12 +1893,22 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         quant_config=quant_config,
     )
     after = _read_seam_counters()
-    # ONE MoE dispatch for the bank and THREE dense ones for the shared expert.
-    # Both seams by name, so a block that ran the shared half through the expert
-    # kernel, or the bank through three dense calls, fails instead of passing on a
-    # total.
+    # ONE MoE dispatch for the bank, THREE dense ones for the shared expert, and ONE
+    # for the router. Every seam by name, so a block that ran the shared half through
+    # the expert kernel, or the bank through three dense calls, fails instead of
+    # passing on a total.
+    #
+    # THE ROUTER'S DISPATCH IS COUNTED SINCE REPAIR R, and the line this replaces
+    # said the router seam defines no counters. It defines
+    # ``noaux_tc_dispatch_counters`` (``router.py:1017``) and increments it once per
+    # call (``:1664``), and ``route_tokens`` is what this forward enters
+    # (``model_fp8.py:1489-1494``) -- so the fallback aggregate over this forward used
+    # to omit the one seam whose fallback the item's own control D discusses.
     _assert_route_predicate(
-        "4 MoE block", {"blockwise_fp8_moe": 1, "blockwise_fp8_mm": 3}, before, after
+        "4 MoE block",
+        {"blockwise_fp8_moe": 1, "blockwise_fp8_mm": 3, "noaux_tc_router": 1},
+        before,
+        after,
     )
 
     if tuple(got.shape) != (TOKENS, ROUTED_HIDDEN_SIZE):
@@ -1862,7 +1988,10 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     )
     after = _read_seam_counters()
     _assert_route_predicate(
-        "4 MoE block, no shared expert", {"blockwise_fp8_moe": 1}, before, after
+        "4 MoE block, no shared expert",
+        {"blockwise_fp8_moe": 1, "noaux_tc_router": 1},
+        before,
+        after,
     )
     print("TINYFWD|moe_control|branch=no shared expert|dense_dispatches=0")
     torch.testing.assert_close(
