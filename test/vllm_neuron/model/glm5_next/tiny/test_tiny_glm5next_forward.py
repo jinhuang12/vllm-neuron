@@ -837,6 +837,110 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
         got.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
     )
 
+    # ---- THE LOADER-FRAME CONJUNCT. Repair round 1, and the reading the seven
+    # items could not make before it.
+    #
+    # WHAT WENT WRONG, so the next reader knows what this is guarding. Everything
+    # above binds weights in the frame the KERNEL multiplies in, with grids already
+    # at the public 256 granularity -- and that is not what a checkpoint load
+    # delivers. The loader delivers the checkpoint's own layout, gate and up
+    # ``[I, H]`` and down ``[H, I]`` (the shard table shards gate and up on dim 0,
+    # "the intermediate width", ``model_fp8.py:503-513``), at the checkpoint's 128
+    # granularity. So the fixture above was the loader's job done by hand, in the
+    # opposite frame, and it passed 7 of 7 while a real load into this class refused
+    # at the first of GLM-5.3-Flash's three dense layers. The review that found it
+    # is ``bless-054a-code-ebcff0ce-findings.md`` finding 1.
+    #
+    # WHAT THIS CONJUNCT DOES. It binds the SAME numbers in the loader's frame at
+    # the loader's granularity, runs the load-path prep that the real
+    # ``load_weights`` runs (``_run_load_time_preps`` reaches this very method by
+    # ``hasattr``), and then runs the forward and compares it to the SAME reference
+    # the item computed above. Nothing is transposed by hand on the way in: if the
+    # prep does not publish the compute frame, the forward refuses or the numbers
+    # move, and either way this conjunct fails.
+    #
+    # WHY THE 128 GRID IS BUILT BY REPEATING THE PUBLIC ONE. Each 256 block then
+    # carries ONE scale across its four 128 tiles, so the coarsening is lossless and
+    # the published weight is item 1's weight again -- which is what lets this
+    # conjunct compare against the reference already computed, at the tolerance
+    # already registered, instead of needing a second reference that would have to
+    # model the requantisation. The losslessness is REPORTED below rather than
+    # assumed, and the comparison that decides the item is the forward's output.
+    tiles_per_block = BLOCK_QUANT_SIZE // TILE_SIZE
+    loaded = model_fp8.Glm5NextDenseMLP(text_config)
+    for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+        compute_weight, public_grid = operands[leaf]
+        checkpoint_grid = public_grid.repeat_interleave(
+            tiles_per_block, dim=0
+        ).repeat_interleave(tiles_per_block, dim=1)
+        # ``.t()`` INTO the loader frame, which is the only hand transpose in this
+        # conjunct and is on the INPUT side: it manufactures what the loader would
+        # have delivered. The output side is never transposed by this test.
+        _attach(
+            loaded,
+            leaf,
+            compute_weight.t().contiguous(),
+            checkpoint_grid.t().contiguous(),
+        )
+
+    # ---- CONTROL: the loader's frame ALONE is refused, by name. This is the
+    # defect's own signature, so if a later edit made the forward tolerant of
+    # either frame -- by transposing on the fly, say -- this control fails and the
+    # conjunct below stops proving that the PREP is what fixed it.
+    with pytest.raises(
+        model_fp8.Glm5NextDenseMLPRouteError, match=r"gate_proj_weight must be \[H="
+    ):
+        loaded.forward(operands["hidden"], quant_config=_quant_config())
+
+    # ---- THE PREP, and what it published.
+    retiled = loaded.retile_checkpoint_scale_grids()
+    if retiled != 3:
+        raise VacuousControlError(
+            f"the load-path prep retiled {retiled} projections, not 3; at "
+            f"[{HIDDEN_SIZE},{INTERMEDIATE_SIZE}] every extent is a whole "
+            f"{BLOCK_QUANT_SIZE} block, so a skip means it could not read them"
+        )
+    health = getattr(loaded, loaded.DENSE_RETILE_HEALTH_ATTR)
+    for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+        compute_weight, public_grid = operands[leaf]
+        record = health[leaf]
+        published = getattr(loaded, leaf)
+        published_grid = getattr(loaded, _scale_grid_attribute(leaf))
+        bytes_identical = bool(torch.equal(published.data, compute_weight))
+        print(
+            f"TINYFWD|dense_loader_frame|{leaf}"
+            f"|loader={tuple(record['loader_frame'])}"
+            f"|compute={tuple(record['compute_frame'])}"
+            f"|grid={tuple(record['compute_grid'])}"
+            f"|inexact_rescales={record.get('inexact_rescales')}"
+            f"|weight_bytes_identical={bytes_identical}"
+        )
+        if tuple(published.shape) != tuple(compute_weight.shape):
+            raise ReferenceShapeError(
+                f"after the prep {leaf} is {tuple(published.shape)}; the frame the "
+                f"seam multiplies in is {tuple(compute_weight.shape)}"
+            )
+        if tuple(published_grid.shape) != tuple(public_grid.shape):
+            raise ReferenceShapeError(
+                f"after the prep {leaf}'s grid is {tuple(published_grid.shape)}; "
+                f"the public grid for this weight is {tuple(public_grid.shape)}"
+            )
+
+    # ---- THE FORWARD, from a loader-frame bind, against the SAME reference.
+    _reset_seam_counters()
+    before_loaded = _read_seam_counters()
+    got_loaded = loaded.forward(operands["hidden"], quant_config=_quant_config())
+    after_loaded = _read_seam_counters()
+    _assert_route_predicate(
+        "1 dense MLP from the loader frame",
+        {"blockwise_fp8_mm": 3},
+        before_loaded,
+        after_loaded,
+    )
+    torch.testing.assert_close(
+        got_loaded.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
+    )
+
 
 # --------------------------------------------------------------------------- #
 # ITEM 2's OWN GEOMETRY. It does not reuse item 1's, and the reason is measured. #
@@ -1548,6 +1652,93 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
         )
     torch.testing.assert_close(
         got.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
+    )
+
+    # ---- THE LOADER-FRAME CONJUNCT, and on this route it carries the reason the
+    # repair had to be a load-time prep at all. Item 1 records what the defect was
+    # and why the fixture above could not see it; this is the same conjunct on the
+    # route where the frame is LOCKED.
+    #
+    # WHY THIS ROUTE COULD NOT TRANSPOSE AT COMPUTE TIME, which is what the
+    # package's own recorded rule says a consumer should do
+    # (``weight_loaders_fp8.py:1764``). ``prepare_scale_operands`` builds the kernel
+    # scale operand ONCE from the STORED weight's extents and keeps it on the
+    # module. A forward that transposed the weight would multiply it against an
+    # operand built in the other frame: the shapes agree and the numbers are wrong,
+    # which is the one failure class nothing in this tree would catch. So the
+    # transpose has to happen BEFORE this prep reads the module, and the chain below
+    # is run in the order ``_run_load_time_preps`` runs it -- retile and republish,
+    # THEN prepare, then forward.
+    tiles_per_block = BLOCK_QUANT_SIZE // TILE_SIZE
+    loaded = model_fp8.Glm5NextSharedExperts(text_config)
+    for leaf in leaves:
+        compute_weight, public_grid = operands[leaf]
+        checkpoint_grid = public_grid.repeat_interleave(
+            tiles_per_block, dim=0
+        ).repeat_interleave(tiles_per_block, dim=1)
+        _attach(
+            loaded,
+            leaf,
+            compute_weight.t().contiguous(),
+            checkpoint_grid.t().contiguous(),
+        )
+
+    republished = loaded.retile_checkpoint_scale_grids()
+    if republished != 3:
+        raise VacuousControlError(
+            f"the load-path prep retiled {republished} projections, not 3; every "
+            f"extent here is a whole {BLOCK_QUANT_SIZE} block"
+        )
+    health = getattr(loaded, loaded.SHARED_RETILE_HEALTH_ATTR)
+    for leaf in leaves:
+        compute_weight, public_grid = operands[leaf]
+        record = health[leaf]
+        print(
+            f"TINYFWD|shared_loader_frame|{leaf}"
+            f"|loader={tuple(record['loader_frame'])}"
+            f"|compute={tuple(record['compute_frame'])}"
+            f"|grid={tuple(record['compute_grid'])}"
+            f"|inexact_rescales={record.get('inexact_rescales')}"
+        )
+        if tuple(getattr(loaded, leaf).shape) != tuple(compute_weight.shape):
+            raise ReferenceShapeError(
+                f"after the prep {leaf} is {tuple(getattr(loaded, leaf).shape)}, "
+                f"not the seam's frame {tuple(compute_weight.shape)}"
+            )
+        if tuple(getattr(loaded, _scale_grid_attribute(leaf)).shape) != tuple(
+            public_grid.shape
+        ):
+            raise ReferenceShapeError(
+                f"after the prep {leaf}'s grid is not the public grid "
+                f"{tuple(public_grid.shape)}"
+            )
+
+    # ---- CONTROL B: the prep operands are built from what the republish left, not
+    # from what the loader left. Building them from the loader frame is the silent
+    # failure this whole repair exists to close, so the operand's own extents are
+    # read back against the compute frame.
+    built_after = loaded.prepare_scale_operands(
+        *(getattr(loaded, leaf) for leaf in leaves),
+        *(getattr(loaded, _scale_grid_attribute(leaf)) for leaf in leaves),
+    )
+    if built_after != 3:
+        raise VacuousControlError(
+            f"the scale prep reported {built_after} operands after the republish, "
+            f"not 3"
+        )
+
+    _reset_seam_counters()
+    before_loaded = _read_seam_counters()
+    got_loaded = loaded.forward(operands["hidden"], quant_config=_quant_config())
+    after_loaded = _read_seam_counters()
+    _assert_route_predicate(
+        "3 shared experts from the loader frame",
+        {"blockwise_fp8_mm": 3},
+        before_loaded,
+        after_loaded,
+    )
+    torch.testing.assert_close(
+        got_loaded.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
     )
 
     # ---- CONTROL B: THE GRID LOOKUP IS THE FORWARD'S OWN, and a missing grid is
