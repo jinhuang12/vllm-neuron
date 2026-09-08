@@ -19,7 +19,16 @@ does not move with the cite.
     the bridge as a per-item record, with regimes B and C as the firing controls. Tier T exactness
     throughout: integer and index equality, no numeric pair authored.
 
-The conjuncts are measured as C01 (3/3 images), C02 (2/2 videos), C03 (0 unreported resamples), C04 (the
+WHY THE QUOTE ABOVE STILL SAYS 2/2 AND THIS FILE MEASURES 5/5. The block above is ruling
+``design-20260905-aq`` (iv) in its own words at plan revision 245, and it is left exactly as the ruling wrote
+it -- editing a quotation to match a later count would make the file report that the ruling said something it
+did not. Increment-plan revision 262 raised this table's registered count to 5/5 as part of
+``inc-glm53f-061``: three rows were added to ``REGISTERED_VIDEO_CASES`` (F=1 and F=2 at 112x112, and F=1 at
+60x40 below the floor), so C02 now runs five cases over four distinct frame counts instead of two cases over
+two. The ruling's other numbers did not move. Everything below this line is this file's own prose and counts
+the cases as they now stand.
+
+The conjuncts are measured as C01 (3/3 images), C02 (5/5 videos), C03 (0 unreported resamples), C04 (the
 registration, asserted positively) and C05 (the field config). C00 guards the import origin and C06 reports
 every reading so no number here is silent.
 
@@ -80,9 +89,21 @@ REGISTERED_IMAGE_CASES = (
 )
 
 # (num_frames, height, width, grid_thw, patch rows, merged tokens)
+#
+# B07-B09 were added by ``inc-glm53f-061`` at increment-plan revision 262, which raised this table's
+# registered count from 2/2 to 5/5. B04 and B05 are unchanged. The reason for the widening: with only two
+# three-frames-or-more rows at one size, the video path was oracle-pinned at no clamp bound and at neither
+# F=1 nor F=2 -- and F=1 is the exact frame count ``-061``'s cross-modality reading depends on. Every value
+# in the three new rows was computed from upstream's own ``smart_resize`` text and printed in
+# ``derive-061-registered-values-r1.out`` part 4, whose bytes are
+# ``cc3b82bdcc9bc53198a17b2292e2b6a8cf92df53e8cca43ccf24af90da59afa6``; B04 and B05 are reproduced by that
+# same derivation as its own check, so the three new rows and the two landed ones come from one rule.
 REGISTERED_VIDEO_CASES = (
     ("B04_three_frames", 3, 112, 112, (2, 8, 8), 128, 32),
     ("B05_eight_frames", 8, 112, 112, (4, 8, 8), 256, 64),
+    ("B07_one_frame", 1, 112, 112, (1, 8, 8), 64, 16),
+    ("B08_two_frames", 2, 112, 112, (1, 8, 8), 64, 16),
+    ("B09_one_frame_below_floor", 1, 60, 40, (1, 14, 10), 140, 35),
 )
 
 #: Extra coverage, not a registered criterion: the one image size here that is NOT a multiple of the canvas
@@ -259,7 +280,7 @@ def test_c01_regime_c_honours_the_ceiling_it_was_cut_to(image_consts):
 
 
 # ---------------------------------------------------------------------------
-# C02 -- 2/2 video frame counts, do_sample_frames pinned False.
+# C02 -- 5/5 video cases (plan rev 262; was 2/2), do_sample_frames pinned False.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "name,num_frames,height,width,grid,rows,tokens", REGISTERED_VIDEO_CASES,
