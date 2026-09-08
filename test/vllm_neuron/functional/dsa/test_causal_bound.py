@@ -41,10 +41,17 @@ THE ZEROS AND THE COMPARISONS OWN FIRING CONTROLS.
 
 WHY THE ORACLES ARE REAL ORACLES. The kernel never divides -- it compares
 ``(p + 1) * pool_size > causal_len`` -- and the bound oracle uses upstream's own
-``masked_fill`` over ``p >= causal_len // pool_size``. The kernel detects ``-inf`` by negating and
-comparing against the largest finite float32; the sentinel oracle uses ``torch.isinf``. Two
-different mechanisms arriving at the same bits is an agreement; one mechanism written twice would
-only prove the module agrees with itself.
+``masked_fill`` over ``p >= causal_len // pool_size``. The marker kernel starts from an all-``-1``
+tile and copies an index IN where a KEEP mask holds; its oracle builds the MARK mask directly out of
+``le``, ``isnan`` and ``ge``. Two different mechanisms arriving at the same bits is an agreement; one
+mechanism written twice would only prove the module agrees with itself.
+
+WHAT CHANGED IN ``103r5``, so a reader of this file is not surprised by the constants. The bound used
+to write ``-inf`` and the marker used to key on it exactly. It now writes the FINITE
+:data:`BOUND_FILL` and the marker fires on two arms -- a value at or below ``BOUND_FILL_MARK``, OR an
+index at or past the real ``width``, which is how a pad column the selector invented is caught. The
+reason is recorded with its bytes in
+``increments/contradiction-103-selector-pad-6874a0f5.md``.
 """
 
 import os
@@ -59,7 +66,8 @@ from vllm_neuron.functional.attention.mla_sparse import (
 )
 from vllm_neuron.functional.dsa import causal_bound as mod
 from vllm_neuron.functional.dsa.causal_bound import (
-    NEG_INF,
+    BOUND_FILL,
+    BOUND_FILL_MARK,
     SENTINEL,
     DsaCausalBoundError,
     can_run_dsa_causal_bound,
@@ -128,13 +136,23 @@ MULTIFOLD_SELECT_K = 16
 """The ``k`` that puts the landed selector on its STRIKING branch -- repair ``103r4``.
 
 Review finding F1 (``reviews/glm-5.3-flash-port/bless-103-code-c81113a2-findings.md``) is about a
-branch no reading at ``SELECT_K`` can reach. The vendored selector runs ``div_ceil(k, 8)`` folds
-(``rotational_topk_utils.py:1022``). At ``k = 2`` there is ONE fold and ``2 % 8 != 0``, so it takes
-the ``max8`` plus ``nc_find_index8`` path that never modifies the score buffer
-(``rotational_topk_utils.py:1028-1039``). At ``k = 16`` there are TWO folds and ``16 % 8 == 0``, so
-BOTH take the branch that strikes each taken value to ``-inf`` IN THE INPUT BUFFER
-(``rotational_topk_utils.py:1053-1066``). 16 is the smallest ``k`` with that property. Production is
-``index_topk // index_kpool`` = 2048 // 4 = 512 and is therefore always on this branch."""
+branch no reading at ``SELECT_K`` can reach. WHICH BRANCH THAT IS, CORRECTED IN ``103r5`` after the
+fresh read of ``6874a0f5`` (record-only finding R2 in
+``reviews/glm-5.3-flash-port/bless-103-code-6874a0f5-findings.md``): at rows 5, width 32, k 16 the
+factory's small-``k`` heuristic sets ``n_stages = min(max_n_stages, div_ceil(min(k, vocab), 8)) = 2``
+(``rotational_topk_utils.py:406-421``), so the call takes the ROTATIONAL path, not the scanning one,
+and ``topk_core`` is called once per stage with ``local_top_k_per_stage = 8``
+(``rotational_topk.py:354``). ``8 % 8 == 0``, so that single fold takes the ``else`` branch that
+STRIKES each taken value to ``-inf`` IN THE INPUT BUFFER
+(``rotational_topk_utils.py:1053-1066``), and the sorted finish strikes twice more in ``sort()``
+(``:1096-1118``). Later passes then read struck buffers, which is what this case needs. The earlier
+account here -- "two folds of ``topk_core(k=16)``" -- described the ``n_stages == 1`` scanning path
+this geometry does not take, and the claim "16 is the smallest such ``k``" was wrong on its own
+terms: ``k = 8`` gives ``n_stages = 1``, one fold, ``8 % 8 == 0`` and the same striking branch, so
+only ``k`` in 1..7 never strikes. 16 is kept because it also leaves four rows with fewer complete
+pools than ``k``. Production is ``index_topk // index_kpool`` = 2048 // 4 = 512, above the factory's
+small-``k`` threshold (``rotational_topk_utils.py:403``, ``:517``), so production runs the rotational
+path with ``n_stages >= 2`` and a per-stage ``k`` that is a multiple of 8 -- always striking."""
 
 MULTIFOLD_POOL_COLUMNS = 32
 """Candidate columns for the multi-fold case. Two clauses fix it rather than taste:
@@ -151,6 +169,18 @@ A row completing fewer pools than ``k`` is the whole point: the selector must fi
 slots from an all-``-inf`` buffer, which is where the strike substitution happens. The last row
 completes exactly ``k`` pools and must show ZERO sentinels, so a case that sentinelised
 unconditionally could not pass."""
+
+PAD_POOL_COLUMNS = 33
+"""Candidate columns for the PAD case -- an ODD width, which is what makes the fold uneven.
+
+``103r5``. The vendored loader folds the candidate axis into ``n_stages`` partitions of
+``n_folded = ceil(width / n_stages)`` columns and pads the LAST fold's tail with a finite
+``-9948.0`` (``cascaded_max_utils.py:61-66``, ``:154-158``). Pads exist exactly when
+``width != n_stages * n_folded``, which the kernel's own config reports as
+``padded_vocab_size - vocab_size`` (``rotational_topk_utils.py:433-434``). At ``n_stages = 2`` any
+odd width gives exactly one pad column, at global index ``width`` -- one past the last real pool.
+The case READS that number off the config rather than assuming it, so a factory that folds evenly
+here reddens with a dial finding instead of passing vacuously."""
 
 MLA_CASE = dict(seq=ROWS, heads=4, latent=128, topk=128, s_kv=256, rope=0)
 """The geometry item 3's chain ends in, taken from ``-098``'s own declared sentinel family.
@@ -233,11 +263,11 @@ def _assert_module_under_test_is_the_candidate() -> str:
 
 
 def test_the_bound_fills_exactly_the_incomplete_pools_and_a_doctored_oracle_fails() -> None:
-    """Conjunct 1. ``-inf`` at exactly the pools the row does not complete, nothing else touched.
+    """Conjunct 1. ``BOUND_FILL`` at exactly the pools the row does not complete, nothing else touched.
 
     FOUR READINGS IN ONE ITEM, because each alone leaves a hole. Bit equality against the oracle
     certifies the rearranged inequality against upstream's floor-division spelling. The per-row
-    ``-inf`` COUNT, computed from this file's dials, fails on an off-by-one that both spellings could
+    FILL COUNT, computed from this file's dials, fails on an off-by-one that both spellings could
     share. The KEPT-COLUMN bit identity certifies that the mask is a select and not arithmetic. The
     doctored oracle certifies the COMPARISON, so a pass means the comparison was able to fail.
 
@@ -270,8 +300,8 @@ def test_the_bound_fills_exactly_the_incomplete_pools_and_a_doctored_oracle_fail
     assert got.dtype is torch.float32, got.dtype
     assert want.dtype is torch.float32, want.dtype
 
-    # BIT EQUALITY, not `assert_close`. `torch.equal` compares `-inf` to `-inf` as equal and would
-    # see a `+0.0` where a `-0.0` belongs -- which `assert_close` at any tolerance would not.
+    # BIT EQUALITY, not `assert_close`. `torch.equal` on the raw int32 view sees a `+0.0` where a
+    # `-0.0` belongs, which `assert_close` at any tolerance would not.
     assert torch.equal(got.view(torch.int32), want.view(torch.int32)), (
         "the kernel and the oracle must agree BIT FOR BIT; the first differing entry is "
         f"{(got.view(torch.int32) != want.view(torch.int32)).nonzero()[:1].tolist()}"
@@ -279,10 +309,10 @@ def test_the_bound_fills_exactly_the_incomplete_pools_and_a_doctored_oracle_fail
     _emit("C1_BIT_EQUALITY", rows=ROWS, columns=POOL_COLUMNS, entries=got.numel(),
           differing_bits=0)
 
-    # THE PER-ROW `-inf` COUNT, computed from the dials. This is the reading a shared off-by-one
+    # THE PER-ROW FILL COUNT, computed from the dials. This is the reading a shared off-by-one
     # cannot survive: it compares the kernel against ARITHMETIC, not against another spelling.
     complete = _complete_pools()
-    per_row = (got == NEG_INF).sum(dim=1).to(torch.int64)
+    per_row = (got == BOUND_FILL).sum(dim=1).to(torch.int64)
     expected = torch.tensor(
         [POOL_COLUMNS - min(POOL_COLUMNS, c) for c in complete], dtype=torch.int64
     )
@@ -332,7 +362,7 @@ def test_the_bound_fills_exactly_the_incomplete_pools_and_a_doctored_oracle_fail
     moved = 0
     for r, c in enumerate(complete):
         if c > 0:
-            doctored[r, min(POOL_COLUMNS, c) - 1] = NEG_INF
+            doctored[r, min(POOL_COLUMNS, c) - 1] = BOUND_FILL
             moved += 1
     assert moved == 4, moved  # every row but the wholly-bounded row 0
     differing = int((doctored != got).sum())
@@ -359,24 +389,30 @@ def test_the_bound_fills_exactly_the_incomplete_pools_and_a_doctored_oracle_fail
 def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None:
     """Conjunct 2. ``-1`` where the selected value is ``-inf``, and the index untouched elsewhere.
 
-    THE READING THIS ITEM TAKES FIRST, AND WHY IT IS NOT PEDANTRY. The sentinel keys on the selected
-    VALUE, so this conjunct depends on the landed selector returning ``-inf`` VERBATIM for a bounded
-    slot. That is not obviously true: ``dsa_topk_select`` wraps the vendored ``rotational_topk``,
-    which uses ``nc_match_replace8(imm=float("-inf"))`` to strike out each value it has already
-    taken (``rotational_topk_utils.py:1065``, ``:1109``, ``:1116``) -- so ``-inf`` is the selector's
-    OWN already-taken marker and an all-``-inf`` row is fed the selector's own sentinel. The design
-    survives that on purpose: this block does not care WHICH index comes back for a bounded slot,
-    only that its value is ``-inf``. But "the returned value is exactly ``-inf``" is then a
-    LOAD-BEARING fact about someone else's kernel, so it is READ HERE, before the sentinel is read,
-    and named in the transcript. If it fails, the finding is about the selector's contract and not
-    about this module's arithmetic -- report it as such rather than widening anything.
+    THE READING THIS ITEM TAKES FIRST, AND WHY IT IS NOT PEDANTRY. The marker's value arm keys on the
+    selected VALUE, so this conjunct depends on a filled column coming back at or below
+    ``BOUND_FILL_MARK``. That is a LOAD-BEARING fact about someone else's kernel, so it is READ HERE,
+    before anything depends on it, and named in the transcript. If it fails, the finding is about the
+    selector's contract and not about this module's arithmetic -- report it as such rather than
+    widening anything.
 
-    THIS ITEM HAS TWO CASES AFTER REPAIR ``103r4``. The first is the declared small shape at
-    ``SELECT_K``. The second runs the same readings at ``MULTIFOLD_SELECT_K``, which is the smallest
-    ``k`` that puts the landed selector on the branch that strikes its own input -- the branch review
-    finding F1 is about, and the one the retired ``bounded.gather`` form got wrong. It is one item and
-    two cases rather than two items, because the conjunct is the same conjunct; the plan declares four
-    items and there are still four.
+    WHY THAT READING IS NOW ROBUST WHERE THE OLD ONE WAS NOT. Until ``103r5`` the fill was ``-inf``
+    and this item read it back EXACTLY. The selector cannot promise that: it moves selected values
+    across partitions with a 0/1 permutation matmul (``rotational_topk.py:385`` into
+    ``rotational_topk_utils.py:867-886``) where ``0 * -inf`` is NaN, and it uses ``-inf`` itself as
+    its own already-taken marker (``rotational_topk_utils.py:1065``). :data:`BOUND_FILL` is finite, so
+    it crosses that matmul as itself, and the mark THRESHOLD is a decade closer to zero than the fill,
+    so even a perturbed round trip is still caught. The record with every link at the bytes is
+    ``increments/contradiction-103-selector-pad-6874a0f5.md``.
+
+    THIS ITEM HAS THREE CASES AFTER REPAIR ``103r5``. The first is the declared small shape at
+    ``SELECT_K``. The second runs the same readings at ``MULTIFOLD_SELECT_K``, where the selector
+    strikes its own input -- the branch review finding F1 is about, and the one the retired
+    ``bounded.gather`` form got wrong. The third runs them at ``PAD_POOL_COLUMNS``, an ODD width, so
+    the selector pads its own input and hands back an index PAST the last real pool -- the defect
+    ``103r5`` repairs, and the one no value test can see. It is one item and three cases rather than
+    three items, because the conjunct is the same conjunct; the plan declares four items and there
+    are still four.
 
     Certifying component (D1.4): ``causal_bound._causal_sentinel_nki`` through the
     ``causal_bound.dsa_causal_sentinel`` seam.
@@ -401,24 +437,25 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     # formula and is computed here rather than typed.
     want_counts = [max(0, SELECT_K - c) for c in complete]
     assert want_counts == [2, 1, 0, 0, 0], want_counts  # the block's declared figure, cross-checked
-    is_neg_inf = torch.isinf(values) & (values < 0)
-    got_neg_inf = is_neg_inf.sum(dim=1).to(torch.int64)
-    assert torch.equal(got_neg_inf, torch.tensor(want_counts, dtype=torch.int64)), (
-        f"the selector did not return -inf verbatim for every bounded slot: got "
-        f"{got_neg_inf.tolist()} against the computed {want_counts}. This is a reading about "
+    is_filled = values <= BOUND_FILL_MARK
+    got_filled = is_filled.sum(dim=1).to(torch.int64)
+    assert torch.equal(got_filled, torch.tensor(want_counts, dtype=torch.int64)), (
+        f"the selector did not return a filled value for every bounded slot: got "
+        f"{got_filled.tolist()} against the computed {want_counts}. This is a reading about "
         f"dsa_topk_select's returned VALUES, not about this module's mask -- see this item's "
         f"docstring before changing anything here"
     )
-    _emit("C2_SELECTOR_RETURNS_NEG_INF_VERBATIM", per_row=got_neg_inf.tolist(),
-          computed=want_counts, total=int(is_neg_inf.sum()))
+    _emit("C2_SELECTOR_RETURNS_THE_FILL_BELOW_THE_MARK", per_row=got_filled.tolist(),
+          computed=want_counts, total=int(is_filled.sum()),
+          mark=BOUND_FILL_MARK, fill=BOUND_FILL)
 
     # THE SENTINEL. `dsa_topk_select` returns int64 indices to match `torch.topk`; the consumer
     # `dsa_index_expand` reads int32, so the cast is the dispatch site's transport and is spelled
     # the same way here. It is dtype plumbing, not a torch implementation of anything.
     idx32 = indices.to(torch.int32)
-    assert can_run_dsa_causal_sentinel(values, idx32) is True
-    got = dsa_causal_sentinel(values, idx32)
-    want = dsa_causal_sentinel_torch_oracle(values, idx32)
+    assert can_run_dsa_causal_sentinel(values, idx32, POOL_COLUMNS) is True
+    got = dsa_causal_sentinel(values, idx32, POOL_COLUMNS)
+    want = dsa_causal_sentinel_torch_oracle(values, idx32, POOL_COLUMNS)
     sent_nki, sent_fb = causal_sentinel_dispatch_counters()
 
     assert got.dtype is torch.int32, got.dtype
@@ -438,14 +475,14 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
 
     # "AND NOWHERE ELSE", as two halves. Every sentinel position is a `-inf` position, and every
     # non-sentinel index is the selector's own index unchanged.
-    assert torch.equal(got == SENTINEL, is_neg_inf), (
-        "a sentinel was written at a position whose value was finite, or withheld at one whose "
-        "value was -inf"
+    assert torch.equal(got == SENTINEL, is_filled), (
+        "a sentinel was written at a position whose value was a real score, or withheld at one "
+        "whose value was a fill"
     )
-    kept = ~is_neg_inf
+    kept = ~is_filled
     assert int(kept.sum()) > 0, "the kept set must be non-empty for this reading to exist"
     assert torch.equal(got[kept], idx32[kept]), "a kept index was rewritten"
-    _emit("C2_NOWHERE_ELSE", sentinel_positions=int(is_neg_inf.sum()),
+    _emit("C2_NOWHERE_ELSE", sentinel_positions=int(is_filled.sum()),
           kept_positions=int(kept.sum()), kept_unchanged=1)
 
     # THE WHOLLY-BOUNDED ROW. Row 0 has no complete pool, so both of its selections are sentinels --
@@ -510,7 +547,7 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     mf_values, mf_indices = dsa_topk_select(mf_bounded, MULTIFOLD_SELECT_K)
     assert tuple(mf_values.shape) == (ROWS, MULTIFOLD_SELECT_K), tuple(mf_values.shape)
     mf_idx32 = mf_indices.to(torch.int32)
-    mf_got = dsa_causal_sentinel(mf_values, mf_idx32)
+    mf_got = dsa_causal_sentinel(mf_values, mf_idx32, MULTIFOLD_POOL_COLUMNS)
 
     mf_bound_nki, mf_bound_fb = causal_bound_dispatch_counters()
     mf_sent_nki, mf_sent_fb = causal_sentinel_dispatch_counters()
@@ -526,28 +563,52 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
         HW_PARAMS,
     )
 
-    per_stage = int(HW_PARAMS.topk_per_stage)
-    mf_folds = -(-MULTIFOLD_SELECT_K // per_stage)
-    assert per_stage == 8, per_stage
-    assert mf_folds == 2 and MULTIFOLD_SELECT_K % per_stage == 0, (mf_folds, per_stage)
-    assert SELECT_K % per_stage != 0 and -(-SELECT_K // per_stage) == 1, SELECT_K
-    _emit("C2_MF_BRANCH", k=MULTIFOLD_SELECT_K, topk_per_stage=per_stage, folds=mf_folds,
-          strikes=1, k2_folds=1, k2_strikes=0)
+    from vllm_neuron.functional.dsa.topk_select import _nki_config, _nki_dtype_of
 
-    # "EVERY `-inf` SLOT AND NO OTHER", the same two halves as above, at the striking k.
-    mf_neg_inf = torch.isinf(mf_values) & (mf_values < 0)
+    per_stage = int(HW_PARAMS.topk_per_stage)
+    assert per_stage == 8, per_stage
+
+    # THE PATH IS READ OFF THE CONFIG THE SEAM ITSELF BUILDS, not inferred here. `103r5` fixes
+    # what this reading used to claim: at this geometry the call is ROTATIONAL with n_stages = 2,
+    # so `topk_core` runs once per stage at `local_top_k_per_stage`, and that per-stage k is the
+    # number whose remainder decides the branch.
+    mf_cfg = _nki_config(
+        ROWS, MULTIFOLD_POOL_COLUMNS, MULTIFOLD_SELECT_K, _nki_dtype_of(mf_bounded)
+    )
+    mf_stages = int(mf_cfg.n_stages)
+    mf_local_k = int(mf_cfg.local_top_k_per_stage)
+    mf_folds_per_stage = -(-mf_local_k // per_stage)
+    assert mf_stages >= 2, (
+        f"this case is about the rotational path; the factory chose n_stages={mf_stages}, which "
+        f"is the scanning path -- a dial finding, not a module finding"
+    )
+    assert mf_local_k % per_stage == 0, (mf_local_k, per_stage)
+    assert mf_folds_per_stage == 1, (mf_folds_per_stage, mf_local_k)
+    assert SELECT_K % per_stage != 0 and -(-SELECT_K // per_stage) == 1, SELECT_K
+    # No pads at this width, which is why the retired GATHER form below can even be evaluated.
+    assert int(mf_cfg.padded_vocab_size) == int(mf_cfg.vocab_size) == MULTIFOLD_POOL_COLUMNS, (
+        int(mf_cfg.padded_vocab_size), int(mf_cfg.vocab_size)
+    )
+    _emit("C2_MF_BRANCH", k=MULTIFOLD_SELECT_K, topk_per_stage=per_stage,
+          n_stages=mf_stages, local_top_k_per_stage=mf_local_k,
+          folds_per_stage=mf_folds_per_stage, striking=int(mf_local_k % per_stage == 0),
+          pad_columns=int(mf_cfg.padded_vocab_size) - int(mf_cfg.vocab_size),
+          k2_folds=1, k2_striking=0)
+
+    # "EVERY FILLED SLOT AND NO OTHER", the same two halves as above, at the striking k.
+    mf_filled = mf_values <= BOUND_FILL_MARK
     mf_per_row = (mf_got == SENTINEL).sum(dim=1).to(torch.int64)
     assert torch.equal(mf_per_row, torch.tensor(mf_want, dtype=torch.int64)), (
         f"per-row sentinel count {mf_per_row.tolist()} against the computed {mf_want}"
     )
-    assert torch.equal(mf_got == SENTINEL, mf_neg_inf), (
-        "a sentinel was written at a position whose value was finite, or withheld at one "
-        "whose value was -inf"
+    assert torch.equal(mf_got == SENTINEL, mf_filled), (
+        "a sentinel was written at a position whose value was a real score, or withheld at "
+        "one whose value was a fill"
     )
-    mf_kept = ~mf_neg_inf
+    mf_kept = ~mf_filled
     assert torch.equal(mf_got[mf_kept], mf_idx32[mf_kept]), "a kept index was rewritten"
     _emit("C2_MF_SENTINEL_COUNT", counts=mf_per_row.tolist(), computed=mf_want,
-          neg_inf_slots=int(mf_neg_inf.sum()), kept=int(mf_kept.sum()))
+          filled_slots=int(mf_filled.sum()), kept=int(mf_kept.sum()))
 
     # NO LEGAL POOL ID TWICE IN A ROW, and every legal id is a pool the row completes. This
     # is the reading the retired gather form fails: it returned a struck-but-legal column
@@ -566,11 +627,14 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     _emit("C2_MF_NO_DUPLICATE_LEGAL_ID", rows=ROWS, duplicate_rows=len(mf_dup_rows),
           legal_per_row=[min(c, MULTIFOLD_SELECT_K) for c in mf_complete])
 
-    # THE RETIRED FORM, COMPUTED THROUGH THE ORACLE so no second kernel dispatch is charged
-    # to the counters read above. It can only MISS sentinels, never invent them, so the
-    # inequality is the gate and the difference is the disclosure.
+    # THE RETIRED FORM IS ASSERTED RED, NOT PRINTED -- `103r5`, the fresh reader's TEST F1 and
+    # the lead's ruling at `approvals/LEAD-LOG.md` §750. The previous round asserted only
+    # `retired <= current`, which the gather form cannot violate, so it was an inequality that
+    # could not fail; the disagreement was merely printed beside it. The reading this case owes
+    # is that the retired form DISAGREES here, because that is the whole claim of the repair.
+    # Computed through the ORACLE so no second kernel dispatch is charged to the counters above.
     mf_retired = dsa_causal_sentinel_torch_oracle(
-        mf_bounded.gather(1, mf_indices.to(torch.int64)), mf_idx32
+        mf_bounded.gather(1, mf_indices.to(torch.int64)), mf_idx32, MULTIFOLD_POOL_COLUMNS
     )
     mf_retired_counts = (mf_retired == SENTINEL).sum(dim=1).to(torch.int64)
     assert bool((mf_retired_counts <= mf_per_row).all()), (
@@ -579,11 +643,160 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     )
     _emit("C2_MF_RETIRED_GATHER_FORM", retired=mf_retired_counts.tolist(),
           value_keyed=mf_per_row.tolist(),
-          the_retired_form_would_have_reddened_this_item=int(
-              bool((mf_retired_counts != mf_per_row).any())
-          ))
+          disagreeing_rows=int(bool((mf_retired_counts != mf_per_row).any())))
+    assert bool((mf_retired_counts != mf_per_row).any()), (
+        f"the retired gather form AGREED with the value-keyed form at this geometry, so this "
+        f"case does not exercise the strike substitution it exists for: retired "
+        f"{mf_retired_counts.tolist()} against {mf_per_row.tolist()}. A red here is a finding "
+        f"about this case's DIALS -- pick a geometry where a later pass re-matches a struck "
+        f"column -- and not about the module under test"
+    )
     _emit("C2_MF_ROUTE", bound=(mf_bound_nki, mf_bound_fb),
           sentinel=(mf_sent_nki, mf_sent_fb), topk_047=(mf_topk_nki, mf_topk_fb))
+
+    # ----------------------------------------------------------------------------------- #
+    # THE PAD CASE. Repair `103r5`: the selector's OWN padding, at an index past the last
+    # real pool. The record is `increments/contradiction-103-selector-pad-6874a0f5.md`.
+    # ----------------------------------------------------------------------------------- #
+    # WHY NEITHER CASE ABOVE CAN SEE THIS. Both run at an EVEN fold (width 16 and 32 with
+    # n_stages 2), so the vendored loader's fast path overwrites every column and no pad
+    # exists (`cascaded_max_utils.py:134-152`). At an ODD width the slow path runs, memsets
+    # the last fold's tail with a FINITE `-9948.0` (`:154-158`), and gives those columns
+    # positions that keep counting past the real width (`rotational_topk.py:203-207` with
+    # `rotational_topk_utils.py:826-856`). A finite pad OUTRANKS every filled column, so a
+    # row with fewer complete pools than `k` spends its free slots on pads FIRST -- and the
+    # value arm cannot see them, because their value is an ordinary finite number. The index
+    # arm is what catches them, and this case is that arm's reading.
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    reset_topk_select_dispatch_counters()
+
+    pad_gen = torch.Generator().manual_seed(20333)
+    pad_scores = torch.randn(
+        ROWS, PAD_POOL_COLUMNS, generator=pad_gen, dtype=torch.float32
+    ) * 0.05
+    pad_causal = torch.tensor(MULTIFOLD_CAUSAL_LENS, dtype=torch.int32).reshape(ROWS, 1)
+    pad_complete = [
+        min(c // POOL_SIZE, PAD_POOL_COLUMNS) for c in MULTIFOLD_CAUSAL_LENS
+    ]
+    pad_want = [max(0, MULTIFOLD_SELECT_K - c) for c in pad_complete]
+    assert pad_complete == [1, 3, 5, 9, 16], pad_complete
+    assert pad_want == [15, 13, 11, 7, 0], pad_want
+
+    pad_bounded = dsa_causal_bound(pad_scores, pad_causal, POOL_SIZE)
+    assert can_run_dsa_topk_select(pad_bounded, MULTIFOLD_SELECT_K) is True, (
+        f"the landed selector must serve rows={ROWS} width={PAD_POOL_COLUMNS} "
+        f"k={MULTIFOLD_SELECT_K}; a False sends the selection to torch.topk, which pads "
+        f"nothing, and this case would then read a path it is not about"
+    )
+
+    # THE PREMISE, READ OFF THE KERNEL'S OWN CONFIG. `padded_vocab_size - vocab_size` IS the
+    # pad-column count (`rotational_topk_utils.py:433-434`), and those columns occupy global
+    # positions `[vocab_size, padded_vocab_size)`. If the factory folds this width evenly the
+    # premise fails and the message says so -- a dial finding, not a module finding.
+    pad_cfg = _nki_config(
+        ROWS, PAD_POOL_COLUMNS, MULTIFOLD_SELECT_K, _nki_dtype_of(pad_bounded)
+    )
+    pad_columns = int(pad_cfg.padded_vocab_size) - int(pad_cfg.vocab_size)
+    assert int(pad_cfg.vocab_size) == PAD_POOL_COLUMNS, int(pad_cfg.vocab_size)
+    assert int(pad_cfg.n_stages) >= 2, int(pad_cfg.n_stages)
+    assert pad_columns >= 1, (
+        f"the factory folded width {PAD_POOL_COLUMNS} into {int(pad_cfg.n_stages)} stages of "
+        f"{int(pad_cfg.stage_free_size)} with NO pad column, so this case cannot read the pad "
+        f"arm. Pick a width whose fold is uneven -- a dial finding, not a module finding"
+    )
+    _emit("C2_PAD_PREMISE", width=PAD_POOL_COLUMNS, n_stages=int(pad_cfg.n_stages),
+          stage_free_size=int(pad_cfg.stage_free_size),
+          padded_vocab_size=int(pad_cfg.padded_vocab_size), pad_columns=pad_columns,
+          first_pad_index=PAD_POOL_COLUMNS)
+
+    pad_values, pad_indices = dsa_topk_select(pad_bounded, MULTIFOLD_SELECT_K)
+    pad_idx32 = pad_indices.to(torch.int32)
+
+    # THE DEFECT'S OWN PRECONDITION, READ RATHER THAN ASSUMED: the selector really did hand
+    # back an index at or past the real width. A zero here means the pads never won a slot,
+    # and then this case proves nothing about the index arm.
+    pad_out_of_range = pad_idx32 >= PAD_POOL_COLUMNS
+    pad_per_row_oor = pad_out_of_range.sum(dim=1).to(torch.int64)
+    assert int(pad_out_of_range.sum()) >= 1, (
+        f"the selector returned no index at or past width {PAD_POOL_COLUMNS} on these "
+        f"inputs, so the pad arm has nothing to catch here. The pads exist "
+        f"({pad_columns} column(s) per row by the config above) but did not win a slot -- "
+        f"a dial finding"
+    )
+    # A row cannot take more pads than exist, nor more than its free slots. The equality
+    # (pads win before fills, because -9948.0 > BOUND_FILL) is DISCLOSED, not gated.
+    pad_ceiling = [min(pad_columns, w) for w in pad_want]
+    assert all(
+        int(pad_per_row_oor[r]) <= pad_ceiling[r] for r in range(ROWS)
+    ), (pad_per_row_oor.tolist(), pad_ceiling)
+    assert int(pad_idx32.max()) < int(pad_cfg.padded_vocab_size), (
+        f"an index past the PADDED extent {int(pad_cfg.padded_vocab_size)} came back: "
+        f"{int(pad_idx32.max())}. That is outside anything this case can explain"
+    )
+    _emit("C2_PAD_WAS_SELECTED", per_row=pad_per_row_oor.tolist(),
+          ceiling=pad_ceiling, total=int(pad_out_of_range.sum()),
+          max_index=int(pad_idx32.max()), width=PAD_POOL_COLUMNS)
+
+    assert can_run_dsa_causal_sentinel(pad_values, pad_idx32, PAD_POOL_COLUMNS) is True
+    pad_got = dsa_causal_sentinel(pad_values, pad_idx32, PAD_POOL_COLUMNS)
+    pad_oracle = dsa_causal_sentinel_torch_oracle(
+        pad_values, pad_idx32, PAD_POOL_COLUMNS
+    )
+    assert torch.equal(pad_got, pad_oracle), (
+        f"the kernel and the oracle must agree element for element; first differing "
+        f"{(pad_got != pad_oracle).nonzero()[:1].tolist()}"
+    )
+
+    pad_bound_nki, pad_bound_fb = causal_bound_dispatch_counters()
+    pad_sent_nki, pad_sent_fb = causal_sentinel_dispatch_counters()
+    pad_topk_nki, pad_topk_fb = topk_select_dispatch_counters()
+    assert (pad_bound_nki, pad_bound_fb) == (1, 0), (pad_bound_nki, pad_bound_fb)
+    assert (pad_sent_nki, pad_sent_fb) == (1, 0), (pad_sent_nki, pad_sent_fb)
+    assert (pad_topk_nki, pad_topk_fb) == (1, 0), (pad_topk_nki, pad_topk_fb)
+
+    # EVERY SURVIVING ID IS A POOL THE ROW COMPLETES, which is the reading the one-arm form
+    # fails: an out-of-range pad id would survive it and land in `dsa_index_expand`.
+    pad_per_row = (pad_got == SENTINEL).sum(dim=1).to(torch.int64)
+    assert torch.equal(pad_per_row, torch.tensor(pad_want, dtype=torch.int64)), (
+        f"per-row sentinel count {pad_per_row.tolist()} against the computed {pad_want}"
+    )
+    for r in range(ROWS):
+        legal = [int(v) for v in pad_got[r].tolist() if v >= 0]
+        assert len(legal) == min(pad_complete[r], MULTIFOLD_SELECT_K), (r, legal)
+        assert all(0 <= v < pad_complete[r] for v in legal), (r, legal, pad_complete[r])
+        assert len(set(legal)) == len(legal), (r, legal)
+    _emit("C2_PAD_SENTINEL_COUNT", counts=pad_per_row.tolist(), computed=pad_want,
+          legal_per_row=[min(c, MULTIFOLD_SELECT_K) for c in pad_complete])
+
+    # THE ONE-ARM FORM IS ASSERTED RED. Passing a width the selector's padded extent cannot
+    # reach disables the index arm and leaves exactly the value-keyed marker this increment
+    # shipped before `103r5`. It MUST disagree here, or the index arm is not load-bearing at
+    # this geometry and the case proves nothing.
+    value_only = dsa_causal_sentinel_torch_oracle(
+        pad_values, pad_idx32, int(pad_cfg.padded_vocab_size) + 1
+    )
+    value_only_counts = (value_only == SENTINEL).sum(dim=1).to(torch.int64)
+    value_only_illegal = [
+        (r, [int(v) for v in value_only[r].tolist() if v >= pad_complete[r]])
+        for r in range(ROWS)
+        if any(int(v) >= pad_complete[r] for v in value_only[r].tolist())
+    ]
+    _emit("C2_PAD_ONE_ARM_FORM", value_only=value_only_counts.tolist(),
+          two_arm=pad_per_row.tolist(), illegal_rows=len(value_only_illegal),
+          illegal_detail=value_only_illegal)
+    assert bool((value_only_counts != pad_per_row).any()), (
+        f"the value-only marker AGREED with the two-arm marker, so the index arm caught "
+        f"nothing here: {value_only_counts.tolist()} against {pad_per_row.tolist()}. Since "
+        f"{int(pad_out_of_range.sum())} out-of-range index(es) were read above, an agreement "
+        f"means the oracle's index arm is not doing what its name says"
+    )
+    assert len(value_only_illegal) >= 1, (
+        "the value-only marker left NO illegal pool id, so this case cannot show what the "
+        "index arm prevents"
+    )
+    _emit("C2_PAD_ROUTE", bound=(pad_bound_nki, pad_bound_fb),
+          sentinel=(pad_sent_nki, pad_sent_fb), topk_047=(pad_topk_nki, pad_topk_fb))
 
 
 # =========================================================================== #
@@ -613,7 +826,7 @@ def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_refere
 
     bounded = dsa_causal_bound(scores, causal_len, POOL_SIZE)
     values, indices = dsa_topk_select(bounded, SELECT_K)
-    pool_ids = dsa_causal_sentinel(values, indices.to(torch.int32))
+    pool_ids = dsa_causal_sentinel(values, indices.to(torch.int32), POOL_COLUMNS)
 
     # `-048`'S OWN READER, on `-048`'s own argument shapes (python lists). ZERO violations.
     violations = _precondition_violations(pool_ids.tolist(), CAUSAL_LENS, POOL_SIZE)
@@ -638,7 +851,7 @@ def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_refere
         "see whether the bound did anything. Choose inputs the unbounded chain breaks"
     )
     assert any(r == 0 for r, _ in control), control
-    assert bool((raw_values > NEG_INF).all()), "the control must run on unbounded scores"
+    assert bool((raw_values > BOUND_FILL_MARK).all()), "the control must run on unbounded scores"
 
     # THE EMITTED WIDTH COMES FROM `-048`'s OWN FUNCTION, never typed. This is what pins MLA_CASE.
     width = index_expand_width(SELECT_K, POOL_SIZE)
@@ -684,8 +897,8 @@ def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_refere
     _emit("C3_ATTENTION_MAXABS_VS_IMPORTED_REFERENCE", err=f"{err:.3e}", rtol=RTOL, atol=ATOL,
           pair_source="test_mla_sparse.py (inc-glm53f-098), imported not authored")
     assert bool(torch.isfinite(out).all()), (
-        "the chain produced a non-finite value -- what a -inf column reaching the softmax as a NaN "
-        "looks like"
+        "the chain produced a non-finite value -- what a filled column reaching the softmax "
+        "unmasked looks like"
     )
     torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
 
@@ -759,10 +972,31 @@ def test_three_malformed_bound_calls_are_refused_by_name_and_the_fallback_can_fi
         dsa_causal_sentinel(
             torch.zeros(ROWS, SELECT_K, dtype=torch.float32),
             torch.zeros(ROWS, SELECT_K, dtype=torch.int64),
+            POOL_COLUMNS,
         )
     idx_message = str(caught_idx.value)
     assert "int32" in idx_message and "torch.int64" in idx_message, idx_message
     _emit("C4_REFUSAL_SENTINEL_DTYPE", dtype="torch.int64", message=idx_message.split(";")[0])
+
+    # AND THE ``width`` REFUSALS, new in ``103r5``. ``width`` is the pad arm's whole basis, so a
+    # caller that cannot say it must not be served: a tensor would be baked into the graph as
+    # something nobody meant, and a zero or negative width would mark every slot. Both RAISE, for
+    # the same reason the other three do, and both are read here so the validation is not decoration.
+    good_values = torch.zeros(ROWS, SELECT_K, dtype=torch.float32)
+    good_idx = torch.zeros(ROWS, SELECT_K, dtype=torch.int32)
+    with pytest.raises(DsaCausalBoundError) as caught_wtype:
+        dsa_causal_sentinel(good_values, good_idx, torch.tensor(POOL_COLUMNS))
+    wtype_message = str(caught_wtype.value)
+    assert "width must be a python int" in wtype_message, wtype_message
+    assert "Tensor" in wtype_message, wtype_message
+    _emit("C4_REFUSAL_WIDTH_TYPE", passed="torch.tensor", message=wtype_message.split(";")[0])
+
+    with pytest.raises(DsaCausalBoundError) as caught_wzero:
+        dsa_causal_sentinel(good_values, good_idx, 0)
+    wzero_message = str(caught_wzero.value)
+    assert "width=0" in wzero_message, wzero_message
+    assert "positive number of real pool columns" in wzero_message, wzero_message
+    _emit("C4_REFUSAL_WIDTH_ZERO", passed=0, message=wzero_message.split(";")[0])
 
     refused = (causal_bound_dispatch_counters(), causal_sentinel_dispatch_counters())
     assert refused == ((0, 0), (0, 0)), (
@@ -775,15 +1009,15 @@ def test_three_malformed_bound_calls_are_refused_by_name_and_the_fallback_can_fi
     reset_causal_bound_dispatch_counters()
     reset_causal_sentinel_dispatch_counters()
     values = torch.zeros(ROWS, SELECT_K, dtype=torch.float32)
-    values[0, 0] = NEG_INF
+    values[0, 0] = BOUND_FILL
     idx32 = torch.zeros(ROWS, SELECT_K, dtype=torch.int32)
     saved = mod.can_run_kernel
     try:
         mod.can_run_kernel = lambda: False
         assert can_run_dsa_causal_bound(scores, causal_len, POOL_SIZE) is False
-        assert can_run_dsa_causal_sentinel(values, idx32) is False
+        assert can_run_dsa_causal_sentinel(values, idx32, POOL_COLUMNS) is False
         served_bound = dsa_causal_bound(scores, causal_len, POOL_SIZE)
-        served_sentinel = dsa_causal_sentinel(values, idx32)
+        served_sentinel = dsa_causal_sentinel(values, idx32, POOL_COLUMNS)
     finally:
         mod.can_run_kernel = saved
     control = (causal_bound_dispatch_counters(), causal_sentinel_dispatch_counters())
@@ -794,7 +1028,9 @@ def test_three_malformed_bound_calls_are_refused_by_name_and_the_fallback_can_fi
         served_bound.view(torch.int32),
         dsa_causal_bound_torch_oracle(scores, causal_len, POOL_SIZE).view(torch.int32),
     )
-    assert torch.equal(served_sentinel, dsa_causal_sentinel_torch_oracle(values, idx32))
+    assert torch.equal(
+        served_sentinel, dsa_causal_sentinel_torch_oracle(values, idx32, POOL_COLUMNS)
+    )
     assert int((served_sentinel == SENTINEL).sum()) == 1, served_sentinel.tolist()
     _emit("C4_FALLBACK_CONTROL", bound=control[0], sentinel=control[1],
           oracle_sentinels=int((served_sentinel == SENTINEL).sum()))
@@ -802,5 +1038,5 @@ def test_three_malformed_bound_calls_are_refused_by_name_and_the_fallback_can_fi
     # and both gates are live again afterwards, so the control did not leak into the process
     assert mod.can_run_kernel is can_run_kernel
     assert can_run_dsa_causal_bound(scores, causal_len, POOL_SIZE) is True
-    assert can_run_dsa_causal_sentinel(values, idx32) is True
+    assert can_run_dsa_causal_sentinel(values, idx32, POOL_COLUMNS) is True
     _emit("C4_GATES_RESTORED", bound=1, sentinel=1)

@@ -2,9 +2,16 @@
 """The DSA indexer's selecting-regime causal bound -- ``inc-glm53f-103``.
 
 WHAT THIS MODULE IS FOR, in one sentence: a query row must not select a key pool that finishes
-after the row's own position, so the scores of every such pool are pushed to ``-inf`` before the
-selector runs, and any selection that comes back holding ``-inf`` is replaced by the ``-1``
-sentinel.
+after the row's own position, so the scores of every such pool are pushed to a fill value below
+every legal score before the selector runs, and any selection that comes back holding that fill --
+or holding an index the selector's own padding invented -- is replaced by the ``-1`` sentinel.
+
+THE FILL IS FINITE, AND THAT IS THE ``103r5`` REPAIR. The first three rounds of this module wrote
+``-inf`` and read it back verbatim. The selector will not carry that promise: it pads its own input
+with a finite constant at indices past the real width, and it moves selected values across
+partitions with a permutation matmul where ``0 * -inf`` is NaN. Both faces are recorded with their
+bytes in ``increments/contradiction-103-selector-pad-6874a0f5.md``; the repair the lead ruled
+(``approvals/LEAD-LOG.md`` §752) is :data:`BOUND_FILL` plus the marker's second arm on the index.
 
 WHY THE GAP EXISTED. The landed chain ``dsa_score_gemm`` -> ``dsa_topk_select`` ->
 ``dsa_index_expand`` carries no per-row bound anywhere. ``inc-glm53f-046`` said so in the code it
@@ -22,7 +29,7 @@ THE RULE, AND IT IS UPSTREAM'S. Pool ``p`` holds tokens ``p * pool_size .. (p + 
 so it is complete for a row of length ``causal_len`` exactly when ``(p + 1) * pool_size <=
 causal_len``, which is ``p < causal_len // pool_size``::
 
-    scores[i, p] = -inf   where (p + 1) * pool_size >  causal_len[i]
+    scores[i, p] = BOUND_FILL   where (p + 1) * pool_size >  causal_len[i]
     scores[i, p] = scores[i, p]  (untouched, bit for bit)  otherwise
 
 Upstream counts the same complete pools, in position units rather than length units:
@@ -36,17 +43,22 @@ the landed bypass passes ``seq_lens - 1`` as the position column
 formula. THE READ-FIRST COMPARISON THIS BLOCK OWES IS RECORDED, NOT ASSERTED:
 ``increments/readfirst-103-upstream-r2.out``, ``READFIRST_103_R2=AGREE`` 10/10.
 
-``-inf`` IS UPSTREAM'S VALUE AT THIS STAGE, AND THE STAGE MATTERS. Upstream bounds the indexer
-LOGITS with a literal ``float("-inf")`` -- ``logits = logits.masked_fill(~mask, float("-inf"))``
-(``vllm/v1/attention/ops/rocm_aiter_mla_sparse.py:734``), and bounds the sparse attention score the
-same way (``backends/mla/rocm_aiter_mla_sparse.py:720``). The ``-FLT_MAX`` a reader may find at
-``csrc/libtorch_stable/sampler.cu:407`` is the top-k selector's OUTPUT tail padding, downstream of
-selection, and is not this stage; round 1 of this block's read-first gate compared against it by
-mistake and the correction is kept beside it rather than deleted
-(``readfirst-103-upstream.out``, ``EXIT=2``, superseded).
+UPSTREAM'S VALUE AT THIS STAGE IS ``-inf``, AND THIS MODULE DELIBERATELY DIFFERS. Upstream bounds the
+indexer LOGITS with a literal ``float("-inf")`` -- ``logits = logits.masked_fill(~mask,
+float("-inf"))`` (``vllm/v1/attention/ops/rocm_aiter_mla_sparse.py:734``), and bounds the sparse
+attention score the same way (``backends/mla/rocm_aiter_mla_sparse.py:720``). Upstream can afford the
+exact value because its selector is ``torch.topk``, which neither pads nor rotates. This fork's
+selector does both, so this module writes :data:`BOUND_FILL` instead and the difference is a
+DEVIATION WITH A REASON rather than a port mismatch: the equivalence upstream needs is "a pool the
+row may not see is never selected", which a fill below every legal score gives exactly. The
+``-FLT_MAX`` a reader may find at ``csrc/libtorch_stable/sampler.cu:407`` is the top-k selector's
+OUTPUT tail padding, downstream of selection, and is not this stage; round 1 of this block's
+read-first gate compared against it by mistake and the correction is kept beside it rather than
+deleted (``readfirst-103-upstream.out``, ``EXIT=2``, superseded). That value is finite; what reason
+upstream had for it is not read here and is not claimed.
 
 A WHOLLY-BOUNDED ROW IS LEGAL AND ITS MEANING IS ALREADY FIXED. A row with ``causal_len <
-pool_size`` has zero complete pools, so every column is ``-inf``. The consumer settles what that
+pool_size`` has zero complete pools, so every column is filled. The consumer settles what that
 means: ``mla_sparse_attention``'s oracle records "A wholly-sentinel row is all -inf, and softmax of
 that is NaN rather than zero -- so the zeros the kernels produce for it are written here too"
 (``mla_sparse.py:1494-1496``). Nothing here masks, clamps or compacts; this module only writes.
@@ -56,8 +68,9 @@ device kernels that consume them, which is ``inc-glm53f-048``'s precedent exactl
 the host would be a fallback for kernel-class work AND one host round trip per step, on the
 per-forward path.
 
-CONSTRUCTS, AND THE SCREENING FOR EACH. Every construct below has a landed fork call site except
-one, which is named as such.
+CONSTRUCTS, AND THE SCREENING FOR EACH. Since the ``103r5`` repair made the fill finite, EVERY
+construct below has a landed fork call site -- the one exception this list used to carry is retired,
+and its old text is kept as the last bullet because the reason it is gone is worth reading.
 
   * NOTHING IS DIVIDED. ``nl.divide`` is silently wrong on int32 and ``nl.right_shift`` refuses as
     the second op of a chain (``index_expand.py:108-114``), so the bound is rearranged into a
@@ -81,16 +94,18 @@ one, which is named as such.
     ``dst`` ALONE elsewhere -- which is how the untouched columns stay bit-identical BY
     CONSTRUCTION rather than by an arithmetic identity. An additive or multiplicative mask cannot
     make that claim: ``x + 0.0`` turns ``-0.0`` into ``+0.0``, and ``0 * -inf`` is NaN.
-  * THE ONE CONSTRUCT WITH NO FORK-AUTHORED SCREENING: ``nisa.memset`` with a NON-FINITE value.
-    ``memset`` itself has 37 landed call sites, but every landed value is finite (``0.0`` eight
-    times, ``0`` three times, ``1.0``, ``-2``, and ``SENTINEL_INDEX`` at ``mla_sparse.py:236``).
-    The nearest on-image precedent for an ``inf`` immediate is vendored rather than fork-authored:
-    ``nisa.nc_match_replace8(imm=float("-inf"))``
-    (``vendored_kernels/rotational_topk/rotational_topk_utils.py:1065``, ``:1109``, ``:1116``).
-    THE NKI SIMULATOR DOES NOT RUN THE MLIR VERIFIER STAGE -- ``causal_fill.py:189-196`` records
-    that trap costing ``-099`` four green items -- so a green Tier N run does not clear this one.
-    The capture leg is what clears it, and this comment is here so the next reader knows which line
-    to look at first if capture refuses.
+  * THE CONSTRUCT THAT USED TO HAVE NO FORK-AUTHORED SCREENING, AND NO LONGER EXISTS HERE:
+    ``nisa.memset`` with a NON-FINITE value. ``memset`` has 37 landed call sites and every landed
+    value is finite (``0.0`` eight times, ``0`` three times, ``1.0``, ``-2``, and ``SENTINEL_INDEX``
+    at ``mla_sparse.py:236``); the nearest on-image precedent for an ``inf`` immediate is vendored
+    rather than fork-authored, ``nisa.nc_match_replace8(imm=float("-inf"))``
+    (``vendored_kernels/rotational_topk/rotational_topk_utils.py:1065``, ``:1109``, ``:1116``). Two
+    risks came with that: the MLIR verifier stage, which the NKI simulator DOES NOT RUN
+    (``causal_fill.py:189-196`` records that trap costing ``-099`` four green items, so a green
+    Tier N run would not have cleared it), and the arithmetic risk this bullet's own last line
+    already named -- ``0 * -inf`` is NaN -- which is what the selector's permutation matmul does to
+    a bounded value. :data:`BOUND_FILL` is finite, so this memset is now one of the 37 and both
+    risks are gone rather than deferred to the capture leg.
 """
 
 import logging
@@ -113,12 +128,36 @@ SENTINEL = -1
 """What a selection that reaches no valid pool holds. ``inc-glm53f-098``'s value, written here and
 masked there. Upstream writes the same ``-1`` for a candidate-less slot (``sampler.cu:405``)."""
 
-NEG_INF = float("-inf")
-"""The bounded-score value. Upstream's at this stage (``rocm_aiter_mla_sparse.py:734``)."""
+BOUND_FILL = -1.0e30
+"""The bounded-score value: FINITE, and far below any score the indexer can produce.
 
-_FLT_MAX = 3.4028234663852886e38
-"""Largest finite float32. Used ONLY as the threshold that separates ``+inf`` from every finite
-score in :func:`_causal_sentinel_nki`, never as a fill value."""
+WHY NOT ``-inf``, WHICH IS UPSTREAM'S VALUE HERE (``rocm_aiter_mla_sparse.py:734``). Repair
+``103r5``, ruled by the lead at ``approvals/LEAD-LOG.md`` §752 on the evidence in
+``increments/contradiction-103-selector-pad-6874a0f5.md``. The landed selector this bound feeds moves
+selected VALUES between partitions with a 0/1 permutation matrix on the tensor engine
+(``vendored_kernels/rotational_topk/rotational_topk.py:385`` into
+``rotational_topk_utils.py:867-886``), and ``0 * -inf`` is NaN under IEEE-754 -- so an ``-inf`` handed
+to that kernel need not come back as ``-inf``, and a marker that keys on the exact value would then
+mark nothing. A finite fill crosses a permutation matmul unchanged: every output is one ``1 * value``
+term plus zeros.
+
+WHY THIS MAGNITUDE. Three constraints, all from bytes rather than taste. It must be BELOW every
+legal indexer score, so no real candidate is ever mistaken for a fill -- indexer scores are softmax-
+scale logits, tens at most. It must be far ABOVE ``FLOAT32_MIN`` (-3.4e38), so a matmul accumulation
+cannot overflow to an infinity, which is the vendor's own reason for padding with a modest
+``-9948.0`` rather than the type minimum (``rotational_topk_utils.py:32-40``). And it must survive a
+bfloat16 round-trip with room to spare, which :data:`BOUND_FILL_MARK` provides. The fork already
+prefers finite mask fills where a kernel consumes them: ``functional/sampling.py:263`` masks with
+``-3000.0`` and ``functional/attention/attention_cte.py:145`` with ``torch.finfo(dtype).min``."""
+
+BOUND_FILL_MARK = -1.0e29
+"""The threshold the marker fires at or below. Ten times closer to zero than :data:`BOUND_FILL`.
+
+The gap is what makes the marker independent of dtype rounding: a ``BOUND_FILL`` that has been
+rounded to bfloat16 and back is still orders of magnitude below this, while no real score comes near
+it. A ``-inf`` that somehow survives is below it too, so this threshold also catches the value the
+vendored selector itself writes when it strikes a taken candidate
+(``rotational_topk_utils.py:1065``)."""
 
 _SCORE_DTYPES = (torch.float32,)
 """Score dtypes that take the NKI route. The bound compares against a length and writes a float
@@ -214,7 +253,7 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 
 @nki.jit
 def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
-    """``-inf`` at every pool column the row's own length does not complete.
+    """:data:`BOUND_FILL` at every pool column the row's own length does not complete.
 
     Args:
         scores_hbm: ``[rows, width]`` float32 -- one score per candidate pool per query row.
@@ -224,7 +263,7 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
             through unchanged (``decode_tail_update.py:544-546``).
 
     Returns:
-        ``[rows, width]`` float32. Column ``p`` of row ``i`` holds :data:`NEG_INF` when
+        ``[rows, width]`` float32. Column ``p`` of row ``i`` holds :data:`BOUND_FILL` when
         ``(p + 1) * pool_size > causal_len[i]`` and row ``i``'s original score, bit for bit,
         otherwise.
 
@@ -273,10 +312,10 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
     bounded = nl.ndarray((rows, width), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
 
-    # The fill source. THIS memset is the one construct in this module with no fork-authored
-    # screening; see the module docstring's last bullet.
+    # The fill source. FINITE since repair `103r5`, which puts this memset in the same landed
+    # family as the other 37 (every landed value is finite; see the module docstring).
     fill = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=fill, value=NEG_INF)
+    nisa.memset(dst=fill, value=BOUND_FILL)
 
     # The mask. `scores_sb` is left alone wherever `bounded` is 0.
     nisa.tensor_copy_predicated(src=fill, predicate=bounded, dst=scores_sb)
@@ -286,48 +325,84 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
 
 
 @nki.jit
-def _causal_sentinel_nki(values_hbm, indices_hbm):
-    """``-1`` at every selection whose value came back ``-inf``.
+def _causal_sentinel_nki(values_hbm, indices_hbm, width):
+    """``-1`` at every selection that reaches no pool the row may see -- by value OR by index.
 
     Args:
         values_hbm: ``[rows, k]`` float32 -- the selector's returned values.
         indices_hbm: ``[rows, k]`` int32 -- the selector's returned pool ids.
+        width: python int, the number of REAL pool columns the selector was given. A trace-time
+            constant, the way ``pool_size`` is in :func:`_causal_bound_nki`.
 
     Returns:
-        ``[rows, k]`` int32. :data:`SENTINEL` where the paired value is ``-inf``, and the original
+        ``[rows, k]`` int32. :data:`SENTINEL` at every slot whose value is at or below
+        :data:`BOUND_FILL_MARK` and at every slot whose index is ``>= width``; the selector's own
         index, bit for bit, everywhere else.
 
-    HOW ``-inf`` IS DETECTED WITHOUT A ``less``. Negating turns ``-inf`` into ``+inf`` and every
-    finite score into a finite number, so one ``greater`` against the largest finite float32
-    separates them: ``+inf > FLT_MAX`` is true and no finite value can be. That keeps the compare
-    in the one form ``tensor_scalar`` has a landed call site for.
+    TWO ARMS, AND EACH HAS ITS OWN JOB. Repair ``103r5`` (``approvals/LEAD-LOG.md`` §752; the
+    evidence is ``increments/contradiction-103-selector-pad-6874a0f5.md``).
+
+      * THE VALUE ARM catches a column the bound filled. Those columns are real columns with legal
+        indices, so only their value distinguishes them.
+      * THE INDEX ARM catches a PAD column the selector invented. The vendored loader pads the last
+        fold of an uneven fold with a FINITE ``-9948.0``
+        (``vendored_kernels/rotational_topk/cascaded_max_utils.py:61-66``, ``:154-158``) and hands
+        those columns positions that keep counting past the real width
+        (``rotational_topk.py:203-207`` with ``rotational_topk_utils.py:826-856``, and the padded
+        extent it names at ``:434``). A finite pad OUTRANKS every bound-filled column, so on the
+        rows this bound acts on the pads win slots -- and no value test can see them, because their
+        value is an ordinary finite number.
+
+    HOW THE POLARITY WORKS WITHOUT A ``less`` OR AN ``or``. The result tile starts as all
+    :data:`SENTINEL` and the selector's index is copied IN only where the value is a real score, so
+    "mark" is the default and "keep" is the exception:
+
+      1. the ids are copied to float32 (exact: a pool index is a whole number far below 2**24);
+      2. ``greater`` against ``width - 1`` marks the pad ids, and one predicated copy writes
+         :data:`SENTINEL` over them IN the id tile;
+      3. ``greater`` against :data:`BOUND_FILL_MARK` -- applied to the value directly, no negation --
+         is 1 exactly where the value is a real score. NaN fails that compare, so a NaN value is
+         marked rather than silently kept, which is what makes this kernel independent of whether
+         the tensor engine's ``0 * x`` follows IEEE-754;
+      4. one predicated copy moves the screened ids into the all-``-1`` result where that keep mask
+         is set.
+
+    Every construct here is already landed in this module: ``greater`` into an integer destination
+    (``moe/topk_reduce.py:351-355``), ``memset`` with the int32 sentinel (``mla_sparse.py:236``), and
+    ``tensor_copy_predicated`` as the select (``moe/topk_reduce.py:309``, ``:360``).
     """
     rows = values_hbm.shape[0]
     k = values_hbm.shape[1]
 
     out = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.shared_hbm)
 
-    # The indices, loaded once. This tile IS the result: the sentinel writes into it.
+    # The indices, loaded once. The pad screen writes into this tile.
     idx_sb = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=idx_sb, src=nl.load(indices_hbm))
 
     vals = nl.ndarray((rows, k), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=vals, src=nl.load(values_hbm))
 
-    # `-value`: `+inf` exactly where the bound fired, finite everywhere else.
-    negv = nl.ndarray((rows, k), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=negv, data=vals, op0=nl.multiply, operand0=-1.0)
-
-    masked = nl.ndarray((rows, k), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=masked, data=negv, op0=nl.greater, operand0=_FLT_MAX)
-
-    # `memset` with the int32 sentinel is the landed form at `mla_sparse.py:236`.
+    # The sentinel source, and the result that starts out entirely sentinel.
     fill = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
     nisa.memset(dst=fill, value=SENTINEL)
+    marked = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.memset(dst=marked, value=SENTINEL)
 
-    nisa.tensor_copy_predicated(src=fill, predicate=masked, dst=idx_sb)
+    # THE INDEX ARM. `index >= width` written as `index > width - 1`, which needs only `greater`.
+    idxf = nl.ndarray((rows, k), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=idxf, src=idx_sb)
+    pad = nl.ndarray((rows, k), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=pad, data=idxf, op0=nl.greater, operand0=float(width) - 1.0)
+    nisa.tensor_copy_predicated(src=fill, predicate=pad, dst=idx_sb)
 
-    nl.store(out, value=idx_sb)
+    # THE VALUE ARM, as a KEEP mask: 1 where the value is a real score. A fill, a `-inf` and a NaN
+    # all fail this compare, so all three are left at the sentinel the result already holds.
+    keep = nl.ndarray((rows, k), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=keep, data=vals, op0=nl.greater, operand0=BOUND_FILL_MARK)
+    nisa.tensor_copy_predicated(src=idx_sb, predicate=keep, dst=marked)
+
+    nl.store(out, value=marked)
     return out
 
 
@@ -349,10 +424,12 @@ def _record_bound_dispatch(rows: int, width: int) -> None:
 
 
 @torch._dynamo.assume_constant_result
-def _record_sentinel_dispatch(rows: int, k: int) -> None:
+def _record_sentinel_dispatch(rows: int, k: int, width: int) -> None:
     """Record which kernel the sentinel seam dispatched, and log it, OFF the compiled graph."""
     _SENTINEL_COUNTERS.last_kernel = _kernel_identity_of(_causal_sentinel_nki)
-    logger.info("[dsa-causal-sentinel] kernel=nki rows=%d k=%d", rows, k)
+    logger.info(
+        "[dsa-causal-sentinel] kernel=nki rows=%d k=%d width=%d", rows, k, width
+    )
 
 
 def _validate_bound(scores: Tensor, causal_len: Tensor, pool_size: int) -> int:
@@ -407,7 +484,7 @@ def can_run_dsa_causal_bound(scores: Tensor, causal_len: Tensor, pool_size: int)
 
 
 def dsa_causal_bound(scores: Tensor, causal_len: Tensor, pool_size: int) -> Tensor:
-    """THE COUNTED SEAM. ``-inf`` at every pool a query row's own length does not complete.
+    """THE COUNTED SEAM. :data:`BOUND_FILL` at every pool a query row's own length does not complete.
 
     Args:
         scores: ``[rows, width]`` float32, one score per candidate pool per query row, as
@@ -439,8 +516,25 @@ def dsa_causal_bound(scores: Tensor, causal_len: Tensor, pool_size: int) -> Tens
     return wrap_nki(_causal_bound_nki)(scores.contiguous(), clen_col, pool_size)
 
 
-def _validate_sentinel(values: Tensor, indices: Tensor) -> int:
-    """Host-side validation for the sentinel writer. Returns ``rows``."""
+def _validate_sentinel(values: Tensor, indices: Tensor, width: int) -> int:
+    """Host-side validation for the sentinel writer. Returns ``rows``.
+
+    ``width`` is validated the way ``pool_size`` is in :func:`_validate_bound` and for the same
+    reason: it is a trace-time constant, so a tensor or a bool arriving here would be baked into the
+    graph as something the caller did not mean. A caller that cannot say how many real columns the
+    selector was given cannot use this seam -- the pad arm has no meaning without it -- so this
+    RAISES rather than declining to the oracle.
+    """
+    if not isinstance(width, int) or isinstance(width, bool):
+        raise DsaCausalBoundError(
+            f"width must be a python int, because it is a trace-time constant; got "
+            f"{type(width).__name__} {width!r}"
+        )
+    if width < 1:
+        raise DsaCausalBoundError(
+            f"width must be the positive number of real pool columns the selector was given; got "
+            f"width={width}"
+        )
     if values.ndim != 2 or indices.ndim != 2:
         raise DsaCausalBoundError(
             f"values and indices must both be 2-D [rows, k]; got {tuple(values.shape)} and "
@@ -458,35 +552,45 @@ def _validate_sentinel(values: Tensor, indices: Tensor) -> int:
     return int(values.shape[0])
 
 
-def can_run_dsa_causal_sentinel(values: Tensor, indices: Tensor) -> bool:
-    """Whether the NKI kernel serves this sentinel call. ``False`` sends it to the torch oracle."""
+def can_run_dsa_causal_sentinel(values: Tensor, indices: Tensor, width: int) -> bool:
+    """Whether the NKI kernel serves this sentinel call. ``False`` sends it to the torch oracle.
+
+    ``width`` is accepted so the gate has the same signature as the seam it guards -- a caller that
+    can ask the gate with fewer arguments than the call it is about would be asking about a different
+    call. It is not read here: a malformed ``width`` RAISES in :func:`_validate_sentinel`, so the only
+    thing left for this gate to decide is whether NKI is available at all.
+    """
     if not can_run_kernel():
         return False
     return values.dtype in _SCORE_DTYPES and indices.dtype in _INDEX_DTYPES
 
 
-def dsa_causal_sentinel(values: Tensor, indices: Tensor) -> Tensor:
-    """THE COUNTED SEAM. :data:`SENTINEL` at every selection whose value came back ``-inf``.
+def dsa_causal_sentinel(values: Tensor, indices: Tensor, width: int) -> Tensor:
+    """THE COUNTED SEAM. :data:`SENTINEL` at every selection that reaches no pool the row may see.
 
     Args:
         values: ``[rows, k]`` float32, the selector's returned values.
         indices: ``[rows, k]`` int32, the selector's returned pool ids.
+        width: the number of REAL pool columns the selector was given, which is
+            ``bounded.shape[1]`` at the dispatch site. Anything the selector returns at or above it
+            is a pad the selector invented, not a pool -- see :func:`_causal_sentinel_nki`.
 
     Returns:
         ``[rows, k]`` int32, sentinelised as :func:`_causal_sentinel_nki` describes.
 
     Raises:
-        DsaCausalBoundError: for a rank or shape mismatch, or a non-int32 ``indices``.
+        DsaCausalBoundError: for a non-int or non-positive ``width``, a rank or shape mismatch, or a
+            non-int32 ``indices``.
     """
-    rows = _validate_sentinel(values, indices)
+    rows = _validate_sentinel(values, indices, width)
 
-    if not can_run_dsa_causal_sentinel(values, indices):
+    if not can_run_dsa_causal_sentinel(values, indices, width):
         _SENTINEL_COUNTERS.torch_fallback += 1
-        return dsa_causal_sentinel_torch_oracle(values, indices)
+        return dsa_causal_sentinel_torch_oracle(values, indices, width)
 
     _SENTINEL_COUNTERS.nki_dispatch += 1
-    _record_sentinel_dispatch(rows, int(values.shape[1]))
-    return wrap_nki(_causal_sentinel_nki)(values.contiguous(), indices.contiguous())
+    _record_sentinel_dispatch(rows, int(values.shape[1]), width)
+    return wrap_nki(_causal_sentinel_nki)(values.contiguous(), indices.contiguous(), width)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -508,16 +612,22 @@ def dsa_causal_bound_torch_oracle(
     rows, width = int(scores.shape[0]), int(scores.shape[1])
     complete = (causal_len.reshape(rows, 1).to(torch.int64) // pool_size)
     cols = torch.arange(width, device=scores.device, dtype=torch.int64)[None, :]
-    return scores.masked_fill(cols >= complete, NEG_INF)
+    return scores.masked_fill(cols >= complete, BOUND_FILL)
 
 
-def dsa_causal_sentinel_torch_oracle(values: Tensor, indices: Tensor) -> Tensor:
+def dsa_causal_sentinel_torch_oracle(
+    values: Tensor, indices: Tensor, width: int
+) -> Tensor:
     """The reference the sentinel writer is measured against. NOT a P13 fallback.
 
-    Uses ``torch.isinf`` on the sign-checked value rather than the kernel's negate-and-compare, so
-    the two spellings are independent. Upstream's equivalent is
-    ``tl.where(offsets < num_compressed, offsets, -1)`` (``attention.py:85``) and
-    ``outIndices[rowIt] = -1`` (``sampler.cu:405``).
+    WRITTEN IN THE OPPOSITE POLARITY TO THE KERNEL, on purpose. The kernel starts from an all-``-1``
+    tile and copies an index IN where a KEEP mask is set; this oracle builds the MARK mask directly
+    out of ``le`` and ``ge``, and names NaN explicitly with ``torch.isnan`` where the kernel gets NaN
+    for free from a failed ``greater``. Two spellings that disagree about NaN would be caught by the
+    items that feed one in; one spelling written twice would only prove the module agrees with
+    itself. Upstream's equivalent is ``tl.where(offsets < num_compressed, offsets, -1)``
+    (``attention.py:85``) and ``outIndices[rowIt] = -1`` (``sampler.cu:405``).
     """
-    masked = torch.isinf(values) & (values < 0)
-    return torch.where(masked, torch.full_like(indices, SENTINEL), indices)
+    filled = torch.le(values, BOUND_FILL_MARK) | torch.isnan(values)
+    pad = torch.ge(indices, width)
+    return torch.where(filled | pad, torch.full_like(indices, SENTINEL), indices)

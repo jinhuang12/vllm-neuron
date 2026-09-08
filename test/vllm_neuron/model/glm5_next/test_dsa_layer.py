@@ -1509,6 +1509,15 @@ def _ref_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
 # would make the reference compare the seam against itself and would fire that reading. And P13 is
 # not in play: this is the test's own oracle, never a production path.
 #
+# TWO NUMBERS ARE READ OFF THE PRODUCT MODULE AND NEITHER IS TYPED HERE (repair `103r5`). The fill is
+# no longer `-inf`: `dsa_causal_bound` writes the finite `BOUND_FILL` and the marker fires at or below
+# `BOUND_FILL_MARK`, because the vendored selector pads its own input with a FINITE value and moves
+# selected values through a 0/1 permutation matmul where `0 * -inf` is NaN -- read at the bytes in
+# `increments/contradiction-103-selector-pad-6874a0f5.md`. :func:`_fill_constants` asks the module for
+# both, so a change to either reaches this file as a mismatch instead of being overwritten by a
+# hand-typed copy. Reading a module CONSTANT is not reaching a seam: it dispatches nothing, and the
+# counters are reset AFTER the reference runs anyway (`:2192-2198` step 3).
+#
 # WHAT THEY DO NOT BUY. Because the reference now transcribes the same declared semantics as the
 # implementation, `test_run_1` can no longer catch a defect in the ORDER of the sentinel columns --
 # both sides pin it the same way. That defect class is caught by `test_run_2`, which compares a row
@@ -1518,10 +1527,22 @@ def _ref_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 
 
+def _fill_constants() -> tuple[float, float]:
+    """``(BOUND_FILL, BOUND_FILL_MARK)``, ASKED OF THE PRODUCT MODULE rather than typed here.
+
+    Two numbers, one source. If the module ever moves the fill or the mark, this file's reference
+    moves with it and `test_run_1` keeps measuring the implementation instead of measuring a stale
+    copy of one of its constants. The pair is also why the reference needs no ``-inf`` anywhere: the
+    fill is finite on purpose, and the reason is `103r5`'s contradiction record.
+    """
+    module = _seam_module("causal_bound")
+    return float(module.BOUND_FILL), float(module.BOUND_FILL_MARK)
+
+
 def _ref_causal_bound(
     scores: torch.Tensor, seq_lens: torch.Tensor, pool_size: int, width: int
 ) -> torch.Tensor:
-    """``dsa_causal_bound``: ``-inf`` at every pool column the row does not complete.
+    """``dsa_causal_bound``: ``BOUND_FILL`` at every pool column the row does not complete.
 
     Pool ``p`` completes at token ``(p + 1) * pool_size - 1`` and is attendable exactly when that
     token is ``< causal_len``, which is the same statement as ``p < causal_len // pool_size`` --
@@ -1529,32 +1550,56 @@ def _ref_causal_bound(
     can check it against upstream's ``[cu_seqlen_ks, cu_seqlen_ke)`` without re-deriving the floor
     division.
 
+    THE FILL IS FINITE AND THAT IS THE `103r5` REPAIR, not a rounding of ``-inf``. A bounded column
+    is moved across SBUF partitions by a 0/1 permutation matmul inside the vendored selector, and
+    ``0 * -inf`` is NaN, so an ``-inf`` written here need not come back as one. The number itself is
+    read from the module by :func:`_fill_constants`.
+
     ``causal_len`` IS ``seq_lens``, the same column the expansion receives -- one producer, two
-    consumers, exactly as ``select_bounded_pools`` says of itself (``model_fp8.py:3783-3785``).
+    consumers, exactly as ``Glm5NextDSAIndexer.select_bounded_pools`` says of itself, named by the
+    method because this increment has already pushed those line numbers twice.
     """
+    fill, _mark = _fill_constants()
     causal = seq_lens.to(torch.int64).reshape(-1, 1)
     columns = torch.arange(int(width), dtype=torch.int64).reshape(1, -1)
     completes = (columns + 1) * int(pool_size) - 1 < causal
-    return scores.masked_fill(~completes, float("-inf"))
+    return scores.masked_fill(~completes, fill)
 
 
-def _ref_causal_sentinel(bounded: torch.Tensor, pool_ids: torch.Tensor) -> torch.Tensor:
-    """``dsa_causal_sentinel``: ``-1`` at every selection whose score was bounded away.
+def _ref_causal_sentinel(
+    bounded: torch.Tensor, pool_ids: torch.Tensor, width: int
+) -> torch.Tensor:
+    """``dsa_causal_sentinel``: ``-1`` at every selection the row may not see.
+
+    TWO ARMS, BECAUSE THE IMPLEMENTATION HAS TWO (repair ``103r5``). A selection is replaced when its
+    VALUE is at or below ``BOUND_FILL_MARK`` -- or is NaN -- or when its INDEX is at or past
+    ``width``, the count of real pool columns the selector was handed.
+
+    THE INDEX ARM IS UNREACHABLE IN THIS REFERENCE, AND SAYING SO IS THE HONEST PART. It exists in
+    the implementation because the vendored selector PADS its own input with a finite ``-9948.0`` at
+    column positions that keep counting past the real width, so a pad can win a slot and come back as
+    an out-of-range pool id. This reference's selector is ``_ref_topk``, a plain ``torch.topk`` over
+    exactly ``width`` columns, which cannot return an index at or past ``width``. So this function
+    transcribes the arm and never exercises it: the pad arm is READ by
+    ``test/vllm_neuron/functional/dsa/test_causal_bound.py``'s pad case against the kernel's own
+    config, and at the dispatch site by
+    :func:`test_forward_at_a_striking_select_k_sentinelises_every_pad_the_selector_returns` below.
 
     THE REFERENCE GATHERS AND THE IMPLEMENTATION NO LONGER DOES, on purpose (repair ``103r4``,
     review finding F1). ``select_bounded_pools`` now hands the sentinel ``dsa_topk_select``'s own
     returned ``values``, because the vendored selector strikes its input buffer on the multi-fold
-    branch and an index returned beside an ``-inf`` value can then point at an originally finite
-    column. THIS reference is safe to gather because its selector is ``_ref_topk``, a plain
-    ``torch.topk`` that never modifies its input, so the gathered score IS the selected value here by
-    construction -- and the two sides therefore reach the same answer by two different spellings,
-    which is what a reference is for. ``isinf`` with a sign test rather than ``== float("-inf")``:
-    the two agree here, and the predicate says what it means without depending on how the comparison
-    treats an infinity.
+    branch and an index returned beside a struck value can then point at an originally finite
+    column. THIS reference is safe to gather because ``torch.topk`` never modifies its input, so the
+    gathered score IS the selected value here by construction -- and the two sides therefore reach the
+    same answer by two different spellings, which is what a reference is for. ``isnan`` is carried for
+    the same reason the module's oracle carries it: nothing here produces a NaN, and if one ever
+    arrives the reference agrees with the implementation about it rather than silently disagreeing.
     """
+    _fill, mark = _fill_constants()
     selected = bounded.gather(1, pool_ids.to(torch.int64))
-    struck = torch.isinf(selected) & (selected < 0)
-    return torch.where(struck, torch.full_like(pool_ids, -1), pool_ids)
+    struck = torch.le(selected, mark) | torch.isnan(selected)
+    padded = torch.ge(pool_ids.to(torch.int64), int(width))
+    return torch.where(struck | padded, torch.full_like(pool_ids, -1), pool_ids)
 
 
 def _ref_canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
@@ -1813,7 +1858,10 @@ def _ref_indexer(
     # scores and masking afterwards would answer a different question.
     bounded = _ref_causal_bound(scores, seq_lens, pool, candidates)
     pool_ids = _ref_topk(bounded, int(indexer.select_k()))
-    pool_ids = _ref_causal_sentinel(bounded, pool_ids)
+    # `candidates` IS the width, read from the same variable the bound was given, exactly as the
+    # implementation reads `int(bounded.shape[1])` rather than a config field: the width the marker
+    # screens against cannot then disagree with the width the selector was handed.
+    pool_ids = _ref_causal_sentinel(bounded, pool_ids, candidates)
     pool_ids = _ref_canonical_sentinel_order(pool_ids)
     return _ref_expand(pool_ids, seq_lens, pool)
 
@@ -1992,7 +2040,7 @@ def _materialise_indexer(indexer, gen: torch.Generator) -> None:
     assert indexer.prepare_projection_weights() == 4, "four indexer projections must prepare"
 
 
-def build_layer_stack(*, layers: int = LAYERS, seed: int = 51_051_051):
+def build_layer_stack(*, layers: int = LAYERS, seed: int = 51_051_051, **cfg_overrides):
     """A stack of :class:`Glm5NextDSALayer` at the tiny geometry, every leaf materialised.
 
     The weight scaling mirrors the ``-042`` sibling's fixture (``test_mla_decode.py:139-143``):
@@ -2001,9 +2049,14 @@ def build_layer_stack(*, layers: int = LAYERS, seed: int = 51_051_051):
 
     EVERY LAYER GETS ITS OWN SEED STREAM from one generator, so the three layers are genuinely
     different maps. A stack of three identical layers would let a per-layer indexing error pass.
+
+    ``cfg_overrides`` REACHES :func:`_tiny_text_config` AND NOTHING ELSE, so the tiny geometry stays
+    the one place a width is declared. It exists for one caller: the striking-``select_k`` item needs a
+    larger ``index_topk``, which is the dial upstream itself expresses in TOKENS, and every reading it
+    makes is then derived from the config it built rather than from a number typed twice.
     """
     model_fp8 = _impl()
-    cfg = _tiny_text_config()
+    cfg = _tiny_text_config(**cfg_overrides)
     gen = torch.Generator().manual_seed(int(seed))
     stack = []
     for layer_idx in range(int(layers)):
@@ -3247,7 +3300,15 @@ def test_softmaxscale_control_the_retired_latent_rank_value_fails_that_item() ->
 # right order, on operands the indexer built itself, with the counters that prove which route ran.
 # A kernel that is correct and never called would pass there and fail here.
 #
-# ONE ITEM, per plan section 6 rule 6. The block declares one item in this file and this is it.
+# TWO ITEMS IN THIS FILE, AND THE SECOND ONE IS A REPAIR (`103r5`). The block declared one, and the
+# one below was it. Review finding F1 at `reviews/glm-5.3-flash-port/bless-103-code-6874a0f5-findings.md`
+# measured what that leaves unread: this item pins `select_k == 2`, where the vendored selector takes
+# the NON-striking `max8` + `nc_find_index8` branch, so the parent commit `c81113a2` -- whose dispatch
+# site gathered the bounded scores instead of reading the selector's values -- passes every test the
+# range shipped. The lead ruled a second model-level item at a STRIKING `select_k`
+# (`approvals/LEAD-LOG.md` §750 ruling 2, §752); it is
+# :func:`test_forward_at_a_striking_select_k_sentinelises_every_pad_the_selector_returns` at the end of
+# this block. The plan revision that records two items is the lead's write, not this file's claim.
 #
 # THE FIGURES THIS ITEM READS WERE CORRECTED BEFORE IT WAS WRITTEN. The plan's first spelling of
 # them at rev 256 named rows 4-7 as the rows reading one sentinel. That does not follow from the
@@ -3348,25 +3409,30 @@ def _expected_sentinel_counts(seq_lens: torch.Tensor, select_k: int, pool: int,
     ]
 
 
-def _selecting_operands(cfg, *, seed: int) -> dict:
+def _selecting_operands(cfg, *, seed: int, tokens: int = SELECTING_SEQ_LEN) -> dict:
     """Operands for ``forward``'s prefill leg one pool ABOVE the bypass boundary.
 
     ``seq_lens = arange(1, n + 1)`` is this file's own prefill convention, unchanged -- which is also
     the evidence that ``causal_len`` is ``position + 1`` here and not ``position``.
+
+    ``tokens`` DEFAULTS TO THE DECLARED CASE and is a parameter only because the striking-``select_k``
+    item below needs a longer leg for the same shape of operand. It is one length, used for the row
+    count, the lengths and the slot mapping alike, so the two legs cannot disagree about it.
     """
     gen = torch.Generator().manual_seed(int(seed))
+    rows = int(tokens)
     return {
         "hidden": torch.randn(
-            SELECTING_SEQ_LEN, int(cfg.hidden_size), generator=gen, dtype=torch.float32
+            rows, int(cfg.hidden_size), generator=gen, dtype=torch.float32
         ),
         "q_latent": torch.randn(
-            SELECTING_SEQ_LEN, int(cfg.q_lora_rank), generator=gen, dtype=torch.float32
+            rows, int(cfg.q_lora_rank), generator=gen, dtype=torch.float32
         ),
         "pool_cache": torch.zeros(
             PAGES * PAGE_SIZE, int(cfg.index_head_dim), dtype=torch.bfloat16
         ),
-        "seq_lens": torch.arange(1, SELECTING_SEQ_LEN + 1, dtype=torch.int32),
-        "slot_mapping": prefill_slot_mapping(SELECTING_SEQ_LEN, int(cfg.index_kpool)),
+        "seq_lens": torch.arange(1, rows + 1, dtype=torch.int32),
+        "slot_mapping": prefill_slot_mapping(rows, int(cfg.index_kpool)),
     }
 
 
@@ -3432,12 +3498,17 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
     # sentinel seam's own output is recorded as it passes. The recorder DELEGATES to the real seam,
     # so it moves no counter of its own -- which the (1, 0) reading below then confirms.
     recorded: list[torch.Tensor] = []
+    recorded_widths: list[int] = []
     causal_bound_mod = _seam_module("causal_bound")
     real_sentinel = causal_bound_mod.dsa_causal_sentinel
 
-    def recording_sentinel(values, indices):
-        out = real_sentinel(values, indices)
+    def recording_sentinel(values, indices, width):
+        # `width` IS FORWARDED AND NEVER DEFAULTED. The seam took two operands before `103r5` and
+        # takes three now; a spy that swallowed the third would keep passing while the dispatch site
+        # stopped screening pads, which is the defect this repair exists to remove.
+        out = real_sentinel(values, indices, width)
         recorded.append(out.clone())
+        recorded_widths.append(int(width))
         return out
 
     reset_all_counters()
@@ -3463,6 +3534,15 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
     assert len(recorded) == 1, (
         f"the sentinel seam ran {len(recorded)} time(s) on one prefill leg; the dispatch site "
         f"composes it exactly once"
+    )
+    # AND THE WIDTH IT WAS GIVEN IS THE ONE THE SELECTOR SAW. `103r5`: the marker screens an index at
+    # or past `width`, so a `width` wider than the real pool columns disables that arm silently. The
+    # dispatch site reads it off the bounded tensor; this reads that the number arriving is the
+    # candidate count and not, say, the pool-cache row count or `select_k`.
+    say("D4", "sentinel_widths", recorded_widths, "candidates", candidates)
+    assert recorded_widths == [candidates], (
+        f"the dispatch site handed the marker width {recorded_widths} where the bounded tensor has "
+        f"{candidates} real pool column(s); a wider width turns the pad arm off without failing"
     )
     pool_ids = recorded[0]
     assert pool_ids.dtype == torch.int32, pool_ids.dtype
@@ -3569,4 +3649,324 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
     assert out_of_row == 0, (
         f"{out_of_row} live token index(es) point past their own row's causal length, which is the "
         f"defect the bound removes seen at the token level"
+    )
+
+
+# =========================================================================== #
+# THE SAME BOUND, AT A `select_k` WHERE THE SELECTOR STRIKES AND PADS -- repair `103r5`.
+#
+# WHAT THIS ITEM ADDS, in one sentence. The item above runs the dispatch site at `select_k = 2`, where
+# the vendored selector takes its non-striking, non-folding branch; this one runs the SAME dispatch
+# site at a `select_k` where the selector folds its input, PADS the short fold with a finite value,
+# strikes what it takes, and moves selected values across partitions with a matmul -- the four
+# behaviours the `103r5` repair exists to survive.
+#
+# WHY IT IS A SEPARATE ITEM AND NOT A PARAMETRISATION of the one above. The two read different
+# claims. That one reads the PREDICATE (`causal_len = position + 1`) against a superseded control and
+# owns this file's declared 32-token case; this one reads the MARKER (both arms) against the selector's
+# own returned pads. Parametrising would make one failure message answer for two claims.
+#
+# EVERY NUMBER BELOW IS DERIVED OR READ, AND THE PREMISES ARE READ OFF THE KERNEL'S OWN CONFIG. The
+# case needs three properties, and no comment in this file can promise them -- the kernel's factories
+# decide them from `(rows, width, k, dtype)`. So the item asks
+# `create_rotational_topk_config` (through the seam's own `_nki_config`) for `n_stages`,
+# `local_top_k_per_stage` and `padded_vocab_size`, and a failure of any premise is a DIAL finding for
+# the lead, not a finding about the module under test. That is the shape review finding R2 asked for:
+# the earlier `k = 16` case NAMED a branch instead of reading one.
+
+#: The striking case's ``select_k``, and why it is 16 rather than 8 or 2.
+#:
+#: `topk_core` strikes each value it takes -- `nc_match_replace8` with `imm=float("-inf")` -- on every
+#: fold whose `k` is a whole number of 8 (`rotational_topk_utils.py:1053-1066`), and takes the
+#: non-writing `max8` + `nc_find_index8` path only on a last fold with `k % 8 != 0` (`:1028-1039`).
+#: WHICH `k` REACHES `topk_core` DEPENDS ON THE STAGE COUNT, and that is the part the earlier round of
+#: this increment got wrong: at `n_stages == 1` the kernel calls `naive_scanning_topk` with the
+#: ORIGINAL `k` (`rotational_topk.py:163-183`, `rotational_topk_utils.py:994`), and at `n_stages >= 2`
+#: it calls `topk_core` per stage with `k = local_top_k_per_stage`, which the factory always aligns UP
+#: to 8 (`:428-430`) -- so the rotational path always strikes.
+#:
+#: 8 WOULD STRIKE AND WOULD STILL PROVE NOTHING. The factory's stage count is
+#: `div_ceil(min(k, vocab), 8)` (`:417`), so `k = 8` gives ONE stage: no folding, hence no pad column,
+#: and no rotation, hence no matmul. 16 is the smallest `select_k` that puts the kernel on the
+#: rotational path, and this file asserts that from the config rather than from this sentence.
+STRIKING_SELECT_K = 16
+
+#: The candidate width: strictly above ``select_k`` -- `can_run_dsa_topk_select` refuses `k == width`
+#: (`topk_select.py:294`) -- and ODD, so the fold cannot divide it and a pad column must exist. The
+#: pad's own existence is read from `padded_vocab_size` below, not from this comment.
+STRIKING_CANDIDATES = STRIKING_SELECT_K + 1
+
+#: The prefill length that yields those candidates, and the ``index_topk`` that yields that
+#: ``select_k``. Both derived: ``select_k()`` is ``index_topk // index_kpool``
+#: (``model_fp8.py:3712``), and ``candidates`` is ``max_seq_len // index_kpool``
+#: (``model_fp8.py:4096``).
+STRIKING_SEQ_LEN = STRIKING_CANDIDATES * POOL_SIZE
+STRIKING_INDEX_TOPK = STRIKING_SELECT_K * POOL_SIZE
+
+
+def test_forward_at_a_striking_select_k_sentinelises_every_pad_the_selector_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``forward`` at a striking ``select_k``: no pad column survives into a row's pool ids.
+
+    SEVEN READINGS, each failing for its own reason.
+      1. THE CASE IS THE ONE IT CLAIMS -- dials first, from the built config.
+      2. THE GEOMETRY IS THE STRIKING, FOLDING, PADDING ONE -- read off the kernel's own factories:
+         at least two stages, a per-stage ``k`` that is a whole number of 8, and at least one pad
+         column. A failure here is a DIAL finding: the case did not reach its own subject.
+      3. THE SELECTOR REALLY RETURNED A PAD, and the pad's VALUE is above the marker's threshold --
+         the two facts that make the index arm load-bearing rather than decorative. Measured from the
+         operands the seam was handed, not argued.
+      4. NO SELECTED VALUE IS NaN. The finite ``BOUND_FILL`` exists so that the rotation matmul --
+         ``nisa.nc_matmul`` with a 0/1 permutation, where ``0 * -inf`` is NaN -- has no infinity to
+         destroy. A NaN here is a reading about the selector for the lead, and the record
+         (``increments/contradiction-103-selector-pad-6874a0f5.md``) already names it as unmeasured.
+      5. THE OUTPUT IS LEGAL: every id a row keeps is a pool that row completes, and no id is at or
+         past the width. This is the reading the parent commit fails.
+      6. THE ONE-ARM MARKER DISAGREES, computed from this run's own recorded values and indices. It is
+         asserted RED, so the pad arm is known to be doing work on this case rather than assumed to.
+      7. THE ROUTE RAN IN NKI, per entry point, with no torch fallback anywhere.
+
+    Certifying component (D1.4): ``Glm5NextDSAIndexer.select_bounded_pools`` -- the same component the
+    item above certifies, at the branch that item cannot reach (review finding F1).
+    """
+    if not gate_live():
+        pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
+
+    fill, mark = _fill_constants()
+    stack, cfg, _gen = build_layer_stack(
+        layers=1, seed=9_103_016, index_topk=STRIKING_INDEX_TOPK
+    )
+    indexer = stack[0].attention.indexer
+    pool = int(cfg.index_kpool)
+    select_k = int(indexer.select_k())
+    candidates = STRIKING_SEQ_LEN // pool
+
+    # 1. THE CASE IS THE ONE IT CLAIMS. Read before the run: a wrong dial here spends nothing.
+    say("D5", "seq_len", STRIKING_SEQ_LEN, "candidates", candidates, "select_k", select_k,
+        "index_topk", int(cfg.index_topk), "fill", fill, "mark", mark)
+    assert select_k == STRIKING_SELECT_K, (
+        f"the config built select_k={select_k} where this case declares {STRIKING_SELECT_K}; "
+        f"index_topk={int(cfg.index_topk)} over index_kpool={pool} is the only route to it"
+    )
+    assert candidates == STRIKING_CANDIDATES and candidates > select_k, (
+        f"{STRIKING_SEQ_LEN} token(s) yields {candidates} candidate pool(s) against select_k="
+        f"{select_k}; the selector refuses k == width and the bypass serves anything below it"
+    )
+    assert candidates >= MAX8_LANES, (candidates, MAX8_LANES)
+
+    bound_api, sentinel_api = _causal_bound_apis()["bound"], _causal_bound_apis()["sentinel"]
+    fill_reset, fill_read = _causal_fill_api()
+    ops = _selecting_operands(cfg, seed=9_103_016, tokens=STRIKING_SEQ_LEN)
+
+    # BOTH SEAMS ARE RECORDED, and each recorder DELEGATES to the real seam, so it moves no counter of
+    # its own -- which the (1, 0) readings below then confirm. The bound's output is recorded because
+    # it is the exact tensor the selector was handed: the width, the row count and the dtype the
+    # kernel's config is built from all come from it rather than from a number typed here.
+    bounded_seen: list[torch.Tensor] = []
+    values_seen: list[torch.Tensor] = []
+    indices_seen: list[torch.Tensor] = []
+    widths_seen: list[int] = []
+    marked_seen: list[torch.Tensor] = []
+    causal_bound_mod = _seam_module("causal_bound")
+    real_bound = causal_bound_mod.dsa_causal_bound
+    real_sentinel = causal_bound_mod.dsa_causal_sentinel
+
+    def recording_bound(scores, causal_len, pool_size):
+        out = real_bound(scores, causal_len, pool_size)
+        bounded_seen.append(out.clone())
+        return out
+
+    def recording_sentinel(values, indices, width):
+        values_seen.append(values.clone())
+        indices_seen.append(indices.clone())
+        widths_seen.append(int(width))
+        out = real_sentinel(values, indices, width)
+        marked_seen.append(out.clone())
+        return out
+
+    reset_all_counters()
+    bound_api[0]()
+    sentinel_api[0]()
+    fill_reset()
+    spy = SeamSpy()
+    spy.install(monkeypatch)
+    monkeypatch.setattr(causal_bound_mod, "dsa_causal_bound", recording_bound)
+    monkeypatch.setattr(causal_bound_mod, "dsa_causal_sentinel", recording_sentinel)
+    try:
+        got = indexer.forward(
+            ops["hidden"], ops["q_latent"], ops["pool_cache"], ops["seq_lens"],
+            max_seq_len=STRIKING_SEQ_LEN, page_size=PAGE_SIZE,
+            slot_mapping=ops["slot_mapping"],
+        )
+    finally:
+        monkeypatch.undo()
+    readings = read_all_counters()
+    bound_count = tuple(int(v) for v in bound_api[1]())
+    sentinel_count = tuple(int(v) for v in sentinel_api[1]())
+    fill_count = tuple(int(v) for v in fill_read())
+
+    assert len(bounded_seen) == len(marked_seen) == 1, (len(bounded_seen), len(marked_seen))
+    bounded, values, raw_ids, pool_ids = (
+        bounded_seen[0], values_seen[0], indices_seen[0], marked_seen[0]
+    )
+    say("D5", "bounded", tuple(bounded.shape), str(bounded.dtype), "values",
+        tuple(values.shape), str(values.dtype), "widths", widths_seen)
+    assert tuple(bounded.shape) == (STRIKING_SEQ_LEN, candidates), tuple(bounded.shape)
+    assert widths_seen == [candidates], (
+        f"the marker was handed width {widths_seen} where the tensor the selector saw has "
+        f"{candidates} real column(s); a wider width switches the index arm off silently"
+    )
+    assert tuple(pool_ids.shape) == (STRIKING_SEQ_LEN, select_k), tuple(pool_ids.shape)
+    assert pool_ids.dtype == torch.int32, pool_ids.dtype
+
+    # 2. THE GEOMETRY IS THE STRIKING, FOLDING, PADDING ONE, asked of the kernel's own factories with
+    # the run's own operands. A failure of any of these three is a DIAL finding.
+    from vllm_neuron.functional.dsa.topk_select import _nki_config, _nki_dtype_of
+
+    kernel_cfg = _nki_config(
+        int(bounded.shape[0]), int(bounded.shape[1]), select_k, _nki_dtype_of(bounded)
+    )
+    n_stages = int(kernel_cfg.n_stages)
+    local_k = int(kernel_cfg.local_top_k_per_stage)
+    pad_columns = int(kernel_cfg.padded_vocab_size) - int(kernel_cfg.vocab_size)
+    say("D5", "n_stages", n_stages, "local_top_k_per_stage", local_k, "stage_free_size",
+        int(kernel_cfg.stage_free_size), "vocab", int(kernel_cfg.vocab_size),
+        "padded_vocab", int(kernel_cfg.padded_vocab_size), "pad_columns", pad_columns)
+    assert int(kernel_cfg.vocab_size) == candidates, (int(kernel_cfg.vocab_size), candidates)
+    assert n_stages >= 2, (
+        f"the factory chose n_stages={n_stages}, so the kernel takes naive_scanning_topk with the "
+        f"ORIGINAL k and neither folds nor rotates; this case then reads no pad and no matmul. A "
+        f"DIAL finding: raise select_k or the width until the factory chooses two stages"
+    )
+    assert local_k % MAX8_LANES == 0, (
+        f"the per-stage k is {local_k}, not a whole number of {MAX8_LANES}, so topk_core takes the "
+        f"non-striking max8 + nc_find_index8 branch and this case is the item above with a longer leg"
+    )
+    assert pad_columns >= 1, (
+        f"padded_vocab_size equals vocab_size, so the fold divides the width evenly and the selector "
+        f"pads NOTHING; the index arm cannot be read on this case. A DIAL finding: the width must not "
+        f"be a multiple of n_stages={n_stages}"
+    )
+
+    # 3. THE SELECTOR REALLY RETURNED A PAD, AND ITS VALUE IS ABOVE THE MARK. The first fact makes the
+    # index arm reachable; the second is why the value arm alone cannot stand in for it.
+    out_of_range = raw_ids.to(torch.int64) >= candidates
+    pad_slots = int(out_of_range.sum())
+    pad_values = values[out_of_range]
+    distinct = sorted({float(v) for v in pad_values.to(torch.float32).flatten()})
+    say("D5", "out_of_range_selections", pad_slots, "rows_touched",
+        int(out_of_range.any(dim=1).sum()), "max_id", int(raw_ids.max()),
+        "pad_values", distinct[:8], "pad_value_count", len(distinct))
+    assert pad_slots >= 1, (
+        f"the selector returned no index at or past the width on a geometry the factory says has "
+        f"{pad_columns} pad column(s), so this case does not read the index arm at all. A DIAL "
+        f"finding about the case, not a pass"
+    )
+    assert bool((pad_values > mark).all()), (
+        f"every out-of-range slot came back at or below the mark {mark}, so the VALUE arm alone would "
+        f"have caught them and this case still does not read the index arm. The pad values seen were "
+        f"{distinct[:8]}"
+    )
+
+    # 4. NO SELECTED VALUE IS NaN, which is what the finite fill was chosen for.
+    nan_slots = int(torch.isnan(values).sum())
+    say("D5", "nan_values", nan_slots, "min_value", float(values.min()),
+        "values_at_or_below_mark", int(torch.le(values, mark).sum()))
+    assert nan_slots == 0, (
+        f"{nan_slots} selected value(s) came back NaN. The bound writes the FINITE {fill} so that the "
+        f"rotation matmul has no infinity to turn into one; a NaN here is a reading about the "
+        f"selector for the lead -- the marker still fires on it, so the ids stay legal, but the "
+        f"per-row count below is then measuring something this case did not declare"
+    )
+
+    # 5. THE OUTPUT IS LEGAL, which is the reading the parent commit fails.
+    complete = [min(int(s) // pool, candidates) for s in ops["seq_lens"]]
+    illegal = [
+        (r, int(p)) for r in range(STRIKING_SEQ_LEN) for p in pool_ids[r]
+        if int(p) != -1 and not (0 <= int(p) < complete[r])
+    ]
+    say("D5", "illegal_pool_ids", len(illegal), "detail", illegal[:12],
+        "still_out_of_range", int((pool_ids.to(torch.int64) >= candidates).sum()))
+    assert int((pool_ids.to(torch.int64) >= candidates).sum()) == 0, (
+        f"a pad column survived into the pool ids: {illegal[:12]}. This is the `103r5` defect at the "
+        f"dispatch site -- a finite pad outranks a bounded column, so it wins a slot, and only the "
+        f"index arm can tell it from a real selection"
+    )
+    assert illegal == [], f"a row selected a pool it does not complete: {illegal[:12]}"
+
+    want = _expected_sentinel_counts(ops["seq_lens"], select_k, pool, candidates)
+    per_row = (pool_ids == -1).sum(dim=1).to(torch.int64).tolist()
+    say("D5", "sentinels_per_row", per_row, "computed", want)
+    assert per_row == want, (
+        f"the bounded chain read {per_row} sentinel(s) per row where the predicate computes {want}. "
+        f"Fewer means a fill or a pad survived; more means a slot was marked that carried a real "
+        f"selection -- a NaN value is the one known way that happens and reading 4 covers it"
+    )
+    assert want[0] == select_k and want[-1] == 0, (
+        f"the computed vector is {want[:3]}..{want[-3:]}; row 0 completes no pool so it owes "
+        f"{select_k} sentinels and the longest row completes {complete[-1]} so it owes none. Without "
+        f"both ends this case reads one regime only"
+    )
+
+    # 6. THE ONE-ARM MARKER DISAGREES, computed from this run's own recorded operands. Asserted RED:
+    # if the value arm alone reached the same answer, the index arm would be decoration on this case.
+    value_only = torch.where(
+        values > mark, raw_ids, torch.full_like(raw_ids, -1)
+    )
+    value_only_out_of_range = int((value_only.to(torch.int64) >= candidates).sum())
+    value_only_counts = (value_only == -1).sum(dim=1).to(torch.int64).tolist()
+    say("D5", "value_only_out_of_range", value_only_out_of_range,
+        "value_only_counts", value_only_counts[:8])
+    assert value_only_out_of_range >= 1, (
+        f"the value arm ALONE left no out-of-range id, so this case cannot tell the two-arm marker "
+        f"from the one-arm form the repair replaced"
+    )
+    assert value_only_counts != per_row, (
+        f"the one-arm form read the same per-row counts as the two-arm marker, so the index arm "
+        f"changed nothing measurable here"
+    )
+
+    # 7. THE ROUTE RAN IN NKI, form R-1, per entry point.
+    for family in FAMILIES:
+        say("D5", "counter", family, readings[family])
+    say("D5", "causal_bound", bound_count, "causal_sentinel", sentinel_count,
+        "causal_fill_099", fill_count)
+    assert bound_count == (1, 0), (
+        f"the bound seam read {bound_count} and owes exactly one NKI dispatch with no fallback"
+    )
+    assert sentinel_count == (1, 0), (
+        f"the sentinel seam read {sentinel_count} and owes exactly one NKI dispatch with no fallback"
+    )
+    assert fill_count == (0, 0), (
+        f"inc-glm53f-099's bypass seam read {fill_count} on a SELECTING case"
+    )
+    for family in SELECTING_ONE_FAMILIES:
+        assert readings[family] == (1, 0), (
+            f"{family} read {readings[family]} where the selecting chain owes exactly one dispatch "
+            f"and no fallback on one prefill leg"
+        )
+    assert all(v[1] == 0 for v in readings.values()), (
+        f"a torch fallback ran on the selecting path: {readings}"
+    )
+    control = readings["kpool_hadamard"]
+    assert control[0] > 0, (
+        f"kpool_hadamard read {control} on a call that must rotate the indexer query, so the counter "
+        f"instrument is not reading this call and the zeros above measure nothing"
+    )
+    spy.report("D5")
+    _check_two_instruments_agree("D5", spy, readings)
+
+    # AND THE EXPANSION CARRIES NOTHING PAST A ROW'S OWN LENGTH, the same defect at the token level.
+    width = _bypass_width(indexer, pool)
+    live = got >= 0
+    limit = ops["seq_lens"].to(torch.int64).reshape(STRIKING_SEQ_LEN, 1).expand_as(got)
+    out_of_row = int((live & (got.to(torch.int64) >= limit)).sum())
+    say("D5", "shape", tuple(got.shape), "want", (STRIKING_SEQ_LEN, width),
+        "live_tokens", int(live.sum()), "out_of_row", out_of_row, "max_token", int(got.max()))
+    assert got.dtype == torch.int32, got.dtype
+    assert tuple(got.shape) == (STRIKING_SEQ_LEN, width), tuple(got.shape)
+    assert out_of_row == 0, (
+        f"{out_of_row} live token index(es) point past their own row's causal length. A surviving pad "
+        f"id expands to tokens at or past {candidates * pool}, which no row of this case can see"
     )

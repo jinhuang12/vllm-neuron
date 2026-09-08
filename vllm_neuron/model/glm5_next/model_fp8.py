@@ -3821,9 +3821,10 @@ class Glm5NextDSAIndexer(nn.Module):
         THE ONE DISPATCH SITE FOR THE CAUSAL BOUND, and both entry points route through
         it for the reason :meth:`_require_serviceable` gives for itself: ``forward`` and
         ``forward_ragged`` must agree about what a row may see, and two copies of that
-        rule are two things that can disagree. ``select_pools`` above is UNTOUCHED --
-        this composes it rather than widening it, so its single-cast-site claim still
-        holds.
+        rule are two things that can disagree. ``select_pools`` above is left UNCHANGED
+        in its own bytes, but this method no longer composes it: it calls the selector
+        itself, so the int64-to-int32 cast now has two sites and
+        :meth:`select_pools`'s docstring names both rather than claiming one.
 
         ``causal_len`` IS ``seq_lens``, THE SAME COLUMN :meth:`expand_indices` ALREADY
         RECEIVES. One producer, two consumers, nothing minted -- which is what makes the
@@ -3834,24 +3835,42 @@ class Glm5NextDSAIndexer(nn.Module):
         ``reviews/glm-5.3-flash-port/bless-103-code-c81113a2-findings.md``). The first
         version of this method read the selected score back with
         ``bounded.gather(1, pool_ids)`` and claimed the two were the same number. They are
-        the same number only on the branch this increment's own tests happen to use.
+        the same number only where the selector leaves its input alone. It often does not:
         ``dsa_topk_select`` wraps the vendored ``rotational_topk``, whose ``topk_core``
-        runs ``div_ceil(k, 8)`` folds (``rotational_topk_utils.py:1022``); when more than
-        one fold runs, each fold STRIKES the values it took by writing ``-inf`` over them
-        IN THE INPUT BUFFER (``rotational_topk_utils.py:1060-1066``, and the rotational
-        ``sort`` path does the same at ``:1105``, ``:1112``). A later fold's ``max8`` then
-        matches one of those struck positions, so the index returned beside an ``-inf``
-        VALUE can be a column that was originally finite and legal. Gathering from the
-        UNSTRUCK ``bounded`` at that index reads the original finite score, no ``-inf`` is
-        seen, no ``-1`` is written, and the row silently carries a legal pool id twice --
-        which ``dsa_index_expand`` then expands twice. Production ``select_k`` is
-        ``index_topk // index_kpool`` = 2048 // 4 = 512, so production always runs the
-        striking branch. At ``k = 2`` -- every item this increment ships -- ``k % 8 != 0``
-        and the single fold takes the ``max8`` plus ``nc_find_index8`` path
-        (``rotational_topk_utils.py:1028-1039``) that never modifies the buffer, so the
-        gather and the values agree there and no test could see the substitution.
-        Taking ``values`` removes the question: a slot's value is the value the selector
-        assigned it, whichever index came back with it.
+        STRIKES each value it takes by writing ``-inf`` over it IN THE INPUT BUFFER
+        whenever the fold's ``k`` is a whole number of stages
+        (``rotational_topk_utils.py:1053-1066``, and the rotational ``sort`` path does the
+        same at ``:1105``, ``:1112``); only a last fold with ``k % 8 != 0`` takes the
+        ``max8`` plus ``nc_find_index8`` path that never writes
+        (``rotational_topk_utils.py:1028-1039``). A later pass's ``max8`` then matches one
+        of those struck positions, so the index returned beside a struck VALUE can be a
+        column that was originally finite and legal. Gathering from the UNSTRUCK
+        ``bounded`` at that index reads the original finite score, no fill is seen, no
+        ``-1`` is written, and the row silently carries a legal pool id twice -- which
+        ``dsa_index_expand`` then expands twice. Production ``select_k`` is ``index_topk //
+        index_kpool`` = 2048 // 4 = 512, which is above the factory's small-``k``
+        threshold, so production runs the rotational path with ``n_stages >= 2`` and a
+        per-stage ``k`` that is a multiple of 8 -- always the striking branch. Taking
+        ``values`` removes the question: a slot's value is the value the selector assigned
+        it, whichever index came back with it.
+
+        AND THE VALUE ALONE IS STILL NOT ENOUGH, WHICH IS THE ``103r5`` REPAIR (the lead's
+        ruling ``approvals/LEAD-LOG.md`` §752; the evidence, with every link read at the
+        bytes, is ``increments/contradiction-103-selector-pad-6874a0f5.md``). The same
+        vendored selector PADS its own input when the fold is uneven -- a finite
+        ``-9948.0`` at column positions that keep counting past the real width
+        (``vendored_kernels/rotational_topk/cascaded_max_utils.py:61-66``, ``:154-158``,
+        with the index map at ``rotational_topk.py:203-207`` and
+        ``rotational_topk_utils.py:826-856``). A finite pad OUTRANKS a bounded column, so
+        on exactly the rows this bound acts on the pads win slots and come back with an
+        out-of-range pool id and an ordinary-looking value. It also moves selected values
+        across partitions with a 0/1 permutation matmul (``rotational_topk.py:385`` into
+        ``rotational_topk_utils.py:867-886``), where ``0 * -inf`` is NaN, so an ``-inf``
+        marker need not survive the trip at all. So the bound now writes a FINITE
+        ``BOUND_FILL`` and the marker takes ``width`` and fires on the fill OR on an index
+        at or past ``width``. ``width`` is read off the bounded tensor
+        (``bounded.shape[1]``) rather than from a config field, so it cannot disagree with
+        what the selector was actually given.
 
         SO THIS METHOD CALLS THE SELECTOR ITSELF rather than composing
         :meth:`select_pools`, which discards ``values``. That moves the one int64-to-int32
@@ -3869,7 +3888,7 @@ class Glm5NextDSAIndexer(nn.Module):
         )
         values, indices = dsa_topk_select(bounded, self.select_k())
         pool_ids = indices.to(torch.int32)
-        sentinelised = dsa_causal_sentinel(values, pool_ids)
+        sentinelised = dsa_causal_sentinel(values, pool_ids, int(bounded.shape[1]))
         return self._canonical_sentinel_order(sentinelised)
 
     @staticmethod
@@ -3888,7 +3907,7 @@ class Glm5NextDSAIndexer(nn.Module):
         and pins NOTHING about the order among EQUAL values -- there was no reason for it
         to, because until this increment no caller handed it ties. The causal bound
         manufactures ties on purpose: every column a row may not see becomes the SAME
-        ``-inf``. So which masked column the selector returns, and in which position, is
+        ``BOUND_FILL``. So which masked column the selector returns, and in which position, is
         unspecified. Two further facts make that unspecified choice vary with the PACK
         rather than with the row: ``can_run_dsa_topk_select`` requires ``0 < k < width``
         strictly and then asks ``_config_builds(n_rows, width, k, dtype)``
@@ -3912,8 +3931,8 @@ class Glm5NextDSAIndexer(nn.Module):
         reports on every branch. It does not by itself fix the PLACES: "sentinels trail"
         would then follow from the selector returning its values in descending order, and
         the selector's contract says *"highest first"* about one pass and says nothing about
-        the order ACROSS the ``div_ceil(k, 8)`` folds of the striking branch
-        (``rotational_topk_utils.py:1022``, ``:1053-1066``). This seat has no reading of
+        the order ACROSS the striking passes or across the rotational stages that feed them
+        (``rotational_topk_utils.py:1022``, ``:1053-1066``; ``rotational_topk.py:351-390``). This seat has no reading of
         that cross-fold order -- it cannot be read on a laptop and no filed transcript
         covers it -- so the permutation stays and the property is true by construction
         rather than by an unstated promise. It is a no-op whenever the values already
@@ -3923,8 +3942,10 @@ class Glm5NextDSAIndexer(nn.Module):
         function of ``(scores, seq_lens, pool_size, select_k)`` and of nothing about the
         batch: real ids first in the selector's own descending order, sentinels after them.
         The packed arm and the row run alone now agree by construction rather than by luck,
-        which is what ``test_run_2``'s commutation claim asks for
-        (``test_dsa_layer.py:2407-2411``; the arm's own ``seq_lens`` contract was never the
+        which is what ``test_run_2``'s commutation claim asks for -- the item named
+        ``test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone``, whose
+        claim reads ``"PADDED GRID ONCE rather than once per request"`` (the arm's own
+        ``seq_lens`` contract was never the
         defect -- :meth:`forward_ragged` already refuses anything but one length per packed
         row, by the guard whose message reads ``"seq_lens must be [tokens] = …, one per
         PACKED row, which is what the lengths sum to"``).
@@ -3952,8 +3973,13 @@ class Glm5NextDSAIndexer(nn.Module):
         may not see and blank them afterwards, instead of choosing among the pools it may
         see. That is a different seam, and it is not the seat's to redefine.
 
-        TORCH, NOT NKI, and the same P13 note as the gather above covers it: this is index
-        plumbing on already-selected ids, not an indexer value. It reads no scores.
+        TORCH, NOT NKI, and the same P13 note as the int64-to-int32 cast in
+        :meth:`select_bounded_pools` covers it: this is index plumbing on already-selected
+        ids, not an indexer value. It reads no scores. The fork's NKI argsort could not take
+        this shape anyway -- ``argsort_unstable`` serves ``1D [N]`` or ``2D [1, N]`` only
+        (``vllm_neuron/functional/argsort_unstable.py:23``, refusal at ``:51-53``) -- and this
+        key is ``[rows, select_k]``, so an NKI route would be one call per row or a new 2-D
+        kernel. The lead has recorded that; the substrate argument belongs to the plan rev.
 
         The key is stable BY CONSTRUCTION rather than by a ``stable=`` keyword: a real id at
         column ``i`` sorts at ``i`` and a sentinel at column ``i`` sorts at ``k + i``, so the
