@@ -6265,11 +6265,79 @@ class Glm5NextMLAAttention(nn.Module):
         )
         return self.project_output(reduced)
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextMLAAttention.forward is a stub created by "
-            "inc-glm53f-013; the projections land with inc-glm53f-039 and "
-            "the decode path with inc-glm53f-042"
+    def forward(
+        self,
+        normed_hidden_states: torch.Tensor,
+        *,
+        latent_cache: torch.Tensor,
+        pool_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        start_position: int,
+        softmax_scale: float,
+        max_seq_len: int,
+        page_size: int,
+        slot_mapping: torch.Tensor | None = None,
+        tail: torch.Tensor | None = None,
+        position: int | None = None,
+    ) -> torch.Tensor:
+        """This module's whole contribution to one layer: select, then attend.
+
+        Returns ``[tokens, hidden_size]`` -- the attention half's output, with no
+        residual added and nothing normalised, because both belong to the layer.
+
+        THE INPUT ARRIVES NORMALISED, and the parameter name says so. The layer
+        owns its pre-attention norm and its residual; this module owns the three
+        calls between them. Every one of the three consumes the same normalised
+        tensor, which is why one argument carries it rather than three.
+
+        THE THREE CALLS ARE THE COMPOSITION AND THIS METHOD ADDS NOTHING TO THEM:
+        the query latent the indexer's ``wq_b`` contracts, the indexer that turns
+        it into selected rows, and :meth:`attend`, which ends in
+        :meth:`project_output`. No numeric is authored here and no refusal is
+        added: every extent and every dial is checked by the callee that owns it,
+        and a second check here is how two authorities on one extent come to
+        disagree.
+
+        THE INDICES PASS THROUGH UNCHANGED. Entry ``design-20260905-af`` route
+        (a) puts the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so no filler,
+        compaction, clamp or mask is applied between the indexer and ``attend()``
+        -- this hands over exactly what the indexer returned. The sibling layer's
+        forward states the same ruling, and this method is now the one place that
+        realises it.
+
+        RECORDED DEBT, unchanged and not paid here: ``attend()`` recomputes the
+        query latent inside :meth:`project_query_and_latent`, so the latent this
+        method computes for the indexer is computed a second time -- one
+        ``[tokens, hidden_size] x [hidden_size, q_lora_rank]`` dispatch per layer
+        per phase. :meth:`project_query_latent` declares that debt and names
+        ``inc-glm53f-054`` as its payer; paying it means threading the latent into
+        ``attend()``, which changes a landed signature whose own acceptance items
+        call it positionally. That is a widening this block does not take, so the
+        debt is carried forward and declared rather than absorbed in silence.
+
+        The two carriers are the caller's and both are written in place:
+        ``latent_cache`` is ``attend()``'s own contract and ``pool_cache`` and
+        ``tail`` are the indexer's. See :meth:`Glm5NextDSAIndexer.forward` for
+        what each means and why ``max_seq_len`` is a python int.
+        """
+        q_latent = self.project_query_latent(normed_hidden_states)
+        topk_indices = self.indexer(
+            normed_hidden_states,
+            q_latent,
+            pool_cache,
+            seq_lens,
+            max_seq_len=int(max_seq_len),
+            page_size=int(page_size),
+            slot_mapping=slot_mapping,
+            tail=tail,
+            position=position,
+        )
+        return self.attend(
+            normed_hidden_states,
+            latent_cache,
+            int(start_position),
+            topk_indices,
+            float(softmax_scale),
         )
 
 
@@ -6351,11 +6419,27 @@ class Glm5NextDSALayer(nn.Module):
     ) -> torch.Tensor:
         """Pre-norm, then the sparse attention half, then the residual add.
 
+        THE ATTENTION HALF IS ONE CALL NOW (``inc-glm53f-054a``, a declared
+        second writer in this section by the invitation two paragraphs down: the
+        landed text names ``inc-glm53f-054`` as the increment that joins this
+        layer's halves). The three calls this method used to inline -- the query
+        latent, the indexer, ``attend()`` -- are
+        :meth:`Glm5NextMLAAttention.forward`'s body, unchanged in order,
+        arguments and count, and this layer calls it. Behaviour does not move:
+        the same three callees run in the same order on the same operands, so
+        every dispatch reading this layer's acceptance declares is the reading it
+        was. What moves is that the composition has ONE definition -- a second
+        copy in the parent is how the two come to disagree about which tensor
+        each callee consumes, and the 45-layer forward this block also writes
+        would have been the second copy's second reader.
+
         THE INDICES PASS THROUGH UNCHANGED, which is the ruling and the whole
-        point of this method's shape. Entry ``design-20260905-af`` route (a) puts
-        the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so this layer applies
-        no filler, no compaction, no clamp and no mask between the indexer and
-        ``attend()`` -- it hands over exactly what the indexer returned.
+        point of the shape. Entry ``design-20260905-af`` route (a) puts
+        the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so no filler, no
+        compaction, no clamp and no mask is applied between the indexer and
+        ``attend()`` -- exactly what the indexer returned is handed over. The
+        callee states the same ruling, and it is now the one place that realises
+        it.
 
         WHAT THIS FORWARD DELIBERATELY DOES NOT DO, AND WHY IT IS NOT A GAP. The
         same two absences the KDA sibling records, for the same D14 reason:
@@ -6376,28 +6460,18 @@ class Glm5NextDSALayer(nn.Module):
         """
         residual = hidden_states
         normed = self._input_norm(hidden_states)
-        attention = self.attention
-        # ONE dispatch, and the reason this accessor exists: the indexer's `wq_b`
-        # contracts `q_lora_rank`, so its input IS the normalised latent, exactly
-        # as the reference passes it in as an argument.
-        q_latent = attention.project_query_latent(normed)
-        topk_indices = attention.indexer(
+        attn_out = self.attention(
             normed,
-            q_latent,
-            pool_cache,
-            seq_lens,
+            latent_cache=latent_cache,
+            pool_cache=pool_cache,
+            seq_lens=seq_lens,
+            start_position=int(start_position),
+            softmax_scale=float(softmax_scale),
             max_seq_len=int(max_seq_len),
             page_size=int(page_size),
             slot_mapping=slot_mapping,
             tail=tail,
             position=position,
-        )
-        attn_out = attention.attend(
-            normed,
-            latent_cache,
-            int(start_position),
-            topk_indices,
-            float(softmax_scale),
         )
         return residual + attn_out
 

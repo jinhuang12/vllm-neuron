@@ -177,13 +177,72 @@ def _impl():
 #: of the module that owns the accessors. The path is spelled out because
 #: :func:`_seam_modules` resolves it with :func:`importlib.import_module`, and the
 #: docstring there is where the reason lives.
-_SEAM_MODULE_PATHS = {
-    "blockwise_fp8_mm": "vllm_neuron.functional.blockwise_fp8_mm",
-    "blockwise_fp8_moe": "vllm_neuron.functional.moe.moe_blockwise_fp8",
+#: ONE ROW PER COUNTER FAMILY, and a family is what a counter counts rather than
+#: what a module holds: ``mla_sparse`` holds THREE families and each gets its own
+#: row, because two of them are DECLARED ZEROS at this geometry and a zero that is
+#: read is worth more than a zero that is not looked at.
+#:
+#: THE READ ACCESSOR IS NAMED AND THE RESET IS DERIVED as ``"reset_" + read``,
+#: which is the convention every seam module in this repository follows -- so the
+#: pair has one declaration and cannot drift apart. Naming the reader rather than
+#: discovering it is deliberate: ``test_dsa_layer.py:380`` discovers the pair by
+#: scanning for the ``_dispatch_counters`` suffix and asserts exactly one pair per
+#: module, which is true of every module below EXCEPT ``mla_sparse``. The coverage
+#: control at :func:`_assert_every_counter_family_is_registered` keeps the naming
+#: honest by refusing a module that grows a family no row claims.
+_SEAM_REGISTRY = {
+    "blockwise_fp8_mm": (
+        "vllm_neuron.functional.blockwise_fp8_mm", "dispatch_counters"),
+    "blockwise_fp8_moe": (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8", "dispatch_counters"),
+    "mla_projection": (
+        "vllm_neuron.functional.attention.mla_projections",
+        "mla_projection_dispatch_counters"),
+    "mla_absorb": (
+        "vllm_neuron.functional.attention.mla_absorb",
+        "mla_absorb_dispatch_counters"),
+    "mla_sparse": (
+        "vllm_neuron.functional.attention.mla_sparse",
+        "mla_sparse_dispatch_counters"),
+    "mla_sparse_tiled": (
+        "vllm_neuron.functional.attention.mla_sparse",
+        "mla_sparse_tiled_dispatch_counters"),
+    "mla_sparse_row_tiled": (
+        "vllm_neuron.functional.attention.mla_sparse",
+        "mla_sparse_row_tiled_dispatch_counters"),
+    "dsa_kpool_hadamard": (
+        "vllm_neuron.functional.dsa.kpool_hadamard",
+        "kpool_hadamard_dispatch_counters"),
+    "dsa_paged_gather": (
+        "vllm_neuron.functional.dsa.paged_gather",
+        "paged_gather_dispatch_counters"),
+    "dsa_score_gemm": (
+        "vllm_neuron.functional.dsa.score_gemm", "score_gemm_dispatch_counters"),
+    "dsa_topk_select": (
+        "vllm_neuron.functional.dsa.topk_select", "topk_select_dispatch_counters"),
+    "dsa_index_expand": (
+        "vllm_neuron.functional.dsa.index_expand",
+        "index_expand_dispatch_counters"),
+    "dsa_decode_tail_update": (
+        "vllm_neuron.functional.dsa.decode_tail_update",
+        "decode_tail_dispatch_counters"),
+    "dsa_ragged_pack": (
+        "vllm_neuron.functional.dsa.ragged_pack", "ragged_pack_dispatch_counters"),
 }
 #: Derived rather than written a second time: a seam listed in one and missing
 #: from the other would make the route predicate iterate a name nothing resolves.
-_SEAMS = tuple(_SEAM_MODULE_PATHS)
+_SEAMS = tuple(_SEAM_REGISTRY)
+
+#: The suffix every counter accessor in this repository carries. Read by the
+#: coverage control below, so the rule it enforces has one spelling.
+#:
+#: NO LEADING UNDERSCORE, and that is measured rather than assumed
+#: (``probe-054a-counter-names-r1``, twelve modules read): the two blockwise seam
+#: modules spell their accessors plainly ``dispatch_counters`` /
+#: ``reset_dispatch_counters``, with no family prefix at all, so a suffix of
+#: ``"_dispatch_counters"`` matches nothing in them and would make the control
+#: below fire on every item -- the four already landed included.
+_COUNTER_SUFFIX = "dispatch_counters"
 
 
 def _seam_modules() -> dict:
@@ -214,25 +273,71 @@ def _seam_modules() -> dict:
     the package's convention rather than one slip to route around.
 
     The previous form's ALIASING was not the mistake, and its reason still holds:
-    both seam modules spell their accessors identically, so a bare ``from ...
-    import dispatch_counters`` would resolve to whichever module was imported
-    last. Naming the module is what avoids that collision. An alias simply was
-    not enough to make the bound object a module.
+    the two blockwise seam modules spell their accessors identically, so a bare
+    ``from ... import dispatch_counters`` would resolve to whichever module was
+    imported last. Naming the module is what avoids that collision. An alias
+    simply was not enough to make the bound object a module.
     """
     return {name: importlib.import_module(path)
-            for name, path in _SEAM_MODULE_PATHS.items()}
+            for name, (path, _reader) in _SEAM_REGISTRY.items()}
+
+
+def _seam_counter_api(name: str) -> tuple:
+    """``(read, reset)`` for one registered family. The reset name is DERIVED."""
+    path, reader = _SEAM_REGISTRY[name]
+    module = importlib.import_module(path)
+    return getattr(module, reader), getattr(module, f"reset_{reader}")
 
 
 def _read_seam_counters() -> dict:
-    """``{seam: (nki_dispatch, torch_fallback)}`` as each seam reports itself."""
-    return {name: tuple(mod.dispatch_counters())
-            for name, mod in _seam_modules().items()}
+    """``{seam: (nki_dispatch, torch_fallback)}`` as each family reports itself."""
+    return {name: tuple(int(v) for v in _seam_counter_api(name)[0]())
+            for name in _SEAMS}
 
 
 def _reset_seam_counters() -> None:
-    """Zero every seam this campaign owns, so a reading is this item's own."""
-    for mod in _seam_modules().values():
-        mod.reset_dispatch_counters()
+    """Zero every family this campaign owns, so a reading is this item's own."""
+    for name in _SEAMS:
+        _seam_counter_api(name)[1]()
+
+
+def _assert_every_counter_family_is_registered() -> None:
+    """Every counter family in every registered module is claimed by a row.
+
+    The registry names its readers, so a module that grows a SECOND family would
+    be read by nobody and its dispatches would leave the torch-fallback total
+    silently incomplete. This walks each registered module for the accessor suffix
+    and requires the set it finds to equal the set the registry claims for that
+    module -- which is the property naming buys and discovery does not.
+
+    ``dir()`` shows imported names too, so a module that imported another's
+    accessor would read as owning a family it does not define. Measured, not
+    assumed: across all twelve registered modules no name ending in the suffix is
+    imported or assigned, only defined (``probe-054a-counter-names-r1``).
+
+    Raises:
+        VacuousControlError: naming which module and which family is unclaimed.
+    """
+    claimed: dict[str, set] = {}
+    for name in _SEAMS:
+        path, reader = _SEAM_REGISTRY[name]
+        claimed.setdefault(path, set()).add(reader)
+    for path, readers in claimed.items():
+        module = importlib.import_module(path)
+        found = {
+            attribute for attribute in dir(module)
+            if attribute.endswith(_COUNTER_SUFFIX)
+            and not attribute.startswith("reset_")
+        }
+        print(f"TINYFWD|counter_families|module={path}"
+              f"|found={sorted(found)}|claimed={sorted(readers)}")
+        if found != readers:
+            raise VacuousControlError(
+                f"{path} reports the counter families {sorted(found)} and this "
+                f"file's registry claims {sorted(readers)}. An unclaimed family "
+                f"is a seam whose dispatches and whose torch fallbacks no route "
+                f"predicate reads"
+            )
 
 
 def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict) -> None:
@@ -251,11 +356,15 @@ def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict
     2. the torch-fallback total across every seam reads exactly 0.
     3. the set of seams that fired is non-empty, and equals ``expected``.
 
+    THE POPULATION IS CHECKED FIRST, because conjuncts 2 and 3 are statements
+    about a set and an unclaimed counter family would quietly shrink it.
+
     Raises:
         VacuousControlError: on any conjunct, named so the transcript says which.
     """
     from vllm_neuron.utils.neuron_utils import can_run_kernel
 
+    _assert_every_counter_family_is_registered()
     gate = bool(can_run_kernel(torch.zeros(1)))
     fired = {}
     fallbacks = 0
@@ -1759,3 +1868,675 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     torch.testing.assert_close(
         bare_got.float(), routed_reference["out"].float(), rtol=RTOL, atol=ATOL
     )
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 5's OWN GEOMETRY. The four MLP items above run at the MLP widths and read #
+# no attention field; this one needs a whole attention geometry, and every width #
+# below is ADOPTED from the landed DSA fixture (``test_dsa_layer.py:231-242``)   #
+# together with the reason that fixture records for it. Adopted rather than      #
+# re-chosen because those values are already measured against each seam's own    #
+# validator, and re-choosing them would put this item in the business of         #
+# re-deriving admissibility it does not own.                                     #
+#                                                                              #
+# THE THREE THAT MAY NOT MOVE, in that fixture's own words: ``index_head_dim``  #
+# is PINNED at 128 because three seams refuse any other width (the Hadamard     #
+# path is a 128-point transform); ``index_kpool`` stays a power of two, which    #
+# ``can_run_dsa_index_expand`` requires; and ``qk_rope_head_dim`` is 0, the      #
+# checkpoint's own value, which ``mla_sparse.py:1287`` admits by name.           #
+# --------------------------------------------------------------------------- #
+MLA_HIDDEN_SIZE = 256
+MLA_HEADS = 4
+MLA_Q_LORA_RANK = 128
+#: An exact fit for the sparse seam's 128-wide partition tile, which selects the
+#: UNTILED body (``mla_sparse.py:1420``) -- the same body production's 512 takes.
+#: A ragged latent would move the tiled counters this item declares at zero.
+MLA_KV_LORA_RANK = 128
+MLA_QK_NOPE_HEAD_DIM = 64
+MLA_QK_ROPE_HEAD_DIM = 0
+MLA_V_HEAD_DIM = 64
+MLA_INDEX_N_HEADS = 4
+MLA_INDEX_HEAD_DIM = 128
+MLA_INDEX_KPOOL = 4
+#: Pools selected per query. ``can_run_dsa_topk_select`` needs ``0 < k < width``
+#: STRICTLY, so two selected pools against eight candidates leaves room on both
+#: sides of that bound.
+MLA_TOPK_POOLS = 2
+MLA_PAGE_SIZE = 4
+MLA_PAGES = 8
+
+#: ``35 = 8 * 4 + 3``: eight complete pools plus a FULL tail, which is the landed
+#: fixture's own choice and its reason is arithmetic rather than taste --
+#: ``35 % 4 == 3`` keeps every tail column a real token index, and the prefill
+#: candidate width lands on 8, the granularity ``nisa.max8`` emits
+#: (``test_dsa_layer.py:135-166`` records the whole derivation and the risk it
+#: bounds). This item runs the PREFILL leg once; the decode leg is
+#: ``inc-glm53f-042``'s and ``inc-glm53f-051``'s and both are landed.
+MLA_TOKENS = 35
+
+#: One generator, drawn in ``projection_widths()`` order. Successive draws from one
+#: stream share no values, so the per-operand seeds items 1 to 4 use to keep two
+#: separately-built operands apart are not needed here -- and the landed attention
+#: fixtures both use exactly this form (``test_mla_decode.py:136``,
+#: ``test_dsa_layer.py:1893``).
+SEED_MLA = 5431
+
+#: THE REGISTERED SOFTMAX SCALE, and it is the plan's value rather than this
+#: file's: ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``, registered at the
+#: increment plan's ``inc-glm53f-054a`` block on the reference implementation's own
+#: derivation (``modeling_glm5_next.py:1128`` with ``:1087``, applied once at
+#: ``:1052``). It is ``0.125`` at this geometry and ``0.0625`` at the checkpoint's.
+#:
+#: THE NEAREST LANDED CONSTANT IS NOT ADOPTED, deliberately: two landed test files
+#: compute this scale as ``kv_lora_rank ** -0.5``, which is the same number times
+#: ``sqrt(2)`` on both fixture geometries, and ``inc-glm53f-109`` repairs them. A
+#: control below recomputes this item's reference at that retired derivation and
+#: requires it to fall OUTSIDE the tolerance, so this item is measurably sensitive
+#: to which of the two it uses.
+MLA_SOFTMAX_SCALE = float(
+    (MLA_QK_NOPE_HEAD_DIM + MLA_QK_ROPE_HEAD_DIM) ** -0.5
+)
+MLA_RETIRED_SOFTMAX_SCALE = float(MLA_KV_LORA_RANK ** -0.5)
+
+
+def _mla_text_config():
+    """The checkpoint's config narrowed to item 5's geometry.
+
+    ``dataclasses.replace`` on a default construction, which is the landed
+    attention fixture's idiom (``test_dsa_layer.py:1002-1009``): every field this
+    item does not name keeps the checkpoint's value, so a config drift reaches
+    this item instead of being overwritten by it.
+
+    ``select_k()`` is ``index_topk // index_kpool``, so the dial set here is
+    ``index_topk`` -- the one upstream itself expresses in TOKENS -- and the pool
+    granularity stays derived.
+    """
+    from dataclasses import replace
+
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    return replace(
+        Glm5NextTextConfig(),
+        hidden_size=MLA_HIDDEN_SIZE,
+        num_key_value_heads=NUM_KEY_VALUE_HEADS,
+        num_attention_heads=MLA_HEADS,
+        q_lora_rank=MLA_Q_LORA_RANK,
+        kv_lora_rank=MLA_KV_LORA_RANK,
+        qk_nope_head_dim=MLA_QK_NOPE_HEAD_DIM,
+        qk_rope_head_dim=MLA_QK_ROPE_HEAD_DIM,
+        v_head_dim=MLA_V_HEAD_DIM,
+        index_n_heads=MLA_INDEX_N_HEADS,
+        index_head_dim=MLA_INDEX_HEAD_DIM,
+        index_kpool=MLA_INDEX_KPOOL,
+        index_topk=MLA_TOPK_POOLS * MLA_INDEX_KPOOL,
+    )
+
+
+def _mla_contract(x: torch.Tensor, weight_out_in: torch.Tensor) -> torch.Tensor:
+    """One projection, from the CHECKPOINT-shaped ``[out, in]`` leaf, in fp32.
+
+    The transpose happens here rather than being read out of
+    ``_prepared_weight``, so the reference never consumes the implementation's own
+    prepared cache -- the same rule items 1 to 4 follow when they dequantise their
+    own operands instead of calling the seam's oracle.
+    """
+    return x.to(torch.float32) @ weight_out_in.to(torch.float32).t()
+
+
+def _mla_latent_norm(
+    x: torch.Tensor, gain: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """RMSNorm on a latent: ``x / sqrt(mean(x**2) + eps) * gain``, fp32, no cast.
+
+    ``eps`` is resolved from the config by the caller, never written here, which is
+    the acceptance's own requirement: a wrong call-site epsilon must redden a
+    comparison rather than cancel out on both sides.
+    """
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    return x * torch.rsqrt(variance + float(eps)) * gain.to(torch.float32)
+
+
+def _mla_attention_fixture(*, seed: int = SEED_MLA):
+    """One MLA attention module, every leaf materialised and both preps run.
+
+    Returns ``(attention, raw, gains, config)`` where ``raw`` holds the five
+    projection leaves in the checkpoint's ``[out, in]`` orientation and ``gains``
+    the two latent-norm gains -- the operands the reference reads.
+
+    THE WEIGHTS ARE ``randn * in_features ** -0.5``, the scaling both landed
+    attention fixtures use (``test_mla_decode.py:139-143``), so activations stay
+    order one instead of growing until the comparison measures overflow. The fp8
+    ``1/8``-grid conditioning items 1 to 4 need is NOT used here and its absence is
+    deliberate: those items compare a blockwise-quantised matmul, where a signed
+    draw makes every dot product a near-cancelling sum, while this path is fp32
+    end to end and has no block scales to line up.
+    """
+    model_fp8 = _impl()
+    cfg = _mla_text_config()
+    attention = model_fp8.Glm5NextMLAAttention(cfg)
+    gen = torch.Generator().manual_seed(int(seed))
+
+    raw: dict = {}
+    for name, in_features, out_features in attention.projection_widths():
+        weight = torch.randn(
+            out_features, in_features, generator=gen, dtype=torch.float32
+        ) * (in_features ** -0.5)
+        raw[name] = weight
+        setattr(attention, f"{name}_weight", torch.nn.Parameter(weight))
+
+    gains: dict = {}
+    for gain_name, width in (
+        ("q_a_layernorm_weight", int(cfg.q_lora_rank)),
+        ("kv_a_layernorm_weight", int(cfg.kv_lora_rank)),
+    ):
+        gain = 1.0 + torch.randn(width, generator=gen, dtype=torch.float32) * 0.05
+        gains[gain_name] = gain
+        setattr(attention, gain_name, torch.nn.Parameter(gain))
+
+    prepared = attention.prepare_projection_weights()
+    absorbed = attention.prepare_absorb_weights()
+    if (prepared, absorbed) != (5, 2):
+        raise VacuousControlError(
+            f"the load-time preps built {prepared} projection(s) and {absorbed} "
+            f"absorb operand(s); this geometry declares five and two"
+        )
+    _materialise_mla_indexer(attention.indexer, gen)
+
+    parameters = sum(int(p.numel()) for p in attention.parameters())
+    print(f"TINYFWD|mla_fixture|parameters={parameters}|bound={MAX_PARAMETERS}"
+          f"|heads={MLA_HEADS}|latent={MLA_KV_LORA_RANK}|tokens={MLA_TOKENS}")
+    if parameters >= MAX_PARAMETERS:
+        raise VacuousControlError(
+            f"the attention module carries {parameters} parameters, at or past "
+            f"the adopted tiny bound of {MAX_PARAMETERS}"
+        )
+    # The constraint set's head-width bound, MEASURED on this geometry's own head
+    # widths rather than declared: the four MLP items above read no head field, so
+    # this is the first item where the bound means anything.
+    widths = {
+        "qk_nope_head_dim": int(cfg.qk_nope_head_dim),
+        "qk_rope_head_dim": int(cfg.qk_rope_head_dim),
+        "v_head_dim": int(cfg.v_head_dim),
+        "index_head_dim": int(cfg.index_head_dim),
+    }
+    print(f"TINYFWD|mla_fixture|head_widths={sorted(widths.items())}"
+          f"|bound={MAX_HEAD_DIM}")
+    over = {name: width for name, width in widths.items() if width > MAX_HEAD_DIM}
+    if over:
+        raise VacuousControlError(
+            f"{sorted(over.items())} exceeds the adopted tiny bound "
+            f"head_dim <= {MAX_HEAD_DIM}"
+        )
+    return attention, raw, gains, cfg
+
+
+def _materialise_mla_indexer(indexer, gen: torch.Generator) -> None:
+    """The indexer's seven leaves, then its own load-time prep.
+
+    The attribute name comes from the indexer's OWN ``PROJECTION_PARAMETERS`` map
+    rather than from a suffix rule, because that map is not uniform -- three sites
+    carry a ``_weight`` suffix and ``index_kpool_compress_gate`` does not, so
+    guessing would materialise three of four (``test_dsa_layer.py:1591-1593``).
+    """
+    for name, in_features, out_features in indexer.projection_widths():
+        weight = torch.randn(
+            out_features, in_features, generator=gen, dtype=torch.float32
+        ) * (in_features ** -0.5)
+        setattr(
+            indexer, indexer.PROJECTION_PARAMETERS[name], torch.nn.Parameter(weight)
+        )
+    head_dim = int(indexer.index_head_dim)
+    pool = int(indexer.index_kpool)
+    indexer.k_norm_weight = torch.nn.Parameter(
+        1.0 + torch.randn(head_dim, generator=gen, dtype=torch.float32) * 0.05
+    )
+    indexer.k_norm_bias = torch.nn.Parameter(
+        torch.randn(head_dim, generator=gen, dtype=torch.float32) * 0.02
+    )
+    # A bf16 checkpoint leaf, stored in the checkpoint's dtype: the consumer casts
+    # it per call, so pre-casting here would let the fixture agree with a cast the
+    # implementation still has to do.
+    indexer.index_kpool_compress_ape = torch.nn.Parameter(
+        (torch.randn(pool, head_dim, generator=gen, dtype=torch.float32) * 0.1).to(
+            torch.bfloat16
+        ),
+        requires_grad=False,
+    )
+    prepared = indexer.prepare_projection_weights()
+    if prepared != 4:
+        raise VacuousControlError(
+            f"the indexer prep built {prepared} projections, not four"
+        )
+
+
+def _mla_selection_operands() -> dict:
+    """The operands the selection stage needs, each derived from its own rule.
+
+    ``slot_mapping`` is pool-granular: a position carries its pool's id where a
+    pool COMPLETES and ``-1`` where it does not, which is how a position says "my
+    window is not a whole pool" and is steered to the trash row rather than
+    dropped. ``seq_lens`` carries one length per score ROW and the rows are
+    tokens, so each token's own context length is its own -- which makes the tail
+    each token's own incomplete pool.
+    """
+    slots = torch.full((MLA_TOKENS,), -1, dtype=torch.int32)
+    for position in range(MLA_TOKENS):
+        if (position + 1) % MLA_INDEX_KPOOL == 0:
+            slots[position] = position // MLA_INDEX_KPOOL
+    candidates = MLA_TOKENS // MLA_INDEX_KPOOL
+    rows = MLA_PAGES * MLA_PAGE_SIZE
+    if candidates <= MLA_TOPK_POOLS:
+        raise VacuousControlError(
+            f"{candidates} candidate pool(s) is not more than the "
+            f"{MLA_TOPK_POOLS} selected, and the indexer serves the bypass "
+            f"regime there instead of selecting"
+        )
+    if candidates > rows - 1:
+        raise VacuousControlError(
+            f"{candidates} candidates leaves no trash row above them in {rows} "
+            f"pooled-key rows"
+        )
+    return {
+        "slot_mapping": slots,
+        "seq_lens": torch.arange(1, MLA_TOKENS + 1, dtype=torch.int32),
+        "candidates": candidates,
+        "pool_rows": rows,
+    }
+
+
+def _mla_pool_cache() -> torch.Tensor:
+    """The pooled-key store, ``[rows, index_head_dim]`` bf16, written in place."""
+    return torch.zeros(
+        MLA_PAGES * MLA_PAGE_SIZE, MLA_INDEX_HEAD_DIM, dtype=torch.bfloat16
+    )
+
+
+def _mla_latent_cache(attention) -> torch.Tensor:
+    """The latent cache at the layer's OWN declared spec, one latent per token.
+
+    ``head_size`` is read off the module rather than typed, because the module
+    derives it from two config fields and a cache built from a literal would stop
+    tracking that derivation.
+
+    FLOAT32 RATHER THAN THE SPEC'S BF16, and the choice is the caller's: the shape
+    check is the only thing ``attend()`` asserts about this tensor, and both the
+    path and the reference write the same latents through the same dtype, so bf16
+    would round both sides identically and prove nothing extra while spending a
+    tenth of the tolerance. The landed DSA fixture makes the same choice
+    (``test_dsa_layer.py:1984-1986``); the bf16 spec dtype is exercised by
+    ``inc-glm53f-042``'s own items.
+    """
+    return torch.zeros(
+        MLA_TOKENS, attention.NUM_LATENT_KV_HEADS, int(attention.head_size),
+        dtype=torch.float32,
+    )
+
+
+def _mla_dense_reference(
+    attention,
+    raw: dict,
+    gains: dict,
+    normed: torch.Tensor,
+    latent_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    *,
+    softmax_scale: float,
+    honour_sentinels: bool = True,
+) -> torch.Tensor:
+    """Dense MLA attention in torch, from the same weights. ``[tokens, hidden]``.
+
+    THE REFERENCE IS THE DENSE FORM, WHICH IS NOT THE FORM UNDER TEST, and that is
+    the whole value of it. The reference implementation this campaign compares
+    against never absorbs: it materialises full-width keys and values through
+    ``kv_b_proj`` and contracts them against a query at the head width
+    (``modeling_glm5_next.py:1145-1152``, ``:1164``). The fork's path absorbs
+    ``kv_b_proj``'s two halves into the query and into the output instead. The two
+    are the same dot product rewritten, so a dense reference certifies the absorb
+    algebra as well as the composition -- and it reads neither ``W_UK`` nor
+    ``W_UV``, so a permutation error in the split cannot cancel out.
+
+    THE SENTINEL SEMANTICS ARE UPSTREAM'S DESIGN, named explicitly because they
+    change the function: a selected-row column holding ``-1`` carries NO token, so
+    it takes no probability mass, and a row that is wholly sentinel produces
+    zeros. Upstream initialises its whole index buffer to ``-1`` and writes the
+    ``-1``-bearing expansion straight into it
+    (``sparse_attn_indexer_kpool.py:435``, ``:606``); the fork's seam masks the
+    value rather than reading it and admits ``-1`` alone below zero
+    (``mla_sparse.py:1394-1405``). ``honour_sentinels=False`` is the FAILING
+    CONTROL for that reading: it points every sentinel column at cache row 0, the
+    in-range filler upstream can only afford because it also clamps the row's
+    length and zeroes the output afterwards.
+
+    The gather-then-softmax structure is mirrored rather than replaced by a mask
+    over the whole cache: softmax normalises over the columns it is GIVEN, so a
+    column that appeared twice would take twice the mass, and only the gathered
+    form reproduces that.
+
+    MUTATES ``latent_cache``, exactly as ``attend()`` does and in the same order --
+    the write lands before the read, so a token attends to its own latent. Each
+    caller therefore hands this function its own cache. The start position is 0
+    for every caller in this item, so the written slots ARE the whole read prefix
+    and no start argument is threaded here; ``attend()``'s own items cover a
+    non-zero start.
+    """
+    tokens = int(normed.shape[0])
+    heads = int(attention.num_attention_heads)
+    nope = int(attention.qk_nope_head_dim)
+    vdim = int(attention.v_head_dim)
+    eps = float(attention.rms_norm_eps)
+    x = normed.to(torch.float32)
+
+    q_latent = _mla_latent_norm(
+        _mla_contract(x, raw["q_a_proj"]), gains["q_a_layernorm_weight"], eps
+    )
+    query = _mla_contract(q_latent, raw["q_b_proj"]).reshape(tokens, heads, nope)
+    kv_latent = _mla_latent_norm(
+        _mla_contract(x, raw["kv_a_proj_with_mqa"]),
+        gains["kv_a_layernorm_weight"],
+        eps,
+    )
+
+    latent_cache[0:tokens, 0, :] = kv_latent.to(latent_cache.dtype)
+    c_kv = latent_cache[:tokens, 0, :].to(torch.float32)
+
+    # THE DENSE EXPANSION. One weight, both halves, split on the boundary the
+    # reference implementation splits on.
+    key_value = _mla_contract(c_kv, raw["kv_b_proj"]).reshape(
+        tokens, heads, nope + vdim
+    )
+    key_nope = key_value[..., :nope]
+    value = key_value[..., nope:]
+
+    index = topk_indices.to(torch.int64)
+    keep = index >= 0
+    rows = index.clamp(min=0)
+    out = torch.empty(tokens, heads, vdim, dtype=torch.float32)
+    for token in range(tokens):
+        gathered_key = key_nope[rows[token]]        # [K, H, nope]
+        gathered_value = value[rows[token]]         # [K, H, v]
+        scores = torch.einsum("hd,khd->hk", query[token], gathered_key)
+        if honour_sentinels:
+            scores = scores.masked_fill(~keep[token], float("-inf"))
+        # ``nan_to_num`` because softmax of an all -inf row is NaN rather than the
+        # zeros the kernels write for a wholly-sentinel row.
+        weights = torch.nan_to_num(
+            torch.softmax(scores * float(softmax_scale), dim=-1)
+        )
+        out[token] = torch.einsum("hk,khv->hv", weights, gathered_value)
+
+    flat = out.reshape(tokens, heads * vdim)
+    return _mla_contract(flat, raw["o_proj"]).to(normed.dtype)
+
+
+def _mla_outside_tolerance(label: str, moved: torch.Tensor, base: torch.Tensor) -> None:
+    """One clamp-style control: ``moved`` must fall OUTSIDE this item's band.
+
+    The file's declared control form -- recompute the whole reference with one
+    branch changed and require the result to leave the tolerance the item passes
+    inside, so a fixture that stopped discriminating fails as a control instead of
+    passing as an item.
+    """
+    outside = not torch.allclose(moved.float(), base.float(), rtol=RTOL, atol=ATOL)
+    gap = float((moved.float() - base.float()).abs().max() / base.abs().max())
+    print(f"TINYFWD|mla_control|branch={label}|outside_tolerance={outside}"
+          f"|gap={gap:.6f}")
+    if not outside:
+        raise VacuousControlError(
+            f"{label}: the change leaves the reference inside rtol={RTOL}, "
+            f"atol={ATOL}, so this item cannot tell the two apart"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# ITEM 5 of 7 -- ``Glm5NextMLAAttention.forward``.                             #
+# Certifying component: ``model_fp8.Glm5NextMLAAttention.forward``.            #
+#                                                                              #
+# WHAT IT CERTIFIES. This forward is the attention half's whole composition:    #
+# the query latent the indexer contracts, the indexer that selects rows, and    #
+# ``attend()``, which ends in the output projection. So the item runs it once   #
+# and compares against a DENSE MLA reference built from the same raw weights --  #
+# the form the reference implementation itself computes, which the absorbed     #
+# path is an exact rewrite of. Nothing here re-certifies a callee: the absorb    #
+# split is ``inc-glm53f-042``'s, the selection chain ``inc-glm53f-051``'s.       #
+#                                                                              #
+# THE INDEXER IS EXECUTED RATHER THAN IMITATED, item 4's convention on the      #
+# router applied to the other selector: its indices are an INPUT to the         #
+# reference. Re-deriving them would put this item in the business of certifying  #
+# the indexer -- eight seams and a Hadamard transform -- and would make the      #
+# comparison hostage to a near-tie flipping one query's pool set. The item does  #
+# check that two calls on the same operands return the same indices, because the #
+# forward makes a THIRD call and the reference stands on the first.              #
+#                                                                              #
+# THE PREFILL LEG ONLY, once, which is what the acceptance asks for: one        #
+# forward, one call. The decode leg's tail ring is ``inc-glm53f-042``'s and      #
+# ``inc-glm53f-051``'s and both are landed with their own items.                 #
+#                                                                              #
+# CAUSALITY IS NOT MEASURED HERE, disclosed rather than implied: a query's       #
+# selected pools may sit past its own position, because bounding them is the     #
+# indexer's business and ``inc-glm53f-051``'s acceptance owns it. Both sides of  #
+# this comparison read the same indices, so the composition is what is measured. #
+# --------------------------------------------------------------------------- #
+def test_tiny_mla_attention_forward_matches_the_reference() -> None:
+    """The MLA attention forward equals dense MLA attention on the same weights.
+
+    D1.4 certifying component: ``Glm5NextMLAAttention.forward`` -- the three-call
+    composition, the registered softmax scale it is handed, and the sentinel
+    semantics of the indices it passes through untouched.
+    """
+    attention, raw, gains, cfg = _mla_attention_fixture()
+    operands = _mla_selection_operands()
+    normed = (
+        torch.randn(
+            MLA_TOKENS, MLA_HIDDEN_SIZE,
+            generator=torch.Generator().manual_seed(SEED_MLA + 1),
+            dtype=torch.float32,
+        )
+        * 0.5
+    )
+
+    # ---- THE INDEXER, EXECUTED. Twice, on two of its OWN pooled-key stores, so
+    # the reference's indices are measured to be the ones a third call will
+    # produce rather than assumed to be.
+    q_latent = attention.project_query_latent(normed)
+    selections = []
+    for _ in range(2):
+        selections.append(
+            attention.indexer(
+                normed,
+                q_latent,
+                _mla_pool_cache(),
+                operands["seq_lens"],
+                max_seq_len=MLA_TOKENS,
+                page_size=MLA_PAGE_SIZE,
+                slot_mapping=operands["slot_mapping"],
+            )
+        )
+    topk_indices, repeat = selections
+    sentinels = int((topk_indices < 0).sum())
+    print(f"TINYFWD|mla_selection|shape={tuple(topk_indices.shape)}"
+          f"|sentinel_columns={sentinels}"
+          f"|max_row={int(topk_indices.max())}|tokens={MLA_TOKENS}")
+    if not torch.equal(topk_indices, repeat):
+        raise VacuousControlError(
+            "two indexer calls on identical operands returned different "
+            "selections, so the reference cannot stand on the first while the "
+            "forward makes a third"
+        )
+    if sentinels == 0:
+        raise VacuousControlError(
+            "no selected-row column carries the -1 sentinel, so the sentinel "
+            "control below would measure nothing. The expansion pads its raw "
+            f"width up to a multiple of the sparse seam's key chunk, and this "
+            f"geometry emits {tuple(topk_indices.shape)}"
+        )
+
+    # ---- THE QUERY LATENT AGREES WITH THE REFERENCE'S OWN DERIVATION. Free, and
+    # it settles that the value the indexer selected on is the value the reference
+    # would have computed -- so the two chains part at the selection and nowhere
+    # earlier.
+    reference_latent = _mla_latent_norm(
+        _mla_contract(normed, raw["q_a_proj"]),
+        gains["q_a_layernorm_weight"],
+        float(cfg.rms_norm_eps),
+    )
+    torch.testing.assert_close(
+        q_latent.float(), reference_latent.float(), rtol=RTOL, atol=ATOL
+    )
+
+    expected = _mla_dense_reference(
+        attention, raw, gains, normed, _mla_latent_cache(attention), topk_indices,
+        softmax_scale=MLA_SOFTMAX_SCALE,
+    )
+
+    # ---- THE REGISTERED ROUTE PREDICATE, around this item's own call.
+    latent_cache = _mla_latent_cache(attention)
+    _reset_seam_counters()
+    before = _read_seam_counters()
+    got = attention.forward(
+        normed,
+        latent_cache=latent_cache,
+        pool_cache=_mla_pool_cache(),
+        seq_lens=operands["seq_lens"],
+        start_position=0,
+        softmax_scale=MLA_SOFTMAX_SCALE,
+        max_seq_len=MLA_TOKENS,
+        page_size=MLA_PAGE_SIZE,
+        slot_mapping=operands["slot_mapping"],
+    )
+    after = _read_seam_counters()
+    # EVERY FIGURE IS READ OFF A LANDED, GREEN TABLE FOR THIS SAME COMPOSITION
+    # rather than counted by eye. Nine projections per layer per phase is
+    # ``test_dsa_layer.py:479-506``'s closed form, term by term: one for the query
+    # latent, four inside the indexer's projection stage, three inside
+    # ``project_query_and_latent`` (its first statement is the nested
+    # ``project_query_latent``) and one for the output. The DSA figures are that
+    # file's prefill column (``:297-307``): the pooling and the query rotation
+    # share one module and so read two, and the tail-ring update is decode-only
+    # and reads zero. Two absorbs and one sparse call are ``attend()``'s own.
+    # The two tiled sparse counters are DECLARED ZEROS at this geometry -- the
+    # latent is an exact 128 fit and 128 selected rows is inside one moving tile --
+    # so they are registered and read rather than left out of the population.
+    _assert_route_predicate(
+        "5 MLA attention",
+        {
+            "mla_projection": 9,
+            "mla_absorb": 2,
+            "mla_sparse": 1,
+            "dsa_kpool_hadamard": 2,
+            "dsa_paged_gather": 1,
+            "dsa_score_gemm": 1,
+            "dsa_topk_select": 1,
+            "dsa_index_expand": 1,
+        },
+        before,
+        after,
+    )
+
+    if tuple(got.shape) != (MLA_TOKENS, MLA_HIDDEN_SIZE):
+        raise ReferenceShapeError(
+            f"the forward returned {tuple(got.shape)}, expected "
+            f"{(MLA_TOKENS, MLA_HIDDEN_SIZE)}"
+        )
+    print(f"TINYFWD|mla_compare|max_abs_diff="
+          f"{float((got.float() - expected.float()).abs().max()):.10g}"
+          f"|peak_reference={float(expected.abs().max()):.10g}")
+    torch.testing.assert_close(got.float(), expected.float(), rtol=RTOL, atol=ATOL)
+
+    # ---- THE CACHE WAS WRITTEN, and by the path rather than only by the
+    # reference. Every token's latent lands in its own slot, so a forward that
+    # skipped the write would attend to zeros and this reading is where that shows
+    # before the comparison above is trusted.
+    written = latent_cache[:MLA_TOKENS, 0, :]
+    if int((written.abs().sum(dim=-1) == 0).sum()) != 0:
+        raise VacuousControlError(
+            "the forward left at least one cache slot all zero, so the latents "
+            "it attended to are not the ones it computed"
+        )
+
+    # ---- CONTROL A: THE SENTINEL COLUMNS CARRY NO MASS. Pointing them at a real
+    # cache row is upstream's other option and it is a DIFFERENT function; the
+    # reference recomputed that way must leave the band.
+    _mla_outside_tolerance(
+        "sentinel columns filled with cache row 0",
+        _mla_dense_reference(
+            attention, raw, gains, normed, _mla_latent_cache(attention),
+            topk_indices, softmax_scale=MLA_SOFTMAX_SCALE,
+            honour_sentinels=False,
+        ),
+        expected,
+    )
+
+    # ---- CONTROL B: THE REGISTERED SCALE IS THE ONE THAT MATTERS. Recomputed at
+    # the retired ``kv_lora_rank ** -0.5`` derivation two landed files still carry,
+    # which is this item's scale times sqrt(2).
+    _mla_outside_tolerance(
+        f"softmax scale {MLA_RETIRED_SOFTMAX_SCALE:.7f} rather than the registered "
+        f"{MLA_SOFTMAX_SCALE:.7f}",
+        _mla_dense_reference(
+            attention, raw, gains, normed, _mla_latent_cache(attention),
+            topk_indices, softmax_scale=MLA_RETIRED_SOFTMAX_SCALE,
+        ),
+        expected,
+    )
+
+    # ---- CONTROL C: THE FORWARD READS THE PREPARED WEIGHTS AND DOES NOT REBUILD
+    # THEM. Called before the load-time prep it must refuse by name, and no seam
+    # may move -- which is what tells a refusal from a silent per-call rebuild.
+    model_fp8 = _impl()
+    bare = model_fp8.Glm5NextMLAAttention(cfg)
+    for name in raw:
+        setattr(bare, f"{name}_weight", torch.nn.Parameter(raw[name]))
+    for gain_name, gain in gains.items():
+        setattr(bare, gain_name, torch.nn.Parameter(gain))
+    _reset_seam_counters()
+    unprepared_before = _read_seam_counters()
+    with pytest.raises(ValueError, match="prepare_projection_weights"):
+        bare.forward(
+            normed,
+            latent_cache=_mla_latent_cache(attention),
+            pool_cache=_mla_pool_cache(),
+            seq_lens=operands["seq_lens"],
+            start_position=0,
+            softmax_scale=MLA_SOFTMAX_SCALE,
+            max_seq_len=MLA_TOKENS,
+            page_size=MLA_PAGE_SIZE,
+            slot_mapping=operands["slot_mapping"],
+        )
+    unprepared_after = _read_seam_counters()
+    moved = {
+        seam: unprepared_after[seam][0] - unprepared_before[seam][0]
+        for seam in _SEAMS
+        if unprepared_after[seam][0] != unprepared_before[seam][0]
+    }
+    print(f"TINYFWD|mla_control|branch=forward before the projection prep"
+          f"|refused=True|seams_that_moved={sorted(moved.items())}")
+    if moved:
+        raise VacuousControlError(
+            f"the refusal ran after {sorted(moved.items())} dispatched, so it is "
+            f"not the first thing the forward does with an unprepared weight"
+        )
+
+    # ---- CONTROL D: THE ABSORB OPERANDS ARE READ, NOT REBUILT. Same reading one
+    # prep later: projections prepared, absorb split not run, refusal by name.
+    half = model_fp8.Glm5NextMLAAttention(cfg)
+    for name in raw:
+        setattr(half, f"{name}_weight", torch.nn.Parameter(raw[name]))
+    for gain_name, gain in gains.items():
+        setattr(half, gain_name, torch.nn.Parameter(gain))
+    half.prepare_projection_weights()
+    _materialise_mla_indexer(half.indexer, torch.Generator().manual_seed(SEED_MLA))
+    with pytest.raises(
+        model_fp8.Glm5NextMLADecodeError, match="prepare_absorb_weights"
+    ):
+        half.forward(
+            normed,
+            latent_cache=_mla_latent_cache(attention),
+            pool_cache=_mla_pool_cache(),
+            seq_lens=operands["seq_lens"],
+            start_position=0,
+            softmax_scale=MLA_SOFTMAX_SCALE,
+            max_seq_len=MLA_TOKENS,
+            page_size=MLA_PAGE_SIZE,
+            slot_mapping=operands["slot_mapping"],
+        )
+    print("TINYFWD|mla_control|branch=forward before the absorb split|refused=True")
