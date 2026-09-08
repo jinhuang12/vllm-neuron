@@ -1904,13 +1904,20 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 # 256x256 blocks`` from ``blockwise_fp8_mm.py:283-287``, reached through
 # ``model_fp8.py:1576``.
 #
-# The bank does not need that prep. ``Glm5NextRoutedExperts`` defines NEITHER
-# load-time prep -- only ``Glm5NextSharedExperts`` (scale) and
-# ``Glm5NextMLAAttention`` (projection) do -- so ``_run_load_time_preps``'s
-# ``hasattr(type(module), ...)`` gate never visits a bank at all. So these items
-# set ``n_shared_experts=0``, which ``model_fp8.py:1857`` reads as "build no
-# shared-expert module", and the routed load completes on the bank's own path.
-# The landed constants are REUSED rather than copied, so a change to the
+# So these items set ``n_shared_experts=0``, which ``model_fp8.py`` reads as "build
+# no shared-expert module", and the routed load completes on the bank's own path.
+#
+# ``inc-glm53f-054a`` CHANGED THE SECOND HALF OF THIS PARAGRAPH, which used to read
+# "The bank does not need that prep. ``Glm5NextRoutedExperts`` defines NEITHER
+# load-time prep ... so ``_run_load_time_preps``'s ``hasattr(type(module), ...)``
+# gate never visits a bank at all." Item (i) gave the bank its own
+# ``prepare_scale_operands``, so that gate now DOES visit every bank, and the bank's
+# prep retiles -- which refuses an extent that is not a whole 256 block. The
+# sentence above about the shared expert is unchanged and still the reason
+# ``n_shared_experts`` is 0 here; what moved is the BANK's own extents, which
+# :func:`_blocked_bank_overrides` writes at 512 by 256 for exactly these items.
+# ``MINI_WEIGHT_SHAPE`` stays ``(128, 128)`` and stays every other item's shape.
+# The landed constants are otherwise REUSED rather than copied, so a change to the
 # miniature moves these items with the other nine.
 # --------------------------------------------------------------------------- #
 
@@ -1918,6 +1925,105 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 #: it expects on each rank. Two ranks over ``MINI_ROUTED_EXPERTS`` experts.
 STACKED_EP_DEGREE = 2
 STACKED_EXPERTS_PER_RANK = MINI_ROUTED_EXPERTS // STACKED_EP_DEGREE
+
+
+#: The bank's widths for the items whose load now RUNS the bank's scale prep --
+#: ``inc-glm53f-054a``'s migration of the five items that reached it.
+#:
+#: A NEW NAME, NOT A REBINDING, on the precedent :data:`DEFERRED_NARROW` states
+#: for the same situation. :data:`MINI_WEIGHT_SHAPE` stays ``(128, 128)`` and stays
+#: every other item's shape; the increment plan's hand-off bullet says in words
+#: that it is not widened, and it is not. What changed is that the bank now
+#: declares ``prepare_scale_operands``, so a load that carries a bank reaches a
+#: retile that refuses any extent which is not a whole ``256`` block
+#: (``blockwise_fp8_retile.py:232-245``) -- and ``(128, 128)`` is not one. Only the
+#: items that reach the prep are given extents that are.
+#:
+#: WHY 512 BY 256. 256 is the smallest width the consumer admits at all (DECISIONS
+#: §83 ruling 1, the ground :data:`DEFERRED_NARROW` records). The out extent is
+#: DOUBLE that on purpose: at 256 by 256 every grid is a single block, and a
+#: single-block grid cannot tell a coarsening apart from no coarsening at all, so
+#: the axis the retile actually folds would be untested.
+BLOCKED_BANK_OUT = 512
+BLOCKED_BANK_IN = 256
+
+#: The bank's three leaves with the dim each is written along, in the frame the
+#: bank registers them: gate and up as ``[I, H]`` and down as ``[H, I]``. The same
+#: dims :data:`DEFERRED_FAMILIES` states for the same three, so the two fixtures
+#: cannot disagree about the bank's orientation.
+BLOCKED_BANK_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
+    ("Glm5NextRoutedExperts", "gate_proj_weight"): (0, BLOCKED_BANK_OUT),
+    ("Glm5NextRoutedExperts", "up_proj_weight"): (0, BLOCKED_BANK_OUT),
+    ("Glm5NextRoutedExperts", "down_proj_weight"): (1, BLOCKED_BANK_OUT),
+}
+
+
+def _blocked_bank_overrides(
+    model: Glm5NextForConditionalGeneration,
+    mappings: dict[str, str | list[str]],
+) -> dict[str, torch.Tensor]:
+    """The bank's checkpoint tensors at 256-blocked extents, VALUES unchanged.
+
+    Only the extents move. Every tensor is built the way
+    :func:`_write_miniature_checkpoint` builds it -- ``torch.ones`` squeezed into
+    fp8 for a weight, ``torch.full(0.5)`` for a grid -- so no item that reads a
+    VALUE can move, and the items that read an extent read it from the checkpoint's
+    own slices through :func:`_implied_numels` rather than from a constant.
+
+    Nothing here spells a checkpoint key: the keys come from the map, the shapes
+    from :data:`BLOCKED_BANK_FAMILIES`, and a grid's shape from
+    ``block_grid_shape`` -- the same closed form the loader divides by. That is
+    :func:`_shard_key_overrides`'s discipline, followed here for the same reason.
+
+    ALL SCALES EQUAL IS THE POINT, not laziness. Every ratio inside a ``256``
+    block is then exactly 1, so the retile's rescale is bit-exact and its two
+    losslessness counters read zero. A fixture with unequal scales would make
+    those counters report the fixture rather than the layout.
+    """
+    overrides: dict[str, torch.Tensor] = {}
+    for path, module in model.named_modules():
+        cls = type(module).__name__
+        for (family, leaf), (shard_dim, full) in BLOCKED_BANK_FAMILIES.items():
+            if cls != family:
+                continue
+            param = f"{path}.{leaf}"
+            if param not in mappings:
+                continue
+            keys = _keys_of(mappings, param)
+            scales = scale_keys(keys)
+            weights = [key for key in keys if key not in scales]
+            shape = (
+                (full, BLOCKED_BANK_IN)
+                if shard_dim == 0
+                else (BLOCKED_BANK_IN, full)
+            )
+            grid_shape = block_grid_shape(shape, DEFAULT_WEIGHT_BLOCK_SIZE)
+            for key in weights:
+                overrides[key] = torch.ones(
+                    shape, dtype=torch.bfloat16
+                ).to(torch.float8_e4m3fn)
+            for key in scales:
+                overrides[key] = torch.full(grid_shape, 0.5, dtype=torch.float32)
+    return overrides
+
+
+def _stacked_checkpoint(
+    directory: Path,
+    mappings: dict[str, str | list[str]],
+    model: Glm5NextForConditionalGeneration,
+) -> int:
+    """:func:`_write_miniature_checkpoint` with the bank at 256-blocked extents.
+
+    ONE call site for the migration, so the five items that reach the bank's scale
+    prep cannot drift apart in the widths they load. Everything except the bank is
+    written exactly as the landed writer writes it.
+    """
+    return _write_miniature_checkpoint(
+        directory,
+        mappings,
+        model,
+        extra_overrides=_blocked_bank_overrides(model, mappings),
+    )
 
 
 def _stacked_config() -> Glm5NextConfig:
@@ -2078,7 +2184,7 @@ def test_the_stacked_bank_delivers_every_expert_or_refuses_by_name(
     directory = tmp_path / "stacked"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    written = _write_miniature_checkpoint(directory, mappings, model)
+    written = _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
 
     print(f"CONJUNCT1_CHECKPOINT_TENSORS={written}")
@@ -2560,7 +2666,7 @@ def test_bankscale_grids_arrive_on_the_bank_as_plain_attributes(
     directory = tmp_path / "bankscale"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    _write_miniature_checkpoint(directory, mappings, model)
+    _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
     assert banks, (
         "this configuration produced no expert-bank entry, so conjunct (1) would "
@@ -2685,7 +2791,7 @@ def test_bankscale_grids_arrive_on_the_bank_as_plain_attributes(
     # ── the D1.5 control: alter ONE scale slice, move EXACTLY one row ─────────
     control_directory = tmp_path / "bankscale-control"
     control_model = _stacked_model()
-    _write_miniature_checkpoint(control_directory, mappings, control_model)
+    _stacked_checkpoint(control_directory, mappings, control_model)
     _distinguish_bank_experts(control_directory, subject_keys)
     altered_expert = layout.experts - 1
     altered_key = subject_keys[layout.scale_at[altered_expert]]
@@ -2744,7 +2850,7 @@ def test_bankscale_leaf_derivation_reads_presence_not_declaration(
     directory = tmp_path / "bankscale-leaves"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    _write_miniature_checkpoint(directory, mappings, model)
+    _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
     assert banks, "no bank entry, so this item has no subject"
     model.load_weights(str(directory), device, None)
@@ -2809,31 +2915,41 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 ) -> None:
     """(3) THE LOOP'S BEHAVIOUR IS UNCHANGED for every landed module.
 
-    Certifies ``_run_load_time_preps``'s visit, read from its RETURN VALUE. The
-    bank now carries three scale grids, and the question this item answers is
-    whether that changed who the loop calls. It did not, and it could not: the
-    loop's gate is a TYPE test and ``Glm5NextRoutedExperts`` defines no
-    ``prepare_scale_operands`` -- ``inc-glm53f-054``'s work, moved there at design
-    entry ``design-20260905-x``.
+    Certifies ``_run_load_time_preps``'s visit, read from its RETURN VALUE.
+
+    ``inc-glm53f-054a`` MOVED THIS ITEM'S SCALE COUNT, and the increment plan said
+    it would: "the prep's arrival makes ``_run_load_time_preps`` visit the bank
+    (its scale-call count rises by the bank count) -- read it here". Before item
+    (i) the bank declared no ``prepare_scale_operands`` and the count was zero.
+    It declares one now, the loop's gate is a type test, so every bank module is
+    visited and the count is the number of bank modules. The fixture moved with
+    it: this item's bank is written at 256-blocked extents
+    (:func:`_blocked_bank_overrides`), because the prep it now reaches retiles and
+    the retile refuses anything narrower. ``MINI_WEIGHT_SHAPE`` did not move.
 
     (i) On a completing load of the bank configuration, the returned pair equals
     the module counts the loop's own two gates select, derived from the tree
-    rather than written down. The scale count is zero because this configuration
-    builds no shared-expert module, and no bank is visited.
+    rather than written down, and the scale half of that pair equals the bank
+    count. Both sides come from the tree, so the agreement is a reading of the
+    loop and not of a number kept here.
 
-    THE CONTROL MOVES, which is what makes that zero a reading. A stub
-    ``prepare_scale_operands`` is planted on the BANK'S TYPE -- the thing the gate
-    actually tests -- and the scale count rises by the number of bank modules. The
-    stub is reached through the full landed path: the device pre-flight passes,
-    ``_scale_prep_leaves`` hands over three leaves, and the operands the loop
-    collects include the three grids conjunct (1) read. So the zero above means
-    "no bank declares a prep", not "the loop cannot reach one".
+    THE FALSIFIER IS THE DENSE ARM, and this is where it changed. The planted stub
+    below used to be what made the zero a reading; a zero that is now a bank count
+    needs a case with no bank instead, which the all-dense tree is -- it declares
+    no bank entry and its scale count is still zero. So the two arms bracket the
+    reading: bank present, count rises; bank absent, count zero.
+
+    THE STUB ARM STILL EARNS ITS PLACE, for a different reading. It captures the
+    SIX OPERANDS the loop hands the bank's prep -- three weights and the three
+    grids conjunct (1) read -- which the real prep consumes and never reports. The
+    stub is reached through the full landed path, so the device pre-flight passing
+    and ``_scale_prep_leaves`` yielding three leaves are part of what it shows.
     """
     device = torch.device("cpu")
     directory = tmp_path / "bankscale-loop"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    _write_miniature_checkpoint(directory, mappings, model)
+    _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
     owner_paths = _bank_owner_paths(banks)
     assert owner_paths, "no bank module, so this item has no subject"
@@ -2861,14 +2977,23 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
         f"gates select ({expected_projection}, {expected_scale}) modules, so it "
         f"visited something other than what it tests for"
     )
-    assert scale_calls == 0, (
-        f"the loop ran {scale_calls} scale preps on a configuration with no "
-        f"shared-expert module, so it is now visiting a bank -- which is "
-        f"inc-glm53f-054's work and breaks the 128-extent load this file reads"
+    # ``inc-glm53f-054a``. THIS COUNT MOVED, from 0 to the number of bank modules,
+    # and the increment plan's hand-off bullet says so in advance: "the prep's
+    # arrival makes ``_run_load_time_preps`` visit the bank (its scale-call count
+    # rises by the bank count) -- read it here". The bank declares
+    # ``prepare_scale_operands`` as of item (i), and the loop's gate is a type test,
+    # so the visit is not optional. The number is read off the tree's own bank
+    # modules rather than typed, so it follows the fixture instead of pinning it.
+    assert scale_calls == len(owner_paths), (
+        f"the loop ran {scale_calls} scale preps over {len(owner_paths)} bank "
+        f"modules on a configuration with no shared-expert module. Every scale "
+        f"prep on this tree is a bank's, so the two must agree: fewer means a "
+        f"bank was skipped, more means something else declared a prep"
     )
 
     # ── the same reading on the DENSE configuration ──────────────────────────
-    # Six of the seven completing loads in this file build ``_dense_model()``, and
+    # Most of the completing loads in this file build ``_dense_model()`` -- six of
+    # the seven that existed before ``inc-glm53f-054a`` item (iii) added one -- and
     # the STOP condition of this increment's block is that none of their readings
     # moves. The bank branch cannot reach this tree -- an all-dense config has no
     # sparse layer and so no bank entry -- and the pair is read here to say so
@@ -2904,7 +3029,12 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
         f"select {dense_expected}"
     )
 
-    # ── the control, and it MOVES: plant a prep on the BANK'S TYPE ────────────
+    # ── the stub arm: read the SIX OPERANDS the loop hands the bank's prep ────
+    # ``inc-glm53f-054a`` re-purposed this arm rather than deleting it. It was the
+    # control that made a zero a reading; the zero is a bank count now and the
+    # all-dense arm above is what brackets it. What the stub still shows, and
+    # nothing else does, is WHICH operands the loop collects and hands over -- the
+    # real prep consumes them and reports nothing about them.
     handed: dict[str, list[str]] = {}
 
     def stub(self, **operands) -> None:
@@ -2920,8 +3050,9 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 
     assert planted_scale == len(owner_paths), (
         f"with a prep planted on {bank_type.__name__} the loop ran "
-        f"{planted_scale} scale preps over {len(owner_paths)} bank modules, so "
-        f"the zero above is not a reading of who declares a prep"
+        f"{planted_scale} scale preps over {len(owner_paths)} bank modules; the "
+        f"stub stands in for the real prep on the same type, so the count it "
+        f"produces must be the same one the real prep produced above"
     )
     assert planted_projection == projection_calls, (
         f"planting a SCALE prep moved the projection count from "
@@ -3108,12 +3239,20 @@ def _shard_config(first_k_dense: int) -> Glm5NextConfig:
     """The shard fixture: :func:`_stacked_config`'s fields with two widths shrunk.
 
     ``n_shared_experts=0`` is carried over from :func:`_stacked_config` and is not
-    a convenience. No completing load in this file has a shared-expert module,
+    a convenience. No completing load on THIS fixture has a shared-expert module,
     because the landed shared-expert scale prep cannot run on a 128-block
     miniature (``inc-glm53f-095b``, which hands that fixture to ``-054``). So the
     shared expert's three deferred families cannot be observed by a real load
     here at all, and conjunct (4) prints that rather than quietly counting six
     deferred families where the table names nine.
+
+    THE FILE-WIDE CLAIM THIS SENTENCE USED TO MAKE IS NO LONGER TRUE, and it is
+    narrowed rather than deleted so the reason survives. It read "No completing
+    load in this file has a shared-expert module". ``inc-glm53f-054a`` item (iii)
+    added one -- ``test_blocked_the_shared_expert_prep_completes_a_load_and_the_
+    retile_ran``, on the 256-blocked checkpoint, where the prep can run because
+    the extents are whole blocks and the load-path retile publishes the grid it
+    wants. This fixture still has none, for the reason above.
 
     ``first_k_dense`` IS THE ONE VARYING FIELD, and the two values it takes are
     both readings rather than one real case and one convenience -- the same reason
@@ -3313,6 +3452,15 @@ def _shard_checkpoint(
     mappings = _mappings_for(config)
     reference = Glm5NextForConditionalGeneration(config)
     overrides = _shard_key_overrides(reference, mappings)
+    # ``inc-glm53f-054a``'s migration. This fixture's own narrow width is
+    # :data:`SHARD_NARROW`, which is 8 and stays 8 -- it is ``-094``'s constant and
+    # every family here except the bank is measured against it. The bank is the one
+    # family whose load now runs a scale prep, and that prep retiles, and the retile
+    # refuses an extent that is not a whole 256 block. So the bank alone takes
+    # :data:`BLOCKED_BANK_IN`, from its own table, and the eighteen sharded families
+    # are untouched. On the all-dense layout this adds no key at all, because no bank
+    # module exists to be found.
+    overrides.update(_blocked_bank_overrides(reference, mappings))
     assert len(overrides) >= len(SHARD_FAMILIES), (
         f"only {len(overrides)} checkpoint keys were given shard tensors, fewer "
         f"than the {len(SHARD_FAMILIES)} families this file declares sharded, so "
