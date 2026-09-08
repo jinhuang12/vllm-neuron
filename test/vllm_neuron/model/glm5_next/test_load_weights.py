@@ -4172,10 +4172,16 @@ def _deferred_key_overrides(
     from :data:`DEFERRED_FAMILIES`, the same discipline
     :func:`_shard_key_overrides` follows.
 
-    EVERY FAMILY THIS FIXTURE WRITES TAKES ONE NARROW WIDTH, :data:`DEFERRED_NARROW`.
-    ``inc-glm53f-094``'s writer is not reused for the fifteen, because a fixture
-    holding two narrow widths would give the consumer's grid check a different
-    answer per family and the reason for a refusal would stop being legible. The
+    EVERY FAMILY THIS FIXTURE WRITES TAKES :data:`DEFERRED_NARROW` UNLESS
+    :data:`SHARD_OTHER_EXTENT` DECLARES ITS OWN. ``inc-glm53f-107`` added the three
+    MLA rows there -- ``q_b_proj_weight``, ``kv_b_proj_weight`` and
+    ``o_proj_weight``, at their own declared extents rather than the 256 fallback --
+    so the older sentence, that every family takes ONE narrow width, stopped being
+    true at that commit and is corrected here. The reason the OTHER families still
+    share one width is unchanged: ``inc-glm53f-094``'s writer is not reused for the
+    fifteen, because a fixture holding two narrow widths for families whose refusal
+    must stay legible would give the consumer's grid check a different answer per
+    family and the reason for a refusal would stop being readable. The
     fifteen keep their SHARD extents and their dims exactly as
     :data:`SHARD_FAMILIES` states them -- only the extent no family shards changes.
     """
@@ -5683,16 +5689,29 @@ def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
 def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> None:
     """inc-glm53f-105b. Why -105 does not pad, and the gate that expires the reason.
 
-    Two readings, the second being the first one's control:
+    Four readings: two subjects, and a control for each.
 
     1. every MLA head width that inc-glm53f-100 shards is a whole number of the
-       consumer's quantisation blocks, measured on the dimension each family is
-       actually sharded on -- dim 0 for the two column-parallel projections, dim 1
-       for the row-parallel one, because a block is not square in principle even
-       though this consumer's is;
-    2. the same predicate run over a DeepSeek-style split that is NOT a whole
-       number of blocks, printed in the same output, so reading 1's zero is a
-       reading of the predicate rather than a claim about it.
+       CHECKPOINT TILE, ``DEFAULT_WEIGHT_BLOCK_SIZE``, measured on the dimension
+       each family is actually sharded on -- dim 0 for the two column-parallel
+       projections, dim 1 for the row-parallel one, because a tile is not square in
+       principle even though this checkpoint's is;
+    2. and a whole number of the CONSUMER's block, imported from
+       ``consumer_block_quant_size()``. These are TWO boundaries and not one
+       restated: ``shard_geometry_for_grid`` refuses on the tile and, separately,
+       on the consumer's block, so a width can clear the first and still stop the
+       load at the second;
+    3. reading 1's control, a DeepSeek-style split that is not a whole tile;
+    4. reading 2's control, a width that CLEARS the tile and still leaves half a
+       consumer block -- the case that made this item read green through a load
+       that refused, before the repair.
+
+    WHAT THIS DOCSTRING USED TO SAY, AND WHY IT WAS WRONG. Reading 1 called
+    ``DEFAULT_WEIGHT_BLOCK_SIZE`` "the consumer's quantisation blocks". It is the
+    checkpoint's tile; the consumer's block is a different number from a different
+    module, and conflating them is what left the second boundary ungated. The FILED
+    evidence record ``../increments/evidence-105b.md:16`` repeats the same wording
+    and keeps its bytes; the erratum belongs to this repair's own record.
 
     NOTHING IS TYPED. The head widths come from ``Glm5NextTextConfig``'s own
     defaults and the block extent from ``DEFAULT_WEIGHT_BLOCK_SIZE``, so a config
@@ -5714,8 +5733,20 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
     }
 
     def part_tile(shard_dim: int, head_width: int) -> int:
-        """The remainder a single head leaves in the consumer's block. 0 is whole."""
+        """The remainder a single head leaves in the CHECKPOINT tile. 0 is whole."""
         return head_width % DEFAULT_WEIGHT_BLOCK_SIZE[shard_dim]
+
+    #: The CONSUMER's block extent, IMPORTED from the consumer and never typed here.
+    #: A literal would be a second place for the consumer's granularity to live,
+    #: which is the reason ``consumer_block_quant_size`` exists and says so in its
+    #: own docstring. It is one number rather than a pair because
+    #: ``blockwise_fp8_mm.BLOCK_QUANT_SIZE`` is one number and the consumer applies
+    #: it on either dimension.
+    consumer_block = _WL_FP8.consumer_block_quant_size()
+
+    def part_block(head_width: int) -> int:
+        """The remainder a single head leaves in the CONSUMER's block. 0 is whole."""
+        return head_width % consumer_block
 
     print(f"GRIDSHARD_B_BLOCK_SIZE={DEFAULT_WEIGHT_BLOCK_SIZE}")
     print(
@@ -5730,6 +5761,16 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
         if part_tile(dim, width)
     }
     print(f"GRIDSHARD_B_HEAD_WIDTHS_LEAVING_A_PART_TILE={offenders}")
+
+    # READING 2, THE SECOND BOUNDARY. Same widths, the consumer's block instead of
+    # the checkpoint's tile.
+    print(f"GRIDSHARD_B_CONSUMER_BLOCK={consumer_block}")
+    block_offenders = {
+        leaf: width
+        for leaf, (_dim, width) in head_widths.items()
+        if part_block(width)
+    }
+    print(f"GRIDSHARD_B_HEAD_WIDTHS_LEAVING_A_PART_BLOCK={block_offenders}")
 
     # READING 2, THE CONTROL, in this same output. A DeepSeek-style split of 128
     # nope plus 64 rope gives 192 to a head, which is one and a half blocks. It is
@@ -5748,6 +5789,29 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
         "reading 1's empty result below says nothing"
     )
 
+    # READING 4, READING 2'S CONTROL, AND THE REASON THIS ITEM WAS REPAIRED. A q_b
+    # split of 256 nope plus 128 rope gives 384 to a head. That CLEARS the checkpoint
+    # tile -- 384 is three whole 128-row tiles -- and still leaves half a consumer
+    # block. Before the repair this item measured the tile alone, so a checkpoint like
+    # that read GREEN here while ``shard_geometry_for_grid`` refused the load at the
+    # consumer boundary: the refused-load-nobody-predicted this gate exists to catch.
+    # ``shard_geometry_for_grid``'s own docstring names this width in those words.
+    escaping_width = 256 + 128
+    escaping_tile = part_tile(0, escaping_width)
+    escaping_block = part_block(escaping_width)
+    print(
+        f"GRIDSHARD_B_CONTROL_ESCAPING_WIDTH={escaping_width} "
+        f"TILE_REMAINDER={escaping_tile} CONSUMER_REMAINDER={escaping_block}"
+    )
+    assert escaping_tile == 0 and escaping_block, (
+        f"the {escaping_width}-wide control no longer clears the tile while failing "
+        f"the consumer block: tile remainder {escaping_tile}, consumer remainder "
+        f"{escaping_block}, against tile {DEFAULT_WEIGHT_BLOCK_SIZE} and consumer "
+        f"block {consumer_block}. This control is the whole reason the item reads "
+        f"both boundaries, so if it stops discriminating then reading 2's empty "
+        f"result below says nothing"
+    )
+
     assert offenders == {}, (
         f"an MLA head width is not a whole number of quantisation blocks: "
         f"{offenders}, against a block size of {DEFAULT_WEIGHT_BLOCK_SIZE}. "
@@ -5759,6 +5823,17 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
         f"columns belonging to no head; that decision rested on this condition, so "
         f"this failure means the decision needs revisiting rather than the widths "
         f"being wrong"
+    )
+
+    assert block_offenders == {}, (
+        f"an MLA head width is not a whole number of the CONSUMER's blocks: "
+        f"{block_offenders}, against a consumer block of {consumer_block} imported "
+        f"from ``consumer_block_quant_size()``. Such a width can clear the "
+        f"{DEFAULT_WEIGHT_BLOCK_SIZE} checkpoint tile and still be refused, because "
+        f"``shard_geometry_for_grid`` makes TWO refusals and this is the second one. "
+        f"inc-glm53f-105 declines ``pad_to_consumer_block`` on a head-bearing axis, "
+        f"and that decision rested on BOTH boundaries holding, so this failure means "
+        f"the decision needs revisiting rather than the widths being wrong"
     )
 
 
