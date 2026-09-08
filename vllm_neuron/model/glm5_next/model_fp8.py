@@ -6528,11 +6528,228 @@ class Glm5NextModel(nn.Module):
             ]
         )
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextModel.forward is a stub created by inc-glm53f-013; the "
-            "full 45-layer forward lands with inc-glm53f-054"
-        )
+    # ── forward (``inc-glm53f-054a``, item 6 of 7) ────────────────────────
+
+    def _rms_norm(self, hidden_states: torch.Tensor, gain: torch.Tensor) -> torch.Tensor:
+        """``x / sqrt(mean(x**2) + eps) * gain``, computed in fp32 and cast back.
+
+        ONE BODY FOR THE TWO NORMS THIS CLASS APPLIES -- each layer's
+        post-attention (FFN) norm and the stack's final norm -- and the THIRD copy
+        of these five lines in this file. The duplication is inherited rather than
+        chosen: ``Glm5NextKDALayer._input_norm`` records why the two layer copies
+        exist (this file's module-level region is another increment's D14 section,
+        and a shared base class would move two landed classes), and both of those
+        grounds hold here too. This copy is inside this increment's own section,
+        which is the cheapest place in the file to carry it.
+
+        The epsilon is the checkpoint's ``rms_norm_eps``, read off the config on
+        every call rather than cached, so a fixture that edits the config between
+        calls cannot be normalised with a stale value.
+        """
+        eps = float(self.text_config.rms_norm_eps)
+        x = hidden_states.to(torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        normed = x * torch.rsqrt(variance + eps)
+        normed = normed * gain.to(torch.float32)
+        return normed.to(hidden_states.dtype)
+
+    def _ffn_half(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        *,
+        quant_config: Glm5NextQuantConfig,
+        block_size: int | None,
+        moe_group: object | None,
+        tp_degree: int,
+        expert_parallel_rank: int,
+    ) -> torch.Tensor:
+        """One layer's feed-forward contribution, WITHOUT its residual add.
+
+        The residual add is the caller's, so this method is only the sublayer:
+        normalise with that layer's own post-attention gain, then run whichever
+        MLP ``_build_mlp`` gave the layer.
+
+        WHY THIS LIVES HERE AND NOT IN THE LAYER FORWARDS. Both landed layer
+        forwards end at the attention half and both say why in the same words --
+        *"this forward stops at the attention half and ``inc-glm53f-054`` joins the
+        halves when it writes the 45-layer forward"*. This is that 45-layer forward,
+        and joining the halves here keeps both landed signatures byte-unchanged. It
+        is not a stylistic preference: five landed call sites in three other
+        increments' test files call those two forwards with the attention carriers
+        alone (measured, ``probe-054a-layer-callsites-r1``), and a required
+        ``quant_config`` on either signature would redden all five. THE COST,
+        DISCLOSED: ``Glm5NextDSALayer.forward`` and its KDA sibling stay
+        attention-half-only, so ``inc-glm53f-063``'s reference still mirrors them
+        exactly and the revision-238 rider's re-derivation over the full layer is
+        NOT triggered by this block.
+
+        THE MoE BRANCH TAKES THE ACTIVATIONS TWICE, which is item 4's finding
+        restated at its caller: this fork's router fuses the FFN RMSNorm inside the
+        kernel, so it consumes the PRE-norm tensor together with the norm's gain,
+        while both expert halves consume the normalised one. The gain the fused
+        router needs is this layer's ``post_attention_layernorm_weight``, and this
+        method is where that layer's own gain is in scope.
+
+        THE BRANCH IS ON THE MLP CLASS, NOT ON THE ATTENTION FAMILY. ``_build_mlp``
+        is the single authority for which layers carry experts (dense below
+        ``first_k_dense_replace``, sparse at and above it), and the two families are
+        orthogonal to it -- a linear-attention layer can hold either MLP. An
+        unrecognised third type refuses by name rather than falling through to one
+        of the two, on ``_build_layer``'s precedent for the family branch.
+
+        Returns:
+            ``[T, H]`` in ``hidden_states``' dtype. The dense route returns the
+            seam's fp32 and the sparse route returns the seams' own dtype; both
+            landed docstrings put that choice on the caller, and this is the
+            caller.
+        """
+        gain = layer.post_attention_layernorm_weight
+        if gain is None:
+            raise ValueError(
+                f"layer {getattr(layer, 'layer_idx', '?')} has no "
+                f"post_attention_layernorm_weight; the FFN norm's gain is a "
+                f"mapped checkpoint tensor "
+                f"(weight_loaders_fp8.py:397) and nothing was loaded onto it"
+            )
+        normed = self._rms_norm(hidden_states, gain)
+        mlp = layer.mlp
+        if isinstance(mlp, Glm5NextMoEBlock):
+            out = mlp(
+                hidden_states,
+                normed,
+                router_gamma=gain,
+                text_config=self.text_config,
+                quant_config=quant_config,
+                block_size=block_size,
+                moe_group=moe_group,
+                tp_degree=tp_degree,
+                expert_parallel_rank=expert_parallel_rank,
+            )
+        elif isinstance(mlp, Glm5NextDenseMLP):
+            out = mlp(normed, quant_config=quant_config)
+        else:
+            raise ValueError(
+                f"layer {getattr(layer, 'layer_idx', '?')} holds an MLP of type "
+                f"{type(mlp).__name__}; _build_mlp builds "
+                f"{Glm5NextDenseMLP.__name__} or {Glm5NextMoEBlock.__name__} and "
+                f"this forward has no route for anything else"
+            )
+        return out.to(hidden_states.dtype)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        layer_carriers: Sequence[dict],
+        quant_config: Glm5NextQuantConfig,
+        block_size: int | None = None,
+        moe_group: object | None = None,
+        tp_degree: int = 1,
+        expert_parallel_rank: int = 0,
+    ) -> torch.Tensor:
+        """The whole decoder stack: embed, every layer in config order, final norm.
+
+        THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC
+        carrier is ``inc-glm53f-030b``'s. The reference implementation carries
+        ``hc_mult`` parallel residual streams between layers -- it expands the
+        embeddings to ``[B, S, hc_mult, H]`` (``modeling_glm5_next.py:1477``), mixes
+        each sublayer's output back through a manifold-constrained hyper-connection
+        at BOTH sites (``:1316-1318``, ``:1325-1327``), and collapses the streams
+        with an unweighted mean before the final norm (``:1493``, ``:302``). This
+        forward carries ONE stream and adds, at both sites. That is a declared exclusion,
+        not an approximation of the reference: the mHC composition is
+        ``inc-glm53f-030b``'s increment, the six mHC weights already sit flat on
+        every layer waiting for it, and NOTHING IN THIS FORWARD IS CERTIFIED FOR
+        THE 4-STREAM CARRIER. At ``hc_mult`` 1 the reference does not degenerate to
+        an add either -- its `pre`, `post` and `comb` gates are sigmoids plus an
+        epsilon and never exactly 1 -- so a one-stream config would not make the
+        two forms equal.
+
+        THE STACK IS FAMILY-BLIND, which is the property ``inc-glm53f-013`` built
+        ``get_kv_spec``'s one loop for and the reason this signature takes carriers
+        as a SEQUENCE OF MAPPINGS rather than named cache arguments. The two
+        families need different state -- the linear-attention layers take
+        ``conv_state``/``recurrent_state``/``is_prefill``, the sparse-attention
+        layers take ``latent_cache``/``pool_cache``/``seq_lens`` and the rest -- and
+        both landed layer forwards declare their own. Each layer is handed its own
+        mapping with ``**``, so this method holds no per-family branch at all and a
+        new family costs it nothing. Building each mapping from the runner's caches
+        is ``inc-glm53f-054b``'s threading job, which is exactly the division the
+        plan records: ``-051`` declares the layer-side interface and ``-054``
+        threads it.
+
+        THE SOFTMAX SCALE IS THE CALLER'S, NOT THIS METHOD'S. Each sparse-attention
+        layer's ``softmax_scale`` rides in that layer's own carrier mapping. The
+        registered value is
+        ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``, and a caller that
+        supplies another number is measured by this block's acceptance rather than
+        corrected here -- putting the constant in this loop would give the tree two
+        authorities for one registered value.
+
+        Args:
+            input_ids: ``[T]`` integer token ids. Embedded by indexing
+                ``embed_tokens_weight`` (mapped at
+                ``weight_loaders_fp8.py:378``); this tree holds no
+                ``nn.Embedding`` module, so the lookup is the index.
+            layer_carriers: one mapping per layer, in stack order, each holding
+                that layer's own forward keywords. A length that disagrees with
+                the stack refuses by name.
+            quant_config: the resolved quantisation policy, threaded down to each
+                MLP. An ARGUMENT rather than a field, the convention every landed
+                compute method in this file follows; the root resolves it once.
+            block_size: tokens per block, forwarded to the expert bank unread.
+            moe_group: the MoE ``GroupCoordinator``, forwarded unread.
+            tp_degree: ranks sharding each expert's intermediate dimension.
+            expert_parallel_rank: which rank's expert slice to select. The
+                registered TP=64 consumption form (``tp_degree`` 4,
+                ``expert_parallel_rank`` from ``get_neuron_ep_rank()``) is the
+                CALLER's to supply, so no degree is frozen at this site.
+
+        Returns:
+            ``[T, H]`` after the final RMSNorm, in the embedding table's dtype.
+            Logits are the root's, which is where ``lm_head_weight`` lives.
+
+        Raises:
+            ValueError: when the carrier count disagrees with the layer count, or
+                when a mapped parameter this forward reads was never loaded.
+        """
+        layers = list(self.layers)
+        carriers = list(layer_carriers)
+        if len(carriers) != len(layers):
+            raise ValueError(
+                f"Glm5NextModel.forward received {len(carriers)} per-layer carrier "
+                f"mappings for {len(layers)} layers; one mapping per layer is "
+                f"required, in stack order. A short sequence would silently run a "
+                f"prefix of the stack"
+            )
+        table = self.embed_tokens_weight
+        if table is None:
+            raise ValueError(
+                "Glm5NextModel.forward has no embed_tokens_weight; the embedding "
+                "table is a mapped checkpoint tensor "
+                "(weight_loaders_fp8.py:378) and nothing was loaded onto it"
+            )
+        hidden_states = table[input_ids]
+        for layer, carrier in zip(layers, carriers):
+            hidden_states = layer(hidden_states, **carrier)
+            hidden_states = hidden_states + self._ffn_half(
+                layer,
+                hidden_states,
+                quant_config=quant_config,
+                block_size=block_size,
+                moe_group=moe_group,
+                tp_degree=tp_degree,
+                expert_parallel_rank=expert_parallel_rank,
+            )
+        gain = self.norm_weight
+        if gain is None:
+            raise ValueError(
+                "Glm5NextModel.forward has no norm_weight; the final norm's gain "
+                "is a mapped checkpoint tensor (weight_loaders_fp8.py:381) and "
+                "nothing was loaded onto it"
+            )
+        return self._rms_norm(hidden_states, gain)
 
 
 # ---------------------------------------------------------------------------
@@ -7402,9 +7619,163 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     # ── forward ──────────────────────────────────────────────────────────
 
-    def forward(self, *args: object, **kwargs: object) -> torch.Tensor:
-        raise NotImplementedError(
-            "Glm5NextForConditionalGeneration.forward is a stub created by "
-            "inc-glm53f-013; the full 45-layer forward lands with "
-            "inc-glm53f-054"
+    def _head_weight(self) -> torch.Tensor:
+        """The tensor the vocabulary projection multiplies by, tied or untied.
+
+        Both arms return a ``[vocab, hidden]`` tensor, which is the orientation
+        :func:`torch.nn.functional.linear` wants and the orientation both
+        checkpoint keys already have, so the caller needs no transpose and no
+        branch of its own.
+
+        WHICH ARM IS PRODUCTION, MEASURED RATHER THAN ASSUMED. The real
+        checkpoint declares ``tie_word_embeddings`` **false**
+        (``test/vllm_neuron/model/glm5_next/fixtures/hf-config.json``, the
+        byte-identical copy ``inc-glm53f-078`` landed), so the untied arm is the
+        one this campaign's gates run and the tied arm exists because the config
+        admits it -- ``config.py:494-497`` lifts the flag from the checkpoint's
+        top level, and ``__init__`` above declares ``lm_head_weight`` only when
+        the flag is false, mirroring the weight map's own condition
+        (``weight_loaders_fp8.py:382-383``).
+
+        A TIED HEAD READS THE EMBEDDING TABLE ITSELF, not a copy of it. The map
+        adds no ``lm_head.weight`` entry in that case, so there is no second
+        tensor to read and nothing to keep in step; the table lives on
+        ``self.model`` because that is where the embedding lookup is.
+        """
+        if self.text_config.tie_word_embeddings:
+            table = self.model.embed_tokens_weight
+            if table is None:
+                raise ValueError(
+                    "Glm5NextForConditionalGeneration ties its head to the "
+                    "embedding table, and model.embed_tokens_weight is None; "
+                    "the table is a mapped checkpoint tensor "
+                    "(weight_loaders_fp8.py:378) and nothing was loaded onto it"
+                )
+            return table
+        weight = self.lm_head_weight
+        if weight is None:
+            raise ValueError(
+                "Glm5NextForConditionalGeneration has no lm_head_weight; the "
+                "head is a mapped checkpoint tensor "
+                "(weight_loaders_fp8.py:383) and nothing was loaded onto it"
+            )
+        return weight
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        layer_carriers: Sequence[dict],
+        sampling_positions: torch.Tensor,
+        block_size: int | None = None,
+        moe_group: object | None = None,
+        tp_degree: int = 1,
+        expert_parallel_rank: int = 0,
+    ) -> torch.Tensor:
+        """Logits for the rows the caller wants sampled: stack, select, project.
+
+        THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC
+        carrier is ``inc-glm53f-030b``'s. This root returns logits taken from a
+        ONE-stream residual carrier. The reference keeps ``hc_mult`` parallel
+        streams the whole way down and collapses them with an unweighted mean
+        just before the final norm (``modeling_glm5_next.py:1493``, ``:302``), so
+        the tensor this method projects is not the reference's tensor at
+        ``hc_mult`` > 1 -- a declared exclusion, recorded here as well as on
+        :meth:`Glm5NextModel.forward` because this is where a reader arrives
+        first.
+
+        THE HEAD IS A PLAIN ``torch`` PROJECTION AND THAT IS THE CHECKPOINT'S OWN
+        DECLARATION, not a fallback (P13). ``lm_head`` is one of the nine bare
+        entries in this checkpoint's 1,509-entry ``modules_to_not_convert`` list,
+        so its weight ships BF16 and no block-FP8 kernel applies to it -- read off
+        the landed fixture rather than recalled:
+        ``test/vllm_neuron/model/glm5_next/fixtures/hf-config.json``
+        (1,509 entries, ``lm_head`` present, bare). ``quantization.py:242-258``
+        records the same fact from the parser's side. The nearest landed form in
+        this package is :meth:`Glm5NextMTPModel.compute_draft_logits`
+        (``mtp.py:251``), which projects the shared head weight with
+        ``torch.nn.functional.linear`` for the same reason.
+
+        THE SELECTION IS ``torch.index_select`` ON DIM 0, the landed family form
+        (``llama3/model.py:1661``), and it happens BEFORE the projection rather
+        than after. On the real geometry the vocabulary is 154,880 wide and
+        hidden is 4,096, so projecting every row of a prefill would build
+        ``tokens x 154,880`` values to keep a handful of them; computing
+        ``logits_indices`` is exactly what the runner does to avoid that
+        (``neuron_model_runner.py:3891``).
+
+        ``sampling_positions`` IS REQUIRED, WITH NO DEFAULT, because every dict
+        that reaches this method is built by one of the runner's three builders
+        and all three set the key unconditionally
+        (``neuron_model_runner.py:4506``, ``:4844``, ``:7035``). A ``None``
+        default would therefore never be taken by the runner, and the only
+        behaviour it could add is the whole-prefill projection the line above
+        exists to prevent.
+
+        THERE IS NO ``**kwargs`` SINK, deliberately, and this is where the
+        family precedent is NOT followed. ``llama3/model.py:1622`` carries one as
+        its async-speculative-decoding injection point. The runner passes eight
+        keys today plus up to four conditional ones
+        (``neuron_model_runner.py:7031-7092``), and three of them --
+        ``sampling_params``, ``logit_mask`` and ``spec_decode_metadata`` -- carry
+        ON-DEVICE SAMPLING, which this tree implements nowhere: there is no
+        sampler on this class and no ``on_device_sampling_config``. A sink would
+        accept those three silently and return unsampled logits while reporting
+        success. Naming the parameters instead makes an unconsumed key a
+        ``TypeError`` at the call, which is what ``inc-glm53f-054b`` needs while
+        it converts those dicts. Turning the sampling keys into behaviour is NOT
+        this half's work and is not smuggled in here.
+
+        THE QUANTISATION POLICY IS RESOLVED HERE, ONCE PER CALL, and threaded
+        down as an argument -- the convention every landed compute method in this
+        file follows. It is not cached on the instance: the resolution reads four
+        attributes off the config and builds one spec
+        (``quantization.py:344-353``), the 1,509-entry skip list is carried by
+        reference and only matched later inside ``get_scheme``, and a field would
+        become a second authority for a policy the config already holds.
+
+        ``self.model(...)`` IS CALLED, not ``self.model.forward(...)``, so torch's
+        module hooks fire. This block's acceptance reads the stack's per-layer
+        boundaries through forward hooks, and calling the bound method directly
+        would make those hooks silently not fire.
+
+        THE HEAD IS RESOLVED FIRST, BEFORE THE STACK RUNS. It is not needed until
+        the last line, and reading it there would spend a whole 45-layer forward
+        before discovering that the tensor it feeds was never loaded. Resolving it
+        first makes that a named refusal with nothing dispatched, which is the same
+        shape :meth:`Glm5NextModel.forward` gives its own two mapped tensors.
+
+        Args:
+            input_ids: ``[T]`` integer token ids.
+            layer_carriers: one mapping per layer, in stack order, forwarded
+                unread to :meth:`Glm5NextModel.forward`, which refuses a count
+                that disagrees with the stack. Building them from the runner's
+                caches is ``inc-glm53f-054b``'s job.
+            sampling_positions: row indices into the stack output to project,
+                the runner's ``logits_indices``.
+            block_size: tokens per block, forwarded to the expert bank unread.
+            moe_group: the MoE ``GroupCoordinator``, forwarded unread.
+            tp_degree: ranks sharding each expert's intermediate dimension.
+            expert_parallel_rank: which rank's expert slice to select.
+
+        Returns:
+            ``[len(sampling_positions), vocab_size]`` logits, in the dtype the
+            head weight and the stack output share.
+
+        Raises:
+            ValueError: when the head tensor this call needs was never loaded,
+                or when the stack refuses its own inputs.
+        """
+        head = self._head_weight()
+        quant_config = Glm5NextQuantConfig.from_model_config(self.config)
+        hidden_states = self.model(
+            input_ids,
+            layer_carriers=layer_carriers,
+            quant_config=quant_config,
+            block_size=block_size,
+            moe_group=moe_group,
+            tp_degree=tp_degree,
+            expert_parallel_rank=expert_parallel_rank,
         )
+        rows = torch.index_select(hidden_states, dim=0, index=sampling_positions)
+        return torch.nn.functional.linear(rows, head)

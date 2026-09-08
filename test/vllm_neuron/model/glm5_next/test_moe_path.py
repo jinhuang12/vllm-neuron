@@ -1757,8 +1757,14 @@ def test_moe_path_landed_sections_are_untouched() -> None:
     assert int(bank.num_routed_experts) == E
     assert int(bank.num_experts_per_tok) == K
     assert int(text_config.n_routed_experts) == E
-    with pytest.raises(NotImplementedError, match="inc-glm53f-013"):
-        bank.forward()
+    # ``inc-glm53f-054a`` REMOVED THE STUB ARM THAT STOOD HERE. It asserted that
+    # ``Glm5NextRoutedExperts.forward`` raises ``NotImplementedError`` naming
+    # ``inc-glm53f-013``; that forward now computes, so the arm was a false
+    # statement about the tree rather than a check of it. Nothing replaces it here:
+    # what the forward does is certified by
+    # ``tiny/test_tiny_glm5next_forward.py``'s item 2, and this test's own claim --
+    # that ``-031``'s, ``-032``'s and ``-013``'s members still resolve unchanged --
+    # is carried by the assertions above and below.
     print(
         f"[landed] num_routed_experts={bank.num_routed_experts} "
         f"num_local_experts={bank.num_local_experts} "
