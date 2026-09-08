@@ -176,8 +176,23 @@ def kda_gate_clamp_kernel(g_hbm, a_hbm, bias_hbm, lower):
     # from the one this file used to hold.
     exp_a = _sbuf(1, 1)
     nisa.activation(dst=exp_a, data=nl.load(a_hbm, dtype=nl.float32), op=nl.exp)
+    # The decay scale has to reach kdim PARTITIONS before it can multiply this
+    # tile. ``tensor_scalar``'s ``operand0`` is a per-partition scalar: one value
+    # per destination partition, broadcast along the free axis only. A ``[1, 1]``
+    # tile is one value in one partition, so passing ``exp_a`` straight in made
+    # the compiler refuse the graph -- ``'nisa.tensor_scalar_arith' op 'operand0'
+    # partition total elements 1 != 'dst' partition total elements 16`` at
+    # kdim=16, and the same refusal at every kdim above one. The bias add above
+    # is the same call done right, with a ``[kdim, 1]`` column.
+    # ``nl.broadcast_to`` is the member that broadcasts on the partition axis and
+    # ``tensor_scalar`` is not: ``functional/moe/router.py:1271`` says so in its
+    # own comment and ``functional/mhc/sinkhorn.py:300`` reuses it. So the scale
+    # is scattered over the partitions here and the multiply below is unchanged.
+    # A ``float`` operand0 like ``lower`` further down stays legal as it is: a
+    # compile-time scalar has no partition axis to mismatch.
+    exp_col = nl.broadcast_to(exp_a, (kdim, 1))
     scaled = _sbuf(kdim, tokens)
-    nisa.tensor_scalar(dst=scaled, data=biased, op0=nl.multiply, operand0=exp_a)
+    nisa.tensor_scalar(dst=scaled, data=biased, op0=nl.multiply, operand0=exp_col)
 
     # gate = lower * sigmoid(z). One activation op, then one scale. The bound is
     # the factor, so the result lands in (lower, 0) without a clamp.
