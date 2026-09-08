@@ -64,7 +64,6 @@ from vllm_neuron.model.glm5_next.model_fp8 import (
     _is_fp8_dtype,
     _scale_prep_leaves,
 )
-from vllm_neuron.functional.blockwise_fp8_mm import BlockwiseFp8MmError
 from vllm_neuron.model.glm5_next.quantization import DEFAULT_WEIGHT_BLOCK_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     DSA_SCALED_PROJECTIONS,
@@ -4409,16 +4408,23 @@ def _mesh_answers(world_size: int, ep_degree: int, rank: int) -> tuple[int, int]
 
 
 class _DeferredLoad(NamedTuple):
-    """One load's outcome: the model with its shards attached, and the refusal.
+    """One load's outcome: the model with its shards attached, and the prep's count.
 
-    ``refusal`` is the ``BlockwiseFp8MmError`` text when the shared expert's
-    ``-054``-owned prep refused the checkpoint-tile grid, and ``None`` for the
-    firing control that carries no shared expert. Both are readings; neither is a
-    failure of this file.
+    ``prepared`` is how many scale operands the shared expert's prep built -- 3 on
+    every completing load that carries one -- and ``None`` for the firing control
+    that carries no shared expert. Both are readings; neither is a failure of this
+    file.
+
+    ``inc-glm53f-054a`` REPLACED THE FIELD THIS TUPLE CARRIED, and the replacement
+    was named in advance. It was ``refusal``: the ``BlockwiseFp8MmError`` text from
+    a prep that could not read a checkpoint-tile grid, because nothing retiled it.
+    :func:`_load_at_ep`'s own comment said that when ``-054`` landed the retile
+    this reading would flip to "the prep built 3" and the capture would become a
+    completing load. Item (iv) landed it, so it did.
     """
 
     model: Glm5NextForConditionalGeneration
-    refusal: str | None
+    prepared: int | None
 
 
 def _load_at_ep(
@@ -4458,30 +4464,28 @@ def _load_at_ep(
     _seed_page_cache_signal()
     if shared_experts == 0:
         # THE FIRING CONTROL. Same fixture, same narrow width, no shared expert --
-        # so the load runs to the end and records NO refusal. Without this side the
-        # recorded gap below would read the same whether the prep refused or the
-        # fixture could not load at all.
+        # so the load runs to the end and there is no prep to count. Without this
+        # side the reading below would be the same whether the prep built three
+        # operands or the fixture simply loaded with nothing to prepare.
         model.load_weights(str(directory), torch.device("cpu"), None)
         return _DeferredLoad(model, None)
 
-    # THE RECORDED GAP, OBSERVED RATHER THAN AVOIDED. DECISIONS §84: nothing on the
-    # shared expert's load path retiles its scale grid from the checkpoint's
-    # (128, 128) tiles onto the 256-granularity PUBLIC grid that the landed
-    # ``prepare_scale_operands`` demands (``model_fp8.py:1820-1824``), and placing
-    # that retile is ``inc-glm53f-054``'s by design entry x. So this load ATTACHES
-    # every shard and then refuses inside the prep, which runs after attachment
-    # (``load_weights``: shards at :4143, preps at :4154).
+    # THE GAP IS CLOSED, AND THE SAME ARITHMETIC READS IT EITHER WAY. Until
+    # ``inc-glm53f-054a`` item (iv), nothing on the shared expert's load path
+    # retiled its scale grid from the checkpoint's ``(128, 128)`` tiles onto the
+    # 256-granularity PUBLIC grid the landed ``prepare_scale_operands`` demands, so
+    # this load attached every shard and then refused inside the prep. DECISIONS §84
+    # placed that retile in this block; the comment that stood here named the flip
+    # in advance -- "the prep built 3", and the capture becomes a completing load.
     #
-    # WHEN ``-054`` LANDS THE RETILE THIS READING FLIPS to "the prep built 3" and
-    # the capture below becomes a completing load. That is the expected change,
-    # named here so the flip is a recorded move rather than a surprise.
-    with pytest.raises(BlockwiseFp8MmError) as raised:
-        model.load_weights(str(directory), torch.device("cpu"), None)
-    refusal = str(raised.value)
+    # THE TWO GRIDS BELOW ARE UNCHANGED and are still this file's own arithmetic.
+    # They used to be the two the refusal had to name: the grid the loader attached
+    # and the grid the prep wanted. They are now the grid the retile STARTED from
+    # and the grid the module ARRIVED at, so the same two numbers read the fix that
+    # read the defect, and a retile that published the wrong granularity fails here
+    # rather than passing quietly.
+    model.load_weights(str(directory), torch.device("cpu"), None)
 
-    # THE TWO GRIDS ARE THIS FILE'S OWN ARITHMETIC, not read back from the message.
-    # The prep's loop takes gate_proj first, so the refusal is the shared expert's
-    # gate: its per-rank rows by this fixture's narrow width.
     block = _WL_FP8.consumer_block_quant_size()
     rows = _padded_shard_extent(SHARED_INTERMEDIATE, world_size, block)
     cols = DEFERRED_NARROW
@@ -4490,19 +4494,51 @@ def _load_at_ep(
         cols // DEFAULT_WEIGHT_BLOCK_SIZE[1],
     )
     public_grid = (rows // block, cols // block)
-    assert f"shape {tile_grid}" in refusal, (
-        f"the refusal does not name the checkpoint-tile grid {tile_grid} the loader "
-        f"attached: {refusal}"
+
+    shared = [
+        (path, module)
+        for path, module in model.named_modules()
+        if type(module).__name__ == "Glm5NextSharedExperts"
+    ]
+    assert shared, (
+        f"this load was asked for {shared_experts} shared experts and built no "
+        f"Glm5NextSharedExperts module, so there is no prep here to read"
     )
-    assert f"expected {public_grid}" in refusal, (
-        f"the refusal does not name the public grid {public_grid} the prep demands: "
-        f"{refusal}"
+
+    # The prep's loop takes gate_proj first, so gate_proj is the projection the
+    # refusal used to name and the one read here, for continuity.
+    built: set[int] = set()
+    for path, module in shared:
+        prepared = getattr(module, Glm5NextSharedExperts.PREPARED_SCALE_OPERANDS_ATTR)
+        built.add(len(prepared))
+        health = getattr(module, Glm5NextSharedExperts.SHARED_RETILE_HEALTH_ATTR)
+        record = health["gate_proj_weight"]
+        assert record["retiled"] is True, (
+            f"{path}.gate_proj_weight was not retiled: {record.get('reason')}. At "
+            f"[{rows},{cols}] both extents are whole {block} blocks, so a skip "
+            f"here means the retile could not read the extents it was given"
+        )
+        assert tuple(record["checkpoint_grid"]) == tile_grid, (
+            f"{path} retiled from grid {tuple(record['checkpoint_grid'])}, not the "
+            f"checkpoint-tile grid {tile_grid} this world size produces"
+        )
+        assert tuple(record["public_grid"]) == public_grid, (
+            f"{path} published grid {tuple(record['public_grid'])}, not the public "
+            f"grid {public_grid} the prep demands at [K={rows}, N={cols}]"
+        )
+        grid = getattr(module, f"gate_proj_{FP8_SCALE_SUFFIX}")
+        assert tuple(grid.shape) == public_grid, (
+            f"{path}.gate_proj_{FP8_SCALE_SUFFIX} is {tuple(grid.shape)} on the "
+            f"module after the load, not the published {public_grid}; the retile "
+            f"has to replace the attribute the prep reads, not a copy of it"
+        )
+
+    assert built == {3}, (
+        f"the shared experts built {sorted(built)} scale operands, not 3 each. "
+        f"Three projections, one operand apiece, and the load completed -- so a "
+        f"shortfall means a projection was skipped rather than refused"
     )
-    assert f"[K={rows}, N={cols}]" in refusal, (
-        f"the refusal does not name the weight extents [K={rows}, N={cols}] this "
-        f"world size produces: {refusal}"
-    )
-    return _DeferredLoad(model, refusal)
+    return _DeferredLoad(model, 3)
 
 
 def _deferred_leaves(
@@ -4551,40 +4587,40 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
         )
         for rank in range(SHARD_EP_WORLD)
     }
-    # The RECORDED GAP is read on every rank before anything else: each load
-    # attached its shards and then the -054-owned prep refused the checkpoint-tile
-    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
-    # counted, so an item cannot read shards from a load that refused for some
-    # other reason.
+    # THE PREP'S OWN COUNT is read on every rank before anything else: each load
+    # attached its shards, the load-path retile published the public grid, and the
+    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # against this file's arithmetic; here the count is only counted, so an item
+    # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
-    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
-    print(f"CONJUNCT1D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
-    # The gap's own words, so the transcript carries the refusal verbatim and a
-    # later reader can see WHICH refusal these items recorded.
-    print(f"CONJUNCT1D_RECORDED_GAP_REFUSAL={loads[0].refusal}")
-    assert sorted(gap_refusals) == sorted(models), (
-        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
-        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
-        f"(so -054 landed and this reading flips) or never reached the prep"
+    prepped = [rank for rank, load in loads.items() if load.prepared == 3]
+    print(f"CONJUNCT1D_RANKS_WHOSE_PREP_BUILT_THREE={sorted(prepped)}")
+    print(f"CONJUNCT1D_PREPARED_OPERANDS_PER_RANK={loads[0].prepared}")
+    assert sorted(prepped) == sorted(models), (
+        f"only ranks {sorted(prepped)} built the shared expert's three scale "
+        f"operands, of {sorted(models)}. A rank that built none either never "
+        f"reached the prep or the load-path retile did not publish its grid"
     )
     whole_load = _load_at_ep(directory, 1, 0, 1, monkeypatch)
     whole = whole_load.model
-    assert whole_load.refusal is not None, (
-        "the world-size-1 load did not refuse inside the prep, so the recorded gap "
-        "is not a property of the shared expert's grid granularity after all"
+    assert whole_load.prepared == 3, (
+        f"the world-size-1 load built {whole_load.prepared} scale operands, not "
+        f"3, so the prep's success is a property of the sharded widths rather "
+        f"than of the retile that publishes the grid at any width"
     )
 
     # THE FIRING CONTROL (DECISIONS §84 ruling (ii)). The same fixture at the same
-    # narrow width with NO shared expert loads to the end and records no refusal, so
+    # narrow width with NO shared expert loads to the end and has no prep to run, so
     # the readings above are of the shared expert's prep and not of a fixture that
-    # cannot load at all.
+    # would load either way.
     control = _load_at_ep(
         directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch, shared_experts=0
     )
-    print(f"CONJUNCT1D_CONTROL_REFUSAL={control.refusal}")
-    assert control.refusal is None, (
-        f"the no-shared-expert control ALSO refused: {control.refusal}. Then the "
-        f"refusal is not the shared expert's prep and the recorded gap is misnamed"
+    print(f"CONJUNCT1D_CONTROL_PREPARED={control.prepared}")
+    assert control.prepared is None, (
+        f"the no-shared-expert control reported {control.prepared} prepared "
+        f"operands. Then the count above is not the shared expert's prep and the "
+        f"reading is misnamed"
     )
     control_shards = _sharded_leaves(control.model) + [
         row
@@ -4669,13 +4705,13 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
         f"CONJUNCT1D_PER_RANK_SHAPES_AS_DECLARED={checked}/"
         f"{SHARD_EP_WORLD * len(_deferred_leaves(models[0]))}"
     )
-    # ATTACHMENT BEFORE REFUSAL (DECISIONS §84 ruling (ii)). Every shape above was
-    # read off a module whose load REFUSED, and each rank in ``models`` is a rank in
-    # ``gap_refusals`` by the assertion at the top of this item. So the attachment
-    # completed and the refusal came after it. Item (2) reads the same shards' BYTES.
+    # ATTACHMENT THEN PREP (DECISIONS §84 ruling (ii)). Every shape above was read
+    # off a module whose load COMPLETED, and each rank in ``models`` is a rank in
+    # ``prepped`` by the assertion at the top of this item. So the attachment
+    # finished and the prep ran on it. Item (2) reads the same shards' BYTES.
     print(
-        f"CONJUNCT1D_ATTACHED_ON_REFUSING_RANKS={checked} on ranks "
-        f"{sorted(gap_refusals)}"
+        f"CONJUNCT1D_ATTACHED_ON_PREPARED_RANKS={checked} on ranks "
+        f"{sorted(prepped)}"
     )
     assert checked == SHARD_EP_WORLD * len(_deferred_leaves(models[0]))
     # Section 79.1: a subset reading over a measured set also asserts non-empty.
@@ -4797,18 +4833,18 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
         )
         for rank in range(SHARD_EP_WORLD)
     }
-    # The RECORDED GAP is read on every rank before anything else: each load
-    # attached its shards and then the -054-owned prep refused the checkpoint-tile
-    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
-    # counted, so an item cannot read shards from a load that refused for some
-    # other reason.
+    # THE PREP'S OWN COUNT is read on every rank before anything else: each load
+    # attached its shards, the load-path retile published the public grid, and the
+    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # against this file's arithmetic; here the count is only counted, so an item
+    # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
-    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
-    print(f"CONJUNCT2D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
-    assert sorted(gap_refusals) == sorted(models), (
-        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
-        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
-        f"(so -054 landed and this reading flips) or never reached the prep"
+    prepped = [rank for rank, load in loads.items() if load.prepared == 3]
+    print(f"CONJUNCT2D_RANKS_WHOSE_PREP_BUILT_THREE={sorted(prepped)}")
+    assert sorted(prepped) == sorted(models), (
+        f"only ranks {sorted(prepped)} built the shared expert's three scale "
+        f"operands, of {sorted(models)}. A rank that built none either never "
+        f"reached the prep or the load-path retile did not publish its grid"
     )
 
     reassembled = 0
@@ -4924,18 +4960,18 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         )
         for rank in range(SHARD_EP_WORLD)
     }
-    # The RECORDED GAP is read on every rank before anything else: each load
-    # attached its shards and then the -054-owned prep refused the checkpoint-tile
-    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
-    # counted, so an item cannot read shards from a load that refused for some
-    # other reason.
+    # THE PREP'S OWN COUNT is read on every rank before anything else: each load
+    # attached its shards, the load-path retile published the public grid, and the
+    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # against this file's arithmetic; here the count is only counted, so an item
+    # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
-    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
-    print(f"CONJUNCT3D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
-    assert sorted(gap_refusals) == sorted(models), (
-        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
-        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
-        f"(so -054 landed and this reading flips) or never reached the prep"
+    prepped = [rank for rank, load in loads.items() if load.prepared == 3]
+    print(f"CONJUNCT3D_RANKS_WHOSE_PREP_BUILT_THREE={sorted(prepped)}")
+    assert sorted(prepped) == sorted(models), (
+        f"only ranks {sorted(prepped)} built the shared expert's three scale "
+        f"operands, of {sorted(models)}. A rank that built none either never "
+        f"reached the prep or the load-path retile did not publish its grid"
     )
 
     dense_paths = sorted(
@@ -5124,11 +5160,11 @@ def test_sharedshard_the_six_families_left_the_replicated_set_both_directions(
     load0 = _load_at_ep(directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch)
     load1 = _load_at_ep(directory, SHARD_EP_WORLD, 1, SHARD_EP_DEGREE, monkeypatch)
     rank0, rank1 = load0.model, load1.model
-    recorded = [load0.refusal is not None, load1.refusal is not None]
-    print(f"CONJUNCT4D_BOTH_RANKS_RECORDED_THE_GAP={recorded}")
-    assert load0.refusal is not None and load1.refusal is not None, (
-        "one of the two loads did not record the -054 prep refusal, so the two are "
-        "not the same kind of load and their difference is not a shard reading"
+    recorded = [load0.prepared, load1.prepared]
+    print(f"CONJUNCT4D_BOTH_RANKS_PREPARED_OPERANDS={recorded}")
+    assert load0.prepared == 3 and load1.prepared == 3, (
+        f"the two loads built {recorded} scale operands, not three each, so they "
+        f"are not the same kind of load and their difference is not a shard reading"
     )
 
     declared_sharded = {
