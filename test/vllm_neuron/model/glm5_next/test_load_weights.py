@@ -3505,6 +3505,56 @@ def _max_abs_diff(left: torch.Tensor, right: torch.Tensor) -> float:
 # --------------------------------------------------------------------------- #
 
 
+#: The two classes whose loaded tensors are REPUBLISHED before any forward sees them.
+#: ``inc-glm53f-054a`` repair round 1: their load path now transposes each weight and
+#: its scale grid once, into the frame ``blockwise_fp8_mm`` multiplies in, because the
+#: checkpoint's own layout is the transpose of it and the kernel scale operand is built
+#: at load from the stored extents (so a per-forward transpose would agree on shape and
+#: be wrong on numbers). The routed expert bank is NOT here: it has its own prep and
+#: this republish never runs on it.
+_REPUBLISHED_CLASSES = ("Glm5NextDenseMLP", "Glm5NextSharedExperts")
+
+
+def _as_the_loader_left_it(
+    module: torch.nn.Module, name: str, tensor: torch.Tensor
+) -> torch.Tensor:
+    """One loaded tensor put back in the frame the LOADER delivered it in.
+
+    ``inc-glm53f-054a`` repair round 1. Every reading below that is about the
+    LOADER's own work -- which dim a family shards on, what a per-rank slice is,
+    whether two ranks reassemble the whole tensor -- asks its question of the
+    checkpoint's layout, and the load path no longer leaves the two republished
+    classes in that layout. So those readings pass through here, and their expected
+    values do NOT move: the declared shard dims, the per-rank widths and the
+    bit-exact reassembly are all still asserted against the same numbers this file
+    always asserted them against.
+
+    THE UNDO IS A TRANSPOSE AND NOTHING ELSE. The republish's other step, coarsening
+    a ``128``-tile grid onto the ``256`` public one, is NOT undone here and cannot
+    be: it requantises. A reading that needs the raw grid VALUES of a republished
+    class has to say so itself; this helper only restores the FRAME.
+
+    It keys on the class rather than on a shape, because a square weight's frame is
+    invisible in its shape and a reading that guessed from the shape would silently
+    stop undoing anything the day a miniature stopped being square.
+    """
+    if type(module).__name__ not in _REPUBLISHED_CLASSES:
+        return tensor
+    if not name.startswith(("gate_proj", "up_proj", "down_proj")):
+        return tensor
+    if tensor.dim() != 2:
+        return tensor
+    return tensor.t()
+
+
+def _in_the_loader_frame(
+    model: Glm5NextForConditionalGeneration, dotted: str
+) -> torch.Tensor:
+    """``_as_the_loader_left_it`` for a reading that holds only the dotted name."""
+    path, leaf = dotted.rsplit(".", 1)
+    return _as_the_loader_left_it(model.get_submodule(path), leaf, _loaded(model, dotted))
+
+
 def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
@@ -3526,8 +3576,12 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
 
     whole = _load_at_world(directory, 1, 0, monkeypatch, MINI_ALL_DENSE_FIRST_K)
     control = {
-        f"{path}.{leaf}": tuple(_loaded(whole, f"{path}.{leaf}").shape)
-        for path, _, leaf, _, _ in _sharded_leaves(whole)
+        f"{path}.{leaf}": tuple(
+            _as_the_loader_left_it(
+                module, leaf, _loaded(whole, f"{path}.{leaf}")
+            ).shape
+        )
+        for path, module, leaf, _, _ in _sharded_leaves(whole)
     }
     print(f"CONJUNCT1_FAMILIES_AT_WORLD_1={len(control)}")
 
@@ -3550,7 +3604,12 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
             )
             expected = list(full_shape)
             expected[shard_dim] = full // SHARD_WORLD
-            got = tuple(_loaded(sharded, dotted).shape)
+            # READ IN THE LOADER'S FRAME: the declared per-rank shape below is a
+            # statement about the checkpoint's layout, and the two republished
+            # classes no longer store that layout.
+            got = tuple(
+                _as_the_loader_left_it(module, leaf, _loaded(sharded, dotted)).shape
+            )
             assert got == tuple(expected), (
                 f"{dotted} loaded {got} at rank {rank} of world size {SHARD_WORLD}; "
                 f"this file declares it sharded on dim {shard_dim} of a full "
@@ -3564,11 +3623,15 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
             families_seen.add((type(module).__name__, leaf))
             checked += 1
 
+    # BOTH SIDES IN THE LOADER'S FRAME. ``control`` was read in that frame, so a
+    # raw read here would count a republished family as "moved" because its two
+    # axes swapped, which is not what this reading is for: it is for showing that
+    # the shard changed an extent (D1.5).
     moved = {
         rank: sum(
             1
             for dotted, shape in control.items()
-            if shape != tuple(_loaded(sharded, dotted).shape)
+            if shape != tuple(_in_the_loader_frame(sharded, dotted).shape)
         )
         for rank, sharded in sorted(per_rank.items())
     }
@@ -3620,12 +3683,17 @@ def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
     rejoined = 0
     worst = 0.0
     ranks_differ = 0
-    for path, _, leaf, shard_dim, full in leaves:
+    for path, module, leaf, shard_dim, full in leaves:
         dotted = f"{path}.{leaf}"
-        reference = _loaded(whole, dotted)
+        # BOTH SIDES IN THE LOADER'S FRAME. ``narrow`` below takes the slice on the
+        # dim this file declares the family sharded on, which is a dim of the
+        # CHECKPOINT's layout; on a republished class the stored tensor's dims are
+        # swapped, and narrowing 256 rows out of a dim of 8 would raise rather than
+        # fail an assertion.
+        reference = _as_the_loader_left_it(module, leaf, _loaded(whole, dotted))
         per_rank = full // SHARD_WORLD
         for rank, model in ((0, rank0), (1, rank1)):
-            mine = _loaded(model, dotted)
+            mine = _as_the_loader_left_it(module, leaf, _loaded(model, dotted))
             expected = reference.narrow(shard_dim, rank * per_rank, per_rank)
             assert tuple(mine.shape) == tuple(expected.shape), (
                 f"{dotted} at rank {rank} is {tuple(mine.shape)} and the matching "
@@ -3646,8 +3714,14 @@ def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
         # tensor". The two slice comparisons above imply it, and this reads it the
         # way the criterion is written -- and it also fails if the two halves are
         # each right but no longer join to the declared full extent.
+        # Both pieces back in the loader's frame first: ``shard_dim`` is a dim of
+        # the CHECKPOINT's layout, which the republished classes no longer store.
         reassembled = torch.cat(
-            [_loaded(rank0, dotted), _loaded(rank1, dotted)], dim=shard_dim
+            [
+                _in_the_loader_frame(rank0, dotted),
+                _in_the_loader_frame(rank1, dotted),
+            ],
+            dim=shard_dim,
         )
         assert tuple(reassembled.shape) == tuple(reference.shape), (
             f"{dotted}: the two ranks' tensors concatenate to "
@@ -3664,8 +3738,8 @@ def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
 
         if (
             _max_abs_diff(
-                _loaded(rank0, dotted).narrow(shard_dim, 0, 1),
-                _loaded(rank1, dotted).narrow(shard_dim, 0, 1),
+                _in_the_loader_frame(rank0, dotted).narrow(shard_dim, 0, 1),
+                _in_the_loader_frame(rank1, dotted).narrow(shard_dim, 0, 1),
             )
             != 0.0
         ):
@@ -3752,18 +3826,30 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
                 f"{path}.{leaf}'s per-rank extent is narrower than one block, so "
                 f"there is no aligned grid shard for this item to measure"
             )
-            reference = getattr(whole.get_submodule(path), attribute)
+            # THE GRID IS READ IN THE LOADER'S FRAME, for this item's own reason: it
+            # compares the grid against the one the CHECKPOINT holds and against
+            # slices taken on the dim the checkpoint shards. The dense MLP's load
+            # path now republishes both weight and grid transposed. Nothing is
+            # coarsened here -- this fixture's per-rank hidden extent is
+            # SHARD_NARROW, which is not a whole consumer block, so the republish's
+            # first step records a skip and only the frame moves.
+            whole_module = whole.get_submodule(path)
+            reference = _as_the_loader_left_it(
+                whole_module, attribute, getattr(whole_module, attribute)
+            )
             assert tuple(reference.shape) == tuple(written.shape), (
                 f"{path}.{attribute} arrived {tuple(reference.shape)} at world size "
                 f"1 but the checkpoint holds {tuple(written.shape)}"
             )
             grids += 1
             for rank, model in ((0, rank0), (1, rank1)):
-                mine = getattr(model.get_submodule(path), attribute, None)
+                rank_module = model.get_submodule(path)
+                mine = getattr(rank_module, attribute, None)
                 assert mine is not None, (
                     f"{path}.{attribute} does not exist after the rank-{rank} load, "
                     f"so a sharded weight's grid never arrived at all"
                 )
+                mine = _as_the_loader_left_it(rank_module, attribute, mine)
                 expected = reference.narrow(shard_dim, rank * blocks, blocks)
                 assert tuple(mine.shape) == tuple(expected.shape), (
                     f"{path}.{attribute} is {tuple(mine.shape)} at rank {rank}; its "
@@ -4526,11 +4612,29 @@ def _load_at_ep(
             f"{path} published grid {tuple(record['public_grid'])}, not the public "
             f"grid {public_grid} the prep demands at [K={rows}, N={cols}]"
         )
+        # WHAT THE MODULE ARRIVES AT IS THE PUBLIC GRID TRANSPOSED, and this is the
+        # one reading in this helper that ``inc-glm53f-054a`` repair round 1 moved.
+        # The retile still publishes ``public_grid`` -- that is asserted three lines
+        # up, off its own health record -- and the republish that FOLLOWS the retile
+        # then turns the weight and its grid together into the frame
+        # ``blockwise_fp8_mm`` multiplies in. So the attribute the prep reads holds
+        # the reversed pair. Asserting the reversed pair keeps the reading
+        # falsifiable: a retile that published the wrong granularity still fails
+        # here, and so does a republish that moved one of the pair without the other.
+        compute_grid = tuple(reversed(public_grid))
         grid = getattr(module, f"gate_proj_{FP8_SCALE_SUFFIX}")
-        assert tuple(grid.shape) == public_grid, (
+        assert tuple(grid.shape) == compute_grid, (
             f"{path}.gate_proj_{FP8_SCALE_SUFFIX} is {tuple(grid.shape)} on the "
-            f"module after the load, not the published {public_grid}; the retile "
-            f"has to replace the attribute the prep reads, not a copy of it"
+            f"module after the load, not the {compute_grid} the republish leaves "
+            f"(the published {public_grid} transposed); the retile has to replace "
+            f"the attribute the prep reads, not a copy of it"
+        )
+        weight = _loaded(model, f"{path}.gate_proj_weight")
+        assert tuple(weight.shape) == (cols, rows), (
+            f"{path}.gate_proj_weight is {tuple(weight.shape)} after the load; the "
+            f"loader delivers [{rows},{cols}] and the republish has to leave the "
+            f"[K={cols}, N={rows}] frame the seam contracts on, or the prepared "
+            f"scale operand above was built from the other frame"
         )
 
     assert built == {3}, (
@@ -4538,6 +4642,41 @@ def _load_at_ep(
         f"Three projections, one operand apiece, and the load completed -- so a "
         f"shortfall means a projection was skipped rather than refused"
     )
+
+    # THE DENSE MLP IS ENROLLED IN THE SAME REPUBLISH, and a REAL load is the only
+    # place that can say so. ``inc-glm53f-054a`` repair round 1 gave that class the
+    # method, and ``_run_load_time_preps`` finds it by
+    # ``hasattr(type(module), "retile_checkpoint_scale_grids")`` -- so the health
+    # record below exists only if the enrolment fired on this load. A conjunct that
+    # called the method directly would prove the method and not the enrolment, which
+    # is the blindness the review found in the first place.
+    #
+    # THE FRAME FLIP IS READ FROM THE RECORD AND NOT FROM A SHAPE, deliberately: at
+    # this fixture's world size the dense per-rank weight is SQUARE, so its transpose
+    # is invisible in its shape and a shape assertion here would pass either way.
+    dense_frames = 0
+    for path, module in model.named_modules():
+        if type(module).__name__ != "Glm5NextDenseMLP":
+            continue
+        health = getattr(module, module.DENSE_RETILE_HEALTH_ATTR, None)
+        assert health is not None, (
+            f"{path} carries no republish health record after a real load, so the "
+            f"load-time prep loop did not reach Glm5NextDenseMLP at all -- the "
+            f"dense route is back to refusing the loader's frame at layer 0"
+        )
+        for leaf, record in health.items():
+            assert record.get("transposed") is True, (
+                f"{path}.{leaf} was not republished into the compute frame: "
+                f"{record}"
+            )
+            assert tuple(record["compute_frame"]) == tuple(
+                reversed(tuple(record["loader_frame"]))
+            ), (
+                f"{path}.{leaf} went from {record['loader_frame']} to "
+                f"{record['compute_frame']}, which is not that pair transposed"
+            )
+            dense_frames += 1
+    print(f"DEFERRED_DENSE_REPUBLISHED_PROJECTIONS={dense_frames}")
     return _DeferredLoad(model, 3)
 
 
@@ -4640,7 +4779,12 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
         for path, module, leaf, shard_dim, full in _deferred_leaves(model):
             cls = type(module).__name__
             dotted = f"{path}.{leaf}"
-            got = tuple(_loaded(model, dotted).shape)
+            # IN THE LOADER'S FRAME: ``expected`` below is this file's own rule about
+            # the CHECKPOINT's extents divided by a world size, and the two
+            # republished classes no longer store that layout.
+            got = tuple(
+                _as_the_loader_left_it(module, leaf, _loaded(model, dotted)).shape
+            )
             if cls in DEFERRED_EP_GROUP_CLASSES:
                 # A bank carries a LEADING expert axis, so its declared dim moves
                 # one place right and the leading extent is this EP rank's experts.
@@ -4725,7 +4869,10 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     whole_checked = 0
     for path, module, leaf, shard_dim, full in _deferred_leaves(whole):
         dotted = f"{path}.{leaf}"
-        got = tuple(_loaded(whole, dotted).shape)
+        # In the loader's frame, for the reason given at the rank loop above.
+        got = tuple(
+            _as_the_loader_left_it(module, leaf, _loaded(whole, dotted)).shape
+        )
         base = list(
             _deferred_full_shape(type(module).__name__, leaf, shard_dim, full)
         )
@@ -4870,8 +5017,25 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
             trim[shard_dim + 1] = slice(0, full)
             got = joined[tuple(trim)]
         else:
+            # THE PIECES ARE PUT BACK IN THE LOADER'S FRAME BEFORE THEY ARE JOINED.
+            # ``shard_dim`` is a dim of the CHECKPOINT's layout, and the two
+            # republished classes no longer store that layout, so a cat on the
+            # stored dim would join along the wrong axis.
+            #
+            # THE FRAME IS ALL THIS UNDOES. The republish's other step requantises a
+            # 128-tile grid onto the 256 public one for any weight whose extents are
+            # whole blocks, and this item's comparison is bit-exact, so it also
+            # depends on that coarsening being lossless on THIS fixture's grids. That
+            # is a property of the fixture, not of the loader, and the first host run
+            # of this file is what settles it -- ``inc-glm53f-054a`` hands that
+            # reading forward rather than weakening the equality to hide it.
             got = torch.cat(
-                [_loaded(models[rank], dotted) for rank in range(SHARD_EP_WORLD)],
+                [
+                    _as_the_loader_left_it(
+                        module, leaf, _loaded(models[rank], dotted)
+                    )
+                    for rank in range(SHARD_EP_WORLD)
+                ],
                 dim=shard_dim,
             )
             expected = overrides[weight_keys[0]]
