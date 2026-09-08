@@ -71,6 +71,43 @@ included -- ``nisa.nc_matmul`` runs on an explicitly fp32 operand at
 twice per iteration so that both reductions fall on the free axis, was
 considered and rejected: it costs 40 ``nc_transpose`` ops for the same answer.
 
+Serving more rows than one partition tile holds
+-----------------------------------------------
+`inc-glm53f-028b`. ``M`` is the token axis, and serving needs prefill extents of
+2048 tokens and more, so ``M`` runs to ``2048 * hc_mult`` and far past the 128
+partitions one tile has. The kernel therefore walks ``M`` in tiles **inside the
+kernel**. Nothing about the answer changes: the row pass is per row and so is
+already independent per tile, and the column sum stays a sum over **every** row
+of the matrix, accumulated in one PSUM tile across the tiles with
+``accumulate=False`` on the first tile and ``True`` on the rest. That is this
+repository's own landed form for a contraction longer than 128 --
+``functional/attention/mla_projections.py:204-209`` -- reused rather than
+invented, and it is why the targets :func:`row_target` and :func:`column_target`
+are unchanged and the oracle is untouched.
+
+Each iteration is three passes over the tiles rather than one, and the order is
+what makes the answer identical to the untiled one: every tile is row-scaled
+first, then the column sums are accumulated over all tiles, then every tile is
+column-scaled by the one ``[1, N]`` scale. A per-tile column scale would
+normalise 128 rows at a time and compute a different matrix.
+
+**Tiles are cut on block boundaries.** The mHC affinity matrix is
+block-diagonal: token ``t`` owns rows and columns ``t * S`` to ``t * S + S - 1``
+where ``S`` is ``hc_mult`` (``model_fp8.py``'s ``mhc_pre`` builds it with
+``torch.block_diag``). :func:`row_tile_extent` therefore rounds the tile height
+DOWN to a multiple of ``S``, so every tile starts at a block boundary and no
+token's ``S x S`` block is split across two tiles. At ``S = 4`` the tile height
+is the full 128 rows; the rounding costs nothing there and keeps the property
+true at stream counts that do not divide 128.
+
+``M`` no longer has a declared ceiling, and that absence is the point of this
+increment -- the same reading ``mla_projections.py:216-224`` records for its own
+tiled axes. What remains bounded is ``N``, still one tile wide on the moving free
+axis, and the SBUF the working set occupies: every tile stays live across the
+iterations because each iteration reads what the last one wrote, so a geometry
+too large to allocate fails at trace time in the allocator rather than returning
+a wrong answer.
+
 Precision, stated rather than implied
 -------------------------------------
 The working tile, both PSUM tiles and the returned tensor are **fp32**. This is
@@ -147,10 +184,11 @@ SINKHORN_ITERS = 20
 #: module docstring's "denominator guard" section.
 SINKHORN_DENOM_EPS = 1e-30
 
-#: Partition-axis bound, from ``nl.tile_size.pmax``. The affinity matrix's row
-#: extent occupies the partition axis in a single tile, so ``M`` may not exceed
-#: it. Written as a module constant so the refusal below and any consumer read
-#: one number.
+#: Partition-axis bound, from ``nl.tile_size.pmax``. This bounds ONE ROW TILE,
+#: not ``M``: `inc-glm53f-028b` walks ``M`` in tiles of at most this height, so a
+#: matrix with more rows than this is served rather than refused. Written as a
+#: module constant so the tile arithmetic, the refusals below and any consumer
+#: read one number.
 PARTITION_MAX = 128
 
 #: Tensor Engine moving free bound, from ``nl.tile_size.gemm_moving_fmax``. The
@@ -159,6 +197,7 @@ MOVING_FMAX = 512
 
 __all__ = [
     "MHC_STREAMS",
+    "MOVING_FMAX",
     "PARTITION_MAX",
     "SINKHORN_DENOM_EPS",
     "SINKHORN_ITERS",
@@ -169,6 +208,8 @@ __all__ = [
     "kernel_identity",
     "reset_dispatch_counters",
     "row_target",
+    "row_tile_extent",
+    "row_tiles",
     "sinkhorn_kernel",
     "sinkhorn_normalise",
     "sinkhorn_torch_oracle",
@@ -215,78 +256,155 @@ def column_target(rows: int, cols: int) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# The row tiling, written once and read by the kernel, the refusals and a test. #
+# --------------------------------------------------------------------------- #
+def row_tile_extent(block: int = MHC_STREAMS) -> int:
+    """How many rows one tile carries: ``PARTITION_MAX`` rounded down to ``block``.
+
+    ``block`` is ``hc_mult`` -- the mHC stream count, and the height of one
+    token's ``S x S`` affinity block. Rounding the tile height down to a multiple
+    of it is what keeps a block inside a single tile, because then every tile
+    starts at a row index that is a multiple of ``block``.
+
+    At the target's ``hc_mult 4`` the answer is 128, the full partition extent:
+    4 divides 128, so the alignment costs no rows. At a stream count that does
+    not divide 128 -- 3, 5, 6 -- the tile gives up the remainder instead of
+    splitting a block.
+
+    Raises:
+        SinkhornError: if ``block`` is not positive, or is taller than one tile
+            can hold, in which case no tile height satisfies the alignment.
+    """
+    if block < 1:
+        raise SinkhornError(f"block={block} must be positive")
+    if block > PARTITION_MAX:
+        raise SinkhornError(
+            f"block={block} exceeds PARTITION_MAX={PARTITION_MAX}; one token's "
+            f"block must fit inside a single row tile, and no tile can be taller "
+            f"than the partition axis"
+        )
+    return (PARTITION_MAX // block) * block
+
+
+def row_tiles(rows: int, block: int = MHC_STREAMS) -> list[tuple[int, int]]:
+    """The ``(start, height)`` row tiles the kernel walks, in order.
+
+    A function rather than a loop written twice, so the kernel and
+    :mod:`test_sinkhorn`'s alignment reading take the same arithmetic. The last
+    tile is short whenever ``rows`` is not a multiple of the tile height -- which
+    is admitted, because ``M`` need not be a whole number of blocks either
+    (``M = 129`` is one of the declared acceptance cases).
+    """
+    height = row_tile_extent(block)
+    return [(start, min(height, rows - start)) for start in range(0, rows, height)]
+
+
+# --------------------------------------------------------------------------- #
 # The NKI kernel. SCRATCH: nkilib provides no sinkhorn member at any shape.     #
 # --------------------------------------------------------------------------- #
 @nki.jit
-def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS):
+def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STREAMS):
     """Doubly stochastic normalisation of ``affinity[M, N]``, in NKI.
 
     Args:
-        affinity: ``[M, N]`` strictly positive affinities in HBM. ``M`` occupies
-            the partition axis in one tile, so ``M <= PARTITION_MAX``; ``N`` is
-            the free extent and the moving free extent of the column-sum matmul.
+        affinity: ``[M, N]`` strictly positive affinities in HBM. ``M`` is walked
+            in row tiles of :func:`row_tile_extent` rows, so it has no ceiling;
+            ``N`` is the free extent and the moving free extent of the column-sum
+            matmul, so it stays one tile wide.
         iters: normalisation iterations, a **trace-time** constant. Defaults to
             :data:`SINKHORN_ITERS`. Exposed so a test can build the same
             algorithm at other iteration counts to show the acceptance's
             threshold is armed -- never so a caller can drive the iteration from
             the host, which is the design the route predicate exists to exclude.
+        block: the mHC stream count ``S``, a **trace-time** constant. It sets the
+            tile height through :func:`row_tile_extent` so that no token's
+            ``S x S`` block is split across two tiles. Defaults to
+            :data:`MHC_STREAMS`; `inc-glm53f-030b`'s layer passes its own
+            ``hc_mult`` rather than relying on the default.
 
     Returns:
         ``[M, N]`` fp32, row sums ``1`` and column sums ``M / N``.
 
-    The loop is ``nl.sequential_range`` because every iteration reads the tile
-    the previous one wrote. The working tile is rewritten in place, which
+    The iteration loop is ``nl.sequential_range`` because every iteration reads
+    what the previous one wrote. Each working tile is rewritten in place, which
     ``nisa`` admits and this repository already relies on
     (``functional/moe/router.py:1212``, ``functional/argsort_unstable.py:216``).
+    The tile loops inside it are ordinary Python loops over a trace-time tile
+    list, the form ``mla_projections.py:187-212`` uses for its own tiled axes.
     """
     m_extent, n_extent = affinity.shape
     col_goal = m_extent / n_extent
     row_goal = 1.0
+    tiles = row_tiles(int(m_extent), block)
 
     out = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.shared_hbm)
 
-    # The ones vector that turns a partition-axis reduction into a matmul.
-    # Built once: it is loop-invariant.
-    ones_col = nl.ndarray((m_extent, 1), dtype=nl.float32, buffer=nl.sbuf)
+    # The ones vector that turns a partition-axis reduction into a matmul. Built
+    # once at the tallest tile's height and sliced per tile: it is loop-invariant
+    # and every entry is 1, so a short tile contracts a prefix of it.
+    ones_col = nl.ndarray((tiles[0][1], 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones_col, value=1.0)
 
-    # The working tile, upcast to fp32 on the load.
-    working = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=working, src=nl.load(affinity, dtype=nl.float32))
+    # One working tile per row tile, upcast to fp32 on the load. These stay live
+    # across the whole iteration loop because the iteration is loop-carried: tile
+    # t's next row pass reads what its own last column pass wrote.
+    working = []
+    row_den = []
+    row_scale = []
+    for start, height in tiles:
+        tile = nl.ndarray((height, n_extent), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=tile,
+            src=nl.load(affinity[start:start + height, 0:n_extent], dtype=nl.float32),
+        )
+        working.append(tile)
+        row_den.append(nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf))
+        row_scale.append(nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf))
 
-    # Every scratch tile is allocated ONCE outside the loop and reused. With 20
+    # The column tiles are allocated ONCE outside the loop and reused. With 20
     # iterations, allocating inside would ask for 20 live PSUM tiles where 1
-    # suffices, and PSUM banks are the scarcest resource on the chip.
+    # suffices, and PSUM banks are the scarcest resource on the chip. There is
+    # one of each for the WHOLE matrix, not one per row tile, because the column
+    # sum is a sum over every row.
     col_psum = nl.ndarray((1, n_extent), dtype=nl.float32, buffer=nl.psum)
     col_sum = nl.ndarray((1, n_extent), dtype=nl.float32, buffer=nl.sbuf)
     col_scale = nl.ndarray((1, n_extent), dtype=nl.float32, buffer=nl.sbuf)
-    row_den = nl.ndarray((m_extent, 1), dtype=nl.float32, buffer=nl.sbuf)
-    row_scale = nl.ndarray((m_extent, 1), dtype=nl.float32, buffer=nl.sbuf)
 
     for _ in nl.sequential_range(iters):
         # ---- row pass: reduce along the FREE axis, scale rows to row_goal ----
-        row_sum = nl.sum(working, axis=1, keepdims=True, dtype=nl.float32)
-        nisa.tensor_scalar(
-            dst=row_den, data=row_sum, op0=nl.add, operand0=SINKHORN_DENOM_EPS
-        )
-        # reciprocal then multiply, rather than a divide: `nisa.reciprocal` is
-        # the member moe/router.py:1312 uses for exactly this shape, and the
-        # multiply below broadcasts an [M, 1] operand along the free axis.
-        nisa.reciprocal(dst=row_scale, data=row_den)
-        nisa.tensor_scalar(
-            dst=row_scale, data=row_scale, op0=nl.multiply, operand0=float(row_goal)
-        )
-        nisa.tensor_scalar(
-            dst=working, data=working, op0=nl.multiply, operand0=row_scale
-        )
+        # Per row, so per tile, and the tiles do not interact here.
+        for idx, (_start, _height) in enumerate(tiles):
+            row_sum = nl.sum(working[idx], axis=1, keepdims=True, dtype=nl.float32)
+            nisa.tensor_scalar(
+                dst=row_den[idx], data=row_sum, op0=nl.add,
+                operand0=SINKHORN_DENOM_EPS,
+            )
+            # reciprocal then multiply, rather than a divide: `nisa.reciprocal` is
+            # the member moe/router.py:1312 uses for exactly this shape, and the
+            # multiply below broadcasts an [height, 1] operand along the free axis.
+            nisa.reciprocal(dst=row_scale[idx], data=row_den[idx])
+            nisa.tensor_scalar(
+                dst=row_scale[idx], data=row_scale[idx], op0=nl.multiply,
+                operand0=float(row_goal),
+            )
+            nisa.tensor_scalar(
+                dst=working[idx], data=working[idx], op0=nl.multiply,
+                operand0=row_scale[idx],
+            )
 
         # ---- column pass: reduce along the PARTITION axis via the ones matmul #
-        # `accumulate=False` is explicit rather than inferred: this PSUM tile is
-        # reused across all 20 iterations, so an accumulating write would sum
-        # every iteration's column sums together instead of replacing them.
-        nisa.nc_matmul(
-            dst=col_psum, stationary=ones_col, moving=working, accumulate=False
-        )
+        # ACROSS ALL TILES into one PSUM tile. `accumulate` is False on the first
+        # tile and True on the rest, which is `mla_projections.py:204-209`'s form
+        # for a contraction longer than the partition axis. False on the first
+        # tile is also what clears the previous iteration's sums: this PSUM tile
+        # is reused across all 20 iterations.
+        for idx, (_start, height) in enumerate(tiles):
+            nisa.nc_matmul(
+                dst=col_psum,
+                stationary=ones_col[0:height, 0:1],
+                moving=working[idx],
+                accumulate=(idx > 0),
+            )
         nisa.tensor_copy(dst=col_sum, src=col_psum)
         nisa.tensor_scalar(
             dst=col_sum, data=col_sum, op0=nl.add, operand0=SINKHORN_DENOM_EPS
@@ -295,38 +413,50 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS):
         nisa.tensor_scalar(
             dst=col_scale, data=col_scale, op0=nl.multiply, operand0=float(col_goal)
         )
-        # The [1, N] scale has to reach M partitions. `nl.broadcast_to` is the
-        # member that broadcasts on the PARTITION axis (moe/router.py:1268-1269).
-        col_scale_b = nl.broadcast_to(col_scale, (m_extent, n_extent))
-        nisa.tensor_tensor(
-            dst=working, data1=working, data2=col_scale_b, op=nl.multiply
-        )
+        # One scale for the whole matrix, applied to every tile. Scaling a tile
+        # by its own column sums instead would normalise 128 rows at a time and
+        # compute a different matrix. `nl.broadcast_to` is the member that
+        # broadcasts on the PARTITION axis (moe/router.py:1268-1269).
+        for idx, (_start, height) in enumerate(tiles):
+            col_scale_b = nl.broadcast_to(col_scale, (height, n_extent))
+            nisa.tensor_tensor(
+                dst=working[idx], data1=working[idx], data2=col_scale_b,
+                op=nl.multiply,
+            )
 
-    nl.store(out[0:m_extent, 0:n_extent], value=working)
+    for idx, (start, height) in enumerate(tiles):
+        nl.store(out[start:start + height, 0:n_extent], value=working[idx])
     return out
 
 
 # --------------------------------------------------------------------------- #
 # Geometry admission.                                                          #
 # --------------------------------------------------------------------------- #
-def _require_admissible(rows: int, cols: int) -> None:
+def _require_admissible(rows: int, cols: int, block: int = MHC_STREAMS) -> None:
     """Every extent condition the kernel above imposes, checked in one place.
 
     Each condition names what in the kernel needs it, so a reader can check the
     refusal against the code rather than against prose.
+
+    ``M`` HAS NO UPPER BOUND HERE, and the absence is deliberate: the kernel walks
+    ``M`` in row tiles, so re-imposing a partition-axis ceiling would refuse the
+    extents `inc-glm53f-028b` exists to serve. ``mla_projections.py:216-224``
+    records the same reading for its own tiled axes. What is still checked is that
+    a token's block fits inside one tile, because the tiling is only correct if it
+    cuts on block boundaries.
     """
     problems: list[str] = []
     if rows <= 0:
         problems.append(f"M={rows} must be positive")
-    elif rows > PARTITION_MAX:
+    if block < 1:
+        problems.append(f"block={block} must be positive")
+    elif block > PARTITION_MAX:
         problems.append(
-            f"M={rows} exceeds PARTITION_MAX={PARTITION_MAX}; the affinity "
-            f"matrix's row extent occupies the partition axis in a SINGLE tile "
-            f"and this kernel does not tile M. Multi-tile M would also make the "
-            f"column sum a cross-tile accumulation, which changes the kernel's "
-            f"shape rather than its parameters -- so it is out of "
-            f"`inc-glm53f-028`'s declared scope and routes to the lead, never to "
-            f"a silent pad or a torch path"
+            f"block={block} exceeds PARTITION_MAX={PARTITION_MAX}; the row tiles "
+            f"are cut on block boundaries so that no token's block is split "
+            f"across two tiles, and a block taller than one tile leaves no tile "
+            f"height that can do that. This refuses rather than splitting a block "
+            f"quietly or routing to a torch path"
         )
     if cols <= 0:
         problems.append(f"N={cols} must be positive")
@@ -378,7 +508,9 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
-def can_run_sinkhorn(affinity: Tensor, rows: int, cols: int) -> bool:
+def can_run_sinkhorn(
+    affinity: Tensor, rows: int, cols: int, block: int = MHC_STREAMS
+) -> bool:
     """Is the NKI route available *and* admissible for this geometry?
 
     Two independent conditions, deliberately not merged: ``can_run_kernel``
@@ -387,14 +519,22 @@ def can_run_sinkhorn(affinity: Tensor, rows: int, cols: int) -> bool:
     cannot serve raises rather than falling back, because falling back would
     ship a torch path for kernel-class work (P13, D6).
 
+    Args:
+        affinity: the tensor whose device decides the route.
+        rows: ``M``, the row extent. No ceiling -- the kernel tiles it.
+        cols: ``N``, the column extent.
+        block: the mHC stream count the row tiles are aligned to.
+
     Raises:
         SinkhornError: if the geometry is inadmissible.
     """
-    _require_admissible(rows, cols)
+    _require_admissible(rows, cols, block)
     return can_run_kernel(affinity)
 
 
-def sinkhorn_normalise(affinity: Tensor, iters: int = SINKHORN_ITERS) -> Tensor:
+def sinkhorn_normalise(
+    affinity: Tensor, iters: int = SINKHORN_ITERS, block: int = MHC_STREAMS
+) -> Tensor:
     """Doubly stochastic normalisation. The seam the route predicate counts.
 
     Args:
@@ -402,6 +542,11 @@ def sinkhorn_normalise(affinity: Tensor, iters: int = SINKHORN_ITERS) -> Tensor:
         iters: normalisation iterations, default :data:`SINKHORN_ITERS`. Passed
             through to the kernel as a trace-time constant, so the loop stays
             inside the single dispatch this function counts.
+        block: the mHC stream count ``S``, default :data:`MHC_STREAMS`. The row
+            tiles are cut on multiples of it, so no token's ``S x S`` block is
+            split. One call still means one dispatch however many tiles the row
+            extent needs -- the tiling is inside the kernel, which is what
+            `inc-glm53f-028b` requires and what the route predicate measures.
 
     Returns:
         ``[M, N]`` fp32, row sums :func:`row_target` and column sums
@@ -423,7 +568,7 @@ def sinkhorn_normalise(affinity: Tensor, iters: int = SINKHORN_ITERS) -> Tensor:
         )
     rows, cols = int(affinity.shape[0]), int(affinity.shape[1])
 
-    if not can_run_sinkhorn(affinity, rows, cols):
+    if not can_run_sinkhorn(affinity, rows, cols, block):
         _COUNTERS.torch_fallback += 1
         logger.debug(
             "sinkhorn_normalise: NKI route unavailable, using the torch path "
@@ -432,7 +577,7 @@ def sinkhorn_normalise(affinity: Tensor, iters: int = SINKHORN_ITERS) -> Tensor:
         return sinkhorn_torch_oracle(affinity, iters=iters)
 
     _COUNTERS.nki_dispatch += 1
-    return wrap_nki(sinkhorn_kernel)(affinity=affinity, iters=iters)
+    return wrap_nki(sinkhorn_kernel)(affinity=affinity, iters=iters, block=block)
 
 
 def sinkhorn_torch_oracle(affinity: Tensor, iters: int = SINKHORN_ITERS) -> Tensor:

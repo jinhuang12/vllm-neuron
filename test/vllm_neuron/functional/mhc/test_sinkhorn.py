@@ -24,6 +24,25 @@ column -- which are properties of the algorithm's definition, not of any
 reference implementation. If the oracle below were wrong, arm 1 would go red and
 arm 2 would not move.
 
+`inc-glm53f-028b` -- the same two arms at serving row extents
+------------------------------------------------------------
+The kernel now walks ``M`` in row tiles, so both arms run again at
+:data:`TILED_ROWS` -- ``129``, ``256``, ``512 * hc_mult`` and ``2048 * hc_mult``
+-- in ``test_tiled_rows_match_the_oracle_and_stay_doubly_stochastic``. Nothing
+about the arms changes: the same fixture construction, the same tolerances, the
+same three route instruments, and one dispatch per case however many tiles the
+extent needs. ``129`` is in the list because it is the first extent that does not
+fit one tile AND is not a whole number of blocks, so a ragged last tile is
+measured rather than assumed.
+
+Two readings are new, and each one exists because the tiling could be wrong in a
+way the arms alone would not name. ``test_row_tiles_are_cut_on_block_boundaries``
+reads the kernel's own tile arithmetic and requires every tile to start on a
+multiple of ``hc_mult``, so no token's block is split. And arm 2 is what catches
+the tempting wrong tiling: a kernel that scaled each tile by its own column sums
+would leave ``tile_rows / N`` in each column instead of ``M / N``, which arm 2
+reads directly and arm 1 would nearly pass.
+
 No tolerance number is invented, widened or narrowed anywhere in this file.
 :data:`RTOL`, :data:`ATOL` and :data:`STOCHASTIC_TOL` are the plan's.
 
@@ -87,6 +106,8 @@ from vllm_neuron.functional.mhc.sinkhorn import (
     kernel_identity,
     reset_dispatch_counters,
     row_target,
+    row_tile_extent,
+    row_tiles,
     sinkhorn_normalise,
     sinkhorn_torch_oracle,
 )
@@ -98,6 +119,14 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # --------------------------------------------------------------------------- #
 M = 64
 N = MHC_STREAMS  # 4
+
+#: `inc-glm53f-028b`'s declared row extents, the ones serving needs. 129 is the
+#: first row count that does not fit one partition tile, and it is deliberately
+#: NOT a whole number of blocks -- 129 = 32 blocks and one row -- so the tiling
+#: is measured on a ragged extent as well as on exact ones. The two largest are
+#: written as ``tokens * MHC_STREAMS`` because that is what they are: 512 and 2048
+#: tokens of the target's four streams each.
+TILED_ROWS = (129, 256, 512 * MHC_STREAMS, 2048 * MHC_STREAMS)
 
 #: The declared tolerance pair for the oracle arm, from the plan block.
 RTOL = 1e-2
@@ -205,9 +234,26 @@ def _affinity(seed: int = 21) -> torch.Tensor:
     the row sums are well conditioned and no term dominates its row. That is the
     `inc-glm53f-025` attempt-1 conditioning lesson applied: a relative tolerance
     over a badly conditioned reduction measures cancellation, not the kernel.
+
+    ``inc-glm53f-028b`` moved the draw into :func:`_affinity_rows` so the tiled
+    row extents use this same construction at their own heights. The ``[64, 4]``
+    fixture and every property claimed for it above are unchanged.
+    """
+    return _affinity_rows(M, seed)
+
+
+def _affinity_rows(rows: int, seed: int = 21) -> torch.Tensor:
+    """The same fixture at ``rows`` rows: ``exp`` of a bounded uniform draw, fp32.
+
+    One construction for every row extent, so a tiled case cannot pass on an
+    easier input than the single-tile case. The seed is fixed for the same reason
+    it is fixed in :func:`_affinity`: strict positivity and "not already
+    normalised" are load-bearing and a draw could satisfy them by luck.
     """
     generator = torch.Generator().manual_seed(seed)
-    logits = torch.rand((M, N), generator=generator, dtype=torch.float32) * 2.0 - 1.0
+    logits = (
+        torch.rand((rows, N), generator=generator, dtype=torch.float32) * 2.0 - 1.0
+    )
     return torch.exp(logits)
 
 
@@ -718,10 +764,150 @@ def test_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
     )
 
 
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-028b` -- ROW EXTENTS PAST ONE PARTITION TILE.                     #
+#                                                                               #
+# RUNTIME NOTE, not a criterion: the largest declared case is 8192 rows, which   #
+# the kernel walks as 64 row tiles of 128, and every one of the 20 iterations    #
+# touches all 64. The declared acceptance command carries `--timeout 60` per     #
+# test. If the simulator needs longer than that on the largest case, the reading #
+# to report is the timeout with its measured duration -- not a widened timeout   #
+# and not a dropped case, both of which would change what was accepted.          #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("rows", TILED_ROWS)
+def test_tiled_rows_match_the_oracle_and_stay_doubly_stochastic(rows: int) -> None:
+    """Both declared arms at a row extent that needs more than one tile.
+
+    ONE dispatch per case, whatever the tile count: the tiling is inside the
+    kernel, so the route instruments read exactly what they read for the 64-row
+    case. That is the property `inc-glm53f-028b` had to preserve -- a host-side
+    loop over 128-row slices would compute the same numbers and read one dispatch
+    per slice.
+
+    Arm 1 is the oracle comparison at the declared tolerances; arm 2 is the
+    doubly-stochastic reading against the two targets, and the column target
+    ``M / N`` is what makes it a real check across tiles: a kernel that scaled
+    each tile by its OWN column sums would put ``tile_rows / N`` in each column
+    instead and fail here while arm 1 still nearly passed.
+    """
+    tiles = row_tiles(rows, MHC_STREAMS)
+    affinity = _affinity_rows(rows)
+    assert tuple(affinity.shape) == (rows, N), tuple(affinity.shape)
+
+    reset_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = sinkhorn_normalise(affinity).to(torch.float32)
+    reading = _assert_route(sim, 1, f"tiled-M{rows}")
+    print(
+        f"[tiled-M{rows}] tiles={len(tiles)} "
+        f"tile_extent={row_tile_extent(MHC_STREAMS)} "
+        f"first={tiles[0]} last={tiles[-1]} {reading}"
+    )
+
+    # Arm 2 first, because it does not depend on the oracle being right.
+    row_dev, col_dev = _report_stochasticity(got, f"tiled-M{rows}")
+    if not torch.isfinite(got).all():
+        raise StochasticityError(f"M={rows}: the kernel returned non-finite values")
+    if row_dev > STOCHASTIC_TOL:
+        raise StochasticityError(
+            f"M={rows}: worst row deviation {row_dev:.6e} exceeds the declared "
+            f"{STOCHASTIC_TOL} against row target {row_target()}"
+        )
+    if col_dev > STOCHASTIC_TOL:
+        raise StochasticityError(
+            f"M={rows}: worst column deviation {col_dev:.6e} exceeds the declared "
+            f"{STOCHASTIC_TOL} against column target {column_target(rows, N)}"
+        )
+
+    # NON-VACUITY on this case's own input: the fixture must fail the bar its
+    # output passes, or a kernel that returned its input would read green here.
+    in_row_dev, in_col_dev = _deviations(affinity)
+    print(
+        f"[tiled-M{rows}] input_row_deviation={in_row_dev:.6e} "
+        f"input_column_deviation={in_col_dev:.6e} bound={STOCHASTIC_TOL}"
+    )
+    if in_row_dev <= STOCHASTIC_TOL and in_col_dev <= STOCHASTIC_TOL:
+        raise VacuousControlError(
+            f"M={rows}: the fixture already satisfies the doubly-stochastic bar, "
+            f"so arm 2 would pass on a kernel that did nothing"
+        )
+
+    want = _sinkhorn_oracle_authored_here(affinity)
+    abs_err = float((got - want).abs().max())
+    rel_err = float(((got - want).abs() / (want.abs() + ATOL)).max())
+    print(
+        f"[tiled-M{rows}] max_abs_error={abs_err:.6e} max_rel_error={rel_err:.6e} "
+        f"rtol={RTOL} atol={ATOL}"
+    )
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+def test_row_tiles_are_cut_on_block_boundaries() -> None:
+    """No token's ``S x S`` block is split, at every declared row extent.
+
+    This reads the same :func:`row_tiles` arithmetic the kernel runs, so it is a
+    check on the tiling the kernel actually uses and not on a restatement of it.
+    Four things are read per extent: every tile starts on a multiple of the block,
+    no tile is taller than one partition tile, the heights sum to ``M`` so no row
+    is dropped or served twice, and the count is above one so the case genuinely
+    exercises tiling.
+    """
+    extent = row_tile_extent(MHC_STREAMS)
+    print(f"[tiling] block={MHC_STREAMS} tile_extent={extent} pmax={PARTITION_MAX}")
+    assert extent % MHC_STREAMS == 0, extent
+    assert 0 < extent <= PARTITION_MAX, extent
+
+    for rows in TILED_ROWS:
+        tiles = row_tiles(rows, MHC_STREAMS)
+        starts = [start for start, _ in tiles]
+        heights = [height for _, height in tiles]
+        print(
+            f"[tiling] M={rows} tiles={len(tiles)} heights_first={heights[0]} "
+            f"heights_last={heights[-1]} sum={sum(heights)}"
+        )
+        assert len(tiles) > 1, f"M={rows} did not tile, so it measures nothing new"
+        assert sum(heights) == rows, (rows, sum(heights))
+        assert all(start % MHC_STREAMS == 0 for start in starts), starts
+        assert all(0 < height <= PARTITION_MAX for height in heights), heights
+
+
+def test_the_moved_bound_admits_the_serving_extent() -> None:
+    """``can_run_sinkhorn`` no longer refuses ``M`` above one partition tile.
+
+    The bound moved, so the reading that used to be a refusal is now an
+    admission, and it is measured at the largest declared extent rather than just
+    above the old ceiling. ``can_run_kernel`` decides the route; this test only
+    requires that the GEOMETRY check raises nothing, which is the half
+    `inc-glm53f-028b` changed.
+    """
+    for rows in (PARTITION_MAX + 1,) + TILED_ROWS:
+        verdict = can_run_sinkhorn(torch.zeros(1), rows, N)
+        print(f"[admits] M={rows} N={N} can_run_sinkhorn={verdict}")
+        assert isinstance(verdict, bool)
+
+
+def test_a_block_taller_than_one_tile_is_refused_by_name() -> None:
+    """A stream count no tile height can align to is refused, not split.
+
+    The one geometry the tiling adds a refusal for. It cannot arise at the
+    target's ``hc_mult 4``; it is checked because the refusal is what keeps the
+    block-alignment property true rather than merely intended.
+    """
+    with pytest.raises(SinkhornError) as excinfo:
+        can_run_sinkhorn(torch.zeros(1), 512, N, block=PARTITION_MAX + 1)
+    message = str(excinfo.value)
+    print(f"[block-refusal] message={message!r}")
+    assert f"block={PARTITION_MAX + 1}" in message, message
+    assert f"PARTITION_MAX={PARTITION_MAX}" in message, message
+
+    with pytest.raises(SinkhornError) as excinfo:
+        row_tile_extent(0)
+    assert "block=0 must be positive" in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     ("rows", "cols", "needle"),
     [
-        (PARTITION_MAX + 1, 4, f"exceeds PARTITION_MAX={PARTITION_MAX}"),
         (0, 4, "M=0 must be positive"),
         (64, 0, "N=0 must be positive"),
         (64, 513, "exceeds the Tensor Engine moving free bound"),
