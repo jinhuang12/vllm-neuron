@@ -123,6 +123,7 @@ from vllm_neuron.functional.mhc import sinkhorn as sinkhorn_mod
 from vllm_neuron.functional.mhc.hyper_connection import HyperConnectionError
 from vllm_neuron.functional.mhc.sinkhorn import (
     MHC_STREAMS,
+    MOVING_FMAX,
     PARTITION_MAX,
     SinkhornError,
     column_target,
@@ -134,8 +135,9 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # The declared tiny case.                                                     #
 # --------------------------------------------------------------------------- #
 #: Tokens. Chosen inside the ceiling the block-diagonal embedding implies --
-#: ``T * S <= PARTITION_MAX`` -- with room to spare, so the declared case is not
-#: also a boundary case. The boundary itself is a separate arm.
+#: ``T * S <= MOVING_FMAX`` since `inc-glm53f-028b` tiled the row axis, and the
+#: row axis before it -- with room to spare either way, so the declared case is
+#: not also a boundary case. The boundary itself is a separate arm.
 T = 8
 #: Streams. ``MHC_STREAMS`` is ``-028``'s named constant for the target's
 #: ``hc_mult 4``; it is imported rather than restated, which is what
@@ -1044,14 +1046,18 @@ def test_mhc_layer_the_two_seam_counters_are_independent() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# THE TOKEN CEILING -- measured at the boundary, refusal allowed to propagate.  #
+# THE TOKEN EXTENTS -- what the layer serves, and where the refusal now sits.   #
+# `inc-glm53f-028b` tiles the Sinkhorn's row axis inside the kernel, so the      #
+# refusal moved from the row axis to the column axis and these cases were        #
+# re-grounded onto what the code does now rather than deleted.                   #
 # --------------------------------------------------------------------------- #
-def test_mhc_layer_runs_at_the_embedding_token_ceiling() -> None:
+def test_mhc_layer_runs_at_the_old_row_axis_ceiling() -> None:
     """``T = PARTITION_MAX // S`` runs, and both counters still read one each.
 
-    The boundary is measured rather than assumed, so the refusal arm below is
-    known to be a refusal of what is genuinely out of range and not of
-    something that never worked.
+    This was the ceiling before `inc-glm53f-028b`, and it is kept as a serving
+    case because the extents above it now have to be compared against something
+    known good BELOW the old bound. It is no longer a boundary: the two cases
+    after it serve 33 and 64 tokens on the same reference.
     """
     ceiling = PARTITION_MAX // S
     fn, hc_scale, hc_base, residual = _fixture(tokens=ceiling)
@@ -1073,16 +1079,63 @@ def test_mhc_layer_runs_at_the_embedding_token_ceiling() -> None:
     torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
 
 
-def test_mhc_layer_above_the_ceiling_the_seam_refusal_propagates() -> None:
-    """One token past the ceiling: ``SinkhornError`` reaches the caller unchanged.
+@pytest.mark.parametrize("tokens", [PARTITION_MAX // S + 1, 2 * (PARTITION_MAX // S)])
+def test_mhc_layer_serves_above_the_old_ceiling(tokens: int) -> None:
+    """Token counts that used to be refused are SERVED, and match the oracle.
 
-    No pad, no tile, no torch fallback -- the lead ruled that the tiling policy
-    is a design revision's and P13 forbids the fallback outright. The refusal's
-    own message is captured, and both counters are read AFTER it to show a
-    refused call charges neither seam.
+    RE-GROUNDED BY `inc-glm53f-028b`, which tiles the Sinkhorn's row axis inside
+    the kernel and removed the ``M > PARTITION_MAX`` refusal these two cases used
+    to assert. A test whose subject a later increment deletes has to be
+    re-grounded onto what the code now does, not deleted quietly: the interesting
+    reading at 33 and 64 tokens is that the layer SERVES them, on the same
+    reference and the same tolerances as the declared tiny case.
+
+    ``33`` is one token past the old ceiling and puts ``M = N = 132`` on the
+    Sinkhorn -- not a whole number of row tiles, so the ragged last tile is
+    exercised through the layer as well as in the kernel's own test. ``64`` puts
+    ``M = N = 256``, two full tiles.
+
+    The route reading is unchanged and is the point: ONE dispatch per seam per
+    layer call however many row tiles the extent needs, because the tiling is
+    inside the kernel.
     """
-    over = PARTITION_MAX // S + 1
-    fn, hc_scale, hc_base, residual = _fixture(tokens=over)
+    fn, hc_scale, hc_base, residual = _fixture(tokens=tokens)
+    layer = _layer()
+    _load(layer, fn, hc_scale, hc_base)
+
+    _reset_both()
+    with _AttributedSimulatorCounter() as sim:
+        got = layer.forward(residual, _sublayer)
+    _assert_route(sim, calls=1, label=f"above-old-ceiling-T{tokens}")
+
+    want, _, _, _, _ = _reference_layer(fn, hc_scale, hc_base, residual, "torch")
+    max_abs, max_rel = _errors(got, want)
+    print(
+        f"[above-old-ceiling] T={tokens} sinkhorn_M=N={tokens * S} "
+        f"old_ceiling_T={PARTITION_MAX // S} max_abs_error={max_abs:.6e} "
+        f"max_rel_error={max_rel:.6e}"
+    )
+    assert tuple(got.shape) == (tokens, S, H)
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize("tokens", [MOVING_FMAX // S + 1, 200])
+def test_mhc_layer_refusal_names_the_offending_extent(tokens: int) -> None:
+    """The refusal that still binds names its extent, and charges neither seam.
+
+    RE-GROUNDED BY `inc-glm53f-028b`. The layer's ceiling did not disappear when
+    the row-axis refusal did -- it MOVED to the other axis. The block-diagonal
+    embedding makes the affinity matrix square, so ``T`` tokens put ``T * S`` on
+    ``N`` as well as on ``M``, and ``N`` is still one tile wide on the Tensor
+    Engine's moving free axis. So the layer now serves ``T <= MOVING_FMAX // S``
+    -- 128 at the checkpoint's ``hc_mult 4`` -- and refuses above it by naming
+    ``N`` instead of ``M``.
+
+    A refusal a caller cannot act on is barely better than a trap, so the message
+    content is asserted rather than only the exception type. Both counters are
+    read after the refusal to show that a refused call charges neither seam.
+    """
+    fn, hc_scale, hc_base, residual = _fixture(tokens=tokens)
     layer = _layer()
     _load(layer, fn, hc_scale, hc_base)
 
@@ -1091,33 +1144,16 @@ def test_mhc_layer_above_the_ceiling_the_seam_refusal_propagates() -> None:
         layer.forward(residual, _sublayer)
     after = _read_both()
     message = str(excinfo.value)
-    print(f"[ceiling-refusal] T={over} sinkhorn_M={over * S} message={message!r}")
-    print(f"[ceiling-refusal] counters_after_refusal={after}")
-    assert f"M={over * S}" in message, message
-    assert f"PARTITION_MAX={PARTITION_MAX}" in message, message
+    print(
+        f"[refusal] T={tokens} sinkhorn_M=N={tokens * S} "
+        f"serving_ceiling_T={MOVING_FMAX // S} message={message!r}"
+    )
+    print(f"[refusal] counters_after_refusal={after}")
+    assert f"N={tokens * S}" in message, message
+    assert f"exceeds the Tensor Engine moving free bound {MOVING_FMAX}" in message, (
+        message
+    )
     assert after == ((0, 0), (0, 0)), after
-
-
-@pytest.mark.parametrize(
-    "tokens,needle",
-    [
-        (PARTITION_MAX // S + 1, f"exceeds PARTITION_MAX={PARTITION_MAX}"),
-        (PARTITION_MAX, "exceeds PARTITION_MAX"),
-    ],
-)
-def test_mhc_layer_refusal_names_the_offending_extent(tokens, needle) -> None:
-    """The refusal names ``M`` and the bound, at two token counts above it.
-
-    A refusal a caller cannot act on is barely better than a trap, so the
-    message content is asserted rather than only the exception type.
-    """
-    fn, hc_scale, hc_base, residual = _fixture(tokens=tokens)
-    layer = _layer()
-    _load(layer, fn, hc_scale, hc_base)
-    with pytest.raises(SinkhornError) as excinfo:
-        layer.forward(residual, _sublayer)
-    print(f"[refusal] T={tokens} message={str(excinfo.value)!r}")
-    assert needle in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
