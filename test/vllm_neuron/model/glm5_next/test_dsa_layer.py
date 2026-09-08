@@ -1541,10 +1541,16 @@ def _ref_causal_bound(
 def _ref_causal_sentinel(bounded: torch.Tensor, pool_ids: torch.Tensor) -> torch.Tensor:
     """``dsa_causal_sentinel``: ``-1`` at every selection whose score was bounded away.
 
-    The value is read back by gathering the BOUNDED scores at the selected ids, which is what the
-    implementation does and for the reason it records (``model_fp8.py:3787-3794``). ``isinf`` with a
-    sign test rather than ``== float("-inf")``: the two agree here, and the predicate says what it
-    means without depending on how the comparison treats an infinity.
+    THE REFERENCE GATHERS AND THE IMPLEMENTATION NO LONGER DOES, on purpose (repair ``103r4``,
+    review finding F1). ``select_bounded_pools`` now hands the sentinel ``dsa_topk_select``'s own
+    returned ``values``, because the vendored selector strikes its input buffer on the multi-fold
+    branch and an index returned beside an ``-inf`` value can then point at an originally finite
+    column. THIS reference is safe to gather because its selector is ``_ref_topk``, a plain
+    ``torch.topk`` that never modifies its input, so the gathered score IS the selected value here by
+    construction -- and the two sides therefore reach the same answer by two different spellings,
+    which is what a reference is for. ``isinf`` with a sign test rather than ``== float("-inf")``:
+    the two agree here, and the predicate says what it means without depending on how the comparison
+    treats an infinity.
     """
     selected = bounded.gather(1, pool_ids.to(torch.int64))
     struck = torch.isinf(selected) & (selected < 0)
@@ -1800,7 +1806,9 @@ def _ref_indexer(
     if probe is not None:
         probe.append(scores.detach())
     # inc-glm53f-103: bound, select, sentinelise, then pin the sentinel places -- the same four steps
-    # in the same order as `select_bounded_pools` (`model_fp8.py:3801-3807`), transcribed rather than
+    # in the same order as `Glm5NextDSAIndexer.select_bounded_pools` in `model_fp8.py` -- named by the
+    # method rather than by a line, because this increment's own docstrings pushed those line numbers
+    # twice already -- transcribed rather than
     # called. The order is the plan's declared order and is not free to vary: selecting on unbounded
     # scores and masking afterwards would answer a different question.
     bounded = _ref_causal_bound(scores, seq_lens, pool, candidates)

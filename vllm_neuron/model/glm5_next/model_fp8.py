@@ -3776,7 +3776,17 @@ class Glm5NextDSAIndexer(nn.Module):
         (``topk_select.py:302-317``), while ``dsa_index_expand`` admits int32
         ONLY and says why -- *"int64 indices would double the SBUF traffic for a
         range no sequence length reaches"* (``index_expand.py:139-141``). So
-        exactly one cast is needed and this is its single site.
+        exactly one cast is needed per selection.
+
+        THERE ARE NOW TWO SITES FOR THAT CAST, AND SAYING SO IS THE POINT (``103r4``).
+        This method used to be the only one, and :meth:`select_bounded_pools` composed it.
+        Review finding F1 moved the selector call into that method, because the sentinel
+        needs the ``values`` this one discards and reading them here would need a second
+        selector dispatch -- which would break the declared one-dispatch-per-call reading.
+        So the same one-line cast appears there too. NOTHING IN PRODUCTION CALLS THIS
+        METHOD ANY MORE: both entry points route the selecting regime through
+        :meth:`select_bounded_pools`. It is landed code and is left standing rather than
+        deleted by this increment; whether it goes is the lead's.
 
         WHY THIS METHOD DOES NOT RE-CHECK THE STRICT BOUND. ``dsa_topk_select``
         needs ``0 < k < width`` STRICTLY, and at ``k == width`` its gate RETURNS
@@ -3819,26 +3829,47 @@ class Glm5NextDSAIndexer(nn.Module):
         RECEIVES. One producer, two consumers, nothing minted -- which is what makes the
         bound and the expansion incapable of disagreeing about a row's length.
 
-        WHY THE SELECTED VALUE IS READ BACK FROM THE BOUNDED SCORES rather than taken
-        from ``dsa_topk_select``'s first return: ``select_pools`` discards that return at
-        one site and reading it here would need a second one. The two are the same number
-        by the selector's own contract -- ``values[r, g]`` is the value at
-        ``indices[r, g]`` -- and that contract is not assumed: it is READ, in
-        ``test_causal_bound.py``'s conjunct 2, which compares this gather against the
-        selector's returned values on the declared shape. The gather is index plumbing,
-        not an indexer value, so it is torch under this class's own P13 note.
+        THE SENTINEL IS FED THE SELECTOR'S OWN ``values``, AND THAT IS A REPAIR (label
+        ``103r4``, review finding F1 at
+        ``reviews/glm-5.3-flash-port/bless-103-code-c81113a2-findings.md``). The first
+        version of this method read the selected score back with
+        ``bounded.gather(1, pool_ids)`` and claimed the two were the same number. They are
+        the same number only on the branch this increment's own tests happen to use.
+        ``dsa_topk_select`` wraps the vendored ``rotational_topk``, whose ``topk_core``
+        runs ``div_ceil(k, 8)`` folds (``rotational_topk_utils.py:1022``); when more than
+        one fold runs, each fold STRIKES the values it took by writing ``-inf`` over them
+        IN THE INPUT BUFFER (``rotational_topk_utils.py:1060-1066``, and the rotational
+        ``sort`` path does the same at ``:1105``, ``:1112``). A later fold's ``max8`` then
+        matches one of those struck positions, so the index returned beside an ``-inf``
+        VALUE can be a column that was originally finite and legal. Gathering from the
+        UNSTRUCK ``bounded`` at that index reads the original finite score, no ``-inf`` is
+        seen, no ``-1`` is written, and the row silently carries a legal pool id twice --
+        which ``dsa_index_expand`` then expands twice. Production ``select_k`` is
+        ``index_topk // index_kpool`` = 2048 // 4 = 512, so production always runs the
+        striking branch. At ``k = 2`` -- every item this increment ships -- ``k % 8 != 0``
+        and the single fold takes the ``max8`` plus ``nc_find_index8`` path
+        (``rotational_topk_utils.py:1028-1039``) that never modifies the buffer, so the
+        gather and the values agree there and no test could see the substitution.
+        Taking ``values`` removes the question: a slot's value is the value the selector
+        assigned it, whichever index came back with it.
+
+        SO THIS METHOD CALLS THE SELECTOR ITSELF rather than composing
+        :meth:`select_pools`, which discards ``values``. That moves the one int64-to-int32
+        cast to two sites; :meth:`select_pools`'s docstring names both rather than claiming
+        one, because a claim that is checked and false is worse than a claim that is wide.
         """
         from vllm_neuron.functional.dsa.causal_bound import (
             dsa_causal_bound,
             dsa_causal_sentinel,
         )
+        from vllm_neuron.functional.dsa.topk_select import dsa_topk_select
 
         bounded = dsa_causal_bound(
             scores, seq_lens.to(torch.int32).reshape(-1, 1), self.index_kpool
         )
-        pool_ids = self.select_pools(bounded)
-        selected = bounded.gather(1, pool_ids.to(torch.int64))
-        sentinelised = dsa_causal_sentinel(selected, pool_ids)
+        values, indices = dsa_topk_select(bounded, self.select_k())
+        pool_ids = indices.to(torch.int32)
+        sentinelised = dsa_causal_sentinel(values, pool_ids)
         return self._canonical_sentinel_order(sentinelised)
 
     @staticmethod
@@ -3875,6 +3906,18 @@ class Glm5NextDSAIndexer(nn.Module):
         leaked was the POSITION of the sentinels among the ``select_k`` columns, and the
         expansion is positional, so a row whose ``-1`` moved re-lays its whole 11-column
         span. That is the shape of the 276.
+
+        WHY THIS METHOD SURVIVES ``103r4``, the F1 repair. That repair keys the sentinel on
+        the selector's own returned value instead of a gather, which fixes the SET a row
+        reports on every branch. It does not by itself fix the PLACES: "sentinels trail"
+        would then follow from the selector returning its values in descending order, and
+        the selector's contract says *"highest first"* about one pass and says nothing about
+        the order ACROSS the ``div_ceil(k, 8)`` folds of the striking branch
+        (``rotational_topk_utils.py:1022``, ``:1053-1066``). This seat has no reading of
+        that cross-fold order -- it cannot be read on a laptop and no filed transcript
+        covers it -- so the permutation stays and the property is true by construction
+        rather than by an unstated promise. It is a no-op whenever the values already
+        arrive descending. Removing it is a later lap with that reading in hand.
 
         SO THE FIX IS TO PIN THE ONE THING THAT WAS FREE. After this method the output is a
         function of ``(scores, seq_lens, pool_size, select_k)`` and of nothing about the

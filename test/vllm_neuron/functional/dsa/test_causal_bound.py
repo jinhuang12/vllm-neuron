@@ -124,6 +124,34 @@ exactly zero -- so a bound that fired unconditionally could not pass."""
 SELECT_K = 2
 """The block's declared ``k`` for the sentinel and integration items."""
 
+MULTIFOLD_SELECT_K = 16
+"""The ``k`` that puts the landed selector on its STRIKING branch -- repair ``103r4``.
+
+Review finding F1 (``reviews/glm-5.3-flash-port/bless-103-code-c81113a2-findings.md``) is about a
+branch no reading at ``SELECT_K`` can reach. The vendored selector runs ``div_ceil(k, 8)`` folds
+(``rotational_topk_utils.py:1022``). At ``k = 2`` there is ONE fold and ``2 % 8 != 0``, so it takes
+the ``max8`` plus ``nc_find_index8`` path that never modifies the score buffer
+(``rotational_topk_utils.py:1028-1039``). At ``k = 16`` there are TWO folds and ``16 % 8 == 0``, so
+BOTH take the branch that strikes each taken value to ``-inf`` IN THE INPUT BUFFER
+(``rotational_topk_utils.py:1053-1066``). 16 is the smallest ``k`` with that property. Production is
+``index_topk // index_kpool`` = 2048 // 4 = 512 and is therefore always on this branch."""
+
+MULTIFOLD_POOL_COLUMNS = 32
+"""Candidate columns for the multi-fold case. Two clauses fix it rather than taste:
+``can_run_dsa_topk_select`` needs ``0 < k < width`` STRICTLY (``topk_select.py:294``) and the
+kernel's own factory needs ``vocab_size >= k`` (``rotational_topk_utils.py:241-243``; ``:240`` is the
+SEPARATE 2D-shape assert, so citing it here would name the wrong clause). 32 satisfies
+both with room, and keeps every column reachable by a 128-token row."""
+
+MULTIFOLD_CAUSAL_LENS = [4, 12, 20, 36, 64]
+"""Lengths that complete 1, 3, 5, 9 and 16 pools -- fewer than ``MULTIFOLD_SELECT_K`` on four rows
+and exactly ``MULTIFOLD_SELECT_K`` on the fifth.
+
+A row completing fewer pools than ``k`` is the whole point: the selector must fill the remaining
+slots from an all-``-inf`` buffer, which is where the strike substitution happens. The last row
+completes exactly ``k`` pools and must show ZERO sentinels, so a case that sentinelised
+unconditionally could not pass."""
+
 MLA_CASE = dict(seq=ROWS, heads=4, latent=128, topk=128, s_kv=256, rope=0)
 """The geometry item 3's chain ends in, taken from ``-098``'s own declared sentinel family.
 
@@ -343,6 +371,13 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     and named in the transcript. If it fails, the finding is about the selector's contract and not
     about this module's arithmetic -- report it as such rather than widening anything.
 
+    THIS ITEM HAS TWO CASES AFTER REPAIR ``103r4``. The first is the declared small shape at
+    ``SELECT_K``. The second runs the same readings at ``MULTIFOLD_SELECT_K``, which is the smallest
+    ``k`` that puts the landed selector on the branch that strikes its own input -- the branch review
+    finding F1 is about, and the one the retired ``bounded.gather`` form got wrong. It is one item and
+    two cases rather than two items, because the conjunct is the same conjunct; the plan declares four
+    items and there are still four.
+
     Certifying component (D1.4): ``causal_bound._causal_sentinel_nki`` through the
     ``causal_bound.dsa_causal_sentinel`` seam.
     """
@@ -431,6 +466,124 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     assert (topk_nki, topk_fb) == (1, 0), (topk_nki, topk_fb)
     _emit("C2_ROUTE", bound=(bound_nki, bound_fb), sentinel=(sent_nki, sent_fb),
           topk_047=(topk_nki, topk_fb), kernel=identity[1])
+
+    # ----------------------------------------------------------------------------------- #
+    # THE MULTI-FOLD CASE. Repair `103r4`, review finding F1.
+    # ----------------------------------------------------------------------------------- #
+    # WHY THE READINGS ABOVE COULD NOT SEE THE DEFECT F1 NAMES. They run at `SELECT_K` = 2,
+    # one fold, the non-striking path. The dispatch site used to read the selected score by
+    # GATHERING the bounded scores at the returned index; on the striking branch a later
+    # fold's `max8` matches a position an earlier fold overwrote with `-inf`, so the index
+    # that comes back beside an `-inf` VALUE can be a column that was originally finite and
+    # legal. The gather then read that original finite score, no `-1` was written, and the
+    # row silently carried a legal pool id twice -- which the expansion expands twice.
+    # THE TWO GATES THIS CASE ADDS ARE THE ONES THAT FORM WOULD HAVE FAILED: the per-row
+    # sentinel count, and no legal pool id appearing twice in a row. The retired form is
+    # computed here too and its own count is printed beside the current one, so the
+    # transcript says whether the substitution actually fired at this geometry rather than
+    # leaving a reader to assume it.
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    reset_topk_select_dispatch_counters()
+
+    mf_gen = torch.Generator().manual_seed(20316)
+    mf_scores = torch.randn(
+        ROWS, MULTIFOLD_POOL_COLUMNS, generator=mf_gen, dtype=torch.float32
+    ) * 0.05
+    mf_causal = torch.tensor(MULTIFOLD_CAUSAL_LENS, dtype=torch.int32).reshape(ROWS, 1)
+    # Complete pools per row, computed from the dials with the block's own formula.
+    mf_complete = [
+        min(c // POOL_SIZE, MULTIFOLD_POOL_COLUMNS) for c in MULTIFOLD_CAUSAL_LENS
+    ]
+    mf_want = [max(0, MULTIFOLD_SELECT_K - c) for c in mf_complete]
+    assert mf_complete == [1, 3, 5, 9, 16], mf_complete
+    assert mf_want == [15, 13, 11, 7, 0], mf_want
+    assert mf_want[-1] == 0, "the last row must have nothing to sentinelise"
+
+    mf_bounded = dsa_causal_bound(mf_scores, mf_causal, POOL_SIZE)
+    assert can_run_dsa_topk_select(mf_bounded, MULTIFOLD_SELECT_K) is True, (
+        f"the landed selector must serve rows={ROWS} width={MULTIFOLD_POOL_COLUMNS} "
+        f"k={MULTIFOLD_SELECT_K}. A False here sends the selection to torch.topk, which "
+        f"never strikes its input, and this case would then read a branch it is not about "
+        f"-- report it as an envelope finding rather than widening anything"
+    )
+    mf_values, mf_indices = dsa_topk_select(mf_bounded, MULTIFOLD_SELECT_K)
+    assert tuple(mf_values.shape) == (ROWS, MULTIFOLD_SELECT_K), tuple(mf_values.shape)
+    mf_idx32 = mf_indices.to(torch.int32)
+    mf_got = dsa_causal_sentinel(mf_values, mf_idx32)
+
+    mf_bound_nki, mf_bound_fb = causal_bound_dispatch_counters()
+    mf_sent_nki, mf_sent_fb = causal_sentinel_dispatch_counters()
+    mf_topk_nki, mf_topk_fb = topk_select_dispatch_counters()
+    assert (mf_bound_nki, mf_bound_fb) == (1, 0), (mf_bound_nki, mf_bound_fb)
+    assert (mf_sent_nki, mf_sent_fb) == (1, 0), (mf_sent_nki, mf_sent_fb)
+    assert (mf_topk_nki, mf_topk_fb) == (1, 0), (mf_topk_nki, mf_topk_fb)
+
+    # THE BRANCH IS READ OFF THE KERNEL'S OWN DIAL, never typed here. By this line the NKI
+    # route has already dispatched, so the vendored module is imported and its constant is
+    # the one the kernel used.
+    from vllm_neuron.functional.vendored_kernels.rotational_topk.rotational_topk_utils import (
+        HW_PARAMS,
+    )
+
+    per_stage = int(HW_PARAMS.topk_per_stage)
+    mf_folds = -(-MULTIFOLD_SELECT_K // per_stage)
+    assert per_stage == 8, per_stage
+    assert mf_folds == 2 and MULTIFOLD_SELECT_K % per_stage == 0, (mf_folds, per_stage)
+    assert SELECT_K % per_stage != 0 and -(-SELECT_K // per_stage) == 1, SELECT_K
+    _emit("C2_MF_BRANCH", k=MULTIFOLD_SELECT_K, topk_per_stage=per_stage, folds=mf_folds,
+          strikes=1, k2_folds=1, k2_strikes=0)
+
+    # "EVERY `-inf` SLOT AND NO OTHER", the same two halves as above, at the striking k.
+    mf_neg_inf = torch.isinf(mf_values) & (mf_values < 0)
+    mf_per_row = (mf_got == SENTINEL).sum(dim=1).to(torch.int64)
+    assert torch.equal(mf_per_row, torch.tensor(mf_want, dtype=torch.int64)), (
+        f"per-row sentinel count {mf_per_row.tolist()} against the computed {mf_want}"
+    )
+    assert torch.equal(mf_got == SENTINEL, mf_neg_inf), (
+        "a sentinel was written at a position whose value was finite, or withheld at one "
+        "whose value was -inf"
+    )
+    mf_kept = ~mf_neg_inf
+    assert torch.equal(mf_got[mf_kept], mf_idx32[mf_kept]), "a kept index was rewritten"
+    _emit("C2_MF_SENTINEL_COUNT", counts=mf_per_row.tolist(), computed=mf_want,
+          neg_inf_slots=int(mf_neg_inf.sum()), kept=int(mf_kept.sum()))
+
+    # NO LEGAL POOL ID TWICE IN A ROW, and every legal id is a pool the row completes. This
+    # is the reading the retired gather form fails: it returned a struck-but-legal column
+    # instead of a sentinel, so the row held that id twice.
+    mf_dup_rows = []
+    for r in range(ROWS):
+        legal = [int(v) for v in mf_got[r].tolist() if v >= 0]
+        if len(set(legal)) != len(legal):
+            mf_dup_rows.append((r, legal))
+        assert len(legal) == min(mf_complete[r], MULTIFOLD_SELECT_K), (r, legal)
+        assert all(0 <= v < mf_complete[r] for v in legal), (r, legal, mf_complete[r])
+    assert mf_dup_rows == [], (
+        f"a row carries a legal pool id twice, which is exactly what the retired gather "
+        f"form produced: {mf_dup_rows}"
+    )
+    _emit("C2_MF_NO_DUPLICATE_LEGAL_ID", rows=ROWS, duplicate_rows=len(mf_dup_rows),
+          legal_per_row=[min(c, MULTIFOLD_SELECT_K) for c in mf_complete])
+
+    # THE RETIRED FORM, COMPUTED THROUGH THE ORACLE so no second kernel dispatch is charged
+    # to the counters read above. It can only MISS sentinels, never invent them, so the
+    # inequality is the gate and the difference is the disclosure.
+    mf_retired = dsa_causal_sentinel_torch_oracle(
+        mf_bounded.gather(1, mf_indices.to(torch.int64)), mf_idx32
+    )
+    mf_retired_counts = (mf_retired == SENTINEL).sum(dim=1).to(torch.int64)
+    assert bool((mf_retired_counts <= mf_per_row).all()), (
+        f"the retired form reported MORE sentinels than the value-keyed form, which it "
+        f"cannot: {mf_retired_counts.tolist()} against {mf_per_row.tolist()}"
+    )
+    _emit("C2_MF_RETIRED_GATHER_FORM", retired=mf_retired_counts.tolist(),
+          value_keyed=mf_per_row.tolist(),
+          the_retired_form_would_have_reddened_this_item=int(
+              bool((mf_retired_counts != mf_per_row).any())
+          ))
+    _emit("C2_MF_ROUTE", bound=(mf_bound_nki, mf_bound_fb),
+          sentinel=(mf_sent_nki, mf_sent_fb), topk_047=(mf_topk_nki, mf_topk_fb))
 
 
 # =========================================================================== #
