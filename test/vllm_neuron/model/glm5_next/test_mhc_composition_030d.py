@@ -1084,3 +1084,552 @@ def test_030d_the_streams_route_runs_the_pair_around_the_same_attention_half(
         f"the combine seam read {comb} for one layer call; one NKI dispatch and no "
         f"fallback is what per-layer-call means"
     )
+
+
+# --------------------------------------------------------------------------- #
+# COMMIT 3 -- part (a), THE CARRIER. The embedding expands across the stream    #
+# axis, every layer is handed streams, the FEED-FORWARD site runs here around   #
+# ``_ffn_half``'s unchanged return, and an UNWEIGHTED mean collapses the        #
+# streams before the final norm. Arms (2) and (3) of the block's acceptance run #
+# at ``T = 128`` on the host; the items below read the composition's shape and   #
+# its three cited steps at ``T = 8``.                                           #
+# --------------------------------------------------------------------------- #
+VOCAB = 16
+QUANT = object()
+BLOCKS = object()
+MOE_GROUP = object()
+
+
+class _StubSite:
+    """Stands in for a bound mHC site, and RECORDS what it collapsed and mixed.
+
+    NOT the real collapse. The real site weights the streams with ``mhc_pre``'s
+    learned ``pre`` row (``reference:294``) and commit 2's items measure that seam;
+    this stand-in collapses with a mean, because what the items below read is WHICH
+    tensor the sublayer is handed and WHETHER its return comes back unchanged, not
+    what the learned collapse computes. A plain object rather than an
+    ``nn.Module``, so a stub cannot add a name to the tree the bind items count.
+    """
+
+    def __init__(self) -> None:
+        self.residuals: list[tuple[int, ...]] = []
+        self.given: list[torch.Tensor] = []
+        self.returned: list[torch.Tensor] = []
+        self.results: list[torch.Tensor] = []
+
+    def forward(self, residual: torch.Tensor, sublayer: object) -> torch.Tensor:
+        self.residuals.append(tuple(residual.shape))
+        collapsed = residual.mean(dim=1)
+        self.given.append(collapsed)
+        produced = sublayer(collapsed)
+        self.returned.append(produced)
+        # FP32 OUT, as the landed combine seam does on purpose
+        # (``inc-glm53f-030``): the carrier decides what to cast back to, and an
+        # item that ran everything in one dtype could not read that decision.
+        result = (residual.to(torch.float32) + produced.unsqueeze(1).to(torch.float32) * 0.5)
+        self.results.append(result)
+        return result
+
+
+class _StubLayer(nn.Module):
+    """Stands in for a decoder layer and records what the carrier handed it.
+
+    It CHANGES the streams it is given, which is what makes the readings below
+    non-vacuous: if it returned them untouched, "the mean collapsed the last
+    layer's streams" and "the mean collapsed the embedding" would be the same
+    sentence.
+    """
+
+    def __init__(self, family: str) -> None:
+        super().__init__()
+        self.family = family
+        self.calls: list[dict] = []
+        self.seen_streams: list[torch.Tensor] = []
+
+    def forward(self, hidden_states: torch.Tensor, *, streams=None, **kwargs):
+        self.calls.append(
+            {
+                "input_shape": tuple(hidden_states.shape),
+                "streams_shape": None if streams is None else tuple(streams.shape),
+                "input_is_streams": hidden_states is streams,
+                "carrier_keys": sorted(kwargs),
+            }
+        )
+        self.seen_streams.append(streams)
+        if streams is None:
+            return hidden_states
+        return streams * 1.25 + 0.01
+
+
+def _stub_stack(text_config, *, tokens: int = TOKENS, dtype=torch.float32):
+    """A ``Glm5NextModel`` whose layers are stubs, with the two mapped tensors loaded.
+
+    The embedding table is allocated HERE at ``[VOCAB, H]`` rather than at the
+    checkpoint's vocabulary, because this tree declares its parameters and
+    allocates none until the load: nothing in the model reads ``vocab_size`` after
+    construction, and the carrier only indexes the table it is given.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextConfig
+
+    impl = _impl()
+    model = impl.Glm5NextModel(Glm5NextConfig(text_config=text_config), 1)
+    hidden = int(text_config.hidden_size)
+    stubs = [_StubLayer("kda"), _StubLayer("dsa")]
+    for stub in stubs:
+        stub.ffn_site = _StubSite()
+        setattr(
+            stub,
+            impl.MHC_SITES_ATTR,
+            {impl.MHC_ATTENTION_SITE: _StubSite(), impl.MHC_FFN_SITE: stub.ffn_site},
+        )
+    model.layers = nn.ModuleList(stubs)
+    gen = torch.Generator().manual_seed(303)
+    table = (torch.randn(VOCAB, hidden, generator=gen, dtype=torch.float32) * 0.05).to(dtype)
+    model.embed_tokens_weight = nn.Parameter(table, requires_grad=False)
+    model.norm_weight = nn.Parameter(torch.ones(hidden, dtype=dtype), requires_grad=False)
+    input_ids = torch.arange(tokens, dtype=torch.long) % VOCAB
+    return model, stubs, table, input_ids
+
+
+def _ffn_recorder():
+    """A stand-in for ``_ffn_half`` that records every call and its own return."""
+    seen: list[dict] = []
+    produced: list[torch.Tensor] = []
+
+    def _ffn_half(self, layer, hidden_states, **kwargs):
+        seen.append(
+            {
+                "layer": layer,
+                "shape": tuple(hidden_states.shape),
+                "tensor": hidden_states,
+                "kwargs": dict(kwargs),
+            }
+        )
+        out = torch.tanh(hidden_states) * 0.75
+        produced.append(out)
+        return out
+
+    return _ffn_half, seen, produced
+
+
+def _run_carrier(model, input_ids, *, carriers=None):
+    """Run the carrier. ``carriers`` defaults to empty mappings, which only the stub
+    layers accept -- both real layer forwards declare required keyword-only carriers,
+    so an item that builds real layers passes :func:`_call_kwargs` for each family."""
+    return model.forward(
+        input_ids,
+        layer_carriers=carriers if carriers is not None else [{} for _ in model.layers],
+        quant_config=QUANT,
+        block_size=BLOCKS,
+        moe_group=MOE_GROUP,
+        tp_degree=4,
+        expert_parallel_rank=2,
+    )
+
+
+def test_030d_the_carrier_expands_the_embedding_across_the_stream_axis() -> None:
+    """Every layer is handed ``[T, hc_mult, H]``, and at entry every stream is the token.
+
+    ``reference:1477`` expands the embeddings across a new stream axis before the
+    stack runs, so the first layer's four streams are four copies of the same token
+    vector. Bitwise, because an expand copies rather than computes.
+
+    The stream count is READ OFF THE CONFIG, so a checkpoint that carried a
+    different ``hc_mult`` would reach this item rather than being overwritten by it.
+    """
+    text_config = _text_config()
+    model, stubs, table, input_ids = _stub_stack(text_config)
+    ffn_half, seen, _ = _ffn_recorder()
+    hc_mult = int(text_config.hc_mult)
+    hidden = int(text_config.hidden_size)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_half)
+        out = _run_carrier(model, input_ids)
+
+    embedded = table[input_ids]
+    first = stubs[0].seen_streams[0]
+    per_stream_equal = [
+        bool(torch.equal(first[:, s, :], embedded)) for s in range(hc_mult)
+    ]
+    say("carrier-expand", f"ids={tuple(input_ids.shape)}", f"out={tuple(out.shape)}")
+    say("carrier-expand", f"first_layer_streams={tuple(first.shape)}",
+        f"streams_equal_the_embedding={per_stream_equal}")
+    say("carrier-expand", f"ffn_half_calls={len(seen)}",
+        f"layer_calls={[len(s.calls) for s in stubs]}")
+
+    assert tuple(first.shape) == (len(input_ids), hc_mult, hidden), (
+        f"the first layer was handed {tuple(first.shape)}; the carrier is "
+        f"[T, hc_mult, H] and hc_mult comes off the config as {hc_mult}"
+    )
+    assert all(per_stream_equal), (
+        f"at entry the streams read {per_stream_equal} against the embedding; "
+        f"reference:1477 expands one token vector into every stream"
+    )
+    assert [c["streams_shape"] for s in stubs for c in s.calls] == [
+        (len(input_ids), hc_mult, hidden)
+    ] * len(stubs), "every layer in the stack must be handed the streams"
+    assert all(c["input_is_streams"] for s in stubs for c in s.calls), (
+        "the positional input and the streams keyword must be the SAME tensor; "
+        "reference:1481 hands the decoder layer the four-stream tensor itself"
+    )
+    # NON-VACUOUS: the stub layer changes the streams, so the SECOND layer's input
+    # is no longer the embedding. A carrier that expanded once per layer would pass
+    # the reading above and fail this one.
+    second = stubs[1].seen_streams[0]
+    assert not torch.equal(second[:, 0, :], embedded), (
+        "the second layer saw the embedding again; the streams must be the first "
+        "layer's output, not a fresh expand"
+    )
+
+
+def test_030d_the_carrier_collapses_with_an_unweighted_mean() -> None:
+    """The final norm sees ``streams.mean(dim=1)``, not a weighted sum.
+
+    ``reference:302`` is the one collapse in this model that carries no learned
+    weight -- the target model's own class comment says "unlike DeepSeek-V4, this is
+    an unweighted mean" -- and ``reference:1493`` puts it BEFORE the norm. Both are
+    read here: the tensor the norm was handed, and the order it was handed it in.
+
+    THE CONTROL IS A WEIGHTED COLLAPSE over the same streams. It differs, printed,
+    so this item distinguishes the mean from the mHC-style collapse the two sites
+    use -- which is the mistake a reader of this file would most plausibly make.
+    """
+    text_config = _text_config()
+    # BF16 TABLE, FP32 SEAM RETURN: the streams come back from each site in fp32, so
+    # the output's dtype reads the carrier's cast rather than the fixture's one dtype.
+    model, stubs, table, input_ids = _stub_stack(text_config, dtype=torch.bfloat16)
+    ffn_half, _, _ = _ffn_recorder()
+    normed: list[torch.Tensor] = []
+    real_norm = type(model)._rms_norm
+
+    def _recording_norm(self, hidden_states, gain):
+        normed.append(hidden_states)
+        return real_norm(self, hidden_states, gain)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_half)
+        patch.setattr(type(model), "_rms_norm", _recording_norm)
+        out = _run_carrier(model, input_ids)
+
+    last = stubs[-1].ffn_site.results[-1]
+    embedded = table[input_ids]
+    want = last.mean(dim=1).to(embedded.dtype)
+    # THE CONTROL'S WEIGHTS ARE DERIVED from the stream count, so a config carrying a
+    # different hc_mult reaches this item instead of an index error.
+    weights = torch.linspace(0.1, 0.4, int(text_config.hc_mult), dtype=torch.float32)
+    weighted = (last * weights[None, :, None]).sum(dim=1).to(embedded.dtype)
+    spread = float((last.max(dim=1).values - last.min(dim=1).values).abs().max())
+
+    say("carrier-mean", f"norm_calls={len(normed)}", f"out={tuple(out.shape)}",
+        f"out_dtype={out.dtype}")
+    say("carrier-mean", f"stream_spread={spread:.6g}",
+        f"weighted_control_delta={float((weighted - want).abs().max()):.6g}")
+
+    assert len(normed) == 1, (
+        f"the final norm ran {len(normed)} times; the carrier norms once, after the "
+        f"collapse"
+    )
+    assert torch.equal(normed[0], want), (
+        "the norm was handed something other than the unweighted mean of the last "
+        f"layer's streams; max deviation {float((normed[0] - want).abs().max())}"
+    )
+    assert tuple(normed[0].shape) == (len(input_ids), int(text_config.hidden_size))
+    assert out.dtype == embedded.dtype, (
+        f"the carrier returned {out.dtype}; the combine seam returns fp32 and the "
+        f"cast back to the table's dtype is this carrier's decision"
+    )
+    assert spread > 0.0, (
+        "the four streams reaching the collapse are identical, so a mean and a "
+        "weighted sum would agree and this item would read nothing"
+    )
+    assert not torch.equal(weighted, want), (
+        "a weighted collapse over these streams equals the mean, so the reading "
+        "above cannot tell the two apart"
+    )
+
+
+def test_030d_the_ffn_site_runs_over_ffn_halfs_unchanged_return() -> None:
+    """``_ffn_half`` is CALLED with one collapsed stream and its return is mixed back.
+
+    ``reference:1321-1327`` runs ``ffn_hc`` around ``mlp``: collapse, feed forward,
+    mix. In this tree the feed-forward half is ``Glm5NextModel._ffn_half``
+    (``inc-glm53f-054a``), so the site composes in the carrier and the call itself is
+    unchanged -- same ``layer`` object, same ``[T, H]`` shape, same five forwarded
+    keywords, and the object it returns is the object the site mixes.
+
+    IDENTITY, NOT EQUALITY, on that last reading: ``is`` cannot pass by two tensors
+    happening to agree.
+    """
+    text_config = _text_config()
+    model, stubs, _, input_ids = _stub_stack(text_config)
+    ffn_half, seen, produced = _ffn_recorder()
+    hidden = int(text_config.hidden_size)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_half)
+        _run_carrier(model, input_ids)
+
+    sites = [stub.ffn_site for stub in stubs]
+    say("ffn-site", f"ffn_half_calls={len(seen)}", f"layers={len(stubs)}")
+    say("ffn-site", f"shapes={[c['shape'] for c in seen]}",
+        f"site_residuals={[s.residuals for s in sites]}")
+    say("ffn-site", f"kwargs={sorted(seen[0]['kwargs'])}",
+        f"returns_mixed_unchanged="
+        f"{[s.returned[0] is p for s, p in zip(sites, produced)]}")
+
+    assert len(seen) == len(stubs), (
+        f"_ffn_half ran {len(seen)} times for {len(stubs)} layers; the carrier "
+        f"composes one feed-forward half per layer"
+    )
+    assert [c["shape"] for c in seen] == [(len(input_ids), hidden)] * len(stubs), (
+        "the feed-forward half must be handed ONE collapsed [T, H] stream, which is "
+        "the shape it has always taken"
+    )
+    assert [c["layer"] for c in seen] == list(stubs), (
+        "each feed-forward half must run against its own layer"
+    )
+    for site, call in zip(sites, seen):
+        assert site.residuals == [(len(input_ids), int(text_config.hc_mult), hidden)]
+        # IDENTITY: the tensor the feed-forward half was handed is the tensor this
+        # site collapsed, so no copy or re-collapse sits between them.
+        assert call["tensor"] is site.given[0], (
+            "the feed-forward half was handed a different tensor from the one the "
+            "site collapsed"
+        )
+        assert sorted(call["kwargs"]) == [
+            "block_size",
+            "expert_parallel_rank",
+            "moe_group",
+            "quant_config",
+            "tp_degree",
+        ]
+        assert call["kwargs"]["quant_config"] is QUANT
+        assert call["kwargs"]["block_size"] is BLOCKS
+        assert call["kwargs"]["moe_group"] is MOE_GROUP
+        assert call["kwargs"]["tp_degree"] == 4
+        assert call["kwargs"]["expert_parallel_rank"] == 2
+    assert [s.returned[0] is p for s, p in zip(sites, produced)] == [True] * len(stubs), (
+        "the site mixed something other than the object _ffn_half returned; the "
+        "plan's word is that _ffn_half is called, never edited"
+    )
+
+
+def test_030d_the_hybrid_stack_runs_both_families_through_real_sites() -> None:
+    """One KDA layer and one DSA layer, both bound, both composed, end to end.
+
+    This is the block's arm (2) at this file's token count: the composition runs at
+    BOTH sublayer sites of BOTH attention families, through the REAL
+    :class:`Glm5NextHyperConnection` -- the attention site inside each layer forward
+    and the feed-forward site in the carrier. Only two things are stood in for: the
+    attention half (another increment's kernels) and ``_ffn_half`` (the expert bank).
+    The arm's numeric equality against the independent reference is the host run's,
+    at ``T = 128``.
+
+    The bind is the layer's own public method, so this item runs the same code path
+    the load path runs.
+    """
+    impl = _impl()
+    from vllm_neuron.model.glm5_next.config import Glm5NextConfig
+
+    text_config = _text_config()
+    model = impl.Glm5NextModel(Glm5NextConfig(text_config=text_config), 1)
+    hidden = int(text_config.hidden_size)
+    stubs = []
+    for layer in model.layers:
+        _norm_ready(layer, text_config)
+        _load_the_six(layer, text_config)
+        stubs.append(_install_stub(layer))
+        layer.bind_hyper_connection_sites(text_config, torch.device("cpu"))
+    gen = torch.Generator().manual_seed(304)
+    table = torch.randn(VOCAB, hidden, generator=gen, dtype=torch.float32) * 0.05
+    model.embed_tokens_weight = nn.Parameter(table, requires_grad=False)
+    model.norm_weight = nn.Parameter(
+        torch.ones(hidden, dtype=torch.float32), requires_grad=False
+    )
+    input_ids = torch.arange(TOKENS, dtype=torch.long) % VOCAB
+    ffn_half, seen, _ = _ffn_recorder()
+
+    carriers = [_call_kwargs("kda"), _call_kwargs("dsa")]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_half)
+        out = _run_carrier(model, input_ids, carriers=carriers)
+
+    families = [type(layer).__name__ for layer in model.layers]
+    site_pairs = [
+        sorted(getattr(layer, impl.MHC_SITES_ATTR)) for layer in model.layers
+    ]
+    distinct = [
+        getattr(layer, impl.MHC_SITES_ATTR)[impl.MHC_ATTENTION_SITE]
+        is not getattr(layer, impl.MHC_SITES_ATTR)[impl.MHC_FFN_SITE]
+        for layer in model.layers
+    ]
+    say("hybrid", f"families={families}", f"sites={site_pairs}",
+        f"two_instances_per_layer={distinct}")
+    say("hybrid", f"attention_saw={[s.seen for s in stubs]}",
+        f"ffn_saw={[c['shape'] for c in seen]}")
+    say("hybrid", f"out={tuple(out.shape)}", f"dtype={out.dtype}",
+        f"finite={bool(torch.isfinite(out).all())}")
+
+    assert len(set(families)) == 2, (
+        f"this stack holds only {families}; arm (2) wants both attention families"
+    )
+    assert all(distinct), "each layer must hold TWO sites, one per sublayer"
+    assert [s.seen for s in stubs] == [[(len(input_ids), hidden)]] * len(stubs), (
+        "each attention half must be entered exactly once, on the collapsed "
+        "[T, H] stream the site handed it"
+    )
+    assert [c["shape"] for c in seen] == [(len(input_ids), hidden)] * len(stubs)
+    assert tuple(out.shape) == (len(input_ids), hidden)
+    assert out.dtype == table.dtype
+    assert bool(torch.isfinite(out).all()), (
+        "the four-stream composition returned a non-finite value through the real "
+        "sinkhorn and combine seams"
+    )
+
+
+def test_030d_a_stack_whose_layers_carry_no_mhc_weight_refuses_by_name() -> None:
+    """The unconditional carrier's other half: no weights, no service.
+
+    The carrier passes streams to every layer whatever the checkpoint holds, so the
+    refusal is what keeps a weightless stack from being served a different network.
+    This is the FIRING CONTROL for that design decision: same carrier, same call,
+    six leaves absent, and the message names the one-stream path.
+    """
+    impl = _impl()
+    from vllm_neuron.model.glm5_next.config import Glm5NextConfig
+
+    text_config = _text_config()
+    model = impl.Glm5NextModel(Glm5NextConfig(text_config=text_config), 1)
+    hidden = int(text_config.hidden_size)
+    for layer in model.layers:
+        _norm_ready(layer, text_config)
+        _install_stub(layer)
+    gen = torch.Generator().manual_seed(305)
+    model.embed_tokens_weight = nn.Parameter(
+        torch.randn(VOCAB, hidden, generator=gen, dtype=torch.float32) * 0.05,
+        requires_grad=False,
+    )
+    model.norm_weight = nn.Parameter(
+        torch.ones(hidden, dtype=torch.float32), requires_grad=False
+    )
+    ffn_half, seen, _ = _ffn_recorder()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_half)
+        with pytest.raises(impl.Glm5NextHyperConnectionError) as caught:
+            _run_carrier(
+                model,
+                torch.arange(TOKENS, dtype=torch.long) % VOCAB,
+                carriers=[_call_kwargs("kda"), _call_kwargs("dsa")],
+            )
+
+    message = str(caught.value)
+    say("weightless-stack", f"ffn_half_calls={len(seen)}", f"message={message[:110]}")
+    assert "carries none of the six" in message, message
+    assert "pass no streams" in message, message
+    assert seen == [], (
+        "the refusal must come before any feed-forward half runs, so a weightless "
+        "stack cannot half-serve a request"
+    )
+
+
+def test_030d_the_carrier_refuses_a_stream_count_that_is_not_positive() -> None:
+    """``hc_mult`` 0 cannot build a carrier, and the message says which value it is.
+
+    The stream count is the checkpoint's, read on every call. A zero would expand to
+    an empty stream axis, every collapse would be a mean over nothing, and the stack
+    would return NaNs rather than refusing.
+    """
+    text_config = _text_config(hc_mult=0)
+    model, _, _, input_ids = _stub_stack(text_config)
+    ffn_half, seen, _ = _ffn_recorder()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_half)
+        with pytest.raises(ValueError) as caught:
+            _run_carrier(model, input_ids)
+
+    message = str(caught.value)
+    say("hc-mult-zero", f"message={message[:110]}", f"ffn_half_calls={len(seen)}")
+    assert "hc_mult=0" in message, message
+    assert seen == []
+
+
+def test_030d_the_role_map_agrees_with_the_reference_by_name() -> None:
+    """The three roles are matched to the reference's own three parameters BY NAME.
+
+    Every other item in this file reads the role map off the product, so a
+    ``base``-for-``scale`` swap in ``MHC_ROLE_PARAMETERS`` would pass all of them and
+    be caught only numerically, by arm (3), on the host. This item closes that gap
+    cheaply and independently: the reference's ``__init__`` declares ``fn``, ``base``
+    and ``scale`` with three DIFFERENT shapes (``reference:259-265``), so comparing
+    each role's bound parameter shape against the reference's same-named parameter
+    catches a swap here, on this machine, with no reference run.
+
+    The extents are EVALUATED FROM THE REFERENCE'S OWN SPELLING, not retyped: the
+    two names its expressions use are bound to this config's values, and any other
+    name refuses.
+    """
+    path = _reference_path()
+    if path is None:
+        pytest.skip("the campaign reference copy is not on this machine")
+    impl = _impl()
+    text_config = _text_config()
+    hc_mult = int(text_config.hc_mult)
+    hidden = int(text_config.hidden_size)
+
+    tree = ast.parse(Path(path).read_text())
+    declared: dict[str, tuple[str, ...]] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name.endswith("HyperConnection")):
+            continue
+        for stmt in ast.walk(node):
+            if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+                continue
+            target = stmt.targets[0]
+            if not (isinstance(target, ast.Attribute) and isinstance(stmt.value.func, ast.Attribute)):
+                continue
+            if stmt.value.func.attr != "Parameter":
+                continue
+            inner = stmt.value.args[0]
+            if not isinstance(inner, ast.Call):
+                continue
+            declared[target.attr] = tuple(ast.unparse(a) for a in inner.args)
+
+    allowed = {"mix": (2 + hc_mult) * hc_mult, "hidden": hidden, "hc_mult": hc_mult}
+
+    def extent(expr: str) -> int:
+        spelled = expr.replace("self.hc_mult", "hc_mult").replace(
+            "config.hidden_size", "hidden"
+        )
+        names = {n.id for n in ast.walk(ast.parse(spelled, mode="eval")) if isinstance(n, ast.Name)}
+        assert names <= set(allowed), (
+            f"the reference spells an extent this item cannot resolve: {expr!r} uses "
+            f"{sorted(names - set(allowed))}"
+        )
+        return int(eval(compile(ast.parse(spelled, mode="eval"), "<ref>", "eval"), {"__builtins__": {}}, allowed))
+
+    want = {role: tuple(extent(e) for e in args) for role, args in declared.items()}
+    site = impl.Glm5NextHyperConnection(text_config, neuron_config=None)
+    got = {
+        role: tuple(getattr(site, impl.MHC_ROLE_PARAMETERS[role]).shape)
+        for role in sorted(impl.MHC_ROLE_PARAMETERS)
+    }
+
+    say("role-map", f"reference_declares={want}")
+    say("role-map", f"this_tree_binds={got}", f"map={impl.MHC_ROLE_PARAMETERS}")
+
+    assert sorted(want) == sorted(impl.MHC_ROLE_PARAMETERS), (
+        f"the reference declares {sorted(want)} and this tree maps "
+        f"{sorted(impl.MHC_ROLE_PARAMETERS)}; the three roles must be the same three"
+    )
+    assert got == want, (
+        f"role-to-parameter mapping disagrees with the reference by shape: this tree "
+        f"binds {got}, the reference declares {want}. A swapped pair would compute a "
+        f"plausible number and only arm (3) would object"
+    )
+    assert len({tuple(v) for v in want.values()}) == len(want), (
+        "the reference's three parameters do not have three distinct shapes, so this "
+        "item cannot catch a swap and the gap it closes is still open"
+    )

@@ -7022,23 +7022,34 @@ class Glm5NextModel(nn.Module):
         tp_degree: int = 1,
         expert_parallel_rank: int = 0,
     ) -> torch.Tensor:
-        """The whole decoder stack: embed, every layer in config order, final norm.
+        """The whole decoder stack: embed, expand to streams, every layer in config
+        order, collapse, final norm.
 
-        THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC
-        carrier is ``inc-glm53f-030b``'s. The reference implementation carries
-        ``hc_mult`` parallel residual streams between layers -- it expands the
-        embeddings to ``[B, S, hc_mult, H]`` (``modeling_glm5_next.py:1477``), mixes
-        each sublayer's output back through a manifold-constrained hyper-connection
-        at BOTH sites (``:1316-1318``, ``:1325-1327``), and collapses the streams
-        with an unweighted mean before the final norm (``:1493``, ``:302``). This
-        forward carries ONE stream and adds, at both sites. That is a declared exclusion,
-        not an approximation of the reference: the mHC composition is
-        ``inc-glm53f-030b``'s increment, the six mHC weights already sit flat on
-        every layer waiting for it, and NOTHING IN THIS FORWARD IS CERTIFIED FOR
-        THE 4-STREAM CARRIER. At ``hc_mult`` 1 the reference does not degenerate to
-        an add either -- its `pre`, `post` and `comb` gates are sigmoids plus an
-        epsilon and never exactly 1 -- so a one-stream config would not make the
-        two forms equal.
+        THE INTER-LAYER CARRIER IS ``[T, hc_mult, H]`` -- the checkpoint's four
+        parallel residual streams, not one. ``inc-glm53f-030d`` part (a) put it here,
+        and each of the three steps is the target model's own, cited rather than
+        invented:
+
+        * the embedding is EXPANDED across the stream axis, every stream a view of
+          the same token vector (``modeling_glm5_next.py:1477``);
+        * every layer is handed the streams and hands streams back -- the attention
+          half's mHC site runs inside the layer (part (b)) and the FEED-FORWARD
+          half's site runs HERE, around ``_ffn_half``'s unchanged return, because
+          that call is this class's (``reference:1321-1327`` runs ``ffn_hc`` around
+          ``mlp``);
+        * the streams are collapsed by an UNWEIGHTED MEAN before the final norm
+          (``reference:302``, ``:1493``), which is the one collapse in this model
+          that carries no learned weight at all -- the target model's own comment
+          says so, and it is why this line is a ``mean`` and not another mHC site.
+
+        THE STACK PASSES STREAMS UNCONDITIONALLY, and that is a design decision with
+        a reason: the branch in :func:`_mhc_site` refuses a streams call on a layer
+        that carries no mHC weight and refuses a no-streams call on a layer that
+        carries them, so a conditional here would be the one place a silent
+        one-stream stack could come back. A caller whose layers hold no mHC weights
+        is refused BY NAME instead of served a different network. The draft head is
+        unaffected: it calls the layer class directly (``mtp.py:158``), never this
+        method.
 
         THE STACK IS FAMILY-BLIND, which is the property ``inc-glm53f-013`` built
         ``get_kv_spec``'s one loop for and the reason this signature takes carriers
@@ -7081,12 +7092,19 @@ class Glm5NextModel(nn.Module):
                 CALLER's to supply, so no degree is frozen at this site.
 
         Returns:
-            ``[T, H]`` after the final RMSNorm, in the embedding table's dtype.
+            ``[T, H]`` after the final RMSNorm, in the embedding table's dtype. The
+            streams live only inside this method: the mean collapses them and the
+            cast back to the table's dtype is this carrier's, because the combine
+            seam returns fp32 on purpose and leaves the decision here
+            (``inc-glm53f-030``).
             Logits are the root's, which is where ``lm_head_weight`` lives.
 
         Raises:
-            ValueError: when the carrier count disagrees with the layer count, or
-                when a mapped parameter this forward reads was never loaded.
+            ValueError: when the carrier count disagrees with the layer count, when
+                a mapped parameter this forward reads was never loaded, or when the
+                checkpoint's ``hc_mult`` is not a positive stream count.
+            Glm5NextHyperConnectionError: from :func:`_mhc_site` when a layer's mHC
+                weights disagree with the streams route this method takes.
         """
         layers = list(self.layers)
         carriers = list(layer_carriers)
@@ -7104,17 +7122,43 @@ class Glm5NextModel(nn.Module):
                 "table is a mapped checkpoint tensor "
                 "(weight_loaders_fp8.py:378) and nothing was loaded onto it"
             )
-        hidden_states = table[input_ids]
+        embedded = table[input_ids]
+        hc_mult = int(self.text_config.hc_mult)
+        if hc_mult <= 0:
+            raise ValueError(
+                f"Glm5NextModel.forward cannot build a stream carrier from "
+                f"hc_mult={hc_mult}; the checkpoint's config declares how many "
+                f"parallel residual streams this model carries and the count has to "
+                f"be positive"
+            )
+        # THE EXPAND, ``reference:1477``. Every stream starts as the same token
+        # vector; ``contiguous`` is the reference's too, because the streams are
+        # written independently from here on and a view would alias them.
+        streams = embedded.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
         for layer, carrier in zip(layers, carriers):
-            hidden_states = layer(hidden_states, **carrier)
-            hidden_states = hidden_states + self._ffn_half(
-                layer,
-                hidden_states,
-                quant_config=quant_config,
-                block_size=block_size,
-                moe_group=moe_group,
-                tp_degree=tp_degree,
-                expert_parallel_rank=expert_parallel_rank,
+            # ONE TENSOR, PASSED AS BOTH ARGUMENTS ON PURPOSE. The streams ARE this
+            # layer's input, exactly as ``reference:1481-1491`` hands the four-stream
+            # tensor to the decoder layer; the keyword is this tree's route selector
+            # (part (b)) and the positional is the one-stream route's operand, which
+            # a bound layer refuses to take.
+            streams = layer(streams, **carrier, streams=streams)
+            # THE FEED-FORWARD SITE, ``reference:1321-1327``. ``_ffn_half`` is
+            # ``inc-glm53f-054a``'s and is CALLED, never edited: the site collapses
+            # the streams, hands it the single ``[T, H]`` stream it has always taken,
+            # and mixes its unchanged return back. ``streams`` is never ``None``
+            # here, so this is a site or a refusal, never the plain add.
+            site = _mhc_ffn_site(layer, streams)
+            streams = site.forward(
+                streams,
+                lambda single_stream, layer=layer: self._ffn_half(
+                    layer,
+                    single_stream,
+                    quant_config=quant_config,
+                    block_size=block_size,
+                    moe_group=moe_group,
+                    tp_degree=tp_degree,
+                    expert_parallel_rank=expert_parallel_rank,
+                ),
             )
         gain = self.norm_weight
         if gain is None:
@@ -7123,7 +7167,11 @@ class Glm5NextModel(nn.Module):
                 "is a mapped checkpoint tensor (weight_loaders_fp8.py:381) and "
                 "nothing was loaded onto it"
             )
-        return self._rms_norm(hidden_states, gain)
+        # THE COLLAPSE, ``reference:302`` and ``:1493``: an UNWEIGHTED mean over the
+        # stream axis, then the norm -- in that order, which is the order the
+        # reference composes ``self.norm(self.hc_head(hidden_states))``.
+        collapsed = streams.mean(dim=1).to(embedded.dtype)
+        return self._rms_norm(collapsed, gain)
 
 
 # ---------------------------------------------------------------------------
@@ -7431,13 +7479,22 @@ def _mhc_leaves_by_site(
     return grouped
 
 
-def _mhc_attention_site(
-    module: nn.Module, streams: torch.Tensor | None
+def _mhc_site(
+    module: nn.Module, streams: torch.Tensor | None, site: str
 ) -> Glm5NextHyperConnection | None:
-    """Which route ONE layer call takes, refusing both ways.
+    """Which route ONE call takes, refusing both ways, for either site.
 
-    Returns the layer's attention-half mHC site when the call carries streams, and
+    Returns the named mHC site of ``module`` when the call carries streams, and
     ``None`` when the plain residual add is the right thing to do.
+
+    ONE RULE, TWO SITES (``inc-glm53f-030d`` part (a) generalised part (b)'s rule).
+    The attention half asks for ``MHC_ATTENTION_SITE`` from inside each layer
+    forward; the feed-forward half asks for ``MHC_FFN_SITE`` from the carrier, which
+    is where ``_ffn_half`` is called. Both ask the same question -- does this
+    module's weights agree with the route this call takes -- so both get the same
+    three answers from this one body rather than two copies that can drift.
+    :func:`_mhc_attention_site` and :func:`_mhc_ffn_site` are the two names, and
+    they add nothing but the site.
 
     ``inc-glm53f-030d`` part (b), route R3. The keyword is optional because two
     callers need it absent -- the draft head hands this same sparse-attention class
@@ -7489,7 +7546,27 @@ def _mhc_attention_site(
             "streams. The checkpoint gives the draft head's layer none of them, so "
             "this call belongs on the one-stream path: pass no streams"
         )
-    return sites[MHC_ATTENTION_SITE]
+    return sites[site]
+
+
+def _mhc_attention_site(
+    module: nn.Module, streams: torch.Tensor | None
+) -> Glm5NextHyperConnection | None:
+    """The attention half's site, or ``None`` for the plain add. See :func:`_mhc_site`."""
+    return _mhc_site(module, streams, MHC_ATTENTION_SITE)
+
+
+def _mhc_ffn_site(
+    module: nn.Module, streams: torch.Tensor | None
+) -> Glm5NextHyperConnection | None:
+    """The feed-forward half's site, or ``None`` for the plain add.
+
+    Asked by the carrier rather than by a layer, because ``_ffn_half`` is
+    ``Glm5NextModel``'s (``inc-glm53f-054a``) and the site therefore composes where
+    that call is made (``reference:1321-1327`` runs ``ffn_hc`` around ``mlp``).
+    See :func:`_mhc_site` for the three answers.
+    """
+    return _mhc_site(module, streams, MHC_FFN_SITE)
 
 
 def _bind_hyper_connection_sites(
