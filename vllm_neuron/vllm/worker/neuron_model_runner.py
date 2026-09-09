@@ -4736,7 +4736,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     # ── GLM-5.3-Flash carrier threading (inc-glm53f-054b) ────────────────
     # This family takes its caches as forward ARGUMENTS -- one mapping per layer,
-    # splatted at `model_fp8.py:6906` and refused on a count mismatch at `:6891` --
+    # splatted at `model_fp8.py:7024` and refused on a count mismatch at `:7009` --
     # while every other family in this tree reads them off attributes. The helpers
     # below build those mappings out of what `bind_kv_cache` kept and nothing else.
     # Only `_glm5next_model_kwargs` is called from a model call site, and it returns
@@ -4752,7 +4752,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         THE RULE IS THE CONSUMER'S OWN, quoted from it: "only the LAST token of each
         complete pool carries a non-negative slot and intra-pool positions carry
         ``-1``" (``model_fp8.py:4624-4627``), and the id is the pool number the
-        decode leg writes with, ``int(position) // pool`` (``model_fp8.py:5382``).
+        decode leg writes with, ``int(position) // pool`` (``model_fp8.py:5482``).
 
         ``start_position`` IS WHAT MAKES THE POSITION ABSOLUTE, and it matters: a
         chunked prefill's later chunk pools on the sequence's own boundaries, not on
@@ -4782,8 +4782,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """``[tokens]`` int32: each score ROW's own causal length.
 
         ``seq_lens`` IS PER TOKEN, NOT PER REQUEST -- "one per PACKED row", guarded
-        at ``model_fp8.py:5541`` -- and it is the causal bound ``inc-glm53f-103``
-        consumes (``model_fp8.py:4944``). Row ``i`` of a chunk that starts at
+        at ``model_fp8.py:5648`` -- and it is the causal bound ``inc-glm53f-103``
+        consumes (``model_fp8.py:5021``). Row ``i`` of a chunk that starts at
         ``start_position`` sees ``start_position + i + 1`` tokens including itself.
         The landed tiny operand is ``arange(1, tokens + 1)``
         (``test_tiny_glm5next_forward.py:2872``), which is this expression at
@@ -4811,20 +4811,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         THE ROW COUNT IS THE INDEXER'S OWN STATED MINIMUM: ``pool_cache`` must leave
         one trash row above every addressable candidate pool -- "allocate at least
         ``candidates + 1``" where ``candidates = max_seq_len // index_kpool``
-        (``model_fp8.py:5211-5218``). Passing the longest sequence the engine admits
+        (``model_fp8.py:5288-5295``). Passing the longest sequence the engine admits
         therefore covers every batch that can be scheduled, and a batch's own
         shorter ``max_seq_len`` rides in the carrier. ``tail`` is ``[2,
         index_kpool, index_head_dim]``, half 0 keys and half 1 gate scores
-        (``model_fp8.py:4733``).
+        (``model_fp8.py:4735``).
 
         BOTH ARE LIVE ACROSS STEPS, which is why the caller allocates them ONCE and
         keeps them: the decode leg advances the ring in place (``tail.copy_``,
-        ``model_fp8.py:5377``) and the pooled store accumulates the prefill's rows.
+        ``model_fp8.py:5477``) and the pooled store accumulates the prefill's rows.
         Re-allocating per step would reset both and lose every pooled key.
 
         THE DTYPE IS THE LATENT BANK'S, so neither cache adds a second dtype
         authority; both of the layer's own checks are shape checks and both writes
-        cast on the way in (``model_fp8.py:5385``, ``:5204-5208``).
+        cast on the way in (``model_fp8.py:5485``, ``:5281-5285``).
         """
         pool = int(index_kpool)
         width = int(index_head_dim)
@@ -4905,15 +4905,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """One mapping per layer, in stack order, each holding THAT layer's own state.
 
         ``Glm5NextModel.forward`` splats these and refuses a count that disagrees
-        with the stack (``model_fp8.py:6891-6906``), so this walks the banks
+        with the stack (``model_fp8.py:7009-7024``), so this walks the banks
         ``bind_kv_cache`` kept -- the spec's own layer order -- and never names a
         layer.
 
         THE KEYS ARE EACH FAMILY'S OWN DECLARED KEYWORDS. A sparse (DSA) layer takes
         ``latent_cache``, ``pool_cache``, ``seq_lens``, ``start_position``,
         ``softmax_scale``, ``max_seq_len`` and ``page_size``, plus ``slot_mapping``
-        on the prefill leg or ``tail`` and ``position`` on the decode leg
-        (``model_fp8.py:6583-6598``); a linear (KDA) layer takes ``conv_state``,
+        and the ring it seeds -- ``prefill_tail`` with ``prefill_end_position`` --
+        on the prefill leg, or ``tail`` and ``position`` on the decode leg
+        (``model_fp8.py:6696-6713``); a linear (KDA) layer takes ``conv_state``,
         ``recurrent_state`` and ``is_prefill`` (``:4149``). Which leg is running is
         the caller's reading of the batch, passed in rather than guessed here.
 
@@ -4941,7 +4942,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         THE SCALE IS THE CALLER'S BY THE MODEL'S OWN INSTRUCTION -- "THE SOFTMAX
         SCALE IS THE CALLER'S, NOT THIS METHOD'S", the registered value being
         ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``
-        (``model_fp8.py:6854-6860``). It arrives as an argument so this function
+        (``model_fp8.py:6972-6978``). It arrives as an argument so this function
         holds no copy of the constant.
         """
         if len(banks) != len(side_caches) or len(banks) != len(geometries):
@@ -4954,7 +4955,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             raise ValueError(
                 f"the decode leg advances the indexer's tail ring one position at a "
                 f"time -- its seam takes a single [1, index_head_dim] key row and a "
-                f"single position (model_fp8.py:4739-4742, :5374) -- and this step "
+                f"single position (model_fp8.py:4741-4744, :5474) -- and this step "
                 f"carries {int(tokens)} token(s); threading a multi-token decode, "
                 f"which is speculative decoding's verify step, is not "
                 f"inc-glm53f-054b's work"
@@ -5023,6 +5024,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     index_kpool=index_kpool,
                     device=device,
                 )
+                # THE RING IS ON BOTH LEGS NOW, under its own keyword. The prefill
+                # leg seeds this chunk's remainder into it (`model_fp8.py`'s
+                # `seed_tail`), because the keys for those positions exist only
+                # inside that forward. The end position is passed rather than
+                # inferred: the indexer's `max_seq_len` is the BATCH's longest
+                # sequence, equal to this sequence's end only while the batch is
+                # one request -- which this half refuses to exceed, but the model
+                # must not depend on that.
+                carrier["prefill_tail"] = side["tail"]
+                carrier["prefill_end_position"] = int(start_position) + int(tokens)
             else:
                 carrier["tail"] = side["tail"]
                 carrier["position"] = int(start_position)
@@ -5040,7 +5051,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
         ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
-        three parallelism arguments (``model_fp8.py:8176-8186``), so the generic
+        three parallelism arguments (``model_fp8.py:8294-8304``), so the generic
         mapping's ``positions``, ``sampling_params``, ``spec_decode_metadata``,
         ``rank``, ``logit_mask`` and ``rotary_position_ids`` have no parameter to
         land on -- they belong to features this campaign has not ported. The batch
@@ -5050,7 +5061,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         ``block_size`` IS NOT PASSED EITHER, AND THAT IS THE POINT. The root's
         parameter of that name is the FP8 WEIGHT-QUANT block, "tokens per block,
-        forwarded to the expert bank unread" (``model_fp8.py:8268``), and the bank
+        forwarded to the expert bank unread" (``model_fp8.py:8386``), and the bank
         refuses it unless it is a positive multiple of ``BLOCK_QUANT_SIZE``
         (``model_fp8.py:1775-1780``). A KV page size is a different number entirely --
         4 in the tiny fixture -- so handing it over raises
@@ -5066,11 +5077,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         has two groups, so reading one entry for the whole stack slices one family out
         of the other family's table -- what review r1 of commit 1 found. The names are
         the same names the banks carry: both sides come from ``get_kv_spec``
-        (``:9175-9176``).
+        (``:9186-9187``).
 
         THE LEG IS READ THE FILE'S OWN WAY, ``max_query_len`` against
         ``decode_token_threshold``, which is the decode test this runner already
-        makes at ``:7513-7516``, so the two cannot disagree. It is read PER GROUP and
+        makes at ``:7524-7527``, so the two cannot disagree. It is read PER GROUP and
         a disagreement refuses, because the layers of one forward are stepped
         together or not at all.
 
@@ -5159,16 +5170,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             #
             # THE POOLED STORE IS LEFT ALONE, deliberately: the candidate gather is
             # bounded by this sequence's own `max_seq_len`
-            # (`model_fp8.py:5211-5218`), and every complete pool below that bound
+            # (`model_fp8.py:5288-5295`), and every complete pool below that bound
             # is written by this prefill, so a stale row above it is unreachable.
             # Clearing it would also hide a bound defect rather than expose one.
             #
-            # THE PREFILL'S REMAINDER IS STILL NOT SEEDED. `model_fp8.py:4631-4636`
-            # says the caller persists it; the only code holding the indexer's key
-            # and gate for those positions is the model's own prefill branch
-            # (`model_fp8.py:5386-5393`), and a `tail` passed to that forward
-            # selects the decode leg (`:5360-5370`), so this runner cannot pass
-            # one. Recorded as a design question, not patched here.
+            # THE PREFILL'S REMAINDER IS SEEDED BY THE MODEL, NOT HERE. The positions
+            # past the last complete pool exist only inside the prefill branch
+            # (`model_fp8.py:5486-5500`), so that branch writes them into the ring this
+            # converter binds -- `prefill_tail` with `prefill_end_position` -- using
+            # `seed_tail` (`model_fp8.py:4631-4638`). Commit 6 of `inc-glm53f-054b`, on
+            # the lead's ruling; item 11 of the tiny end-to-end file measures it.
             for side in side_caches:
                 if "tail" in side:
                     side["tail"].zero_()

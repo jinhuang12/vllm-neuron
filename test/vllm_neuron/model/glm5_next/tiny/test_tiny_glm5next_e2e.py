@@ -5,7 +5,7 @@ into the per-layer carriers this model family takes as forward ARGUMENTS, and th
 block's registered acceptance over that thread:
 
   1. ``Glm5NextForConditionalGeneration.bind_kv_cache`` -- the method the runner calls on every
-     start-up (``neuron_model_runner.py:9131``) and that this package did not have until plan
+     start-up (``neuron_model_runner.py:9142``) and that this package did not have until plan
      revision 276. It must map every layer the spec reports onto that layer's OWN slots, keep
      views rather than copies, and refuse by name anything it cannot map.
   2. ``NeuronModelRunner._glm5next_layer_carriers`` and its two operand derivations -- the runner
@@ -75,7 +75,7 @@ def _blocks_for(slots: int) -> int:
 PROMPT_BLOCKS = _blocks_for(item.STACK_TOKENS)
 
 #: The bank must hold the prompt AND everything the generation appends, or the last decode
-#: step would write past the end -- which the layer refuses (`model_fp8.py:6398-6402`).
+#: step would write past the end -- which the layer refuses (`model_fp8.py:6505-6509`).
 E2E_BLOCKS = _blocks_for(item.STACK_TOKENS + GENERATED_TOKENS)
 
 #: The longest sequence this file admits, the number the side caches are sized from exactly as
@@ -124,9 +124,9 @@ def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
     """The dict ``initialize_kv_cache`` hands ``bind_kv_cache``, built the runner's own way.
 
     Every shape here is the runner's: a sparse layer gets a key/value PAIR of
-    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:8991-9027``)
+    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:9002-9038``)
     and a recurrent layer gets two ``[slots, *state shape]`` banks in conv-then-recurrent
-    order (``:9089-9119``). The geometry is read off the spec the model itself produced, so
+    order (``:9100-9130``). The geometry is read off the spec the model itself produced, so
     this helper cannot disagree with the model about what was asked for.
     """
     caches: dict[str, list[torch.Tensor]] = {}
@@ -185,7 +185,7 @@ def _recurrent_spec(root) -> KVSpec:
 
     The mapper recognises a family by the fields the spec carries, never by a layer name
     (``model_fp8.py``'s ``bind_kv_cache``, the same test the runner makes at
-    ``neuron_model_runner.py:9182-9188``), and it reads no layer module at all. So a spec
+    ``neuron_model_runner.py:9193-9199``), and it reads no layer module at all. So a spec
     with the stack's own length and names, reporting the four ``kda_*`` fields, drives the
     recurrent branch of exactly the code the runner drives.
     """
@@ -231,7 +231,7 @@ def _mixed_spec(root) -> KVSpec:
 
     THIS IS THE HYBRID SHAPE THAT MAKES TWO KV-CACHE GROUPS EXIST. A sparse layer's spec
     becomes a ``FullAttentionSpec`` and a recurrent layer's a ``MambaSpec``
-    (``neuron_model_runner.py:9182-9234``), and the KV-cache manager gives each class its own
+    (``neuron_model_runner.py:9193-9245``), and the KV-cache manager gives each class its own
     group with its own block table. The landed tiny stack is sparse on every layer, so one
     group is all it would ever have; this builds the two-group case out of the stack's own
     names and geometry, reading no layer module -- and neither the mapper nor the converter
@@ -513,7 +513,7 @@ def test_side_caches_meet_the_indexers_own_stated_minimum():
     """The pooled store leaves one trash row above every addressable pool, and the ring is sized.
 
     The minimum is the indexer's own, in its own words: ``allocate at least candidates + 1``
-    where ``candidates = max_seq_len // index_kpool`` (``model_fp8.py:5211-5218``). The
+    where ``candidates = max_seq_len // index_kpool`` (``model_fp8.py:5288-5295``). The
     allocator sits ON that boundary rather than over-allocating, so the assertions below
     are equalities in the derived row count; the guard itself is the instrument in item 5,
     where a store one row short raises inside the indexer instead of being asserted here.
@@ -608,9 +608,14 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
     assert len(carriers) == len(landed) == item.STACK_LAYERS
     for index, (got, want) in enumerate(zip(carriers, landed)):
         print(f"TINYE2E|carrier|{index}|keys={sorted(got)}")
-        assert set(got) == set(want), (
+        assert set(got) - set(want) == {"prefill_tail", "prefill_end_position"}, (
             f"layer {index}'s runner-built carrier carries {sorted(set(got))} and the "
-            f"landed prefill carrier carries {sorted(set(want))}"
+            f"landed prefill carrier carries {sorted(set(want))}; commit 6 adds the ring "
+            f"and its end position to the prefill leg and nothing else may move"
+        )
+        assert set(want) - set(got) == set(), (
+            f"layer {index}'s runner-built carrier LOST {sorted(set(want) - set(got))}, "
+            f"which the landed prefill carrier declares"
         )
         assert tuple(got["latent_cache"].shape) == tuple(want["latent_cache"].shape)
         assert int(got["start_position"]) == 0
@@ -742,7 +747,7 @@ def _metadata(names, *, blocks: int, tokens: int, cached: int, threshold: int = 
 def _model_kwargs(runner, *, input_ids, cached: int, sampling_row: int) -> dict:
     """One step's generic runner kwargs, translated by the converter under test.
 
-    THE GENERIC KEYS ARE THE ONES THE RUNNER SENDS (`neuron_model_runner.py:7493-7504`),
+    THE GENERIC KEYS ARE THE ONES THE RUNNER SENDS (`neuron_model_runner.py:7504-7515`),
     including the six this model implements nowhere, so the converter is measured dropping
     exactly what it says it drops rather than being handed a pre-cleaned mapping.
     """
@@ -1169,7 +1174,7 @@ def test_the_converter_does_not_hand_the_root_a_kv_page_as_its_quant_block():
     """Two different numbers share one name, and only one of them belongs to the root.
 
     THE ROOT'S `block_size` IS THE FP8 WEIGHT-QUANT BLOCK, "tokens per block, forwarded to the
-    expert bank unread" (`model_fp8.py:8268`), and the bank refuses it unless it is a positive
+    expert bank unread" (`model_fp8.py:8386`), and the bank refuses it unless it is a positive
     multiple of `BLOCK_QUANT_SIZE` (`model_fp8.py:1775-1780`). The KV page size is a different
     number -- 4 in this fixture -- so passing it would raise `Glm5NextBlockQuantRouteError` on
     the first routed layer. Unset, the bank uses its own declared block, which is the value
@@ -1243,7 +1248,7 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     0 is a new sequence, so the converter clears the ring there.
 
     THE POOLED STORE IS NOT CLEARED, and this item requires that too. The candidate gather is
-    bounded by this sequence's own `max_seq_len` (`model_fp8.py:5211-5218`) and every complete
+    bounded by this sequence's own `max_seq_len` (`model_fp8.py:5288-5295`) and every complete
     pool below that bound is written by the prefill, so a row above the bound is unreachable.
     The planted row above the bound must SURVIVE, so a future blanket clear of both caches
     fails here and has to argue for itself.
@@ -1252,14 +1257,14 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     come back UNCLEARED. A converter that zeroed the ring on every call would satisfy the first
     conjunct and fail this one, so the item cannot pass by clearing too much.
 
-    WHAT IT DOES NOT MEASURE: the prefill's own remainder is not seeded into the ring by
-    anything in this tree. `model_fp8.py:4631-4636` says the caller persists it, the only code
-    holding the indexer's key and gate for those positions is the model's prefill branch
-    (`:5386-5393`), and a `tail` passed to that forward selects the decode leg (`:5360-5370`).
-    A prompt whose length is not a multiple of `index_kpool` therefore pools its first
-    post-prompt completion from zeros. This file's acceptance cannot see it: `STACK_TOKENS` is
-    128 and `MLA_INDEX_KPOOL` is 4, so the prompt divides evenly. Reported as a design
-    question, not papered over here.
+    WHAT ITEM 11 MEASURES INSTEAD, and this item deliberately does not: the prefill's own
+    remainder. The rows past the last complete pool exist only inside the model's prefill
+    branch (`:5486-5500`), which now seeds them into the ring the converter binds with
+    `seed_tail` (`model_fp8.py:4631-4638`); a `tail` passed to that forward would select the
+    decode leg (`:5449-5470`), so the ring arrives as `prefill_tail` instead. This item's
+    prompt divides evenly -- `STACK_TOKENS` is 128 and `MLA_INDEX_KPOOL` is 4 -- so the
+    seeding is invisible here by construction; item 11 uses a prompt two rows past a pool
+    boundary and pools those rows on its first decode step.
     """
     _require_cpu_mode()
     root = _fixture()["root"]
@@ -1330,3 +1335,135 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
         "a decode step must not clear the ring; the ring is the decode leg's own state and "
         "clearing it would lose the partial pool this step is meant to advance"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 11. a prompt that leaves a remainder: the ring is seeded and the next pool is whole.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+#: A prompt that does NOT divide into pools, and the same prompt extended to the next pool
+#: boundary. Both are DERIVED from the landed dials, so a change to either moves them.
+REMAINDER_PROMPT = item.STACK_TOKENS + 2
+EVEN_PROMPT = item.STACK_TOKENS + item.MLA_INDEX_KPOOL
+
+
+def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
+    """The tokens after a prompt's last complete pool must reach the ring the decode leg pools.
+
+    THE ROW THIS ITEM MEASURES. A prompt of {REMAINDER} tokens completes pools 0..{LAST}
+    and leaves two positions over. The decode leg pools from the ring
+    (`vllm_neuron/functional/dsa/decode_tail_update.py`), so unless the prefill stashed those
+    two positions there, the pool that completes on the second decode step is built from zeros
+    in their place -- wrong candidate keys for every later token, with no tolerance and no
+    refusal below to catch it.
+
+    HOW IT IS CHECKED WITHOUT A NEW ORACLE. Two routes over the SAME token ids: one prefill of
+    {EVEN} tokens, which pools that block inside the prefill seam, against a prefill of
+    {REMAINDER} plus two decode steps, which pools it out of the ring. The pooled row they both
+    write is compared at the registered pair, `rtol=1e-2` / `atol=1e-5` (plan `:1183`); no new
+    constant is introduced here. The two routes do not use one kernel -- `decode_tail_update`
+    records that its completion is not bit-identical to the prefill kernel's on the same pool,
+    two bf16 round trips against one -- which is why the registered tolerance and not equality.
+
+    THE CONTROL IS A MUST-FAIL. The last block runs route B again and empties the ring after
+    the prefill, which is exactly "seeding removed". The completed pool must then MISS the
+    reference by more than the tolerance. If the seeding stopped happening, that block would
+    pass quietly and this item would fail, which is the direction an acceptance row has to
+    fail in.
+
+    THE DIRECT CONJUNCT is in the middle: after the prefill, the ring's low slots must be
+    non-zero and its high slots -- the positions the prompt never reached -- must still be
+    zero. That is the seeding itself, not its consequence.
+    """
+    _require_cpu_mode()
+    root = _fixture()["root"]
+    caches = _runner_shaped_caches(root)
+    root.bind_kv_cache(caches)
+    banks = root.glm5next_layer_banks
+    pool = int(root.text_config.index_kpool)
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+
+    remainder = REMAINDER_PROMPT % pool
+    completed_pool = (EVEN_PROMPT - 1) // pool
+    print(f"TINYE2E|remainder_case|prompt={REMAINDER_PROMPT}|even={EVEN_PROMPT}|pool={pool}"
+          f"|remainder={remainder}|completing_position={EVEN_PROMPT - 1}"
+          f"|pool_id={completed_pool}")
+    if remainder == 0 or EVEN_PROMPT % pool != 0 or EVEN_PROMPT > E2E_MAX_SEQ_LEN:
+        raise item.VacuousControlError(
+            f"this item needs a prompt that leaves a remainder ({REMAINDER_PROMPT} % {pool} "
+            f"= {remainder}), an extension that divides evenly ({EVEN_PROMPT} % {pool} = "
+            f"{EVEN_PROMPT % pool}) and both inside {E2E_MAX_SEQ_LEN} slots"
+        )
+
+    ids = torch.arange(EVEN_PROMPT, dtype=torch.long) % int(root.text_config.vocab_size)
+    side = runner._glm5next_live_side_caches(banks)
+    rings = [entry for entry in side if "tail" in entry]
+    if not rings:
+        raise item.VacuousControlError("no bank in this stack carries a ring")
+
+    def _rows() -> list[torch.Tensor]:
+        return [entry["pool_cache"][completed_pool] for entry in rings]
+
+    def _clear_the_row() -> None:
+        for row in _rows():
+            row.zero_()
+
+    # ---- Route A: one prefill over the whole block, pooled inside the prefill seam.
+    _clear_the_row()
+    root(**_model_kwargs(runner, input_ids=ids, cached=0, sampling_row=EVEN_PROMPT - 1))
+    want = [row.clone().float() for row in _rows()]
+    reference_scale = max(float(row.abs().max()) for row in want)
+    print(f"TINYE2E|route_a|pool_id={completed_pool}|max_abs={reference_scale:.6g}")
+    if reference_scale == 0.0:
+        raise item.VacuousControlError(
+            "the all-prefill route wrote nothing into the pool row this item compares, so "
+            "every comparison below would pass against zeros"
+        )
+
+    # ---- Route B: prefill the odd prompt, then step through the remainder.
+    _clear_the_row()
+    root(**_model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
+                         sampling_row=REMAINDER_PROMPT - 1))
+    low = min(float(entry["tail"][0, :remainder].abs().max()) for entry in rings)
+    high = max(float(entry["tail"][0, remainder:].abs().max()) for entry in rings)
+    print(f"TINYE2E|seeded_ring|low_slots_min={low:.6g}|high_slots_max={high:.6g}"
+          f"|seeded_slots={remainder}")
+    assert low > 0.0, (
+        "the prefill left the ring's remainder slots empty, so the next pool would complete "
+        "from zeros in their place"
+    )
+    assert high == 0.0, (
+        "the prefill wrote ring slots belonging to positions it never saw, which would put "
+        "the wrong keys in the next completion"
+    )
+    for step in range(remainder):
+        position = REMAINDER_PROMPT + step
+        root(**_model_kwargs(runner, input_ids=ids[position:position + 1], cached=position,
+                             sampling_row=0))
+    for index, (row, reference) in enumerate(zip(_rows(), want)):
+        got = row.float()
+        print(f"TINYE2E|pool_row|{index}|max_abs_delta={float((got - reference).abs().max()):.6g}"
+              f"|rtol=1e-2|atol=1e-5")
+        torch.testing.assert_close(got, reference, rtol=1e-2, atol=1e-5)
+
+    # ---- THE CONTROL, must fail: the same route with the seeding taken back out.
+    _clear_the_row()
+    root(**_model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
+                         sampling_row=REMAINDER_PROMPT - 1))
+    for entry in rings:
+        entry["tail"].zero_()
+    for step in range(remainder):
+        position = REMAINDER_PROMPT + step
+        root(**_model_kwargs(runner, input_ids=ids[position:position + 1], cached=position,
+                             sampling_row=0))
+    for index, (row, reference) in enumerate(zip(_rows(), want)):
+        delta = float((row.float() - reference).abs().max())
+        bound = 1e-5 + 1e-2 * float(reference.abs().max())
+        print(f"TINYE2E|control|{index}|max_abs_delta={delta:.6g}|tolerance_bound={bound:.6g}")
+        assert delta > bound, (
+            "with the ring emptied after the prefill, the completed pool still matched the "
+            "all-prefill reference inside the registered tolerance, so this item is not "
+            "measuring the seeding at all"
+        )
