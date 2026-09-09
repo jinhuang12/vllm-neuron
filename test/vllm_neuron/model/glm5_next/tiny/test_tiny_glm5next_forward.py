@@ -3877,9 +3877,10 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             # only routed layer IS the last (``STACK_LAYERS = 3``, ``STACK_FIRST_K_DENSE
             # = 2``), so it compares dense outputs alone. The eight-expert sum reaches a
             # comparison only through conjunct 5's final norm below, which is frozen at
-            # ``RTOL``/``ATOL``. DO NOT SWITCH THIS TO THE MoE BAND: at this fixture's
-            # shape the routed branch cannot execute, so it would widen nothing today and
-            # arm an unruled widening the moment the layer count or the dense split moves.
+            # ``RTOL``/``ATOL``. DO NOT SWITCH THIS TO THE MoE BAND: the routed LAYER does
+            # run, but this comparison never sees it, so a band selector here would widen
+            # nothing today and arm an unruled widening the moment the layer count or the
+            # dense split moves.
             torch.testing.assert_close(
                 recorded_in[index + 1][1][0].float(), expected,
                 rtol=RTOL, atol=ATOL,
@@ -4358,6 +4359,62 @@ def test_tiny_root_forward_matches_the_reference() -> None:
             f"{STACK_VOCAB_SIZE}-wide vocabulary"
         )
     expected = _root_reference(hidden, head, ROOT_SAMPLING_POSITIONS)
+
+    # ---- THE READING CLASS C TURNS ON, PRINTED AND GATED BY NOTHING. Control E below
+    # reads inside this item's band, and the round-3 review settled why: the bar on the
+    # relative row spread is about 0.13 -- a max over the 1024 compared elements, not the
+    # one-sigma size an earlier proposal of mine used -- and the rows arrive ALREADY
+    # HOMOGENISED by the stack, whose unsigned-weight MLPs make each output row nearly a
+    # function of its input row's mean. The rows are also post-RMS-norm, so no magnitude
+    # difference between positions survives to the head and only shape differences reach
+    # it. Whether ANY pair of the 128 positions is far enough apart to give control E its
+    # power is therefore a measurement, not an argument, and this is that measurement.
+    #
+    # SPREAD IS ``||x_a - x_b||_2 / mean(||x_a||_2, ||x_b||_2)``, so it is symmetric and
+    # dimensionless. NOTHING BELOW RAISES, nothing is compared against a bound, and no
+    # constant, comparator, position or fixture value is touched: these are readings.
+    if hidden.dim() != 2:
+        print(f"TINYFWD|root_row_spread|unavailable|hidden_dim={hidden.dim()}")
+    else:
+        _rows = hidden.float()
+        _norms = _rows.norm(dim=1)
+        # The difference is broadcast explicitly rather than taken from ``torch.cdist``,
+        # whose default compute mode switches to a matrix-multiply formula above 25 rows.
+        # At 128 x 512 the explicit form costs about 33 MB and is exact.
+        _dist = (_rows.unsqueeze(1) - _rows.unsqueeze(0)).norm(dim=2)
+        _norm_mean = (_norms.unsqueeze(1) + _norms.unsqueeze(0)) / 2.0
+        _spread = _dist / _norm_mean.clamp_min(1e-12)
+        # The three pairs THIS ITEM SAMPLES, derived from the frozen tuple rather than
+        # written out, so they follow the tuple if it ever moves under a ruling.
+        for _a, _b in (
+            (ROOT_SAMPLING_POSITIONS[1], ROOT_SAMPLING_POSITIONS[0]),
+            (ROOT_SAMPLING_POSITIONS[1], ROOT_SAMPLING_POSITIONS[2]),
+            (ROOT_SAMPLING_POSITIONS[2], ROOT_SAMPLING_POSITIONS[0]),
+        ):
+            print(f"TINYFWD|root_row_spread|pair=({_a}, {_b})"
+                  f"|l2_diff={float(_dist[_a, _b]):.6g}"
+                  f"|l2_row_mean={float(_norm_mean[_a, _b]):.6g}"
+                  f"|spread={float(_spread[_a, _b]):.6f}")
+        # And the whole matrix, so a ruling does not need another run to learn whether a
+        # better pair exists. Unordered pairs only: the statistic is symmetric. The argmax
+        # is divided back into a row and a column, which cannot mislabel the pair.
+        _upper = torch.triu(torch.ones_like(_spread), diagonal=1) > 0
+        _flat = _spread[_upper]
+        _masked = _spread.masked_fill(~_upper, -1.0)
+        _best = int(_masked.argmax())
+        _ba, _bb = divmod(_best, _spread.shape[1])
+        print(f"TINYFWD|root_row_spread_max|rows={_spread.shape[0]}"
+              f"|unordered_pairs={int(_flat.numel())}"
+              f"|argmax=({_ba}, {_bb})"
+              f"|spread={float(_spread[_ba, _bb]):.6f}"
+              f"|min_spread={float(_flat.min()):.6f}"
+              f"|median_spread={float(_flat.median()):.6f}")
+        print("TINYFWD|root_row_spread_population"
+              + "".join(f"|above_{_t:g}={int((_flat > _t).sum())}"
+                        for _t in (0.05, 0.10, 0.13, 0.20))
+              + "|note=0.13 is the round-3 review's derived bar for this control,"
+              + " not a fixture constant and not gated on here")
+
     terms = torch.stack(
         [hidden[int(index)].abs().float() for index in ROOT_SAMPLING_POSITIONS]
     ) @ head.abs().float().t()
@@ -4468,16 +4525,22 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # ---- CONTROL E: THE ROWS ARE MEASURED, NOT INCIDENTAL. The reference recomputed
     # on rolled positions must leave the band, or a forward that projected some other
     # rows would be indistinguishable from this one.
-    # ROLLED BY ONE, and the positions do not move. Row 2 of ``(127, 0, 7, 7)`` maps
-    # position 7 to position 7, so its logits cannot change and this control reads as
-    # DEGENERATE ON PURPOSE instead of being quietly repaired. Rolling by two does not
-    # repair it: it compares a subset of the position pairs rolling by one already
-    # compares, so its gap is <= this one's by construction, and it drops the
-    # first-token-versus-last-token pair this control exists to exercise. The fix is the
-    # fixture's POSITIONS, proposed in
-    # ``increments/proposal-054a-root-positions-r1.md`` and not yet ruled; until it is,
-    # ``VacuousControlError`` reddens this item honestly rather than passing on a
-    # comparison that cannot discriminate.
+    # ROLLED BY ONE, and nothing here moves. Row 2 of ``(127, 0, 7, 7)`` maps position 7
+    # to position 7, so its logits cannot change and this control reads as DEGENERATE ON
+    # PURPOSE instead of being quietly repaired. Rolling by two does not repair it: it
+    # compares a subset of the position pairs rolling by one already compares, so its gap
+    # is <= this one's by construction, and it drops the first-token-versus-last-token
+    # pair this control exists to exercise.
+    #
+    # WHAT IS NOT SETTLED, and what this file must NOT do about it. The round-3 review
+    # froze the positions, the head and both tolerance pairs, and refused a byte-equality
+    # replacement for this control: a forward that read ``positions - 1``, or one constant
+    # position, would pass shape, pass the repeated-row check, pass the band and pass a
+    # byte-difference check on the REFERENCE too, so such a control would turn this item
+    # green on wrong code. The cause of the inside reading is the stack homogenising its
+    # rows, and the deciding reading is the row spread printed above. Until that reading
+    # is ruled, ``VacuousControlError`` reddens this item honestly rather than passing on
+    # a comparison that cannot discriminate.
     rolled = tuple(ROOT_SAMPLING_POSITIONS[1:]) + (ROOT_SAMPLING_POSITIONS[0],)
     _stack_outside_tolerance(
         f"the logits recomputed on rolled positions {list(rolled)}",
