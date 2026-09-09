@@ -4285,23 +4285,58 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 f"the FFN half alone and every comparison below it is blind to the "
                 f"other one"
             )
-        # THE FAILING CONTROLS. The OLD grids must fire BOTH guards, or the guards
-        # are statements no scale in this file's history could have violated.
+        # THE FAILING CONTROLS, EXECUTED ONLY WHERE THE CONTROL TENSOR IS EXACT.
+        #
+        # The OLD grids must fire BOTH guards, or the guards are statements no scale
+        # in this file's history could have violated. But this control is a
+        # REPRODUCTION of grant 127, and it reproduces only where it runs on the
+        # tensor grant 127 ran on. Layer 0 is that place: the FFN half is added
+        # OUTSIDE the layer call, so ``recorded_out[0][1]`` is the attention half and
+        # this commit cannot move it. Layer 1 is not: its input carries layer 0's FFN
+        # half AT THE NEW SCALE, which no run has measured.
+        #
+        # WHY REQUIRING IT THERE WOULD BE A FALSE RED. At the old scale a layer-1 row
+        # sums about 3200 per column, so one bf16 ULP is 16 and half a ULP is 8; a
+        # single layer-1 element reaching 8 leaves ``_oabs`` below 1.0 and ``_osum``
+        # above 0, and the guard (ii) control raises on a healthy fixture. And
+        # ``_oas == 0`` needs EVERY gate element and EVERY |up| element at or past
+        # the limit in EVERY row, which grant 127 proved for layer 0 only.
+        #
+        # SO THE RAISES RUN WHERE THE CONTROL IS EXACT, and layer 1's old-scale
+        # numbers stay the READINGS they always were: the ``scale=old`` row above
+        # prints them, and the legend row below says which layer's control gates and
+        # which only reads. Nothing else about the guards moves.
         _ogf, _ouf, _oas, _oabs, _osum = _readings["old"]
-        if _ogf > 0.0 and _ouf > 0.0 and _oas > 0.0:
-            raise VacuousControlError(
-                f"layer {_dense_index}: guard (i)'s control did not fire. The OLD "
-                f"exponents give gate at-limit {_ogf:.6f}, up at-limit {_ouf:.6f}, "
-                f"activated spread {_oas:.6g}, all of which the guard accepts -- so "
-                f"the guard is not what tells the two scales apart"
-            )
-        if _oabs < 1.0 and _osum > 0.0:
-            raise VacuousControlError(
-                f"layer {_dense_index}: guard (ii)'s control did not fire. The OLD "
-                f"exponents absorb the hidden term in {_oabs:.6f} of elements and "
-                f"leave the sum's row spread at {_osum:.6g}, both of which the guard "
-                f"accepts -- so the guard is not what tells the two scales apart"
-            )
+        _control_is_exact = not any(
+            _below < _dense_index for _below in fixture["dense_at"]
+        )
+        _control_class = "gated" if _control_is_exact else "reading_only"
+        print(f"TINYFWD|stack_scale_guard_legend|layer={_dense_index}"
+              f"|old_scale_control={_control_class}"
+              f"|old_gate_at_limit_frac={_ogf:.6f}"
+              f"|old_up_at_limit_frac={_ouf:.6f}"
+              f"|old_activated_max_spread={_oas:.6g}"
+              f"|old_elements_absorbed_frac={_oabs:.6f}"
+              f"|old_sum_max_spread={_osum:.6g}"
+              f"|gates_iff_no_dense_layer_sits_below_this_one={_control_is_exact}"
+              f"|note=only there is the old-scale recompute the tensor grant 127 read")
+        if _control_is_exact:
+            if _ogf > 0.0 and _ouf > 0.0 and _oas > 0.0:
+                raise VacuousControlError(
+                    f"layer {_dense_index}: guard (i)'s control did not "
+                    f"fire. The OLD exponents give gate at-limit {_ogf:.6f}, "
+                    f"up at-limit {_ouf:.6f}, activated spread {_oas:.6g}, all "
+                    f"of which the guard accepts -- so the guard is not what "
+                    f"tells the two scales apart"
+                )
+            if _oabs < 1.0 and _osum > 0.0:
+                raise VacuousControlError(
+                    f"layer {_dense_index}: guard (ii)'s control did not "
+                    f"fire. The OLD exponents absorb the hidden term in "
+                    f"{_oabs:.6f} of elements and leave the sum's row spread "
+                    f"at {_osum:.6g}, both of which the guard accepts -- so "
+                    f"the guard is not what tells the two scales apart"
+                )
 
     # ---- GUARD (iii): EVERY STAGE BELOW LAYER 0 STILL CARRIES DISTINCT ROWS. Grant
     # 127 read `layer1_in`, `layer1_out`, `layer2_in` and `layer2_out` at a row
