@@ -1619,8 +1619,14 @@ def _ref_canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
     Mirrors ``Glm5NextDSAIndexer._canonical_sentinel_order``. It exists in the reference for the
     same reason it exists in the implementation: the selector promises "highest first" and promises
     NOTHING about the order among EQUAL values (``topk_select.py:312``), and the bound manufactures
-    equal values in bulk at ``-inf``. Without this the two sides would differ on the PLACES of
+    equal values in bulk at ``BOUND_FILL`` -- a FINITE ``-1e30`` since ``-103``, not the ``-inf``
+    this line said until rev 268. Without this the two sides would differ on the PLACES of
     identical contents, which is not a numeric disagreement and would read like one.
+
+    THE FILL IS NOT THE ONLY SOURCE OF EQUAL VALUES, which is why this ordering is necessary but not
+    sufficient. Two REAL candidates can also hold the same score -- the product's own ReLU floors
+    every all-non-positive candidate to an identical ``0.0`` -- and their relative order is pinned by
+    nothing here. That case is handled by the tie-equivalence comparison rather than by this sort.
     """
     k = int(pool_ids.shape[1])
     position = torch.arange(k, dtype=torch.int64)
@@ -2680,11 +2686,23 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
         ]
     )
 
+    # THE ORACLE MIRRORS THE PRODUCT'S FOUR-STEP CHAIN, and until rev 268 it did not (item 3, a
+    # stale oracle). It selected straight off the UNBOUNDED scores and expanded, while
+    # `select_bounded_pools` bounds, selects, marks and canonically orders -- three steps this arm
+    # never applied. So the arm was comparing the packed implementation against a reference for an
+    # older product, and any disagreement the bound or the marker introduced would have been read
+    # here as a packing defect. The steps and their order are transcribed from `_ref_indexer` above,
+    # which is the single place this file spells the chain; the order is not free to vary, because
+    # selecting on unbounded scores and masking afterwards answers a different question.
     ref_rows = []
     offset = 0
     for n, scores in scored:
-        pool_ids = _ref_topk(scores, select_k)
-        ref_rows.append(_ref_expand(pool_ids, seq_lens[offset : offset + n], pool))
+        own_lens = seq_lens[offset : offset + n]
+        bounded = _ref_causal_bound(scores, own_lens, pool, candidates)
+        pool_ids = _ref_topk(bounded, select_k)
+        pool_ids = _ref_causal_sentinel(bounded, pool_ids, candidates)
+        pool_ids = _ref_canonical_sentinel_order(pool_ids)
+        ref_rows.append(_ref_expand(pool_ids, own_lens, pool))
         offset += n
     reference = torch.cat(ref_rows, dim=0)
 

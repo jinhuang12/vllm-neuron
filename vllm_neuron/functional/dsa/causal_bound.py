@@ -141,11 +141,22 @@ to that kernel need not come back as ``-inf``, and a marker that keys on the exa
 mark nothing. A finite fill crosses a permutation matmul unchanged: every output is one ``1 * value``
 term plus zeros.
 
+THAT LAST SENTENCE IS TRUE OF THE FILL AND WAS INCOMPLETE ABOUT THE MATMUL (rev 268). It covers every
+operand this bound writes, and the matmul also contracts partitions this bound never wrote: the
+kernel's staging buffer was uninitialised on a ragged tile, so a partition holding stale non-finite
+bits reached the same ``0 *`` term and produced NaN with no help from any caller. That was a defect of
+the kernel, repaired by the ragged-tile guard in ``rotational_topk.py`` (`design-20260909-bh`), and it
+is recorded here because this docstring is where a reader goes to learn whether the fill is safe. The
+fill is; the buffer was not.
+
 WHY THIS MAGNITUDE. Three constraints, all from bytes rather than taste. It must be BELOW every
 legal indexer score, so no real candidate is ever mistaken for a fill -- indexer scores are softmax-
 scale logits, tens at most. It must be far ABOVE ``FLOAT32_MIN`` (-3.4e38), so a matmul accumulation
-cannot overflow to an infinity, which is the vendor's own reason for padding with a modest
-``-9948.0`` rather than the type minimum (``rotational_topk_utils.py:32-40``). And it must survive a
+cannot overflow to an infinity. THE VENDOR CITATION HERE WAS MISREAD UNTIL REV 268: ``-9948.0`` is the
+vendor's pad for ``bfloat16`` ONLY, and for ``float32`` it pads with the type minimum itself
+(``_get_dtype_min``, ``rotational_topk_utils.py:32-40``). So the vendor is not evidence that a modest
+magnitude is required -- the reason above stands on its own arithmetic, and it also means this fill is
+FAR LESS extreme than what the vendor writes into the same buffers. And it must survive a
 bfloat16 round-trip with room to spare, which :data:`BOUND_FILL_MARK` provides. The fork already
 prefers finite mask fills where a kernel consumes them: ``functional/sampling.py:263`` masks with
 ``-3000.0`` and ``functional/attention/attention_cte.py:145`` with ``torch.finfo(dtype).min``."""
