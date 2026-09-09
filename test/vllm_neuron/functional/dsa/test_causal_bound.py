@@ -598,6 +598,42 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     # "EVERY FILLED SLOT AND NO OTHER", the same two halves as above, at the striking k.
     mf_filled = mf_values <= BOUND_FILL_MARK
     mf_per_row = (mf_got == SENTINEL).sum(dim=1).to(torch.int64)
+
+    # READ 1 (`-103` r7 residual), PRINTED BEFORE ANY ASSERTION CAN ABORT THE CASE. The r7 run read
+    # 16 marks on rows 3 and 4 where the per-stage cap predicts 8, and this case emits `pad_columns=0`
+    # (asserted above), so the marker's index arm CANNOT have fired and every mark came from the
+    # value arm. That makes the returned VALUES the thing to read, so they are printed rather than
+    # reasoned about. Row 2 is the in-run control: it is the last row whose completed-pool count sits
+    # at or under one stage's cap, so a difference between row 2 and row 3 is the cliff itself.
+    # The block boundary is DERIVED from the config the kernel used, never typed.
+    mf_block = MULTIFOLD_POOL_COLUMNS // mf_stages
+    for mf_row in (2, 3, 4):
+        mf_vrow = mf_values[mf_row].to(torch.float64)
+        mf_irow = mf_idx32[mf_row].to(torch.int64)
+        _emit(
+            "C2_MF_READ1_PAIRS",
+            row=mf_row,
+            complete=mf_complete[mf_row],
+            pairs=";".join(
+                f"{slot}:{int(i)}:{float(v):.9e}"
+                for slot, (i, v) in enumerate(zip(mf_irow.tolist(), mf_vrow.tolist()))
+            ),
+        )
+        _emit(
+            "C2_MF_READ1_COUNTS",
+            row=mf_row,
+            complete=mf_complete[mf_row],
+            marks=int((mf_got[mf_row] == SENTINEL).sum()),
+            at_or_below_mark=int((mf_vrow <= BOUND_FILL_MARK).sum()),
+            nan=int(torch.isnan(mf_vrow).sum()),
+            equal_to_bound_fill=int((mf_vrow == BOUND_FILL).sum()),
+            distinct_indices=len(set(mf_irow.tolist())),
+            block_width=mf_block,
+            in_block0=int((mf_irow < mf_block).sum()),
+            in_block1=int((mf_irow >= mf_block).sum()),
+            real_columns_returned=int((mf_irow < mf_complete[mf_row]).sum()),
+        )
+
     assert torch.equal(mf_per_row, torch.tensor(mf_want, dtype=torch.int64)), (
         f"per-row sentinel count {mf_per_row.tolist()} against the computed {mf_want}"
     )

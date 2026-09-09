@@ -1483,8 +1483,19 @@ def _ref_score(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -> torch
     head's score before the head weight is applied, so dropping it would change which pools win, not
     merely the score values.
     """
-    per_head = torch.einsum("mhd,nd->mhn", q.float(), k.float())
-    return (per_head.clamp(min=0.0) * weights.float().unsqueeze(-1)).sum(dim=1)
+    return (
+        _ref_score_per_head(q, k).clamp(min=0.0) * weights.float().unsqueeze(-1)
+    ).sum(dim=1)
+
+
+def _ref_score_per_head(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """The per-head scores BEFORE the ReLU and before the head weights.
+
+    Split out at `-103`'s r7 read so the tie diagnostic can print the four per-head numbers behind a
+    tied row without a SECOND spelling of the einsum. The arithmetic above is unchanged: it now calls
+    this instead of inlining the same call.
+    """
+    return torch.einsum("mhd,nd->mhn", q.float(), k.float())
 
 
 def _ref_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -1793,6 +1804,7 @@ def _ref_indexer(
     tail: torch.Tensor | None = None,
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
+    probe_per_head: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """``Glm5NextDSAIndexer.forward``, both legs (``model_fp8.py:3645-3689``).
 
@@ -1850,6 +1862,11 @@ def _ref_indexer(
     # rather than chosen. Both cases are therefore decided, and neither is decided by a tie.
     if probe is not None:
         probe.append(scores.detach())
+    # `-103` r7 READ 2. Recomputed rather than captured inside `_ref_score`, so the value path above
+    # is not touched by a diagnostic. Same inputs, same function, so it cannot disagree with the
+    # scores the tie control reads.
+    if probe_per_head is not None:
+        probe_per_head.append(_ref_score_per_head(query, candidate_keys).detach())
     # inc-glm53f-103: bound, select, sentinelise, then pin the sentinel places -- the same four steps
     # in the same order as `Glm5NextDSAIndexer.select_bounded_pools` in `model_fp8.py` -- named by the
     # method rather than by a line, because this increment's own docstrings pushed those line numbers
@@ -1947,6 +1964,7 @@ def _ref_layer(
     tail: torch.Tensor | None = None,
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
+    probe_per_head: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """``Glm5NextDSALayer.forward`` (``model_fp8.py:4687-4712``).
 
@@ -1975,6 +1993,7 @@ def _ref_layer(
         tail=tail,
         position=position,
         probe=probe,
+        probe_per_head=probe_per_head,
     )
     attn_out = _ref_attend(
         attention, normed, latent_cache, int(start_position), topk_indices, float(softmax_scale)
@@ -2211,7 +2230,55 @@ def say_and_check_gaps(gaps: list[tuple[str, float]]) -> None:
     )
 
 
-def assert_selection_is_not_a_tie(scores: torch.Tensor, k: int, label: str) -> None:
+def say_tie_diagnostics(
+    scores: torch.Tensor, k: int, label: str, per_head: torch.Tensor | None = None
+) -> None:
+    """`-103` r7 READ 2. Disclose the row that DECIDES the k-th-place gap, before any assertion.
+
+    The r7 run read `prefill-layer2 kth_place_gap_min = 0.000e+00`, and an exact zero is not a near
+    miss: `_ref_score` applies a ReLU (``clamp(min=0.0)``) before the head weights, so every candidate
+    whose per-head scores are all non-positive collapses to the SAME exact `0.0`. Two candidates on
+    that floor is one row's bad luck; several is structure, and only the count can tell them apart.
+    So the count is printed rather than argued -- with the per-head numbers behind it when the caller
+    has them, because the floor is reached in the per-head values and not in the weighted sum.
+
+    The gap arithmetic is not respelled here: the row is chosen by the same top-``k+1`` difference
+    :func:`kth_place_gap` minimises, so the row named below IS the row that produced the reading.
+    """
+    s = scores.float()
+    top = torch.topk(s, int(k) + 1, dim=-1).values
+    row_gaps = top[:, int(k) - 1] - top[:, int(k)]
+    row = int(torch.argmin(row_gaps))
+    row_values = s[row]
+    say(
+        label,
+        "tie_read2",
+        f"row={row}",
+        f"gap={float(row_gaps[row]):.9e}",
+        f"floor={TIE_FLOOR:.3e}",
+        f"candidates={int(row_values.numel())}",
+        f"at_exact_zero={int((row_values == 0.0).sum())}",
+        f"distinct={len(set(row_values.tolist()))}",
+        "values=" + ";".join(f"{float(v):.9e}" for v in row_values),
+    )
+    if per_head is not None:
+        block = per_head.float()[row]
+        say(
+            label,
+            "tie_read2_per_head",
+            f"row={row}",
+            f"heads={int(block.shape[0])}",
+            f"nonpositive={int((block <= 0.0).sum())}",
+            f"of={int(block.numel())}",
+            "block=" + ";".join(
+                "|".join(f"{float(x):.6e}" for x in head) for head in block
+            ),
+        )
+
+
+def assert_selection_is_not_a_tie(
+    scores: torch.Tensor, k: int, label: str, per_head: torch.Tensor | None = None
+) -> None:
     """No row may be decided by a tie at the k-th place.
 
     WHY THIS CONTROL EXISTS. Item (1) compares the layer's FINAL output, and the selection sits in
@@ -2224,6 +2291,7 @@ def assert_selection_is_not_a_tie(scores: torch.Tensor, k: int, label: str) -> N
     is its own reading. It now routes through the shared reader above so there is ONE definition of
     the gap arithmetic and ONE floor.
     """
+    say_tie_diagnostics(scores, int(k), label, per_head)
     say_and_check_gaps([(label, kth_place_gap(scores, int(k)))])
 
 
@@ -2317,6 +2385,9 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         candidates = (PREFILL_TOKENS if phase == "prefill" else PREFILL_TOKENS + 1) // pool
         ref_hidden = step_hidden
         probe: list[torch.Tensor] = []
+        # `-103` r7 READ 2 collects the per-head scores beside the weighted ones, so a tied row can be
+        # read at the place the ReLU floor is actually reached.
+        probe_per_head: list[torch.Tensor] = []
         for layer, caches in zip(stack, ref_caches):
             ref_hidden = _ref_layer(
                 layer,
@@ -2332,6 +2403,7 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
                 tail=None if phase == "prefill" else caches["tail"],
                 position=kwargs.get("position"),
                 probe=probe,
+                probe_per_head=probe_per_head,
             )
         reference = ref_hidden
 
@@ -2341,9 +2413,17 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
             f"the probe collected {len(probe)} score tensors for {layers} layer(s); every layer "
             f"selects once per phase, so a short count means a layer was skipped"
         )
+        assert len(probe_per_head) == len(probe), (
+            f"the per-head probe collected {len(probe_per_head)} tensors against the score probe's "
+            f"{len(probe)}; the two are appended in the same call, so a difference means one of them "
+            f"was not threaded through every layer"
+        )
         for idx, scores in enumerate(probe):
             assert_selection_is_not_a_tie(
-                scores, int(stack[idx].attention.indexer.select_k()), f"{phase}-layer{idx}"
+                scores,
+                int(stack[idx].attention.indexer.select_k()),
+                f"{phase}-layer{idx}",
+                probe_per_head[idx],
             )
 
         # THE REFERENCE MOVED NO PROJECTION COUNTER, read rather than assumed. The seven family
