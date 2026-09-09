@@ -41,9 +41,7 @@ from vllm_neuron.functional.dsa.causal_bound import (
     causal_bound_dispatch_counters,
     causal_sentinel_dispatch_counters,
     dsa_causal_bound,
-    dsa_causal_bound_torch_oracle,
     dsa_causal_sentinel,
-    dsa_causal_sentinel_torch_oracle,
     reset_causal_bound_dispatch_counters,
     reset_causal_sentinel_dispatch_counters,
 )
@@ -61,7 +59,6 @@ from vllm_neuron.functional.dsa.index_expand import (
     row_tiles,
 )
 from vllm_neuron.functional.dsa.topk_select import (
-    _dsa_topk_select_torch,
     can_run_dsa_topk_select,
     dsa_topk_select,
     reset_topk_select_dispatch_counters,
@@ -198,34 +195,9 @@ def _trap_of(call) -> tuple[str, str]:
     raise AssertionError("the call was expected to trap above the partition ceiling and did not")
 
 
-def _stage(name: str, device_call, oracle_call) -> tuple[object, str, str]:
-    """Run one chain stage on device, substituting its OWN torch oracle only if it hit the ceiling.
-
-    WHY THIS GUARD EXISTS, AND WHY IT IS NOT A WEAKENING. The three kernels ahead of the expansion carry
-    the identical ceiling defect and are repaired on their own branches (``-103b`` for the bound and the
-    sentinel), so which of them serves a 132-row call is a property of the TREE, not of this increment. A
-    stage that trapped ON THE PARTITION CEILING, and only there, is served by its own module's published
-    torch oracle and the substitution is RECORDED as a value. Nothing is swallowed: the numbers are
-    re-extracted before any substitution, so a trap that is not the ceiling propagates and reddens the
-    item. This file ASSERTS the expansion's own route and bits and RECORDS the stages ahead of it.
-    """
-    try:
-        return (device_call(), "device", "")
-    except BaseException as exc:  # noqa: BLE001 - re-raised below unless it is the known ceiling
-        text = f"{exc}"
-        found = re.search(VENDOR_PARTITION_NUMBERS, text)
-        if found is None:
-            raise
-        return (
-            oracle_call(),
-            "oracle_after_partition_trap",
-            f"{name}:{found.group(1)}>{found.group(2)}",
-        )
-
-
 # THE PARENT BODY, RE-SPELLED, AND THE WRONG WALK. The replica is the kernel body at `b7b3d80e`
-# (`index_expand.py:314-370`) with its comments dropped and not one call changed; `prove-103c-c2.py`
-# compares it against that commit's own bytes statement by statement.
+# (`index_expand.py:308-370`, the body's own first statement) with its comments dropped and not one
+# call changed; this increment's checker compares it against that commit's bytes, statement by statement.
 
 
 @nki.jit
@@ -593,13 +565,15 @@ def test_tiled_route_is_one_dispatch_standalone_and_along_the_device_chain() -> 
     seam. A host-side loop over 128-row slices would serve the same shapes and read ``len(tiles)``
     dispatches, which is the design P13 excludes and the number that tells the two apart.
 
-    ALONG THE CHAIN IS WHERE ``-103b``'S RECORDED GAP IS TAKEN UP: it fed its sentinel from a host
+    ALONG THE CHAIN IS WHERE ``-103b``'S RECORDED GAP CLOSES: it fed its sentinel from a host
     ``torch.topk`` on purpose and recorded that no reading had run the DEVICE selector above 128 rows.
-    Here the four stages run in order -- bound, select, sentinel, expand -- at 132 and 256 rows, the
-    EXPANSION's route and bits are asserted on the ids the chain really produced, and each stage ahead of
-    it has its route RECORDED (:func:`_stage` says why that order is the tree's property, not this
-    increment's). ``device_selector_above_128`` says whether the gap closed on this tree. Certifying
-    component (D1.4): the four seams' counters and ``index_expand_kernel_identity``.
+    Here the four stages run in order -- bound, select, sentinel, expand -- at 132 and 256 rows, and
+    EVERY ONE of them is asserted to have taken its kernel: one dispatch, no fallback, per stage per
+    extent. That is only askable because commit 3 merged ``-103b``'s tiled bound and sentinel onto this
+    tree; before it, the chain trapped in its first seam. Nothing here substitutes a torch reference for
+    a kernel that refused -- a guarded chain would be a hollow chain, and a stage that cannot serve these
+    extents is a finding about THAT kernel. Certifying component (D1.4): the four seams' own counters and
+    ``index_expand_kernel_identity``.
     """
     rows = TILED_ROWS
     tiles = row_tile_count(rows)
@@ -624,65 +598,46 @@ def test_tiled_route_is_one_dispatch_standalone_and_along_the_device_chain() -> 
     assert index_expand_dispatch_counters() == (2, 0)
     _emit("I5_PER_CALL", second_call=index_expand_dispatch_counters()[0], tiles=tiles)
 
-    # ---- THE CHAIN, ABOVE THE CEILING ----
+    # ---- THE CHAIN, ABOVE THE CEILING, EVERY STAGE ON DEVICE ----
     selector_on_device = 0
     for chain_rows in CHAIN_LADDER:
         assert row_tile_count(chain_rows) > 1, chain_rows
         seq = _seq_lens(chain_rows)
         clen = seq.reshape(chain_rows, 1).contiguous()
         gen = torch.Generator().manual_seed(1030 + chain_rows)
-        scores = torch.randn(
-            chain_rows, CHAIN_WIDTH, generator=gen, dtype=torch.float32
-        ) * 0.05
+        scores = torch.randn(chain_rows, CHAIN_WIDTH, generator=gen, dtype=torch.float32) * 0.05
 
         reset_causal_bound_dispatch_counters()
         reset_topk_select_dispatch_counters()
         reset_causal_sentinel_dispatch_counters()
         reset_index_expand_dispatch_counters()
-        notes = []
 
-        # STAGE 1, the bound: it fills every pool a row's length does not complete, so the selector
+        # STAGE 1, the bound: it fills every pool a row's own length does not complete, so the selector
         # cannot pick one and the expansion's caller precondition holds by construction.
         assert can_run_dsa_causal_bound(scores, clen, POOL_SIZE) is True
-        bounded, bound_route, bound_note = _stage(
-            "bound",
-            lambda: dsa_causal_bound(scores, clen, POOL_SIZE),
-            lambda: dsa_causal_bound_torch_oracle(scores, clen, POOL_SIZE),
-        )
-        notes.append(bound_note)
+        bounded = dsa_causal_bound(scores, clen, POOL_SIZE)
+        assert causal_bound_dispatch_counters() == (1, 0), causal_bound_dispatch_counters()
 
-        # STAGE 2, the vendored selector. Its gate is READ and printed -- it decides for itself
-        # whether it serves this geometry, and either answer is a fact about THAT kernel.
-        select_gate = can_run_dsa_topk_select(bounded, N_GROUPS)
-        selected, select_route, select_note = _stage(
-            "select",
-            lambda: dsa_topk_select(bounded, N_GROUPS),
-            lambda: _dsa_topk_select_torch(bounded, N_GROUPS),
-        )
-        values, indices = selected
-        notes.append(select_note)
-        select_counters = topk_select_dispatch_counters()
-        if select_route == "device" and select_counters == (1, 0):
-            selector_on_device += 1
+        # STAGE 2, the vendored selector. Its gate is ASSERTED, not merely read: on this tree it must
+        # serve this geometry, and a refusal is a finding about that kernel, not a reason to fall back.
+        assert can_run_dsa_topk_select(bounded, N_GROUPS) is True
+        values, indices = dsa_topk_select(bounded, N_GROUPS)
+        assert topk_select_dispatch_counters() == (1, 0), topk_select_dispatch_counters()
+        selector_on_device += 1
 
         # STAGE 3, the sentinel: anything the selector returned at or above the real pool width is a
         # pad it invented, and this turns that into a -1 the expansion understands.
         idx32 = indices.to(torch.int32).contiguous()
         vals = values.contiguous()
-        marked, sentinel_route, sentinel_note = _stage(
-            "sentinel",
-            lambda: dsa_causal_sentinel(vals, idx32, CHAIN_WIDTH),
-            lambda: dsa_causal_sentinel_torch_oracle(vals, idx32, CHAIN_WIDTH),
-        )
-        notes.append(sentinel_note)
+        assert can_run_dsa_causal_sentinel(vals, idx32, CHAIN_WIDTH) is True
+        marked = dsa_causal_sentinel(vals, idx32, CHAIN_WIDTH)
+        assert causal_sentinel_dispatch_counters() == (1, 0), causal_sentinel_dispatch_counters()
 
-        # STAGE 4, THE INCREMENT UNDER TEST -- no guard, because a trap here is the finding.
+        # STAGE 4, THE INCREMENT UNDER TEST, on the ids the chain really produced.
         assert can_run_dsa_index_expand(marked, seq, POOL_SIZE) is True
         expanded = dsa_index_expand(marked, seq, POOL_SIZE)
         assert index_expand_dispatch_counters() == (1, 0), index_expand_dispatch_counters()
-        assert tuple(expanded.shape) == (
-            chain_rows, index_expand_width(N_GROUPS, POOL_SIZE)
-        ), tuple(expanded.shape)
+        assert tuple(expanded.shape) == (chain_rows, index_expand_width(N_GROUPS, POOL_SIZE))
         assert expanded.dtype is torch.int32, expanded.dtype
 
         # The chain's own ids must satisfy -048's precondition, read with -048's reader.
@@ -691,14 +646,14 @@ def test_tiled_route_is_one_dispatch_standalone_and_along_the_device_chain() -> 
         want = mod._dsa_index_expand_torch(marked, seq, POOL_SIZE)
         assert torch.equal(expanded, want), \
             f"rows={chain_rows}: the expansion of the chain's own ids differs from the oracle's"
-        _emit('I5_CHAIN', rows=chain_rows, tiles=row_tile_count(chain_rows), bound=bound_route,
-              select=select_route, sentinel=sentinel_route, select_gate=int(select_gate),
-              select_counters=select_counters, expand=index_expand_dispatch_counters(),
+        _emit("I5_CHAIN", rows=chain_rows, tiles=row_tile_count(chain_rows),
+              bound=causal_bound_dispatch_counters(), select=topk_select_dispatch_counters(),
+              sentinel=causal_sentinel_dispatch_counters(), expand=index_expand_dispatch_counters(),
               sentinel_ids=int((marked == -1).sum()), live_ids=int((marked >= 0).sum()),
               precondition_violations=len(violations),
-              max_abs_diff_vs_oracle=_max_abs_diff(expanded, want),
-              ceiling_traps_ahead_of_this_kernel=';'.join((n for n in notes if n)) or 'none')
+              max_abs_diff_vs_oracle=_max_abs_diff(expanded, want))
 
+    assert selector_on_device == len(CHAIN_LADDER), selector_on_device
     _emit("I5_CHAIN_CASES", extents=CHAIN_LADDER, stages=4, of=len(CHAIN_LADDER),
           device_selector_above_128=selector_on_device,
-          gap="-103b's recorded gap closes only where device_selector_above_128 equals of")
+          gap="-103b's gap is closed: the device selector ran above 128 rows at every extent")
