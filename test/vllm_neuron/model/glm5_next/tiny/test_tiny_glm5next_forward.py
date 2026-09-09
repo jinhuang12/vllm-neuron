@@ -4716,23 +4716,50 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                                  f"conjunct 4 layer {index}")
 
     # ---- CONJUNCT 5: THE FINAL NORM CLOSES THE CHAIN, on the last layer's own
-    # output rather than on any earlier one.
+    # output rather than on any earlier one. TWO COMPARISONS, EACH AT THE BAND THIS
+    # FILE ALREADY REGISTERS FOR ITS PATH (lead ruling, LEAD-LOG section 879):
+    #   5a THE LAYER-2 ROUTED HALF, at ``MOE_RTOL``/``MOE_ATOL`` -- the pair item 4
+    #      registers for this same expert bank. Layer 2 is the one layer whose FFN
+    #      half reached no bank comparison at all before, because conjunct 4 stops
+    #      one layer short of the routed one by construction.
+    #   5b THE FINAL ADD AND THE FINAL NORM, at the peak-scaled band, over the
+    #      PRODUCT's own routed half rather than the fixture's recompute of it. So
+    #      each half certifies the arithmetic it is named for and nothing else.
     #
-    # THE REFERENCE MIRRORS THE MODEL'S OWN CAST POINTS HERE, and round 20 is why it
-    # has to. ``_ffn_half`` rounds its output to the residual's dtype before it
-    # returns (``model_fp8.py:6616``) and ``forward`` adds in that dtype
-    # (``model_fp8.py:6714``), so the tensor the final norm receives is bf16 and the
-    # attention residual is quantised INTO it rather than kept whole. A float32 sum
-    # compares the shipped path against arithmetic it never computes, and at THIS
-    # layer that is not a rounding: the run read ``ffn_share=216.05``, so the
-    # residual is 0.46% of the half, below one bf16 step of 2**-7, and the product's
-    # add drops it at the large cells while a float32 sum keeps all of it. That one
-    # difference is larger than this comparison's whole band.
-    # ``increments/investigation-054a-stack-r20.md`` carries the arithmetic. The band
-    # is NOT widened -- the reference is corrected, because a reference comes from
-    # the model's code.
+    # WHY THE SPLIT, MEASURED RATHER THAN ARGUED. One comparison over both paths is
+    # structurally unpassable, and two counted runs proved it. Round 20 read 179 of
+    # 65536 cells outside while the reference summed in float32. Round 21 mirrored
+    # the model's cast points -- ``model_fp8.py:6616`` casts the half to the
+    # residual's dtype, ``:6714`` adds in that dtype, ``:6532`` casts the norm's
+    # output -- and still read 751 cells outside, because the reading added with that
+    # fix measured the term left over: ``routed_bank_term`` put the bank's own
+    # recompute at 0.95% of its peak, 1.22 bf16 steps, with 31193 of 65536 cells
+    # landing on a different bf16 value after the cast. A 1.22-step term cannot fit a
+    # band whose whole allowance is one step, and this file already says where that
+    # term belongs. So the band does NOT move and never did; the comparison is split
+    # along the paths the two bands were registered for.
+    # ``increments/investigation-054a-stack-r20.md`` carries the round-20 arithmetic.
     last = recorded_out[-1][1]
-    final_input = last + ffn[-1]["out"].to(last.dtype)
+    # THE HOOK MUST HAVE FIRED, and on a tensor of the shape the add needs. A gated
+    # path never skips silently: an empty recording means the product never called
+    # the routed MLP at all, and a shape disagreement means the half it returned
+    # cannot be the one the residual add consumes.
+    if not recorded_mlp:
+        raise VacuousControlError(
+            "the last layer's MLP hook recorded nothing, so the product never "
+            "called the routed MLP and conjunct 5 has no product half either to "
+            "compare or to add; a skip here would hide a stack that ran no experts"
+        )
+    _half_product = recorded_mlp[-1][1]
+    _half_ref = ffn[-1]["out"]
+    if tuple(_half_product.shape) != tuple(_half_ref.shape):
+        raise ReferenceShapeError(
+            f"the routed MLP returned {tuple(_half_product.shape)} and the "
+            f"reference computed {tuple(_half_ref.shape)}; conjunct 5 compares them "
+            f"cell by cell and adds one of them to the residual, so a shape "
+            f"disagreement is a refusal and not a skip"
+        )
+    final_input = last + _half_product.to(last.dtype)
     expected = _ffn_norm(final_input, fixture["final_gain"], float(cfg.rms_norm_eps))
     if tuple(got.shape) != (STACK_TOKENS, STACK_HIDDEN_SIZE):
         raise ReferenceShapeError(
@@ -4751,37 +4778,29 @@ def test_tiny_model_forward_matches_the_reference() -> None:
           f"|float32_max_spread={_f32[1]:.6g}|bf16_max_spread={_bf[1]:.6g}"
           f"|float32_median_spread={_f32[3]:.6g}|bf16_median_spread={_bf[3]:.6g}"
           f"|note=float32 is the sum the model does not compute; the compared final_input is the bf16 sum")
-    # ---- READINGS ONLY, BLOCK B2: the cast points this comparison now mirrors, and the one
-    # term left over. `residual_share` below one bf16 step is what reddened round 20, and
-    # `routed_bank_term` is the routed bank's own recompute difference, which no other
-    # comparison in this file measures at this band. Nothing gates.
-    _half_ref = ffn[-1]["out"]
+    # ---- READINGS ONLY, BLOCK B2: the cast points 5b mirrors, and the term 5a owns.
+    # `residual_share` below one bf16 step is what reddened round 20, and `routed_bank_term`
+    # is the bank's own recompute difference, which round 21 measured at 1.22 bf16 steps and
+    # 5a compares at its registered pair. Both rows are unconditional: the refusals above
+    # already proved the operands, so a guard here would be dead. Nothing gates.
     _resid_share = float(last.abs().max() / _half_ref.abs().max())
     print(f"TINYFWD|final_add_castpoints|half_reference_dtype={_half_ref.dtype}"
           f"|residual_dtype={last.dtype}|sum_dtype={final_input.dtype}"
           f"|residual_share={_resid_share:.6g}|one_bf16_step={2.0 ** -7:.6g}"
           f"|residual_below_one_step={bool(_resid_share < 2.0 ** -7)}"
           f"|note=the model casts the half at model_fp8.py:6616 and adds in that dtype at :6714")
-    if recorded_mlp:
-        _half_product = recorded_mlp[-1][1]
-        if tuple(_half_product.shape) != tuple(_half_ref.shape):
-            print(f"TINYFWD|routed_bank_term|reading_skipped"
-                  f"|product_shape={tuple(_half_product.shape)}"
-                  f"|reference_shape={tuple(_half_ref.shape)}"
-                  f"|note=the shapes disagree, so this reading says nothing here")
-        else:
-            _bank_ae = (_half_product.float() - _half_ref.float()).abs()
-            _bank_peak = float(_half_ref.abs().max())
-            print(f"TINYFWD|routed_bank_term|product_dtype={_half_product.dtype}"
-                  f"|reference_dtype={_half_ref.dtype}"
-                  f"|worst_abs={float(_bank_ae.max()):.10g}|peak={_bank_peak:.10g}"
-                  f"|worst_against_the_peak="
-                  f"{(float(_bank_ae.max()) / _bank_peak if _bank_peak else float('inf')):.6g}"
-                  f"|one_bf16_step={2.0 ** -7:.6g}"
-                  f"|cells_apart_after_the_cast="
-                  f"{int((_half_product.to(last.dtype) != _half_ref.to(last.dtype)).sum())}"
-                  f"|cells={int(_half_ref.numel())}"
-                  f"|note=the term conjunct 5 still carries; item 4 bands this path at MOE_RTOL")
+    _bank_ae = (_half_product.float() - _half_ref.float()).abs()
+    _bank_peak = float(_half_ref.abs().max())
+    print(f"TINYFWD|routed_bank_term|product_dtype={_half_product.dtype}"
+          f"|reference_dtype={_half_ref.dtype}"
+          f"|worst_abs={float(_bank_ae.max()):.10g}|peak={_bank_peak:.10g}"
+          f"|worst_against_the_peak="
+          f"{(float(_bank_ae.max()) / _bank_peak if _bank_peak else float('inf')):.6g}"
+          f"|one_bf16_step={2.0 ** -7:.6g}"
+          f"|cells_apart_after_the_cast="
+          f"{int((_half_product.to(last.dtype) != _half_ref.to(last.dtype)).sum())}"
+          f"|cells={int(_half_ref.numel())}"
+          f"|note=5a compares this at MOE_RTOL, the pair item 4 registers for this bank")
     _got_f, _exp_f = got.float(), expected.float()
     _abs_err = (_got_f - _exp_f).abs()
     _rel_err = _abs_err / _exp_f.abs().clamp_min(1e-30)
@@ -4800,9 +4819,19 @@ def test_tiny_model_forward_matches_the_reference() -> None:
           f"|abs={float(_abs_err[55, 6]):.6g}|rel={float(_rel_err[55, 6]):.6g}"
           f"|one_bf16_ulp_at_1={float(2.0 ** -8):.6g}")
     # ---- end of the BLOCK B readings.
-    # ---- THE SECOND SITE THE OPTION (b) RULING MOVES. Same reasoning as conjunct
-    # 3's: `expected` here is a float32 torch recompute of the final norm over two
-    # bf16 terms, so its error floor is peak-set, not cell-set.
+    # ---- 5a THE LAYER-2 ROUTED HALF, at the pair item 4 registers for this bank. This
+    # is the only comparison in this file that reaches layer 2's expert bank at all:
+    # conjunct 4 stops one layer short of the routed layer, so before this line the
+    # eight-expert sum was certified at every layer except the one the stack ends on.
+    # Round 21 measured the term at 0.95% of the peak -- inside this pair and outside a
+    # one-step band, which is the whole reason the comparison is split here.
+    torch.testing.assert_close(_half_product.float(), _half_ref,
+                               rtol=MOE_RTOL, atol=MOE_ATOL)
+    # ---- 5b THE FINAL ADD AND THE FINAL NORM, at the peak-scaled band the option (b)
+    # ruling put here, unchanged. `expected` is now the fixture's own norm over the
+    # PRODUCT's own tensors -- its last layer output plus its own routed half, cast and
+    # added the way the model does it -- so it is bf16 rather than a float32 recompute
+    # of a whole path, and the error this band must hold is the norm's own rounding.
     _rtol, _atol = _stack_peak_band(expected.float(), "conjunct 5 the final norm")
     _ae = (got.float() - expected.float()).abs()
     print(f"TINYFWD|stack_compare|max_abs_diff={float(_ae.max()):.10g}"
