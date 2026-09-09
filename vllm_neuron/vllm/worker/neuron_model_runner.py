@@ -4886,14 +4886,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         banks,
         side_caches,
         *,
-        block_ids,
-        state_slot: int,
+        geometries,
         is_prefill: bool,
         tokens: int,
         start_position: int,
         softmax_scale: float,
         max_seq_len: int,
-        page_size: int,
         index_kpool: int,
     ) -> list[dict]:
         """One mapping per layer, in stack order, each holding THAT layer's own state.
@@ -4919,30 +4917,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         scattered block table is not this increment's work, and a wrong slice would
         write this sequence's latents into another sequence's slots.
 
+        ONE GEOMETRY PER BANK, NOT ONE FOR THE WHOLE STACK. ``geometries`` pairs with
+        ``banks`` positionally and each entry carries THAT layer's own ``block_ids``,
+        ``state_slot`` and ``page_size``. The runner builds one block table per
+        KV-CACHE GROUP (``:4115-4121``) and this stack is hybrid -- its sparse layers
+        report a ``FullAttentionSpec`` and its linear ones a ``MambaSpec``, so there
+        are two groups and two tables. A stack-wide row would slice one family out of
+        the other family's table; review r1 of commit 1 found exactly that.
+
+        EACH SPARSE BANK'S OWN PAGING IS CROSS-CHECKED against the page its group
+        reports, because the two are sourced independently -- the bank's from the
+        tensor the runner allocated, the group's from the KV-cache spec -- and a slice
+        computed in the wrong page would be silently short or long.
+
         THE SCALE IS THE CALLER'S BY THE MODEL'S OWN INSTRUCTION -- "THE SOFTMAX
         SCALE IS THE CALLER'S, NOT THIS METHOD'S", the registered value being
         ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``
         (``model_fp8.py:6854-6860``). It arrives as an argument so this function
         holds no copy of the constant.
         """
-        if len(banks) != len(side_caches):
+        if len(banks) != len(side_caches) or len(banks) != len(geometries):
             raise ValueError(
                 f"{len(banks)} bank(s) against {len(side_caches)} side-cache "
-                f"entry(ies); the two come from one walk and must pair"
-            )
-        ids = [int(value) for value in block_ids]
-        if not ids:
-            raise ValueError(
-                "a GLM-5.3-Flash request needs at least one KV block; the block "
-                "table row handed here is empty"
-            )
-        if any(later - earlier != 1 for earlier, later in zip(ids, ids[1:])):
-            raise ValueError(
-                f"this half slices one sequence out of the paged latent bank by a "
-                f"single ascending run of blocks, and the row handed here is "
-                f"{ids}, which is not one run; gathering scattered blocks is not "
-                f"inc-glm53f-054b's work and a wrong slice would write this "
-                f"sequence's latents into another sequence's slots"
+                f"entry(ies) and {len(geometries)} geometry(ies); the three come "
+                f"from one walk and must pair"
             )
         if not is_prefill and int(tokens) != 1:
             raise ValueError(
@@ -4955,7 +4953,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
 
         carriers: list[dict] = []
-        for bank, side in zip(banks, side_caches):
+        for bank, side, geometry in zip(banks, side_caches, geometries):
+            state_slot = int(geometry["state_slot"])
             if bank["family"] != "self_attn":
                 slots = int(bank["state_slots"])
                 if not 0 <= int(state_slot) < slots:
@@ -4972,7 +4971,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     }
                 )
                 continue
+            ids = [int(value) for value in geometry["block_ids"]]
+            if not ids:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed an empty block-table row; "
+                    f"a GLM-5.3-Flash request needs at least one KV block"
+                )
+            if any(later - earlier != 1 for earlier, later in zip(ids, ids[1:])):
+                raise ValueError(
+                    f"this half slices one sequence out of the paged latent bank by a "
+                    f"single ascending run of blocks, and KV layer '{bank['name']}' "
+                    f"was handed {ids}, which is not one run; gathering scattered "
+                    f"blocks is not inc-glm53f-054b's work and a wrong slice would "
+                    f"write this sequence's latents into another sequence's slots"
+                )
             block_size = int(bank["block_size"])
+            if int(geometry["page_size"]) != block_size:
+                raise ValueError(
+                    f"KV layer '{bank['name']}'s bank is paged {block_size} slot(s) to "
+                    f"the block and the KV-cache group it belongs to reports page "
+                    f"{int(geometry['page_size'])}; the slice and the layer's own page "
+                    f"are one number or the slice is wrong"
+                )
             latent = bank["latent_cache"][
                 ids[0] * block_size : (ids[-1] + 1) * block_size
             ]
@@ -4986,7 +5006,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "start_position": int(start_position),
                 "softmax_scale": float(softmax_scale),
                 "max_seq_len": int(max_seq_len),
-                "page_size": int(page_size),
+                "page_size": int(geometry["page_size"]),
             }
             if is_prefill:
                 carrier["slot_mapping"] = cls._glm5next_pool_slot_mapping(
@@ -5012,7 +5032,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
         ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
-        three parallelism arguments (``model_fp8.py:7996-8004``), so the generic
+        three parallelism arguments (``model_fp8.py:8176-8186``), so the generic
         mapping's ``positions``, ``sampling_params``, ``spec_decode_metadata``,
         ``rank``, ``logit_mask`` and ``rotary_position_ids`` have no parameter to
         land on -- they belong to features this campaign has not ported. The batch
@@ -5020,14 +5040,36 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         this function needs and cannot find refuses by name with what the site did
         hand it.
 
+        ``block_size`` IS NOT PASSED EITHER, AND THAT IS THE POINT. The root's
+        parameter of that name is the FP8 WEIGHT-QUANT block, "tokens per block,
+        forwarded to the expert bank unread" (``model_fp8.py:8268``), and the bank
+        refuses it unless it is a positive multiple of ``BLOCK_QUANT_SIZE``
+        (``model_fp8.py:1775-1780``). A KV page size is a different number entirely --
+        4 in the tiny fixture -- so handing it over raises
+        ``Glm5NextBlockQuantRouteError`` on the first routed layer. Left unset, the
+        bank uses its own declared block, which is the value ``inc-glm53f-054a``'s
+        landed acceptance asserts the root forwards to its stack
+        (``test_tiny_glm5next_forward.py:5392-5393``). The KV page reaches the layers
+        where it belongs, on each carrier's ``page_size``.
+
+        ONE METADATA ENTRY PER LAYER, LOOKED UP BY THAT LAYER'S NAME. The runner
+        builds one block table per KV-CACHE GROUP and writes that group's entry under
+        every layer name in the group (``:4115-4121``, ``:4256-4257``). A hybrid stack
+        has two groups, so reading one entry for the whole stack slices one family out
+        of the other family's table -- what review r1 of commit 1 found. The names are
+        the same names the banks carry: both sides come from ``get_kv_spec``
+        (``:9075-9076``).
+
         THE LEG IS READ THE FILE'S OWN WAY, ``max_query_len`` against
         ``decode_token_threshold``, which is the decode test this runner already
-        makes at ``:7051-7054``, so the two cannot disagree.
+        makes at ``:7413-7416``, so the two cannot disagree. It is read PER GROUP and
+        a disagreement refuses, because the layers of one forward are stepped
+        together or not at all.
 
         THE BLOCK RUN IS DERIVED FROM THE SEQUENCE, not from the row's length: the
         request holds ``start_position + tokens`` slots, so it occupies that many
-        slots rounded up to whole blocks, and the trailing entries of a padded
-        block-table row are not read.
+        slots rounded up to whole blocks IN THAT GROUP'S PAGE, and the trailing
+        entries of a padded block-table row are not read.
         """
         banks = getattr(self.model, "glm5next_layer_banks", None)
         if not banks:
@@ -5048,32 +5090,60 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "a GLM-5.3-Flash forward needs attention metadata to slice its "
                 "paged latent cache, and this call site handed none"
             )
-        metadata = next(iter(metadata_map.values()))
-        block_size = int(metadata["block_size"])
-        is_prefill = int(metadata["max_query_len"]) > int(
-            metadata["decode_token_threshold"]
-        )
-        table = metadata["block_table_tensor"]
-        if int(table.shape[0]) != 1:
-            raise ValueError(
-                f"this half threads ONE sequence per forward, because the layers "
-                f"take a single sequence's cache slots (inc-glm53f-051's declared "
-                f"interface); this batch carries {int(table.shape[0])} request(s)"
-            )
         input_ids = kwargs["input_ids"]
         tokens = int(input_ids.shape[0])
-        cached = metadata["cached_seq_len"]
-        start_position = (
-            int(cached.reshape(-1)[0]) if torch.is_tensor(cached) else int(cached)
-        )
-        blocks_used = -(-(start_position + tokens) // block_size)
-        row = table[0].reshape(-1)
+        geometries: list[dict] = []
+        legs: set[bool] = set()
+        starts: set[int] = set()
+        for bank in banks:
+            name = bank["name"]
+            if name not in metadata_map:
+                raise ValueError(
+                    f"KV layer '{name}' has no attention-metadata entry; the runner "
+                    f"writes one entry per layer of every KV-cache group "
+                    f"(:4256-4257) and this call site handed {sorted(metadata_map)}"
+                )
+            metadata = metadata_map[name]
+            block_size = int(metadata["block_size"])
+            table = metadata["block_table_tensor"]
+            if int(table.shape[0]) != 1:
+                raise ValueError(
+                    f"this half threads ONE sequence per forward, because the layers "
+                    f"take a single sequence's cache slots (inc-glm53f-051's declared "
+                    f"interface); this batch carries {int(table.shape[0])} request(s)"
+                )
+            cached = metadata["cached_seq_len"]
+            start_position = (
+                int(cached.reshape(-1)[0]) if torch.is_tensor(cached) else int(cached)
+            )
+            row = table[0].reshape(-1)
+            blocks_used = -(-(start_position + tokens) // block_size)
+            geometries.append(
+                {
+                    "block_ids": [int(value) for value in row[:blocks_used]],
+                    "state_slot": int(row[0]),
+                    "page_size": block_size,
+                }
+            )
+            legs.add(
+                int(metadata["max_query_len"])
+                > int(metadata["decode_token_threshold"])
+            )
+            starts.add(start_position)
+        if len(legs) != 1 or len(starts) != 1:
+            raise ValueError(
+                f"the layers of one forward are stepped together, so their KV-cache "
+                f"groups must agree on the leg and the cached length; this call "
+                f"site's entries carry prefill flags {sorted(legs)} and cached "
+                f"lengths {sorted(starts)}"
+            )
+        is_prefill = legs.pop()
+        start_position = starts.pop()
         text_config = self.model.text_config
         carriers = self._glm5next_layer_carriers(
             banks,
             self._glm5next_live_side_caches(banks),
-            block_ids=[int(value) for value in row[:blocks_used]],
-            state_slot=int(row[0]),
+            geometries=geometries,
             is_prefill=is_prefill,
             tokens=tokens,
             start_position=start_position,
@@ -5085,14 +5155,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ** -0.5
             ),
             max_seq_len=start_position + tokens,
-            page_size=block_size,
             index_kpool=int(text_config.index_kpool),
         )
         return {
             "input_ids": input_ids,
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
-            "block_size": block_size,
         }
 
 

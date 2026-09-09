@@ -1,8 +1,8 @@
-"""``inc-glm53f-054b`` commit 1: the runner's caches reach the layers, and the layers write them.
+"""``inc-glm53f-054b``: the runner's caches reach the layers, and eight tokens match a reference.
 
 WHAT THIS FILE MEASURES. This half of ``inc-glm53f-054`` threads the runner's allocated caches
-into the per-layer carriers this model family takes as forward ARGUMENTS. Commit 1 lands the two
-halves of that thread and this file measures both:
+into the per-layer carriers this model family takes as forward ARGUMENTS, and then measures the
+block's registered acceptance over that thread:
 
   1. ``Glm5NextForConditionalGeneration.bind_kv_cache`` -- the method the runner calls on every
      start-up (``neuron_model_runner.py:8669``) and that this package did not have until plan
@@ -10,6 +10,11 @@ halves of that thread and this file measures both:
      views rather than copies, and refuse by name anything it cannot map.
   2. ``NeuronModelRunner._glm5next_layer_carriers`` and its two operand derivations -- the runner
      side that turns those banks into one mapping per layer.
+  3. ``NeuronModelRunner._glm5next_model_kwargs`` -- the converter the five production call
+     sites go through. It must read EACH layer's own KV-cache group and must not hand the root
+     a KV page size where the root declares an FP8 weight-quant block.
+  4. The registered acceptance itself: eight generated tokens whose logits match a torch
+     reference composed from ``-054a``'s landed oracles, at the registered tolerance.
 
 THE BIND IS EXERCISED, NOT ASSUMED. The last item runs the root's forward with carriers built by
 the runner's own helpers out of a runner-shaped cache dict, and then requires the RUNNER'S OWN
@@ -17,15 +22,18 @@ TENSORS to have changed. A cache that arrived as a copy, or a bank handed to the
 fails that conjunct. An item that built its own caches and never bound anything would pass while
 the production path stayed broken, which is the reason this file exists in this shape.
 
-WHAT THIS FILE DOES NOT MEASURE, stated so the gap is not read as coverage. The registered
-acceptance for ``inc-glm53f-054b`` is eight generated tokens compared against a torch reference
-built from the same weights (plan ``:1183``). That reference needs the decode leg, which commit 2
-lands; commit 1's items below assert shape, finiteness and write-through, never a token value, and
-this file carries no tolerance of its own. The recurrent (KDA) arm of the bind is measured on a
-spec this file substitutes rather than on a KDA layer, because the landed tiny stack is
-sparse-attention on every layer (``test_tiny_glm5next_forward.py:3822-3842`` reads
-``layer.self_attn`` for all of them); the mapper reads no layer module, so the substitution
-exercises the same code the runner drives.
+WHAT THIS FILE DOES NOT MEASURE, stated so the gap is not read as coverage. One sequence per
+forward and one token per decode step: a batch of more than one request and a multi-token decode
+(speculative decoding's verify step) both refuse by name rather than being threaded, so this file
+measures the refusal and not the feature. One rank: the reference is single-rank and reads the
+fixture's own per-rank operands, so it neither reduces FFN partial sums across ranks nor
+compensates a scale grid -- the two defects ``inc-glm53f-054c`` and ``-054d`` own stay visible
+through it. No hardware: the CPU lane is the whole scope here, and a real Neuron compile is
+stage 7's. The recurrent (KDA) arms are measured on specs this file substitutes rather than on a
+KDA layer, because the landed tiny stack is sparse-attention on every layer
+(``test_tiny_glm5next_forward.py:3822-3842`` reads ``layer.self_attn`` for all of them); the
+mapper and the converter read no layer module, so the substitution exercises the same code the
+runner drives.
 
 HOW TO RUN IT, and both variables must be in the environment rather than set from a fixture
 (``inc-glm53f-051``'s obligation 4):
@@ -36,6 +44,7 @@ HOW TO RUN IT, and both variables must be in the environment rather than set fro
 
 from __future__ import annotations
 
+import inspect
 import os
 
 import pytest
@@ -197,6 +206,57 @@ def _recurrent_spec(root) -> KVSpec:
             for layer_spec in root.get_kv_spec().layers
         ]
     )
+
+
+def _geometries(banks, *, block_ids, state_slot: int, page_size: int | None = None):
+    """One geometry per bank, the shape the carrier builder pairs positionally with its banks.
+
+    THE PAGE COMES FROM THE LANDED DIAL, not from the bank, so the builder's cross-check
+    between the group's page and the bank's own paging compares two independently sourced
+    numbers instead of one number twice.
+    """
+    page = item.MLA_PAGE_SIZE if page_size is None else page_size
+    return [
+        {
+            "block_ids": [int(value) for value in block_ids],
+            "state_slot": int(state_slot),
+            "page_size": int(page),
+        }
+        for _ in banks
+    ]
+
+
+def _mixed_spec(root) -> KVSpec:
+    """The stack's own spec with ALTERNATE layers reporting recurrent geometry instead of a pair.
+
+    THIS IS THE HYBRID SHAPE THAT MAKES TWO KV-CACHE GROUPS EXIST. A sparse layer's spec
+    becomes a ``FullAttentionSpec`` and a recurrent layer's a ``MambaSpec``
+    (``neuron_model_runner.py:9082-9135``), and the KV-cache manager gives each class its own
+    group with its own block table. The landed tiny stack is sparse on every layer, so one
+    group is all it would ever have; this builds the two-group case out of the stack's own
+    names and geometry, reading no layer module -- and neither the mapper nor the converter
+    reads one either.
+    """
+    layers = []
+    for index, layer_spec in enumerate(root.get_kv_spec().layers):
+        if index % 2 == 0:
+            layers.append(layer_spec)
+            continue
+        layers.append(
+            LayerSpec(
+                name=layer_spec.name,
+                num_kv_heads=layer_spec.num_kv_heads,
+                head_size=layer_spec.head_size,
+                dtype=layer_spec.dtype,
+                sliding_window_size=None,
+                chunk_size=None,
+                kda_conv_state_shape=E2E_CONV_STATE_SHAPE,
+                kda_recurrent_state_shape=E2E_RECURRENT_STATE_SHAPE,
+                kda_conv_state_dtype=torch.float32,
+                kda_recurrent_state_dtype=torch.float32,
+            )
+        )
+    return KVSpec(layers=layers)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -530,14 +590,12 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
     carriers = NeuronModelRunner._glm5next_layer_carriers(
         banks,
         side,
-        block_ids=range(PROMPT_BLOCKS),
-        state_slot=0,
+        geometries=_geometries(banks, block_ids=range(PROMPT_BLOCKS), state_slot=0),
         is_prefill=True,
         tokens=item.STACK_TOKENS,
         start_position=0,
         softmax_scale=item.MLA_SOFTMAX_SCALE,
         max_seq_len=item.STACK_TOKENS,
-        page_size=item.MLA_PAGE_SIZE,
         index_kpool=int(text_config.index_kpool),
     )
 
@@ -645,30 +703,40 @@ def test_the_tiny_config_is_the_registered_constraint_set():
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 
-def _metadata(*, blocks: int, tokens: int, cached: int, threshold: int = 1) -> dict:
-    """The runner's attention-metadata mapping, one group, at this step's geometry.
+def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) -> dict:
+    """ONE KV-cache group's attention-metadata entry, at this step's geometry.
 
     THE KEYS AND THEIR SHAPES ARE THE RUNNER'S OWN, read off the mapping it builds at
     `neuron_model_runner.py:4417-4429`; the converter under test reads five of them --
     `block_table_tensor`, `block_size`, `max_query_len`, `decode_token_threshold` and
     `cached_seq_len` -- and the rest are present so that this is the runner's mapping and not
-    a five-key stand-in. The runner also wraps it in a per-group dict, which is why the
-    converter takes `next(iter(...values()))` (`:7053`), and this reproduces that shape.
+    a five-key stand-in.
     """
-    table = torch.arange(blocks, dtype=torch.int32).reshape(1, blocks)
+    table = torch.tensor([[int(value) for value in row]], dtype=torch.int32)
     return {
-        "glm5_next": {
-            "block_table_tensor": table,
-            "full_block_table_tensor": table,
-            "slot_mapping": torch.arange(tokens, dtype=torch.int32) + cached,
-            "max_query_len": int(tokens),
-            "block_size": item.MLA_PAGE_SIZE,
-            "max_blocks_per_seq": int(blocks),
-            "decode_token_threshold": int(threshold),
-            "cached_seq_len": torch.tensor([cached], dtype=torch.int32),
-            "kv_segment_size": int(blocks) * item.MLA_PAGE_SIZE,
-        }
+        "block_table_tensor": table,
+        "full_block_table_tensor": table,
+        "slot_mapping": torch.arange(tokens, dtype=torch.int32) + cached,
+        "max_query_len": int(tokens),
+        "block_size": int(block_size),
+        "max_blocks_per_seq": int(table.shape[1]),
+        "decode_token_threshold": int(threshold),
+        "cached_seq_len": torch.tensor([cached], dtype=torch.int32),
+        "kv_segment_size": int(table.shape[1]) * int(block_size),
     }
+
+
+def _metadata(names, *, blocks: int, tokens: int, cached: int, threshold: int = 1) -> dict:
+    """The runner's attention-metadata mapping: ONE ENTRY PER LAYER NAME, one group's geometry.
+
+    THE KEYING IS THE RUNNER'S. It builds a block table per KV-cache group and then writes
+    that group's entry under every layer name in the group
+    (`neuron_model_runner.py:4256-4257`), and the converter looks each layer's own name up. A
+    mapping under one made-up key would not reach the code under test at all.
+    """
+    entry = _entry(row=range(blocks), tokens=tokens, cached=cached, threshold=threshold,
+                   block_size=item.MLA_PAGE_SIZE)
+    return {str(name): entry for name in names}
 
 
 def _model_kwargs(runner, *, input_ids, cached: int, sampling_row: int) -> dict:
@@ -683,7 +751,10 @@ def _model_kwargs(runner, *, input_ids, cached: int, sampling_row: int) -> dict:
     generic = {
         "input_ids": input_ids,
         "positions": torch.arange(tokens, dtype=torch.long) + cached,
-        "attn_metadata": _metadata(blocks=blocks, tokens=tokens, cached=cached),
+        "attn_metadata": _metadata(
+            [bank["name"] for bank in runner.model.glm5next_layer_banks],
+            blocks=blocks, tokens=tokens, cached=cached,
+        ),
         "sampling_positions": torch.tensor([sampling_row], dtype=torch.long),
         "sampling_params": None,
         "spec_decode_metadata": None,
@@ -933,3 +1004,222 @@ def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
     print(f"TINYE2E|cache_written|nonzero_elements={written}"
           f"|slots={root.glm5next_layer_banks[0]['slots']}")
     assert written > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 8. the converter reads EACH layer's own KV-cache group, not one group's for all.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def _grouped_metadata(banks, *, tokens: int, sparse_row, state_row,
+                      sparse_block_size: int | None = None, sparse_cached: int = 0,
+                      state_cached: int = 0, threshold: int = 1) -> dict:
+    """TWO KV-cache groups, each with its own block table, keyed by every layer name.
+
+    This is the mapping a hybrid stack produces: one entry per group, written under every
+    layer name of that group (`neuron_model_runner.py:4256-4257`). The two rows differ on
+    purpose, so a converter that read one entry for the whole stack would slice the sparse
+    layers out of the recurrent group's table -- the defect this item is about.
+    """
+    sparse = _entry(
+        row=sparse_row, tokens=tokens, cached=sparse_cached, threshold=threshold,
+        block_size=item.MLA_PAGE_SIZE if sparse_block_size is None else sparse_block_size,
+    )
+    state = _entry(row=state_row, tokens=tokens, cached=state_cached, threshold=threshold,
+                   block_size=item.MLA_PAGE_SIZE)
+    return {
+        bank["name"]: (sparse if bank["family"] == "self_attn" else state)
+        for bank in banks
+    }
+
+
+def _generic(*, tokens: int, metadata: dict, sampling_row: int) -> dict:
+    """One step's generic runner kwargs at a GIVEN metadata mapping.
+
+    The ids are zeros of the right length: the converter reads `input_ids.shape[0]` and
+    nothing else off them, so a real prompt would add nothing this item can check.
+    """
+    return {
+        "input_ids": torch.zeros(int(tokens), dtype=torch.long),
+        "positions": torch.arange(int(tokens), dtype=torch.long),
+        "attn_metadata": metadata,
+        "sampling_positions": torch.tensor([int(sampling_row)], dtype=torch.long),
+        "sampling_params": None,
+        "spec_decode_metadata": None,
+        "rank": None,
+        "logit_mask": None,
+    }
+
+
+def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
+    """A hybrid stack has TWO block tables, and every layer's carrier comes from its own.
+
+    WHY THIS ITEM EXISTS. Commit 1 read one entry -- `next(iter(metadata_map.values()))` --
+    and applied its block size, its block run and its first block id to every layer. The
+    runner builds one table per KV-CACHE GROUP (`neuron_model_runner.py:4115-4121`) and a
+    GLM-5.3-Flash stack is hybrid, so the sparse layers and the recurrent layers land in
+    different groups with different tables. One entry for the whole stack therefore slices one
+    family out of the other family's table, and `inc-glm53f-051`'s interface record says
+    nothing below this point detects it. Review r1 of commit 1 found it.
+
+    THE CONTROL IS THE OLD BEHAVIOUR, RUN. The last block calls the same converter with the
+    single-table mapping commit 1 effectively used and requires the sparse slice to land
+    somewhere ELSE. Remove the per-layer lookup and the two calls agree, and this item fails.
+    """
+    _require_cpu_mode()
+    root = _fixture()["root"]
+    spec = _mixed_spec(root)
+    monkeypatch.setattr(root, "get_kv_spec", lambda: spec)
+    caches = _runner_shaped_caches(root)
+    root.bind_kv_cache(caches)
+    banks = root.glm5next_layer_banks
+    families = sorted({bank["family"] for bank in banks})
+    print(f"TINYE2E|groups|layers={len(banks)}|families={families}")
+    if families != ["linear_attn", "self_attn"]:
+        raise item.VacuousControlError(
+            f"this item needs BOTH families in one stack for two groups to exist at all, "
+            f"and the spec it built reports {families}"
+        )
+
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+    tokens = GENERATED_TOKENS
+    state_slot = E2E_STATE_SLOTS - 1
+    sparse_row = [0, 1]
+    grouped = _grouped_metadata(banks, tokens=tokens, sparse_row=sparse_row,
+                                state_row=[state_slot])
+    translated = runner._glm5next_model_kwargs(
+        _generic(tokens=tokens, metadata=grouped, sampling_row=tokens - 1)
+    )
+    carriers = translated["layer_carriers"]
+    assert len(carriers) == len(banks)
+    for index, (bank, carrier) in enumerate(zip(banks, carriers)):
+        if bank["family"] == "self_attn":
+            page = int(bank["block_size"])
+            want = bank["latent_cache"][sparse_row[0] * page]
+            print(f"TINYE2E|group_slice|{index}|sparse|first_block={sparse_row[0]}"
+                  f"|slots={int(carrier['latent_cache'].shape[0])}")
+            assert carrier["latent_cache"].data_ptr() == want.data_ptr(), (
+                f"layer {index} is sparse and its latent slice does not start at its own "
+                f"group's first block"
+            )
+            assert int(carrier["latent_cache"].shape[0]) == len(sparse_row) * page
+        else:
+            print(f"TINYE2E|group_slice|{index}|recurrent|state_slot={state_slot}")
+            assert (carrier["conv_state"].data_ptr()
+                    == bank["conv_state"][state_slot].data_ptr()), (
+                f"layer {index} is recurrent and its conv state is not the slot its own "
+                f"group's table names"
+            )
+            assert (carrier["recurrent_state"].data_ptr()
+                    == bank["recurrent_state"][state_slot].data_ptr())
+
+    # ---- A layer with no entry of its own refuses by name rather than borrowing one.
+    short = dict(grouped)
+    short.pop(banks[0]["name"])
+    with pytest.raises(ValueError, match="has no attention-metadata entry"):
+        runner._glm5next_model_kwargs(
+            _generic(tokens=tokens, metadata=short, sampling_row=tokens - 1)
+        )
+
+    # ---- A group whose page disagrees with the bank's own paging refuses rather than slicing.
+    wrong_page = _grouped_metadata(banks, tokens=tokens, sparse_row=sparse_row,
+                                   state_row=[state_slot],
+                                   sparse_block_size=int(item.MLA_PAGE_SIZE) * 2)
+    with pytest.raises(ValueError, match="reports page"):
+        runner._glm5next_model_kwargs(
+            _generic(tokens=tokens, metadata=wrong_page, sampling_row=tokens - 1)
+        )
+
+    # ---- Groups that disagree about the step refuse: the layers are stepped together.
+    disagreeing = _grouped_metadata(banks, tokens=tokens, sparse_row=sparse_row,
+                                    state_row=[state_slot], state_cached=1)
+    with pytest.raises(ValueError, match="must agree on the leg and the cached length"):
+        runner._glm5next_model_kwargs(
+            _generic(tokens=tokens, metadata=disagreeing, sampling_row=tokens - 1)
+        )
+
+    # ---- THE CONTROL: one table for the whole stack lands the sparse slice elsewhere.
+    single = {
+        bank["name"]: _entry(row=[state_slot], tokens=tokens, cached=0, threshold=1,
+                             block_size=item.MLA_PAGE_SIZE)
+        for bank in banks
+    }
+    control = runner._glm5next_model_kwargs(
+        _generic(tokens=tokens, metadata=single, sampling_row=tokens - 1)
+    )
+    sparse_index = next(i for i, bank in enumerate(banks) if bank["family"] == "self_attn")
+    per_layer_ptr = carriers[sparse_index]["latent_cache"].data_ptr()
+    single_ptr = control["layer_carriers"][sparse_index]["latent_cache"].data_ptr()
+    print(f"TINYE2E|group_control|per_layer={per_layer_ptr}|single_table={single_ptr}"
+          f"|differ={per_layer_ptr != single_ptr}")
+    assert per_layer_ptr != single_ptr, (
+        "the single-table mapping produced the same sparse slice as the per-layer one, so "
+        "this item is not measuring the per-layer lookup at all"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 9. the root's `block_size` is the weight-quant block, and the converter leaves it unset.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_converter_does_not_hand_the_root_a_kv_page_as_its_quant_block():
+    """Two different numbers share one name, and only one of them belongs to the root.
+
+    THE ROOT'S `block_size` IS THE FP8 WEIGHT-QUANT BLOCK, "tokens per block, forwarded to the
+    expert bank unread" (`model_fp8.py:8268`), and the bank refuses it unless it is a positive
+    multiple of `BLOCK_QUANT_SIZE` (`model_fp8.py:1775-1780`). The KV page size is a different
+    number -- 4 in this fixture -- so passing it would raise `Glm5NextBlockQuantRouteError` on
+    the first routed layer. Unset, the bank uses its own declared block, which is the value
+    `-054a`'s landed acceptance asserts the root forwards to its stack
+    (`test_tiny_glm5next_forward.py:5392-5393`).
+
+    THE CONTROL IS THE ARITHMETIC, and it is the same constant the model's own guard imports:
+    `item.BLOCK_QUANT_SIZE` comes from `blockwise_fp8_retile`, which is where
+    `model_fp8.py:1676-1680` gets it. This item requires the KV page NOT to be a multiple of
+    it, so the wrong value would have been refused rather than silently tolerated; if a later
+    dial made the two coincide, this item fails and says so instead of going quiet.
+    """
+    _require_cpu_mode()
+    root = _fixture()["root"]
+    caches = _runner_shaped_caches(root)
+    root.bind_kv_cache(caches)
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+
+    translated = _model_kwargs(
+        runner,
+        input_ids=torch.zeros(item.STACK_TOKENS, dtype=torch.long),
+        cached=0,
+        sampling_row=item.STACK_TOKENS - 1,
+    )
+    declared = inspect.signature(type(root).forward).parameters
+    print(f"TINYE2E|root_params|declared={sorted(declared)}|translated={sorted(translated)}")
+    assert set(translated) <= set(declared), (
+        f"the converter returned {sorted(set(translated) - set(declared))}, which the root "
+        f"forward does not declare"
+    )
+    assert "block_size" not in translated
+    assert declared["block_size"].default is None
+
+    page = int(item.MLA_PAGE_SIZE)
+    quant = int(item.BLOCK_QUANT_SIZE)
+    print(f"TINYE2E|quant_block|kv_page={page}|quant_block={quant}"
+          f"|page_is_a_multiple={page % quant == 0}")
+    if page % quant == 0:
+        raise item.VacuousControlError(
+            f"the KV page {page} IS a multiple of the quant block {quant}, so passing the "
+            f"page as the root's block_size would not be refused and this item's control is "
+            f"vacuous"
+        )
+
+    for index, (bank, carrier) in enumerate(
+        zip(root.glm5next_layer_banks, translated["layer_carriers"])
+    ):
+        assert int(carrier["page_size"]) == int(bank["block_size"]), (
+            f"layer {index}'s carrier carries page {int(carrier['page_size'])} and its bank "
+            f"is paged {int(bank['block_size'])}; the KV page must still reach the layers"
+        )
