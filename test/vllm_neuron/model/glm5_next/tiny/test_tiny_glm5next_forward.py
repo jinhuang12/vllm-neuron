@@ -86,6 +86,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -3890,7 +3891,7 @@ def _stack_attention_half(layer, raw, gains, hidden, cfg, selection):
 
 
 def _stack_ffn_half(layer, hidden, cfg, operands, *, routed: bool, gain=None,
-                    router_input=None) -> dict:
+                    router_input=None, expert_input=None) -> dict:
     """One layer's FFN half in torch, from the tensor that layer's MLP RECEIVED.
 
     Returns whichever of :func:`_dense_output`'s or :func:`_routed_output`'s mappings
@@ -3906,11 +3907,18 @@ def _stack_ffn_half(layer, hidden, cfg, operands, *, routed: bool, gain=None,
     un-normalised states together with the norm's gain. It is an argument for the same
     reason -- a control feeds it the normalised tensor, which normalises twice and is
     a different router.
+
+    ``expert_input`` DEFAULTS TO THE NORMALISED TENSOR, which is what the block's expert
+    side consumes. It is an argument for one reason -- a reading below hands the experts
+    the pre-norm states while the router gets the normalised tensor -- and it changes
+    nothing at all when it is not passed.
     """
     limit = float(cfg.swiglu_limit)
     if gain is None:
         gain = layer.post_attention_layernorm_weight
     normed = _ffn_norm(hidden, gain, float(cfg.rms_norm_eps))
+    if expert_input is not None:
+        normed = expert_input
     if not routed:
         return _dense_output({**operands, "hidden": normed}, limit, -limit, limit)
     if router_input is None:
@@ -4046,6 +4054,27 @@ def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
             )
 
 
+def _diag_mode() -> bool:
+    """Diagnostic mode, and it is OFF unless the launcher sets it.
+
+    ``TINY_054A_DIAG=1`` makes item 6's refusal sites after conjunct 5 PRINT what they
+    would have raised and CONTINUE, so ONE run enumerates every one of them instead of
+    one run per site. With the variable unset -- which is every run this fixture has
+    ever had -- each site raises exactly as it does at ``0f5182a``.
+    """
+    return os.environ.get("TINY_054A_DIAG", "") == "1"
+
+
+def _diag_or_raise(site: str, message: str, *, gap: str = "n/a",
+                   band: str = "n/a") -> None:
+    """Raise ``VacuousControlError(message)``; in DIAG mode print the row and continue."""
+    if _diag_mode():
+        print(f"TINYFWD|diag_control|site={site}|gap={gap}|band={band}"
+              f"|would_raise=True")
+        return
+    raise VacuousControlError(message)
+
+
 def _stack_outside_tolerance(label: str, moved: torch.Tensor,
                              base: torch.Tensor) -> None:
     """One control: ``moved`` must fall OUTSIDE this item's band.
@@ -4059,6 +4088,10 @@ def _stack_outside_tolerance(label: str, moved: torch.Tensor,
     gap = float((moved.float() - base.float()).abs().max() / base.abs().max())
     print(f"TINYFWD|stack_control|branch={label}|outside_tolerance={outside}"
           f"|gap={gap:.6f}")
+    if _diag_mode():
+        print(f"TINYFWD|diag_control|site={label}|gap={gap:.6f}"
+              f"|band=rtol {RTOL} atol {ATOL}|would_raise={not outside}")
+        return
     if not outside:
         raise VacuousControlError(
             f"{label}: the change leaves the reference inside rtol={RTOL}, "
@@ -4185,7 +4218,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         recorded_out.append((module, output))
 
     def _record_mlp(module, args, kwargs, output):
-        recorded_mlp.append((module, output))
+        recorded_mlp.append((module, args, kwargs, output))
 
     handles = []
     for layer in layers:
@@ -4750,7 +4783,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             "called the routed MLP and conjunct 5 has no product half either to "
             "compare or to add; a skip here would hide a stack that ran no experts"
         )
-    _half_product = recorded_mlp[-1][1]
+    _half_product = recorded_mlp[-1][3]
     _half_ref = ffn[-1]["out"]
     if tuple(_half_product.shape) != tuple(_half_ref.shape):
         raise ReferenceShapeError(
@@ -4873,25 +4906,124 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         ffn[first_dense]["out"],
     )
 
-    # ---- CONTROL C: THE ROUTER READS THE PRE-NORM TENSOR. ``_ffn_half`` passes two
-    # activation tensors to the block and their ORDER is this forward's decision;
-    # item 4 owns what the block does with them. Feeding the router the normalised
-    # states normalises twice inside the fused kernel, which is a different router.
+    # ---- CONTROL C: THE ORDER THE PRODUCT HANDED ITS TWO ACTIVATION TENSORS IN,
+    # CERTIFIED BY STRUCTURE AND NOT BY A BAND. ``_ffn_half`` passes the PRE-NORM states
+    # first, the normalised tensor second and the norm's gain as ``router_gamma``
+    # (``model_fp8.py:6595-6598``), and that order is this forward's decision; item 4 owns
+    # what the block does with them. THIS FIXTURE CANNOT SEE THE ORDER THROUGH THE BANK:
+    # layer 2's routed half is clamp-saturated here, so every expert's SwiGLU term is
+    # constant and the half moves with the affinities alone -- the two readings at the end
+    # of this control measure exactly that, and both come back at the same number (ruling
+    # LEAD-LOG section 889, debt D-054A-L2-BANK-SATURATED; the bank's arithmetic off the
+    # clamp is items 2 and 4's). So the control reads the ARGUMENTS the product passed,
+    # recorded by the same MLP hook conjunct 5 already installs, and certifies the order
+    # itself. The arm below plants the swap in the reading and requires it to fail, which
+    # is what stops this certificate from holding no matter what the product did.
     moe_layer = fixture["moe_at"][0]
     moe_input = recorded_out[moe_layer][1]
-    _stack_outside_tolerance(
-        f"layer {moe_layer}'s router fed the FFN-normalised tensor",
-        _stack_ffn_half(
-            layers[moe_layer], moe_input, cfg,
-            fixture["mlp_operands"][moe_layer], routed=True,
-            router_input=_ffn_norm(
-                moe_input,
-                layers[moe_layer].post_attention_layernorm_weight,
-                float(cfg.rms_norm_eps),
-            ),
-        )["out"],
-        ffn[moe_layer]["out"],
+    _c_gain = layers[-1].post_attention_layernorm_weight
+    _c_eps = float(cfg.rms_norm_eps)
+    _c_args = recorded_mlp[-1][1]
+    _c_kwargs = recorded_mlp[-1][2]
+    if len(_c_args) < 2:
+        raise ReferenceShapeError(
+            f"the routed MLP was called with {len(_c_args)} positional tensors; this "
+            f"control reads the two activation tensors the block is handed, so a "
+            f"shorter call is a refusal and not a skip"
+        )
+    _c_normed = _ffn_norm(_c_args[0], _c_gain, _c_eps)
+    _c1 = torch.equal(_c_args[1], _c_normed)
+    _c1_max = float((_c_args[1].float() - _c_normed.float()).abs().max())
+    _c_router_gamma = _c_kwargs.get("router_gamma")
+    _c2 = _c_router_gamma is _c_gain or (
+        _c_router_gamma is not None and torch.equal(_c_router_gamma, _c_gain)
     )
+    print(f"TINYFWD|stack_control|branch=layer {moe_layer}'s block handed its two "
+          f"activation tensors in order|c1={_c1}|c2={_c2}|max_abs_c1={_c1_max:.6g}")
+    if not (_c1 and _c2):
+        raise AssertionError(
+            f"layer {moe_layer}'s block was handed its arguments in the wrong order: "
+            f"the second positional tensor is the FFN norm of the first at c1={_c1} "
+            f"(worst cell {_c1_max:.6g}) and the router's gain is this layer's "
+            f"post-attention gain at c2={_c2}; the fused router applies the norm itself, "
+            f"so the pre-norm states go first and the normalised tensor second"
+        )
+    # ---- THE ARM. Reading the same two tensors SWAPPED must not also hold, or the
+    # certificate above would pass on any pair of tensors the product handed over.
+    _c_arm_failed = not torch.equal(_c_args[0], _ffn_norm(_c_args[1], _c_gain, _c_eps))
+    print(f"TINYFWD|stack_control|branch=layer {moe_layer}'s block handed its two "
+          f"activation tensors in order|arm=swapped|must_fail=True"
+          f"|failed={_c_arm_failed}")
+    if not _c_arm_failed:
+        _diag_or_raise(
+            f"item 6 control C's arm: the swapped reading held too",
+            f"layer {moe_layer}'s order certificate cannot tell the two apart: reading "
+            f"the tensors swapped ALSO holds, so it certifies nothing",
+        )
+    # ---- READINGS ONLY, GATED ON NOTHING: the two plants that used to BE control C.
+    # Their numbers are worth keeping -- they are the measurement that says the bank
+    # cannot see its own expert input at this layer -- and a plant that cannot
+    # discriminate is a reading, never a gate.
+    _moe_normed = _ffn_norm(
+        moe_input,
+        layers[moe_layer].post_attention_layernorm_weight,
+        _c_eps,
+    )
+    _ro_base = ffn[moe_layer]["out"]
+    for _r_label, _r_kwargs, _r_note in (
+        ("block handed its two activation tensors in the swapped order",
+         {"router_input": _moe_normed, "expert_input": moe_input},
+         "the bank is clamp-saturated at this layer, so its output cannot see this"),
+        ("router alone fed the FFN-normalised tensor",
+         {"router_input": _moe_normed},
+         "this plant reaches the affinities only"),
+    ):
+        _r_moved = _stack_ffn_half(
+            layers[moe_layer], moe_input, cfg,
+            fixture["mlp_operands"][moe_layer], routed=True, **_r_kwargs,
+        )["out"]
+        _r_outside = not torch.allclose(_r_moved.float(), _ro_base.float(),
+                                        rtol=RTOL, atol=ATOL)
+        _r_gap = float((_r_moved.float() - _ro_base.float()).abs().max()
+                       / _ro_base.abs().max())
+        print(f"TINYFWD|stack_control_reading|branch=layer {moe_layer}'s {_r_label}"
+              f"|outside_tolerance={_r_outside}|gap={_r_gap:.6f}|note={_r_note}")
+    # ---- READING: HOW FAR APART THE TWO TENSORS ACTUALLY ARE. If this were zero the
+    # pre-norm states and the normalised tensor would be the same input and every plant
+    # on the order would be a no-op by arithmetic. It is not zero -- the router-only
+    # reading above already moves the answer -- and this row says so directly.
+    _pn_peak = float(moe_input.float().abs().max())
+    _pn_rel = float((moe_input.float() - _moe_normed.float()).abs().max()
+                    / max(_pn_peak, 1e-30))
+    print(f"TINYFWD|stack_control_reading|branch=layer {moe_layer} pre-norm vs normalised"
+          f"|rel_max_abs={_pn_rel:.6f}|pre_norm_peak={_pn_peak:.10g}"
+          f"|note=zero here would mean the two tensors are one input")
+    # ---- READING: THE ROUTED BANK'S OWN CLAMP CENSUS, in the same form the dense guard
+    # rows print, over the cells this bank actually clamps -- the gate and up activations
+    # of the experts the router SELECTED for each token. Saturation is why nothing handed
+    # to the experts can be seen through this half (ruling LEAD-LOG section 889).
+    _bank_gate = ffn[moe_layer]["gate"].float()
+    _bank_up = ffn[moe_layer]["up"].float()
+    _bank_limit = float(cfg.swiglu_limit)
+    _bank_logits, _bank_index, _bank_aff = layers[moe_layer].mlp.experts.route_tokens(
+        moe_input.unsqueeze(0),
+        layers[moe_layer].post_attention_layernorm_weight,
+        cfg,
+    )
+    _sel = (_bank_aff.t() != 0).unsqueeze(-1).expand_as(_bank_gate)
+    _sel_any = bool(_sel.any())
+    _sel_cells = int(_sel.sum())
+    _bg_peak = float(_bank_gate[_sel].abs().max()) if _sel_any else 0.0
+    _bu_peak = float(_bank_up[_sel].abs().max()) if _sel_any else 0.0
+    _bg_frac = float((_bank_gate >= _bank_limit)[_sel].float().mean()) if _sel_any else 0.0
+    _bu_frac = float((_bank_up.abs() >= _bank_limit)[_sel].float().mean()) if _sel_any else 0.0
+    print(f"TINYFWD|stack_scale_guard|layer={moe_layer}|scale=new|bank=routed"
+          f"|gate_peak={_bg_peak:.10g}|up_peak={_bu_peak:.10g}"
+          f"|limit={_bank_limit:.10g}"
+          f"|gate_at_limit_frac={_bg_frac:.6f}|up_at_limit_frac={_bu_frac:.6f}"
+          f"|selected_cells={_sel_cells}|experts_selected_per_token="
+          f"{int(( _bank_aff != 0).sum(dim=1).max())}"
+          f"|note=a reading and not a gate: the fractions cover the selected experts only")
 
     # ---- CONTROL D: A CARRIER LIST THAT DOES NOT MATCH THE STACK REFUSES BY NAME,
     # and it refuses before any layer runs. A short sequence would otherwise run a
@@ -4926,9 +5058,10 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     print(f"TINYFWD|stack_control|branch=forward with no embedding table"
           f"|refused=True|seams_that_moved={sorted(moved.items())}")
     if moved:
-        raise VacuousControlError(
+        _diag_or_raise(
+            "item 6 control E: seams dispatched before the named refusal",
             f"the refusal ran after {sorted(moved.items())} dispatched, so it is "
-            f"not reached before the stack starts"
+            f"not reached before the stack starts",
         )
 
 
