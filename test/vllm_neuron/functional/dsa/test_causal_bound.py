@@ -66,6 +66,7 @@ and computes no new number, and ``-103b`` is registered at exact bit equality.
 """
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -1204,14 +1205,23 @@ registered envelope. Read off :data:`PARTITION_MAX` rather than typed, so the la
 constant if the constant ever moves."""
 
 VENDOR_PARTITION_ASSERT = "dma_copy dst partition dimension {rows} exceeds maximum {pmax}"
-"""What the PARENT dies of above the ceiling, quoted from the failing run that found it.
+"""What the PARENT died of above the ceiling in the run that found it -- kept for the READER, not for
+the assertion.
 
 This module has no row-count check anywhere -- ``_validate_bound`` reads shapes and dtypes,
 ``can_run_dsa_causal_bound`` reads only whether NKI is available -- so the parent does not refuse by
 name. It dispatches, and the vendor's own assert fires in ``nki/isa/_copy.py:152`` by way of
-``nki/isa/_validation.py:261``. The template is formatted from :data:`TRAP_ROWS` and
-:data:`PARTITION_MAX`, so the control quotes the message verbatim WITHOUT typing either number
-twice."""
+``nki/isa/_validation.py:261``."""
+
+VENDOR_PARTITION_NUMBERS = r"partition dimension (\d+) exceeds maximum (\d+)"
+"""WHAT THE CONTROL ACTUALLY ASSERTS ON, and why it is a pattern and not the sentence above.
+
+The control's claim is "the parent trapped BECAUSE 132 rows exceeded the 128-row partition axis", and
+that claim lives in the two NUMBERS. The surrounding words are the vendor's to change: a wording drift
+between the run that produced :data:`VENDOR_PARTITION_ASSERT` and the image this acceptance runs on
+would redden a correct candidate on prose. So the control EXTRACTS the pair and compares it with
+:data:`TRAP_ROWS` and :data:`PARTITION_MAX`, and it still prints the raw text and the exception type
+verbatim -- a drift then shows up in the transcript as a fact rather than as a red."""
 
 TILED_LENGTH_PERIOD = POOL_COLUMNS + 1
 """Row ``i``'s causal length completes ``i % TILED_LENGTH_PERIOD`` pools, and this period is chosen so
@@ -1480,6 +1490,22 @@ def _trap_of(call) -> tuple[str, str]:
     raise AssertionError("the call was expected to trap above the partition ceiling and did not")
 
 
+def _partition_numbers(text: str) -> tuple[int, int]:
+    """The ``(rows, maximum)`` pair out of a vendor partition-ceiling trap, or a failure saying so.
+
+    :data:`VENDOR_PARTITION_NUMBERS` is searched ANYWHERE in the text rather than anchored, because
+    the trap arrives wrapped in whatever frames the dispatch path adds. Two numbers is the whole
+    reading: they are what says the trap was the partition ceiling and not some other assert that
+    happened to fire at the same call.
+    """
+    found = re.search(VENDOR_PARTITION_NUMBERS, text)
+    assert found is not None, (
+        f"the trap did not report a partition dimension against a maximum, so it is not the ceiling "
+        f"this control is about; the raw text was: {' '.join(text.split())[:400]}"
+    )
+    return (int(found.group(1)), int(found.group(2)))
+
+
 # =========================================================================== #
 # TILED ITEM 1 -- ADMISSION WHERE THERE IS A TRAP TODAY                        #
 # =========================================================================== #
@@ -1490,8 +1516,10 @@ def test_tiled_admits_the_registered_envelope_where_the_parent_trapped() -> None
 
     THE CONTROL IS IN THIS ITEM because it is what makes the admission mean something: without it, a
     candidate that tiles nothing could pass item 1 by the extent simply never having been tried. The
-    control runs the PARENT replica at the observed :data:`TRAP_ROWS` and quotes the vendor assert
-    verbatim, and then the candidate serves that same call.
+    control runs the PARENT replica at the observed :data:`TRAP_ROWS`, EXTRACTS the two numbers out of
+    the vendor's trap and asserts them against this file's dials, and then the candidate serves that
+    same call. The vendor's wording is printed verbatim beside the numbers and is not asserted on --
+    :data:`VENDOR_PARTITION_NUMBERS` says why.
 
     Certifying component (D1.4): ``causal_bound._causal_bound_nki`` and
     ``causal_bound._causal_sentinel_nki`` through their two seams.
@@ -1532,10 +1560,16 @@ def test_tiled_admits_the_registered_envelope_where_the_parent_trapped() -> None
     # ---- CONTROL: the parent traps at the observed extent, in the vendor's own words ----
     trap_scores = _tiled_scores(TRAP_ROWS, 1032)
     trap_clen = _tiled_causal_len(TRAP_ROWS)
+    # THE ASSERTION IS ON THE TWO NUMBERS, NOT ON THE SENTENCE. See VENDOR_PARTITION_NUMBERS: the
+    # claim is that 132 rows exceeded the 128-row partition axis, and a wording change in the vendor's
+    # message must not redden a correct candidate. The wording is still printed, verbatim.
     quoted = VENDOR_PARTITION_ASSERT.format(rows=TRAP_ROWS, pmax=PARTITION_MAX)
     kind, text = _trap_of(lambda: _run_parent_bound(trap_scores, trap_clen, POOL_SIZE))
-    assert quoted in text, (quoted, kind, text)
-    _emit_tiled("I1_CONTROL_PARENT_BOUND_TRAPS", rows=TRAP_ROWS, exception=kind, quoted=quoted,
+    numbers = _partition_numbers(text)
+    assert numbers == (TRAP_ROWS, PARTITION_MAX), (numbers, kind, text)
+    _emit_tiled("I1_CONTROL_PARENT_BOUND_TRAPS", rows=TRAP_ROWS, exception=kind,
+                extracted_rows=numbers[0], extracted_maximum=numbers[1],
+                wording_matches_the_recorded_run=int(quoted in text),
                 raw=" ".join(text.split())[:240])
 
     # The sentinel half traps too, at the same extent -- which is why the block put BOTH entry points
@@ -1545,9 +1579,12 @@ def test_tiled_admits_the_registered_envelope_where_the_parent_trapped() -> None
     s_kind, s_text = _trap_of(
         lambda: _run_parent_sentinel(trap_values, trap_idx, POOL_COLUMNS)
     )
-    assert quoted in s_text, (quoted, s_kind, s_text)
+    s_numbers = _partition_numbers(s_text)
+    assert s_numbers == (TRAP_ROWS, PARTITION_MAX), (s_numbers, s_kind, s_text)
     _emit_tiled("I1_CONTROL_PARENT_SENTINEL_TRAPS", rows=TRAP_ROWS, exception=s_kind,
-                quoted=quoted, raw=" ".join(s_text.split())[:240])
+                extracted_rows=s_numbers[0], extracted_maximum=s_numbers[1],
+                wording_matches_the_recorded_run=int(quoted in s_text),
+                raw=" ".join(s_text.split())[:240])
 
     # ---- and the candidate serves exactly that call, bit-exactly ----
     reset_causal_bound_dispatch_counters()
