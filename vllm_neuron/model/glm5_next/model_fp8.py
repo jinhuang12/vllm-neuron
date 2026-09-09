@@ -87,10 +87,12 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MAPPED_KEY_STACKED_BANK,
     build_weight_mappings,
     classify_mapped_keys,
+    compensate_block_scales,
     consumer_block_quant_size,
     DeferredShardGeometry,
     dequantise_blockwise,
     loader_for_mapped_keys,
+    report_floored_blocks,
     scale_keys,
     sharded_scale_grid_loader,
     ShardGeometry,
@@ -7004,15 +7006,28 @@ def _publish_compute_frame_operands(
     this step already count. The transpose count and both frames go into the health
     record on ``health_attr``.
 
-    TWO STEPS, INDEPENDENT, IN THIS ORDER.
+    THREE STEPS, INDEPENDENT, IN THIS ORDER.
 
-    1. Coarsen the checkpoint's ``128``-tile scale grid onto the ``256`` public
+    1. Compensate the checkpoint's scale grid by ``448/240``, once
+       (``inc-glm53f-054c``). The loader squeezed the weight BYTES into the 240
+       range and attached these grids RAW, so without this step the product
+       reaching the kernel is ``240/448`` of the checkpoint's. NEVER skipped and
+       never conditional on extents -- the compensator's own platform gate decides
+       whether the multiply happens, and on a platform that needs no squeeze it is
+       a no-op that still reports.
+    2. Coarsen the checkpoint's ``128``-tile scale grid onto the ``256`` public
        grid, which also requantises the weight. This runs only for extents that
        are whole ``256`` blocks; a miniature with no public grid to build is
        RECORDED and skipped, because a silent skip looks exactly like a working
        retile.
-    2. Transpose the weight and its grid into the compute frame. This is NEVER
+    3. Transpose the weight and its grid into the compute frame. This is NEVER
        skipped: a skipped transpose leaves the forward refusing at layer 0.
+
+    STEP 1 RUNS BEFORE STEP 2 AND THE ORDER IS LOAD-BEARING. Step 2's refusal
+    predicate reads ``scales[tile] / retained``, and a uniform multiply of the whole
+    grid cancels in that ratio, so compensating first leaves which blocks step 2
+    refuses unchanged -- EXCEPT where the ``MINVAL`` floor engages on a block and
+    breaks the uniformity, which is why the floored count is recorded per leaf.
 
     WHY THE TRANSPOSE IS HERE AND NOT IN THE FORWARD. The loader delivers the
     checkpoint's own layout -- ``[I, H]`` for gate and up, ``[H, I]`` for down (the
@@ -7076,6 +7091,50 @@ def _publish_compute_frame_operands(
             raise error_cls(f"{grid_name} must be 2-D, got shape {tuple(grid.shape)}")
         rows, cols = int(weight.shape[0]), int(weight.shape[1])
         record: dict[str, object] = {"loader_frame": (rows, cols)}
+
+        # ---- THE 448/240 SCALE COMPENSATION, EXACTLY ONCE PER GRID (``inc-glm53f-054c``).
+        # The weight BYTES arrive already squeezed into the 240 range by the loader
+        # (``weight_loaders_fp8.py:2250`` -> ``:1346`` -> ``:1174``), while this file
+        # attached their scale GRIDS raw (``:7734``/``:7743``). Only half a matched pair
+        # ran, so the product the kernel multiplied was 240/448 = 53.5714% of the
+        # checkpoint's. The loader's own module header states the pair -- squeeze the
+        # bytes AND compensate the per-block scale by the inverse factor -- and
+        # ``sharded_scale_grid_loader``'s docstring names THIS prep as the consumer that
+        # owes the second half. Nothing did it: the file held zero calls to it.
+        #
+        # HERE, AND NOT BESIDE THE RETILE, for three reasons. Both grid routes have
+        # converged by this line, so the unsharded ``_get_slice`` grid is covered as well
+        # as the sharded one. It runs once per projection per LOAD rather than once per
+        # token. And it sits AHEAD of the extent branch below: that branch skips the
+        # retile but still transposes whatever grid is attached, so a compensation placed
+        # in the retile arm would miss exactly the extents no retile covers.
+        #
+        # THE FUNCTION IS REUSED, NEVER REWRITTEN. It carries the platform gate
+        # (``needs_240_downscale``), the ``MINVAL`` floor and the floored-block census,
+        # and the routed bank already calls that same function in its own loader
+        # (``weight_loaders_fp8.py:2623``). The bank never reaches this prep -- it retiles
+        # inside ``Glm5NextRoutedExperts.prepare_scale_operands`` -- so this call cannot
+        # double-compensate it, and no second copy of the arithmetic exists to drift.
+        compensation = compensate_block_scales(grid)
+        report_floored_blocks(compensation, grid_name)
+        grid = compensation.scale_inv
+        # WRITTEN BACK BEFORE THE BRANCH, not after it. The retile arm rebinds this
+        # attribute to the public grid further down, but the skip arm never rebinds it and
+        # STEP 2 transposes whatever is attached. Without this ``setattr`` a skipped
+        # projection would carry the RAW grid into the compute frame and the defect would
+        # survive at the one granularity the retile does not touch.
+        setattr(module, grid_name, grid)
+        # A COUNTER, NOT A LITERAL. ``record`` is fresh per leaf, so this reads 1 for a
+        # grid compensated once and would read 2 if a second call were ever added to this
+        # loop body -- which is the reading the acceptance asks for ("neither 0 nor 2").
+        # ``scale_compensated`` is the PLATFORM answer and is False where the squeeze is a
+        # no-op, so a test cannot mistake a no-op platform for a working compensation.
+        record["scale_compensations_applied"] = (
+            int(record.get("scale_compensations_applied", 0)) + 1
+        )
+        record["scale_compensated"] = compensation.applied
+        record["scale_blocks_floored"] = len(compensation.floored_blocks)
+
         if rows % BLOCK_QUANT_SIZE or cols % BLOCK_QUANT_SIZE:
             # No public grid exists for these extents. Recorded, not silent. The
             # transpose below still runs: the frame is wrong for the kernel

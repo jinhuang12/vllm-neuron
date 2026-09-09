@@ -5444,36 +5444,45 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     h_padded = (gate_padded @ x) * (up_padded @ x)
     y_padded = down_padded @ h_padded
 
-    def _reference(leaf: str, *, compensated: bool = False) -> torch.Tensor:
-        """The same three tensors whole, at the SAME scale convention.
+    def _reference(leaf: str, *, uncompensated: bool = False) -> torch.Tensor:
+        """The same three tensors whole, with BOTH halves of the trn2 pair applied.
 
-        ``compensated=True`` is the CONTROL ARM and never the reference: it builds
-        the same tensor at the other convention, so a reading that cannot tell the
-        two apart fails instead of passing quietly (DECISIONS §706-§707). The
-        reference itself is the checkpoint's own tensors at the checkpoint's own raw
-        grid and the checkpoint's own 128 granularity -- the model's semantics -- and
-        it re-implements no part of the republish.
+        CORRECTED BY ``inc-glm53f-054c``, and the correction is one word: the grid is
+        now compensated on the reference side, because the load path compensates it.
+        The trn2 encoding is a matched pair -- the weight bytes are squeezed into the
+        240 range and the per-block grid is multiplied by the inverse factor -- and
+        ``_publish_compute_frame_operands`` applies the second half at
+        ``model_fp8.py:7118``. Before ``-054c`` NOTHING applied it for these two
+        classes, so a reference carrying only the squeeze agreed with the product, and
+        this reading passed while the effective matrix stood at ``240/448`` of the
+        checkpoint's magnitude.
 
-        THE GRID IS NOT COMPENSATED HERE, and that is read off the loader rather
-        than chosen. A sharded weight's grid travels the non-compensating loader,
-        whose own words are "IT DOES NOT COMPENSATE, AND THAT IS THE WHOLE REASON
-        IT EXISTS SEPARATELY ... leaves ``compensate_block_scales`` to the
-        load-time prep that consumes it" (``weight_loaders_fp8.py:1840-1848``). So
-        the grid on the module above is the checkpoint's own, and a reference that
-        compensated would compare two different conventions.
+        ``uncompensated=True`` IS NOW THE CONTROL ARM: it is the pre-``-054c`` value,
+        the one that half-applied pair produced. It must NOT match, and if it does then
+        the compensation is not reaching the grid and this reading cannot tell the fixed
+        load path from the broken one (DECISIONS §706-§707).
 
-        The first version of this reference DID compensate. The instrument caught
-        it: both sides came out uniform and their ratio was exactly
-        ``(448/240) ** 3``, one factor per leaf
-        (``probe-101-r11c-pad-repair.out``). It is the same defect this seat keeps
-        making -- the reference named "the checkpoint's own tensors" and then
-        applied a transformation the load path does not apply at that point.
+        WHY THE REFERENCE STILL CARRIES THE SQUEEZE, rather than being the raw
+        checkpoint numbers. ``downscale_fp8_weight_bytes`` multiplies by 240/448 and
+        casts BACK to fp8, so it re-quantises: the squeezed bytes are not
+        ``w * 240/448`` exactly. A raw-checkpoint reference is therefore unreachable at
+        the EXACT equality this reading asserts, and loosening that equality to a
+        tolerance would give up the bit-exactness that makes the pad readings worth
+        having. The un-squeezed comparison belongs where a tolerance is honest and is
+        made there instead, over the real loader and the real prep, in
+        ``test_scale_compensation_054c.py``.
+
+        The history is kept because it is the same defect twice, in opposite
+        directions. The FIRST version of this reference compensated, the instrument
+        caught a ratio of exactly ``(448/240) ** 3`` -- one factor per leaf --
+        (``probe-101-r11c-pad-repair.out``) and the reference was changed to match the
+        product. The product was the thing that was wrong.
         """
         keys = _keys_of(mappings, f"{path}.{leaf}")
         scales = scale_keys(keys)
         weight_key = next(key for key in keys if key not in scales)
         grid = overrides[scales[0]]
-        if compensated:
+        if not uncompensated:
             grid = compensate_block_scales(grid).scale_inv
         return dequantise_blockwise(
             downscale_fp8_weight_bytes(overrides[weight_key]),
@@ -5486,9 +5495,11 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
 
     # WHICH CONVENTION THE MODULE CARRIES, read at the NUMBERS, per projection
     # (DECISIONS §706-§707). Each padded stack's real rows -- real columns, for the
-    # down projection -- are compared against the checkpoint's own tensor at the raw
-    # convention, which must agree exactly, and against the compensated form, which
-    # must NOT: if both agreed, neither reading could tell the conventions apart.
+    # down projection -- are compared against the checkpoint's own tensor with BOTH
+    # halves of the trn2 pair applied, which must agree exactly, and against the
+    # pre-``-054c`` half-applied form, which must NOT: if both agreed, neither reading
+    # could tell the conventions apart. The two arms SWAPPED at ``-054c`` because the
+    # load path changed, not because the reading did -- the grid is compensated now.
     # This is per projection so that a red run names which one moved.
     stacks = {
         "gate_proj_weight": gate_padded,
@@ -5498,22 +5509,22 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     conventions: dict[str, tuple[float, float]] = {}
     for leaf, stack in stacks.items():
         whole = _reference(leaf)
-        other = _reference(leaf, compensated=True)
+        other = _reference(leaf, uncompensated=True)
         real = (
             stack[:, : whole.shape[1]]
             if leaf == "down_proj_weight"
             else stack[: whole.shape[0]]
         )
         raw_diff = _max_abs_diff(real, whole)
-        compensated_diff = _max_abs_diff(real, other)
-        conventions[leaf] = (raw_diff, compensated_diff)
-        print(f"CONJUNCT3D_{leaf.upper()}_VS_CHECKPOINT_RAW={raw_diff}")
-        print(f"CONJUNCT3D_{leaf.upper()}_VS_COMPENSATED={compensated_diff}")
-    for leaf, (raw_diff, compensated_diff) in conventions.items():
-        assert compensated_diff != 0.0, (
-            f"{leaf} matches the compensated form as well as the raw one, so this "
-            f"item cannot tell the two conventions apart and its reference is "
-            f"unguarded"
+        uncompensated_diff = _max_abs_diff(real, other)
+        conventions[leaf] = (raw_diff, uncompensated_diff)
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_CHECKPOINT_PAIRED={raw_diff}")
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_UNCOMPENSATED={uncompensated_diff}")
+    for leaf, (raw_diff, uncompensated_diff) in conventions.items():
+        assert uncompensated_diff != 0.0, (
+            f"{leaf} matches the UNCOMPENSATED form as well as the paired one, so the "
+            f"448/240 compensation is not reaching this grid and this item cannot tell "
+            f"the fixed load path from the pre-inc-glm53f-054c one"
         )
         assert raw_diff == 0.0, (
             f"{leaf}'s real rows differ from the checkpoint's own tensor by "
