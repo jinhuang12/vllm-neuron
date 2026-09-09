@@ -4643,7 +4643,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             set_active_context(
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
-        model_output = self.model(**warmup_kwargs)
+        model_output = self.model(**self._glm5next_model_kwargs(warmup_kwargs))
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -4733,6 +4733,358 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+
+    # ── GLM-5.3-Flash carrier threading (inc-glm53f-054b) ────────────────
+    # This family takes its caches as forward ARGUMENTS -- one mapping per layer,
+    # splatted at `model_fp8.py:6906` and refused on a count mismatch at `:6891` --
+    # while every other family in this tree reads them off attributes. The helpers
+    # below build those mappings out of what `bind_kv_cache` kept and nothing else.
+    # Only `_glm5next_model_kwargs` is called from a model call site, and it returns
+    # its argument unchanged for a model that kept no banks, so the other five
+    # families run exactly the code they ran before.
+
+    @staticmethod
+    def _glm5next_pool_slot_mapping(
+        *, tokens: int, start_position: int, index_kpool: int, device
+    ) -> torch.Tensor:
+        """``[tokens]`` int32: the POOL id where a pool completes, ``-1`` elsewhere.
+
+        THE RULE IS THE CONSUMER'S OWN, quoted from it: "only the LAST token of each
+        complete pool carries a non-negative slot and intra-pool positions carry
+        ``-1``" (``model_fp8.py:4624-4627``), and the id is the pool number the
+        decode leg writes with, ``int(position) // pool`` (``model_fp8.py:5382``).
+
+        ``start_position`` IS WHAT MAKES THE POSITION ABSOLUTE, and it matters: a
+        chunked prefill's later chunk pools on the sequence's own boundaries, not on
+        the chunk's, so a derivation from ``0`` would put its rows in the wrong pool
+        and the mask would let the wrong ones through.
+
+        The tiny acceptance's landed operand is built by the same two lines
+        (``test_tiny_glm5next_forward.py:2853-2856``) and
+        ``test_tiny_glm5next_e2e.py`` asserts this function equals it, so the two
+        derivations cannot drift apart unnoticed.
+        """
+        pool = int(index_kpool)
+        if pool <= 0:
+            raise ValueError(f"index_kpool must be positive; got {index_kpool!r}")
+        positions = torch.arange(
+            int(tokens), dtype=torch.int64, device=device
+        ) + int(start_position)
+        completes = ((positions + 1) % pool) == 0
+        return torch.where(
+            completes, positions // pool, torch.full_like(positions, -1)
+        ).to(torch.int32)
+
+    @staticmethod
+    def _glm5next_row_seq_lens(
+        *, tokens: int, start_position: int, device
+    ) -> torch.Tensor:
+        """``[tokens]`` int32: each score ROW's own causal length.
+
+        ``seq_lens`` IS PER TOKEN, NOT PER REQUEST -- "one per PACKED row", guarded
+        at ``model_fp8.py:5541`` -- and it is the causal bound ``inc-glm53f-103``
+        consumes (``model_fp8.py:4944``). Row ``i`` of a chunk that starts at
+        ``start_position`` sees ``start_position + i + 1`` tokens including itself.
+        The landed tiny operand is ``arange(1, tokens + 1)``
+        (``test_tiny_glm5next_forward.py:2872``), which is this expression at
+        ``start_position == 0``.
+        """
+        return (
+            torch.arange(int(tokens), dtype=torch.int32, device=device)
+            + int(start_position)
+            + 1
+        )
+
+    @staticmethod
+    def _glm5next_side_caches(
+        banks, *, index_kpool: int, index_head_dim: int, max_seq_len: int
+    ) -> list[dict]:
+        """The two DSA caches NO ``LayerSpec`` declares, one set per sparse layer.
+
+        WHY THE KV MACHINERY DOES NOT ALLOCATE THESE. A sparse-attention layer needs
+        a pooled-key store and a decode tail ring besides its latent cache, and
+        ``get_kv_spec`` reports neither: a ``LayerSpec`` carries one
+        ``num_kv_heads``/``head_size``/``dtype`` triple and both of these are the
+        INDEXER's width, ``index_head_dim``, a different number from the latent
+        width. So the cache manager never sees them and this runner allocates them.
+
+        THE ROW COUNT IS THE INDEXER'S OWN STATED MINIMUM: ``pool_cache`` must leave
+        one trash row above every addressable candidate pool -- "allocate at least
+        ``candidates + 1``" where ``candidates = max_seq_len // index_kpool``
+        (``model_fp8.py:5211-5218``). Passing the longest sequence the engine admits
+        therefore covers every batch that can be scheduled, and a batch's own
+        shorter ``max_seq_len`` rides in the carrier. ``tail`` is ``[2,
+        index_kpool, index_head_dim]``, half 0 keys and half 1 gate scores
+        (``model_fp8.py:4733``).
+
+        BOTH ARE LIVE ACROSS STEPS, which is why the caller allocates them ONCE and
+        keeps them: the decode leg advances the ring in place (``tail.copy_``,
+        ``model_fp8.py:5377``) and the pooled store accumulates the prefill's rows.
+        Re-allocating per step would reset both and lose every pooled key.
+
+        THE DTYPE IS THE LATENT BANK'S, so neither cache adds a second dtype
+        authority; both of the layer's own checks are shape checks and both writes
+        cast on the way in (``model_fp8.py:5385``, ``:5204-5208``).
+        """
+        pool = int(index_kpool)
+        width = int(index_head_dim)
+        if pool <= 0 or width <= 0:
+            raise ValueError(
+                f"index_kpool and index_head_dim must be positive; got "
+                f"{index_kpool!r} and {index_head_dim!r}"
+            )
+        if int(max_seq_len) <= 0:
+            raise ValueError(f"max_seq_len must be positive; got {max_seq_len!r}")
+        rows = int(max_seq_len) // pool + 1
+        side: list[dict] = []
+        for bank in banks:
+            if bank["family"] != "self_attn":
+                side.append({})
+                continue
+            reference = bank["latent_cache"]
+            side.append(
+                {
+                    "pool_cache": torch.zeros(
+                        (rows, width),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                    "tail": torch.zeros(
+                        (2, pool, width),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                }
+            )
+        return side
+
+    def _glm5next_live_side_caches(self, banks) -> list[dict]:
+        """The one live set of side caches for this process, allocated on first use.
+
+        THE ALLOCATION BOUND IS ``max_model_len``, not the batch's own length, for
+        the reason the allocator's docstring gives: the pooled store must outlive
+        the step and cover every sequence the engine admits, while the carrier
+        carries the batch's own ``max_seq_len`` so the indexer's candidate count
+        stays the batch's.
+        """
+        live = getattr(self, "_glm5next_side_cache_set", None)
+        if live is not None and len(live) == len(banks):
+            return live
+        text_config = self.model.text_config
+        live = self._glm5next_side_caches(
+            banks,
+            index_kpool=int(text_config.index_kpool),
+            index_head_dim=int(text_config.index_head_dim),
+            max_seq_len=int(self.max_model_len),
+        )
+        self._glm5next_side_cache_set = live
+        return live
+
+    @classmethod
+    def _glm5next_layer_carriers(
+        cls,
+        banks,
+        side_caches,
+        *,
+        block_ids,
+        state_slot: int,
+        is_prefill: bool,
+        tokens: int,
+        start_position: int,
+        softmax_scale: float,
+        max_seq_len: int,
+        page_size: int,
+        index_kpool: int,
+    ) -> list[dict]:
+        """One mapping per layer, in stack order, each holding THAT layer's own state.
+
+        ``Glm5NextModel.forward`` splats these and refuses a count that disagrees
+        with the stack (``model_fp8.py:6891-6906``), so this walks the banks
+        ``bind_kv_cache`` kept -- the spec's own layer order -- and never names a
+        layer.
+
+        THE KEYS ARE EACH FAMILY'S OWN DECLARED KEYWORDS. A sparse (DSA) layer takes
+        ``latent_cache``, ``pool_cache``, ``seq_lens``, ``start_position``,
+        ``softmax_scale``, ``max_seq_len`` and ``page_size``, plus ``slot_mapping``
+        on the prefill leg or ``tail`` and ``position`` on the decode leg
+        (``model_fp8.py:6583-6598``); a linear (KDA) layer takes ``conv_state``,
+        ``recurrent_state`` and ``is_prefill`` (``:4149``). Which leg is running is
+        the caller's reading of the batch, passed in rather than guessed here.
+
+        ONE SEQUENCE PER CALL, REFUSED RATHER THAN MIS-SLICED. The latent cache a
+        DSA layer takes is one sequence's slots in position order, and
+        ``inc-glm53f-051``'s interface record states that nothing below this point
+        detects a wrong or shared cache set. So the paged bank is sliced by ONE
+        ascending run of blocks and anything else refuses by name: gathering a
+        scattered block table is not this increment's work, and a wrong slice would
+        write this sequence's latents into another sequence's slots.
+
+        THE SCALE IS THE CALLER'S BY THE MODEL'S OWN INSTRUCTION -- "THE SOFTMAX
+        SCALE IS THE CALLER'S, NOT THIS METHOD'S", the registered value being
+        ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``
+        (``model_fp8.py:6854-6860``). It arrives as an argument so this function
+        holds no copy of the constant.
+        """
+        if len(banks) != len(side_caches):
+            raise ValueError(
+                f"{len(banks)} bank(s) against {len(side_caches)} side-cache "
+                f"entry(ies); the two come from one walk and must pair"
+            )
+        ids = [int(value) for value in block_ids]
+        if not ids:
+            raise ValueError(
+                "a GLM-5.3-Flash request needs at least one KV block; the block "
+                "table row handed here is empty"
+            )
+        if any(later - earlier != 1 for earlier, later in zip(ids, ids[1:])):
+            raise ValueError(
+                f"this half slices one sequence out of the paged latent bank by a "
+                f"single ascending run of blocks, and the row handed here is "
+                f"{ids}, which is not one run; gathering scattered blocks is not "
+                f"inc-glm53f-054b's work and a wrong slice would write this "
+                f"sequence's latents into another sequence's slots"
+            )
+        carriers: list[dict] = []
+        for bank, side in zip(banks, side_caches):
+            if bank["family"] != "self_attn":
+                slots = int(bank["state_slots"])
+                if not 0 <= int(state_slot) < slots:
+                    raise ValueError(
+                        f"KV layer '{bank['name']}' holds {slots} recurrent state "
+                        f"slot(s) and this request was given slot "
+                        f"{int(state_slot)}"
+                    )
+                carriers.append(
+                    {
+                        "conv_state": bank["conv_state"][int(state_slot)],
+                        "recurrent_state": bank["recurrent_state"][int(state_slot)],
+                        "is_prefill": bool(is_prefill),
+                    }
+                )
+                continue
+            block_size = int(bank["block_size"])
+            latent = bank["latent_cache"][
+                ids[0] * block_size : (ids[-1] + 1) * block_size
+            ]
+            device = latent.device
+            carrier = {
+                "latent_cache": latent,
+                "pool_cache": side["pool_cache"],
+                "seq_lens": cls._glm5next_row_seq_lens(
+                    tokens=tokens, start_position=start_position, device=device
+                ),
+                "start_position": int(start_position),
+                "softmax_scale": float(softmax_scale),
+                "max_seq_len": int(max_seq_len),
+                "page_size": int(page_size),
+            }
+            if is_prefill:
+                carrier["slot_mapping"] = cls._glm5next_pool_slot_mapping(
+                    tokens=tokens,
+                    start_position=start_position,
+                    index_kpool=index_kpool,
+                    device=device,
+                )
+            else:
+                carrier["tail"] = side["tail"]
+                carrier["position"] = int(start_position)
+            carriers.append(carrier)
+        return carriers
+
+    def _glm5next_model_kwargs(self, kwargs: dict) -> dict:
+        """The generic model kwargs, translated for a carrier-passing model family.
+
+        RETURNS ITS ARGUMENT UNCHANGED unless the loaded model kept cache banks,
+        which only ``Glm5NextForConditionalGeneration.bind_kv_cache`` does. That is
+        what lets all five call sites go through one function: for llama3, qwen3,
+        gpt_oss, qwen3_vl and synthetic this is one ``getattr`` and a return of the
+        same object.
+
+        WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
+        ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
+        three parallelism arguments (``model_fp8.py:7996-8004``), so the generic
+        mapping's ``positions``, ``sampling_params``, ``spec_decode_metadata``,
+        ``rank``, ``logit_mask`` and ``rotary_position_ids`` have no parameter to
+        land on -- they belong to features this campaign has not ported. The batch
+        geometry is READ out of ``attn_metadata`` before it is dropped, and a key
+        this function needs and cannot find refuses by name with what the site did
+        hand it.
+
+        THE LEG IS READ THE FILE'S OWN WAY, ``max_query_len`` against
+        ``decode_token_threshold``, which is the decode test this runner already
+        makes at ``:7051-7054``, so the two cannot disagree.
+
+        THE BLOCK RUN IS DERIVED FROM THE SEQUENCE, not from the row's length: the
+        request holds ``start_position + tokens`` slots, so it occupies that many
+        slots rounded up to whole blocks, and the trailing entries of a padded
+        block-table row are not read.
+        """
+        banks = getattr(self.model, "glm5next_layer_banks", None)
+        if not banks:
+            return kwargs
+        missing = [
+            key
+            for key in ("input_ids", "attn_metadata", "sampling_positions")
+            if key not in kwargs
+        ]
+        if missing:
+            raise ValueError(
+                f"a GLM-5.3-Flash forward needs {missing} to build its per-layer "
+                f"carriers; this call site handed {sorted(kwargs)}"
+            )
+        metadata_map = kwargs["attn_metadata"]
+        if not metadata_map:
+            raise ValueError(
+                "a GLM-5.3-Flash forward needs attention metadata to slice its "
+                "paged latent cache, and this call site handed none"
+            )
+        metadata = next(iter(metadata_map.values()))
+        block_size = int(metadata["block_size"])
+        is_prefill = int(metadata["max_query_len"]) > int(
+            metadata["decode_token_threshold"]
+        )
+        table = metadata["block_table_tensor"]
+        if int(table.shape[0]) != 1:
+            raise ValueError(
+                f"this half threads ONE sequence per forward, because the layers "
+                f"take a single sequence's cache slots (inc-glm53f-051's declared "
+                f"interface); this batch carries {int(table.shape[0])} request(s)"
+            )
+        input_ids = kwargs["input_ids"]
+        tokens = int(input_ids.shape[0])
+        cached = metadata["cached_seq_len"]
+        start_position = (
+            int(cached.reshape(-1)[0]) if torch.is_tensor(cached) else int(cached)
+        )
+        blocks_used = -(-(start_position + tokens) // block_size)
+        row = table[0].reshape(-1)
+        text_config = self.model.text_config
+        carriers = self._glm5next_layer_carriers(
+            banks,
+            self._glm5next_live_side_caches(banks),
+            block_ids=[int(value) for value in row[:blocks_used]],
+            state_slot=int(row[0]),
+            is_prefill=is_prefill,
+            tokens=tokens,
+            start_position=start_position,
+            softmax_scale=float(
+                (
+                    int(text_config.qk_nope_head_dim)
+                    + int(text_config.qk_rope_head_dim)
+                )
+                ** -0.5
+            ),
+            max_seq_len=start_position + tokens,
+            page_size=block_size,
+            index_kpool=int(text_config.index_kpool),
+        )
+        return {
+            "input_ids": input_ids,
+            "layer_carriers": carriers,
+            "sampling_positions": kwargs["sampling_positions"],
+            "block_size": block_size,
+        }
+
 
     def _build_decode_synthetic_inputs(
         self,
@@ -5013,7 +5365,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kwargs["input_ids"].shape[0], self.device
                 )
             )
-        model_output = self.model(**kwargs)
+        model_output = self.model(**self._glm5next_model_kwargs(kwargs))
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -5057,7 +5409,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         kwargs["input_ids"].shape[0], self.device
                     )
                 )
-            model_output = self.model(**kwargs)
+            model_output = self.model(**self._glm5next_model_kwargs(kwargs))
             if self.use_async_scheduling:
                 self._materialize_warmup_output(model_output)
             if self._tensor_replacer is not None:
@@ -7123,7 +7475,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         with self._snapshot_capture_context(positions, spec_decode_metadata):
             with model_forward_context(self.vllm_config):
-                model_output = self.model(**model_kwargs)
+                model_output = self.model(**self._glm5next_model_kwargs(model_kwargs))
         if self._tensor_replacer is not None:
             set_active_context(None)
         if self._target_tensor_capture is not None:
@@ -7806,7 +8158,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Execute model forward pass directly (same as warmup_decode) to
         # match the exact traced graph signature including all kwargs.
         with model_forward_context(self.vllm_config):
-            model_output = self.model(**decode_kwargs)
+            model_output = self.model(**self._glm5next_model_kwargs(decode_kwargs))
         if self.use_async_scheduling:
             # The dummy batch produces no token consumed by anyone; its only
             # purpose is to make this idle DP rank participate in the

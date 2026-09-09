@@ -7949,6 +7949,186 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         return KVSpec(layers=layers)
 
+    def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
+        """Keep the runner's per-layer cache tensors so the runner can name them again.
+
+        THE RUNNER CALLS THIS ON EVERY START-UP AND NOTHING GUARDS THE CALL
+        (``neuron_model_runner.py:8669``, inside ``initialize_kv_cache`` ``:8457``,
+        which the worker runs at ``neuron_worker.py:1101``). Five of the six shipped
+        model families define it; this one did not, so a GLM-5.3-Flash serve raised
+        ``AttributeError`` there before any forward ran. ``inc-glm53f-054b`` adds it
+        at plan revision 276.
+
+        IT IS A MAPPER AND NOTHING ELSE: it allocates no tensor, copies no tensor,
+        runs no math and reads no weight. Every entry it keeps is a VIEW of the
+        runner's own allocation, so a layer that writes its cache writes the
+        runner's paged buffer -- which is what a paged cache requires and the reason
+        the latent view below is taken with ``.view`` and not ``.reshape``: a layout
+        that cannot be viewed raises here instead of silently handing the layers a
+        private copy whose writes are dropped.
+
+        THE KEY IS ``get_kv_spec``'S OWN NAME, asked for rather than rebuilt, so the
+        two cannot drift apart. A layer whose name is absent refuses by name and
+        prints what the dict does hold.
+
+        THE TWO FAMILIES ARE RECOGNISED BY THE FIELDS THE SPEC CARRIES, never by a
+        layer name -- the same test the runner makes at
+        ``neuron_model_runner.py:8720-8726``:
+
+        * a linear-attention (KDA) layer reports the ``kda_*`` geometry, and the
+          runner allocated one ``[state_slots, *shape]`` bank per state, position 0
+          the short convolution and position 1 the recurrent state
+          (``neuron_model_runner.py:8627-8657``);
+        * a sparse-attention (DSA) layer reports none of it, and the runner
+          allocated ``[blocks, num_kv_heads, block_size, head_size]`` for each half
+          of a key/value pair (``:8529-8565``). Only the FIRST half is this
+          attention's latent cache: MLA keeps one latent vector per slot and has no
+          value half to read, which is also why ``num_kv_heads`` is 1
+          (``NUM_LATENT_KV_HEADS``).
+
+        THE LATENT BANK IS ALSO KEPT AS ITS SEQUENCE VIEW, because that is the shape
+        ``Glm5NextDSALayer.forward`` declares: ``[slots, 1, head_size]``, one slot
+        per token in position order. At ONE kv head the paged buffer already has
+        that order -- it is block-major and each block holds ``block_size``
+        consecutive slots, so flattening gives slot ``block * block_size + offset``,
+        exactly the runner's own slot number. At more than one head the flattening
+        would interleave heads, so that case refuses rather than returning a view
+        that looks right and is not.
+
+        THE LAYER MODULES ARE NOT READ, only counted. Every geometry this method
+        needs is already on the spec the model itself produced, so the loop walks
+        the spec and the stack length is checked against it; that keeps this method
+        a mapping of the runner's dict and leaves every per-layer authority where
+        ``inc-glm53f-013`` put it.
+
+        The records land on ``glm5next_layer_banks``, in stack order, one mapping
+        per layer. ``inc-glm53f-054b``'s runner side reads that attribute and builds
+        each layer's carrier from it; nothing else in this tree reads it, and no
+        forward line of this file moves for it. A plain tuple of plain dicts is
+        deliberate: ``nn.Module.__setattr__`` leaves it alone, so ``_apply`` never
+        walks these tensors and the runner stays their only owner.
+
+        Args:
+            kv_caches: the runner's ``layer name -> list of tensors`` mapping,
+                exactly what ``initialize_kv_cache`` returns.
+
+        Raises:
+            ValueError: the spec and the stack disagree on how many layers there
+                are, a layer's spec name is absent from ``kv_caches``, a bank's
+                shape disagrees with the spec that asked for it, a layer reports
+                part of its recurrent geometry, or a latent bank declares more than
+                one KV head.
+        """
+        spec_layers = self.get_kv_spec().layers
+        stack = len(self.model.layers)
+        if len(spec_layers) != stack:
+            raise ValueError(
+                f"get_kv_spec reports {len(spec_layers)} layer(s) and the stack "
+                f"holds {stack}; the carriers are paired positionally, so a "
+                f"disagreement here would hand a layer another layer's cache"
+            )
+        banks: list[dict[str, object]] = []
+        for layer_idx, layer_spec in enumerate(spec_layers):
+            name = layer_spec.name
+            if name not in kv_caches:
+                raise ValueError(
+                    f"kv_caches has no entry for KV layer '{name}', which "
+                    f"get_kv_spec reports at stack position {layer_idx}; the dict "
+                    f"holds {sorted(kv_caches)}"
+                )
+            tensors = list(kv_caches[name])
+            recurrent = (
+                layer_spec.kda_conv_state_shape,
+                layer_spec.kda_recurrent_state_shape,
+            )
+            if all(value is not None for value in recurrent):
+                if len(tensors) != 2:
+                    raise ValueError(
+                        f"KV layer '{name}' reports recurrent geometry, so the "
+                        f"runner allocates exactly two state banks, position 0 the "
+                        f"short convolution and position 1 the recurrent state; "
+                        f"kv_caches holds {len(tensors)} tensor(s)"
+                    )
+                record: dict[str, object] = {
+                    "name": name,
+                    "layer_index": layer_idx,
+                    "family": "linear_attn",
+                }
+                for key, tensor, want in (
+                    ("conv_state", tensors[0], recurrent[0]),
+                    ("recurrent_state", tensors[1], recurrent[1]),
+                ):
+                    if tuple(tensor.shape[1:]) != tuple(want):
+                        raise ValueError(
+                            f"KV layer '{name}' has a {key} bank of "
+                            f"{tuple(tensor.shape)}; the spec asked for one "
+                            f"{tuple(want)} state per slot, so the bank must be "
+                            f"[slots, {', '.join(str(v) for v in want)}]"
+                        )
+                    record[key] = tensor
+                if int(tensors[0].shape[0]) != int(tensors[1].shape[0]):
+                    raise ValueError(
+                        f"KV layer '{name}' has {int(tensors[0].shape[0])} "
+                        f"convolution slot(s) against "
+                        f"{int(tensors[1].shape[0])} recurrent slot(s); the two "
+                        f"states of one request live at one slot number"
+                    )
+                record["state_slots"] = int(tensors[0].shape[0])
+                banks.append(record)
+                continue
+            if any(value is not None for value in recurrent):
+                raise ValueError(
+                    f"KV layer '{name}' reports part of its recurrent geometry "
+                    f"({recurrent}); the two states are paired positionally, so a "
+                    f"missing member would shorten the page the runner allocated"
+                )
+            if not tensors:
+                raise ValueError(
+                    f"KV layer '{name}' has no cache tensor at all; the runner "
+                    f"allocates a key/value pair for a sparse-attention layer "
+                    f"(neuron_model_runner.py:8529-8565)"
+                )
+            bank = tensors[0]
+            if bank.dim() != 4:
+                raise ValueError(
+                    f"KV layer '{name}' has a latent bank of {tuple(bank.shape)}; "
+                    f"the runner allocates [blocks, num_kv_heads, block_size, "
+                    f"head_size] for each half of the pair"
+                )
+            blocks, heads, block_size, width = (int(value) for value in bank.shape)
+            if heads != int(layer_spec.num_kv_heads) or width != int(
+                layer_spec.head_size
+            ):
+                raise ValueError(
+                    f"KV layer '{name}' has a latent bank of {tuple(bank.shape)}, "
+                    f"whose head count and width are ({heads}, {width}); the spec "
+                    f"this model produced asked for "
+                    f"({int(layer_spec.num_kv_heads)}, "
+                    f"{int(layer_spec.head_size)})"
+                )
+            if heads != 1:
+                raise ValueError(
+                    f"KV layer '{name}' declares {heads} KV heads; the sequence "
+                    f"view this method keeps is the paged bank flattened over "
+                    f"blocks and slots, which is that sequence's slot order only "
+                    f"at ONE head -- at more the flattening interleaves heads"
+                )
+            banks.append(
+                {
+                    "name": name,
+                    "layer_index": layer_idx,
+                    "family": "self_attn",
+                    "latent_bank": bank,
+                    "latent_cache": bank.view(blocks * block_size, heads, width),
+                    "blocks": blocks,
+                    "block_size": block_size,
+                    "slots": blocks * block_size,
+                    "head_size": width,
+                }
+            )
+        self.glm5next_layer_banks = tuple(banks)
+
+
     # ── forward ──────────────────────────────────────────────────────────
 
     def _head_weight(self) -> torch.Tensor:
