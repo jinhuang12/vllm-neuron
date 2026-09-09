@@ -351,6 +351,58 @@ class _DeclaredShard:
     require_consumer_block: bool = False
 
 
+#: The value a pad row carries, and no activation on either dense path does.
+#:
+#: `inc-glm53f-026b`. The seam tiles ``M`` over the PSUM partition axis and does
+#: not pad, so it refuses any token count that is not a whole number of
+#: ``TILE_SIZE`` rows and says in its own message that padding is the caller's
+#: (``functional/blockwise_fp8_mm.py:239-245``). A one-token decode step is
+#: exactly that case, so both dense paths pad here and slice the result back
+#: inside the same call. **The refusal itself is not touched**: weakening it
+#: would ship a torch path for kernel-class work, which is what its own
+#: docstring refuses (``blockwise_fp8_mm.py:386-397``, P13 and D6).
+#:
+#: ``-2 ** 15`` is exact in ``bfloat16`` and orders of magnitude outside the
+#: widest pre-activation this path has produced -- ``[67.94, 184.89]`` at
+#: `-033`'s fixture (``increments/probe-R7-clamp-and-config-lift.out``) -- so a
+#: pad row is identifiable by EQUALITY rather than by a tolerance. The value
+#: never reaches a caller: the slice removes every pad row at the single return,
+#: and the acceptance counts that.
+_TOKEN_PAD_SENTINEL = -32768.0
+
+
+def _pad_tokens_to_tile(
+    hidden_states: torch.Tensor, tile: int
+) -> tuple[torch.Tensor, int]:
+    """Grow ``[T, H]`` up to a whole tile of rows. Returns it with the caller's T.
+
+    A token count that is already a whole tile is returned UNCHANGED and pays no
+    copy, so the prefill shape this model has always run keeps its exact bytes.
+
+    A count of zero or less is also returned unchanged, deliberately: the seam
+    refuses it by name and inventing rows for an empty call would replace a clear
+    refusal with a silently different function.
+    """
+    tokens = int(hidden_states.shape[0])
+    if tokens <= 0 or tokens % tile == 0:
+        return hidden_states, tokens
+    pad = hidden_states.new_full(
+        (tile - tokens % tile, int(hidden_states.shape[1])), _TOKEN_PAD_SENTINEL
+    )
+    return torch.cat((hidden_states, pad), dim=0), tokens
+
+
+def _unpad_rows(out: torch.Tensor, tokens: int) -> torch.Tensor:
+    """Give the caller back its own rows. The pad never leaves the call.
+
+    Written as its own function rather than inline so the acceptance can remove
+    exactly this step and nothing else, which is the control the design names.
+    """
+    if int(out.shape[0]) == tokens:
+        return out
+    return out[:tokens]
+
+
 def _kda_head_width(module: nn.Module, world_size: int) -> int:
     """This rank's ``heads * head_dim``, per-rank ALREADY.
 
@@ -2782,10 +2834,12 @@ class Glm5NextSharedExperts(nn.Module):
         says what the omission cost.
 
         Args:
-            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
-                whole number of ``TILE_SIZE`` rows -- the seam tiles ``M`` over
-                the PSUM partition axis and does not pad
-                (``blockwise_fp8_mm.py:239-245``), so padding is the caller's.
+            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` may be any
+                positive count: the seam tiles ``M`` over the PSUM partition axis
+                and does not pad (``blockwise_fp8_mm.py:239-245``), so THIS
+                METHOD pads to a whole ``TILE_SIZE`` and slices the result back
+                before returning (`inc-glm53f-026b`). A ``T`` that is already a
+                whole tile is not copied.
             gate_proj_weight: ``[H, I]`` fp8-e4m3, expressed against
                 ``gate_proj_scale``.
             up_proj_weight: ``[H, I]`` fp8-e4m3.
@@ -2891,6 +2945,14 @@ class Glm5NextSharedExperts(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
+        # ---- PAD TO A WHOLE TILE. `inc-glm53f-026b`. ---------------------- #
+        # The pad is created here, consumed by the three dispatches below and
+        # removed at the single return, so it never leaves this call: nothing
+        # outside can observe it and no state can be advanced by it. The extent
+        # checks above ran on the caller's own tensor, so a mis-shaped operand
+        # still fails on what the caller passed.
+        hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
+
         # ---- The three projection sites. The counted seam entries. ------- #
         # Each passes the operand ``prepare_scale_operands`` built at load time,
         # by keyword (`inc-glm53f-090`). The public grid is still passed too: the
@@ -2964,12 +3026,17 @@ class Glm5NextSharedExperts(nn.Module):
         # cast back to the activation dtype. The cast is named rather than
         # implicit because it is a real precision step and the acceptance's torch
         # reference mirrors it at the same point.
-        # ENTRY 3 of 3 -- down.
-        return blockwise_fp8_mm(
-            activated.to(hidden_states.dtype),
-            down_proj_weight,
-            down_proj_scale,
-            prebuilt_scale_t=self._prepared_scale_operand("down_proj"),
+        # ENTRY 3 of 3 -- down. The slice back is `-026b`'s, and it is the last
+        # thing that happens: the caller receives its own row count, never the
+        # padded one.
+        return _unpad_rows(
+            blockwise_fp8_mm(
+                activated.to(hidden_states.dtype),
+                down_proj_weight,
+                down_proj_scale,
+                prebuilt_scale_t=self._prepared_scale_operand("down_proj"),
+            ),
+            tokens,
         )
 
     # ── the shared expert's forward -- ``inc-glm53f-054a`` item 3 of 7 ────
@@ -3470,11 +3537,12 @@ class Glm5NextDenseMLP(nn.Module):
         and the shared expert alike (DECISIONS §77).
 
         Args:
-            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
-                whole number of ``TILE_SIZE`` rows -- the seam tiles ``M`` over
-                the PSUM partition axis and does not pad
-                (``blockwise_fp8_mm.py:239-245``), so padding is the caller's,
-                exactly as it is for the shared expert.
+            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` may be any
+                positive count: the seam tiles ``M`` over the PSUM partition axis
+                and does not pad (``blockwise_fp8_mm.py:239-245``), so THIS
+                METHOD pads to a whole ``TILE_SIZE`` and slices the result back
+                before returning, exactly as the shared expert does
+                (`inc-glm53f-026b`).
             quant_config: the resolved per-model quantisation policy, and the
                 route selector. An ARGUMENT rather than a field, because that is
                 what all three landed methods of this family do (``:1539``,
@@ -3577,6 +3645,12 @@ class Glm5NextDenseMLP(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
+        # ---- PAD TO A WHOLE TILE. `inc-glm53f-026b`, the same two lines as the
+        # shared expert's and for the same reason: the seam refuses a token count
+        # that is not a whole tile and does not pad, so a one-token decode step
+        # pads here and is sliced back at the single return below.
+        hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
+
         # ---- THE TWO PARALLEL PROJECTIONS. Two entries, two dispatches.
         gate = blockwise_fp8_mm(
             hidden_states, gate_proj_weight, scale_grid("gate_proj_weight")
@@ -3603,11 +3677,15 @@ class Glm5NextDenseMLP(nn.Module):
 
         # ---- THE DOWN PROJECTION re-enters the seam, whose declared input
         # dtype is ``bfloat16`` (``blockwise_fp8_mm.py:446``), so the fp32
-        # intermediate is cast back to the caller's activation dtype here.
-        return blockwise_fp8_mm(
-            activated.to(hidden_states.dtype),
-            down_proj_weight,
-            scale_grid("down_proj_weight"),
+        # intermediate is cast back to the caller's activation dtype here. The
+        # slice back is `-026b`'s and it is the last thing that happens.
+        return _unpad_rows(
+            blockwise_fp8_mm(
+                activated.to(hidden_states.dtype),
+                down_proj_weight,
+                scale_grid("down_proj_weight"),
+            ),
+            tokens,
         )
 
 
@@ -6925,6 +7003,50 @@ class Glm5NextModel(nn.Module):
                 f"{Glm5NextDenseMLP.__name__} or {Glm5NextMoEBlock.__name__} and "
                 f"this forward has no route for anything else"
             )
+
+        # ---- THE ONE ROW-PARALLEL REDUCTION AT THE FFN SITE. ``inc-glm53f-054d``,
+        # and the rider ``inc-glm53f-054a`` left here: the routed bank's, the shared
+        # expert's and the dense MLP's partial sums combine in ONE reduction.
+        #
+        # WHY ALL THREE MEET AT THIS LINE. Every FFN weight family that is declared
+        # row-parallel is declared so on its INTERMEDIATE width (``_SHARD_GEOMETRY``
+        # above: ``down_proj_weight`` for the dense MLP, the shared expert and the
+        # routed bank), so on every route each rank returns a partial sum at the FULL
+        # output width. Both branches above return through the same ``out``, and the
+        # sparse branch's value is already routed-plus-shared (``Glm5NextMoEBlock``
+        # adds them and says so at its own "THE ONE add"), so one reduction here owns
+        # all three. A rank's routed contribution covers only ITS experts and only its
+        # slice of their intermediate width, and the expert-parallel groups partition
+        # the experts, so summing across the whole tensor-parallel world sums each
+        # token's contributions exactly once rather than twice.
+        #
+        # NOTHING ON THIS PATH REDUCED BEFORE. Measured at this pin rather than
+        # assumed: the file's only other collective is ``project_output``'s MLA
+        # ``o_proj`` reduction, ``moe_group`` is forwarded to the MoE branch and read
+        # only by the metadata builder ``build_blockwise_mapping``, and
+        # ``functional/moe/moe_blockwise_fp8.py`` performs no collective at all. What
+        # crosses the wire on the routed path is per-expert token COUNTS, not values.
+        #
+        # THE GROUP, THE FORM AND THE PLACE ARE ``inc-glm53f-100``'s, not a second
+        # convention: :func:`_resolve_tp_group` returns ``None`` at world size 1, so a
+        # single-rank run takes exactly the path it took before this increment -- no
+        # collective and no vllm import -- and ``all_reduce`` is called as a statement
+        # whose return is discarded, the form all 18 shipped row-parallel sites use.
+        #
+        # BEFORE THE CAST, and that ordering is the load-bearing part. ``out`` is the
+        # seam's own dtype here (fp32 on the dense route), so the partial sums are
+        # added at the width they were computed in; reducing after the cast on line
+        # below would round each rank's fraction to the caller's dtype and add the
+        # rounded parts instead of rounding the whole.
+        #
+        # IN-PLACE IS SAFE AGAINST ALIASING for the same reason it is at
+        # ``project_output``: both branches return a freshly allocated tensor -- the
+        # dense route returns the seam's output and the sparse route returns the sum
+        # of two seam outputs -- so neither is a view of a cached weight or of the
+        # residual the caller still holds.
+        group = _resolve_tp_group()
+        if group is not None:
+            group.all_reduce(out)
         return out.to(hidden_states.dtype)
 
     def forward(
