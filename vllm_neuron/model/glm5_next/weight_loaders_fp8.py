@@ -1113,7 +1113,8 @@ class BlockScaleCompensation:
 
 
 def compensate_block_scales(scale_inv: torch.Tensor) -> BlockScaleCompensation:
-    """Multiply a block scale grid by 448/240 and floor it at :data:`MINVAL`.
+    """Multiply a block scale grid by :data:`_FP8_SCALE_COMPENSATION` and floor it at
+    :data:`MINVAL`.
 
     Conditional on :func:`needs_240_downscale`, and the floor travels with the
     compensation rather than standing alone: the floor exists to keep the grid

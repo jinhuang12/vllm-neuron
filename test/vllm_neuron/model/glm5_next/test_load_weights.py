@@ -3317,8 +3317,10 @@ def _shard_pattern(
     distinct finite value per index with no rounding at all.
 
     THE BYTE RANGE IS 8 TO 126, AND BOTH ENDS ARE CHOSEN. Bytes 1 to 7 are
-    subnormal, where the 240/448 squeeze rounds several distinct bytes onto one
-    value and weakens what conjunct (2) can detect; bytes 127 and 255 are ``NaN``
+    subnormal, where the squeeze rounds distinct bytes onto one value and weakens
+    what conjunct (2) can detect -- at 240/448 that was several of them, and at the
+    exact ``x 1/2`` of ``inc-glm53f-054e`` it is worse for the smallest, which
+    halves onto a tie and lands on zero; bytes 127 and 255 are ``NaN``
     in ``e4m3fn``, which no equality comparison survives. That leaves 119 values,
     so index ``i`` and ``i + 119`` share one -- the single aliasing this pattern
     has, stated rather than left to be discovered. Rank 0's first row (byte 8) and
@@ -5219,10 +5221,13 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
 
     "ONES" IN THE NAME IS THE CHECKPOINT'S PAD VALUE, NOT THE STORED ONE. The pad
     grid is written as 1.0 and ``inc-glm53f-054c`` makes the load path compensate
-    every block by 448/240, so the stored reading is that factor and 1.0 is now the
-    control. The name is kept because filed records cite it. Twice the factor,
-    3.4844, would mean the sharded route compensated a grid that a loader had
-    already compensated, so this line is also that double's only reader.
+    every block by the compensation factor -- ``448/240`` then, an exact ``2.0`` since
+    ``inc-glm53f-054e`` -- so the stored reading is that factor and 1.0 is now the
+    control. The name is kept because filed records cite it. TWICE the factor (3.4844
+    then, 4.0 now) would mean the sharded route compensated a grid that a loader had
+    already compensated, so this line is also that double's only reader. Neither number
+    is written here: the assertion reads the factor from
+    ``compensate_block_scales`` itself, so it follows the constant with no edit.
 
     WHY THE DENSE THREE ARE THE SUBJECT. At world 4 the dense intermediate 512 pads
     to 1024, so ranks 2 and 3 hold no real row at all -- the strongest form of the
@@ -5494,18 +5499,22 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         load path from the broken one (DECISIONS §706-§707).
 
         WHY THE REFERENCE STILL CARRIES THE SQUEEZE, rather than being the raw
-        checkpoint numbers. ``downscale_fp8_weight_bytes`` multiplies by 240/448 and
-        casts BACK to fp8, so it re-quantises: the squeezed bytes are not
-        ``w * 240/448`` exactly. A raw-checkpoint reference is therefore unreachable at
-        the EXACT equality this reading asserts, and loosening that equality to a
-        tolerance would give up the bit-exactness that makes the pad readings worth
-        having. The un-squeezed comparison belongs where a tolerance is honest and is
+        checkpoint numbers. ``downscale_fp8_weight_bytes`` casts BACK to fp8, so it can
+        re-quantise. At 240/448 it re-quantised nearly every byte, so the squeezed bytes
+        were not ``w * 240/448`` exactly and a raw-checkpoint reference was unreachable
+        at the EXACT equality this reading asserts.
+        ``inc-glm53f-054e`` NARROWED THAT TO FOUR BYTES AND DID NOT REMOVE IT: an exact
+        ``x 1/2`` is a pure exponent shift, so of the 119 bytes this fixture uses only
+        bytes 9, 11, 13 and 15 -- the odd multiples of ``2**-9`` above the subnormals --
+        still re-quantise. Four is enough: a raw-checkpoint reference would break on
+        them, and loosening this equality to a tolerance would give up the
+        bit-exactness that makes the pad readings worth having. The un-squeezed comparison belongs where a tolerance is honest and is
         made there instead, over the real loader and the real prep, in
         ``test_scale_compensation_054c.py``.
 
         The history is kept because it is the same defect twice, in opposite
         directions. The FIRST version of this reference compensated, the instrument
-        caught a ratio of exactly ``(448/240) ** 3`` -- one factor per leaf --
+        caught a ratio of exactly the compensation cubed -- one factor per leaf --
         (``probe-101-r11c-pad-repair.out``) and the reference was changed to match the
         product. The product was the thing that was wrong.
         """
@@ -5554,7 +5563,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     for leaf, (raw_diff, uncompensated_diff) in conventions.items():
         assert uncompensated_diff != 0.0, (
             f"{leaf} matches the UNCOMPENSATED form as well as the paired one, so the "
-            f"448/240 compensation is not reaching this grid and this item cannot tell "
+            f"compensation is not reaching this grid and this item cannot tell "
             f"the fixed load path from the pre-inc-glm53f-054c one"
         )
         assert raw_diff == 0.0, (

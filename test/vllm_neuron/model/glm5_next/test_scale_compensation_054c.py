@@ -1,20 +1,22 @@
-"""``inc-glm53f-054c``: the dense and shared scale grids are compensated by 448/240 exactly once.
+"""``inc-glm53f-054c``: the dense and shared scale grids are compensated exactly once.
 
 WHAT THIS MEASURES, AND WHY IT STARTS FROM CHECKPOINT BYTES. The trn2 load is a matched pair -- squeeze
 the weight BYTES into the 240 range, multiply the per-block scale grid by the inverse factor -- and before
 this increment only the first half ran for the dense MLP and the shared expert. Their grids are attached
-out-of-band and raw, so the product the kernel multiplied was ``240/448`` of the checkpoint's numbers.
+out-of-band and raw, so the product the kernel multiplied was the SQUEEZE FACTOR times the checkpoint's
+numbers -- ``240/448`` when this file was written, an exact ``1/2`` since ``inc-glm53f-054e``.
 A test that hands the seam PREPARED operands cannot see that, because the defect lives in the step that
 turns checkpoint-format tensors into prepared ones. So every reading here starts from fp8-e4m3fn bytes and
 a ``128``-tile grid and drives the real loader and the real prep.
 
 THE REFERENCE IS THE CHECKPOINT'S OWN NUMBERS, NOT THE LOAD PATH'S. It dequantises the RAW bytes against
 the RAW grid: no squeeze, no compensation. The landed reference in ``test_load_weights.py`` applies the
-squeeze to its own reference, which makes both sides carry ``240/448`` and agrees with the defect -- that
+squeeze to its own reference, which makes both sides carry the factor and agrees with the defect -- that
 one is corrected under this increment, and this file states the convention it should have had.
 
 THE CONTROL RUNS IN BOTH DIRECTIONS, and each arm asserts the NUMBER it expects. A missing multiply reads
-``240/448 = 0.5357143`` per projection; a doubled one reads its square. An arm that only required "some
+``0.5`` per projection since ``-054e`` (it was ``240/448 = 0.5357143``); a doubled one reads ``2.0``. An
+arm that only required "some
 failure" would be satisfied by an unrelated breakage.
 
 VACUITY IS THE REAL RISK HERE. ``needs_240_downscale()`` resolves the clamp maximum AT IMPORT TIME and
@@ -47,12 +49,27 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     needs_240_downscale,
 )
 
-#: The two magnitudes the pair is built from, read off the loader rather than typed here.
+#: The two magnitudes the pair is built from -- the legacy and OCP e4m3 maxima.
 FP8_E4M3_MAX = 240.0
 FP8_E4M3FN_MAX = 448.0
+
 #: What a MISSING compensation costs, per projection and through one MLP.
-SQUEEZE = FP8_E4M3_MAX / FP8_E4M3FN_MAX          # 0.5357142857142857
-MLP_SQUEEZE = SQUEEZE**3                          # 0.1537445335276968
+#:
+#: ``inc-glm53f-054e`` made the squeeze the largest POWER OF TWO that fits 448 inside 240
+#: rather than the ratio of the two, so this is 0.5 and not 240/448. It is written as the
+#: literal it is: the ratio would be the wrong relation, and the load path's own constant is
+#: pinned against the same literal in ``test_weight_loaders.py``.
+#:
+#: WHICH COMPARISONS BECOME EXACT. ``x 1/2`` is a pure exponent shift, so every fp8 value at
+#: or above ``2**-5`` survives the round trip bit-exactly; the eight that do not are the odd
+#: multiples of ``2**-9``. :func:`_ratio` is a ratio of SUMS weighted by magnitude, so those
+#: eight contribute essentially nothing and every reading below becomes exact up to fp32
+#: summation noise, where at 240/448 the same statistic sat about 1.4% high. THE BANDS ARE
+#: NOT RE-TUNED for that -- a band is not this file's to move, and gaining margin is not a
+#: reason to touch one. The exact-element count is PRINTED instead, so the gain is visible
+#: in the transcript rather than folded into a tolerance.
+SQUEEZE = 0.5                                     # was FP8_E4M3_MAX / FP8_E4M3FN_MAX
+MLP_SQUEEZE = SQUEEZE**3                          # 0.125, was 0.1537445335276968
 
 BLOCK = 256
 TILE = 128
@@ -83,7 +100,7 @@ def _the_gate_is_engaged() -> None:
     if not needs_240_downscale():
         pytest.fail(
             "VACUOUS RUN REFUSED: needs_240_downscale() is False, so the 240 squeeze and "
-            "the 448/240 compensation are both no-ops and every reading in this file "
+            "the compensation are both no-ops and every reading in this file "
             "would pass without measuring anything -- the controls included. The clamp "
             "maximum is resolved at IMPORT time, so this cannot be fixed from a fixture. "
             "Re-run with NEURON_PLATFORM_TARGET_OVERRIDE=trn2 in the process invocation."
@@ -226,10 +243,15 @@ def test_the_effective_matrix_matches_the_checkpoint_not_the_squeezed_copy(kind)
         want = _reference_matrix(raw_bytes, raw_grid)
         got = _effective_matrix(module, weight_name, grid_name)
         ratio = _ratio(got, want)
+        exact = int(torch.eq(got, want).sum())
         print(f"S054C|{kind}|{leaf}|EFFECTIVE_OVER_CHECKPOINT|{ratio:.7f}")
+        print(
+            f"S054C|{kind}|{leaf}|ELEMENTS_BIT_EXACT|{exact}/{want.numel()}"
+            f"|gated_on_none|118 of the 126 fp8 magnitudes can match at x 1/2, 14 at 240/448"
+        )
         assert ratio == pytest.approx(1.0, rel=0.02), (
             f"{kind} {leaf}: the effective matrix is {ratio:.7f} of the checkpoint's. "
-            f"A missing 448/240 compensation reads {SQUEEZE:.7f}"
+            f"A missing compensation reads {SQUEEZE:.7f}"
         )
 
 
@@ -330,7 +352,7 @@ def test_one_mlp_output_carries_no_leftover_squeeze() -> None:
     """y = down @ ((gate @ x) * (up @ x)), the load path against the checkpoint.
 
     Three projections means the missing factor would appear three times, which is the
-    ``(240/448)**3`` the landed test's own docstring recorded as ``(448/240)**3`` in the
+    ``SQUEEZE**3`` the landed test's own docstring recorded as its inverse in the
     other direction. Computed from the effective matrices rather than by running the
     kernel: this increment corrects a LOAD-path value and owes no kernel dispatch.
     """

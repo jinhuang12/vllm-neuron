@@ -7008,10 +7008,13 @@ def _publish_compute_frame_operands(
 
     THREE STEPS, INDEPENDENT, IN THIS ORDER.
 
-    1. Compensate the checkpoint's scale grid by ``448/240``, once
+    1. Compensate the checkpoint's scale grid by the compensation factor, once
        (``inc-glm53f-054c``). The loader squeezed the weight BYTES into the 240
        range and attached these grids RAW, so without this step the product
-       reaching the kernel is ``240/448`` of the checkpoint's. NEVER skipped and
+       reaching the kernel is the SQUEEZE FACTOR times the checkpoint's -- ``240/448``
+       when this step was written, an exact ``1/2`` since ``inc-glm53f-054e``. The
+       factor is read from ``compensate_block_scales``, never written here. NEVER
+       skipped and
        never conditional on extents -- the compensator's own platform gate decides
        whether the multiply happens, and on a platform that needs no squeeze it is
        a no-op that still reports.
@@ -7092,12 +7095,13 @@ def _publish_compute_frame_operands(
         rows, cols = int(weight.shape[0]), int(weight.shape[1])
         record: dict[str, object] = {"loader_frame": (rows, cols)}
 
-        # ---- THE 448/240 SCALE COMPENSATION, EXACTLY ONCE PER GRID (``inc-glm53f-054c``).
+        # ---- THE SCALE COMPENSATION, EXACTLY ONCE PER GRID (``inc-glm53f-054c``).
         # The weight BYTES arrive already squeezed into the 240 range by the loader
         # (``weight_loaders_fp8.py:2250`` -> ``:1346`` -> ``:1174``), while this file
         # attached their scale GRIDS raw (``:7734``/``:7743``). Only half a matched pair
-        # ran, so the product the kernel multiplied was 240/448 = 53.5714% of the
-        # checkpoint's. The loader's own module header states the pair -- squeeze the
+        # ran, so the product the kernel multiplied was the squeeze factor times the
+        # checkpoint's -- 240/448 = 53.5714% when this was written, an exact 50% since
+        # ``inc-glm53f-054e``. The loader's own module header states the pair -- squeeze the
         # bytes AND compensate the per-block scale by the inverse factor -- and
         # ``sharded_scale_grid_loader``'s docstring names THIS prep as the consumer that
         # owes the second half. Nothing did it: the file held zero calls to it.

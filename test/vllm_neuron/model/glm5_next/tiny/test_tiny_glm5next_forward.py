@@ -621,12 +621,13 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
     cannot share an off-by-one with it (``test_moe_path.py:677-699``'s reason).
 
     IT APPLIES THE trn2 PAIR ONCE, ASKED RATHER THAN RETYPED. On a 240-clamp
-    platform the store is a matched pair -- the bytes are squeezed by 240/448 and
-    the grid is compensated by 448/240 -- so a reference that applied neither
-    would disagree with a correct product by 448/240, and one that applied only
-    the squeeze would disagree by the same factor the other way. Both halves come
-    from the loader's own functions, never a constant copied into this file, so a
-    change to the factor moves this reference with it. On a platform where the
+    platform the store is a matched pair -- the bytes are squeezed and the grid is
+    compensated by the exact inverse -- so a reference that applied neither would
+    disagree with a correct product by that factor, and one that applied only the
+    squeeze would disagree by the same factor the other way. Both halves come from
+    the loader's own functions, never a constant copied into this file, so a change
+    to the factor moves this reference with it: ``inc-glm53f-054e`` moved it from
+    ``240/448`` to an exact ``1/2`` and not a line here changed. On a platform where the
     clamp is 448 both calls are no-ops and this is the arithmetic it always was.
 
     WHAT IT DELIBERATELY DOES NOT MEASURE. The squeeze re-quantises through fp8,
@@ -680,10 +681,12 @@ def _attach(
     not a parameter, which is the arrangement ``_scale_prep_leaves`` documents.
 
     IT BINDS WHAT THE LOADER DELIVERS, WHICH IS A PAIR. On a 240-clamp platform a
-    real load squeezes the bytes by 240/448 and compensates the grid by 448/240,
-    so binding the checkpoint's own bytes beside the checkpoint's own grid is not
-    a load at all -- it is half of one, and a forward built on it disagrees with a
-    correct product by 448/240. The bytes are therefore always squeezed here.
+    real load squeezes the bytes and compensates the grid by the exact inverse, so
+    binding the checkpoint's own bytes beside the checkpoint's own grid is not a load
+    at all -- it is half of one, and a forward built on it disagrees with a correct
+    product by that factor. The bytes are therefore always squeezed here. The factor
+    itself is never named in this file, which is why ``inc-glm53f-054e`` moving it to
+    an exact ``1/2`` left this argument untouched.
 
     ``prep_will_compensate`` IS ABOUT WHERE THE OTHER HALF COMES FROM, NOT WHETHER.
     A module whose test then calls ``retile_checkpoint_scale_grids`` gets its grid
