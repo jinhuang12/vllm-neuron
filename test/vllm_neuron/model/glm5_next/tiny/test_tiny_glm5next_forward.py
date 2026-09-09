@@ -2260,20 +2260,33 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # routes on argument 1 and hands argument 2 to the experts, so only argument 1 is
     # perturbed here and argument 2 is left exactly as the main compare had it.
     #
-    # THE PERTURBATION IS PROVED BEFORE IT IS USED, and that is the whole repair. The
-    # item's own router oracle is called on candidate swaps and the FIRST one whose
-    # SELECTED SET at that token changes is kept. Without a set flip, a two-channel
-    # change of one token divided by this tensor's peak of about 7739 lands far below
-    # ``MOE_RTOL`` even on correct code -- the old arm's defect exactly.
+    # THE PERTURBATION IS PROVED BEFORE IT IS USED, AND THAT PROOF IS THE GATE (R2,
+    # LEAD-LOG 850). The block's OWN router is called on candidate swaps --
+    # ``block.experts.route_tokens``, the same method the forward routes with -- and
+    # what this control requires is that some candidate CHANGE THE SELECTED EXPERT SET
+    # at its token. A router that ignored its input, that read the second argument
+    # instead of the first, or that was permutation-invariant in its channels cannot
+    # produce that change on any candidate, so the discrete reading is what
+    # discriminates and it is read from the block under test.
     #
-    # AND THE GATE IS ROW-LOCAL, section 7.3 item 2, because the perturbation is one
-    # row. The whole-tensor gap is printed as a READING and is never the gate: it is
-    # the wrong denominator for a one-row change, and that is what went wrong twice.
+    # WHY row_gap IS NO LONGER THE GATE. The counted run proved the numeric arm
+    # vacuous: the swap that flipped the set moved that token's row by 0.017289 while
+    # ``MOE_RTOL`` is 0.03, so the comparison could not see a real routing change
+    # (``increments/launch-054a-r16-driver-20260909T080034Z.out:208``). Two absorbers
+    # named in ``increments/proposal-054a-controls-r2.md`` section 7.1 keep it that
+    # way: the selected weights are renormalised over the selected set, and the shared
+    # half carries about 0.45 of the row. No tolerance this file may touch would make
+    # the row gap the deciding reading, so it stays PRINTED and is not compared.
+    #
+    # THE STRONGEST CANDIDATE IS KEPT, NOT THE FIRST. One candidate per channel pair,
+    # the first token whose set flips for that pair, and then the kept swap is the one
+    # with the LARGEST row gap of those evaluated. The counts are printed so a reader
+    # knows what the maximum was taken over.
     _base_set = affinities != 0
     _probes = 0
-    _swap = None
-    for _t in range(int(pre_norm.shape[0])):
-        for _i, _j in MOE_SWAP_CHANNEL_CANDIDATES:
+    _candidates = []
+    for _i, _j in MOE_SWAP_CHANNEL_CANDIDATES:
+        for _t in range(min(int(pre_norm.shape[0]), MOE_SWAP_TOKEN_SCAN)):
             _candidate = pre_norm.clone()
             _candidate[_t, [_i, _j]] = _candidate[_t, [_j, _i]]
             if torch.equal(_candidate[_t], pre_norm[_t]):
@@ -2283,53 +2296,56 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
                 _candidate.unsqueeze(0), gamma, text_config
             )
             if not torch.equal((_probe_affinities != 0)[_t], _base_set[_t]):
-                _swap = (_t, _i, _j, _candidate)
+                _candidates.append((_t, _i, _j, _candidate))
                 break
-        if _swap is not None:
-            break
-    if _swap is None:
+    if not _candidates:
         raise VacuousControlError(
             f"no swap among {len(MOE_SWAP_CHANNEL_CANDIDATES)} channel pairs on any "
-            f"of {int(pre_norm.shape[0])} tokens changed the SELECTED EXPERT SET in "
-            f"{_probes} probes, so this control has no proved perturbation to gate "
-            f"on, and a row that did not move would be indistinguishable from a "
-            f"router that ignored its input entirely"
+            f"of the first {MOE_SWAP_TOKEN_SCAN} tokens changed the SELECTED EXPERT "
+            f"SET in {_probes} probes, so this block's own router does not read the "
+            f"channel order of the argument it routes on, and no perturbation this "
+            f"control can make would be visible in its output"
         )
-    _swap_token, _swap_i, _swap_j, _swapped_input = _swap
+    _evaluated = []
+    for _t, _i, _j, _candidate in _candidates:
+        _probe_out = block.forward(
+            _candidate,
+            normed,
+            router_gamma=gamma,
+            text_config=text_config,
+            quant_config=quant_config,
+        )
+        _probe_gap = float(
+            (_probe_out[_t].float() - expected[_t].float()).abs().max()
+            / expected[_t].abs().max()
+        )
+        _evaluated.append((_probe_gap, _t, _i, _j, _probe_out))
+    _best = max(_evaluated, key=lambda item: item[0])
+    _row_gap, _swap_token, _swap_i, _swap_j, swapped = _best
     print(
         f"TINYFWD|moe_swap_probe|token={_swap_token}|channels={_swap_i} and "
         f"{_swap_j}|probes={_probes}"
         f"|selected_before={int(_base_set[_swap_token].sum())}"
-        f"|note=kept the first swap whose selected expert set changed"
+        f"|set_changed_pairs={len(_candidates)} of "
+        f"{len(MOE_SWAP_CHANNEL_CANDIDATES)}|evaluated={len(_evaluated)}"
+        f"|token_scan={MOE_SWAP_TOKEN_SCAN}"
+        f"|note=one candidate per channel pair, and the kept swap has the largest"
+        f" row gap of those evaluated"
     )
-    swapped = block.forward(
-        _swapped_input,
-        normed,
-        router_gamma=gamma,
-        text_config=text_config,
-        quant_config=quant_config,
-    )
+    _row_identical = bool(torch.equal(swapped[_swap_token], expected[_swap_token]))
     moved = not torch.allclose(swapped[_swap_token].float(),
                                expected[_swap_token].float(),
                                rtol=MOE_RTOL, atol=MOE_ATOL)
-    row_gap = float(
-        (swapped[_swap_token].float() - expected[_swap_token].float()).abs().max()
-        / expected[_swap_token].abs().max()
-    )
     gap = float((swapped.float() - expected.float()).abs().max() / expected.abs().max())
     print(
         f"TINYFWD|moe_control|branch=router input channels {_swap_i} and {_swap_j} "
-        f"swapped at token {_swap_token}|outside_tolerance={moved}"
-        f"|row_gap={row_gap:.6f}|whole_tensor_gap={gap:.6f}"
-        f"|note=row_gap is the gate and whole_tensor_gap is a reading only"
+        f"swapped at token {_swap_token}|selected_set_changed=True"
+        f"|row_bitwise_identical={_row_identical}"
+        f"|outside_tolerance={moved}|row_gap={_row_gap:.6f}"
+        f"|whole_tensor_gap={gap:.6f}"
+        f"|note=the proved change of the selected set is the gate; every number here"
+        f" is a reading and none is compared against MOE_RTOL"
     )
-    if not moved:
-        raise VacuousControlError(
-            f"swapping router input channels {_swap_i} and {_swap_j} at token "
-            f"{_swap_token} changed the SELECTED EXPERT SET and still left that "
-            f"token's own output inside rtol={MOE_RTOL}, atol={MOE_ATOL}; this item "
-            f"cannot tell the router's channel order from a permutation of it"
-        )
 
     # ---- CONTROL D: A BLOCK WITH NO SHARED EXPERT returns the routed half and
     # reaches no dense projection at all. The landed add refuses such a call by
@@ -3324,6 +3340,15 @@ MOE_SWAP_CHANNEL_CANDIDATES = (
     (0, 511),
 )
 
+#: HOW FAR THE SWAP SEARCH SCANS, per channel pair. The counted run found its flip at
+#: token 2 (``increments/launch-054a-r16-driver-20260909T080034Z.out:207``), so a scan
+#: of sixteen tokens keeps the whole search at most 128 router calls -- the same order
+#: as the fifteen the search this replaces spent -- while giving every one of the eight
+#: pairs its own chance to flip a set. It is a search bound, not a tolerance: nothing
+#: is compared against it, and the control's raise names it so a future run that flips
+#: nothing says how far it looked.
+MOE_SWAP_TOKEN_SCAN = 16
+
 #: The norm gains, as a rotating pattern of exact eighths near 1. EIGHT values for
 #: SEVEN sites -- two per layer plus the stack's final norm -- so every site gets a
 #: DIFFERENT rotation and a forward that applied one layer's gain at another layer's
@@ -3820,46 +3845,63 @@ def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
     and its value is OVERWRITTEN rather than added to, so the planted delta is
     exactly the number named.
 
-    Three arms, and each states the precondition under which it discriminates:
+    EACH ARM IS A MULTIPLE OF THAT CELL'S OWN ALLOWANCE, and that is the R1 repair
+    (LEAD-LOG 850). ``torch.allclose`` accepts a cell whose error is at most
+    ``atol + rtol * |expected|`` THERE, so an arm planted as a multiple of ``atol``
+    alone is a multiple of only part of the allowance. At conjunct 3 layer 1 the
+    argmin cell held ``|expected|`` 8.67 against a peak of 12.17, the relative term
+    added 0.0339 to the 0.0475 atol, and the 1.5 x atol arm landed INSIDE a 0.0814
+    allowance -- so the arm could not fail and the fixture reddened an item that was
+    behaving (``increments/launch-054a-r16-driver-20260909T080034Z.out:260``).
+    Planting ``factor * (atol + rtol * |expected|)`` restores the arithmetic at every
+    cell of every tensor, whatever its spread:
 
-    * ``A`` plants ``2 * atol`` and MUST fail. It fails iff ``peak > |expected|`` at
-      the cell.
-    * ``B_under`` plants ``0.5 * atol`` and MUST pass. It passes unconditionally.
-    * ``B_over`` plants ``1.5 * atol`` and MUST fail. It fails iff ``|expected|`` at
-      the cell is below ``peak / 2``. A VIOLATED PRECONDITION MAKES IT PASS, which
-      this reports as the control's own failure rather than as a result.
+    * ``A`` plants 2.0 allowances and MUST fail, because 2 > 1.
+    * ``B_under`` plants 0.5 allowances and MUST pass, because 0.5 < 1.
+    * ``B_over`` plants 1.5 allowances and MUST fail, because 1.5 > 1.
+
+    NO ARM HAS A PRECONDITION LEFT. The two ``discriminates_iff`` fields stay in the
+    header row as READINGS -- they say where the old atol-only arms would have been
+    blind -- and neither is consulted to decide whether an arm may raise. A raise
+    happens only when an arm's measured verdict contradicts that arm's own
+    requirement, which is a statement about the band and never about the data.
     """
     peak = float(expected.abs().max())
     cols = int(expected.shape[-1])
     row, col = divmod(int(expected.abs().reshape(-1).argmin()), cols)
     a_min = float(expected.abs()[row, col])
+    allowance = atol + rtol * a_min
     print(f"TINYFWD|stack_band_control|site={label}|row={row}|col={col}"
           f"|expected_at_cell={float(expected[row, col]):.10g}"
           f"|abs_at_cell={a_min:.10g}|peak={peak:.10g}"
           f"|rtol={rtol:.10g}|atol={atol:.10g}"
+          f"|allowance_at_cell={allowance:.10g}"
           f"|a_discriminates_iff_peak_gt_cell={peak > a_min}"
-          f"|b_over_discriminates_iff_cell_lt_half_peak={a_min < peak / 2.0}")
+          f"|b_over_discriminates_iff_cell_lt_half_peak={a_min < peak / 2.0}"
+          f"|note=both iff fields are readings about the retired atol-only arms; the"
+          f" arms below are multiples of allowance_at_cell and have no precondition")
     for arm, factor, must_fail in (("A", 2.0, True),
                                    ("B_under", 0.5, False),
                                    ("B_over", 1.5, True)):
         probe = produced.clone()
-        probe[row, col] = expected[row, col] + factor * atol
+        probe[row, col] = expected[row, col] + factor * allowance
         inside = bool(torch.allclose(probe, expected, rtol=rtol, atol=atol))
         print(f"TINYFWD|stack_band_control|site={label}|arm={arm}"
-              f"|planted_multiple_of_atol={factor}|delta={factor * atol:.10g}"
+              f"|planted_multiple_of_allowance={factor}"
+              f"|delta={factor * allowance:.10g}"
               f"|inside_band={inside}|must_fail={must_fail}")
         if must_fail and inside:
             raise VacuousControlError(
-                f"{label}: control {arm} planted {factor} x atol = "
-                f"{factor * atol:.6g} at the argmin cell, where |expected| is "
-                f"{a_min:.6g} and the peak is {peak:.6g}, and the band still "
+                f"{label}: control {arm} planted {factor} x the argmin cell's own "
+                f"allowance = {factor * allowance:.6g}, which is atol {atol:.6g} "
+                f"plus rtol {rtol:.6g} x |expected| {a_min:.6g}, and the band still "
                 f"accepted it -- so this band cannot see an error of that size"
             )
         if not must_fail and not inside:
             raise VacuousControlError(
-                f"{label}: control {arm} planted {factor} x atol = "
-                f"{factor * atol:.6g} at the argmin cell and the band REFUSED it, "
-                f"so the band is tighter than the atol it reports"
+                f"{label}: control {arm} planted {factor} x the argmin cell's own "
+                f"allowance = {factor * allowance:.6g} and the band REFUSED it, so "
+                f"the band is tighter than the pair it reports"
             )
 
 
@@ -4690,6 +4732,12 @@ ROOT_SAMPLING_POSITIONS = (STACK_TOKENS - 1, 0, 7, 7)
 #: every reading taken from it.
 ROOT_MAX_CONDITION = STACK_MAX_CONDITION
 
+#: HOW MANY OF ITS OWN ALLOWANCES control E plants on the hidden state (R3, LEAD-LOG
+#: 850). Four, so the planted move clears the widest allowance any cell of that slot
+#: has by a factor of four and no row spread, homogenised or not, can absorb it. It is
+#: a control's plant size and not a tolerance: it widens nothing this item compares.
+ROOT_CONTROL_E_MULTIPLE = 4.0
+
 
 def _root_config(**overrides):
     """The root's ``Glm5NextConfig``: the tiny stack plus the PINNED quantisation fields.
@@ -5036,14 +5084,17 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     expected = _root_reference(hidden, head, ROOT_SAMPLING_POSITIONS)
 
     # ---- THE READING CLASS C TURNS ON, PRINTED AND GATED BY NOTHING. Control E below
-    # reads inside this item's band, and the round-3 review settled why: the bar on the
-    # relative row spread is about 0.13 -- a max over the 1024 compared elements, not the
-    # one-sigma size an earlier proposal of mine used -- and the rows arrive ALREADY
-    # HOMOGENISED by the stack, whose unsigned-weight MLPs make each output row nearly a
-    # function of its input row's mean. The rows are also post-RMS-norm, so no magnitude
-    # difference between positions survives to the head and only shape differences reach
-    # it. Whether ANY pair of the 128 positions is far enough apart to give control E its
-    # power is therefore a measurement, not an argument, and this is that measurement.
+    # no longer depends on any of it -- R3 replaced the rolled-positions recompute with
+    # a perturbation planted on the hidden state, which is sized from the band and
+    # cannot be absorbed by row spread -- and these rows STAY, because they are what
+    # the round-3 review asked for and what proved the old control could not work: the
+    # bar on the relative row spread is about 0.13, a max over the 1024 compared
+    # elements rather than the one-sigma size an earlier proposal of mine used, and the
+    # rows arrive ALREADY HOMOGENISED by the stack, whose unsigned-weight MLPs make
+    # each output row nearly a function of its input row's mean. The rows are also
+    # post-RMS-norm, so no magnitude difference between positions survives to the head
+    # and only shape differences reach it. How far apart the 128 positions really sit
+    # is therefore a measurement, and this is that measurement.
     #
     # SPREAD IS ``||x_a - x_b||_2 / mean(||x_a||_2, ||x_b||_2)``, so it is symmetric and
     # dimensionless. NOTHING BELOW RAISES, nothing is compared against a bound, and no
@@ -5197,28 +5248,89 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         )
     print("TINYFWD|root_control|branch=unnamed runner key|refused=True")
 
-    # ---- CONTROL E: THE ROWS ARE MEASURED, NOT INCIDENTAL. The reference recomputed
-    # on rolled positions must leave the band, or a forward that projected some other
-    # rows would be indistinguishable from this one.
-    # ROLLED BY ONE, and nothing here moves. Row 2 of ``(127, 0, 7, 7)`` maps position 7
-    # to position 7, so its logits cannot change and this control reads as DEGENERATE ON
-    # PURPOSE instead of being quietly repaired. Rolling by two does not repair it: it
-    # compares a subset of the position pairs rolling by one already compares, so its gap
-    # is <= this one's by construction, and it drops the first-token-versus-last-token
-    # pair this control exists to exercise.
+    # ---- CONTROL E: THE ROWS ARE THE CALLER'S, AND A PLANTED PERTURBATION PROVES IT
+    # (R3, LEAD-LOG 850). The rolled-positions recompute that stood here could not
+    # discriminate, and it said so: rolling ``(127, 0, 7, 7)`` by one maps position 7
+    # to position 7, and the stack hands the head rows it has already homogenised, so
+    # the recompute landed inside this item's band at a gap of 0.000313 and reddened
+    # the item as a vacuous control
+    # (``increments/launch-054a-r16-driver-20260909T080034Z.out:330``). The round-3
+    # review froze the positions, the head and both tolerance pairs; this repair moves
+    # none of them. It changes WHAT IS PERTURBED, from the position list to the hidden
+    # state, so the control's power stops depending on how far apart two rows of the
+    # stack happen to sit.
     #
-    # WHAT IS NOT SETTLED, and what this file must NOT do about it. The round-3 review
-    # froze the positions, the head and both tolerance pairs, and refused a byte-equality
-    # replacement for this control: a forward that read ``positions - 1``, or one constant
-    # position, would pass shape, pass the repeated-row check, pass the band and pass a
-    # byte-difference check on the REFERENCE too, so such a control would turn this item
-    # green on wrong code. The cause of the inside reading is the stack homogenising its
-    # rows, and the deciding reading is the row spread printed above. Until that reading
-    # is ruled, ``VacuousControlError`` reddens this item honestly rather than passing on
-    # a comparison that cannot discriminate.
-    rolled = tuple(ROOT_SAMPLING_POSITIONS[1:]) + (ROOT_SAMPLING_POSITIONS[0],)
+    # THE PLANT IS SIZED FROM THE BAND ITSELF. The hidden state at the position slot 0
+    # asks for gains a delta along ONE head row, scaled so the logit that row projects
+    # moves by :data:`ROOT_CONTROL_E_MULTIPLE` times the widest allowance any cell of
+    # that slot has, ``ATOL + RTOL * peak``. Only that one position is touched, so the
+    # control states two things a wrong selection cannot satisfy at once:
+    #
+    #   * slot 0 MUST leave the band, because the planted move is four allowances wide;
+    #   * the slots for positions 0 and 7 MUST be bit-identical to the reference, so a
+    #     forward reading ``positions - 1``, one constant position, or any other row
+    #     would move a row this plant never touched.
+    #
+    # AND IT CARRIES ITS OWN VACUITY GUARD, which names the head: if the delta maps to
+    # no change at slot 0 the head row is zero or masked, and then the control proves
+    # nothing and says that instead of passing.
+    _slot = 0
+    _plant_position = int(ROOT_SAMPLING_POSITIONS[_slot])
+    _slot_peak = float(expected[_slot].abs().max())
+    _slot_band = ATOL + RTOL * _slot_peak
+    _head_rows = head.float()
+    _head_row = int(_head_rows.norm(dim=1).argmax())
+    _head_norm2 = float(_head_rows[_head_row].pow(2).sum())
+    if _head_norm2 <= 0.0:
+        raise VacuousControlError(
+            f"head row {_head_row} is the widest of {int(_head_rows.shape[0])} and "
+            f"still has zero norm, so no perturbation of the hidden state can move "
+            f"the logit it projects and this control cannot say which rows the root "
+            f"selected"
+        )
+    _plant_scale = ROOT_CONTROL_E_MULTIPLE * _slot_band
+    _probe_hidden = hidden.float().clone()
+    _probe_hidden[_plant_position] = (
+        _probe_hidden[_plant_position]
+        + (_plant_scale / _head_norm2) * _head_rows[_head_row]
+    )
+    _moved = _root_reference(_probe_hidden, head, ROOT_SAMPLING_POSITIONS)
+    _slot_diff = float((_moved[_slot] - expected[_slot]).abs().max())
+    print(f"TINYFWD|root_control_e|slot={_slot}|position={_plant_position}"
+          f"|head_row={_head_row}|head_rows={int(_head_rows.shape[0])}"
+          f"|slot_peak={_slot_peak:.10g}|allowance={_slot_band:.10g}"
+          f"|multiple={ROOT_CONTROL_E_MULTIPLE}"
+          f"|planted_logit_delta={_plant_scale:.10g}"
+          f"|measured_slot_max_abs_diff={_slot_diff:.10g}")
+    if _slot_diff <= 0.0:
+        raise VacuousControlError(
+            f"the plant of {_plant_scale:.6g} along head row {_head_row} moved slot "
+            f"{_slot} by exactly nothing, so this head masks it and the control "
+            f"cannot say which rows the root selected"
+        )
+    for _other in range(1, len(ROOT_SAMPLING_POSITIONS)):
+        _other_diff = float((_moved[_other] - expected[_other]).abs().max())
+        print(f"TINYFWD|root_control_e_untouched|slot={_other}"
+              f"|position={int(ROOT_SAMPLING_POSITIONS[_other])}"
+              f"|max_abs_diff={_other_diff:.10g}")
+        if _other_diff != 0.0:
+            raise VacuousControlError(
+                f"slot {_other} asks for position "
+                f"{int(ROOT_SAMPLING_POSITIONS[_other])}, which this control planted "
+                f"nothing on, and it moved by {_other_diff:.6g}: either the "
+                f"projection mixes rows or the reference is reading a row the caller "
+                f"did not ask for, and neither leaves this control able to speak"
+            )
+    if torch.allclose(_moved[_slot].float(), expected[_slot].float(),
+                      rtol=RTOL, atol=ATOL):
+        raise VacuousControlError(
+            f"slot {_slot} was planted {ROOT_CONTROL_E_MULTIPLE} x its widest "
+            f"allowance of {_slot_band:.6g} and still sits inside rtol={RTOL}, "
+            f"atol={ATOL}, so this item's band cannot see the rows it selects moving"
+        )
     _stack_outside_tolerance(
-        f"the logits recomputed on rolled positions {list(rolled)}",
-        _root_reference(hidden, head, rolled),
+        f"the logits recomputed with {_plant_scale:.6g} planted on the hidden state "
+        f"at position {_plant_position}, the row slot {_slot} asks for",
+        _moved,
         expected,
     )
