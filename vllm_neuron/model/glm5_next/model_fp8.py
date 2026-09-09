@@ -1144,7 +1144,7 @@ class Glm5NextHyperConnection(nn.Module):
     def mhc_pre(
         self, residual: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The base's ``mhc_pre``, with its Sinkhorn on ``-028``'s kernel.
+        """The base's ``mhc_pre``, with its Sinkhorn on ``-028b``'s BATCHED kernel.
 
         Args:
             residual: ``[T, S, H]`` -- the ``S = hc_mult`` residual streams.
@@ -1155,24 +1155,33 @@ class Glm5NextHyperConnection(nn.Module):
             weights input stream ``i`` into output stream ``j``, the base's
             convention and the one ``-029``'s kernel reads.
 
-        THE TOKEN CEILING, MEASURED AND DELIBERATELY NOT WORKED AROUND. The
-        block-diagonal embedding puts ``T * S`` on the Sinkhorn's ``M``, and
-        ``-028`` refuses ``M > PARTITION_MAX``. So this layer serves
-        ``T <= PARTITION_MAX // S`` -- **32** at the checkpoint's ``hc_mult 4``
-        -- where ``-029``'s combine kernel on its own would serve ``T <= 128``.
-        The Sinkhorn therefore binds first. Nothing here pads, tiles or falls
-        back: the seam's ``SinkhornError`` propagates to the caller unchanged,
-        which is what the lead ruled and what P13 requires. The reading is in
-        ``probe-030-m129.out``.
+        THE TOKEN CEILING, AND WHICH SEAM NOW SETS IT. ``inc-glm53f-030c``
+        replaced the note that stood here. It said the block-diagonal embedding
+        put ``T * S`` on the Sinkhorn's ``M``, that ``-028`` refused
+        ``M > PARTITION_MAX``, and that this layer therefore served **32**
+        tokens at ``hc_mult 4``. **Every clause of that is now false**, in two
+        steps: ``inc-glm53f-028b`` tiled the row axis and removed the ``M``
+        refusal, which moved the bound to the square matrix's ``N``; and this
+        increment stops building a square matrix at all. The Sinkhorn is called
+        on ``[T, S, S]`` blocks, where ``N`` per block is ``S`` and
+        :func:`_require_blocks_admissible` carries **no token bound**.
+
+        So the ceiling is now ``-029``'s combine kernel alone: ``T <=
+        PARTITION_MAX`` -- **128**, refused with ``HyperConnectionError`` from
+        :meth:`mhc_post`. The NUMBER did not move (the old square ceiling was
+        ``MOVING_FMAX // S``, also 128); the axis, the seam and the exception
+        class did. Lifting 128 is ``inc-glm53f-029b``'s registered work, not a
+        pad and not a torch path here (P13).
 
         Raises:
             Glm5NextHyperConnectionError: on a non-3-D ``residual`` or a stream
                 or hidden extent that contradicts this layer's configuration.
-            SinkhornError: from the seam, on a token count this layer's
-                embedding puts above ``-028``'s ``M`` bound. Propagated, never
-                caught.
+            SinkhornError: from the seam, on a non-3-D block input, a
+                non-square block, or an unavailable NKI route -- the batched
+                seam ships no torch path, so an absent route raises rather than
+                falling back. Propagated, never caught.
         """
-        from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise
+        from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
         tokens, streams, hidden = self._require_streams(residual)
 
@@ -1229,13 +1238,27 @@ class Glm5NextHyperConnection(nn.Module):
         # glue, which P13 leaves to torch.
         comb_start = torch.softmax(comb_logits, dim=-1) + self.hc_eps
 
-        # ---- ENTRY 1 of 1 into ``-028``'s Sinkhorn seam. ----------------- #
-        # The counted dispatch. One call for all ``T`` tokens, which is what the
-        # block-diagonal embedding buys and what the route predicate declares.
-        normalised = sinkhorn_normalise(
-            torch.block_diag(*comb_start.unbind(0)), iters=self.sinkhorn_iters
+        # ---- ENTRY 1 of 1 into ``-028b``'s BATCHED Sinkhorn seam. -------- #
+        # The counted dispatch, still exactly one for all ``T`` tokens.
+        #
+        # `inc-glm53f-030c` moved this off the square form. It used to embed the
+        # ``T`` blocks down the diagonal of a ``[T*S, T*S]`` matrix, normalise
+        # that, and extract the diagonal blocks back out. The off-diagonal of
+        # that matrix is all zero and a zero stays zero under row and column
+        # rescaling, so it carried no information and cost ``(T*S)^2`` values --
+        # 256 MB of fp32 at 2048 tokens against 128 KB for the blocks, which is
+        # the reading `sinkhorn.py:587-591` records. The batched seam takes the
+        # blocks directly, so the embedding and the extraction both go away and
+        # `_diagonal_blocks` is deleted with them.
+        #
+        # `comb_start` is ALREADY `[T, S, S]`, which is the seam's own input
+        # shape, so this is a call rather than a translation. The seam ships NO
+        # torch path (`sinkhorn.py:957-964`): an absent NKI route raises instead
+        # of quietly normalising 2048 tokens in torch, which is what P13 and D6
+        # require of kernel-class work.
+        comb_mix = sinkhorn_normalise_blocks(
+            comb_start, iters=self.sinkhorn_iters
         )
-        comb_mix = self._diagonal_blocks(normalised, tokens, streams)
 
         layer_input = (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1)
         return post_mix.reshape(tokens, streams, 1), comb_mix, layer_input
@@ -1351,19 +1374,6 @@ class Glm5NextHyperConnection(nn.Module):
             )
         return tokens, streams, hidden
 
-    @staticmethod
-    def _diagonal_blocks(
-        normalised: torch.Tensor, tokens: int, streams: int
-    ) -> torch.Tensor:
-        """Read the ``T`` per-token blocks back off a ``[T*S, T*S]`` diagonal.
-
-        The inverse of :func:`torch.block_diag` for equal-sized blocks. Pure
-        indexing: it selects, and computes nothing.
-        """
-        index = torch.arange(tokens, device=normalised.device)
-        return normalised.reshape(tokens, streams, tokens, streams)[
-            index, :, index, :
-        ]
 
 
 # ---------------------------------------------------------------------------

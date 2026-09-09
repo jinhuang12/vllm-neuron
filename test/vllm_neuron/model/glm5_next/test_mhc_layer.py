@@ -1119,41 +1119,60 @@ def test_mhc_layer_serves_above_the_old_ceiling(tokens: int) -> None:
     torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
 
 
-@pytest.mark.parametrize("tokens", [MOVING_FMAX // S + 1, 200])
+@pytest.mark.parametrize("tokens", [PARTITION_MAX + 1, 200])
 def test_mhc_layer_refusal_names_the_offending_extent(tokens: int) -> None:
-    """The refusal that still binds names its extent, and charges neither seam.
+    """The refusal that still binds names its extent, and which seam charges.
 
-    RE-GROUNDED BY `inc-glm53f-028b`. The layer's ceiling did not disappear when
-    the row-axis refusal did -- it MOVED to the other axis. The block-diagonal
-    embedding makes the affinity matrix square, so ``T`` tokens put ``T * S`` on
-    ``N`` as well as on ``M``, and ``N`` is still one tile wide on the Tensor
-    Engine's moving free axis. So the layer now serves ``T <= MOVING_FMAX // S``
-    -- 128 at the checkpoint's ``hc_mult 4`` -- and refuses above it by naming
-    ``N`` instead of ``M``.
+    RE-GROUNDED BY `inc-glm53f-030c`, for the second time, and the history is the
+    point of the note. This item first asserted `-028`'s row-axis refusal on
+    ``M``; `inc-glm53f-028b` tiled that axis away and it was re-grounded onto the
+    square matrix's ``N``, on the Tensor Engine's moving free bound. `-030c` now
+    stops building a square matrix at all: :meth:`mhc_pre` calls
+    ``sinkhorn_normalise_blocks`` on ``[T, S, S]``, where ``N`` per block is
+    ``S`` and the batched seam carries **no token bound**.
+
+    So the ceiling is `-029`'s combine kernel alone -- ``T <= PARTITION_MAX``,
+    refused with ``HyperConnectionError`` from :meth:`mhc_post`. **The NUMBER
+    did not move:** the previous ceiling was ``MOVING_FMAX // S``, which is also
+    128 at ``hc_mult 4``, so both parametrised cases are the same two token
+    counts they always were. What moved is the axis, the seam and the exception
+    class, and asserting the class is not the same one is part of the reading.
+
+    THE COUNTERS MOVE TOO, and that is a real behavioural change rather than
+    bookkeeping. This call used to charge NEITHER seam, because the Sinkhorn
+    refused before dispatching. Now the Sinkhorn genuinely RUNS -- one real
+    dispatch over ``T`` blocks -- and the combine refuses afterwards, before its
+    own dispatch, because ``can_run_hyper_connection`` calls
+    ``_require_admissible`` before it asks whether a route exists
+    (``hyper_connection.py:363-364``). That ordering is also why an inadmissible
+    ``T`` can never reach the combine's torch oracle: refusal comes first, so no
+    torch path serves kernel-class work here (P13, D6).
 
     A refusal a caller cannot act on is barely better than a trap, so the message
-    content is asserted rather than only the exception type. Both counters are
-    read after the refusal to show that a refused call charges neither seam.
+    content is asserted rather than only the exception type.
     """
     fn, hc_scale, hc_base, residual = _fixture(tokens=tokens)
     layer = _layer()
     _load(layer, fn, hc_scale, hc_base)
 
     _reset_both()
-    with pytest.raises(SinkhornError) as excinfo:
+    with pytest.raises(HyperConnectionError) as excinfo:
         layer.forward(residual, _sublayer)
     after = _read_both()
     message = str(excinfo.value)
     print(
-        f"[refusal] T={tokens} sinkhorn_M=N={tokens * S} "
-        f"serving_ceiling_T={MOVING_FMAX // S} message={message!r}"
+        f"[refusal] T={tokens} blocks_normalised={tokens} block_side={S} "
+        f"serving_ceiling_T={PARTITION_MAX} "
+        f"old_square_ceiling_T={MOVING_FMAX // S} message={message!r}"
     )
     print(f"[refusal] counters_after_refusal={after}")
-    assert f"N={tokens * S}" in message, message
-    assert f"exceeds the Tensor Engine moving free bound {MOVING_FMAX}" in message, (
-        message
-    )
-    assert after == ((0, 0), (0, 0)), after
+    assert f"T={tokens} exceeds PARTITION_MAX={PARTITION_MAX}" in message, message
+    # The class changed with the axis. A `SinkhornError` here would mean the
+    # layer is still embedding the blocks in a square matrix.
+    assert not isinstance(excinfo.value, SinkhornError), type(excinfo.value).__name__
+    # The Sinkhorn ran (1 dispatch, 0 fallback); the combine refused before its
+    # own dispatch and before any route question, so it charges nothing at all.
+    assert after == ((1, 0), (0, 0)), after
 
 
 # --------------------------------------------------------------------------- #
