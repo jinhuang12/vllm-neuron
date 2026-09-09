@@ -582,6 +582,11 @@ class SeamSpy:
         # list so no existing reading changes shape: `calls` still holds `(entry, layer)` and every
         # count above is computed from it exactly as before.
         self.first_arg_dtypes: list[tuple[str, torch.dtype]] = []
+        # THE KERNEL'S SELECTED POOL IDS, per layer, recorded at rev 268 so the reference can ADOPT
+        # them. Its own list for the same reason as above: no existing reading changes shape. The
+        # tensor is DETACHED AND CLONED, because the buffer the product returns is free to be reused
+        # and a live view would let the implementation edit the reference's input after the fact.
+        self.selected_pool_ids: list[tuple[int | None, torch.Tensor]] = []
 
     # -- what the spy is asked --------------------------------------------------------------
     @property
@@ -625,6 +630,27 @@ class SeamSpy:
 
         layer_cls = model_fp8.Glm5NextDSALayer
         monkeypatch.setattr(layer_cls, "forward", self._bracket(layer_cls.forward))
+        # REV 268: record the selected pool ids so the reference can adopt them. This is the method
+        # both entry points call (`model_fp8.py:4289`, `:4473`) and its return is the FINAL set --
+        # bounded, selected, marked and canonically ordered -- which is exactly the set the tie
+        # comparison is about. Recorded only; the real value is returned unchanged, so this patch
+        # cannot alter what the implementation computes.
+        indexer_cls = model_fp8.Glm5NextDSAIndexer
+        monkeypatch.setattr(
+            indexer_cls,
+            "select_bounded_pools",
+            self._record_pool_ids(indexer_cls.select_bounded_pools),
+        )
+
+    def _record_pool_ids(self, real):
+        @functools.wraps(real)
+        def wrapper(*args, **kwargs):
+            out = real(*args, **kwargs)
+            if isinstance(out, torch.Tensor):
+                self.selected_pool_ids.append((self.current_layer, out.detach().clone()))
+            return out
+
+        return wrapper
 
     def _wrap(self, entry: str, real):
         @functools.wraps(real)
@@ -1483,13 +1509,155 @@ def _ref_score(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -> torch
     head's score before the head weight is applied, so dropping it would change which pools win, not
     merely the score values.
     """
-    per_head = torch.einsum("mhd,nd->mhn", q.float(), k.float())
-    return (per_head.clamp(min=0.0) * weights.float().unsqueeze(-1)).sum(dim=1)
+    return (
+        _ref_score_per_head(q, k).clamp(min=0.0) * weights.float().unsqueeze(-1)
+    ).sum(dim=1)
+
+
+def _ref_score_per_head(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """The per-head scores BEFORE the ReLU and before the head weights.
+
+    Split out at `-103`'s r7 read so the tie diagnostic can print the four per-head numbers behind a
+    tied row without a SECOND spelling of the einsum. The arithmetic above is unchanged: it now calls
+    this instead of inlining the same call.
+    """
+    return torch.einsum("mhd,nd->mhn", q.float(), k.float())
 
 
 def _ref_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
     """``dsa_topk_select`` then ``select_pools``' cast (``topk_select.py:369``, ``model_fp8.py:3439-3440``)."""
     return torch.topk(scores, int(k), dim=-1).indices.to(torch.int32)
+
+
+# --------------------------------------------------------------------------- #
+# THE CAUSAL BOUND, IN THE REFERENCE. `inc-glm53f-103`, declared as an amendment to a LANDED test
+# in the block's Surface bullet at plan revision 260 -- not discovered at review.
+#
+# WHY THE REFERENCE HAD TO CHANGE AT ALL. `_ref_indexer` below selects pools from unbounded scores,
+# so before this increment it agreed with the implementation and after it, it cannot: the bound
+# changes WHICH pools a row selects, which is the whole point of the increment. Measured, not
+# argued: the first counted run read `Mismatched elements: 5601 / 8960` and `8910 / 8960` on the two
+# `test_run_1` arms. A reference that does not know about the bound disagrees BY CONSTRUCTION, and a
+# stale reference is a wrong expectation rather than a finding.
+#
+# THESE THREE FUNCTIONS ARE TORCH AND STAY TORCH, AND THAT IS LOAD-BEARING TWICE OVER. The reference
+# must reach NO seam -- `:2182-2196` MEASURES that it moves no projection counter and says the
+# arrangement "is only sound if the reference is torch-only" -- so calling `dsa_causal_bound` here
+# would make the reference compare the seam against itself and would fire that reading. And P13 is
+# not in play: this is the test's own oracle, never a production path.
+#
+# TWO NUMBERS ARE READ OFF THE PRODUCT MODULE AND NEITHER IS TYPED HERE (repair `103r5`). The fill is
+# no longer `-inf`: `dsa_causal_bound` writes the finite `BOUND_FILL` and the marker fires at or below
+# `BOUND_FILL_MARK`, because the vendored selector pads its own input with a FINITE value and moves
+# selected values through a 0/1 permutation matmul where `0 * -inf` is NaN -- read at the bytes in
+# `increments/contradiction-103-selector-pad-6874a0f5.md`. :func:`_fill_constants` asks the module for
+# both, so a change to either reaches this file as a mismatch instead of being overwritten by a
+# hand-typed copy. Reading a module CONSTANT is not reaching a seam: it dispatches nothing, and the
+# counters are reset AFTER the reference runs anyway (`:2192-2198` step 3).
+#
+# WHAT THEY DO NOT BUY. Because the reference now transcribes the same declared semantics as the
+# implementation, `test_run_1` can no longer catch a defect in the ORDER of the sentinel columns --
+# both sides pin it the same way. That defect class is caught by `test_run_2`, which compares a row
+# against ITSELF run alone and needs no reference at all. The separation is deliberate: a reference
+# checks the values, and the pack-commutation item checks that a row's answer does not depend on its
+# neighbours.
+# --------------------------------------------------------------------------- #
+
+
+def _fill_constants() -> tuple[float, float]:
+    """``(BOUND_FILL, BOUND_FILL_MARK)``, ASKED OF THE PRODUCT MODULE rather than typed here.
+
+    Two numbers, one source. If the module ever moves the fill or the mark, this file's reference
+    moves with it and `test_run_1` keeps measuring the implementation instead of measuring a stale
+    copy of one of its constants. The pair is also why the reference needs no ``-inf`` anywhere: the
+    fill is finite on purpose, and the reason is `103r5`'s contradiction record.
+    """
+    module = _seam_module("causal_bound")
+    return float(module.BOUND_FILL), float(module.BOUND_FILL_MARK)
+
+
+def _ref_causal_bound(
+    scores: torch.Tensor, seq_lens: torch.Tensor, pool_size: int, width: int
+) -> torch.Tensor:
+    """``dsa_causal_bound``: ``BOUND_FILL`` at every pool column the row does not complete.
+
+    Pool ``p`` completes at token ``(p + 1) * pool_size - 1`` and is attendable exactly when that
+    token is ``< causal_len``, which is the same statement as ``p < causal_len // pool_size`` --
+    the block's Surface bullet's predicate, written here as the inequality on the token so a reader
+    can check it against upstream's ``[cu_seqlen_ks, cu_seqlen_ke)`` without re-deriving the floor
+    division.
+
+    THE FILL IS FINITE AND THAT IS THE `103r5` REPAIR, not a rounding of ``-inf``. A bounded column
+    is moved across SBUF partitions by a 0/1 permutation matmul inside the vendored selector, and
+    ``0 * -inf`` is NaN, so an ``-inf`` written here need not come back as one. The number itself is
+    read from the module by :func:`_fill_constants`.
+
+    ``causal_len`` IS ``seq_lens``, the same column the expansion receives -- one producer, two
+    consumers, exactly as ``Glm5NextDSAIndexer.select_bounded_pools`` says of itself, named by the
+    method because this increment has already pushed those line numbers twice.
+    """
+    fill, _mark = _fill_constants()
+    causal = seq_lens.to(torch.int64).reshape(-1, 1)
+    columns = torch.arange(int(width), dtype=torch.int64).reshape(1, -1)
+    completes = (columns + 1) * int(pool_size) - 1 < causal
+    return scores.masked_fill(~completes, fill)
+
+
+def _ref_causal_sentinel(
+    bounded: torch.Tensor, pool_ids: torch.Tensor, width: int
+) -> torch.Tensor:
+    """``dsa_causal_sentinel``: ``-1`` at every selection the row may not see.
+
+    TWO ARMS, BECAUSE THE IMPLEMENTATION HAS TWO (repair ``103r5``). A selection is replaced when its
+    VALUE is at or below ``BOUND_FILL_MARK`` -- or is NaN -- or when its INDEX is at or past
+    ``width``, the count of real pool columns the selector was handed.
+
+    THE INDEX ARM IS UNREACHABLE IN THIS REFERENCE, AND SAYING SO IS THE HONEST PART. It exists in
+    the implementation because the vendored selector PADS its own input with a finite ``-9948.0`` at
+    column positions that keep counting past the real width, so a pad can win a slot and come back as
+    an out-of-range pool id. This reference's selector is ``_ref_topk``, a plain ``torch.topk`` over
+    exactly ``width`` columns, which cannot return an index at or past ``width``. So this function
+    transcribes the arm and never exercises it: the pad arm is READ by
+    ``test/vllm_neuron/functional/dsa/test_causal_bound.py``'s pad case against the kernel's own
+    config, and at the dispatch site by
+    :func:`test_forward_at_a_striking_select_k_sentinelises_every_pad_the_selector_returns` below.
+
+    THE REFERENCE GATHERS AND THE IMPLEMENTATION NO LONGER DOES, on purpose (repair ``103r4``,
+    review finding F1). ``select_bounded_pools`` now hands the sentinel ``dsa_topk_select``'s own
+    returned ``values``, because the vendored selector strikes its input buffer on the multi-fold
+    branch and an index returned beside a struck value can then point at an originally finite
+    column. THIS reference is safe to gather because ``torch.topk`` never modifies its input, so the
+    gathered score IS the selected value here by construction -- and the two sides therefore reach the
+    same answer by two different spellings, which is what a reference is for. ``isnan`` is carried for
+    the same reason the module's oracle carries it: nothing here produces a NaN, and if one ever
+    arrives the reference agrees with the implementation about it rather than silently disagreeing.
+    """
+    _fill, mark = _fill_constants()
+    selected = bounded.gather(1, pool_ids.to(torch.int64))
+    struck = torch.le(selected, mark) | torch.isnan(selected)
+    padded = torch.ge(pool_ids.to(torch.int64), int(width))
+    return torch.where(struck | padded, torch.full_like(pool_ids, -1), pool_ids)
+
+
+def _ref_canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
+    """Sentinels to the trailing columns; real ids keep their relative order.
+
+    Mirrors ``Glm5NextDSAIndexer._canonical_sentinel_order``. It exists in the reference for the
+    same reason it exists in the implementation: the selector promises "highest first" and promises
+    NOTHING about the order among EQUAL values (``topk_select.py:312``), and the bound manufactures
+    equal values in bulk at ``BOUND_FILL`` -- a FINITE ``-1e30`` since ``-103``, not the ``-inf``
+    this line said until rev 268. Without this the two sides would differ on the PLACES of
+    identical contents, which is not a numeric disagreement and would read like one.
+
+    THE FILL IS NOT THE ONLY SOURCE OF EQUAL VALUES, which is why this ordering is necessary but not
+    sufficient. Two REAL candidates can also hold the same score -- the product's own ReLU floors
+    every all-non-positive candidate to an identical ``0.0`` -- and their relative order is pinned by
+    nothing here. That case is handled by the tie-equivalence comparison rather than by this sort.
+    """
+    k = int(pool_ids.shape[1])
+    position = torch.arange(k, dtype=torch.int64)
+    key = (pool_ids < 0).to(torch.int64) * k + position
+    return pool_ids.gather(1, key.argsort(dim=1))
 
 
 def _ref_expand(pool_ids: torch.Tensor, seq_lens: torch.Tensor, pool_size: int) -> torch.Tensor:
@@ -1668,6 +1836,9 @@ def _ref_indexer(
     tail: torch.Tensor | None = None,
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
+    probe_per_head: list[torch.Tensor] | None = None,
+    adopt_pool_ids: torch.Tensor | None = None,
+    tie_label: str | None = None,
 ) -> torch.Tensor:
     """``Glm5NextDSAIndexer.forward``, both legs (``model_fp8.py:3645-3689``).
 
@@ -1714,9 +1885,49 @@ def _ref_indexer(
 
     candidate_keys = _ref_candidate_keys(pool_cache, candidates)
     scores = _ref_score(query, candidate_keys, weights)
+    # THE PROBE KEEPS THE UNBOUNDED SCORES, ON PURPOSE, and its consumer changed at rev 268. It used
+    # to feed a control that asserted no selection was decided by a tie. That control is RETIRED: a
+    # tie at the k-th place among REAL candidates is a legal product state -- the product's own ReLU
+    # floors every all-non-positive candidate to an identical `0.0` -- so no criterion may be stricter
+    # than tie-equivalence, and a reseed moves such a tie without removing it. The probe now feeds a
+    # NON-GATING reading only. (The old comment here also said the bound writes `-inf`; it writes a
+    # finite `BOUND_FILL`.)
     if probe is not None:
         probe.append(scores.detach())
-    pool_ids = _ref_topk(scores, int(indexer.select_k()))
+    # `-103` r7 READ 2. Recomputed rather than captured inside `_ref_score`, so the value path above
+    # is not touched by a diagnostic. Same inputs, same function, so it cannot disagree with the
+    # scores the tie control reads.
+    if probe_per_head is not None:
+        probe_per_head.append(_ref_score_per_head(query, candidate_keys).detach())
+    # inc-glm53f-103: bound, select, sentinelise, then pin the sentinel places -- the same four steps
+    # in the same order as `Glm5NextDSAIndexer.select_bounded_pools` in `model_fp8.py` -- named by the
+    # method rather than by a line, because this increment's own docstrings pushed those line numbers
+    # twice already -- transcribed rather than
+    # called. The order is the plan's declared order and is not free to vary: selecting on unbounded
+    # scores and masking afterwards would answer a different question.
+    bounded = _ref_causal_bound(scores, seq_lens, pool, candidates)
+    pool_ids = _ref_topk(bounded, int(indexer.select_k()))
+    # `candidates` IS the width, read from the same variable the bound was given, exactly as the
+    # implementation reads `int(bounded.shape[1])` rather than a config field: the width the marker
+    # screens against cannot then disagree with the width the selector was handed.
+    pool_ids = _ref_causal_sentinel(bounded, pool_ids, candidates)
+    pool_ids = _ref_canonical_sentinel_order(pool_ids)
+    # ADOPTION, and it is CONDITIONAL (rev 268). The reference has now computed its OWN selection
+    # above, which is what the comparison below is against; adoption never replaces that step. When
+    # the kernel's set differs, it is adopted ONLY if it is itself a legal top-k of the same bounded
+    # scores -- checked, not assumed -- so a genuinely wrong selection cannot be laundered into
+    # agreement by handing it to the reference.
+    if adopt_pool_ids is not None:
+        assert tuple(adopt_pool_ids.shape) == tuple(pool_ids.shape), (
+            f"{tie_label or 'adopt'}: the kernel returned selected pool ids of shape "
+            f"{tuple(adopt_pool_ids.shape)} where the reference computed "
+            f"{tuple(pool_ids.shape)}. Adoption compares the two sets row by row, so a different "
+            f"shape is a finding about the seam's contract and not a shape to broadcast past"
+        )
+        check_tie_equivalent_selection(
+            bounded, pool_ids, adopt_pool_ids, tie_label or "adopt"
+        )
+        pool_ids = adopt_pool_ids.to(pool_ids.dtype)
     return _ref_expand(pool_ids, seq_lens, pool)
 
 
@@ -1801,6 +2012,9 @@ def _ref_layer(
     tail: torch.Tensor | None = None,
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
+    probe_per_head: list[torch.Tensor] | None = None,
+    adopt_pool_ids: torch.Tensor | None = None,
+    tie_label: str | None = None,
 ) -> torch.Tensor:
     """``Glm5NextDSALayer.forward`` (``model_fp8.py:4687-4712``).
 
@@ -1829,6 +2043,9 @@ def _ref_layer(
         tail=tail,
         position=position,
         probe=probe,
+        probe_per_head=probe_per_head,
+        adopt_pool_ids=adopt_pool_ids,
+        tie_label=tie_label,
     )
     attn_out = _ref_attend(
         attention, normed, latent_cache, int(start_position), topk_indices, float(softmax_scale)
@@ -1894,7 +2111,7 @@ def _materialise_indexer(indexer, gen: torch.Generator) -> None:
     assert indexer.prepare_projection_weights() == 4, "four indexer projections must prepare"
 
 
-def build_layer_stack(*, layers: int = LAYERS, seed: int = 51_051_051):
+def build_layer_stack(*, layers: int = LAYERS, seed: int = 51_051_051, **cfg_overrides):
     """A stack of :class:`Glm5NextDSALayer` at the tiny geometry, every leaf materialised.
 
     The weight scaling mirrors the ``-042`` sibling's fixture (``test_mla_decode.py:139-143``):
@@ -1903,9 +2120,14 @@ def build_layer_stack(*, layers: int = LAYERS, seed: int = 51_051_051):
 
     EVERY LAYER GETS ITS OWN SEED STREAM from one generator, so the three layers are genuinely
     different maps. A stack of three identical layers would let a per-layer indexing error pass.
+
+    ``cfg_overrides`` REACHES :func:`_tiny_text_config` AND NOTHING ELSE, so the tiny geometry stays
+    the one place a width is declared. It exists for one caller: the striking-``select_k`` item needs a
+    larger ``index_topk``, which is the dial upstream itself expresses in TOKENS, and every reading it
+    makes is then derived from the config it built rather than from a number typed twice.
     """
     model_fp8 = _impl()
-    cfg = _tiny_text_config()
+    cfg = _tiny_text_config(**cfg_overrides)
     gen = torch.Generator().manual_seed(int(seed))
     stack = []
     for layer_idx in range(int(layers)):
@@ -1943,8 +2165,8 @@ def prefill_slot_mapping(tokens: int, pool: int) -> torch.Tensor:
     """The pool-granular slot per position: the pool's own id where a pool COMPLETES, else ``-1``.
 
     ``pool_window``'s write mask is ``(slot_mapping >= 0) & (pos >= pool - 1)``
-    (``model_fp8.py:3209``), so a ``-1`` here is how a position says "my window is not a whole pool";
-    those rows are steered to the trash row rather than dropped (``model_fp8.py:3679-3684``).
+    (``model_fp8.py:3569``), so a ``-1`` here is how a position says "my window is not a whole pool";
+    those rows are steered to the trash row rather than dropped (``model_fp8.py:4272-4278``).
     """
     slots = torch.full((int(tokens),), -1, dtype=torch.int32)
     for p in range(int(tokens)):
@@ -2042,38 +2264,181 @@ def kth_place_gap(scores: torch.Tensor, k: int) -> float:
     return float((top[:, int(k) - 1] - top[:, int(k)]).min())
 
 
-def say_and_check_gaps(gaps: list[tuple[str, float]]) -> None:
-    """Print EVERY label's gap, then assert over all of them at once.
+def say_gaps(gaps: list[tuple[str, float]]) -> None:
+    """Print EVERY label's k-th-place gap. NON-GATING since rev 268, and the rename says so.
 
-    The printing comes first on purpose: a reading that only reaches the transcript when it passes
-    is not a reading. With this order a failing run still shows every label's number, so a reader
-    can see at a glance whether one row was unlucky or the seed is bad everywhere.
+    IT USED TO ASSERT, AND THE ASSERTION WAS WRONG IN KIND. It required every gap to clear
+    :data:`TIE_FLOOR` and told a failing run to reseed. But a tie at the k-th place among REAL
+    candidates is a legal product state, not a bad draw: ``_ref_score`` and the product kernel both
+    apply a ReLU, so every candidate whose per-head scores are all non-positive collapses to the
+    same exact ``0.0``, and at ``prefill-layer2`` two causally-attendable pools sat on that floor
+    with the k-th gap exactly zero. A reseed moves which row ties and cannot remove ties, and
+    upstream's own top-k is arbitrary among equal values -- so no criterion here may be stricter
+    than TIE-EQUIVALENCE, which :func:`check_tie_equivalent_selection` enforces instead.
+
+    The number is still worth reading, so it is still printed: a gap that collapses across a whole
+    leg says something about the fixture even when nothing is wrong with the product.
     """
     for label, gap in gaps:
-        say(label, "kth_place_gap_min", f"{gap:.3e}")
-    bad = [(label, gap) for label, gap in gaps if not gap > TIE_FLOOR]
-    assert not bad, (
-        f"{', '.join(label for label, _ in bad)}: the smallest gap at the k-th place is "
-        f"{', '.join(f'{gap:.3e}' for _, gap in bad)}, so at least one row's selection is "
-        f"effectively a tie and this case cannot tell a tie-break difference from a defect. "
-        f"Reseed the fixture rather than loosening the comparison"
-    )
+        say(label, "kth_place_gap_min", f"{gap:.3e}", "gating", "no")
 
 
-def assert_selection_is_not_a_tie(scores: torch.Tensor, k: int, label: str) -> None:
-    """No row may be decided by a tie at the k-th place.
+def check_tie_equivalent_selection(
+    bounded: torch.Tensor, ref_ids: torch.Tensor, kernel_ids: torch.Tensor, label: str
+) -> None:
+    """The kernel's selected set must equal the reference's UP TO SUBSTITUTION AMONG EXACT TIES.
 
-    WHY THIS CONTROL EXISTS. Item (1) compares the layer's FINAL output, and the selection sits in
-    the middle of that chain. If the kernel and the reference broke a tie differently they would
-    attend different cache rows and the numeric comparison would fail for a reason that is not a
-    defect -- or, worse, a real defect could be excused as a tie. ``torch.topk``'s tie order is not
-    contracted to match the kernel's, so the fixture must make ties impossible rather than hope.
+    This is the comparison that replaced the retired no-tie control, and it is what makes adoption
+    safe. Two sets may differ only in a way the scores cannot distinguish: every id the kernel chose
+    must score at least as high as every id it did not, compared EXACTLY -- no tolerance, so the
+    boundary case is bit equality at the k-th value. A kernel that dropped a strictly better
+    candidate fails here and is not adopted.
 
-    The single-label form, kept because run 1 reads one label per layer per phase and each of those
-    is its own reading. It now routes through the shared reader above so there is ONE definition of
-    the gap arithmetic and ONE floor.
+    WHY EXACT AND NOT TOLERANT. A tolerance would admit a kernel that picked a slightly worse
+    candidate, which is precisely the defect this item is meant to catch. The legal case is an exact
+    tie, so the legal case needs no tolerance to pass.
+
+    The sentinel columns are compared as a COUNT, not as places: `-1` marks carry no score, so
+    which slot holds one is not a selection question, and `_ref_canonical_sentinel_order` has
+    already pinned them to the trailing columns on both sides.
+
+    DISTINCTNESS IS CHECKED FIRST, AND THAT IS A REPAIR. Every reading below this point treats a
+    row's chosen ids as a SET, so a row that carries one legal id twice used to walk straight
+    through: `[0, 0]` against a reference `[0, 1]` matched on count (two real ids each), collapsed
+    to `{0}`, and then satisfied "lowest chosen at least as high as highest unchosen" for free
+    whenever column 0 was the row's top score -- no tie anywhere. The reference then ADOPTED the
+    duplicated row and the output comparison passed on a selection that is illegal. A repeated id
+    is not a tie substitution: it is one fewer token attended, and
+    `select_bounded_pools`' own docstring records that the vendored selector's striking branch can
+    return a legal column twice. So a repeat is a named failure here and never reaches the set.
     """
-    say_and_check_gaps([(label, kth_place_gap(scores, int(k)))])
+    scores = bounded.float()
+    rows, width = int(scores.shape[0]), int(scores.shape[1])
+    reported = False
+    for r in range(rows):
+        ref_row = [int(v) for v in ref_ids[r].tolist()]
+        ker_row = [int(v) for v in kernel_ids[r].tolist()]
+        ref_real = sorted(v for v in ref_row if v >= 0)
+        ker_real = sorted(v for v in ker_row if v >= 0)
+
+        # THE DISTINCTNESS READING, BEFORE ANY SET IS TAKEN. Both lists are already sorted, so a
+        # repeat is an equal neighbour. The repeated id is named because "a duplicate exists" sends
+        # the next reader back to the transcript, and the id says which pool the row lost.
+        ker_repeats = sorted({v for i, v in enumerate(ker_real[1:]) if v == ker_real[i]})
+        ref_repeats = sorted({v for i, v in enumerate(ref_real[1:]) if v == ref_real[i]})
+        assert not ker_repeats, (
+            f"{label} row {r}: the kernel returned pool id(s) "
+            f"{';'.join(str(v) for v in ker_repeats)} more than once, so this row attends fewer "
+            f"pools than it claims. A repeat is an ILLEGAL selection and not a tie substitution -- "
+            f"kernel={ker_row} reference={ref_row}"
+        )
+        assert not ref_repeats, (
+            f"{label} row {r}: the REFERENCE returned pool id(s) "
+            f"{';'.join(str(v) for v in ref_repeats)} more than once. The reference is the oracle, "
+            f"so this is a fault in the test's own scorer and not a finding about the kernel -- "
+            f"reference={ref_row} kernel={ker_row}"
+        )
+
+        assert len(ker_real) == len(ref_real), (
+            f"{label} row {r}: the kernel returned {len(ker_real)} real pool ids where the "
+            f"reference returned {len(ref_real)}. A different COUNT is not a tie substitution -- "
+            f"kernel={ker_row} reference={ref_row}"
+        )
+        if ker_real == ref_real:
+            continue
+
+        chosen = set(ker_real)
+        lo = min(float(scores[r, c]) for c in chosen)
+        unchosen = [c for c in range(width) if c not in chosen]
+        hi = max(float(scores[r, c]) for c in unchosen) if unchosen else float("-inf")
+        # ONE row per leg, and it is the row that actually differs -- the interesting one.
+        if not reported:
+            say(label, "tie_choice", f"row={r}", f"kth_value={lo:.9e}",
+                "kernel_ids=" + ";".join(str(v) for v in ker_real),
+                "ref_ids=" + ";".join(str(v) for v in ref_real))
+            reported = True
+        assert lo >= hi, (
+            f"{label} row {r}: the kernel's selection is not a legal top-k, so it is a WRONG "
+            f"selection and not a tie substitution. Its lowest chosen score is {lo:.9e} while an "
+            f"unchosen column scores {hi:.9e}, which is strictly higher. kernel={ker_real} "
+            f"reference={ref_real}"
+        )
+    if not reported:
+        # The row that came CLOSEST to a tie, so the leg always emits exactly one row.
+        gaps = torch.topk(scores, min(width, 2), dim=-1).values
+        row = int(torch.argmin(gaps[:, 0] - gaps[:, -1])) if width > 1 else 0
+        say(label, "tie_choice", f"row={row}", f"kth_value={float(gaps[row, -1]):.9e}",
+            "kernel_ids=identical", "ref_ids=identical")
+
+
+def say_tie_diagnostics(
+    scores: torch.Tensor, k: int, label: str, per_head: torch.Tensor | None = None
+) -> None:
+    """`-103` r7 READ 2. Disclose the row that DECIDES the k-th-place gap, before any assertion.
+
+    The r7 run read `prefill-layer2 kth_place_gap_min = 0.000e+00`, and an exact zero is not a near
+    miss: `_ref_score` applies a ReLU (``clamp(min=0.0)``) before the head weights, so every candidate
+    whose per-head scores are all non-positive collapses to the SAME exact `0.0`. Two candidates on
+    that floor is one row's bad luck; several is structure, and only the count can tell them apart.
+    So the count is printed rather than argued -- with the per-head numbers behind it when the caller
+    has them, because the floor is reached in the per-head values and not in the weighted sum.
+
+    The gap arithmetic is not respelled here: the row is chosen by the same top-``k+1`` difference
+    :func:`kth_place_gap` minimises, so the row named below IS the row that produced the reading.
+    """
+    s = scores.float()
+    top = torch.topk(s, int(k) + 1, dim=-1).values
+    row_gaps = top[:, int(k) - 1] - top[:, int(k)]
+    row = int(torch.argmin(row_gaps))
+    row_values = s[row]
+    say(
+        label,
+        "tie_read2",
+        f"row={row}",
+        f"gap={float(row_gaps[row]):.9e}",
+        f"floor={TIE_FLOOR:.3e}",
+        f"candidates={int(row_values.numel())}",
+        f"at_exact_zero={int((row_values == 0.0).sum())}",
+        f"distinct={len(set(row_values.tolist()))}",
+        "values=" + ";".join(f"{float(v):.9e}" for v in row_values),
+    )
+    if per_head is not None:
+        block = per_head.float()[row]
+        say(
+            label,
+            "tie_read2_per_head",
+            f"row={row}",
+            f"heads={int(block.shape[0])}",
+            f"nonpositive={int((block <= 0.0).sum())}",
+            f"of={int(block.numel())}",
+            "block=" + ";".join(
+                "|".join(f"{float(x):.6e}" for x in head) for head in block
+            ),
+        )
+
+
+def say_selection_tie_readings(
+    scores: torch.Tensor, k: int, label: str, per_head: torch.Tensor | None = None
+) -> None:
+    """Read the selection's tie structure. NON-GATING since rev 268 -- it asserts nothing.
+
+    WHAT IT USED TO DO AND WHY THAT WAS WRONG. It required no row to be decided by a tie at the
+    k-th place, on the reasoning that the kernel and the reference might break a tie differently and
+    the output comparison would then fail for a reason that is not a defect. The premise was right;
+    the remedy was not. Ties among real candidates cannot be excluded by any fixture -- the ReLU in
+    both scorers manufactures them -- so demanding their absence made a legal product state read as
+    a bad draw.
+
+    The disagreement it worried about is now handled where it belongs: the reference ADOPTS the
+    kernel's selected set once :func:`check_tie_equivalent_selection` has confirmed the set is a
+    legal top-k. So the two sides attend the same rows by construction, and a wrong selection is
+    caught by the set comparison rather than pre-empted by a floor.
+
+    The single-label form is kept because run 1 reads one label per layer per phase and each of
+    those is its own reading.
+    """
+    say_tie_diagnostics(scores, int(k), label, per_head)
+    say_gaps([(label, kth_place_gap(scores, int(k)))])
 
 
 # =========================================================================== #
@@ -2093,23 +2458,37 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
 
     THE ORDER OF OPERATIONS IS LOAD-BEARING AND IS NOT AN ACCIDENT OF WRITING:
 
-      1. build the operands once,
-      2. CLONE every mutable cache and run the REFERENCE on the clones,
-      3. reset the counters, and assert the reset landed,
-      4. run the implementation on the originals,
-      5. read the counters, then compare the numbers.
+      1. build the operands once, one cache set PER SIDE,
+      2. reset the counters, and assert the reset landed,
+      3. run the IMPLEMENTATION on the originals, recording each layer's selected pool ids,
+      4. read the counters -- the implementation's dispatches and nothing else,
+      5. run the REFERENCE on its own caches, ADOPTING those ids where they are tie-equivalent,
+      6. compare the two hidden states.
 
-    Steps 2 and 3 are in that order because the caches are mutated in place by BOTH sides -- the
+    Each side gets its OWN cache set because the caches are mutated in place by BOTH sides -- the
     pool cache, the latent cache and the tail ring all are -- so sharing them would compare a run
-    against itself. And the reset sits AFTER the reference because a reference is allowed to move a
-    counter; what the route predicate measures is the IMPLEMENTATION's dispatches alone.
+    against itself.
 
-    THE PROJECTION COUNTER IS THE ONE EXCEPTION TO STEP 3, and it is deliberate rather than an
+    THE REFERENCE RUNS LAST, AND THAT IS A REV 268 CHANGE. It used to run first, with the reset
+    between the two sides so that the readings were the implementation's alone. The reference now
+    ADOPTS the implementation's selected pool ids, so the implementation must run first; the reset
+    therefore moved AHEAD of both, which is strictly stronger -- the readings are now taken with
+    nothing at all having run before the implementation, rather than with a reference cleared out
+    behind them. What the route predicate measures is unchanged: the IMPLEMENTATION's dispatches.
+
+    WHY THE REFERENCE ADOPTS. A tie at the k-th place among real candidates is a legal product
+    state, because the product's own ReLU floors every all-non-positive candidate to an identical
+    ``0.0``. Two different index sets can then both be correct top-k answers, so no criterion here
+    may be stricter than tie-equivalence. Adoption is GATED on that legality being proven
+    (:func:`check_tie_equivalent_selection`), so a genuinely wrong selection still fails.
+
+    THE PROJECTION COUNTER IS THE ONE EXCEPTION TO STEP 2, and it is deliberate rather than an
     inconsistency. It is reset ONCE before the phase loop instead of per phase, because its per-case
     total is the second instrument that the per-call probe is checked against, and a reset inside the
-    loop would leave nothing to check. That is only sound if the reference dispatches nothing, so
-    each leg READS the counter after its own reference and asserts it did not move -- which turns the
-    thing step 3 ASSUMES for the seven families into a measurement for the eighth.
+    loop would leave nothing to check. That is only sound if the reference dispatches nothing, so the
+    reference is BRACKETED by its own before-and-after read of that counter and asserted not to have
+    moved it -- which turns the thing step 2 ASSUMES for the seven families into a measurement for
+    the eighth.
     """
     if not gate_live():
         pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
@@ -2162,64 +2541,20 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         # know what the previous phase left behind.
         projection_mark = read_projection_counter()
 
-        # (2) THE REFERENCE, on its own per-layer caches.
-        candidates = (PREFILL_TOKENS if phase == "prefill" else PREFILL_TOKENS + 1) // pool
-        ref_hidden = step_hidden
-        probe: list[torch.Tensor] = []
-        for layer, caches in zip(stack, ref_caches):
-            ref_hidden = _ref_layer(
-                layer,
-                ref_hidden,
-                latent_cache=caches["latent_cache"],
-                pool_cache=caches["pool_cache"],
-                seq_lens=kwargs["seq_lens"],
-                start_position=start,
-                softmax_scale=SOFTMAX_SCALE,
-                candidates=candidates,
-                trash=ops["trash"],
-                slot_mapping=kwargs.get("slot_mapping"),
-                tail=None if phase == "prefill" else caches["tail"],
-                position=kwargs.get("position"),
-                probe=probe,
-            )
-        reference = ref_hidden
-
-        # THE TIE CONTROL, on every layer's own selection. Run BEFORE the comparison so a tie is
-        # reported as a fixture problem rather than surfacing as a numeric failure downstream.
-        assert len(probe) == int(layers), (
-            f"the probe collected {len(probe)} score tensors for {layers} layer(s); every layer "
-            f"selects once per phase, so a short count means a layer was skipped"
-        )
-        for idx, scores in enumerate(probe):
-            assert_selection_is_not_a_tie(
-                scores, int(stack[idx].attention.indexer.select_k()), f"{phase}-layer{idx}"
-            )
-
-        # THE REFERENCE MOVED NO PROJECTION COUNTER, read rather than assumed. The seven family
-        # counters are reset AFTER the reference precisely because a reference is ALLOWED to move
-        # one; the projection counter is deliberately NOT reset here, because the case total has to
-        # survive both phases. That is only sound if the reference is torch-only, so it is measured
-        # rather than trusted: the reference projects through `_ref_projection`, a plain matmul in
-        # this file, and reaches no seam. If it ever did, the case total would be part reference and
-        # the closed form below would read high for a reason no assertion could name.
-        after_reference = read_projection_counter()
-        say(phase, "projection_after_reference", after_reference, "at_phase_start", projection_mark)
-        assert after_reference == projection_mark, (
-            f"the torch reference moved the projection counter from {projection_mark} to "
-            f"{after_reference} on the {phase} leg. The reference and the implementation have to be "
-            f"computed by different means, and a reference that dispatches the seam under test is "
-            f"comparing the seam against itself"
-        )
-
-        # (3) RESET, and prove the reset landed before anything is measured against it.
+        # (2) RESET FIRST, and prove the reset landed before anything is measured against it. This
+        # sits ahead of BOTH sides at rev 268, where it used to sit between them: the reference now
+        # adopts the implementation's selected pool ids, so the implementation has to run first, and
+        # a reset can no longer come between the two. Ahead of both is strictly stronger -- the
+        # readings below are the implementation's alone because nothing ran before it, rather than
+        # because a reference that already ran was cleared out behind them.
         reset_all_counters()
         after_reset = read_all_counters()
         assert all(v == (0, 0) for v in after_reset.values()), (
             f"the counters did not reset to zero: {after_reset}. Every reading below would then be "
-            f"partly the reference's dispatches, which is exactly the confusion this order avoids"
+            f"partly an earlier leg's dispatches, which is exactly the confusion this order avoids"
         )
 
-        # (4) THE IMPLEMENTATION, on the originals, with the spy installed.
+        # (3) THE IMPLEMENTATION, on the originals, with the spy installed.
         spy_here = SeamSpy()
         spy_here.install(monkeypatch)
         # The projection probe is installed in the SAME window as the spy and is undone by the same
@@ -2249,8 +2584,27 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         # three times each. Two lists filled by one wrapper have to be merged by one step.
         spy.calls.extend(spy_here.calls)
         spy.first_arg_dtypes.extend(spy_here.first_arg_dtypes)
+        spy.selected_pool_ids.extend(spy_here.selected_pool_ids)
 
-        # (5) THE READINGS, then the comparison.
+        # (4) THE CAPTURED SELECTION, checked before anything is allowed to use it. The ids the
+        # reference adopts come from the spy's RECORDED RETURN VALUES and from nowhere else -- the
+        # product is not called a second time and nothing here recomputes them -- so this leg must
+        # hold exactly one recorded set per layer, in layer order. A repeat means a layer ran twice
+        # and a gap means one did not run; either way the adopted set would belong to a different
+        # layer than the reference row it is handed to, which no downstream assertion could name.
+        captured_layers = [int(idx) for idx, _ids in spy_here.selected_pool_ids]
+        say(phase, "pool_ids_captured", len(captured_layers),
+            "layers", "|".join(str(v) for v in captured_layers))
+        assert captured_layers == list(range(int(layers))), (
+            f"the {phase} leg recorded selected pool ids for layers {captured_layers}, where "
+            f"{layers} layer(s) each select exactly once per leg and the expected record is "
+            f"therefore {list(range(int(layers)))}. `build_layer_stack` numbers the stack "
+            f"0..n-1 and the spy reads that same `layer_idx`, so this compares the recording "
+            f"against the stack rather than against a typed count"
+        )
+        kernel_pool_ids = [ids for _idx, ids in spy_here.selected_pool_ids]
+
+        # (5) THE READINGS -- the implementation's alone, taken BEFORE the reference runs at all.
         readings = read_all_counters()
         for family in FAMILIES:
             say(phase, "counter", family, readings[family])
@@ -2277,7 +2631,95 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
             f"this increment must be re-derived rather than this number relaxed"
         )
         spy_here.report(f"{phase}-L{layers}")
+
+        # (6) THE REFERENCE, on its own per-layer caches, ADOPTING the implementation's selection
+        # where that selection is tie-equivalent. It runs LAST because adoption needs the recorded
+        # ids, and it runs after every counter reading above so it cannot touch one of them.
+        #
+        # THE REFERENCE IS BRACKETED BY ITS OWN PROJECTION-COUNTER SNAPSHOT, because the projection
+        # counter is the one counter NOT reset per phase -- the case total after the loop is the
+        # second instrument the per-call probe is checked against, so a per-phase reset would leave
+        # nothing to check it with. That is only sound if the reference dispatches nothing, and here
+        # that is measured rather than trusted: the reference projects through `_ref_projection`, a
+        # plain matmul in this file, and reaches no seam. If it ever did, the case total below would
+        # be part reference and would read high for a reason no assertion could name.
+        candidates = (PREFILL_TOKENS if phase == "prefill" else PREFILL_TOKENS + 1) // pool
+        ref_before = read_projection_counter()
+        ref_hidden = step_hidden
+        probe: list[torch.Tensor] = []
+        # `-103` r7 READ 2 collects the per-head scores beside the weighted ones, so a tied row can be
+        # read at the place the ReLU floor is actually reached.
+        probe_per_head: list[torch.Tensor] = []
+        for idx, (layer, caches) in enumerate(zip(stack, ref_caches)):
+            ref_hidden = _ref_layer(
+                layer,
+                ref_hidden,
+                latent_cache=caches["latent_cache"],
+                pool_cache=caches["pool_cache"],
+                seq_lens=kwargs["seq_lens"],
+                start_position=start,
+                softmax_scale=SOFTMAX_SCALE,
+                candidates=candidates,
+                trash=ops["trash"],
+                slot_mapping=kwargs.get("slot_mapping"),
+                tail=None if phase == "prefill" else caches["tail"],
+                position=kwargs.get("position"),
+                probe=probe,
+                probe_per_head=probe_per_head,
+                # THE ADOPTION, one layer's recorded set per layer, positionally matched to the stack
+                # by the check at step (4) rather than by assumption.
+                adopt_pool_ids=kernel_pool_ids[idx],
+                tie_label=f"{phase}-layer{idx}",
+            )
+        reference = ref_hidden
+
+        # THE TIE READINGS, on every layer's own selection, and they are NON-GATING now. The control
+        # that used to assert no selection was decided by a tie is retired: a k-th-place tie among
+        # real candidates is a legal product state, so the numbers are disclosed and the legality of
+        # the adopted set is what is asserted, inside `_ref_indexer`.
+        assert len(probe) == int(layers), (
+            f"the probe collected {len(probe)} score tensors for {layers} layer(s); every layer "
+            f"selects once per phase, so a short count means a layer was skipped"
+        )
+        assert len(probe_per_head) == len(probe), (
+            f"the per-head probe collected {len(probe_per_head)} tensors against the score probe's "
+            f"{len(probe)}; the two are appended in the same call, so a difference means one of them "
+            f"was not threaded through every layer"
+        )
+        for idx, scores in enumerate(probe):
+            say_selection_tie_readings(
+                scores,
+                int(stack[idx].attention.indexer.select_k()),
+                f"{phase}-layer{idx}",
+                probe_per_head[idx],
+            )
+
+        ref_after = read_projection_counter()
+        say(phase, "projection_after_reference", ref_after, "before_reference", ref_before)
+        assert ref_after == ref_before, (
+            f"the torch reference moved the projection counter from {ref_before} to {ref_after} on "
+            f"the {phase} leg. The reference and the implementation have to be computed by different "
+            f"means, and a reference that dispatches the seam under test is comparing the seam "
+            f"against itself"
+        )
+
+        # (7) THE COMPARISON.
         report_close(f"item-1-{phase}-L{layers}", got, reference)
+
+    # THE ADOPTION'S OWN COUNT, over the whole case rather than per leg. Every layer selects once per
+    # leg, so the case owes exactly layers x legs recorded sets. The per-leg check above already
+    # proved each leg's record is `0..n-1` with no repeat; this one proves no leg was skipped and no
+    # leg recorded a second time, which is the other way the adopted ids could have come from
+    # somewhere other than the run they are compared against.
+    want_pool_id_sets = int(layers) * len(PHASES)
+    say("part1", "pool_id_sets", len(spy.selected_pool_ids), "want", want_pool_id_sets,
+        "layers", int(layers), "legs", len(PHASES))
+    assert len(spy.selected_pool_ids) == want_pool_id_sets, (
+        f"the case recorded {len(spy.selected_pool_ids)} selected-pool-id sets where {layers} "
+        f"layer(s) across {len(PHASES)} leg(s) owe {want_pool_id_sets}, at one per layer per leg. "
+        f"The reference adopted from this record, so a wrong count means it adopted a set from a "
+        f"call it was not compared against"
+    )
 
     # PART 1 OF THE ROUTE PREDICATE, over this case: six of the seven families move here and the
     # pack pair is the DECLARED ZERO entry `aa` ruled. The seventh is run 2's.
@@ -2442,18 +2884,30 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
         )
         scored.append((n, _ref_score(q_own, _ref_candidate_keys(pool_cache, candidates), w_own)))
 
-    say_and_check_gaps(
+    say_gaps(
         [
             (f"arm-request-{b}", kth_place_gap(scores, select_k))
             for b, (_n, scores) in enumerate(scored)
         ]
     )
 
+    # THE ORACLE MIRRORS THE PRODUCT'S FOUR-STEP CHAIN, and until rev 268 it did not (item 3, a
+    # stale oracle). It selected straight off the UNBOUNDED scores and expanded, while
+    # `select_bounded_pools` bounds, selects, marks and canonically orders -- three steps this arm
+    # never applied. So the arm was comparing the packed implementation against a reference for an
+    # older product, and any disagreement the bound or the marker introduced would have been read
+    # here as a packing defect. The steps and their order are transcribed from `_ref_indexer` above,
+    # which is the single place this file spells the chain; the order is not free to vary, because
+    # selecting on unbounded scores and masking afterwards answers a different question.
     ref_rows = []
     offset = 0
     for n, scores in scored:
-        pool_ids = _ref_topk(scores, select_k)
-        ref_rows.append(_ref_expand(pool_ids, seq_lens[offset : offset + n], pool))
+        own_lens = seq_lens[offset : offset + n]
+        bounded = _ref_causal_bound(scores, own_lens, pool, candidates)
+        pool_ids = _ref_topk(bounded, select_k)
+        pool_ids = _ref_causal_sentinel(bounded, pool_ids, candidates)
+        pool_ids = _ref_canonical_sentinel_order(pool_ids)
+        ref_rows.append(_ref_expand(pool_ids, own_lens, pool))
         offset += n
     reference = torch.cat(ref_rows, dim=0)
 
@@ -2564,7 +3018,7 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     assert mismatches == 0, (
         f"{mismatches} of {int(reference.numel())} meaningful expanded indices differ over the first "
         f"{raw_got} columns. The implementation claims the pack COMMUTES with the row-wise "
-        f"projections bit-for-bit (model_fp8.py:3679-3682); this is that claim failing, not a "
+        f"projections bit-for-bit (model_fp8.py:4437-4448); this is that claim failing, not a "
         f"tolerance to widen"
     )
 
@@ -3132,4 +3586,703 @@ def test_softmaxscale_control_the_retired_latent_rank_value_fails_that_item() ->
     )
     assert SOFTMAX_SCALE != retired, (
         f"SOFTMAX_SCALE still reads the retired latent-rank value {retired!r}"
+    )
+
+
+# =============================================================================================== #
+# THE SELECTING-REGIME CAUSAL BOUND -- inc-glm53f-103's dispatch half.
+#
+# WHAT THE BOUND IS, in one sentence. Above the bypass bound the selector runs, and a query row must
+# not select a key pool whose tokens finish AFTER the row's own position -- so every such pool's
+# score is pushed to `-inf` before selection and any selection that comes back holding `-inf` is
+# replaced by the `-1` sentinel.
+#
+# WHY THE READING BELONGS IN THIS FILE and not only in `test_causal_bound.py`. That file measures
+# the two kernels against their oracles on a synthetic shape. This item measures the DISPATCH SITE:
+# that the indexer's own forward composes the bound, the landed selector and the sentinel in the
+# right order, on operands the indexer built itself, with the counters that prove which route ran.
+# A kernel that is correct and never called would pass there and fail here.
+#
+# TWO ITEMS IN THIS FILE, AND THE SECOND ONE IS A REPAIR (`103r5`). The block declared one, and the
+# one below was it. Review finding F1 at `reviews/glm-5.3-flash-port/bless-103-code-6874a0f5-findings.md`
+# measured what that leaves unread: this item pins `select_k == 2`, where the vendored selector takes
+# the NON-striking `max8` + `nc_find_index8` branch, so the parent commit `c81113a2` -- whose dispatch
+# site gathered the bounded scores instead of reading the selector's values -- passes every test the
+# range shipped. The lead ruled a second model-level item at a STRIKING `select_k`
+# (`approvals/LEAD-LOG.md` §750 ruling 2, §752); it is
+# :func:`test_forward_at_a_striking_select_k_sentinelises_every_pad_the_selector_returns` at the end of
+# this block. The plan revision that records two items is the lead's write, not this file's claim.
+#
+# THE FIGURES THIS ITEM READS WERE CORRECTED BEFORE IT WAS WRITTEN. The plan's first spelling of
+# them at rev 256 named rows 4-7 as the rows reading one sentinel. That does not follow from the
+# block's own predicate, `causal_len = position + 1` -- which is upstream's formula and which this
+# file's own fixtures already use, `seq_lens = arange(1, n + 1)`. Under it the rows reading one are
+# 3, 4, 5 and 6. Ruled at DECISIONS section 332, plan rev 257: ":889 becomes 'rows 3-6 one each'".
+# CARRIED FORWARD UNCHANGED to the 32-token case at plan rev 260 (entry `design-20260907-bd`): rows 3
+# to 6 still read one, rows 0 to 2 still read two, and the rows the longer case adds -- 7 through 31 --
+# all read zero, because every one of them completes at least `select_k` pools. The ruling's own words
+# still describe the vector; the case moved because the selector could not run the shorter one.
+# NOTHING HERE IS TYPED FROM THAT RULING: the vector is computed from this item's own inputs by
+# :func:`_expected_sentinel_counts`, and the superseded reading is PLANTED as the control, so an
+# implementation that used `position` instead of `position + 1` fails this item rather than passing
+# it.
+
+#: The 8 fixed lanes ``nisa.max8`` emits. THIS FILE ALREADY ARGUES THIS FLOOR at :138-166, where it
+#: is why ``PREFILL_TOKENS`` is 35 and not 19; it is named here so the tiny case and the boundary case
+#: below cite ONE floor instead of two, and so the reason a shorter case cannot run is readable in the
+#: file rather than only in a run record.
+MAX8_LANES = 8
+
+#: The shortest length that SELECTS at this file's dials AND that the selector can actually run.
+#: DERIVED from the dials and the lane floor, so a dial change moves the case instead of quietly
+#: turning it back into a bypass case that would read every counter below as a zero and pass for the
+#: wrong reason.
+#:
+#: WHY 32 AND NOT 12, which is what this constant read until plan revision 260. Twelve is one pool
+#: past the bypass boundary and is the shorter, sharper case -- and it CANNOT EXECUTE. At
+#: ``POOL_SIZE`` 4 it gives 3 candidate pools, and the vendored selector asserts at least 8 on the
+#: non-partition axis: ``rotational_topk.py:180`` -> ``rotational_topk_utils.py:994``
+#: ``naive_scanning_topk`` -> ``:1036`` ``nisa.max8`` -> ``nki/isa/_validation.py:1608``
+#: ``assert n >= 8``. Measured on the host, not inferred: the item raised
+#: ``AssertionError: max8 requires at least 8 elements per partition, got 3`` before it reached its
+#: own subject. 32 tokens give 8 pools, so one ``nisa.max8`` can run, and 32 is the SMALLEST length
+#: that clears the floor -- 28 gives 7 and misses it by one.
+#:
+#: THE CLAIM DID NOT MOVE WITH THE CASE. The formula below is unchanged, the vector is still computed
+#: from this item's own inputs, its first eight entries are what the 12-token case read, every row 32
+#: adds is a zero, and the superseded control still differs at rows 3 and 7. Ruled at plan revision
+#: 260, entry ``design-20260907-bd``.
+SELECTING_SEQ_LEN = POOL_SIZE * max(MAX8_LANES, TOPK_POOLS + 1)
+
+#: The families the SELECTING decision governs, each owing exactly one dispatch on one prefill leg.
+#: `causal_fill` is deliberately NOT here: it is inc-glm53f-099's bypass seam and owes a ZERO on
+#: this case, which is a different claim and is read as such below.
+SELECTING_ONE_FAMILIES: tuple[str, ...] = (
+    "paged_gather", "score_gemm", "topk_select", "index_expand",
+)
+
+
+def _causal_bound_apis():
+    """``{"bound": (reset, read), "sentinel": (reset, read)}`` for inc-glm53f-103's two seams.
+
+    A SIBLING OF :func:`_discover_counter_api`, NOT A SECOND CONVENTION. Same suffix rule, same
+    `reset_` prefix rule; the only difference is the arity it admits. It exists because
+    `causal_bound.py` carries TWO pairs -- the block requires "accessors and reset per entry point"
+    so that "exactly 1 per call, per entry point" is readable at all, where one summed pair could not
+    tell a bound call and a sentinel call apart from two bound calls.
+
+    THE SINGLE-PAIR HELPER'S REFUSAL IS ASSERTED HERE rather than described, because that helper
+    documents itself as failing loudly "if a module ever grows a second pair" and this is the first
+    module that has. If it ever stopped refusing, this rule would be redundant and a reader should
+    find that out from a failure, not from reading two helpers side by side.
+    """
+    module = _seam_module("causal_bound")
+    names = [n for n in dir(module) if n.endswith("_dispatch_counters")]
+    resets = sorted(n for n in names if n.startswith("reset_"))
+    reads = sorted(n for n in names if not n.startswith("reset_"))
+    assert len(resets) == 2 and len(reads) == 2, (module.__name__, resets, reads)
+    with pytest.raises(AssertionError):
+        _discover_counter_api(module)
+    out = {}
+    for key, token in (("bound", "causal_bound"), ("sentinel", "causal_sentinel")):
+        reset = [n for n in resets if token in n]
+        read = [n for n in reads if token in n]
+        assert len(reset) == 1 and len(read) == 1, (key, reset, read)
+        out[key] = (getattr(module, reset[0]), getattr(module, read[0]))
+    return out
+
+
+def _expected_sentinel_counts(seq_lens: torch.Tensor, select_k: int, pool: int,
+                              width: int, *, offset: int = 0) -> list[int]:
+    """Sentinels per row, COMPUTED from the predicate, the dials and this case's own lengths.
+
+    ``offset`` exists ONLY so the superseded reading can be produced by the same function as the
+    ruled one: ``offset=0`` is ``causal_len = seq_len = position + 1``, the block's predicate and
+    upstream's; ``offset=-1`` is ``causal_len = position``, the reading DECISIONS section 332 struck.
+    Producing both from one function is the point -- if the control came from a second expression the
+    two could drift and the control would stop being a control.
+
+    A row completes ``causal_len // pool`` pools, capped by the candidate width, and the selector
+    takes ``select_k`` of them, so the selections that reached no complete pool number
+    ``max(0, select_k - min(complete, width))``.
+    """
+    return [
+        max(0, int(select_k) - min((int(s) + int(offset)) // int(pool), int(width)))
+        for s in seq_lens
+    ]
+
+
+def _selecting_operands(cfg, *, seed: int, tokens: int = SELECTING_SEQ_LEN) -> dict:
+    """Operands for ``forward``'s prefill leg one pool ABOVE the bypass boundary.
+
+    ``seq_lens = arange(1, n + 1)`` is this file's own prefill convention, unchanged -- which is also
+    the evidence that ``causal_len`` is ``position + 1`` here and not ``position``.
+
+    ``tokens`` DEFAULTS TO THE DECLARED CASE and is a parameter only because the striking-``select_k``
+    item below needs a longer leg for the same shape of operand. It is one length, used for the row
+    count, the lengths and the slot mapping alike, so the two legs cannot disagree about it.
+    """
+    gen = torch.Generator().manual_seed(int(seed))
+    rows = int(tokens)
+    return {
+        "hidden": torch.randn(
+            rows, int(cfg.hidden_size), generator=gen, dtype=torch.float32
+        ),
+        "q_latent": torch.randn(
+            rows, int(cfg.q_lora_rank), generator=gen, dtype=torch.float32
+        ),
+        "pool_cache": torch.zeros(
+            PAGES * PAGE_SIZE, int(cfg.index_head_dim), dtype=torch.bfloat16
+        ),
+        "seq_lens": torch.arange(1, rows + 1, dtype=torch.int32),
+        "slot_mapping": prefill_slot_mapping(rows, int(cfg.index_kpool)),
+    }
+
+
+def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``forward`` above the bypass bound: every row selects only pools it completes.
+
+    FOUR READINGS, and they fail for four different reasons.
+      1. THE REGIME SELECTS. Read first, because every reading below is about the selecting chain and
+         would pass vacuously on the bypass -- where the two new counters, like every other one,
+         read zero.
+      2. THE POOL IDS CARRY THE RIGHT SENTINELS, per row, against a vector computed from this case's
+         own lengths and dials. This is the block's declared figure and the reason the item exists.
+      3. THE SUPERSEDED PREDICATE FAILS. The struck reading (`causal_len = position`) is computed by
+         the same function and asserted to DISAGREE, naming the rows where it differs -- so a
+         regression to it fails here instead of passing.
+      4. THE ROUTE RAN IN NKI. Each of this block's two entry points reads exactly one dispatch and
+         no fallback, `-047`'s selector reads exactly one, and `-099`'s bypass seam reads ZERO --
+         which is what says the two regimes are exclusive rather than both firing.
+
+    Certifying component (D1.4): `Glm5NextDSAIndexer.select_bounded_pools`, composing
+    `dsa_causal_bound`, the landed `dsa_topk_select` and `dsa_causal_sentinel`.
+    """
+    if not gate_live():
+        pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
+
+    stack, cfg, _gen = build_layer_stack(layers=1)
+    indexer = stack[0].attention.indexer
+    pool = int(cfg.index_kpool)
+    select_k = int(indexer.select_k())
+
+    # 1. THE REGIME SELECTS, read from the closed form before anything else.
+    candidates = SELECTING_SEQ_LEN // pool
+    say("D4", "regime", "seq_len", SELECTING_SEQ_LEN, "candidates", candidates,
+        "select_k", select_k, "bypass_bound", BYPASS_SEQ_LEN)
+    assert candidates > select_k, (
+        f"{SELECTING_SEQ_LEN} token(s) yields {candidates} complete pool(s) against select_k="
+        f"{select_k}; this item must sit ABOVE the strict bound or the bypass serves it and every "
+        f"counter below reads zero for a reason that has nothing to do with the causal bound"
+    )
+    # THE LANE FLOOR, READ BEFORE THE CASE IDENTITY. This is the reading whose ABSENCE let the
+    # 12-token case be ruled and land: the item asserted `candidates > select_k` and never that the
+    # selector could run the width it was handed, so it raised inside `nisa.max8` before reaching its
+    # own subject and reported nothing about the causal bound at all.
+    assert candidates >= MAX8_LANES, (
+        f"{SELECTING_SEQ_LEN} token(s) yields {candidates} candidate pool(s), under the "
+        f"{MAX8_LANES} lanes nisa.max8 emits; the selector refuses with 'max8 requires at least 8 "
+        f"elements per partition' (rotational_topk_utils.py:1036 -> nki/isa/_validation.py:1608) and "
+        f"this item never reaches the bound it exists to read"
+    )
+    assert SELECTING_SEQ_LEN == 32, (
+        f"the block declares a 32-token case and this file's dials now derive "
+        f"{SELECTING_SEQ_LEN}; the figures below are computed, but the case identity is declared"
+    )
+    assert select_k == TOPK_POOLS == 2 and pool == POOL_SIZE == 4, (select_k, pool)
+
+    bound_api, sentinel_api = _causal_bound_apis()["bound"], _causal_bound_apis()["sentinel"]
+    fill_reset, fill_read = _causal_fill_api()
+    ops = _selecting_operands(cfg, seed=9_103_001)
+
+    # The pool ids are the block's subject and `forward` returns the EXPANDED token indices, so the
+    # sentinel seam's own output is recorded as it passes. The recorder DELEGATES to the real seam,
+    # so it moves no counter of its own -- which the (1, 0) reading below then confirms.
+    recorded: list[torch.Tensor] = []
+    recorded_widths: list[int] = []
+    causal_bound_mod = _seam_module("causal_bound")
+    real_sentinel = causal_bound_mod.dsa_causal_sentinel
+
+    def recording_sentinel(values, indices, width):
+        # `width` IS FORWARDED AND NEVER DEFAULTED. The seam took two operands before `103r5` and
+        # takes three now; a spy that swallowed the third would keep passing while the dispatch site
+        # stopped screening pads, which is the defect this repair exists to remove.
+        out = real_sentinel(values, indices, width)
+        recorded.append(out.clone())
+        recorded_widths.append(int(width))
+        return out
+
+    reset_all_counters()
+    bound_api[0]()
+    sentinel_api[0]()
+    fill_reset()
+    spy = SeamSpy()
+    spy.install(monkeypatch)
+    monkeypatch.setattr(causal_bound_mod, "dsa_causal_sentinel", recording_sentinel)
+    try:
+        got = indexer.forward(
+            ops["hidden"], ops["q_latent"], ops["pool_cache"], ops["seq_lens"],
+            max_seq_len=SELECTING_SEQ_LEN, page_size=PAGE_SIZE,
+            slot_mapping=ops["slot_mapping"],
+        )
+    finally:
+        monkeypatch.undo()
+    readings = read_all_counters()
+    bound_count = tuple(int(v) for v in bound_api[1]())
+    sentinel_count = tuple(int(v) for v in sentinel_api[1]())
+    fill_count = tuple(int(v) for v in fill_read())
+
+    assert len(recorded) == 1, (
+        f"the sentinel seam ran {len(recorded)} time(s) on one prefill leg; the dispatch site "
+        f"composes it exactly once"
+    )
+    # AND THE WIDTH IT WAS GIVEN IS THE ONE THE SELECTOR SAW. `103r5`: the marker screens an index at
+    # or past `width`, so a `width` wider than the real pool columns disables that arm silently. The
+    # dispatch site reads it off the bounded tensor; this reads that the number arriving is the
+    # candidate count and not, say, the pool-cache row count or `select_k`.
+    say("D4", "sentinel_widths", recorded_widths, "candidates", candidates)
+    assert recorded_widths == [candidates], (
+        f"the dispatch site handed the marker width {recorded_widths} where the bounded tensor has "
+        f"{candidates} real pool column(s); a wider width turns the pad arm off without failing"
+    )
+    pool_ids = recorded[0]
+    assert pool_ids.dtype == torch.int32, pool_ids.dtype
+    assert tuple(pool_ids.shape) == (SELECTING_SEQ_LEN, select_k), tuple(pool_ids.shape)
+
+    # 2. THE POOL IDS CARRY THE RIGHT SENTINELS, per row, computed and not typed.
+    want = _expected_sentinel_counts(ops["seq_lens"], select_k, pool, candidates)
+    per_row = (pool_ids == -1).sum(dim=1).to(torch.int64).tolist()
+    say("D4", "sentinels_per_row", per_row, "computed", want,
+        "lengths", ops["seq_lens"].tolist())
+    assert per_row == want, (
+        f"the bounded chain read {per_row} sentinel(s) per row where the predicate computes {want}"
+    )
+    ones = [r for r, n in enumerate(want) if n == 1]
+    twos = [r for r, n in enumerate(want) if n == 2]
+    zeros = [r for r, n in enumerate(want) if n == 0]
+    say("D4", "rows_with_two", twos, "rows_with_one", ones, "rows_with_zero", zeros)
+    assert twos[0] == 0 and per_row[0] == 2, (twos, per_row[0])
+    assert ones == [3, 4, 5, 6], (
+        f"the rows reading one sentinel computed to {ones}; DECISIONS section 332 ruled the plan's "
+        f"figure to 'rows 3-6 one each' on exactly this arithmetic"
+    )
+    assert per_row[-1] == 0 and (SELECTING_SEQ_LEN - 1) in zeros, (per_row[-1], zeros)
+
+    # EVERY NON-SENTINEL POOL ID IS ONE THE ROW COMPLETES, which is inc-glm53f-048's precondition
+    # restated per row -- the property the whole increment exists to restore, read directly.
+    complete = [min(int(s) // pool, candidates) for s in ops["seq_lens"]]
+    illegal = [
+        (r, int(p)) for r in range(SELECTING_SEQ_LEN) for p in pool_ids[r]
+        if int(p) != -1 and not (0 <= int(p) < complete[r])
+    ]
+    say("D4", "illegal_pool_ids", len(illegal), "detail", illegal, "complete_pools", complete)
+    assert illegal == [], f"a row selected a pool it does not complete: {illegal}"
+
+    # 3. THE SUPERSEDED PREDICATE FAILS, from the same function at offset -1.
+    struck = _expected_sentinel_counts(ops["seq_lens"], select_k, pool, candidates, offset=-1)
+    differing = [r for r in range(SELECTING_SEQ_LEN) if struck[r] != want[r]]
+    say("D4", "struck_predicate", struck, "differs_at_rows", differing)
+    assert struck != want, (
+        "the struck reading (causal_len = position) agrees with the ruled one on this case, so this "
+        "item cannot tell them apart and the control is not a control"
+    )
+    assert differing == [3, 7], (
+        f"the two predicates differ at rows {differing}; on a 32-token case at these dials they "
+        f"differ at exactly rows 3 and 7 -- the two pool boundaries the off-by-one moves -- which is "
+        f"what makes this control able to fire. The wider case did not weaken it: the width cap does "
+        f"not reach these rows, so the differing set is the one the 12-token case read"
+    )
+    assert per_row != struck, (
+        f"the chain reproduced the STRUCK predicate {struck} rather than the ruled one {want}: the "
+        f"dispatch site is passing position where it owes position + 1"
+    )
+
+    # 4. THE ROUTE RAN IN NKI, form R-1, per entry point.
+    for family in FAMILIES:
+        say("D4", "counter", family, readings[family])
+    say("D4", "causal_bound", bound_count, "causal_sentinel", sentinel_count,
+        "causal_fill_099", fill_count)
+    assert bound_count == (1, 0), (
+        f"the bound seam read {bound_count} and owes exactly one NKI dispatch with no fallback; a "
+        f"torch masked_fill would read (0, 1) here and P13 forbids it"
+    )
+    assert sentinel_count == (1, 0), (
+        f"the sentinel seam read {sentinel_count} and owes exactly one NKI dispatch with no fallback"
+    )
+    assert fill_count == (0, 0), (
+        f"inc-glm53f-099's bypass seam read {fill_count} on a SELECTING case; the two regimes are "
+        f"exclusive and a non-zero here means both fired"
+    )
+    for family in SELECTING_ONE_FAMILIES:
+        assert readings[family] == (1, 0), (
+            f"{family} read {readings[family]} where the selecting chain owes exactly one dispatch "
+            f"and no fallback on one prefill leg"
+        )
+    assert all(v[1] == 0 for v in readings.values()), (
+        f"a torch fallback ran on the selecting path: {readings}"
+    )
+    control = readings["kpool_hadamard"]
+    assert control[0] > 0, (
+        f"kpool_hadamard read {control} on a call that must rotate the indexer query, so the counter "
+        f"instrument is not reading this call and the zeros above measure nothing"
+    )
+    spy.report("D4")
+    _check_two_instruments_agree("D4", spy, readings)
+    identity = causal_bound_mod.causal_bound_kernel_identity()
+    sentinel_identity = causal_bound_mod.causal_sentinel_kernel_identity()
+    say("D4", "kernel", identity, "sentinel_kernel", sentinel_identity)
+    assert identity is not None and identity[1].endswith("_causal_bound_nki"), identity
+    assert sentinel_identity is not None and sentinel_identity[1].endswith(
+        "_causal_sentinel_nki"
+    ), sentinel_identity
+
+    # AND THE EXPANSION STILL EMITS THE SHAPE EVERY CONSUMER READS, unchanged by the bound.
+    width = _bypass_width(indexer, pool)
+    say("D4", "shape", tuple(got.shape), "want", (SELECTING_SEQ_LEN, width),
+        "dtype", str(got.dtype))
+    assert got.dtype == torch.int32, got.dtype
+    assert tuple(got.shape) == (SELECTING_SEQ_LEN, width), tuple(got.shape)
+    live = got >= 0
+    limit = ops["seq_lens"].to(torch.int64).reshape(SELECTING_SEQ_LEN, 1).expand_as(got)
+    out_of_row = int((live & (got.to(torch.int64) >= limit)).sum())
+    say("D4", "live_tokens", int(live.sum()), "out_of_row", out_of_row,
+        "max_token", int(got.max()))
+    assert out_of_row == 0, (
+        f"{out_of_row} live token index(es) point past their own row's causal length, which is the "
+        f"defect the bound removes seen at the token level"
+    )
+
+
+# =========================================================================== #
+# THE SAME BOUND, AT A `select_k` WHERE THE SELECTOR STRIKES AND PADS -- repair `103r5`.
+#
+# WHAT THIS ITEM ADDS, in one sentence. The item above runs the dispatch site at `select_k = 2`, where
+# the vendored selector takes its non-striking, non-folding branch; this one runs the SAME dispatch
+# site at a `select_k` where the selector folds its input, PADS the short fold with a finite value,
+# strikes what it takes, and moves selected values across partitions with a matmul -- the four
+# behaviours the `103r5` repair exists to survive.
+#
+# WHY IT IS A SEPARATE ITEM AND NOT A PARAMETRISATION of the one above. The two read different
+# claims. That one reads the PREDICATE (`causal_len = position + 1`) against a superseded control and
+# owns this file's declared 32-token case; this one reads the MARKER (both arms) against the selector's
+# own returned pads. Parametrising would make one failure message answer for two claims.
+#
+# EVERY NUMBER BELOW IS DERIVED OR READ, AND THE PREMISES ARE READ OFF THE KERNEL'S OWN CONFIG. The
+# case needs three properties, and no comment in this file can promise them -- the kernel's factories
+# decide them from `(rows, width, k, dtype)`. So the item asks
+# `create_rotational_topk_config` (through the seam's own `_nki_config`) for `n_stages`,
+# `local_top_k_per_stage` and `padded_vocab_size`, and a failure of any premise is a DIAL finding for
+# the lead, not a finding about the module under test. That is the shape review finding R2 asked for:
+# the earlier `k = 16` case NAMED a branch instead of reading one.
+
+#: The striking case's ``select_k``, and why it is 16 rather than 8 or 2.
+#:
+#: `topk_core` strikes each value it takes -- `nc_match_replace8` with `imm=float("-inf")` -- on every
+#: fold whose `k` is a whole number of 8 (`rotational_topk_utils.py:1053-1066`), and takes the
+#: non-writing `max8` + `nc_find_index8` path only on a last fold with `k % 8 != 0` (`:1028-1039`).
+#: WHICH `k` REACHES `topk_core` DEPENDS ON THE STAGE COUNT, and that is the part the earlier round of
+#: this increment got wrong: at `n_stages == 1` the kernel calls `naive_scanning_topk` with the
+#: ORIGINAL `k` (`rotational_topk.py:163-183`, `rotational_topk_utils.py:994`), and at `n_stages >= 2`
+#: it calls `topk_core` per stage with `k = local_top_k_per_stage`, which the factory always aligns UP
+#: to 8 (`:428-430`) -- so the rotational path always strikes.
+#:
+#: 8 WOULD STRIKE AND WOULD STILL PROVE NOTHING. The factory's stage count is
+#: `div_ceil(min(k, vocab), 8)` (`:417`), so `k = 8` gives ONE stage: no folding, hence no pad column,
+#: and no rotation, hence no matmul.
+#:
+#: 16 IS NOT THE SMALLEST SUCH `k`, AND THIS FILE WILL NOT CLAIM IT IS. That claim is exactly what
+#: review finding R2 struck from the sibling test file, and the arithmetic here says the same thing:
+#: the stage count reaches 2 as soon as `min(k, vocab) >= 9`, so `k = 9` over a width of 11 is already
+#: rotational, already striking (`local_top_k_per_stage` aligns up to 8), and already padded. It would
+#: run on a 44-token leg instead of a 68-token one.
+#:
+#: 16 IS CHOSEN FOR A DIFFERENT AND SMALLER REASON: it is the smallest ROTATIONAL `k` for which
+#: `padded_k == orig_k` -- `local_top_k_per_stage * n_stages` is `8 * 2` (`:428-431`) -- which is also
+#: true of production's `k = 512`. (`k = 8` also has `padded_k == orig_k` and also strikes, but on the
+#: scanning branch, which is the branch this case exists to leave.) At `k = 9` the kernel would return its padded 16 and trim, adding one
+#: behaviour between the selector and the marker that production does not have. The cost is 24 extra
+#: token rows, and every property the case needs is READ from the config below either way, so a future
+#: lap may move this dial down without touching a single reading.
+STRIKING_SELECT_K = 16
+
+#: The candidate width: strictly above ``select_k`` -- `can_run_dsa_topk_select` refuses `k == width`
+#: (`topk_select.py:294`) -- and ODD, so the fold cannot divide it and a pad column must exist. The
+#: pad's own existence is read from `padded_vocab_size` below, not from this comment.
+STRIKING_CANDIDATES = STRIKING_SELECT_K + 1
+
+#: The prefill length that yields those candidates, and the ``index_topk`` that yields that
+#: ``select_k``. Both derived: ``select_k()`` is ``index_topk // index_kpool``
+#: (``model_fp8.py:3712``), and ``candidates`` is ``max_seq_len // index_kpool``
+#: (``model_fp8.py:4096``).
+STRIKING_SEQ_LEN = STRIKING_CANDIDATES * POOL_SIZE
+STRIKING_INDEX_TOPK = STRIKING_SELECT_K * POOL_SIZE
+
+
+def test_forward_at_a_striking_select_k_sentinelises_every_pad_the_selector_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``forward`` at a striking ``select_k``: no pad column survives into a row's pool ids.
+
+    SEVEN READINGS, each failing for its own reason.
+      1. THE CASE IS THE ONE IT CLAIMS -- dials first, from the built config.
+      2. THE GEOMETRY IS THE STRIKING, FOLDING, PADDING ONE -- read off the kernel's own factories:
+         at least two stages, a per-stage ``k`` that is a whole number of 8, and at least one pad
+         column. A failure here is a DIAL finding: the case did not reach its own subject.
+      3. THE SELECTOR REALLY RETURNED A PAD, and the pad's VALUE is above the marker's threshold --
+         the two facts that make the index arm load-bearing rather than decorative. Measured from the
+         operands the seam was handed, not argued.
+      4. NO SELECTED VALUE IS NaN. The finite ``BOUND_FILL`` exists so that the rotation matmul --
+         ``nisa.nc_matmul`` with a 0/1 permutation, where ``0 * -inf`` is NaN -- has no infinity to
+         destroy. A NaN here is a reading about the selector for the lead, and the record
+         (``increments/contradiction-103-selector-pad-6874a0f5.md``) already names it as unmeasured.
+      5. THE OUTPUT IS LEGAL: every id a row keeps is a pool that row completes, and no id is at or
+         past the width. This is the reading the parent commit fails.
+      6. THE ONE-ARM MARKER DISAGREES, computed from this run's own recorded values and indices. It is
+         asserted RED, so the pad arm is known to be doing work on this case rather than assumed to.
+      7. THE ROUTE RAN IN NKI, per entry point, with no torch fallback anywhere.
+
+    Certifying component (D1.4): ``Glm5NextDSAIndexer.select_bounded_pools`` -- the same component the
+    item above certifies, at the branch that item cannot reach (review finding F1).
+    """
+    if not gate_live():
+        pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
+
+    fill, mark = _fill_constants()
+    stack, cfg, _gen = build_layer_stack(
+        layers=1, seed=9_103_016, index_topk=STRIKING_INDEX_TOPK
+    )
+    indexer = stack[0].attention.indexer
+    pool = int(cfg.index_kpool)
+    select_k = int(indexer.select_k())
+    candidates = STRIKING_SEQ_LEN // pool
+
+    # 1. THE CASE IS THE ONE IT CLAIMS. Read before the run: a wrong dial here spends nothing.
+    say("D5", "seq_len", STRIKING_SEQ_LEN, "candidates", candidates, "select_k", select_k,
+        "index_topk", int(cfg.index_topk), "fill", fill, "mark", mark)
+    assert select_k == STRIKING_SELECT_K, (
+        f"the config built select_k={select_k} where this case declares {STRIKING_SELECT_K}; "
+        f"index_topk={int(cfg.index_topk)} over index_kpool={pool} is the only route to it"
+    )
+    assert candidates == STRIKING_CANDIDATES and candidates > select_k, (
+        f"{STRIKING_SEQ_LEN} token(s) yields {candidates} candidate pool(s) against select_k="
+        f"{select_k}; the selector refuses k == width and the bypass serves anything below it"
+    )
+    assert candidates >= MAX8_LANES, (candidates, MAX8_LANES)
+
+    bound_api, sentinel_api = _causal_bound_apis()["bound"], _causal_bound_apis()["sentinel"]
+    fill_reset, fill_read = _causal_fill_api()
+    ops = _selecting_operands(cfg, seed=9_103_016, tokens=STRIKING_SEQ_LEN)
+
+    # BOTH SEAMS ARE RECORDED, and each recorder DELEGATES to the real seam, so it moves no counter of
+    # its own -- which the (1, 0) readings below then confirm. The bound's output is recorded because
+    # it is the exact tensor the selector was handed: the width, the row count and the dtype the
+    # kernel's config is built from all come from it rather than from a number typed here.
+    bounded_seen: list[torch.Tensor] = []
+    values_seen: list[torch.Tensor] = []
+    indices_seen: list[torch.Tensor] = []
+    widths_seen: list[int] = []
+    marked_seen: list[torch.Tensor] = []
+    causal_bound_mod = _seam_module("causal_bound")
+    real_bound = causal_bound_mod.dsa_causal_bound
+    real_sentinel = causal_bound_mod.dsa_causal_sentinel
+
+    def recording_bound(scores, causal_len, pool_size):
+        out = real_bound(scores, causal_len, pool_size)
+        bounded_seen.append(out.clone())
+        return out
+
+    def recording_sentinel(values, indices, width):
+        values_seen.append(values.clone())
+        indices_seen.append(indices.clone())
+        widths_seen.append(int(width))
+        out = real_sentinel(values, indices, width)
+        marked_seen.append(out.clone())
+        return out
+
+    reset_all_counters()
+    bound_api[0]()
+    sentinel_api[0]()
+    fill_reset()
+    spy = SeamSpy()
+    spy.install(monkeypatch)
+    monkeypatch.setattr(causal_bound_mod, "dsa_causal_bound", recording_bound)
+    monkeypatch.setattr(causal_bound_mod, "dsa_causal_sentinel", recording_sentinel)
+    try:
+        got = indexer.forward(
+            ops["hidden"], ops["q_latent"], ops["pool_cache"], ops["seq_lens"],
+            max_seq_len=STRIKING_SEQ_LEN, page_size=PAGE_SIZE,
+            slot_mapping=ops["slot_mapping"],
+        )
+    finally:
+        monkeypatch.undo()
+    readings = read_all_counters()
+    bound_count = tuple(int(v) for v in bound_api[1]())
+    sentinel_count = tuple(int(v) for v in sentinel_api[1]())
+    fill_count = tuple(int(v) for v in fill_read())
+
+    assert len(bounded_seen) == len(marked_seen) == 1, (len(bounded_seen), len(marked_seen))
+    bounded, values, raw_ids, pool_ids = (
+        bounded_seen[0], values_seen[0], indices_seen[0], marked_seen[0]
+    )
+    say("D5", "bounded", tuple(bounded.shape), str(bounded.dtype), "values",
+        tuple(values.shape), str(values.dtype), "widths", widths_seen)
+    assert tuple(bounded.shape) == (STRIKING_SEQ_LEN, candidates), tuple(bounded.shape)
+    assert widths_seen == [candidates], (
+        f"the marker was handed width {widths_seen} where the tensor the selector saw has "
+        f"{candidates} real column(s); a wider width switches the index arm off silently"
+    )
+    assert tuple(pool_ids.shape) == (STRIKING_SEQ_LEN, select_k), tuple(pool_ids.shape)
+    assert pool_ids.dtype == torch.int32, pool_ids.dtype
+
+    # 2. THE GEOMETRY IS THE STRIKING, FOLDING, PADDING ONE, asked of the kernel's own factories with
+    # the run's own operands. A failure of any of these three is a DIAL finding.
+    from vllm_neuron.functional.dsa.topk_select import _nki_config, _nki_dtype_of
+
+    kernel_cfg = _nki_config(
+        int(bounded.shape[0]), int(bounded.shape[1]), select_k, _nki_dtype_of(bounded)
+    )
+    n_stages = int(kernel_cfg.n_stages)
+    local_k = int(kernel_cfg.local_top_k_per_stage)
+    pad_columns = int(kernel_cfg.padded_vocab_size) - int(kernel_cfg.vocab_size)
+    say("D5", "n_stages", n_stages, "local_top_k_per_stage", local_k, "stage_free_size",
+        int(kernel_cfg.stage_free_size), "vocab", int(kernel_cfg.vocab_size),
+        "padded_vocab", int(kernel_cfg.padded_vocab_size), "pad_columns", pad_columns)
+    assert int(kernel_cfg.vocab_size) == candidates, (int(kernel_cfg.vocab_size), candidates)
+    assert n_stages >= 2, (
+        f"the factory chose n_stages={n_stages}, so the kernel takes naive_scanning_topk with the "
+        f"ORIGINAL k and neither folds nor rotates; this case then reads no pad and no matmul. A "
+        f"DIAL finding: raise select_k or the width until the factory chooses two stages"
+    )
+    assert local_k % MAX8_LANES == 0, (
+        f"the per-stage k is {local_k}, not a whole number of {MAX8_LANES}, so topk_core takes the "
+        f"non-striking max8 + nc_find_index8 branch and this case is the item above with a longer leg"
+    )
+    assert pad_columns >= 1, (
+        f"padded_vocab_size equals vocab_size, so the fold divides the width evenly and the selector "
+        f"pads NOTHING; the index arm cannot be read on this case. A DIAL finding: the width must not "
+        f"be a multiple of n_stages={n_stages}"
+    )
+
+    # 3. THE SELECTOR REALLY RETURNED A PAD, AND ITS VALUE IS ABOVE THE MARK. The first fact makes the
+    # index arm reachable; the second is why the value arm alone cannot stand in for it.
+    out_of_range = raw_ids.to(torch.int64) >= candidates
+    pad_slots = int(out_of_range.sum())
+    pad_values = values[out_of_range]
+    distinct = sorted({float(v) for v in pad_values.to(torch.float32).flatten()})
+    say("D5", "out_of_range_selections", pad_slots, "rows_touched",
+        int(out_of_range.any(dim=1).sum()), "max_id", int(raw_ids.max()),
+        "pad_values", distinct[:8], "pad_value_count", len(distinct))
+    assert pad_slots >= 1, (
+        f"the selector returned no index at or past the width on a geometry the factory says has "
+        f"{pad_columns} pad column(s), so this case does not read the index arm at all. A DIAL "
+        f"finding about the case, not a pass"
+    )
+    assert bool((pad_values > mark).all()), (
+        f"every out-of-range slot came back at or below the mark {mark}, so the VALUE arm alone would "
+        f"have caught them and this case still does not read the index arm. The pad values seen were "
+        f"{distinct[:8]}"
+    )
+
+    # 4. NO SELECTED VALUE IS NaN, which is what the finite fill was chosen for.
+    nan_slots = int(torch.isnan(values).sum())
+    say("D5", "nan_values", nan_slots, "min_value", float(values.min()),
+        "values_at_or_below_mark", int(torch.le(values, mark).sum()))
+    assert nan_slots == 0, (
+        f"{nan_slots} selected value(s) came back NaN. The bound writes the FINITE {fill} so that the "
+        f"rotation matmul has no infinity to turn into one; a NaN here is a reading about the "
+        f"selector for the lead -- the marker still fires on it, so the ids stay legal, but the "
+        f"per-row count below is then measuring something this case did not declare"
+    )
+
+    # 5. THE OUTPUT IS LEGAL, which is the reading the parent commit fails.
+    complete = [min(int(s) // pool, candidates) for s in ops["seq_lens"]]
+    illegal = [
+        (r, int(p)) for r in range(STRIKING_SEQ_LEN) for p in pool_ids[r]
+        if int(p) != -1 and not (0 <= int(p) < complete[r])
+    ]
+    say("D5", "illegal_pool_ids", len(illegal), "detail", illegal[:12],
+        "still_out_of_range", int((pool_ids.to(torch.int64) >= candidates).sum()))
+    assert int((pool_ids.to(torch.int64) >= candidates).sum()) == 0, (
+        f"a pad column survived into the pool ids: {illegal[:12]}. This is the `103r5` defect at the "
+        f"dispatch site -- a finite pad outranks a bounded column, so it wins a slot, and only the "
+        f"index arm can tell it from a real selection"
+    )
+    assert illegal == [], f"a row selected a pool it does not complete: {illegal[:12]}"
+
+    want = _expected_sentinel_counts(ops["seq_lens"], select_k, pool, candidates)
+    per_row = (pool_ids == -1).sum(dim=1).to(torch.int64).tolist()
+    say("D5", "sentinels_per_row", per_row, "computed", want)
+    assert per_row == want, (
+        f"the bounded chain read {per_row} sentinel(s) per row where the predicate computes {want}. "
+        f"Fewer means a fill or a pad survived; more means a slot was marked that carried a real "
+        f"selection -- a NaN value is the one known way that happens and reading 4 covers it"
+    )
+    assert want[0] == select_k and want[-1] == 0, (
+        f"the computed vector is {want[:3]}..{want[-3:]}; row 0 completes no pool so it owes "
+        f"{select_k} sentinels and the longest row completes {complete[-1]} so it owes none. Without "
+        f"both ends this case reads one regime only"
+    )
+
+    # 6. THE ONE-ARM MARKER DISAGREES, computed from this run's own recorded operands. Asserted RED:
+    # if the value arm alone reached the same answer, the index arm would be decoration on this case.
+    value_only = torch.where(
+        values > mark, raw_ids, torch.full_like(raw_ids, -1)
+    )
+    value_only_out_of_range = int((value_only.to(torch.int64) >= candidates).sum())
+    value_only_counts = (value_only == -1).sum(dim=1).to(torch.int64).tolist()
+    say("D5", "value_only_out_of_range", value_only_out_of_range,
+        "value_only_counts", value_only_counts[:8])
+    assert value_only_out_of_range >= 1, (
+        f"the value arm ALONE left no out-of-range id, so this case cannot tell the two-arm marker "
+        f"from the one-arm form the repair replaced"
+    )
+    assert value_only_counts != per_row, (
+        f"the one-arm form read the same per-row counts as the two-arm marker, so the index arm "
+        f"changed nothing measurable here"
+    )
+
+    # 7. THE ROUTE RAN IN NKI, form R-1, per entry point.
+    for family in FAMILIES:
+        say("D5", "counter", family, readings[family])
+    say("D5", "causal_bound", bound_count, "causal_sentinel", sentinel_count,
+        "causal_fill_099", fill_count)
+    assert bound_count == (1, 0), (
+        f"the bound seam read {bound_count} and owes exactly one NKI dispatch with no fallback"
+    )
+    assert sentinel_count == (1, 0), (
+        f"the sentinel seam read {sentinel_count} and owes exactly one NKI dispatch with no fallback"
+    )
+    assert fill_count == (0, 0), (
+        f"inc-glm53f-099's bypass seam read {fill_count} on a SELECTING case"
+    )
+    for family in SELECTING_ONE_FAMILIES:
+        assert readings[family] == (1, 0), (
+            f"{family} read {readings[family]} where the selecting chain owes exactly one dispatch "
+            f"and no fallback on one prefill leg"
+        )
+    assert all(v[1] == 0 for v in readings.values()), (
+        f"a torch fallback ran on the selecting path: {readings}"
+    )
+    control = readings["kpool_hadamard"]
+    assert control[0] > 0, (
+        f"kpool_hadamard read {control} on a call that must rotate the indexer query, so the counter "
+        f"instrument is not reading this call and the zeros above measure nothing"
+    )
+    spy.report("D5")
+    _check_two_instruments_agree("D5", spy, readings)
+
+    # AND THE EXPANSION CARRIES NOTHING PAST A ROW'S OWN LENGTH, the same defect at the token level.
+    width = _bypass_width(indexer, pool)
+    live = got >= 0
+    limit = ops["seq_lens"].to(torch.int64).reshape(STRIKING_SEQ_LEN, 1).expand_as(got)
+    out_of_row = int((live & (got.to(torch.int64) >= limit)).sum())
+    say("D5", "shape", tuple(got.shape), "want", (STRIKING_SEQ_LEN, width),
+        "live_tokens", int(live.sum()), "out_of_row", out_of_row, "max_token", int(got.max()))
+    assert got.dtype == torch.int32, got.dtype
+    assert tuple(got.shape) == (STRIKING_SEQ_LEN, width), tuple(got.shape)
+    assert out_of_row == 0, (
+        f"{out_of_row} live token index(es) point past their own row's causal length. A surviving pad "
+        f"id expands to tokens at or past {candidates * pool}, which no row of this case can see"
     )
