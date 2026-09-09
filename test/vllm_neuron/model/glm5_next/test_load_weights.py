@@ -64,7 +64,6 @@ from vllm_neuron.model.glm5_next.model_fp8 import (
     _is_fp8_dtype,
     _scale_prep_leaves,
 )
-from vllm_neuron.functional.blockwise_fp8_mm import BlockwiseFp8MmError
 from vllm_neuron.model.glm5_next.quantization import DEFAULT_WEIGHT_BLOCK_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     DSA_SCALED_PROJECTIONS,
@@ -1904,13 +1903,20 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 # 256x256 blocks`` from ``blockwise_fp8_mm.py:283-287``, reached through
 # ``model_fp8.py:1576``.
 #
-# The bank does not need that prep. ``Glm5NextRoutedExperts`` defines NEITHER
-# load-time prep -- only ``Glm5NextSharedExperts`` (scale) and
-# ``Glm5NextMLAAttention`` (projection) do -- so ``_run_load_time_preps``'s
-# ``hasattr(type(module), ...)`` gate never visits a bank at all. So these items
-# set ``n_shared_experts=0``, which ``model_fp8.py:1857`` reads as "build no
-# shared-expert module", and the routed load completes on the bank's own path.
-# The landed constants are REUSED rather than copied, so a change to the
+# So these items set ``n_shared_experts=0``, which ``model_fp8.py`` reads as "build
+# no shared-expert module", and the routed load completes on the bank's own path.
+#
+# ``inc-glm53f-054a`` CHANGED THE SECOND HALF OF THIS PARAGRAPH, which used to read
+# "The bank does not need that prep. ``Glm5NextRoutedExperts`` defines NEITHER
+# load-time prep ... so ``_run_load_time_preps``'s ``hasattr(type(module), ...)``
+# gate never visits a bank at all." Item (i) gave the bank its own
+# ``prepare_scale_operands``, so that gate now DOES visit every bank, and the bank's
+# prep retiles -- which refuses an extent that is not a whole 256 block. The
+# sentence above about the shared expert is unchanged and still the reason
+# ``n_shared_experts`` is 0 here; what moved is the BANK's own extents, which
+# :func:`_blocked_bank_overrides` writes at 512 by 256 for exactly these items.
+# ``MINI_WEIGHT_SHAPE`` stays ``(128, 128)`` and stays every other item's shape.
+# The landed constants are otherwise REUSED rather than copied, so a change to the
 # miniature moves these items with the other nine.
 # --------------------------------------------------------------------------- #
 
@@ -1918,6 +1924,105 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 #: it expects on each rank. Two ranks over ``MINI_ROUTED_EXPERTS`` experts.
 STACKED_EP_DEGREE = 2
 STACKED_EXPERTS_PER_RANK = MINI_ROUTED_EXPERTS // STACKED_EP_DEGREE
+
+
+#: The bank's widths for the items whose load now RUNS the bank's scale prep --
+#: ``inc-glm53f-054a``'s migration of the five items that reached it.
+#:
+#: A NEW NAME, NOT A REBINDING, on the precedent :data:`DEFERRED_NARROW` states
+#: for the same situation. :data:`MINI_WEIGHT_SHAPE` stays ``(128, 128)`` and stays
+#: every other item's shape; the increment plan's hand-off bullet says in words
+#: that it is not widened, and it is not. What changed is that the bank now
+#: declares ``prepare_scale_operands``, so a load that carries a bank reaches a
+#: retile that refuses any extent which is not a whole ``256`` block
+#: (``blockwise_fp8_retile.py:232-245``) -- and ``(128, 128)`` is not one. Only the
+#: items that reach the prep are given extents that are.
+#:
+#: WHY 512 BY 256. 256 is the smallest width the consumer admits at all (DECISIONS
+#: §83 ruling 1, the ground :data:`DEFERRED_NARROW` records). The out extent is
+#: DOUBLE that on purpose: at 256 by 256 every grid is a single block, and a
+#: single-block grid cannot tell a coarsening apart from no coarsening at all, so
+#: the axis the retile actually folds would be untested.
+BLOCKED_BANK_OUT = 512
+BLOCKED_BANK_IN = 256
+
+#: The bank's three leaves with the dim each is written along, in the frame the
+#: bank registers them: gate and up as ``[I, H]`` and down as ``[H, I]``. The same
+#: dims :data:`DEFERRED_FAMILIES` states for the same three, so the two fixtures
+#: cannot disagree about the bank's orientation.
+BLOCKED_BANK_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
+    ("Glm5NextRoutedExperts", "gate_proj_weight"): (0, BLOCKED_BANK_OUT),
+    ("Glm5NextRoutedExperts", "up_proj_weight"): (0, BLOCKED_BANK_OUT),
+    ("Glm5NextRoutedExperts", "down_proj_weight"): (1, BLOCKED_BANK_OUT),
+}
+
+
+def _blocked_bank_overrides(
+    model: Glm5NextForConditionalGeneration,
+    mappings: dict[str, str | list[str]],
+) -> dict[str, torch.Tensor]:
+    """The bank's checkpoint tensors at 256-blocked extents, VALUES unchanged.
+
+    Only the extents move. Every tensor is built the way
+    :func:`_write_miniature_checkpoint` builds it -- ``torch.ones`` squeezed into
+    fp8 for a weight, ``torch.full(0.5)`` for a grid -- so no item that reads a
+    VALUE can move, and the items that read an extent read it from the checkpoint's
+    own slices through :func:`_implied_numels` rather than from a constant.
+
+    Nothing here spells a checkpoint key: the keys come from the map, the shapes
+    from :data:`BLOCKED_BANK_FAMILIES`, and a grid's shape from
+    ``block_grid_shape`` -- the same closed form the loader divides by. That is
+    :func:`_shard_key_overrides`'s discipline, followed here for the same reason.
+
+    ALL SCALES EQUAL IS THE POINT, not laziness. Every ratio inside a ``256``
+    block is then exactly 1, so the retile's rescale is bit-exact and its two
+    losslessness counters read zero. A fixture with unequal scales would make
+    those counters report the fixture rather than the layout.
+    """
+    overrides: dict[str, torch.Tensor] = {}
+    for path, module in model.named_modules():
+        cls = type(module).__name__
+        for (family, leaf), (shard_dim, full) in BLOCKED_BANK_FAMILIES.items():
+            if cls != family:
+                continue
+            param = f"{path}.{leaf}"
+            if param not in mappings:
+                continue
+            keys = _keys_of(mappings, param)
+            scales = scale_keys(keys)
+            weights = [key for key in keys if key not in scales]
+            shape = (
+                (full, BLOCKED_BANK_IN)
+                if shard_dim == 0
+                else (BLOCKED_BANK_IN, full)
+            )
+            grid_shape = block_grid_shape(shape, DEFAULT_WEIGHT_BLOCK_SIZE)
+            for key in weights:
+                overrides[key] = torch.ones(
+                    shape, dtype=torch.bfloat16
+                ).to(torch.float8_e4m3fn)
+            for key in scales:
+                overrides[key] = torch.full(grid_shape, 0.5, dtype=torch.float32)
+    return overrides
+
+
+def _stacked_checkpoint(
+    directory: Path,
+    mappings: dict[str, str | list[str]],
+    model: Glm5NextForConditionalGeneration,
+) -> int:
+    """:func:`_write_miniature_checkpoint` with the bank at 256-blocked extents.
+
+    ONE call site for the migration, so the five items that reach the bank's scale
+    prep cannot drift apart in the widths they load. Everything except the bank is
+    written exactly as the landed writer writes it.
+    """
+    return _write_miniature_checkpoint(
+        directory,
+        mappings,
+        model,
+        extra_overrides=_blocked_bank_overrides(model, mappings),
+    )
 
 
 def _stacked_config() -> Glm5NextConfig:
@@ -2078,7 +2183,7 @@ def test_the_stacked_bank_delivers_every_expert_or_refuses_by_name(
     directory = tmp_path / "stacked"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    written = _write_miniature_checkpoint(directory, mappings, model)
+    written = _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
 
     print(f"CONJUNCT1_CHECKPOINT_TENSORS={written}")
@@ -2560,7 +2665,7 @@ def test_bankscale_grids_arrive_on_the_bank_as_plain_attributes(
     directory = tmp_path / "bankscale"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    _write_miniature_checkpoint(directory, mappings, model)
+    _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
     assert banks, (
         "this configuration produced no expert-bank entry, so conjunct (1) would "
@@ -2685,7 +2790,7 @@ def test_bankscale_grids_arrive_on_the_bank_as_plain_attributes(
     # ── the D1.5 control: alter ONE scale slice, move EXACTLY one row ─────────
     control_directory = tmp_path / "bankscale-control"
     control_model = _stacked_model()
-    _write_miniature_checkpoint(control_directory, mappings, control_model)
+    _stacked_checkpoint(control_directory, mappings, control_model)
     _distinguish_bank_experts(control_directory, subject_keys)
     altered_expert = layout.experts - 1
     altered_key = subject_keys[layout.scale_at[altered_expert]]
@@ -2744,7 +2849,7 @@ def test_bankscale_leaf_derivation_reads_presence_not_declaration(
     directory = tmp_path / "bankscale-leaves"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    _write_miniature_checkpoint(directory, mappings, model)
+    _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
     assert banks, "no bank entry, so this item has no subject"
     model.load_weights(str(directory), device, None)
@@ -2809,31 +2914,41 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 ) -> None:
     """(3) THE LOOP'S BEHAVIOUR IS UNCHANGED for every landed module.
 
-    Certifies ``_run_load_time_preps``'s visit, read from its RETURN VALUE. The
-    bank now carries three scale grids, and the question this item answers is
-    whether that changed who the loop calls. It did not, and it could not: the
-    loop's gate is a TYPE test and ``Glm5NextRoutedExperts`` defines no
-    ``prepare_scale_operands`` -- ``inc-glm53f-054``'s work, moved there at design
-    entry ``design-20260905-x``.
+    Certifies ``_run_load_time_preps``'s visit, read from its RETURN VALUE.
+
+    ``inc-glm53f-054a`` MOVED THIS ITEM'S SCALE COUNT, and the increment plan said
+    it would: "the prep's arrival makes ``_run_load_time_preps`` visit the bank
+    (its scale-call count rises by the bank count) -- read it here". Before item
+    (i) the bank declared no ``prepare_scale_operands`` and the count was zero.
+    It declares one now, the loop's gate is a type test, so every bank module is
+    visited and the count is the number of bank modules. The fixture moved with
+    it: this item's bank is written at 256-blocked extents
+    (:func:`_blocked_bank_overrides`), because the prep it now reaches retiles and
+    the retile refuses anything narrower. ``MINI_WEIGHT_SHAPE`` did not move.
 
     (i) On a completing load of the bank configuration, the returned pair equals
     the module counts the loop's own two gates select, derived from the tree
-    rather than written down. The scale count is zero because this configuration
-    builds no shared-expert module, and no bank is visited.
+    rather than written down, and the scale half of that pair equals the bank
+    count. Both sides come from the tree, so the agreement is a reading of the
+    loop and not of a number kept here.
 
-    THE CONTROL MOVES, which is what makes that zero a reading. A stub
-    ``prepare_scale_operands`` is planted on the BANK'S TYPE -- the thing the gate
-    actually tests -- and the scale count rises by the number of bank modules. The
-    stub is reached through the full landed path: the device pre-flight passes,
-    ``_scale_prep_leaves`` hands over three leaves, and the operands the loop
-    collects include the three grids conjunct (1) read. So the zero above means
-    "no bank declares a prep", not "the loop cannot reach one".
+    THE FALSIFIER IS THE DENSE ARM, and this is where it changed. The planted stub
+    below used to be what made the zero a reading; a zero that is now a bank count
+    needs a case with no bank instead, which the all-dense tree is -- it declares
+    no bank entry and its scale count is still zero. So the two arms bracket the
+    reading: bank present, count rises; bank absent, count zero.
+
+    THE STUB ARM STILL EARNS ITS PLACE, for a different reading. It captures the
+    SIX OPERANDS the loop hands the bank's prep -- three weights and the three
+    grids conjunct (1) read -- which the real prep consumes and never reports. The
+    stub is reached through the full landed path, so the device pre-flight passing
+    and ``_scale_prep_leaves`` yielding three leaves are part of what it shows.
     """
     device = torch.device("cpu")
     directory = tmp_path / "bankscale-loop"
     model = _stacked_model()
     mappings = _mappings_for(_stacked_config())
-    _write_miniature_checkpoint(directory, mappings, model)
+    _stacked_checkpoint(directory, mappings, model)
     banks = _bank_entries(mappings)
     owner_paths = _bank_owner_paths(banks)
     assert owner_paths, "no bank module, so this item has no subject"
@@ -2861,14 +2976,23 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
         f"gates select ({expected_projection}, {expected_scale}) modules, so it "
         f"visited something other than what it tests for"
     )
-    assert scale_calls == 0, (
-        f"the loop ran {scale_calls} scale preps on a configuration with no "
-        f"shared-expert module, so it is now visiting a bank -- which is "
-        f"inc-glm53f-054's work and breaks the 128-extent load this file reads"
+    # ``inc-glm53f-054a``. THIS COUNT MOVED, from 0 to the number of bank modules,
+    # and the increment plan's hand-off bullet says so in advance: "the prep's
+    # arrival makes ``_run_load_time_preps`` visit the bank (its scale-call count
+    # rises by the bank count) -- read it here". The bank declares
+    # ``prepare_scale_operands`` as of item (i), and the loop's gate is a type test,
+    # so the visit is not optional. The number is read off the tree's own bank
+    # modules rather than typed, so it follows the fixture instead of pinning it.
+    assert scale_calls == len(owner_paths), (
+        f"the loop ran {scale_calls} scale preps over {len(owner_paths)} bank "
+        f"modules on a configuration with no shared-expert module. Every scale "
+        f"prep on this tree is a bank's, so the two must agree: fewer means a "
+        f"bank was skipped, more means something else declared a prep"
     )
 
     # ── the same reading on the DENSE configuration ──────────────────────────
-    # Six of the seven completing loads in this file build ``_dense_model()``, and
+    # Most of the completing loads in this file build ``_dense_model()`` -- six of
+    # the seven that existed before ``inc-glm53f-054a`` item (iii) added one -- and
     # the STOP condition of this increment's block is that none of their readings
     # moves. The bank branch cannot reach this tree -- an all-dense config has no
     # sparse layer and so no bank entry -- and the pair is read here to say so
@@ -2904,7 +3028,12 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
         f"select {dense_expected}"
     )
 
-    # ── the control, and it MOVES: plant a prep on the BANK'S TYPE ────────────
+    # ── the stub arm: read the SIX OPERANDS the loop hands the bank's prep ────
+    # ``inc-glm53f-054a`` re-purposed this arm rather than deleting it. It was the
+    # control that made a zero a reading; the zero is a bank count now and the
+    # all-dense arm above is what brackets it. What the stub still shows, and
+    # nothing else does, is WHICH operands the loop collects and hands over -- the
+    # real prep consumes them and reports nothing about them.
     handed: dict[str, list[str]] = {}
 
     def stub(self, **operands) -> None:
@@ -2920,8 +3049,9 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 
     assert planted_scale == len(owner_paths), (
         f"with a prep planted on {bank_type.__name__} the loop ran "
-        f"{planted_scale} scale preps over {len(owner_paths)} bank modules, so "
-        f"the zero above is not a reading of who declares a prep"
+        f"{planted_scale} scale preps over {len(owner_paths)} bank modules; the "
+        f"stub stands in for the real prep on the same type, so the count it "
+        f"produces must be the same one the real prep produced above"
     )
     assert planted_projection == projection_calls, (
         f"planting a SCALE prep moved the projection count from "
@@ -3108,12 +3238,20 @@ def _shard_config(first_k_dense: int) -> Glm5NextConfig:
     """The shard fixture: :func:`_stacked_config`'s fields with two widths shrunk.
 
     ``n_shared_experts=0`` is carried over from :func:`_stacked_config` and is not
-    a convenience. No completing load in this file has a shared-expert module,
+    a convenience. No completing load on THIS fixture has a shared-expert module,
     because the landed shared-expert scale prep cannot run on a 128-block
     miniature (``inc-glm53f-095b``, which hands that fixture to ``-054``). So the
     shared expert's three deferred families cannot be observed by a real load
     here at all, and conjunct (4) prints that rather than quietly counting six
     deferred families where the table names nine.
+
+    THE FILE-WIDE CLAIM THIS SENTENCE USED TO MAKE IS NO LONGER TRUE, and it is
+    narrowed rather than deleted so the reason survives. It read "No completing
+    load in this file has a shared-expert module". ``inc-glm53f-054a`` item (iii)
+    added one -- ``test_blocked_the_shared_expert_prep_completes_a_load_and_the_
+    retile_ran``, on the 256-blocked checkpoint, where the prep can run because
+    the extents are whole blocks and the load-path retile publishes the grid it
+    wants. This fixture still has none, for the reason above.
 
     ``first_k_dense`` IS THE ONE VARYING FIELD, and the two values it takes are
     both readings rather than one real case and one convenience -- the same reason
@@ -3193,6 +3331,91 @@ def _shard_pattern(
         line = ((index % 119) + 8).to(torch.uint8).view(torch.float8_e4m3fn)
     else:
         line = (index + 1).to(dtype)
+    view = [1] * len(shape)
+    view[dim] = extent
+    return line.reshape(view).expand(shape).contiguous()
+
+
+#: The classes whose LOAD PATH coarsens a checkpoint scale grid onto the consumer's
+#: 256 granularity. Read off the two call sites that do it -- the republish the two
+#: dense-shaped classes go through (``model_fp8.py:6915``) and the routed bank's own
+#: prep (``:2281-2293``) -- rather than from a guess about which families are
+#: quantised. A family outside this tuple keeps :func:`_shard_pattern`'s ramp,
+#: because nothing rescales its weights there and the ramp's per-128-tile
+#: distinctness is the stronger position reading.
+_RETILED_AT_LOAD_CLASSES = (
+    "Glm5NextDenseMLP",
+    "Glm5NextSharedExperts",
+    "Glm5NextRoutedExperts",
+)
+
+#: The exponents the pow2 grid cycles through, one per 256 block along the shard
+#: dim. Eight of them, which is the widest block count any family in the deferred
+#: fixture has -- the shared expert's 2048 shard extent is 8 blocks of 256 -- so no
+#: tensor this fixture writes aliases at all. Small magnitudes on purpose: the
+#: values multiply fp8 bytes in the dequantisations these items compare.
+_POW2_GRID_EXPONENTS = tuple(range(-3, 5))
+
+
+def _tiles_per_consumer_block() -> int:
+    """How many checkpoint ``128`` tiles one consumer ``256`` block covers.
+
+    Derived from the consumer's own block size and the checkpoint's, never typed:
+    a fixture that hardcoded 2 would keep writing 2 the day either side moved.
+    """
+    block = _WL_FP8.consumer_block_quant_size()
+    tiles, remainder = divmod(block, DEFAULT_WEIGHT_BLOCK_SIZE[0])
+    assert remainder == 0 and len(set(DEFAULT_WEIGHT_BLOCK_SIZE)) == 1, (
+        f"the consumer's {block} block is not a whole number of the checkpoint's "
+        f"{DEFAULT_WEIGHT_BLOCK_SIZE} tiles, so no grid this fixture writes can be "
+        f"one the coarsening reproduces and the items below would be measuring the "
+        f"fixture instead of the loader"
+    )
+    return tiles
+
+
+def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
+    """A ``128``-tile scale grid the ``256`` coarsening reproduces BIT-EXACTLY.
+
+    ``inc-glm53f-054a`` repair batch R6 item R-T2 wrote this, on a measurement
+    rather than a preference. The coarsening keeps ONE scale per 256 block and
+    rescales the block's other three 128 tiles into it
+    (``blockwise_fp8_retile.py:443-480``), so on :func:`_shard_pattern`'s fp32 ramp
+    -- 1, 2, 3, ... along the shard dim -- the first block's ratio is exactly 2 and
+    every later one is a fraction like 4/3. Both consequences were measured on the
+    host: the fractions raise ``inexact_rescales``, and an fp8 byte at the maximum
+    doubled leaves what fp8-e4m3 can hold, which the landed cast turned into a
+    silent NaN and R6 item R-P1 now REFUSES by name
+    (``blockwise_fp8_retile.py:461-476``).
+
+    So a grid whose four 128-tile scales AGREE inside every 256 block is not a
+    fixture retuned to pass. It is the only grid family on which a BIT-EXACT
+    reassembly can be asked at all: :func:`_as_the_loader_left_it` undoes the
+    republish's FRAME and cannot undo a requantisation (see its own docstring), so
+    any ratio other than 1 moves the weight bytes the comparison is about. With
+    every ratio 1 the coarsening moves the layout and no byte, which is exactly
+    what those items claim.
+
+    Every value is an exact power of two, so the dequantisations these items
+    compare stay exact in fp32 and the retained scale satisfies the complete
+    losslessness condition ``inc-glm53f-024`` part 5 states. Each 256 BLOCK along
+    ``dim`` gets its own value, so "did this rank get the right blocks" is still
+    answerable -- and a rank boundary is always a whole block here, because the
+    consumer refuses any other shard.
+
+    WHAT IT GIVES UP, STATED RATHER THAN LEFT TO BE FOUND. A scale-position mixup
+    INSIDE one 256 block is invisible on this grid, where the ramp would catch it.
+    No single fixture can hold both readings. The ramp reading is kept by the item
+    that keeps the ramp and asserts the refusal fires by name,
+    :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`.
+    """
+    per_block = _tiles_per_consumer_block()
+    extent = shape[dim]
+    block = torch.arange(extent, dtype=torch.int64) // per_block
+    exponents = torch.tensor(_POW2_GRID_EXPONENTS, dtype=torch.int64)
+    line = torch.ldexp(
+        torch.ones(extent, dtype=torch.float32), exponents[block % exponents.numel()]
+    )
     view = [1] * len(shape)
     view[dim] = extent
     return line.reshape(view).expand(shape).contiguous()
@@ -3313,6 +3536,15 @@ def _shard_checkpoint(
     mappings = _mappings_for(config)
     reference = Glm5NextForConditionalGeneration(config)
     overrides = _shard_key_overrides(reference, mappings)
+    # ``inc-glm53f-054a``'s migration. This fixture's own narrow width is
+    # :data:`SHARD_NARROW`, which is 8 and stays 8 -- it is ``-094``'s constant and
+    # every family here except the bank is measured against it. The bank is the one
+    # family whose load now runs a scale prep, and that prep retiles, and the retile
+    # refuses an extent that is not a whole 256 block. So the bank alone takes
+    # :data:`BLOCKED_BANK_IN`, from its own table, and the eighteen sharded families
+    # are untouched. On the all-dense layout this adds no key at all, because no bank
+    # module exists to be found.
+    overrides.update(_blocked_bank_overrides(reference, mappings))
     assert len(overrides) >= len(SHARD_FAMILIES), (
         f"only {len(overrides)} checkpoint keys were given shard tensors, fewer "
         f"than the {len(SHARD_FAMILIES)} families this file declares sharded, so "
@@ -3358,6 +3590,58 @@ def _max_abs_diff(left: torch.Tensor, right: torch.Tensor) -> float:
 # --------------------------------------------------------------------------- #
 
 
+#: The two classes whose loaded tensors are REPUBLISHED before any forward sees them.
+#: ``inc-glm53f-054a`` repair round 1: their load path now transposes each weight and
+#: its scale grid once, into the frame ``blockwise_fp8_mm`` multiplies in, because the
+#: checkpoint's own layout is the transpose of it and the kernel scale operand is built
+#: at load from the stored extents (so a per-forward transpose would agree on shape and
+#: be wrong on numbers). The routed expert bank is NOT here: it has its own prep and
+#: this republish never runs on it.
+_REPUBLISHED_CLASSES = ("Glm5NextDenseMLP", "Glm5NextSharedExperts")
+
+
+def _as_the_loader_left_it(
+    module: torch.nn.Module, name: str, tensor: torch.Tensor
+) -> torch.Tensor:
+    """One loaded tensor put back in the frame the LOADER delivered it in.
+
+    ``inc-glm53f-054a`` repair round 1. Every reading below that is about the
+    LOADER's own work -- which dim a family shards on, what a per-rank slice is,
+    whether two ranks reassemble the whole tensor -- asks its question of the
+    checkpoint's layout, and the load path no longer leaves the two republished
+    classes in that layout. So those readings pass through here, and their expected
+    values do NOT move: the declared shard dims, the per-rank widths and the
+    bit-exact reassembly are all still asserted against the same numbers this file
+    always asserted them against.
+
+    THE UNDO IS A TRANSPOSE AND NOTHING ELSE. The republish's other step, coarsening
+    a ``128``-tile grid onto the ``256`` public one, is NOT undone here and cannot
+    be: it requantises. A reading that needs the raw grid VALUES of a republished
+    class has to say so itself; this helper only restores the FRAME.
+
+    It keys on the class rather than on a shape, because a square weight's frame is
+    invisible in its shape and a reading that guessed from the shape would silently
+    stop undoing anything the day a miniature stopped being square.
+    """
+    if type(module).__name__ not in _REPUBLISHED_CLASSES:
+        return tensor
+    if not name.startswith(("gate_proj", "up_proj", "down_proj")):
+        return tensor
+    if tensor.dim() != 2:
+        return tensor
+    return tensor.t()
+
+
+def _in_the_loader_frame(
+    model: Glm5NextForConditionalGeneration, dotted: str
+) -> torch.Tensor:
+    """``_as_the_loader_left_it`` for a reading that holds only the dotted name."""
+    path, leaf = dotted.rsplit(".", 1)
+    return _as_the_loader_left_it(
+        model.get_submodule(path), leaf, _loaded(model, dotted)
+    )
+
+
 def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
@@ -3379,8 +3663,12 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
 
     whole = _load_at_world(directory, 1, 0, monkeypatch, MINI_ALL_DENSE_FIRST_K)
     control = {
-        f"{path}.{leaf}": tuple(_loaded(whole, f"{path}.{leaf}").shape)
-        for path, _, leaf, _, _ in _sharded_leaves(whole)
+        f"{path}.{leaf}": tuple(
+            _as_the_loader_left_it(
+                module, leaf, _loaded(whole, f"{path}.{leaf}")
+            ).shape
+        )
+        for path, module, leaf, _, _ in _sharded_leaves(whole)
     }
     print(f"CONJUNCT1_FAMILIES_AT_WORLD_1={len(control)}")
 
@@ -3403,7 +3691,12 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
             )
             expected = list(full_shape)
             expected[shard_dim] = full // SHARD_WORLD
-            got = tuple(_loaded(sharded, dotted).shape)
+            # READ IN THE LOADER'S FRAME: the declared per-rank shape below is a
+            # statement about the checkpoint's layout, and the two republished
+            # classes no longer store that layout.
+            got = tuple(
+                _as_the_loader_left_it(module, leaf, _loaded(sharded, dotted)).shape
+            )
             assert got == tuple(expected), (
                 f"{dotted} loaded {got} at rank {rank} of world size {SHARD_WORLD}; "
                 f"this file declares it sharded on dim {shard_dim} of a full "
@@ -3417,11 +3710,15 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
             families_seen.add((type(module).__name__, leaf))
             checked += 1
 
+    # BOTH SIDES IN THE LOADER'S FRAME. ``control`` was read in that frame, so a
+    # raw read here would count a republished family as "moved" because its two
+    # axes swapped, which is not what this reading is for: it is for showing that
+    # the shard changed an extent (D1.5).
     moved = {
         rank: sum(
             1
             for dotted, shape in control.items()
-            if shape != tuple(_loaded(sharded, dotted).shape)
+            if shape != tuple(_in_the_loader_frame(sharded, dotted).shape)
         )
         for rank, sharded in sorted(per_rank.items())
     }
@@ -3473,12 +3770,17 @@ def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
     rejoined = 0
     worst = 0.0
     ranks_differ = 0
-    for path, _, leaf, shard_dim, full in leaves:
+    for path, module, leaf, shard_dim, full in leaves:
         dotted = f"{path}.{leaf}"
-        reference = _loaded(whole, dotted)
+        # BOTH SIDES IN THE LOADER'S FRAME. ``narrow`` below takes the slice on the
+        # dim this file declares the family sharded on, which is a dim of the
+        # CHECKPOINT's layout; on a republished class the stored tensor's dims are
+        # swapped, and narrowing 256 rows out of a dim of 8 would raise rather than
+        # fail an assertion.
+        reference = _as_the_loader_left_it(module, leaf, _loaded(whole, dotted))
         per_rank = full // SHARD_WORLD
         for rank, model in ((0, rank0), (1, rank1)):
-            mine = _loaded(model, dotted)
+            mine = _as_the_loader_left_it(module, leaf, _loaded(model, dotted))
             expected = reference.narrow(shard_dim, rank * per_rank, per_rank)
             assert tuple(mine.shape) == tuple(expected.shape), (
                 f"{dotted} at rank {rank} is {tuple(mine.shape)} and the matching "
@@ -3499,8 +3801,14 @@ def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
         # tensor". The two slice comparisons above imply it, and this reads it the
         # way the criterion is written -- and it also fails if the two halves are
         # each right but no longer join to the declared full extent.
+        # Both pieces back in the loader's frame first: ``shard_dim`` is a dim of
+        # the CHECKPOINT's layout, which the republished classes no longer store.
         reassembled = torch.cat(
-            [_loaded(rank0, dotted), _loaded(rank1, dotted)], dim=shard_dim
+            [
+                _in_the_loader_frame(rank0, dotted),
+                _in_the_loader_frame(rank1, dotted),
+            ],
+            dim=shard_dim,
         )
         assert tuple(reassembled.shape) == tuple(reference.shape), (
             f"{dotted}: the two ranks' tensors concatenate to "
@@ -3517,8 +3825,8 @@ def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
 
         if (
             _max_abs_diff(
-                _loaded(rank0, dotted).narrow(shard_dim, 0, 1),
-                _loaded(rank1, dotted).narrow(shard_dim, 0, 1),
+                _in_the_loader_frame(rank0, dotted).narrow(shard_dim, 0, 1),
+                _in_the_loader_frame(rank1, dotted).narrow(shard_dim, 0, 1),
             )
             != 0.0
         ):
@@ -3605,18 +3913,30 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
                 f"{path}.{leaf}'s per-rank extent is narrower than one block, so "
                 f"there is no aligned grid shard for this item to measure"
             )
-            reference = getattr(whole.get_submodule(path), attribute)
+            # THE GRID IS READ IN THE LOADER'S FRAME, for this item's own reason: it
+            # compares the grid against the one the CHECKPOINT holds and against
+            # slices taken on the dim the checkpoint shards. The dense MLP's load
+            # path now republishes both weight and grid transposed. Nothing is
+            # coarsened here -- this fixture's per-rank hidden extent is
+            # SHARD_NARROW, which is not a whole consumer block, so the republish's
+            # first step records a skip and only the frame moves.
+            whole_module = whole.get_submodule(path)
+            reference = _as_the_loader_left_it(
+                whole_module, attribute, getattr(whole_module, attribute)
+            )
             assert tuple(reference.shape) == tuple(written.shape), (
                 f"{path}.{attribute} arrived {tuple(reference.shape)} at world size "
                 f"1 but the checkpoint holds {tuple(written.shape)}"
             )
             grids += 1
             for rank, model in ((0, rank0), (1, rank1)):
-                mine = getattr(model.get_submodule(path), attribute, None)
+                rank_module = model.get_submodule(path)
+                mine = getattr(rank_module, attribute, None)
                 assert mine is not None, (
                     f"{path}.{attribute} does not exist after the rank-{rank} load, "
                     f"so a sharded weight's grid never arrived at all"
                 )
+                mine = _as_the_loader_left_it(rank_module, attribute, mine)
                 expected = reference.narrow(shard_dim, rank * blocks, blocks)
                 assert tuple(mine.shape) == tuple(expected.shape), (
                     f"{path}.{attribute} is {tuple(mine.shape)} at rank {rank}; its "
@@ -4160,8 +4480,21 @@ def _deferred_config(shared_experts: int = MINI_SHARED_EXPERTS) -> Glm5NextConfi
 def _deferred_key_overrides(
     model: Glm5NextForConditionalGeneration,
     mappings: dict[str, str | list[str]],
+    *,
+    ramp_grids: bool = False,
 ) -> dict[str, torch.Tensor]:
     """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
+
+    A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK, and that
+    is R6 item R-T2's change here. Every family in :data:`_RETILED_AT_LOAD_CLASSES`
+    has whole-256 extents in this fixture, so its load coarsens the grid; on the
+    ramp that coarsening rescales weight bytes, which contradicts the bit-exact
+    readings below and now REFUSES where a byte leaves the fp8 range (R6 item
+    R-P1). :func:`_pow2_block_grid_pattern` carries the reasoning and what it gives
+    up. Every other family keeps the ramp: nothing rescales its weights.
+
+    ``ramp_grids=True`` writes the ramp for EVERY family, which is the fixture the
+    refusal item needs and the only caller that asks for it.
 
     A bank entry is E weight keys and E scale keys interleaved, so its arm writes
     one tensor per expert at that expert's own full width -- the loader's job is to
@@ -4209,18 +4542,31 @@ def _deferred_key_overrides(
                 overrides[key] = _shard_pattern(
                     shape, shard_dim, torch.float8_e4m3fn
                 )
+            coarsened = not ramp_grids and family in _RETILED_AT_LOAD_CLASSES
             for key in scales:
-                overrides[key] = _shard_pattern(grid_shape, shard_dim, torch.float32)
+                overrides[key] = (
+                    _pow2_block_grid_pattern(grid_shape, shard_dim)
+                    if coarsened
+                    else _shard_pattern(grid_shape, shard_dim, torch.float32)
+                )
     return overrides
 
 
-def _deferred_checkpoint(tmp_path: Path) -> tuple[Path, dict, dict]:
-    """One checkpoint holding every full tensor these five items read."""
+def _deferred_checkpoint(
+    tmp_path: Path, *, ramp_grids: bool = False, name: str = "deferred"
+) -> tuple[Path, dict, dict]:
+    """One checkpoint holding every full tensor these five items read.
+
+    ``ramp_grids`` and ``name`` exist for R6 item R-T2's refusal item alone: it
+    needs the SAME checkpoint with the ramp scale grid restored, written beside this
+    one rather than over it, so the two loads in that item differ in exactly the one
+    field it varies.
+    """
     config = _deferred_config()
     mappings = _mappings_for(config)
     reference = Glm5NextForConditionalGeneration(config)
-    overrides = _deferred_key_overrides(reference, mappings)
-    directory = tmp_path / "deferred"
+    overrides = _deferred_key_overrides(reference, mappings, ramp_grids=ramp_grids)
+    directory = tmp_path / name
     _write_miniature_checkpoint(
         directory, mappings, reference, extra_overrides=overrides
     )
@@ -4261,16 +4607,23 @@ def _mesh_answers(world_size: int, ep_degree: int, rank: int) -> tuple[int, int]
 
 
 class _DeferredLoad(NamedTuple):
-    """One load's outcome: the model with its shards attached, and the refusal.
+    """One load's outcome: the model with its shards attached, and the prep's count.
 
-    ``refusal`` is the ``BlockwiseFp8MmError`` text when the shared expert's
-    ``-054``-owned prep refused the checkpoint-tile grid, and ``None`` for the
-    firing control that carries no shared expert. Both are readings; neither is a
-    failure of this file.
+    ``prepared`` is how many scale operands the shared expert's prep built -- 3 on
+    every completing load that carries one -- and ``None`` for the firing control
+    that carries no shared expert. Both are readings; neither is a failure of this
+    file.
+
+    ``inc-glm53f-054a`` REPLACED THE FIELD THIS TUPLE CARRIED, and the replacement
+    was named in advance. It was ``refusal``: the ``BlockwiseFp8MmError`` text from
+    a prep that could not read a checkpoint-tile grid, because nothing retiled it.
+    :func:`_load_at_ep`'s own comment said that when ``-054`` landed the retile
+    this reading would flip to "the prep built 3" and the capture would become a
+    completing load. Item (iv) landed it, so it did.
     """
 
     model: Glm5NextForConditionalGeneration
-    refusal: str | None
+    prepared: int | None
 
 
 def _load_at_ep(
@@ -4310,30 +4663,28 @@ def _load_at_ep(
     _seed_page_cache_signal()
     if shared_experts == 0:
         # THE FIRING CONTROL. Same fixture, same narrow width, no shared expert --
-        # so the load runs to the end and records NO refusal. Without this side the
-        # recorded gap below would read the same whether the prep refused or the
-        # fixture could not load at all.
+        # so the load runs to the end and there is no prep to count. Without this
+        # side the reading below would be the same whether the prep built three
+        # operands or the fixture simply loaded with nothing to prepare.
         model.load_weights(str(directory), torch.device("cpu"), None)
         return _DeferredLoad(model, None)
 
-    # THE RECORDED GAP, OBSERVED RATHER THAN AVOIDED. DECISIONS §84: nothing on the
-    # shared expert's load path retiles its scale grid from the checkpoint's
-    # (128, 128) tiles onto the 256-granularity PUBLIC grid that the landed
-    # ``prepare_scale_operands`` demands (``model_fp8.py:1820-1824``), and placing
-    # that retile is ``inc-glm53f-054``'s by design entry x. So this load ATTACHES
-    # every shard and then refuses inside the prep, which runs after attachment
-    # (``load_weights``: shards at :4143, preps at :4154).
+    # THE GAP IS CLOSED, AND THE SAME ARITHMETIC READS IT EITHER WAY. Until
+    # ``inc-glm53f-054a`` item (iv), nothing on the shared expert's load path
+    # retiled its scale grid from the checkpoint's ``(128, 128)`` tiles onto the
+    # 256-granularity PUBLIC grid the landed ``prepare_scale_operands`` demands, so
+    # this load attached every shard and then refused inside the prep. DECISIONS §84
+    # placed that retile in this block; the comment that stood here named the flip
+    # in advance -- "the prep built 3", and the capture becomes a completing load.
     #
-    # WHEN ``-054`` LANDS THE RETILE THIS READING FLIPS to "the prep built 3" and
-    # the capture below becomes a completing load. That is the expected change,
-    # named here so the flip is a recorded move rather than a surprise.
-    with pytest.raises(BlockwiseFp8MmError) as raised:
-        model.load_weights(str(directory), torch.device("cpu"), None)
-    refusal = str(raised.value)
+    # THE TWO GRIDS BELOW ARE UNCHANGED and are still this file's own arithmetic.
+    # They used to be the two the refusal had to name: the grid the loader attached
+    # and the grid the prep wanted. They are now the grid the retile STARTED from
+    # and the grid the module ARRIVED at, so the same two numbers read the fix that
+    # read the defect, and a retile that published the wrong granularity fails here
+    # rather than passing quietly.
+    model.load_weights(str(directory), torch.device("cpu"), None)
 
-    # THE TWO GRIDS ARE THIS FILE'S OWN ARITHMETIC, not read back from the message.
-    # The prep's loop takes gate_proj first, so the refusal is the shared expert's
-    # gate: its per-rank rows by this fixture's narrow width.
     block = _WL_FP8.consumer_block_quant_size()
     rows = _padded_shard_extent(SHARED_INTERMEDIATE, world_size, block)
     cols = DEFERRED_NARROW
@@ -4342,19 +4693,104 @@ def _load_at_ep(
         cols // DEFAULT_WEIGHT_BLOCK_SIZE[1],
     )
     public_grid = (rows // block, cols // block)
-    assert f"shape {tile_grid}" in refusal, (
-        f"the refusal does not name the checkpoint-tile grid {tile_grid} the loader "
-        f"attached: {refusal}"
+
+    shared = [
+        (path, module)
+        for path, module in model.named_modules()
+        if type(module).__name__ == "Glm5NextSharedExperts"
+    ]
+    assert shared, (
+        f"this load was asked for {shared_experts} shared experts and built no "
+        f"Glm5NextSharedExperts module, so there is no prep here to read"
     )
-    assert f"expected {public_grid}" in refusal, (
-        f"the refusal does not name the public grid {public_grid} the prep demands: "
-        f"{refusal}"
+
+    # The prep's loop takes gate_proj first, so gate_proj is the projection the
+    # refusal used to name and the one read here, for continuity.
+    built: set[int] = set()
+    for path, module in shared:
+        prepared = getattr(module, Glm5NextSharedExperts.PREPARED_SCALE_OPERANDS_ATTR)
+        built.add(len(prepared))
+        health = getattr(module, Glm5NextSharedExperts.SHARED_RETILE_HEALTH_ATTR)
+        record = health["gate_proj_weight"]
+        assert record["retiled"] is True, (
+            f"{path}.gate_proj_weight was not retiled: {record.get('reason')}. At "
+            f"[{rows},{cols}] both extents are whole {block} blocks, so a skip "
+            f"here means the retile could not read the extents it was given"
+        )
+        assert tuple(record["checkpoint_grid"]) == tile_grid, (
+            f"{path} retiled from grid {tuple(record['checkpoint_grid'])}, not the "
+            f"checkpoint-tile grid {tile_grid} this world size produces"
+        )
+        assert tuple(record["public_grid"]) == public_grid, (
+            f"{path} published grid {tuple(record['public_grid'])}, not the public "
+            f"grid {public_grid} the prep demands at [K={rows}, N={cols}]"
+        )
+        # WHAT THE MODULE ARRIVES AT IS THE PUBLIC GRID TRANSPOSED, and this is the
+        # one reading in this helper that ``inc-glm53f-054a`` repair round 1 moved.
+        # The retile still publishes ``public_grid`` -- that is asserted three lines
+        # up, off its own health record -- and the republish that FOLLOWS the retile
+        # then turns the weight and its grid together into the frame
+        # ``blockwise_fp8_mm`` multiplies in. So the attribute the prep reads holds
+        # the reversed pair. Asserting the reversed pair keeps the reading
+        # falsifiable: a retile that published the wrong granularity still fails
+        # here, and so does a republish that moved one of the pair without the other.
+        compute_grid = tuple(reversed(public_grid))
+        grid = getattr(module, f"gate_proj_{FP8_SCALE_SUFFIX}")
+        assert tuple(grid.shape) == compute_grid, (
+            f"{path}.gate_proj_{FP8_SCALE_SUFFIX} is {tuple(grid.shape)} on the "
+            f"module after the load, not the {compute_grid} the republish leaves "
+            f"(the published {public_grid} transposed); the retile has to replace "
+            f"the attribute the prep reads, not a copy of it"
+        )
+        weight = _loaded(model, f"{path}.gate_proj_weight")
+        assert tuple(weight.shape) == (cols, rows), (
+            f"{path}.gate_proj_weight is {tuple(weight.shape)} after the load; the "
+            f"loader delivers [{rows},{cols}] and the republish has to leave the "
+            f"[K={cols}, N={rows}] frame the seam contracts on, or the prepared "
+            f"scale operand above was built from the other frame"
+        )
+
+    assert built == {3}, (
+        f"the shared experts built {sorted(built)} scale operands, not 3 each. "
+        f"Three projections, one operand apiece, and the load completed -- so a "
+        f"shortfall means a projection was skipped rather than refused"
     )
-    assert f"[K={rows}, N={cols}]" in refusal, (
-        f"the refusal does not name the weight extents [K={rows}, N={cols}] this "
-        f"world size produces: {refusal}"
-    )
-    return _DeferredLoad(model, refusal)
+
+    # THE DENSE MLP IS ENROLLED IN THE SAME REPUBLISH, and a REAL load is the only
+    # place that can say so. ``inc-glm53f-054a`` repair round 1 gave that class the
+    # method, and ``_run_load_time_preps`` finds it by
+    # ``hasattr(type(module), "retile_checkpoint_scale_grids")`` -- so the health
+    # record below exists only if the enrolment fired on this load. A conjunct that
+    # called the method directly would prove the method and not the enrolment, which
+    # is the blindness the review found in the first place.
+    #
+    # THE FRAME FLIP IS READ FROM THE RECORD AND NOT FROM A SHAPE, deliberately: at
+    # this fixture's world size the dense per-rank weight is SQUARE, so its transpose
+    # is invisible in its shape and a shape assertion here would pass either way.
+    dense_frames = 0
+    for path, module in model.named_modules():
+        if type(module).__name__ != "Glm5NextDenseMLP":
+            continue
+        health = getattr(module, module.DENSE_RETILE_HEALTH_ATTR, None)
+        assert health is not None, (
+            f"{path} carries no republish health record after a real load, so the "
+            f"load-time prep loop did not reach Glm5NextDenseMLP at all -- the "
+            f"dense route is back to refusing the loader's frame at layer 0"
+        )
+        for leaf, record in health.items():
+            assert record.get("transposed") is True, (
+                f"{path}.{leaf} was not republished into the compute frame: "
+                f"{record}"
+            )
+            assert tuple(record["compute_frame"]) == tuple(
+                reversed(tuple(record["loader_frame"]))
+            ), (
+                f"{path}.{leaf} went from {record['loader_frame']} to "
+                f"{record['compute_frame']}, which is not that pair transposed"
+            )
+            dense_frames += 1
+    print(f"DEFERRED_DENSE_REPUBLISHED_PROJECTIONS={dense_frames}")
+    return _DeferredLoad(model, 3)
 
 
 def _deferred_leaves(
@@ -4403,40 +4839,40 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
         )
         for rank in range(SHARD_EP_WORLD)
     }
-    # The RECORDED GAP is read on every rank before anything else: each load
-    # attached its shards and then the -054-owned prep refused the checkpoint-tile
-    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
-    # counted, so an item cannot read shards from a load that refused for some
-    # other reason.
+    # THE PREP'S OWN COUNT is read on every rank before anything else: each load
+    # attached its shards, the load-path retile published the public grid, and the
+    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # against this file's arithmetic; here the count is only counted, so an item
+    # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
-    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
-    print(f"CONJUNCT1D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
-    # The gap's own words, so the transcript carries the refusal verbatim and a
-    # later reader can see WHICH refusal these items recorded.
-    print(f"CONJUNCT1D_RECORDED_GAP_REFUSAL={loads[0].refusal}")
-    assert sorted(gap_refusals) == sorted(models), (
-        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
-        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
-        f"(so -054 landed and this reading flips) or never reached the prep"
+    prepped = [rank for rank, load in loads.items() if load.prepared == 3]
+    print(f"CONJUNCT1D_RANKS_WHOSE_PREP_BUILT_THREE={sorted(prepped)}")
+    print(f"CONJUNCT1D_PREPARED_OPERANDS_PER_RANK={loads[0].prepared}")
+    assert sorted(prepped) == sorted(models), (
+        f"only ranks {sorted(prepped)} built the shared expert's three scale "
+        f"operands, of {sorted(models)}. A rank that built none either never "
+        f"reached the prep or the load-path retile did not publish its grid"
     )
     whole_load = _load_at_ep(directory, 1, 0, 1, monkeypatch)
     whole = whole_load.model
-    assert whole_load.refusal is not None, (
-        "the world-size-1 load did not refuse inside the prep, so the recorded gap "
-        "is not a property of the shared expert's grid granularity after all"
+    assert whole_load.prepared == 3, (
+        f"the world-size-1 load built {whole_load.prepared} scale operands, not "
+        f"3, so the prep's success is a property of the sharded widths rather "
+        f"than of the retile that publishes the grid at any width"
     )
 
     # THE FIRING CONTROL (DECISIONS §84 ruling (ii)). The same fixture at the same
-    # narrow width with NO shared expert loads to the end and records no refusal, so
+    # narrow width with NO shared expert loads to the end and has no prep to run, so
     # the readings above are of the shared expert's prep and not of a fixture that
-    # cannot load at all.
+    # would load either way.
     control = _load_at_ep(
         directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch, shared_experts=0
     )
-    print(f"CONJUNCT1D_CONTROL_REFUSAL={control.refusal}")
-    assert control.refusal is None, (
-        f"the no-shared-expert control ALSO refused: {control.refusal}. Then the "
-        f"refusal is not the shared expert's prep and the recorded gap is misnamed"
+    print(f"CONJUNCT1D_CONTROL_PREPARED={control.prepared}")
+    assert control.prepared is None, (
+        f"the no-shared-expert control reported {control.prepared} prepared "
+        f"operands. Then the count above is not the shared expert's prep and the "
+        f"reading is misnamed"
     )
     control_shards = _sharded_leaves(control.model) + [
         row
@@ -4456,7 +4892,12 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
         for path, module, leaf, shard_dim, full in _deferred_leaves(model):
             cls = type(module).__name__
             dotted = f"{path}.{leaf}"
-            got = tuple(_loaded(model, dotted).shape)
+            # IN THE LOADER'S FRAME: ``expected`` below is this file's own rule about
+            # the CHECKPOINT's extents divided by a world size, and the two
+            # republished classes no longer store that layout.
+            got = tuple(
+                _as_the_loader_left_it(module, leaf, _loaded(model, dotted)).shape
+            )
             if cls in DEFERRED_EP_GROUP_CLASSES:
                 # A bank carries a LEADING expert axis, so its declared dim moves
                 # one place right and the leading extent is this EP rank's experts.
@@ -4521,13 +4962,13 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
         f"CONJUNCT1D_PER_RANK_SHAPES_AS_DECLARED={checked}/"
         f"{SHARD_EP_WORLD * len(_deferred_leaves(models[0]))}"
     )
-    # ATTACHMENT BEFORE REFUSAL (DECISIONS §84 ruling (ii)). Every shape above was
-    # read off a module whose load REFUSED, and each rank in ``models`` is a rank in
-    # ``gap_refusals`` by the assertion at the top of this item. So the attachment
-    # completed and the refusal came after it. Item (2) reads the same shards' BYTES.
+    # ATTACHMENT THEN PREP (DECISIONS §84 ruling (ii)). Every shape above was read
+    # off a module whose load COMPLETED, and each rank in ``models`` is a rank in
+    # ``prepped`` by the assertion at the top of this item. So the attachment
+    # finished and the prep ran on it. Item (2) reads the same shards' BYTES.
     print(
-        f"CONJUNCT1D_ATTACHED_ON_REFUSING_RANKS={checked} on ranks "
-        f"{sorted(gap_refusals)}"
+        f"CONJUNCT1D_ATTACHED_ON_PREPARED_RANKS={checked} on ranks "
+        f"{sorted(prepped)}"
     )
     assert checked == SHARD_EP_WORLD * len(_deferred_leaves(models[0]))
     # Section 79.1: a subset reading over a measured set also asserts non-empty.
@@ -4541,7 +4982,10 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     whole_checked = 0
     for path, module, leaf, shard_dim, full in _deferred_leaves(whole):
         dotted = f"{path}.{leaf}"
-        got = tuple(_loaded(whole, dotted).shape)
+        # In the loader's frame, for the reason given at the rank loop above.
+        got = tuple(
+            _as_the_loader_left_it(module, leaf, _loaded(whole, dotted)).shape
+        )
         base = list(
             _deferred_full_shape(type(module).__name__, leaf, shard_dim, full)
         )
@@ -4649,18 +5093,18 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
         )
         for rank in range(SHARD_EP_WORLD)
     }
-    # The RECORDED GAP is read on every rank before anything else: each load
-    # attached its shards and then the -054-owned prep refused the checkpoint-tile
-    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
-    # counted, so an item cannot read shards from a load that refused for some
-    # other reason.
+    # THE PREP'S OWN COUNT is read on every rank before anything else: each load
+    # attached its shards, the load-path retile published the public grid, and the
+    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # against this file's arithmetic; here the count is only counted, so an item
+    # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
-    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
-    print(f"CONJUNCT2D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
-    assert sorted(gap_refusals) == sorted(models), (
-        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
-        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
-        f"(so -054 landed and this reading flips) or never reached the prep"
+    prepped = [rank for rank, load in loads.items() if load.prepared == 3]
+    print(f"CONJUNCT2D_RANKS_WHOSE_PREP_BUILT_THREE={sorted(prepped)}")
+    assert sorted(prepped) == sorted(models), (
+        f"only ranks {sorted(prepped)} built the shared expert's three scale "
+        f"operands, of {sorted(models)}. A rank that built none either never "
+        f"reached the prep or the load-path retile did not publish its grid"
     )
 
     reassembled = 0
@@ -4686,8 +5130,25 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
             trim[shard_dim + 1] = slice(0, full)
             got = joined[tuple(trim)]
         else:
+            # THE PIECES ARE PUT BACK IN THE LOADER'S FRAME BEFORE THEY ARE JOINED.
+            # ``shard_dim`` is a dim of the CHECKPOINT's layout, and the two
+            # republished classes no longer store that layout, so a cat on the
+            # stored dim would join along the wrong axis.
+            #
+            # THE FRAME IS ALL THIS UNDOES. The republish's other step requantises a
+            # 128-tile grid onto the 256 public one for any weight whose extents are
+            # whole blocks, and this item's comparison is bit-exact, so it also
+            # depends on that coarsening being lossless on THIS fixture's grids. That
+            # is a property of the fixture, not of the loader, and the first host run
+            # of this file is what settles it -- ``inc-glm53f-054a`` hands that
+            # reading forward rather than weakening the equality to hide it.
             got = torch.cat(
-                [_loaded(models[rank], dotted) for rank in range(SHARD_EP_WORLD)],
+                [
+                    _as_the_loader_left_it(
+                        module, leaf, _loaded(models[rank], dotted)
+                    )
+                    for rank in range(SHARD_EP_WORLD)
+                ],
                 dim=shard_dim,
             )
             expected = overrides[weight_keys[0]]
@@ -4767,6 +5228,22 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     row contributes exactly nothing to the down projection's contraction. So the
     padded emulation must equal the unpadded reference at max abs diff 0.0 and no
     numeric pair is authored.
+
+    ``inc-glm53f-054a`` REPAIR ROUND 1 CHANGED HOW THE MODULE SIDE IS READ, and not
+    what is claimed (DECISIONS §706-§707). The claim above is frozen. What moved is
+    one assertion that had described the pre-republish design -- that the module's
+    grid IS the checkpoint's own rows -- which the republish makes false by design,
+    because it coarsens that grid onto the consumer's 256 and turns it together with
+    its weight. The module side is now dequantised at the grid the module actually
+    carries, in the loader's frame, and the reference stays the checkpoint's own
+    unpadded tensors at the raw grid and the checkpoint's 128 granularity: the
+    model's semantics, re-implementing no part of the republish. THREE readings were
+    added rather than removed: the republish's own losslessness counter is asserted at
+    zero for these projections, so a red run names the cause; the convention is read
+    at the numbers per projection, with the compensated form as the control that
+    moves; and the pad is read once on its own, against the same module tensors with
+    the padded ranks left out, so a republish finding and a pad defect cannot be
+    mistaken for each other.
     """
     directory, overrides, mappings = _deferred_checkpoint(tmp_path)
     block = _WL_FP8.consumer_block_quant_size()
@@ -4776,18 +5253,18 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         )
         for rank in range(SHARD_EP_WORLD)
     }
-    # The RECORDED GAP is read on every rank before anything else: each load
-    # attached its shards and then the -054-owned prep refused the checkpoint-tile
-    # grid (DECISIONS §84). :func:`_load_at_ep` names that refusal; here it is only
-    # counted, so an item cannot read shards from a load that refused for some
-    # other reason.
+    # THE PREP'S OWN COUNT is read on every rank before anything else: each load
+    # attached its shards, the load-path retile published the public grid, and the
+    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # against this file's arithmetic; here the count is only counted, so an item
+    # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
-    gap_refusals = [rank for rank, load in loads.items() if load.refusal is not None]
-    print(f"CONJUNCT3D_RANKS_RECORDING_THE_GAP={sorted(gap_refusals)}")
-    assert sorted(gap_refusals) == sorted(models), (
-        f"only ranks {sorted(gap_refusals)} recorded the -054 prep refusal, of "
-        f"{sorted(models)}. A load that did NOT refuse either retiled the grid "
-        f"(so -054 landed and this reading flips) or never reached the prep"
+    prepped = [rank for rank, load in loads.items() if load.prepared == 3]
+    print(f"CONJUNCT3D_RANKS_WHOSE_PREP_BUILT_THREE={sorted(prepped)}")
+    assert sorted(prepped) == sorted(models), (
+        f"only ranks {sorted(prepped)} built the shared expert's three scale "
+        f"operands, of {sorted(models)}. A rank that built none either never "
+        f"reached the prep or the load-path retile did not publish its grid"
     )
 
     dense_paths = sorted(
@@ -4849,44 +5326,108 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     # order, and run gate * up through down. Then do the same from the checkpoint's
     # own unpadded tensors. The two must agree exactly.
     path = dense_paths[0]
-    hidden = int(_loaded(models[0], f"{path}.gate_proj_weight").shape[1])
+    # READ IN THE LOADER'S FRAME. Since the republish the module stores gate as
+    # [H, I_per_rank], so the stored second extent is the per-rank intermediate and
+    # not the hidden size this vector has to be as long as.
+    hidden = int(_in_the_loader_frame(models[0], f"{path}.gate_proj_weight").shape[1])
     torch.manual_seed(0)
     x = torch.randn(hidden, dtype=torch.float32)
 
-    # WHICH SCALE CONVENTION THE MODULE ACTUALLY CARRIES, read before either side
-    # is computed, with the compensated form as the control that MOVES. If both
-    # branches below matched, this reading would prove nothing.
+    # WHAT THE MODULE CARRIES SINCE THE REPUBLISH, printed rather than asserted
+    # (DECISIONS §706-§707). This block used to assert that the module's grid IS the
+    # checkpoint's own rows. That described the pre-republish design and is now false
+    # BY DESIGN: the republish coarsens the checkpoint's 128-tile grid onto the
+    # consumer's 256 and turns it together with its weight. So the layout is REPORTED
+    # here, at both frames and with the block size it implies, and the thing the old
+    # equality existed to protect -- that the module's NUMBERS are the checkpoint's
+    # numbers at the checkpoint's own convention -- is read at the values further
+    # down, where the compensated form is the control that moves.
     _gate_keys = _keys_of(mappings, f"{path}.gate_proj_weight")
     _gate_scale = scale_keys(_gate_keys)[0]
     _raw_grid = overrides[_gate_scale]
     _compensated = compensate_block_scales(_raw_grid).scale_inv
-    _on_module = getattr(models[0].get_submodule(path), SHARD_GRID_ATTRIBUTES[0])
-    _rows = _on_module.shape[0]
-    print(
-        f"CONJUNCT3D_MODULE_GRID_IS_THE_RAW_CHECKPOINT="
-        f"{bool(torch.equal(_on_module, _raw_grid[:_rows]))}"
+    _module = models[0].get_submodule(path)
+    _on_module = getattr(_module, SHARD_GRID_ATTRIBUTES[0])
+    _published = _as_the_loader_left_it(_module, SHARD_GRID_ATTRIBUTES[0], _on_module)
+    _weight_lf = _in_the_loader_frame(models[0], f"{path}.gate_proj_weight")
+    _stored = _loaded(models[0], f"{path}.gate_proj_weight")
+    print(f"CONJUNCT3D_MODULE_WEIGHT_AS_STORED={tuple(_stored.shape)}")
+    print(f"CONJUNCT3D_MODULE_WEIGHT_IN_THE_LOADER_FRAME={tuple(_weight_lf.shape)}")
+    print(f"CONJUNCT3D_MODULE_GRID_AS_STORED={tuple(_on_module.shape)}")
+    print(f"CONJUNCT3D_MODULE_GRID_IN_THE_LOADER_FRAME={tuple(_published.shape)}")
+    print(f"CONJUNCT3D_CHECKPOINT_GRID={tuple(_raw_grid.shape)}")
+    print(f"CONJUNCT3D_CHECKPOINT_GRID_BLOCK={tuple(DEFAULT_WEIGHT_BLOCK_SIZE)}")
+    _implied_block = (
+        _weight_lf.shape[0] // _published.shape[0],
+        _weight_lf.shape[1] // _published.shape[1],
     )
-    print(
-        f"CONJUNCT3D_MODULE_GRID_IS_THE_COMPENSATED_FORM="
-        f"{bool(torch.equal(_on_module, _compensated[:_rows]))}"
+    print(f"CONJUNCT3D_MODULE_GRID_IMPLIED_BLOCK={_implied_block}")
+    assert not torch.equal(_raw_grid, _compensated), (
+        "compensation is a no-op on this fixture's grid, so the convention control "
+        "further down cannot tell the two conventions apart and the reference is "
+        "unguarded"
     )
-    assert not torch.equal(_raw_grid[:_rows], _compensated[:_rows]), (
-        "compensation is a no-op on this fixture's grid, so the two readings above "
-        "cannot tell the conventions apart and the reference below is unguarded"
+
+    # THE REPUBLISH'S OWN LOSSLESSNESS COUNTER, read off its health record and
+    # asserted at zero for these projections (DECISIONS §706 item 4). The coarsening
+    # keeps one scale per 256 block and rescales the other three 128 tiles into it, so
+    # it is exact only where each ratio is a power of two; the counter is the
+    # republish's own report of how often it was not. Asserting it here means a red
+    # run names the CAUSE, not only the moved number, and it is a finding on the
+    # landed retile rather than a tolerance to widen.
+    inexact: dict[tuple[int, str], int] = {}
+    for rank in range(SHARD_EP_WORLD):
+        module = models[rank].get_submodule(path)
+        health = getattr(module, module.DENSE_RETILE_HEALTH_ATTR, None)
+        assert health is not None, (
+            f"{path} at rank {rank} carries no republish health record after a real "
+            f"load, so the load-time prep loop never reached Glm5NextDenseMLP"
+        )
+        for leaf, record in health.items():
+            if not record.get("retiled"):
+                continue
+            inexact[(rank, leaf)] = int(record["inexact_rescales"])
+    print(f"CONJUNCT3D_RETILED_PROJECTIONS={len(inexact)}")
+    print(f"CONJUNCT3D_RETILE_INEXACT_RESCALES={sorted(inexact.values())}")
+    assert inexact, (
+        f"no dense projection was coarsened at world size {SHARD_EP_WORLD}, so this "
+        f"reading is vacuous and the exactness below is not testing the coarsening "
+        f"at all"
     )
-    assert torch.equal(_on_module, _raw_grid[:_rows]), (
-        "the module's grid is not the checkpoint's own rows, so the reference below "
-        "must not use them either -- see weight_loaders_fp8.py:1840"
+    _worst_inexact = max(inexact.values())
+    assert _worst_inexact == 0, (
+        f"the republish rescaled {_worst_inexact} 128 tiles inexactly on this "
+        f"fixture, so the coarsening changed weight NUMBERS and not just the layout: "
+        f"{sorted(key for key, count in inexact.items() if count)}. That is a finding "
+        f"against the landed retile, to be handed back with this count -- never a "
+        f"tolerance and never a fixture retuned to pass (DECISIONS §706 item 4)"
     )
 
     def _dequantised(rank: int, leaf: str) -> torch.Tensor:
+        """One rank's shard, dequantised AT THE GRID THE MODULE ACTUALLY CARRIES.
+
+        The block size is derived from the weight and its grid rather than named as a
+        constant, because the republish leaves a whole-block weight at the consumer's
+        256 granularity and leaves any other extent at the checkpoint's 128. A
+        constant would be right for one of those and silently wrong for the other;
+        derived, a grid that does not divide its weight is refused by
+        ``dequantise_blockwise`` itself.
+
+        Both tensors are put back in the loader's frame first, so what this returns
+        is the checkpoint's own layout and the concatenations below still join on the
+        checkpoint's declared shard dim.
+        """
         module = models[rank].get_submodule(path)
         attribute = SHARD_GRID_ATTRIBUTES[SHARD_DENSE_LEAVES.index(leaf)]
-        return dequantise_blockwise(
-            _loaded(models[rank], f"{path}.{leaf}"),
-            getattr(module, attribute),
-            DEFAULT_WEIGHT_BLOCK_SIZE,
-        ).to(torch.float32)
+        weight = _as_the_loader_left_it(
+            module, leaf, _loaded(models[rank], f"{path}.{leaf}")
+        )
+        grid = _as_the_loader_left_it(module, attribute, getattr(module, attribute))
+        block = (
+            weight.shape[0] // grid.shape[0],
+            weight.shape[1] // grid.shape[1],
+        )
+        return dequantise_blockwise(weight, grid, block).to(torch.float32)
 
     gate_padded = torch.cat(
         [_dequantised(rank, "gate_proj_weight") for rank in range(SHARD_EP_WORLD)],
@@ -4903,8 +5444,15 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     h_padded = (gate_padded @ x) * (up_padded @ x)
     y_padded = down_padded @ h_padded
 
-    def _reference(leaf: str) -> torch.Tensor:
+    def _reference(leaf: str, *, compensated: bool = False) -> torch.Tensor:
         """The same three tensors whole, at the SAME scale convention.
+
+        ``compensated=True`` is the CONTROL ARM and never the reference: it builds
+        the same tensor at the other convention, so a reading that cannot tell the
+        two apart fails instead of passing quietly (DECISIONS §706-§707). The
+        reference itself is the checkpoint's own tensors at the checkpoint's own raw
+        grid and the checkpoint's own 128 granularity -- the model's semantics -- and
+        it re-implements no part of the republish.
 
         THE GRID IS NOT COMPENSATED HERE, and that is read off the loader rather
         than chosen. A sharded weight's grid travels the non-compensating loader,
@@ -4924,14 +5472,82 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         keys = _keys_of(mappings, f"{path}.{leaf}")
         scales = scale_keys(keys)
         weight_key = next(key for key in keys if key not in scales)
+        grid = overrides[scales[0]]
+        if compensated:
+            grid = compensate_block_scales(grid).scale_inv
         return dequantise_blockwise(
             downscale_fp8_weight_bytes(overrides[weight_key]),
-            overrides[scales[0]],
+            grid,
             DEFAULT_WEIGHT_BLOCK_SIZE,
         ).to(torch.float32)
 
     h_whole = (_reference("gate_proj_weight") @ x) * (_reference("up_proj_weight") @ x)
     y_whole = _reference("down_proj_weight") @ h_whole
+
+    # WHICH CONVENTION THE MODULE CARRIES, read at the NUMBERS, per projection
+    # (DECISIONS §706-§707). Each padded stack's real rows -- real columns, for the
+    # down projection -- are compared against the checkpoint's own tensor at the raw
+    # convention, which must agree exactly, and against the compensated form, which
+    # must NOT: if both agreed, neither reading could tell the conventions apart.
+    # This is per projection so that a red run names which one moved.
+    stacks = {
+        "gate_proj_weight": gate_padded,
+        "up_proj_weight": up_padded,
+        "down_proj_weight": down_padded,
+    }
+    conventions: dict[str, tuple[float, float]] = {}
+    for leaf, stack in stacks.items():
+        whole = _reference(leaf)
+        other = _reference(leaf, compensated=True)
+        real = (
+            stack[:, : whole.shape[1]]
+            if leaf == "down_proj_weight"
+            else stack[: whole.shape[0]]
+        )
+        raw_diff = _max_abs_diff(real, whole)
+        compensated_diff = _max_abs_diff(real, other)
+        conventions[leaf] = (raw_diff, compensated_diff)
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_CHECKPOINT_RAW={raw_diff}")
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_COMPENSATED={compensated_diff}")
+    for leaf, (raw_diff, compensated_diff) in conventions.items():
+        assert compensated_diff != 0.0, (
+            f"{leaf} matches the compensated form as well as the raw one, so this "
+            f"item cannot tell the two conventions apart and its reference is "
+            f"unguarded"
+        )
+        assert raw_diff == 0.0, (
+            f"{leaf}'s real rows differ from the checkpoint's own tensor by "
+            f"{raw_diff} at the checkpoint's own convention. The load path is meant "
+            f"to change this tensor's LAYOUT and not its numbers, so a non-zero "
+            f"reading here is a finding against the republish -- most likely its 256 "
+            f"coarsening requantising a block whose four 128 tiles do not share a "
+            f"power-of-two scale ratio. It is never a tolerance to widen and never a "
+            f"fixture to retune (DECISIONS §706 item 4): hand it back with this "
+            f"number"
+        )
+
+    # THE PAD, ON ITS OWN (DECISIONS §707 item 5). The same module tensors with and
+    # without the padded ranks. Both sides come from the module, so whatever the
+    # republish did to the numbers cancels and what is left is the pad's own
+    # contribution -- which tells a republish finding and a pad defect apart in one
+    # run, instead of leaving one to be blamed for the other.
+    def _stacked(leaf: str, ranks: range, dim: int) -> torch.Tensor:
+        return torch.cat([_dequantised(rank, leaf) for rank in ranks], dim=dim)
+
+    real_only = range(real_ranks)
+    h_real = (
+        _stacked("gate_proj_weight", real_only, 0) @ x
+    ) * (_stacked("up_proj_weight", real_only, 0) @ x)
+    y_real = _stacked("down_proj_weight", real_only, 1) @ h_real
+    pad_only_diff = _max_abs_diff(y_padded, y_real)
+    print(f"CONJUNCT3D_PADDED_VS_REAL_RANKS_ONLY_MAX_ABS_DIFF={pad_only_diff}")
+    print(f"CONJUNCT3D_REAL_RANKS_INTERMEDIATE={tuple(h_real.shape)}")
+    assert pad_only_diff == 0.0, (
+        f"the padded ranks change the output by {pad_only_diff} against the same "
+        f"module tensors with those ranks left out, so the pad itself contributes. "
+        f"This side of the item is independent of the checkpoint's numbers, so a red "
+        f"here is a pad defect and not a republish finding"
+    )
 
     print(f"CONJUNCT3D_PADDED_INTERMEDIATE={tuple(h_padded.shape)}")
     print(f"CONJUNCT3D_WHOLE_INTERMEDIATE={tuple(h_whole.shape)}")
@@ -4976,11 +5592,11 @@ def test_sharedshard_the_six_families_left_the_replicated_set_both_directions(
     load0 = _load_at_ep(directory, SHARD_EP_WORLD, 0, SHARD_EP_DEGREE, monkeypatch)
     load1 = _load_at_ep(directory, SHARD_EP_WORLD, 1, SHARD_EP_DEGREE, monkeypatch)
     rank0, rank1 = load0.model, load1.model
-    recorded = [load0.refusal is not None, load1.refusal is not None]
-    print(f"CONJUNCT4D_BOTH_RANKS_RECORDED_THE_GAP={recorded}")
-    assert load0.refusal is not None and load1.refusal is not None, (
-        "one of the two loads did not record the -054 prep refusal, so the two are "
-        "not the same kind of load and their difference is not a shard reading"
+    recorded = [load0.prepared, load1.prepared]
+    print(f"CONJUNCT4D_BOTH_RANKS_PREPARED_OPERANDS={recorded}")
+    assert load0.prepared == 3 and load1.prepared == 3, (
+        f"the two loads built {recorded} scale operands, not three each, so they "
+        f"are not the same kind of load and their difference is not a shard reading"
     )
 
     declared_sharded = {
@@ -6293,3 +6909,325 @@ def test_bankpad_the_grid_conversion_carries_the_degree_through_both_returns() -
         f"the conversion did not carry the declared degree {degree} through both "
         f"returns: {readings}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# ``inc-glm53f-054a`` hand-off item (iii): the first COMPLETING load in this file
+# that carries a shared-expert module.
+#
+# WHY IT IS NEEDED. The landed shared-expert scale prep had never run through
+# ``load_weights`` in any item here. Of the seven completing loads this file had,
+# one carried a routed bank and none carried a shared expert -- every fixture that
+# completes either sets ``n_shared_experts=0`` (``_stacked_config``,
+# ``_shard_config``, ``_grid_shard_config``; ``_shard_config``'s docstring records
+# that it is not a convenience) or is all-dense and so builds no MoE block at all
+# (``_dense_config``). The two fixtures that do build the module both refused.
+#
+# NO NEW CHECKPOINT WRITER IS MINTED, and that is a measurement rather than a
+# shortcut. Item (iii) asks for a 256-blocked checkpoint carrying a shared expert,
+# and ``_deferred_checkpoint`` already writes one: its six MoE families come from
+# :data:`DEFERRED_FAMILIES` at :data:`SHARED_INTERMEDIATE` and
+# :data:`BANK_INTERMEDIATE` by :data:`DEFERRED_NARROW` -- 2048 and 512 by 256, all
+# whole multiples of the consumer's block. A second writer differing only in the
+# shared expert's width would be a copy of 200 lines with nothing new to say. What
+# was missing was a LOAD that completes through it, so that is what this section
+# adds: the same checkpoint at world size 1, where nothing shards and the only
+# thing standing between the load and the prep was the retile.
+#
+# THE 128-BLOCK GRID IS THE POINT, not an accident of the fixture. The checkpoint
+# holds one scale per 128-tile, exactly as the published one does, and the prep
+# consumes the 256 public grid. So a completing load here is evidence that the
+# load-path retile ran; without it this same load is ``-101``'s recorded refusal.
+# --------------------------------------------------------------------------- #
+
+#: World size 1 and expert-parallel degree 1, so every family loads whole and no
+#: padding or column arithmetic stands between the checkpoint and the prep. The
+#: sharded readings are ``-094``'s and ``-101``'s and are not repeated here.
+BLOCKED_WORLD = 1
+BLOCKED_EP_DEGREE = 1
+
+
+def _load_blocked(
+    directory: Path,
+    monkeypatch,
+    shared_experts: int = MINI_SHARED_EXPERTS,
+) -> Glm5NextForConditionalGeneration:
+    """Load the 256-blocked checkpoint at world 1, where nothing shards.
+
+    ``shared_experts`` IS THE FIRING CONTROL'S ONE VARYING FIELD, the same field
+    :func:`_deferred_config` varies for the same reason: at 0 no module of the
+    class exists, so a reading taken at 1 is a reading of the shared expert and
+    not of the fixture at large.
+    """
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_world_size", lambda: BLOCKED_WORLD)
+    monkeypatch.setattr(_MODEL_FP8, "_resolve_rank", lambda: 0)
+    monkeypatch.setattr(
+        _FACTORY, "_resolve_ep_degree", lambda given: BLOCKED_EP_DEGREE
+    )
+    monkeypatch.setattr(_NPS, "get_neuron_ep_rank", lambda: 0)
+    monkeypatch.setattr(
+        _NPS,
+        "get_neuron_ep_tp_group",
+        lambda: _FixtureGroup(0, BLOCKED_WORLD // BLOCKED_EP_DEGREE),
+    )
+    model = Glm5NextForConditionalGeneration(_deferred_config(shared_experts))
+    assert model.world_size == BLOCKED_WORLD, (
+        f"the model resolved world size {model.world_size}, not the patched "
+        f"{BLOCKED_WORLD}, so this is not the load this item means to measure"
+    )
+    _seed_page_cache_signal()
+    model.load_weights(str(directory), torch.device("cpu"), None)
+    return model
+
+
+def _modules_named(
+    model: Glm5NextForConditionalGeneration, class_name: str
+) -> list[tuple[str, torch.nn.Module]]:
+    """Every ``(path, module)`` whose type has this name, from the tree itself.
+
+    The class name is a STRING because that is what the prep loop's own gate
+    compares (``model_fp8.py``'s ``hasattr`` on the type, read per module), and
+    because importing the bank's class here would add an import for a count the
+    tree already answers.
+    """
+    return [
+        (path, module)
+        for path, module in model.named_modules()
+        if type(module).__name__ == class_name
+    ]
+
+
+def test_blocked_the_shared_expert_prep_completes_a_load_and_the_retile_ran(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """Item (iii). The shared expert's prep runs inside a COMPLETING load.
+
+    Five conjuncts, and the firing control that makes them readings.
+
+    (1) The load completes. Until the load-path retile landed, this same
+        checkpoint refused inside the prep, and ``-101`` attempt 2 recorded the
+        refusal by name -- so completion is the evidence the retile ran, not a
+        restatement of it.
+    (2) Every shared-expert module carries three prepared scale operands, read
+        through the class's own attribute name rather than a string here.
+    (3) The retile's health record says all three projections were retiled, and
+        the public grid it published is the one the weight's own extents imply,
+        computed here from the consumer's block size rather than read back from
+        the record.
+    (4) Both losslessness counters read zero on this fixture. They are counters,
+        not assertions: the grid writes a distinct value per 256 BLOCK along the
+        shard dim, so a layout that dropped or invented a scale would move them.
+        R6 item R-T2 changed that granularity from ``-095b``'s per-128-tile ramp
+        and corrected this sentence with it -- on the ramp the coarsening rescales
+        weight bytes, which is what these counters were reporting and what R-P1 now
+        refuses; :func:`_pow2_block_grid_pattern` records the trade and
+        :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`
+        keeps the ramp reading.
+    (5) Every routed bank carries its prepared kernel operands. This is the plan's
+        own sentence for this item -- the prep's arrival makes the loop visit the
+        bank -- read on the module the loop visited.
+
+    THE CONTROL: the same fixture with no shared expert. The load still
+    completes and no module of the class exists, so conjuncts (2) to (4) are
+    readings of the shared expert rather than of a load that would pass anyway.
+    """
+    directory, _overrides, _mappings = _deferred_checkpoint(tmp_path)
+    block = _WL_FP8.consumer_block_quant_size()
+
+    model = _load_blocked(directory, monkeypatch)
+
+    shared = _modules_named(model, "Glm5NextSharedExperts")
+    assert shared, (
+        "this configuration built no Glm5NextSharedExperts module, so there is "
+        "nothing here to read and the conjuncts below would pass vacuously"
+    )
+
+    for path, module in shared:
+        # (2) the prep built three operands.
+        prepared = getattr(module, Glm5NextSharedExperts.PREPARED_SCALE_OPERANDS_ATTR)
+        assert len(prepared) == 3, (
+            f"{path} carries {len(prepared)} prepared scale operands, not 3; the "
+            f"prep builds one per projection and the load completed, so a "
+            f"shortfall means a projection was skipped rather than refused"
+        )
+
+        # (3) the retile ran on all three, and published the implied grid.
+        health = getattr(module, Glm5NextSharedExperts.SHARED_RETILE_HEALTH_ATTR)
+        leaves = _scale_prep_leaves(module)
+        assert len(leaves) == 3, (
+            f"{path} offers {leaves} to the prep loop, not three leaves; this "
+            f"item's arithmetic below is per projection"
+        )
+        for leaf in leaves:
+            record = health[leaf]
+            assert record["retiled"] is True, (
+                f"{path}.{leaf} was NOT retiled: {record.get('reason')}. On this "
+                f"fixture every MoE extent is a whole {block} block, so a skip "
+                f"here means the retile could not read the extents it was given"
+            )
+            weight = getattr(module, leaf)
+            rows, cols = int(weight.shape[0]), int(weight.shape[1])
+            implied = (rows // block, cols // block)
+            grid_name = f"{leaf[: -len(_WEIGHT_LEAF_SUFFIX)]}_{FP8_SCALE_SUFFIX}"
+            grid = getattr(module, grid_name)
+            assert tuple(grid.shape) == implied, (
+                f"{path}.{grid_name} is {tuple(grid.shape)} after the load; a "
+                f"[{rows},{cols}] weight implies the public grid {implied} at "
+                f"the consumer's {block}-block granularity. A grid that survived "
+                f"at checkpoint granularity is the refusal -101 recorded"
+            )
+            assert grid.dtype is torch.float32, (
+                f"{path}.{grid_name} is {grid.dtype}; the scale grids stay fp32 "
+                f"through the retile, which is what -091's own item pins"
+            )
+
+            # (4) the two counters, which can move.
+            assert record["emitted_unsupplied"] == 0, (
+                f"{path}.{leaf} emitted {record['emitted_unsupplied']} slots the "
+                f"input did not supply, so the retiled layout does not decode "
+                f"back to the grid it was given"
+            )
+            assert record["input_scales_dropped"] == 0, (
+                f"{path}.{leaf} dropped {record['input_scales_dropped']} input "
+                f"scales, so the coarser grid cannot reproduce them bit-exactly"
+            )
+
+    # (5) the loop visited every bank, which is what item (i)'s arrival changed.
+    banks = _modules_named(model, "Glm5NextRoutedExperts")
+    assert banks, (
+        "this configuration built no routed bank, so conjunct (5) has nothing "
+        "to read; first_k_dense_replace must leave at least one MoE layer"
+    )
+    bank_class = type(banks[0][1])
+    for path, module in banks:
+        prepared = getattr(module, bank_class.PREPARED_KERNEL_OPERANDS_ATTR, None)
+        assert prepared, (
+            f"{path} carries no prepared kernel operands after a completing "
+            f"load. The prep loop's gate is a type test and this class now "
+            f"defines prepare_scale_operands, so the loop must have visited it"
+        )
+        assert len(prepared) == 4, (
+            f"{path} carries {len(prepared)} prepared kernel operands, not the "
+            f"four block_quant_expert_mm takes: {sorted(prepared)}"
+        )
+
+    # THE CONTROL. Same checkpoint, same widths, no shared expert.
+    control = _load_blocked(directory, monkeypatch, shared_experts=0)
+    assert not _modules_named(control, "Glm5NextSharedExperts"), (
+        "the control built a shared-expert module at n_shared_experts=0, so the "
+        "field this control varies is not the field the tree reads and the "
+        "readings above are not attributable to the shared expert"
+    )
+    assert _modules_named(control, "Glm5NextRoutedExperts"), (
+        "the control built no routed bank either, so it varies more than the one "
+        "field it declares and cannot isolate anything"
+    )
+
+
+def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """R6 item R-T2's pair: the grid the coarsening cannot reproduce is REFUSED.
+
+    This is the reading the ramp grid used to carry and the pow2 grid above gives
+    up, kept here where it belongs. The SAME checkpoint is written twice, differing
+    in one field -- the scale grid's family -- and the two loads are compared:
+
+    * the pow2 grid loads and completes, which is the arming half. Without it a
+      refusal below could be any load failure wearing the right words.
+    * the ramp grid, 1, 2, 3, ... per 128 tile, makes the first 256 block's ratio
+      exactly 2, and an fp8 byte at the maximum doubled leaves what fp8-e4m3 holds.
+      The landed cast is not saturating, so until R6 item R-P1 that produced a
+      SILENT NaN which every shape reading passed straight over; now the retile
+      refuses and names the expert, the 256 block, the 128 tile, the ratio, the
+      retained scale, the bound and both health counters
+      (``blockwise_fp8_retile.py:461-476``).
+
+    A clamp is deliberately not the alternative: it would ship numbers the
+    checkpoint does not contain (lead ruling ``LEAD-LOG.md`` §901).
+
+    The refusal is read off the exception CHAIN rather than the outermost type,
+    because the load path is entitled to wrap it; what this item claims is that a
+    ``BlockwiseFp8RetileError`` is in that chain and that its sentence names the
+    coordinates, not that nothing re-raises it.
+    """
+    from vllm_neuron.functional.moe.blockwise_fp8_retile import (
+        BlockwiseFp8RetileError,
+    )
+
+    pow2_directory, pow2_overrides, _mappings = _deferred_checkpoint(tmp_path)
+    ramp_directory, ramp_overrides, _ramp_mappings = _deferred_checkpoint(
+        tmp_path, ramp_grids=True, name="deferred-ramp"
+    )
+
+    # THE ONE FIELD THIS ITEM VARIES, measured rather than declared: the two
+    # checkpoints differ on the grids of the retiled families and nowhere else.
+    # The comparison goes through fp32 because the weight tensors are fp8, where a
+    # dtype-native equality is not something this file assumes it has.
+    def _same(left: torch.Tensor, right: torch.Tensor) -> bool:
+        if left.dtype != right.dtype or tuple(left.shape) != tuple(right.shape):
+            return False
+        return bool(torch.equal(left.to(torch.float32), right.to(torch.float32)))
+
+    assert sorted(ramp_overrides) == sorted(pow2_overrides), (
+        "the two fixtures do not even hold the same keys, so they differ in more "
+        "than the grid family this item varies"
+    )
+    differing = sorted(
+        key
+        for key, tensor in ramp_overrides.items()
+        if not _same(tensor, pow2_overrides[key])
+    )
+    print(f"RAMPREFUSAL_KEYS_THAT_DIFFER={len(differing)}")
+    assert differing, (
+        "the ramp fixture and the pow2 fixture hold identical tensors, so this "
+        "item varies nothing and the refusal below would not be attributable to "
+        "the grid"
+    )
+    assert all(key.endswith(FP8_SCALE_SUFFIX) for key in differing), (
+        f"the two fixtures differ on tensors that are not scale grids: "
+        f"{[key for key in differing if not key.endswith(FP8_SCALE_SUFFIX)][:6]}. "
+        f"This item varies the grid family and must vary nothing else"
+    )
+
+    # THE ARMING HALF. Same widths, same weights, pow2 grid: the load completes.
+    armed = _load_blocked(pow2_directory, monkeypatch)
+    assert _modules_named(armed, "Glm5NextSharedExperts"), (
+        "the pow2 load built no shared-expert module, so the refusal below cannot "
+        "be attributed to the grid the retile read"
+    )
+
+    with pytest.raises(Exception) as raised:  # noqa: B017 -- the chain is the claim
+        _load_blocked(ramp_directory, monkeypatch)
+
+    chain: list[BaseException] = []
+    error: BaseException | None = raised.value
+    while error is not None and error not in chain:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    types = [type(item).__name__ for item in chain]
+    refusals = [item for item in chain if isinstance(item, BlockwiseFp8RetileError)]
+    print(f"RAMPREFUSAL_EXCEPTION_CHAIN={types}")
+    for item in refusals:
+        print(f"RAMPREFUSAL_MESSAGE={str(item)[:400]}")
+    assert refusals, (
+        f"the ramp grid raised {types}, with no BlockwiseFp8RetileError anywhere in "
+        f"the chain. Either the retile no longer refuses an unrepresentable rescale "
+        f"-- in which case it is emitting NaN again -- or the load failed for some "
+        f"other reason and this item is measuring that instead"
+    )
+    message = str(refusals[0])
+    for phrase in (
+        "REFUSES",
+        "256-block",
+        "128-tile",
+        "ratio",
+        "retained scale",
+        "inexact_rescales",
+        "input_scales_dropped",
+    ):
+        assert phrase in message, (
+            f"the refusal does not say {phrase!r}: {message[:300]}. The whole point "
+            f"of refusing rather than emitting NaN is that the message locates the "
+            f"block and reports the counters"
+        )

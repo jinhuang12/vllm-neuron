@@ -707,22 +707,44 @@ def torch_reference_moe(
     down_proj_weight: torch.Tensor,
     gate_up_logical_scale: torch.Tensor,
     down_logical_scale: torch.Tensor,
+    *,
+    swiglu_limit: float,
+    post_scale: bool = True,
+    clamp: bool = True,
 ) -> torch.Tensor:
     """A pure-torch block-quant MoE. No NKI, no mapping, no vendor code.
 
-    Semantics transcribed from the vendor's own reference
-    (``nkilib/core/moe/moe_cte/moe_cte_torch.py``) at the two points where a
-    plausible alternative would give different numbers:
+    THE AUTHORITY IS THE MODEL, NOT THE KERNEL, and repair batch R6 of
+    ``inc-glm53f-054a`` moved it there. Until R6 this reference was transcribed
+    from the vendor KERNEL's torch reference
+    (``nkilib/core/moe/moe_cte/moe_cte_torch.py:193``) and therefore computed the
+    kernel's DEFAULTS, while the product call site deliberately overrides both of
+    them (``model_fp8.py:1968`` and ``:2009-2012``) to match the checkpoint's own
+    model. A reference built on the wrong authority is a comparator defect, not a
+    tolerance question, so the two overridden points now read from the model:
 
-    * ``PRE_SCALE`` -- the expert affinity multiplies the HIDDEN STATES before
-      the gate/up matmuls (``:193``), not the expert output after the down
-      matmul. The two differ because SiLU is nonlinear, so this is not a
-      refactor of the same expression. ``PRE_SCALE`` is the kernel's own default
-      (``bwmm_shard_on_I.py:122``) and ``-025``'s seam forwards it.
-    * the affinity is applied IN THE ACTIVATION DTYPE (bf16), matching the
-      call site's ``.to(hidden_states.dtype)`` cast, and the per-expert
-      contribution is rounded to bf16 before accumulation, matching the
-      vendor's ``scaled.to(bfloat16).to(float32)``.
+    * ``POST_SCALE`` -- the expert affinity multiplies the expert's output AFTER
+      the down matmul (``design/reference/modeling_glm5_next.py:133``), which is
+      what the call site selects (``model_fp8.py:1968``). The pre-scaling
+      alternative is a DIFFERENT function, not a refactor, because SiLU is
+      nonlinear; ``post_scale=False`` computes that other function and exists
+      only for the must-fail control
+      (:func:`test_moe_path_f1_pre_scale_unclamped_reference_must_fail`).
+    * THE SwiGLU CLAMP -- ``gate`` is bounded from above only and ``up`` on both
+      sides (``modeling_glm5_next.py:139-140``), at the checkpoint's own
+      ``swiglu_limit``, which the call site sends as the kernel's four limit
+      keywords (``model_fp8.py:2009-2012``). The asymmetry is the model's.
+      ``clamp=False`` drops it, again only for that control.
+
+    ``swiglu_limit`` is keyword-ONLY and has NO default: every caller names the
+    value it read off the bank (``model_fp8.py:1433``), so no arm can silently
+    inherit a bound the checkpoint did not declare.
+
+    The affinity is applied IN THE ACTIVATION DTYPE (bf16), matching the call
+    site's ``.to(hidden_states.dtype)`` cast, and the per-expert contribution is
+    rounded to bf16 at accumulation, matching the model's
+    ``current.to(final.dtype)`` (``:134``) -- which, under ``POST_SCALE``, is a
+    rounding of the SCALED contribution, since the model scales first (``:133``).
 
     The trailing ``TILE_SIZE`` axis of both logical scale tensors is the
     partition broadcast -- 128 copies of one scalar -- so index ``0`` is read.
@@ -761,13 +783,22 @@ def torch_reference_moe(
         if rows.numel() == 0:
             continue
         scale = expert_affinities[rows, expert].to(hidden_states.dtype).unsqueeze(1)
-        local = (scale * hidden_states[rows]).to(torch.float32)
+        if post_scale:
+            local = hidden_states[rows].to(torch.float32)
+        else:
+            local = (scale * hidden_states[rows]).to(torch.float32)
         gate_act = local @ gate_weight
         up_act = local @ up_weight
+        if clamp:
+            # The model's own asymmetry, not a tidier symmetric bound
+            # (``modeling_glm5_next.py:139-140``).
+            gate_act = gate_act.clamp(min=None, max=swiglu_limit)
+            up_act = up_act.clamp(min=-swiglu_limit, max=swiglu_limit)
         intermediate = torch.nn.functional.silu(gate_act) * up_act
-        output[rows] += (intermediate @ down_weight).to(torch.bfloat16).to(
-            torch.float32
-        )
+        contribution = intermediate @ down_weight
+        if post_scale:
+            contribution = contribution * scale.to(torch.float32)
+        output[rows] += contribution.to(torch.bfloat16).to(torch.float32)
     return output
 
 
@@ -822,6 +853,8 @@ def test_moe_path_output_matches_pure_torch_reference() -> None:
             f"the padding-token row must be sliced off"
         )
 
+    # The reference is configured from the BANK the call site used, so the two
+    # sides cannot disagree about the bound by construction (R6 item R-T1).
     want = torch_reference_moe(
         hidden_states=case["call_site_inputs"]["hidden_states"],
         expert_affinities=case["call_site_inputs"]["expert_affinities"],
@@ -829,6 +862,9 @@ def test_moe_path_output_matches_pure_torch_reference() -> None:
         down_proj_weight=case["call_site_inputs"]["down_proj_weight"],
         gate_up_logical_scale=case["gup_logical"],
         down_logical_scale=case["down_logical"],
+        swiglu_limit=bank.swiglu_limit,
+        post_scale=True,
+        clamp=True,
     )
     got_f32 = got.to(torch.float32)
     nonzero_rows = _nonempty_or_raise(want, "acceptance")
@@ -839,6 +875,7 @@ def test_moe_path_output_matches_pure_torch_reference() -> None:
         f"max_rel_error={_max_rel_error(got_f32, want):.6e} "
         f"max_abs_error={float((got_f32 - want).abs().max()):.6e} "
         f"rtol={RTOL} atol={ATOL} reference_absmax={float(want.abs().max()):.6e} "
+        f"post_scale=True clamp=True swiglu_limit={float(bank.swiglu_limit)!r} "
         f"|| {reading}"
     )
     torch.testing.assert_close(got_f32, want, rtol=RTOL, atol=ATOL)
@@ -859,9 +896,27 @@ def test_moe_path_reference_agrees_with_vendor_torch_oracle() -> None:
     The vendor reference consumes the seam's operand form, so the mapping is
     rebuilt here with the same inputs the call site uses. Rebuilding it is
     legitimate for a SUPPLEMENTARY arm; the declared arm above never sees it.
+
+    R6 item R-T1 ADDED THE CONFIGURED HALF. The acceptance now compares the call
+    site under ``POST_SCALE`` and the model's SwiGLU clamp, so an oracle arm left
+    at the vendor's own defaults would certify arithmetic the acceptance no longer
+    uses. This arm therefore runs the vendor oracle TWICE -- once at those
+    defaults, and once carrying the same scaling mode and the same four clamp
+    limits the call site sends (``model_fp8.py:1968``, ``:2009-2012``), which the
+    seam forwards VERBATIM into the vendor's torch reference
+    (``moe_blockwise_fp8.py:445`` then ``:519``) -- and compares each against the
+    matching configuration of this file's reference.
+
+    A keyword the vendor ACCEPTED AND THEN IGNORED would turn the configured
+    comparison into a false pass, so the two oracle outputs must differ before
+    either comparison is believed. That refusal is the arm's own arming check, in
+    the idiom :func:`_nonempty_or_raise` uses one concern over.
     """
     from vllm_neuron.functional import build_blockwise_mapping
+    from vllm_neuron.functional.moe.moe_blockwise_fp8 import ExpertAffinityScaleMode
 
+    bank, _text_config = _build_bank()
+    limit = float(bank.swiglu_limit)
     case = _build_case()
     inputs = case["call_site_inputs"]
     hidden = inputs["hidden_states"]
@@ -883,34 +938,163 @@ def test_moe_path_reference_agrees_with_vendor_torch_oracle() -> None:
             tp_degree=1,
         )
     )
-    oracle = blockwise_fp8_moe_torch_oracle(
-        hidden_states=padded_hidden,
-        expert_affinities_masked=masked.to(hidden.dtype),
-        gate_up_proj_weight=inputs["gate_up_proj_weight"],
-        down_proj_weight=inputs["down_proj_weight"],
-        block_size=B,
-        token_position_to_id=token_position_to_id,
-        block_to_expert=block_to_expert.reshape(-1, 1),
-        gate_up_proj_scale=case["gup_logical"],
-        down_proj_scale=case["down_logical"],
+    def _oracle(**configuration) -> torch.Tensor:
+        return blockwise_fp8_moe_torch_oracle(
+            hidden_states=padded_hidden,
+            expert_affinities_masked=masked.to(hidden.dtype),
+            gate_up_proj_weight=inputs["gate_up_proj_weight"],
+            down_proj_weight=inputs["down_proj_weight"],
+            block_size=B,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert.reshape(-1, 1),
+            gate_up_proj_scale=case["gup_logical"],
+            down_proj_scale=case["down_logical"],
+            **configuration,
+        ).to(torch.float32)[:T]
+
+    def _mine(**configuration) -> torch.Tensor:
+        return torch_reference_moe(
+            hidden_states=hidden,
+            expert_affinities=affinities,
+            gate_up_proj_weight=inputs["gate_up_proj_weight"],
+            down_proj_weight=inputs["down_proj_weight"],
+            gate_up_logical_scale=case["gup_logical"],
+            down_logical_scale=case["down_logical"],
+            swiglu_limit=limit,
+            **configuration,
+        )
+
+    vendor_default = _oracle()
+    vendor_configured = _oracle(
+        expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+        gate_clamp_upper_limit=limit,
+        gate_clamp_lower_limit=None,
+        up_clamp_upper_limit=limit,
+        up_clamp_lower_limit=-limit,
     )
-    vendor = oracle.to(torch.float32)[:T]
-    mine = torch_reference_moe(
-        hidden_states=hidden,
-        expert_affinities=affinities,
-        gate_up_proj_weight=inputs["gate_up_proj_weight"],
-        down_proj_weight=inputs["down_proj_weight"],
-        gate_up_logical_scale=case["gup_logical"],
-        down_logical_scale=case["down_logical"],
-    )
-    _nonempty_or_raise(vendor, "reference-provenance")
+    separation = float((vendor_configured - vendor_default).abs().max())
+    if not separation > 0.0:
+        raise VacuousControlError(
+            f"the vendor oracle returned the same numbers with and without the "
+            f"call site's scaling mode and four clamp limits (max abs difference "
+            f"{separation!r}), so those keywords were accepted and ignored and "
+            f"the configured comparison below would pass on arithmetic that is "
+            f"not the configured arithmetic"
+        )
+    _nonempty_or_raise(vendor_default, "reference-provenance")
+    _nonempty_or_raise(vendor_configured, "reference-provenance-configured")
+
+    mine_default = _mine(post_scale=False, clamp=False)
+    mine_configured = _mine(post_scale=True, clamp=True)
     print(
-        f"[reference-provenance] max_rel_error="
-        f"{_max_rel_error(mine, vendor):.6e} "
-        f"max_abs_error={float((mine - vendor).abs().max()):.6e} "
+        f"[reference-provenance] vendor_default_vs_configured_absmax="
+        f"{separation:.6e} swiglu_limit={limit!r} "
+        f"default_max_rel_error={_max_rel_error(mine_default, vendor_default):.6e} "
+        f"default_max_abs_error="
+        f"{float((mine_default - vendor_default).abs().max()):.6e} "
+        f"configured_max_rel_error="
+        f"{_max_rel_error(mine_configured, vendor_configured):.6e} "
+        f"configured_max_abs_error="
+        f"{float((mine_configured - vendor_configured).abs().max()):.6e} "
         f"rtol={RTOL} atol={ATOL}"
     )
-    torch.testing.assert_close(mine, vendor, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(mine_default, vendor_default, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(
+        mine_configured, vendor_configured, rtol=RTOL, atol=ATOL
+    )
+
+
+# ===========================================================================
+# R6 item R-T1's own instrument: each of the call site's two overrides, reverted
+# one at a time, must turn the acceptance comparison RED.
+# ===========================================================================
+def test_moe_path_f1_pre_scale_unclamped_reference_must_fail() -> None:
+    """MEASURED: revert either override in the reference and the numbers diverge.
+
+    Batch R6 moved this file's reference off the vendor kernel's defaults and onto
+    the model the checkpoint ships (``design/reference/modeling_glm5_next.py:133``
+    and ``:139-140``), because the call site overrides both
+    (``model_fp8.py:1968``, ``:2009-2012``). This item is the pair that makes that
+    move a measurement rather than an assertion: the CONFIGURED reference passes
+    at the declared tolerances, and each override reverted -- the scaling point
+    alone, the clamp alone, and both together, which is exactly the reference this
+    file carried before R6 -- FAILS at the same tolerances.
+
+    So it is also the regression guard. If a later edit puts the reference back on
+    the kernel's defaults, or drops the clamp keywords from the call site, one of
+    these three must-fail arms goes green and this item goes red.
+
+    Each arm first proves it is ARMED, by measuring that reverting the override
+    actually moved the numbers on this fixture. An override that changed nothing
+    here would make its arm a tautology, and this fixture is conditioned so that
+    both bite: the activations reach ~1e8 against a bound of ``swiglu_limit``.
+    """
+    bank, _text_config = _build_bank()
+    quant_config = _block_quant_config()
+    case = _build_case()
+    limit = float(bank.swiglu_limit)
+
+    reset_dispatch_counters()
+    got = bank.block_quant_expert_mm(
+        quant_config=quant_config, block_size=B, **case["call_site_inputs"]
+    ).to(torch.float32)
+    nki_dispatch, torch_fallback = dispatch_counters()
+
+    def _reference(post_scale: bool, clamp: bool) -> torch.Tensor:
+        return torch_reference_moe(
+            hidden_states=case["call_site_inputs"]["hidden_states"],
+            expert_affinities=case["call_site_inputs"]["expert_affinities"],
+            gate_up_proj_weight=case["call_site_inputs"]["gate_up_proj_weight"],
+            down_proj_weight=case["call_site_inputs"]["down_proj_weight"],
+            gate_up_logical_scale=case["gup_logical"],
+            down_logical_scale=case["down_logical"],
+            swiglu_limit=limit,
+            post_scale=post_scale,
+            clamp=clamp,
+        )
+
+    configured = _reference(post_scale=True, clamp=True)
+    _nonempty_or_raise(configured, "override-pair")
+    reverted = {
+        "scaling_point_reverted": _reference(post_scale=False, clamp=True),
+        "clamp_reverted": _reference(post_scale=True, clamp=False),
+        "both_reverted_the_pre_r6_reference": _reference(
+            post_scale=False, clamp=False
+        ),
+    }
+
+    print(
+        f"[override-pair] seam_nki_dispatch={nki_dispatch} "
+        f"seam_torch_fallback={torch_fallback} swiglu_limit={limit!r} "
+        f"configured_max_rel_error={_max_rel_error(got, configured):.6e} "
+        f"configured_max_abs_error={float((got - configured).abs().max()):.6e} "
+        f"rtol={RTOL} atol={ATOL}"
+    )
+    assert (nki_dispatch, torch_fallback) == (DECLARED_DISPATCHES, 0), (
+        f"expected the seam reading ({DECLARED_DISPATCHES}, 0), got "
+        f"({nki_dispatch}, {torch_fallback}); this pair is about the route the "
+        f"acceptance measures, so it must run on that route"
+    )
+    for label, other in reverted.items():
+        separation = float((other - configured).abs().max())
+        print(
+            f"[override-pair] {label} "
+            f"separation_from_configured_absmax={separation:.6e} "
+            f"max_rel_error={_max_rel_error(got, other):.6e} "
+            f"max_abs_error={float((got - other).abs().max()):.6e}"
+        )
+        if not separation > 0.0:
+            raise VacuousControlError(
+                f"{label}: reverting the override left the reference numerically "
+                f"identical on this fixture (max abs difference {separation!r}), "
+                f"so this arm cannot fail for the reason it claims"
+            )
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(got, other, rtol=RTOL, atol=ATOL)
+
+    # The configured reference is asserted LAST, so a failure here reads as the
+    # call site disagreeing with the model rather than as an unarmed control.
+    torch.testing.assert_close(got, configured, rtol=RTOL, atol=ATOL)
 
 
 # ===========================================================================
@@ -947,6 +1131,11 @@ def test_moe_path_f1_numeric_arm_alone_cannot_discriminate(
             quant_config=quant_config, block_size=B, **case["call_site_inputs"]
         )
     nki_dispatch, torch_fallback = dispatch_counters()
+    # The CONFIGURED reference, because the fallback route carries the call
+    # site's mode and clamp limits too: the seam forwards ``**kernel_kwargs``
+    # verbatim on both routes (``moe_blockwise_fp8.py:445``, ``:462``). A
+    # default-configured reference here would turn this hazard arm red for a
+    # comparator reason and hide the hazard it exists to show (R6 item R-T1).
     want = torch_reference_moe(
         hidden_states=case["call_site_inputs"]["hidden_states"],
         expert_affinities=case["call_site_inputs"]["expert_affinities"],
@@ -954,6 +1143,9 @@ def test_moe_path_f1_numeric_arm_alone_cannot_discriminate(
         down_proj_weight=case["call_site_inputs"]["down_proj_weight"],
         gate_up_logical_scale=case["gup_logical"],
         down_logical_scale=case["down_logical"],
+        swiglu_limit=bank.swiglu_limit,
+        post_scale=True,
+        clamp=True,
     )
     got_f32 = got.to(torch.float32)
     error = _max_rel_error(got_f32, want)
@@ -1757,8 +1949,14 @@ def test_moe_path_landed_sections_are_untouched() -> None:
     assert int(bank.num_routed_experts) == E
     assert int(bank.num_experts_per_tok) == K
     assert int(text_config.n_routed_experts) == E
-    with pytest.raises(NotImplementedError, match="inc-glm53f-013"):
-        bank.forward()
+    # ``inc-glm53f-054a`` REMOVED THE STUB ARM THAT STOOD HERE. It asserted that
+    # ``Glm5NextRoutedExperts.forward`` raises ``NotImplementedError`` naming
+    # ``inc-glm53f-013``; that forward now computes, so the arm was a false
+    # statement about the tree rather than a check of it. Nothing replaces it here:
+    # what the forward does is certified by
+    # ``tiny/test_tiny_glm5next_forward.py``'s item 2, and this test's own claim --
+    # that ``-031``'s, ``-032``'s and ``-013``'s members still resolve unchanged --
+    # is carried by the assertions above and below.
     print(
         f"[landed] num_routed_experts={bank.num_routed_experts} "
         f"num_local_experts={bank.num_local_experts} "
