@@ -54,6 +54,7 @@ import hashlib
 import os
 import re
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -507,6 +508,141 @@ def test_030c_hc_epsilon_sites_are_the_pre_and_comb_gates_only() -> None:
         f"epsilon on the post term (reference:284), so this layer is adding one "
         f"the model does not have"
     )
+
+
+# --------------------------------------------------------------------------- #
+# COUNTED VALUE 3 -- every normalised block hits the seam's declared targets.    #
+# --------------------------------------------------------------------------- #
+def test_030c_each_normalised_block_hits_the_seams_declared_targets() -> None:
+    """The batched entry's ``[T, S, S]`` output is doubly stochastic, per block.
+
+    This is the plan's row for correction (iii), and it is a reading about the
+    SEAM SWAP rather than about arithmetic the layer authors: ``mhc_pre`` now
+    hands ``-028b``'s batched kernel the ``T`` blocks directly, so every one of
+    the ``T`` blocks -- not their average -- must come back on target.
+
+    The two targets are IMPORTED from the seam, never restated here
+    (:func:`row_target`, :func:`column_target`), which is what
+    ``sinkhorn.py:262-270`` asks of a caller by name: the kernel, the oracle and
+    every acceptance take the number from one place so they cannot drift.
+
+    NO NEW THRESHOLD IS REGISTERED. The two bounds are the cited pair read out of
+    ``test_mhc_layer.py``, used per axis the way that file's own landed item uses
+    them on this same quantity at this same case: the seam ends on a COLUMN pass,
+    so the column axis is the exact one (``atol``) and the row axis is the one
+    left one half-step behind (``rtol``). ``-028``'s own declared per-axis
+    expected result, "within ``1e-3`` of *its* target"
+    (``sinkhorn.py:267-268``), is printed beside them so a reader can see all
+    three numbers rather than trust one.
+    """
+    rtol, atol = _cited_tolerances()
+    fn, hc_scale, hc_base, residual = _fixture()
+    layer, _cfg = _layer()
+    _load(layer, fn, hc_scale, hc_base)
+
+    sinkhorn_mod.reset_dispatch_counters()
+    _post_mix, comb_mix, _layer_input = layer.mhc_pre(residual)
+    _route_reading("value-3-block-targets", calls=1)
+
+    row_goal = sinkhorn_mod.row_target()
+    col_goal = sinkhorn_mod.column_target(S, S)
+    assert tuple(comb_mix.shape) == (T, S, S), tuple(comb_mix.shape)
+
+    # Per BLOCK, so one bad token cannot hide inside an average.
+    row_sums = comb_mix.sum(dim=-1)          # [T, S]
+    col_sums = comb_mix.sum(dim=-2)          # [T, S]
+    row_dev = (row_sums - row_goal).abs()
+    col_dev = (col_sums - col_goal).abs()
+    worst_row_block = int(row_dev.amax(dim=-1).argmax())
+    worst_col_block = int(col_dev.amax(dim=-1).argmax())
+    print(
+        f"[value-3] blocks={T} row_target={row_goal} column_target={col_goal} "
+        f"worst_row_deviation={float(row_dev.max()):.6e} "
+        f"in_block={worst_row_block} "
+        f"worst_column_deviation={float(col_dev.max()):.6e} "
+        f"in_block={worst_col_block} rtol={rtol} atol={atol} "
+        f"seam_declared_per_axis_bound=1e-3 "
+        f"min_entry={float(comb_mix.min()):.6e}"
+    )
+    # Every entry stays strictly positive: a doubly stochastic matrix reached by
+    # multiplicative rescaling cannot introduce a zero, and a zero would mean the
+    # kernel returned an unwritten tile rather than a normalised block.
+    assert float(comb_mix.min()) > 0.0, float(comb_mix.min())
+    assert float(col_dev.max()) <= atol, (
+        f"worst column-sum deviation {float(col_dev.max()):.6e} exceeds the "
+        f"cited atol {atol}; the seam ends on a column pass, so this axis is the "
+        f"exact one and a miss here is a seam defect rather than a schedule gap"
+    )
+    assert float(row_dev.max()) <= rtol, (
+        f"worst row-sum deviation {float(row_dev.max()):.6e} exceeds the cited "
+        f"rtol {rtol}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# FAILING CONTROL 4 -- the batched seam REFUSES a missing route, and the        #
+# square seam it replaced would have papered over it.                          #
+# --------------------------------------------------------------------------- #
+def test_030c_control_the_batched_seam_refuses_an_unavailable_route() -> None:
+    """With no device and no simulator, ``mhc_pre`` must RAISE, not fall back.
+
+    This is correction (iii)'s failing control, and it is built in BOTH
+    directions on purpose, because a one-directional version of it would pass on
+    the code this increment replaced:
+
+    * the batched entry has **no torch path at all** and raises
+      :class:`SinkhornError` (``sinkhorn.py:952-1002``), so nothing is computed
+      and neither counter moves;
+    * the SQUARE entry this increment stopped calling does the opposite on the
+      same input -- it returns the torch oracle and charges a
+      ``torch_fallback`` (``sinkhorn.py:904-950``).
+
+    So reverting (iii) to ``sinkhorn_normalise(torch.block_diag(...))`` fails
+    this item by name. That is the point: kernel-class work ships no torch path
+    (P13), and an mHC layer that silently normalised its blocks in torch would be
+    slow in a way no numeric arm in this file could see.
+    """
+    fn, hc_scale, hc_base, residual = _fixture()
+    layer, _cfg = _layer()
+    _load(layer, fn, hc_scale, hc_base)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(os.environ, "NKI_SIMULATOR", "0")
+        gate = can_run_kernel(torch.zeros(1))
+        if gate is not False:
+            raise RouteInstrumentError(
+                f"can_run_kernel() still reads {gate} with NKI_SIMULATOR=0, so "
+                f"this control is unarmed and its raise would prove nothing"
+            )
+
+        sinkhorn_mod.reset_dispatch_counters()
+        with pytest.raises(sinkhorn_mod.SinkhornError) as excinfo:
+            layer.mhc_pre(residual)
+        after_batched = sinkhorn_mod.dispatch_counters()
+        message = str(excinfo.value)
+
+        # The same blocks, through the seam this increment REPLACED.
+        blocks = torch.rand(T, S, S, dtype=torch.float32) + 0.5
+        sinkhorn_mod.reset_dispatch_counters()
+        square = sinkhorn_mod.sinkhorn_normalise(
+            torch.block_diag(*blocks.unbind(0)),
+            iters=int(layer.sinkhorn_iters),
+        )
+        after_square = sinkhorn_mod.dispatch_counters()
+
+    print(
+        f"[control-4] gate={gate} batched_raised={type(excinfo.value).__name__} "
+        f"counters_after_batched={after_batched} "
+        f"square_returned_shape={tuple(square.shape)} "
+        f"counters_after_square={after_square} "
+        f"message={message[:120]!r}"
+    )
+    assert "no torch path" in message, message
+    assert "kernel-class" in message, message
+    assert after_batched == (0, 0), after_batched
+    # The discriminating half: the replaced seam would have RETURNED here.
+    assert after_square == (0, 1), after_square
+    assert tuple(square.shape) == (T * S, T * S), tuple(square.shape)
 
 
 # --------------------------------------------------------------------------- #

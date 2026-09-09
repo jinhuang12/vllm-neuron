@@ -67,20 +67,30 @@ operation in **two independent spellings**, and both are transcribed here:
 so the comparator does not rest on one reading of one file. This is the
 discipline ``-029`` set (``evidence-029.md`` section 2.1).
 
-THE COMPOSITION THE LAYER HAD TO AUTHOR, AND THE CONTROL THAT GUARDS IT.
-``-028``'s seam normalises ONE ``[M, N]`` matrix; the target needs ``T``
-independent ``[S, S]`` ones; the predicate above declares ONE Sinkhorn dispatch
-per layer call. The layer reconciles those with a **block-diagonal embedding**
-(``model_fp8.py``, the ``Glm5NextHyperConnection`` docstring). The embedding is
-not asserted, it is guarded from two sides:
+THE COMPOSITION THE LAYER HAD TO AUTHOR -- RE-GROUNDED BY ``inc-glm53f-030c``.
+The problem was real: ``-028``'s square seam normalises ONE ``[M, N]`` matrix,
+the target needs ``T`` independent ``[S, S]`` ones, and the predicate above
+declares ONE Sinkhorn dispatch per layer call. ``-030`` reconciled them with a
+**block-diagonal embedding**. ``-030c`` removed that reconciliation: ``mhc_pre``
+now calls ``-028b``'s BATCHED entry, which takes ``[T, S, S]`` directly, so this
+layer builds no square matrix and calls ``torch.block_diag`` nowhere. The
+dispatch count is unchanged at one per layer call.
 
-* :func:`test_mhc_layer_tokens_are_independent_of_each_other` perturbs ONE
-  token and requires every OTHER token's output to be **bit-identical**. The
-  rejected flat ``[T*S, S]`` reshape lets ``-028``'s column pass sum across
-  tokens, so it fails this arm loudly -- which is why the arm exists.
-* :func:`test_mhc_layer_off_block_entries_stay_zero` reads the off-block maximum
-  of the kernel's own output and requires exactly ``0.0``, and reads each
-  token's row and column sums against the base's own targets.
+The two arms that guarded the embedding are kept, and what each one reads NOW is
+stated rather than left to the reader:
+
+* :func:`test_mhc_layer_tokens_are_independent_of_each_other` perturbs ONE token
+  and requires every OTHER token's output to be **bit-identical**. Still exactly
+  the right arm: the property is per-token independence, whichever seam delivers
+  it, and the rejected flat ``[T*S, S]`` reshape -- measured at ``4.68e-01`` in
+  ``probe-030-composition-algebra.out`` -- would still fail it loudly.
+* :func:`test_mhc_layer_off_block_entries_stay_zero` now reads TWO different
+  things: the layer's own ``comb_mix`` row and column sums against ``-028``'s
+  targets, which is a live reading of the batched seam; and an off-block maximum
+  taken by calling the SQUARE seam directly from the test, which is now a
+  property of ``-028``'s square kernel rather than of this layer's composition.
+  ``-030c`` leaves that item byte-unchanged and reports it, so the split is a
+  ruling rather than a seat's edit (LEAD-LOG §988).
 
 TWO DIVERGENCES FROM THE BASE THAT THIS INCREMENT CANNOT REMOVE, and both are
 inside ``-028``'s LANDED kernel, so both are measured rather than repaired: the
@@ -134,10 +144,11 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # --------------------------------------------------------------------------- #
 # The declared tiny case.                                                     #
 # --------------------------------------------------------------------------- #
-#: Tokens. Chosen inside the ceiling the block-diagonal embedding implies --
-#: ``T * S <= MOVING_FMAX`` since `inc-glm53f-028b` tiled the row axis, and the
-#: row axis before it -- with room to spare either way, so the declared case is
-#: not also a boundary case. The boundary itself is a separate arm.
+#: Tokens. RE-GROUNDED BY `inc-glm53f-030c`: the ceiling used to be the square
+#: embedding's, ``T * S <= MOVING_FMAX``. ``mhc_pre`` now enters the batched
+#: entry, which carries NO token bound, so the only ceiling left is the combine
+#: kernel's ``T <= PARTITION_MAX`` = ``128``. ``8`` sits far inside it, so the
+#: declared case is not also a boundary case. The boundary is a separate arm.
 T = 8
 #: Streams. ``MHC_STREAMS`` is ``-028``'s named constant for the target's
 #: ``hc_mult 4``; it is imported rather than restated, which is what
@@ -642,7 +653,7 @@ def test_mhc_layer_counters_read_one_per_layer_call_across_two_calls() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# THE COMPOSITION CONTROLS -- the block-diagonal embedding, guarded.            #
+# THE COMPOSITION CONTROLS -- per-token independence, re-grounded by -030c.     #
 # --------------------------------------------------------------------------- #
 def test_mhc_layer_tokens_are_independent_of_each_other() -> None:
     """Perturb ONE token; every OTHER token's output must be BIT-IDENTICAL.
@@ -855,15 +866,35 @@ def test_mhc_layer_folds_the_streams_as_the_base_does() -> None:
 def test_mhc_layer_route_control_fallback_counters_discriminate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the simulator disabled BOTH seams take the torch path, and it is COUNTED.
+    """RE-GROUNDED BY ``inc-glm53f-030c``. The LAYER refuses; the COMBINE still counts.
 
-    This is what makes ``torch_fallback == 0`` on both seams a measurement
-    rather than a default: each counter is shown reading ``(0, 1)`` through the
-    real gate rather than a mock.
+    This item used to call the layer with the simulator off and read ``(0, 1)``
+    on BOTH seams, because both had a torch path. ``-030c``'s correction (iii)
+    moved ``mhc_pre`` onto ``-028b``'s batched entry, which ships **no torch path
+    at all** and raises instead (``sinkhorn.py:952-1002``), so the old reading is
+    now unreachable: nothing is computed and neither counter moves.
+
+    What the item is for survives, and it is what is asserted here. Two readings,
+    both taken from the seams themselves rather than from a mock:
+
+    * with the route gone, ``layer.forward`` RAISES :class:`SinkhornError` and
+      leaves both counters at ``(0, 0)`` -- the Sinkhorn seam never dispatches
+      and the combine is never reached, so the refusal is the whole behaviour;
+    * the combine seam, which DOES still carry a torch path, is then called
+      directly on the same route and charges ``(0, 1)``. That is what keeps
+      ``torch_fallback == 0`` a MEASUREMENT in every passing arm above rather
+      than a number that could not move.
     """
     fn, hc_scale, hc_base, residual = _fixture()
     layer = _layer()
     _load(layer, fn, hc_scale, hc_base)
+
+    # Take real pre-block outputs on the working route, so the combine call below
+    # is the layer's own data rather than a synthetic stand-in.
+    _reset_both()
+    post_mix, comb_mix, layer_input = layer.mhc_pre(residual)
+    x = _sublayer(layer_input)
+    on_route = _read_both()
 
     monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
     assert can_run_kernel(torch.zeros(1)) is False, (
@@ -872,44 +903,92 @@ def test_mhc_layer_route_control_fallback_counters_discriminate(
 
     _reset_both()
     with _AttributedSimulatorCounter() as sim:
-        out = layer.forward(residual, _sublayer)
-    readings = _read_both()
+        with pytest.raises(SinkhornError) as excinfo:
+            layer.forward(residual, _sublayer)
+    refused = _read_both()
+    message = str(excinfo.value)
+
+    # The seam that still HAS a fallback, on the same dead route.
+    _reset_both()
+    combined = layer.mhc_post(x, residual, post_mix, comb_mix)
+    fell_back = _read_both()
+
     print(
-        f"[route-control] sinkhorn={readings[0]} combine={readings[1]} "
-        f"simulate_kernel_total={sim.total}"
+        f"[route-control] on_route sinkhorn={on_route[0]} combine={on_route[1]} "
+        f"| refused sinkhorn={refused[0]} combine={refused[1]} "
+        f"raised={type(excinfo.value).__name__} simulate_kernel_total={sim.total} "
+        f"| combine_alone sinkhorn={fell_back[0]} combine={fell_back[1]} "
+        f"message={message[:96]!r}"
     )
-    assert readings == ((0, 1), (0, 1)), readings
+    assert on_route == ((1, 0), (0, 0)), on_route
+    assert refused == ((0, 0), (0, 0)), refused
     assert sim.total == 0, sim.total
-    assert tuple(out.shape) == (T, S, H)
+    assert "no torch path" in message, message
+    # The discriminating reading: this counter CAN move, so its zero above counts.
+    assert fell_back == ((0, 0), (0, 1)), fell_back
+    assert tuple(combined.shape) == (T, S, H), tuple(combined.shape)
 
 
 def test_mhc_layer_f1_numeric_arm_alone_cannot_discriminate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The torch-fallback layer passes the NUMERIC arm, which is why counters decide.
+    """RE-GROUNDED BY ``inc-glm53f-030c``. F1's hazard, closed at one seam and live at the other.
 
-    F1's hazard stated as a measurement: with no kernel running at all, the
-    declared tolerance comparison still succeeds, because both seams' fallbacks
-    compute the same function. So a green numeric arm is not evidence a kernel
-    ran, and the plan's counter clause is the only thing that is.
+    F1's hazard is that a green numeric arm is not evidence a kernel ran. After
+    ``-030c``'s correction (iii) the hazard is closed at the Sinkhorn seam **by
+    construction** -- with the route gone there is no number to compare, because
+    the batched entry raises rather than returning an oracle -- and it is STILL
+    LIVE at the combine, whose torch path computes the same function as its
+    kernel. Both halves are read here, so the item measures the hazard's real
+    shape instead of the shape it had before (iii):
+
+    1. the combine's torch fallback matches its own kernel output within the
+       declared pair, and matches the reference too, while charging ``(0, 1)`` --
+       so a numeric-only reading cannot tell which path ran;
+    2. the whole layer cannot be measured at all on the dead route: it raises.
+
+    Which is why the plan's counter clause, not the tolerance comparison, is what
+    makes a kernel run a fact.
     """
     fn, hc_scale, hc_base, residual = _fixture()
     layer = _layer()
     _load(layer, fn, hc_scale, hc_base)
     want, _, _, _, _ = _reference_layer(fn, hc_scale, hc_base, residual, "torch")
 
-    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
+    # The kernel route, kept for the comparison the fallback must be indistinguishable from.
     _reset_both()
-    got = layer.forward(residual, _sublayer)
-    readings = _read_both()
-    max_abs, max_rel = _errors(got, want)
+    post_mix, comb_mix, layer_input = layer.mhc_pre(residual)
+    x = _sublayer(layer_input)
+    kernel_out = layer.mhc_post(x, residual, post_mix, comb_mix)
+    on_route = _read_both()
+
+    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
+
+    _reset_both()
+    with pytest.raises(SinkhornError) as excinfo:
+        layer.forward(residual, _sublayer)
+    refused = _read_both()
+
+    _reset_both()
+    fallback_out = layer.mhc_post(x, residual, post_mix, comb_mix)
+    fell_back = _read_both()
+
+    max_abs, max_rel = _errors(fallback_out, kernel_out)
+    ref_abs, ref_rel = _errors(fallback_out, want)
     print(
-        f"[f1] no_kernel_ran sinkhorn={readings[0]} combine={readings[1]} "
-        f"max_abs_error={max_abs:.6e} max_rel_error={max_rel:.6e}"
+        f"[f1] on_route sinkhorn={on_route[0]} combine={on_route[1]} "
+        f"| layer_on_dead_route raised={type(excinfo.value).__name__} "
+        f"sinkhorn={refused[0]} combine={refused[1]} "
+        f"| combine_fallback sinkhorn={fell_back[0]} combine={fell_back[1]} "
+        f"vs_kernel max_abs_error={max_abs:.6e} max_rel_error={max_rel:.6e} "
+        f"vs_reference max_abs_error={ref_abs:.6e} max_rel_error={ref_rel:.6e}"
     )
-    assert readings == ((0, 1), (0, 1)), readings
-    # The point of the arm: this comparison PASSES with zero kernels dispatched.
-    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+    assert on_route == ((1, 0), (1, 0)), on_route
+    assert refused == ((0, 0), (0, 0)), refused
+    assert fell_back == ((0, 0), (0, 1)), fell_back
+    # The point of the arm: BOTH comparisons pass with no combine kernel dispatched.
+    torch.testing.assert_close(fallback_out, kernel_out, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(fallback_out, want, rtol=RTOL, atol=ATOL)
 
 
 def test_mhc_layer_route_control_simulator_is_load_bearing() -> None:
