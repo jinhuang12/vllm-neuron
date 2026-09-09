@@ -66,6 +66,14 @@ WHAT THIS MODULE DOES NOT DO -- declared, so the omissions read as decisions
   powers of two, so the satisfying fraction over real weights is expected to be
   materially below 100%. That reading, and any tolerance question it raises,
   belongs to the first attempt that loads a real checkpoint.
+* It does, since ``inc-glm53f-054a`` repair batch R6, **REFUSE a rescale it
+  cannot represent**, which is a different thing from enforcing losslessness: an
+  inexact rescale is counted and emitted, while a rescaled byte outside what
+  fp8-e4m3 can hold has no representation at all and the cast to fp8 is not
+  saturating, so the only alternatives were a refusal or a silent NaN. A clamp is
+  deliberately NOT the remedy -- clamped bytes are numbers the checkpoint does
+  not contain, which is the lead's and the user's question behind design door
+  ``SUR-7``, never this module's (lead ruling ``LEAD-LOG.md`` §901).
 * It does not enforce the consumer's *sharded* I-extent constraint. The vendor
   asserts ``I_TP % 256 == 0`` (``:681``) while the scale index divides the
   un-asserted ``I_TP_sharded = I_TP // NUM_SHARDS`` (``:91``) by 256, so at
@@ -95,6 +103,13 @@ I_TILES_PER_BLOCK = BLOCK_QUANT_SIZE // TILE_SIZE
 
 _FP32 = torch.float32
 _FP8 = torch.float8_e4m3fn
+
+#: The largest magnitude fp8-e4m3 holds, READ off the dtype rather than typed
+#: (``torch.finfo(torch.float8_e4m3fn).max``, 448.0 at this pin). The sibling
+#: fp8 writer bounds its own cast at the same value
+#: (``vllm_neuron/model/glm5_next/weight_loaders_fp8.py:1176``), by clamping;
+#: this module refuses instead, for the reason the module docstring records.
+_FP8_MAX = float(torch.finfo(_FP8).max)
 
 #: The three ratio constraints, in the order the design declares them, taken
 #: against the block's ``(h_tile 0, i_tile 0)`` scale.
@@ -328,7 +343,12 @@ def retile_block_scales(
 
     Raises:
         BlockwiseFp8RetileError: on an extent that is not ``256``-blocked, a scale
-            grid that does not match the weight, or an unusable dtype.
+            grid that does not match the weight, or an unusable dtype; and, since
+            ``inc-glm53f-054a`` repair batch R6 item R-P1, on a retained block
+            scale that is zero or non-finite, or a rescaled byte outside what
+            fp8-e4m3 can hold. The refusal names the expert, the 256-block, the
+            128-tile and both health counters, because the alternative was a
+            silent NaN: the cast to fp8 does not saturate.
     """
     if weights.dim() != 3:
         raise BlockwiseFp8RetileError(
@@ -379,6 +399,19 @@ def retile_block_scales(
             for i_block in range(i_256):
                 retained = scales[expert, h_block * I_TILES_PER_BLOCK,
                                   i_block * I_TILES_PER_BLOCK]
+                # R6 item R-P1: a retained scale of zero or a non-finite one makes
+                # every ratio in the block undefined, and the emission that
+                # followed would carry inf or NaN with no counter reporting it.
+                if not bool(torch.isfinite(retained)) or float(retained) == 0.0:
+                    raise BlockwiseFp8RetileError(
+                        f"expert {expert} 256-block (h={h_block}, i={i_block}) "
+                        f"retains scale {float(retained)!r}, so every tile ratio "
+                        f"in the block is undefined; the retile REFUSES rather "
+                        f"than emit it. Counters at the refusal: "
+                        f"inexact_rescales={inexact} so far, and "
+                        f"input_scales_dropped is read off a COMPLETED emission, "
+                        f"which this refusal prevents"
+                    )
                 block_scales[expert, i_block, h_block] = retained
                 ratios: list[float] = []
                 ratios_pow2: list[bool] = []
@@ -418,6 +451,29 @@ def retile_block_scales(
                             slice(i_tile * TILE_SIZE, (i_tile + 1) * TILE_SIZE),
                         )
                         wanted = weights_fp32[window] * ratio
+                        # R6 item R-P1: the cast below is NOT saturating, so a
+                        # rescaled byte past the fp8 bound becomes NaN in silence
+                        # and the health record has no counter for it. Refuse
+                        # instead -- a clamp would ship numbers the checkpoint
+                        # does not contain (module docstring; LEAD-LOG §901).
+                        # The finiteness test runs FIRST: an all-NaN window's
+                        # maximum is NaN, and NaN > bound is False.
+                        if not bool(torch.isfinite(wanted).all()) or float(
+                            wanted.abs().max()
+                        ) > _FP8_MAX:
+                            raise BlockwiseFp8RetileError(
+                                f"expert {expert} 256-block (h={h_block}, "
+                                f"i={i_block}) 128-tile (h={h_tile}, i={i_tile}) "
+                                f"rescales by ratio {float(ratio)!r} against "
+                                f"retained scale {float(retained)!r} and reaches "
+                                f"{float(wanted.abs().max())!r}, which fp8-e4m3 "
+                                f"cannot hold (bound {_FP8_MAX}); the retile "
+                                f"REFUSES rather than cast it, because the cast "
+                                f"does not saturate and would emit NaN. Counters "
+                                f"at the refusal: inexact_rescales={inexact} so "
+                                f"far, and input_scales_dropped is read off a "
+                                f"COMPLETED emission, which this refusal prevents"
+                            )
                         stored = wanted.to(_FP8).to(_FP32)
                         if not torch.equal(stored, wanted):
                             inexact += 1

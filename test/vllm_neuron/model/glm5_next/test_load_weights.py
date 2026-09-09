@@ -3336,6 +3336,91 @@ def _shard_pattern(
     return line.reshape(view).expand(shape).contiguous()
 
 
+#: The classes whose LOAD PATH coarsens a checkpoint scale grid onto the consumer's
+#: 256 granularity. Read off the two call sites that do it -- the republish the two
+#: dense-shaped classes go through (``model_fp8.py:6915``) and the routed bank's own
+#: prep (``:2281-2293``) -- rather than from a guess about which families are
+#: quantised. A family outside this tuple keeps :func:`_shard_pattern`'s ramp,
+#: because nothing rescales its weights there and the ramp's per-128-tile
+#: distinctness is the stronger position reading.
+_RETILED_AT_LOAD_CLASSES = (
+    "Glm5NextDenseMLP",
+    "Glm5NextSharedExperts",
+    "Glm5NextRoutedExperts",
+)
+
+#: The exponents the pow2 grid cycles through, one per 256 block along the shard
+#: dim. Eight of them, which is the widest block count any family in the deferred
+#: fixture has -- the shared expert's 2048 shard extent is 8 blocks of 256 -- so no
+#: tensor this fixture writes aliases at all. Small magnitudes on purpose: the
+#: values multiply fp8 bytes in the dequantisations these items compare.
+_POW2_GRID_EXPONENTS = tuple(range(-3, 5))
+
+
+def _tiles_per_consumer_block() -> int:
+    """How many checkpoint ``128`` tiles one consumer ``256`` block covers.
+
+    Derived from the consumer's own block size and the checkpoint's, never typed:
+    a fixture that hardcoded 2 would keep writing 2 the day either side moved.
+    """
+    block = _WL_FP8.consumer_block_quant_size()
+    tiles, remainder = divmod(block, DEFAULT_WEIGHT_BLOCK_SIZE[0])
+    assert remainder == 0 and len(set(DEFAULT_WEIGHT_BLOCK_SIZE)) == 1, (
+        f"the consumer's {block} block is not a whole number of the checkpoint's "
+        f"{DEFAULT_WEIGHT_BLOCK_SIZE} tiles, so no grid this fixture writes can be "
+        f"one the coarsening reproduces and the items below would be measuring the "
+        f"fixture instead of the loader"
+    )
+    return tiles
+
+
+def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
+    """A ``128``-tile scale grid the ``256`` coarsening reproduces BIT-EXACTLY.
+
+    ``inc-glm53f-054a`` repair batch R6 item R-T2 wrote this, on a measurement
+    rather than a preference. The coarsening keeps ONE scale per 256 block and
+    rescales the block's other three 128 tiles into it
+    (``blockwise_fp8_retile.py:443-480``), so on :func:`_shard_pattern`'s fp32 ramp
+    -- 1, 2, 3, ... along the shard dim -- the first block's ratio is exactly 2 and
+    every later one is a fraction like 4/3. Both consequences were measured on the
+    host: the fractions raise ``inexact_rescales``, and an fp8 byte at the maximum
+    doubled leaves what fp8-e4m3 can hold, which the landed cast turned into a
+    silent NaN and R6 item R-P1 now REFUSES by name
+    (``blockwise_fp8_retile.py:461-476``).
+
+    So a grid whose four 128-tile scales AGREE inside every 256 block is not a
+    fixture retuned to pass. It is the only grid family on which a BIT-EXACT
+    reassembly can be asked at all: :func:`_as_the_loader_left_it` undoes the
+    republish's FRAME and cannot undo a requantisation (see its own docstring), so
+    any ratio other than 1 moves the weight bytes the comparison is about. With
+    every ratio 1 the coarsening moves the layout and no byte, which is exactly
+    what those items claim.
+
+    Every value is an exact power of two, so the dequantisations these items
+    compare stay exact in fp32 and the retained scale satisfies the complete
+    losslessness condition ``inc-glm53f-024`` part 5 states. Each 256 BLOCK along
+    ``dim`` gets its own value, so "did this rank get the right blocks" is still
+    answerable -- and a rank boundary is always a whole block here, because the
+    consumer refuses any other shard.
+
+    WHAT IT GIVES UP, STATED RATHER THAN LEFT TO BE FOUND. A scale-position mixup
+    INSIDE one 256 block is invisible on this grid, where the ramp would catch it.
+    No single fixture can hold both readings. The ramp reading is kept by the item
+    that keeps the ramp and asserts the refusal fires by name,
+    :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`.
+    """
+    per_block = _tiles_per_consumer_block()
+    extent = shape[dim]
+    block = torch.arange(extent, dtype=torch.int64) // per_block
+    exponents = torch.tensor(_POW2_GRID_EXPONENTS, dtype=torch.int64)
+    line = torch.ldexp(
+        torch.ones(extent, dtype=torch.float32), exponents[block % exponents.numel()]
+    )
+    view = [1] * len(shape)
+    view[dim] = extent
+    return line.reshape(view).expand(shape).contiguous()
+
+
 def _shard_key_overrides(
     model: Glm5NextForConditionalGeneration,
     mappings: dict[str, str | list[str]],
@@ -4395,8 +4480,21 @@ def _deferred_config(shared_experts: int = MINI_SHARED_EXPERTS) -> Glm5NextConfi
 def _deferred_key_overrides(
     model: Glm5NextForConditionalGeneration,
     mappings: dict[str, str | list[str]],
+    *,
+    ramp_grids: bool = False,
 ) -> dict[str, torch.Tensor]:
     """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
+
+    A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK, and that
+    is R6 item R-T2's change here. Every family in :data:`_RETILED_AT_LOAD_CLASSES`
+    has whole-256 extents in this fixture, so its load coarsens the grid; on the
+    ramp that coarsening rescales weight bytes, which contradicts the bit-exact
+    readings below and now REFUSES where a byte leaves the fp8 range (R6 item
+    R-P1). :func:`_pow2_block_grid_pattern` carries the reasoning and what it gives
+    up. Every other family keeps the ramp: nothing rescales its weights.
+
+    ``ramp_grids=True`` writes the ramp for EVERY family, which is the fixture the
+    refusal item needs and the only caller that asks for it.
 
     A bank entry is E weight keys and E scale keys interleaved, so its arm writes
     one tensor per expert at that expert's own full width -- the loader's job is to
@@ -4444,18 +4542,31 @@ def _deferred_key_overrides(
                 overrides[key] = _shard_pattern(
                     shape, shard_dim, torch.float8_e4m3fn
                 )
+            coarsened = not ramp_grids and family in _RETILED_AT_LOAD_CLASSES
             for key in scales:
-                overrides[key] = _shard_pattern(grid_shape, shard_dim, torch.float32)
+                overrides[key] = (
+                    _pow2_block_grid_pattern(grid_shape, shard_dim)
+                    if coarsened
+                    else _shard_pattern(grid_shape, shard_dim, torch.float32)
+                )
     return overrides
 
 
-def _deferred_checkpoint(tmp_path: Path) -> tuple[Path, dict, dict]:
-    """One checkpoint holding every full tensor these five items read."""
+def _deferred_checkpoint(
+    tmp_path: Path, *, ramp_grids: bool = False, name: str = "deferred"
+) -> tuple[Path, dict, dict]:
+    """One checkpoint holding every full tensor these five items read.
+
+    ``ramp_grids`` and ``name`` exist for R6 item R-T2's refusal item alone: it
+    needs the SAME checkpoint with the ramp scale grid restored, written beside this
+    one rather than over it, so the two loads in that item differ in exactly the one
+    field it varies.
+    """
     config = _deferred_config()
     mappings = _mappings_for(config)
     reference = Glm5NextForConditionalGeneration(config)
-    overrides = _deferred_key_overrides(reference, mappings)
-    directory = tmp_path / "deferred"
+    overrides = _deferred_key_overrides(reference, mappings, ramp_grids=ramp_grids)
+    directory = tmp_path / name
     _write_miniature_checkpoint(
         directory, mappings, reference, extra_overrides=overrides
     )
@@ -6904,8 +7015,14 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_retile_ran(
         computed here from the consumer's block size rather than read back from
         the record.
     (4) Both losslessness counters read zero on this fixture. They are counters,
-        not assertions: ``-095b``'s pattern writes a distinct value per index, so
-        a layout that dropped or invented a scale would move them.
+        not assertions: the grid writes a distinct value per 256 BLOCK along the
+        shard dim, so a layout that dropped or invented a scale would move them.
+        R6 item R-T2 changed that granularity from ``-095b``'s per-128-tile ramp
+        and corrected this sentence with it -- on the ramp the coarsening rescales
+        weight bytes, which is what these counters were reporting and what R-P1 now
+        refuses; :func:`_pow2_block_grid_pattern` records the trade and
+        :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`
+        keeps the ramp reading.
     (5) Every routed bank carries its prepared kernel operands. This is the plan's
         own sentence for this item -- the prep's arrival makes the loop visit the
         bank -- read on the module the loop visited.
@@ -7005,3 +7122,112 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_retile_ran(
         "the control built no routed bank either, so it varies more than the one "
         "field it declares and cannot isolate anything"
     )
+
+
+def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """R6 item R-T2's pair: the grid the coarsening cannot reproduce is REFUSED.
+
+    This is the reading the ramp grid used to carry and the pow2 grid above gives
+    up, kept here where it belongs. The SAME checkpoint is written twice, differing
+    in one field -- the scale grid's family -- and the two loads are compared:
+
+    * the pow2 grid loads and completes, which is the arming half. Without it a
+      refusal below could be any load failure wearing the right words.
+    * the ramp grid, 1, 2, 3, ... per 128 tile, makes the first 256 block's ratio
+      exactly 2, and an fp8 byte at the maximum doubled leaves what fp8-e4m3 holds.
+      The landed cast is not saturating, so until R6 item R-P1 that produced a
+      SILENT NaN which every shape reading passed straight over; now the retile
+      refuses and names the expert, the 256 block, the 128 tile, the ratio, the
+      retained scale, the bound and both health counters
+      (``blockwise_fp8_retile.py:461-476``).
+
+    A clamp is deliberately not the alternative: it would ship numbers the
+    checkpoint does not contain (lead ruling ``LEAD-LOG.md`` §901).
+
+    The refusal is read off the exception CHAIN rather than the outermost type,
+    because the load path is entitled to wrap it; what this item claims is that a
+    ``BlockwiseFp8RetileError`` is in that chain and that its sentence names the
+    coordinates, not that nothing re-raises it.
+    """
+    from vllm_neuron.functional.moe.blockwise_fp8_retile import (
+        BlockwiseFp8RetileError,
+    )
+
+    pow2_directory, pow2_overrides, _mappings = _deferred_checkpoint(tmp_path)
+    ramp_directory, ramp_overrides, _ramp_mappings = _deferred_checkpoint(
+        tmp_path, ramp_grids=True, name="deferred-ramp"
+    )
+
+    # THE ONE FIELD THIS ITEM VARIES, measured rather than declared: the two
+    # checkpoints differ on the grids of the retiled families and nowhere else.
+    # The comparison goes through fp32 because the weight tensors are fp8, where a
+    # dtype-native equality is not something this file assumes it has.
+    def _same(left: torch.Tensor, right: torch.Tensor) -> bool:
+        if left.dtype != right.dtype or tuple(left.shape) != tuple(right.shape):
+            return False
+        return bool(torch.equal(left.to(torch.float32), right.to(torch.float32)))
+
+    assert sorted(ramp_overrides) == sorted(pow2_overrides), (
+        "the two fixtures do not even hold the same keys, so they differ in more "
+        "than the grid family this item varies"
+    )
+    differing = sorted(
+        key
+        for key, tensor in ramp_overrides.items()
+        if not _same(tensor, pow2_overrides[key])
+    )
+    print(f"RAMPREFUSAL_KEYS_THAT_DIFFER={len(differing)}")
+    assert differing, (
+        "the ramp fixture and the pow2 fixture hold identical tensors, so this "
+        "item varies nothing and the refusal below would not be attributable to "
+        "the grid"
+    )
+    assert all(key.endswith(FP8_SCALE_SUFFIX) for key in differing), (
+        f"the two fixtures differ on tensors that are not scale grids: "
+        f"{[key for key in differing if not key.endswith(FP8_SCALE_SUFFIX)][:6]}. "
+        f"This item varies the grid family and must vary nothing else"
+    )
+
+    # THE ARMING HALF. Same widths, same weights, pow2 grid: the load completes.
+    armed = _load_blocked(pow2_directory, monkeypatch)
+    assert _modules_named(armed, "Glm5NextSharedExperts"), (
+        "the pow2 load built no shared-expert module, so the refusal below cannot "
+        "be attributed to the grid the retile read"
+    )
+
+    with pytest.raises(Exception) as raised:  # noqa: B017 -- the chain is the claim
+        _load_blocked(ramp_directory, monkeypatch)
+
+    chain: list[BaseException] = []
+    error: BaseException | None = raised.value
+    while error is not None and error not in chain:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    types = [type(item).__name__ for item in chain]
+    refusals = [item for item in chain if isinstance(item, BlockwiseFp8RetileError)]
+    print(f"RAMPREFUSAL_EXCEPTION_CHAIN={types}")
+    for item in refusals:
+        print(f"RAMPREFUSAL_MESSAGE={str(item)[:400]}")
+    assert refusals, (
+        f"the ramp grid raised {types}, with no BlockwiseFp8RetileError anywhere in "
+        f"the chain. Either the retile no longer refuses an unrepresentable rescale "
+        f"-- in which case it is emitting NaN again -- or the load failed for some "
+        f"other reason and this item is measuring that instead"
+    )
+    message = str(refusals[0])
+    for phrase in (
+        "REFUSES",
+        "256-block",
+        "128-tile",
+        "ratio",
+        "retained scale",
+        "inexact_rescales",
+        "input_scales_dropped",
+    ):
+        assert phrase in message, (
+            f"the refusal does not say {phrase!r}: {message[:300]}. The whole point "
+            f"of refusing rather than emitting NaN is that the message locates the "
+            f"block and reports the counters"
+        )
