@@ -2301,6 +2301,16 @@ def check_tie_equivalent_selection(
     The sentinel columns are compared as a COUNT, not as places: `-1` marks carry no score, so
     which slot holds one is not a selection question, and `_ref_canonical_sentinel_order` has
     already pinned them to the trailing columns on both sides.
+
+    DISTINCTNESS IS CHECKED FIRST, AND THAT IS A REPAIR. Every reading below this point treats a
+    row's chosen ids as a SET, so a row that carries one legal id twice used to walk straight
+    through: `[0, 0]` against a reference `[0, 1]` matched on count (two real ids each), collapsed
+    to `{0}`, and then satisfied "lowest chosen at least as high as highest unchosen" for free
+    whenever column 0 was the row's top score -- no tie anywhere. The reference then ADOPTED the
+    duplicated row and the output comparison passed on a selection that is illegal. A repeated id
+    is not a tie substitution: it is one fewer token attended, and
+    `select_bounded_pools`' own docstring records that the vendored selector's striking branch can
+    return a legal column twice. So a repeat is a named failure here and never reaches the set.
     """
     scores = bounded.float()
     rows, width = int(scores.shape[0]), int(scores.shape[1])
@@ -2310,6 +2320,24 @@ def check_tie_equivalent_selection(
         ker_row = [int(v) for v in kernel_ids[r].tolist()]
         ref_real = sorted(v for v in ref_row if v >= 0)
         ker_real = sorted(v for v in ker_row if v >= 0)
+
+        # THE DISTINCTNESS READING, BEFORE ANY SET IS TAKEN. Both lists are already sorted, so a
+        # repeat is an equal neighbour. The repeated id is named because "a duplicate exists" sends
+        # the next reader back to the transcript, and the id says which pool the row lost.
+        ker_repeats = sorted({v for i, v in enumerate(ker_real[1:]) if v == ker_real[i]})
+        ref_repeats = sorted({v for i, v in enumerate(ref_real[1:]) if v == ref_real[i]})
+        assert not ker_repeats, (
+            f"{label} row {r}: the kernel returned pool id(s) "
+            f"{';'.join(str(v) for v in ker_repeats)} more than once, so this row attends fewer "
+            f"pools than it claims. A repeat is an ILLEGAL selection and not a tie substitution -- "
+            f"kernel={ker_row} reference={ref_row}"
+        )
+        assert not ref_repeats, (
+            f"{label} row {r}: the REFERENCE returned pool id(s) "
+            f"{';'.join(str(v) for v in ref_repeats)} more than once. The reference is the oracle, "
+            f"so this is a fault in the test's own scorer and not a finding about the kernel -- "
+            f"reference={ref_row} kernel={ker_row}"
+        )
 
         assert len(ker_real) == len(ref_real), (
             f"{label} row {r}: the kernel returned {len(ker_real)} real pool ids where the "
