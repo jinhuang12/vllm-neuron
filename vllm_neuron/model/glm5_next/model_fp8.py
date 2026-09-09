@@ -85,6 +85,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MAPPED_KEY_QUANTISED_WEIGHT,
     MAPPED_KEY_SCALE_GRID,
     MAPPED_KEY_STACKED_BANK,
+    MHC_LEAVES,
     build_weight_mappings,
     classify_mapped_keys,
     consumer_block_quant_size,
@@ -1148,9 +1149,18 @@ class Glm5NextHyperConnection(nn.Module):
         # map declares this family absent, so there is no map name to reserve",
         # which ``inc-glm53f-078`` falsified: the map now emits six mHC names
         # per layer (``MHC_LEAVES``). Those six are reserved FLAT ON THE LAYER
-        # by ``Glm5NextKDALayer`` and ``Glm5NextDSALayer``, not here, because
-        # this class is not bound into a layer anywhere in this tree. The three
-        # ``nn.Parameter`` names below are unchanged.
+        # by ``Glm5NextKDALayer`` and ``Glm5NextDSALayer``, not here.
+        #
+        # RE-GROUNDED AGAIN BY ``inc-glm53f-030d``. This note used to end "because
+        # this class is not bound into a layer anywhere in this tree", and that
+        # sentence is now false: :func:`_bind_hyper_connection_sites` builds two
+        # instances per layer after the load and hands each one three of the six
+        # loaded tensors. What did NOT change is the reason the three names below
+        # are not map names: the map still reads the six leaves off the layer, the
+        # two instances are held in a plain dict rather than registered as
+        # submodules, and the tensors arrive here by ``.data`` assignment. So the
+        # three ``nn.Parameter`` names below are unchanged, and so is every name
+        # ``named_parameters()`` reports.
         self.fn = nn.Parameter(
             torch.zeros(self.hc_mult3, hc_mult * hidden, dtype=torch.float32)
         )
@@ -4192,11 +4202,14 @@ class Glm5NextKDALayer(nn.Module):
             # The six mHC weights sit FLAT ON THE LAYER because that is where
             # the map puts them: ``MHC_LEAVES``, emitted for every layer by an
             # unconditional ``_add_mhc`` as ``f"{param_prefix}.{leaf}"`` -- no
-            # ``.weight`` leaf, no scale companion, no submodule. A later
-            # increment that binds a ``Glm5NextHyperConnection`` instance keeps
-            # them here at layer level; moving them under a submodule attribute
-            # reddens the map equality, and re-opening the map is the lead's
-            # call rather than that increment's.
+            # ``.weight`` leaf, no scale companion, no submodule.
+            #
+            # ``inc-glm53f-030d`` IS THE INCREMENT THIS NOTE RESERVED, and it
+            # keeps them here: :meth:`bind_hyper_connection_sites` hands the six
+            # loaded tensors to two ``Glm5NextHyperConnection`` instances after
+            # the load and holds those instances in a plain dict, so no leaf
+            # moves under a submodule attribute and the map equality is
+            # untouched.
             "hc_attn_base",
             "hc_attn_fn",
             "hc_attn_scale",
@@ -4207,6 +4220,22 @@ class Glm5NextKDALayer(nn.Module):
         self.self_attn = Glm5NextKDAAttention(text_config, world_size)
         self.mlp = _build_mlp(text_config, layer_idx)
         self.rms_norm_eps = float(text_config.rms_norm_eps)
+
+    def bind_hyper_connection_sites(
+        self, text_config: Glm5NextTextConfig, device: torch.device
+    ) -> int:
+        """Give this layer's two mHC sites the six tensors the load brought.
+
+        ``inc-glm53f-030d``. ONE BODY FOR BOTH LAYER FAMILIES, in
+        :func:`_bind_hyper_connection_sites`, on the precedent
+        :func:`_publish_compute_frame_operands` sets: the rule lives once and the
+        two families call it, so the linear-attention and sparse-attention halves
+        cannot drift apart in a rule neither of them owns.
+        ``_run_load_time_preps`` is the single production caller and reaches this
+        method through the same ``hasattr`` gate it already uses on the three
+        load-time preps.
+        """
+        return _bind_hyper_connection_sites(self, text_config, device)
 
     @property
     def attention(self) -> nn.Module:
@@ -6632,6 +6661,18 @@ class Glm5NextDSALayer(nn.Module):
         # Resolved at construction, on the same ground the KDA sibling states.
         self.rms_norm_eps = float(text_config.rms_norm_eps)
 
+    def bind_hyper_connection_sites(
+        self, text_config: Glm5NextTextConfig, device: torch.device
+    ) -> int:
+        """Give this layer's two mHC sites the six tensors the load brought.
+
+        ``inc-glm53f-030d``. THE SAME ONE-LINE DELEGATION AS THE KDA SIBLING, and
+        for once the duplication is only the signature: the rule itself lives once
+        in :func:`_bind_hyper_connection_sites`, so the two halves cannot drift
+        apart. ``_run_load_time_preps`` is the single production caller.
+        """
+        return _bind_hyper_connection_sites(self, text_config, device)
+
     @property
     def attention(self) -> nn.Module:
         return getattr(self, self.ATTENTION_ATTR)
@@ -7273,6 +7314,242 @@ def _publish_compute_frame_operands(
         health[leaf] = record
     setattr(module, health_attr, health)
     return retiled
+
+
+# ---------------------------------------------------------------------------
+# The mHC bind -- ``inc-glm53f-030d`` part (c). One rule, called by both decoder
+# layer families, run once per layer on the load path.
+# ---------------------------------------------------------------------------
+
+#: Where a layer keeps its two bound mHC instances, and where it keeps the record
+#: of what was bound. Both are PLAIN attributes holding a dict, deliberately
+#: outside ``_modules`` and ``_parameters``, on the precedent
+#: :func:`_publish_compute_frame_operands` sets for its own health dict.
+#:
+#: WHY NOT SUBMODULES. Registering the two instances would put their three
+#: parameters each into ``named_parameters()``, and two landed readings count that
+#: list exactly: it is ``0`` on a declared-but-unloaded tree and the declared count
+#: after materialisation (``test/vllm_neuron/model/glm5_next/test_load_weights.py``
+#: ``:960-980``), with the pre-load zero read again at ``test_kv_spec.py:621``. The
+#: same hazard in the other direction is already written down two steps above, on
+#: the retile: "``setattr(module, leaf, tensor)`` would drop the ``nn.Parameter``
+#: and with it every landed reading that counts ``named_parameters()``". Neither
+#: this bind nor that retile is allowed to move those readings.
+MHC_SITES_ATTR = "_mhc_sites"
+MHC_BIND_HEALTH_ATTR = "_mhc_bind_health"
+
+#: Which parameter of :class:`Glm5NextHyperConnection` each leaf ROLE fills. The
+#: leaf spellings are the checkpoint's own (``hc_attn_fn``) and the three
+#: parameter names are the target model's own (``fn`` at
+#: ``design/reference/modeling_glm5_next.py:259``, ``base`` at ``:260``, ``scale``
+#: at ``:265``), so the two differ by a prefix rather than by meaning. Three
+#: entries and no default, so a fourth role cannot be bound by accident.
+MHC_ROLE_PARAMETERS: dict[str, str] = {
+    "fn": "fn",
+    "base": "hc_base",
+    "scale": "hc_scale",
+}
+
+
+def _mhc_leaves_by_site(
+    leaves: Sequence[str] = MHC_LEAVES,
+) -> dict[str, dict[str, str]]:
+    """The map's mHC leaves grouped as ``{site: {role: leaf}}``.
+
+    DERIVED FROM THE MAP'S OWN TUPLE, never retyped here. The six names live once,
+    in ``weight_loaders_fp8.MHC_LEAVES``, and the grouping is read off the name
+    shape ``hc_<site>_<role>`` -- which is also how the map emits them
+    (``weight_loaders_fp8.py:488-489``).
+
+    A leaf that is not spelled that way, or whose role is not one of the three the
+    class takes, RAISES rather than being skipped. A silently dropped leaf would
+    leave one site holding the zeros its constructor allocated, the forward would
+    compute a plausible number from them, and no check in this file would object.
+
+    Raises:
+        Glm5NextHyperConnectionError: if a leaf cannot be resolved to a site and a
+            role.
+    """
+    grouped: dict[str, dict[str, str]] = {}
+    for leaf in leaves:
+        parts = leaf.split("_")
+        if len(parts) != 3 or parts[0] != "hc" or parts[2] not in MHC_ROLE_PARAMETERS:
+            raise Glm5NextHyperConnectionError(
+                f"the mHC leaf {leaf!r} is not spelled hc_<site>_<role> with a "
+                f"role in {sorted(MHC_ROLE_PARAMETERS)}, so this bind cannot say "
+                f"which site it belongs to or which parameter it fills. The weight "
+                f"map and this file disagree about the family's names"
+            )
+        grouped.setdefault(parts[1], {})[parts[2]] = leaf
+    return grouped
+
+
+def _bind_hyper_connection_sites(
+    module: nn.Module,
+    text_config: Glm5NextTextConfig,
+    device: torch.device,
+) -> int:
+    """Hand one layer's six loaded mHC tensors to its two mHC instances.
+
+    Returns how many sites were bound: ``2`` on a layer whose six leaves are
+    loaded, ``0`` on a layer that carries none of them.
+
+    WHY IT RUNS AFTER THE LOAD AND NOT AT CONSTRUCTION. The six leaves are
+    ``register_parameter(name, None)`` declarations until
+    ``_materialise_declared_parameters`` registers placeholders for them, so an
+    instance built in ``__init__`` and handed ``self.hc_attn_fn`` would be handed
+    ``None``. This is a load-time prep
+    for the same reason the three preps above it are, and it reaches the tree
+    through the same single production caller, :meth:`_run_load_time_preps`.
+
+    THREE CASES, AND THE MIDDLE ONE IS THE REFUSAL.
+
+    * All six loaded: both sites are bound.
+    * NONE loaded: the layer is skipped and the skip is RECORDED. This case is
+      real rather than defensive -- the map emits the six leaves only for the
+      layers in ``layer_types`` (``weight_loaders_fp8.py:385-401``) and the
+      checkpoint carries them on layers 0-44 and on no other, read off
+      ``test/vllm_neuron/model/glm5_next/fixtures/model.safetensors.index.json``
+      (270 keys = 45 layers x 6). A draft-head block built from the same layer
+      class therefore declares all six and is loaded none of them.
+    * SOME loaded: raised, naming every leaf that is missing. A half-bound site
+      would compute from the zeros its constructor allocated.
+
+    SHAPES ARE RECORDED, NOT ENFORCED, and that is a measured decision rather
+    than an omission. Every landed end-to-end load in this package runs against a
+    miniature checkpoint that writes each plain key at an arbitrary
+    ``MINI_PLAIN_SHAPE = (4,)`` on purpose
+    (``test/vllm_neuron/model/glm5_next/test_load_weights.py:139-141``, written at
+    ``:315-380``), so a shape check here would refuse every one of those loads for
+    a shape the fixture never meant to be right. What each site received is in the
+    record instead, and the shape that matters is checked where it is used, in the
+    forward, against the reference pair.
+
+    ``.data`` ASSIGNMENT, NOT A COPY. The site parameter keeps its own
+    ``nn.Parameter`` object and takes the loaded tensor's storage, so the bind
+    copies no weight bytes -- the same rule the retile step above states for the
+    opposite direction.
+
+    ONE EXPOSURE, DISCLOSED. A plain dict is not visited by ``nn.Module._apply``,
+    measured in
+    ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-091-device-binding.out``
+    (``PLAIN_DICT_IS_LEFT_BEHIND=True``), so a ``.to(device)`` issued AFTER this
+    bind would move the layer's own parameter and leave the site pointing at the
+    old storage. This is the exposure the load-time prep operands already carry,
+    and the answer here is the same: the bind runs after the weights are on the
+    device, it refuses an operand that is somewhere else, and each leaf's
+    ``data_ptr`` goes into the record so the two pointers can be compared later
+    without a new instrument.
+
+    THE POST GATE'S MULTIPLIER IS LEFT AT THE CLASS DEFAULT of ``2.0``, which is
+    the target model's own factor: ``post = 2 * torch.sigmoid(...)``
+    (``design/reference/modeling_glm5_next.py:284``). Nothing here chooses a
+    number.
+
+    Args:
+        module: the layer, with the six leaves declared and -- if the checkpoint
+            carried them -- loaded.
+        text_config: sizes both instances, and carries the framework overrides
+            ``mhc_sinkhorn_iters`` and ``mhc_eps`` on its ``neuron_config``.
+        device: where the load put the weights.
+
+    Raises:
+        Glm5NextHyperConnectionError: if some but not all of the six leaves are
+            loaded, if a loaded leaf is still a shape-free placeholder, or if one
+            is not on ``device``.
+    """
+    sites = _mhc_leaves_by_site()
+    loaded: dict[str, torch.Tensor] = {}
+    unloaded: list[str] = []
+    for roles in sites.values():
+        for leaf in roles.values():
+            operand = getattr(module, leaf, None)
+            if operand is None:
+                unloaded.append(leaf)
+            else:
+                loaded[leaf] = operand
+
+    # A visit is counted whether it binds or skips, so a reader can tell one visit
+    # from two. ``_run_load_time_preps`` is called a second time by a landed item
+    # (``test/vllm_neuron/model/glm5_next/test_load_weights.py:2967``), so a second
+    # visit is normal and is recorded rather than refused.
+    previous = getattr(module, MHC_BIND_HEALTH_ATTR, None)
+    binds = int((previous or {}).get("binds", 0)) + 1
+
+    if not loaded:
+        setattr(module, MHC_SITES_ATTR, {})
+        setattr(
+            module,
+            MHC_BIND_HEALTH_ATTR,
+            {
+                "bound_sites": 0,
+                "binds": binds,
+                "unloaded_leaves": sorted(unloaded),
+                "skipped_because": (
+                    "the checkpoint carried none of the six mHC leaves for this "
+                    "layer, so there is nothing to bind"
+                ),
+            },
+        )
+        return 0
+
+    if unloaded:
+        raise Glm5NextHyperConnectionError(
+            f"this layer carries {len(loaded)} of the six mHC weights and is "
+            f"missing {sorted(unloaded)}, so a bind would leave a site holding "
+            f"the zeros its constructor allocated. Loaded: {sorted(loaded)}"
+        )
+
+    for leaf, operand in sorted(loaded.items()):
+        if torch.nn.parameter.is_lazy(operand):
+            raise Glm5NextHyperConnectionError(
+                f"{leaf} is still a shape-free placeholder, so the load has not "
+                f"filled it and binding it now would hand a site an empty tensor"
+            )
+        if not _is_on_device(operand.device, device):
+            raise Glm5NextHyperConnectionError(
+                f"{leaf} is on {operand.device} and this load targets {device}. "
+                f"The bound site is held in a plain dict that no later "
+                f"``.to(device)`` visits, so a bind from the wrong device would "
+                f"strand this weight there permanently"
+            )
+
+    bound: dict[str, Glm5NextHyperConnection] = {}
+    record: dict[str, dict[str, object]] = {}
+    for site in sorted(sites):
+        instance = Glm5NextHyperConnection(
+            text_config, neuron_config=text_config.neuron_config
+        )
+        site_record: dict[str, object] = {}
+        for role, leaf in sorted(sites[site].items()):
+            operand = loaded[leaf]
+            parameter = getattr(instance, MHC_ROLE_PARAMETERS[role])
+            parameter.data = operand.data
+            site_record[leaf] = {
+                "parameter": MHC_ROLE_PARAMETERS[role],
+                "shape": tuple(operand.shape),
+                "dtype": str(operand.dtype),
+                "device": str(operand.device),
+                "data_ptr": int(operand.data_ptr()),
+            }
+        bound[site] = instance
+        record[site] = site_record
+
+    setattr(module, MHC_SITES_ATTR, bound)
+    setattr(
+        module,
+        MHC_BIND_HEALTH_ATTR,
+        {
+            "bound_sites": len(bound),
+            "binds": binds,
+            "device": str(device),
+            "sinkhorn_iters": int(bound[sorted(bound)[0]].sinkhorn_iters),
+            "hc_eps": float(bound[sorted(bound)[0]].hc_eps),
+            "post_mult_value": float(bound[sorted(bound)[0]].post_mult_value),
+            "sites": record,
+        },
+    )
+    return len(bound)
 
 
 class Glm5NextWeightLoadError(ValueError):
@@ -7958,6 +8235,24 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     )
                 module.prepare_scale_operands(**operands)
                 scale_calls += 1
+            # ``inc-glm53f-030d`` part (c), THE mHC BIND, on the same
+            # ``hasattr`` gate the three steps above use. It fires on the two
+            # decoder layer classes, and those two declare none of the three
+            # preps, so this branch adds a step to the walk without reordering
+            # one.
+            #
+            # IT ADDS NO RETURN VALUE, on the precedent recorded for
+            # ``prepare_absorb_weights`` and the retile above: this method
+            # returns ``(projection calls, scale calls)`` and
+            # ``inc-glm53f-091``'s items read that pair. What the bind did is on
+            # the layer, in its own record.
+            #
+            # ``self.text_config`` is passed because both site instances are
+            # sized from the config's own dials and a layer keeps no config of
+            # its own, and ``device`` is passed because the bind refuses an
+            # operand that is not where this load put it.
+            if hasattr(type(module), "bind_hyper_connection_sites"):
+                module.bind_hyper_connection_sites(self.text_config, device)
         return projection_calls, scale_calls
 
     def _require_prep_operands_on_device(
