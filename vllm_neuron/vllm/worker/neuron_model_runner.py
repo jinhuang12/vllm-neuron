@@ -5066,11 +5066,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         has two groups, so reading one entry for the whole stack slices one family out
         of the other family's table -- what review r1 of commit 1 found. The names are
         the same names the banks carry: both sides come from ``get_kv_spec``
-        (``:9075-9076``).
+        (``:9175-9176``).
 
         THE LEG IS READ THE FILE'S OWN WAY, ``max_query_len`` against
         ``decode_token_threshold``, which is the decode test this runner already
-        makes at ``:7413-7416``, so the two cannot disagree. It is read PER GROUP and
+        makes at ``:7513-7516``, so the two cannot disagree. It is read PER GROUP and
         a disagreement refuses, because the layers of one forward are stepped
         together or not at all.
 

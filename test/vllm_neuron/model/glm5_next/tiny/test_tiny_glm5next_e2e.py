@@ -5,7 +5,7 @@ into the per-layer carriers this model family takes as forward ARGUMENTS, and th
 block's registered acceptance over that thread:
 
   1. ``Glm5NextForConditionalGeneration.bind_kv_cache`` -- the method the runner calls on every
-     start-up (``neuron_model_runner.py:8669``) and that this package did not have until plan
+     start-up (``neuron_model_runner.py:9131``) and that this package did not have until plan
      revision 276. It must map every layer the spec reports onto that layer's OWN slots, keep
      views rather than copies, and refuse by name anything it cannot map.
   2. ``NeuronModelRunner._glm5next_layer_carriers`` and its two operand derivations -- the runner
@@ -124,9 +124,9 @@ def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
     """The dict ``initialize_kv_cache`` hands ``bind_kv_cache``, built the runner's own way.
 
     Every shape here is the runner's: a sparse layer gets a key/value PAIR of
-    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:8529-8565``)
+    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:8991-9027``)
     and a recurrent layer gets two ``[slots, *state shape]`` banks in conv-then-recurrent
-    order (``:8627-8657``). The geometry is read off the spec the model itself produced, so
+    order (``:9089-9119``). The geometry is read off the spec the model itself produced, so
     this helper cannot disagree with the model about what was asked for.
     """
     caches: dict[str, list[torch.Tensor]] = {}
@@ -185,7 +185,7 @@ def _recurrent_spec(root) -> KVSpec:
 
     The mapper recognises a family by the fields the spec carries, never by a layer name
     (``model_fp8.py``'s ``bind_kv_cache``, the same test the runner makes at
-    ``neuron_model_runner.py:8720-8726``), and it reads no layer module at all. So a spec
+    ``neuron_model_runner.py:9182-9188``), and it reads no layer module at all. So a spec
     with the stack's own length and names, reporting the four ``kda_*`` fields, drives the
     recurrent branch of exactly the code the runner drives.
     """
@@ -231,7 +231,7 @@ def _mixed_spec(root) -> KVSpec:
 
     THIS IS THE HYBRID SHAPE THAT MAKES TWO KV-CACHE GROUPS EXIST. A sparse layer's spec
     becomes a ``FullAttentionSpec`` and a recurrent layer's a ``MambaSpec``
-    (``neuron_model_runner.py:9082-9135``), and the KV-cache manager gives each class its own
+    (``neuron_model_runner.py:9182-9234``), and the KV-cache manager gives each class its own
     group with its own block table. The landed tiny stack is sparse on every layer, so one
     group is all it would ever have; this builds the two-group case out of the stack's own
     names and geometry, reading no layer module -- and neither the mapper nor the converter
@@ -742,7 +742,7 @@ def _metadata(names, *, blocks: int, tokens: int, cached: int, threshold: int = 
 def _model_kwargs(runner, *, input_ids, cached: int, sampling_row: int) -> dict:
     """One step's generic runner kwargs, translated by the converter under test.
 
-    THE GENERIC KEYS ARE THE ONES THE RUNNER SENDS (`neuron_model_runner.py:7031-7042`),
+    THE GENERIC KEYS ARE THE ONES THE RUNNER SENDS (`neuron_model_runner.py:7493-7504`),
     including the six this model implements nowhere, so the converter is measured dropping
     exactly what it says it drops rather than being handed a pre-cleaned mapping.
     """
@@ -1235,7 +1235,7 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
 
     WHAT IS MEASURED, AND WHY IT IS NOT A STYLE POINT. `_glm5next_live_side_caches` allocates
     the pooled store and the decode ring ONCE and hands the same objects to every step
-    (`neuron_model_runner.py:4870-4881`); that identity is what makes a decode step's ring
+    (`neuron_model_runner.py:4870-4889`); that identity is what makes a decode step's ring
     survive into the next step. Its cost is that a NEW sequence would start on the previous
     sequence's partial pool -- every real token stashes into the ring
     (`vllm_neuron/functional/dsa/decode_tail_update.py`) -- and its next completion would pool

@@ -7914,7 +7914,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         looking at. That keeps the one loop family-blind, which is the property
         ``inc-glm53f-013`` built it for, and it is why the runner recognises the
         two halves BY THE FIELDS THEY CARRY (``neuron_model_runner.py``
-        ``:8720-8726``) rather than by a layer name.
+        ``:9182-9188``) rather than by a layer name.
 
         All four move together or not at all. The runner refuses a layer that
         declares part of the geometry (``neuron_model_runner.py:8727-8733``),
@@ -7953,7 +7953,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         """Keep the runner's per-layer cache tensors so the runner can name them again.
 
         THE RUNNER CALLS THIS ON EVERY START-UP AND NOTHING GUARDS THE CALL
-        (``neuron_model_runner.py:8669``, inside ``initialize_kv_cache`` ``:8457``,
+        (``neuron_model_runner.py:9131``, inside ``initialize_kv_cache`` ``:8919``,
         which the worker runs at ``neuron_worker.py:1101``). Five of the six shipped
         model families define it; this one did not, so a GLM-5.3-Flash serve raised
         ``AttributeError`` there before any forward ran. ``inc-glm53f-054b`` adds it
@@ -7973,15 +7973,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         THE TWO FAMILIES ARE RECOGNISED BY THE FIELDS THE SPEC CARRIES, never by a
         layer name -- the same test the runner makes at
-        ``neuron_model_runner.py:8720-8726``:
+        ``neuron_model_runner.py:9182-9188``:
 
         * a linear-attention (KDA) layer reports the ``kda_*`` geometry, and the
           runner allocated one ``[state_slots, *shape]`` bank per state, position 0
           the short convolution and position 1 the recurrent state
-          (``neuron_model_runner.py:8627-8657``);
+          (``neuron_model_runner.py:9089-9119``);
         * a sparse-attention (DSA) layer reports none of it, and the runner
           allocated ``[blocks, num_kv_heads, block_size, head_size]`` for each half
-          of a key/value pair (``:8529-8565``). Only the FIRST half is this
+          of a key/value pair (``:8991-9027``). Only the FIRST half is this
           attention's latent cache: MLA keeps one latent vector per slot and has no
           value half to read, which is also why ``num_kv_heads`` is 1
           (``NUM_LATENT_KV_HEADS``).
@@ -8086,7 +8086,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 raise ValueError(
                     f"KV layer '{name}' has no cache tensor at all; the runner "
                     f"allocates a key/value pair for a sparse-attention layer "
-                    f"(neuron_model_runner.py:8529-8565)"
+                    f"(neuron_model_runner.py:8991-9027)"
                 )
             bank = tensors[0]
             if bank.dim() != 4:
