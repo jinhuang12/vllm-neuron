@@ -1006,7 +1006,7 @@ class Glm5NextHyperConnection(nn.Module):
         self,
         text_config: Glm5NextTextConfig,
         neuron_config: NeuronConfig | None = None,
-        post_mult_value: float = 1.0,
+        post_mult_value: float = 2.0,
     ) -> None:
         """Size the layer from the checkpoint's own dials.
 
@@ -1017,36 +1017,60 @@ class Glm5NextHyperConnection(nn.Module):
                 ``mhc_eps`` (``neuron_config.py:194,197``) win when not
                 ``None``, which is the override contract ``-013``'s section note
                 for this class already stated.
-            post_mult_value: the base's ``hc_post_mult_value``. **Its default is
-                the base's own test value**, ``hc_post_alpha = 1.0``
-                (``tests/kernels/test_mhc_kernels.py:126``); no fork config
-                field carries it, so it is a constructor argument rather than an
-                invented config default.
+            post_mult_value: the multiplier on the post gate. **Its default is
+                ``2.0``, which is the target model's own number**, and that is
+                ``inc-glm53f-030c`` correcting ``inc-glm53f-030``:
+                ``Glm5NextTextHyperConnection.forward`` computes
+                ``post = 2 * torch.sigmoid(post_w * post_scale + post_b)``
+                (``design/reference/modeling_glm5_next.py:284``, sha256
+                ``2092bbb4...``), and its own shape guide names the range:
+                "block-output placement, range [0, 2]" (``reference:246``).
+                The earlier default of ``1.0`` came from the pinned base's
+                kernel test (``hc_post_alpha = 1.0``,
+                ``tests/kernels/test_mhc_kernels.py:126``) -- the base's test
+                value, not the target's model value -- so every post term this
+                layer produced was HALF the target's. No fork config field
+                carries the multiplier, so it stays a constructor argument
+                rather than an invented config default, and passing ``1.0``
+                explicitly is how ``-030c``'s failing control reproduces the
+                defect.
 
-        TWO EPSILONS FOR THE BASE'S THREE, GROUNDED ON THE CHECKPOINT. The
+        TWO EPSILONS, EACH AT THE SITE THE TARGET MODEL PLACES IT. The pinned
         base's signature takes three (``rms_eps``, ``hc_pre_eps``,
-        ``hc_sinkhorn_eps``) and the fork's config carries two fields. The
-        split follows what the checkpoint sets, not what the base's test sets:
+        ``hc_sinkhorn_eps``); the fork's config carries two fields, and the
+        target model reads exactly two constants at three sites:
 
-        * ``hc_pre_eps`` and ``hc_sinkhorn_eps`` are mHC-native, and the
-          checkpoint's own ``text_config.hc_eps`` is ``1e-06``, so both keep
-          ``hc_eps`` and the base's collapse onto one value is faithful for
-          them. That is the value ``inc-glm53f-030`` measured its tiny case on,
-          and nothing it recorded moves.
-        * ``rms_eps`` is an RMSNorm epsilon, and the checkpoint's RMSNorm
-          epsilon is ``1e-05`` -- a different number. It lives on
-          ``Glm5NextTextConfig.rms_norm_eps`` (``inc-glm53f-080``) and reaches
-          the router seam through :meth:`Glm5NextRoutedExperts.route_tokens`.
-          It reaches no mHC line: ``self.hc_eps`` and the three sites that
-          consume it below are unchanged.
+        * ``hc_pre_eps`` and ``hc_sinkhorn_eps`` are mHC-native and both read
+          ``text_config.hc_eps`` (``1e-06``). The target agrees: it adds
+          ``self.hc_eps`` after the pre sigmoid
+          (``design/reference/modeling_glm5_next.py:283``) and after the comb
+          softmax (``reference:286``), which are the two sites
+          :meth:`mhc_pre` adds it at.
+        * ``rms_eps`` is the RMSNorm epsilon and reads
+          ``text_config.rms_norm_eps`` (``1e-05``) -- a DIFFERENT number, on
+          the same config object (``config.py:256``, beside ``hc_eps`` at
+          ``:262``).
 
-        WHAT THIS CORRECTS. The earlier wording argued the single field was
-        faithful for all three uses, and grounded that on the base's own kernel
-        test setting ``hc_sinkhorn_eps = hc_pre_eps = rms_eps = 1e-6``
-        (``tests/kernels/test_mhc_kernels.py:121``). That is the base's number,
-        not the target's. Two thirds of the claim stand on the checkpoint's own
-        ``hc_eps``; the RMSNorm third is settled against the checkpoint
-        instead, which is where it always belonged.
+        WHAT ``inc-glm53f-030c`` CORRECTS HERE, and it is a correction of a
+        recorded claim rather than a re-opening. The bullet this replaces said
+        of ``rms_eps``: "It reaches no mHC line: ``self.hc_eps`` and the three
+        sites that consume it below are unchanged." **The target model
+        falsifies that sentence.** Its mHC layer normalises the folded input
+        through its own RMSNorm, built with the model's RMSNorm epsilon --
+        ``self.input_norm = Glm5NextTextUnweightedRMSNorm(eps=config.rms_norm_eps)``
+        (``reference:257``), whose forward is
+        ``x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)``
+        (``reference:216``) -- and that norm is applied before the projection
+        (``reference:278``). So the RMSNorm epsilon reaches exactly ONE mHC
+        line, and it is the RMS denominator in :meth:`mhc_pre`, which read
+        ``hc_eps`` until this increment. :attr:`rms_eps` below carries it.
+
+        WHY THE OVERRIDE CONTRACT NARROWS, stated rather than left to be
+        discovered: ``neuron_config.mhc_eps`` still overrides ``hc_eps`` and so
+        still reaches the pre and comb sites, but it no longer reaches the RMS
+        denominator, because that site now reads the model's own RMSNorm
+        epsilon. No ``mhc_rms_eps`` override field exists and this increment
+        invents none.
 
         Raises:
             Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
@@ -1082,6 +1106,12 @@ class Glm5NextHyperConnection(nn.Module):
         self.hidden_size = hidden
         self.sinkhorn_iters = iters
         self.hc_eps = eps
+        # The RMSNorm epsilon, at the ONE mHC site the target model puts it:
+        # `mhc_pre`'s RMS denominator. Read off the same config object as
+        # `hc_eps` and deliberately NOT overridable by `neuron_config.mhc_eps`,
+        # because it is the model's RMSNorm constant rather than an mHC dial
+        # (`reference:257`, `reference:216`; `inc-glm53f-030c`).
+        self.rms_eps = float(text_config.rms_norm_eps)
         self.post_mult_value = float(post_mult_value)
 
         # ``hc_mult3`` is the base's own name for the projection's output width:
@@ -1152,15 +1182,35 @@ class Glm5NextHyperConnection(nn.Module):
         # projection's own input width -- ``hc_mult * hidden_size`` in
         # ``mhc_pre_torch``, ``fn.shape[-1]`` in ``mhc_pre_ref`` -- and those are
         # the same number.
+        # THE EPSILON HERE IS THE MODEL'S RMSNorm EPSILON, not the mHC one, and
+        # that is `inc-glm53f-030c` correcting `inc-glm53f-030`. The target builds
+        # this norm as `Glm5NextTextUnweightedRMSNorm(eps=config.rms_norm_eps)`
+        # (`reference:257`) and applies it to the folded input before the
+        # projection (`reference:278`); `self.rms_eps` is that constant. The
+        # `sum / (S * H)` above is the same reduction as the target's
+        # `.mean(-1)` (`reference:216`), and scaling `mixes` after the matmul is
+        # the same result as normalising `flat` before it, because the projection
+        # carries no bias and is therefore homogeneous.
         sqrsum = flat.square().sum(dim=-1, keepdim=True)
-        mixes = mixes * torch.rsqrt(sqrsum / float(streams * hidden) + self.hc_eps)
+        mixes = mixes * torch.rsqrt(sqrsum / float(streams * hidden) + self.rms_eps)
 
         scale = self.hc_scale.to(torch.float32)
         base = self.hc_base.to(torch.float32)
+        # `+ self.hc_eps` on the PRE gate and nothing on the POST gate, which is
+        # the target's own asymmetry rather than an omission here:
+        # `pre = torch.sigmoid(...) + self.hc_eps` (`reference:283`) against
+        # `post = 2 * torch.sigmoid(...)` (`reference:284`), with no epsilon on
+        # the post term. `-030c`'s epsilon control reads that asymmetry directly:
+        # moving `hc_eps` must move `layer_input` and `comb_mix` and must leave
+        # `post_mix` bit-identical.
         pre_mix = (
             torch.sigmoid(mixes[:, :streams] * scale[0] + base[:streams])
             + self.hc_eps
         )
+        # `post_mult_value` defaults to the target's `2` (`reference:284`); the
+        # multiply is written after the sigmoid rather than before it, which is
+        # the same number in IEEE-754 and keeps the value a settable argument so
+        # the failing control can put the old `1.0` back.
         post_mix = (
             torch.sigmoid(
                 mixes[:, streams : 2 * streams] * scale[1]
@@ -1171,9 +1221,12 @@ class Glm5NextHyperConnection(nn.Module):
         comb_logits = mixes[:, 2 * streams :].reshape(
             tokens, streams, streams
         ) * scale[2] + base[2 * streams :].reshape(1, streams, streams)
-        # ``softmax`` and the ``+ eps`` are the base's, and they sit OUTSIDE the
-        # seam because ``-028``'s kernel starts from an affinity matrix. This is
-        # elementwise glue, which P13 leaves to torch.
+        # ``softmax`` and the ``+ eps`` are the base's, and the target agrees
+        # line for line: ``comb = torch.softmax(comb_logits, dim=-1) +
+        # self.hc_eps`` (``reference:286``), so this is the SECOND of the two
+        # sites ``hc_eps`` belongs at. They sit OUTSIDE the seam because
+        # ``-028``'s kernel starts from an affinity matrix. This is elementwise
+        # glue, which P13 leaves to torch.
         comb_start = torch.softmax(comb_logits, dim=-1) + self.hc_eps
 
         # ---- ENTRY 1 of 1 into ``-028``'s Sinkhorn seam. ----------------- #

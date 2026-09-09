@@ -1,0 +1,544 @@
+"""``inc-glm53f-030c``: the mHC layer's arithmetic corrections, against the model.
+
+WHAT THIS FILE MEASURES, and why it is a new file rather than more items in
+``test_mhc_layer.py``. ``inc-glm53f-030`` landed :class:`Glm5NextHyperConnection`
+and measured it against the **pinned base's** two spellings of ``mhc_pre``. That
+comparison cannot see a place where the base and the TARGET MODEL disagree,
+because both sides of it are the base. ``-030c`` compares the layer against the
+checkpoint's own model file instead, and two disagreements fall out:
+
+* **the post gate's multiplier.** The target computes
+  ``post = 2 * torch.sigmoid(post_w * post_scale + post_b)``
+  (``modeling_glm5_next.py:284``) and calls the result "block-output placement,
+  range [0, 2]" in its own shape guide (``:246``). The layer defaulted to
+  ``1.0``, the pinned base's *kernel test* value
+  (``tests/kernels/test_mhc_kernels.py:126``), so every post term it produced
+  was HALF the target's.
+* **the RMSNorm epsilon.** The target normalises the folded input with
+  ``Glm5NextTextUnweightedRMSNorm(eps=config.rms_norm_eps)`` (``:257``, forward
+  at ``:216``, applied at ``:278``) -- the model's ``rms_norm_eps``, ``1e-05``.
+  The layer's RMS denominator read ``hc_eps``, ``1e-06``. The two mHC-native
+  epsilons are unaffected: the target adds ``hc_eps`` after the pre sigmoid
+  (``:283``) and after the comb softmax (``:286``), which is what the layer does.
+
+A NEW FILE AND NOT AN EXTENSION, for a measured reason. ``inc-glm53f-028b-tn``
+declares ``test_mhc_layer.py``'s collection as **exactly 28** items with **28**
+``PASSED`` lines. Adding items there would falsify both of that block's counted
+values, so this increment authors its own file and leaves every value ``-028b-tn``
+recorded untouched. That is also what ``inc-glm53f-054d`` did, landing its proof
+in a new ``test_ffn_reduction_054d.py``.
+
+THE REFERENCE IS TRANSCRIBED, WITH ITS LINES CITED, and the transcription is
+itself checked. The campaign's reference copy lives outside this repository
+(``design/reference/modeling_glm5_next.py``, sha256 ``2092bbb4...``), so
+:func:`_reference_post_and_mixes` restates its arithmetic here the way
+``test_mhc_layer.py:395-409`` restates the base's Sinkhorn -- verbatim in
+structure, every line cited. :func:`test_030c_the_reference_transcription_is_faithful`
+verifies the transcription against the real file whenever that file is reachable,
+and says so in its transcript when it is not.
+
+NO TOLERANCE IS REGISTERED HERE. The pair is ``test_mhc_layer.py``'s already
+declared ``(RTOL, ATOL)``, read out of that file's own bytes by
+:func:`_cited_tolerances` so the citation is mechanical rather than a comment,
+and never widened.
+
+THE MODELING MODULE IS IMPORTED INSIDE TEST BODIES, never at module scope, for
+the reason ``test_mhc_layer.py:102-107`` records: ``test_factory.py``'s C03
+asserts ``model_fp8`` is absent from ``sys.modules``, and pytest imports every
+collected module before running any test.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+
+import torch
+import torch.nn.functional as F
+
+import nki  # noqa: F401  -- the simulator route this layer's Sinkhorn needs
+import nki.simulator  # noqa: F401
+
+from vllm_neuron.functional.mhc import sinkhorn as sinkhorn_mod
+from vllm_neuron.functional.mhc.sinkhorn import MHC_STREAMS
+from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+# --------------------------------------------------------------------------- #
+# The case. Small on purpose: this file measures arithmetic, not size.         #
+# --------------------------------------------------------------------------- #
+#: Tokens. Well inside every seam bound, so no item here is also a boundary case.
+T = 8
+#: Streams. ``-028``'s own constant for the target's ``hc_mult 4``, imported.
+S = MHC_STREAMS
+#: Hidden.
+H = 64
+
+#: The reference copy's identity, from ``design/reference/PROVENANCE.txt``.
+REFERENCE_SHA256 = "2092bbb4efa2a8087b74f4a4da37635c503fe1df9ae73f1e6e8342af8b4b8e8b"
+#: The reference lines this file transcribes, each with the text that must be on it.
+REFERENCE_LINES = {
+    216: "torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)",
+    257: "self.input_norm = Glm5NextTextUnweightedRMSNorm(eps=config.rms_norm_eps)",
+    278: "flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())",
+    283: "pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps",
+    284: "post = 2 * torch.sigmoid(post_w * post_scale + post_b)",
+    286: "comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps",
+}
+#: The target's post multiplier, read off ``reference:284``.
+REFERENCE_POST_MULT = 2.0
+#: The value ``-030`` defaulted to. Kept ONLY as the failing control's input.
+OLD_POST_MULT = 1.0
+
+
+class VacuousControlError(AssertionError):
+    """A control whose input could not have made it fail.
+
+    Borrowed by name from ``test_mhc_layer.py:171``: a control that passes over
+    input incapable of failing measures nothing, so it refuses the pass.
+    """
+
+
+class RouteInstrumentError(AssertionError):
+    """A route reading that is not the one the plan declares."""
+
+
+def _impl():
+    """Import the implementation module INSIDE a test body, never at import."""
+    from vllm_neuron.model.glm5_next import model_fp8
+
+    return model_fp8
+
+
+def _cited_tolerances() -> tuple[float, float]:
+    """``(rtol, atol)`` READ OUT OF ``test_mhc_layer.py``, not declared here.
+
+    The pair this file compares on is the one that file already declares at its
+    lines 150-152 ("The declared tolerance pair, from the plan block. Not
+    widened anywhere."). Reading it from that file's bytes makes the citation
+    mechanical: if the sibling's pair ever moves, this file moves with it or
+    fails, and it can never silently hold a looser number of its own.
+    """
+    sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_mhc_layer.py")
+    text = open(sibling, encoding="utf-8").read()
+    rtol = re.search(r"^RTOL = (\S+)$", text, re.M)
+    atol = re.search(r"^ATOL = (\S+)$", text, re.M)
+    if rtol is None or atol is None:
+        raise AssertionError(
+            f"could not read the declared tolerance pair out of {sibling}; this "
+            f"file registers no tolerance of its own and has nothing to fall "
+            f"back on"
+        )
+    return float(rtol.group(1)), float(atol.group(1))
+
+
+def _config(hidden: int = H):
+    """A real ``Glm5NextTextConfig``, carrying the checkpoint's own dials."""
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    return Glm5NextTextConfig(hidden_size=hidden, hc_mult=S)
+
+
+def _fixture(seed: int = 30, tokens: int = T, hidden: int = H):
+    """``(fn, hc_scale, hc_base, residual)`` fp32, on ``test_mhc_layer.py``'s scales.
+
+    The magnitudes are that file's (``fn`` at ``1e-4``, ``hc_scale`` and
+    ``hc_base`` at ``0.1``, its lines 345-361), so ``mixes`` lands where the
+    target actually runs rather than in sigmoid saturation -- where every
+    implementation agrees and a comparison would measure nothing.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    hc_mult3 = 2 * S + S * S
+    fn = torch.randn(hc_mult3, S * hidden, generator=gen, dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn(3, generator=gen, dtype=torch.float32) * 0.1
+    hc_base = torch.randn(hc_mult3, generator=gen, dtype=torch.float32) * 0.1
+    residual = torch.randn(tokens, S, hidden, generator=gen, dtype=torch.float32)
+    return fn, hc_scale, hc_base, residual
+
+
+def _layer(post_mult_value: float | None = None, hidden: int = H):
+    """The layer under test. ``post_mult_value`` is LEFT DEFAULT unless given.
+
+    Every item but the failing control takes the default on purpose: the default
+    is the thing ``-030c`` corrects, so a test that always passed the value
+    explicitly could not see the correction at all -- which is exactly why
+    ``test_mhc_layer.py`` cannot: it passes ``POST_ALPHA`` at its line 375.
+    """
+    impl = _impl()
+    cfg = _config(hidden)
+    if post_mult_value is None:
+        return impl.Glm5NextHyperConnection(cfg), cfg
+    return impl.Glm5NextHyperConnection(cfg, post_mult_value=post_mult_value), cfg
+
+
+def _load(layer, fn, hc_scale, hc_base) -> None:
+    """Set the layer's parameters; the acceptance is synthetic by declaration."""
+    with torch.no_grad():
+        layer.fn.copy_(fn)
+        layer.hc_scale.copy_(hc_scale)
+        layer.hc_base.copy_(hc_base)
+
+
+# --------------------------------------------------------------------------- #
+# The comparator: the TARGET MODEL's arithmetic, transcribed with its lines.    #
+# --------------------------------------------------------------------------- #
+def _reference_post_and_mixes(
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    rms_eps: float,
+    post_mult: float = REFERENCE_POST_MULT,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(post, mixes)`` as ``Glm5NextTextHyperConnection.forward`` computes them.
+
+    Verbatim in structure against ``modeling_glm5_next.py``, line by line:
+
+    * ``:278`` ``flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())``
+      -- the norm is applied to the FOLDED input, BEFORE the projection.
+    * ``:216`` the norm itself,
+      ``x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)``,
+      whose ``eps`` is ``config.rms_norm_eps`` by ``:257``.
+    * ``:279`` ``F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)``
+      -- pre, post, comb in that order, which is the order the layer slices.
+    * ``:284`` ``post = 2 * torch.sigmoid(post_w * post_scale + post_b)``.
+
+    The reference's leading batch axis is absent here because this layer's
+    contract is ``[T, S, H]`` rather than ``[B, S, H, D]``; the per-token
+    arithmetic is unchanged, and ``flatten(start_dim=2)`` on a batched input is
+    ``flatten(start_dim=1)`` on this one.
+
+    ``mixes`` is returned beside ``post`` so an item can attribute a delta to a
+    site rather than only to an output.
+    """
+    hc = S
+    flat = residual.flatten(start_dim=1).to(torch.float32)
+    # `:216` + `:257`: the model's own RMSNorm, on the model's own epsilon.
+    normed = flat * torch.rsqrt(
+        flat.square().mean(dim=-1, keepdim=True) + rms_eps
+    )
+    # `:279`: one projection, split pre / post / comb.
+    mixes = F.linear(normed, fn.to(torch.float32))
+    post_w = mixes[:, hc : 2 * hc]
+    post_b = hc_base.to(torch.float32)[hc : 2 * hc]
+    post_scale = hc_scale.to(torch.float32)[1]
+    # `:284`: the multiplier is on the OUTSIDE of the sigmoid, and it is 2.
+    post = post_mult * torch.sigmoid(post_w * post_scale + post_b)
+    return post, mixes
+
+
+def _reference_path() -> str | None:
+    """The campaign's reference copy, if this machine has it. Never required."""
+    env = os.environ.get("GLM53F_REFERENCE_FILE")
+    if env and os.path.exists(env):
+        return env
+    tail = os.path.join(
+        "artifacts/campaigns/glm-5.3-flash-port/design/reference",
+        "modeling_glm5_next.py",
+    )
+    here = os.path.abspath(__file__)
+    for _ in range(12):
+        here = os.path.dirname(here)
+        # Both shapes: the campaign inside this checkout, and the campaign in a
+        # SIBLING checkout, which is where it sits on the authoring machine.
+        for cand in (
+            os.path.join(here, tail),
+            os.path.join(here, "NeuronAgenticDevelopment", tail),
+        ):
+            if os.path.exists(cand):
+                return cand
+        if here == os.path.dirname(here):
+            break
+    return None
+
+
+def _route_reading(label: str, calls: int) -> str:
+    """Print and CHECK the Sinkhorn route, so no reading here is a torch pass.
+
+    ``mhc_pre`` enters ``-028``'s seam exactly once per call. A run whose
+    ``torch_fallback`` moved would be comparing torch against torch, which would
+    make every number in this file meaningless rather than merely wrong.
+    """
+    nki_dispatch, torch_fallback = sinkhorn_mod.dispatch_counters()
+    gate = can_run_kernel(torch.zeros(1))
+    reading = (
+        f"[{label}] mhc_pre_calls={calls} sinkhorn_nki_dispatch={nki_dispatch} "
+        f"sinkhorn_torch_fallback={torch_fallback} can_run_kernel={gate} "
+        f"per_call={nki_dispatch / calls if calls else float('nan')}"
+    )
+    print(reading)
+    if nki_dispatch != calls:
+        raise RouteInstrumentError(
+            f"{label}: -028's dispatch counter read {nki_dispatch} over {calls} "
+            f"mhc_pre call(s); exactly ONE per call is declared. {reading}"
+        )
+    if torch_fallback != 0:
+        raise RouteInstrumentError(
+            f"{label}: torch_fallback read {torch_fallback}, declared 0 -- a "
+            f"fallback pass would compare torch against torch. {reading}"
+        )
+    if gate is not True:
+        raise RouteInstrumentError(
+            f"{label}: can_run_kernel() read {gate}, declared True. {reading}"
+        )
+    return reading
+
+
+def _max_abs_rel(got: torch.Tensor, want: torch.Tensor) -> tuple[float, float]:
+    """``(max_abs, max_rel)``, both floats, printed by every item that compares."""
+    diff = (got.to(torch.float32) - want.to(torch.float32)).abs()
+    denom = want.to(torch.float32).abs().clamp_min(1e-12)
+    return float(diff.max()), float((diff / denom).max())
+
+
+# --------------------------------------------------------------------------- #
+# COUNTED VALUE 1 -- the post gate equals the target's ``2 * sigmoid``.         #
+# --------------------------------------------------------------------------- #
+def test_030c_post_gate_matches_the_reference_two_sigmoid() -> None:
+    """The layer's ``post_mix`` equals ``reference:284`` on ``N/N`` cases.
+
+    Taken on the DEFAULT ``post_mult_value``, because the default is what
+    ``-030c`` corrects.
+    """
+    rtol, atol = _cited_tolerances()
+    fn, hc_scale, hc_base, residual = _fixture()
+    layer, cfg = _layer()
+    _load(layer, fn, hc_scale, hc_base)
+
+    sinkhorn_mod.reset_dispatch_counters()
+    post_mix, _comb_mix, _layer_input = layer.mhc_pre(residual)
+    _route_reading("value-1-post-gate", calls=1)
+
+    want, _ = _reference_post_and_mixes(
+        fn, hc_scale, hc_base, residual, float(cfg.rms_norm_eps)
+    )
+    got = post_mix.reshape(T, S)
+    max_abs, max_rel = _max_abs_rel(got, want)
+    cases = int(want.numel())
+    within = int(
+        torch.isclose(got, want, rtol=rtol, atol=atol).sum()
+    )
+    print(
+        f"[value-1] post_mult_default={layer.post_mult_value} "
+        f"reference_post_mult={REFERENCE_POST_MULT} cases={within}/{cases} "
+        f"rtol={rtol} atol={atol} max_abs_error={max_abs:.6e} "
+        f"max_rel_error={max_rel:.6e} "
+        f"reference_post_min={float(want.min()):.6f} "
+        f"reference_post_max={float(want.max()):.6f}"
+    )
+    assert layer.post_mult_value == REFERENCE_POST_MULT, layer.post_mult_value
+    assert within == cases, f"{within}/{cases} within the cited pair"
+    torch.testing.assert_close(got, want, rtol=rtol, atol=atol)
+
+
+def test_030c_the_default_post_multiplier_is_the_targets_two() -> None:
+    """The default itself, read off a layer nobody passed the value to.
+
+    ``test_mhc_layer.py`` cannot make this reading: it constructs with
+    ``post_mult_value=POST_ALPHA`` at its line 375, so the default never reaches
+    it. That is why the defect survived ``-030``'s landed acceptance.
+    """
+    layer, _ = _layer()
+    print(
+        f"[default] post_mult_value={layer.post_mult_value} "
+        f"reference={REFERENCE_POST_MULT} old_default={OLD_POST_MULT} "
+        f"range_upper_bound_in_reference_shape_guide=2"
+    )
+    assert layer.post_mult_value == REFERENCE_POST_MULT, layer.post_mult_value
+
+
+# --------------------------------------------------------------------------- #
+# FAILING CONTROL 2 -- the old ``1.0`` must FAIL counted value 1.               #
+# --------------------------------------------------------------------------- #
+def test_030c_control_the_old_one_point_zero_default_fails_value_1() -> None:
+    """With ``1.0`` in place of the target's ``2``, value 1 must FAIL.
+
+    The parent block's words are "``counted value 1`` must FAIL and the
+    transcript prints the delta -- a composition that halves the post term must
+    not be able to pass". The vacuity guard is not decoration: if the reference
+    post term were near zero, ``1x`` and ``2x`` would be indistinguishable and a
+    passing control would measure nothing.
+    """
+    rtol, atol = _cited_tolerances()
+    fn, hc_scale, hc_base, residual = _fixture()
+    layer, cfg = _layer(post_mult_value=OLD_POST_MULT)
+    _load(layer, fn, hc_scale, hc_base)
+
+    sinkhorn_mod.reset_dispatch_counters()
+    post_mix, _c, _l = layer.mhc_pre(residual)
+    _route_reading("control-2-old-default", calls=1)
+
+    want, _ = _reference_post_and_mixes(
+        fn, hc_scale, hc_base, residual, float(cfg.rms_norm_eps)
+    )
+    got = post_mix.reshape(T, S)
+    max_abs, max_rel = _max_abs_rel(got, want)
+    ratio = float((want / got.clamp_min(1e-12)).median())
+    print(
+        f"[control-2] post_mult={layer.post_mult_value} "
+        f"max_abs_error={max_abs:.6e} max_rel_error={max_rel:.6e} "
+        f"median_reference_over_got={ratio:.6f} rtol={rtol} atol={atol} "
+        f"smallest_reference_post={float(want.abs().min()):.6e}"
+    )
+
+    if float(want.abs().min()) <= atol:
+        raise VacuousControlError(
+            f"the smallest reference post term is {float(want.abs().min()):.3e}, "
+            f"at or under atol={atol}: halving it could not have been detected, "
+            f"so this control proves nothing about the multiplier"
+        )
+    assert not torch.allclose(got, want, rtol=rtol, atol=atol), (
+        f"the old {OLD_POST_MULT} default matched the target's "
+        f"{REFERENCE_POST_MULT} within the cited pair -- the control is not "
+        f"discriminating, so value 1 cannot be trusted either"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# COUNTED VALUE 2 and FAILING CONTROL 3 -- each epsilon at its own site.        #
+# --------------------------------------------------------------------------- #
+def test_030c_rms_epsilon_reads_the_models_rms_norm_eps() -> None:
+    """The layer carries the model's RMSNorm epsilon, distinct from ``hc_eps``.
+
+    Both constants come off the same config object, and the whole correction is
+    that they are DIFFERENT numbers: a config where they happened to be equal
+    would make every downstream delta in this file vacuous, so that is checked
+    here rather than assumed.
+    """
+    layer, cfg = _layer()
+    print(
+        f"[value-2-constants] layer.rms_eps={layer.rms_eps} "
+        f"config.rms_norm_eps={float(cfg.rms_norm_eps)} "
+        f"layer.hc_eps={layer.hc_eps} config.hc_eps={float(cfg.hc_eps)}"
+    )
+    assert layer.rms_eps == float(cfg.rms_norm_eps), layer.rms_eps
+    assert layer.hc_eps == float(cfg.hc_eps), layer.hc_eps
+    if layer.rms_eps == layer.hc_eps:
+        raise VacuousControlError(
+            f"rms_eps and hc_eps are both {layer.rms_eps}: this config cannot "
+            f"distinguish the corrected site from the old one, so every epsilon "
+            f"delta measured on it would be vacuous"
+        )
+
+
+def test_030c_rms_epsilon_site_is_load_bearing_and_the_old_value_moves_it() -> None:
+    """COUNTED VALUE 2, site 1: swapping the RMS epsilon MOVES the output.
+
+    The reading is a printed delta rather than a must-fail comparison, and that
+    is deliberate (the parent block's own words): ``1e-05`` against ``1e-06``
+    inside an RMS denominator can sit under the cited pair, so a must-fail arm
+    there could be vacuous while a printed nonzero delta cannot. A **ZERO**
+    delta means this site does not read the constant the design says it reads,
+    and that is a finding for the lead, never a pass.
+    """
+    fn, hc_scale, hc_base, residual = _fixture()
+    layer, cfg = _layer()
+    _load(layer, fn, hc_scale, hc_base)
+
+    sinkhorn_mod.reset_dispatch_counters()
+    post_a, comb_a, input_a = layer.mhc_pre(residual)
+    # Put the OLD, wrong constant back at this one site and nothing else.
+    layer.rms_eps = layer.hc_eps
+    post_b, comb_b, input_b = layer.mhc_pre(residual)
+    _route_reading("value-2-rms-site", calls=2)
+
+    d_post = float((post_a - post_b).abs().max())
+    d_comb = float((comb_a - comb_b).abs().max())
+    d_input = float((input_a - input_b).abs().max())
+    print(
+        f"[value-2-site-rms] swapped rms_eps {float(cfg.rms_norm_eps)} -> "
+        f"{layer.hc_eps} delta_post_mix={d_post:.6e} "
+        f"delta_comb_mix={d_comb:.6e} delta_layer_input={d_input:.6e}"
+    )
+    # The RMS scale multiplies `mixes`, which feeds all three heads, so all
+    # three returns must move. Any zero here means the denominator did not read
+    # `rms_eps` at all.
+    for name, delta in (
+        ("post_mix", d_post),
+        ("comb_mix", d_comb),
+        ("layer_input", d_input),
+    ):
+        assert delta > 0.0, (
+            f"swapping rms_eps left {name} bit-identical (delta {delta}); the "
+            f"RMS denominator does not read rms_eps, which is a finding for the "
+            f"lead rather than a pass"
+        )
+
+
+def test_030c_hc_epsilon_sites_are_the_pre_and_comb_gates_only() -> None:
+    """COUNTED VALUE 2, sites 2 and 3, WITH their negative reading.
+
+    ``hc_eps`` belongs at exactly two sites -- after the pre sigmoid
+    (``reference:283``) and after the comb softmax (``reference:286``) -- and the
+    target puts NO epsilon on the post term (``reference:284``). So moving
+    ``hc_eps`` must move ``layer_input`` (through ``pre_mix``) and ``comb_mix``,
+    and must leave ``post_mix`` **bit-identical**. The zero is as much a
+    criterion as the two nonzeros: a ``post_mix`` that moved would mean this
+    layer adds an epsilon the target does not have.
+    """
+    fn, hc_scale, hc_base, residual = _fixture()
+    layer, _cfg = _layer()
+    _load(layer, fn, hc_scale, hc_base)
+
+    sinkhorn_mod.reset_dispatch_counters()
+    post_a, comb_a, input_a = layer.mhc_pre(residual)
+    layer.hc_eps = layer.hc_eps * 100.0
+    post_b, comb_b, input_b = layer.mhc_pre(residual)
+    _route_reading("value-2-hc-sites", calls=2)
+
+    d_post = float((post_a - post_b).abs().max())
+    d_comb = float((comb_a - comb_b).abs().max())
+    d_input = float((input_a - input_b).abs().max())
+    print(
+        f"[value-2-sites-hc] scaled hc_eps by 100 delta_post_mix={d_post:.6e} "
+        f"delta_comb_mix={d_comb:.6e} delta_layer_input={d_input:.6e} "
+        f"expected_post_delta=0"
+    )
+    assert d_input > 0.0, (
+        f"scaling hc_eps left layer_input bit-identical (delta {d_input}); the "
+        f"pre gate does not read hc_eps -- a finding, not a pass"
+    )
+    assert d_comb > 0.0, (
+        f"scaling hc_eps left comb_mix bit-identical (delta {d_comb}); the comb "
+        f"gate does not read hc_eps -- a finding, not a pass"
+    )
+    assert d_post == 0.0, (
+        f"scaling hc_eps moved post_mix by {d_post:.6e}; the target puts NO "
+        f"epsilon on the post term (reference:284), so this layer is adding one "
+        f"the model does not have"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The comparator's own provenance.                                             #
+# --------------------------------------------------------------------------- #
+def test_030c_the_reference_transcription_is_faithful() -> None:
+    """The transcription above is checked against the real reference file.
+
+    Never a skip: when the campaign's reference copy is not on this machine the
+    item still runs, prints that the file was unreachable, and asserts the
+    transcription's own internal consistency. When the file IS reachable its
+    sha256 is asserted against ``PROVENANCE.txt``'s recorded value and every
+    cited line is read.
+    """
+    path = _reference_path()
+    print(f"[provenance] reference_file={path!r} expected_sha256={REFERENCE_SHA256}")
+    if path is None:
+        print(
+            "[provenance] reference_file_unreachable=1 -- the transcription is "
+            "checked by its cited line numbers only; the reachable-file arm runs "
+            "on the authoring machine and in the filed commit record"
+        )
+        assert len(REFERENCE_SHA256) == 64, REFERENCE_SHA256
+        assert set(REFERENCE_LINES) == {216, 257, 278, 283, 284, 286}
+        return
+
+    body = open(path, encoding="utf-8").read()
+    got_sha = hashlib.sha256(body.encode()).hexdigest()
+    rows = body.split("\n")
+    print(f"[provenance] measured_sha256={got_sha} lines={len(rows)}")
+    assert got_sha == REFERENCE_SHA256, got_sha
+    for line_no, must in REFERENCE_LINES.items():
+        text = rows[line_no - 1]
+        print(f"[provenance] :{line_no} {text.strip()[:78]}")
+        assert must in text, f"reference:{line_no} reads {text.strip()!r}"
