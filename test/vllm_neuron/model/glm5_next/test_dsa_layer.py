@@ -582,6 +582,11 @@ class SeamSpy:
         # list so no existing reading changes shape: `calls` still holds `(entry, layer)` and every
         # count above is computed from it exactly as before.
         self.first_arg_dtypes: list[tuple[str, torch.dtype]] = []
+        # THE KERNEL'S SELECTED POOL IDS, per layer, recorded at rev 268 so the reference can ADOPT
+        # them. Its own list for the same reason as above: no existing reading changes shape. The
+        # tensor is DETACHED AND CLONED, because the buffer the product returns is free to be reused
+        # and a live view would let the implementation edit the reference's input after the fact.
+        self.selected_pool_ids: list[tuple[int | None, torch.Tensor]] = []
 
     # -- what the spy is asked --------------------------------------------------------------
     @property
@@ -625,6 +630,27 @@ class SeamSpy:
 
         layer_cls = model_fp8.Glm5NextDSALayer
         monkeypatch.setattr(layer_cls, "forward", self._bracket(layer_cls.forward))
+        # REV 268: record the selected pool ids so the reference can adopt them. This is the method
+        # both entry points call (`model_fp8.py:4289`, `:4473`) and its return is the FINAL set --
+        # bounded, selected, marked and canonically ordered -- which is exactly the set the tie
+        # comparison is about. Recorded only; the real value is returned unchanged, so this patch
+        # cannot alter what the implementation computes.
+        indexer_cls = model_fp8.Glm5NextDSAIndexer
+        monkeypatch.setattr(
+            indexer_cls,
+            "select_bounded_pools",
+            self._record_pool_ids(indexer_cls.select_bounded_pools),
+        )
+
+    def _record_pool_ids(self, real):
+        @functools.wraps(real)
+        def wrapper(*args, **kwargs):
+            out = real(*args, **kwargs)
+            if isinstance(out, torch.Tensor):
+                self.selected_pool_ids.append((self.current_layer, out.detach().clone()))
+            return out
+
+        return wrapper
 
     def _wrap(self, entry: str, real):
         @functools.wraps(real)
@@ -1811,6 +1837,8 @@ def _ref_indexer(
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
     probe_per_head: list[torch.Tensor] | None = None,
+    adopt_pool_ids: torch.Tensor | None = None,
+    tie_label: str | None = None,
 ) -> torch.Tensor:
     """``Glm5NextDSAIndexer.forward``, both legs (``model_fp8.py:3645-3689``).
 
@@ -1857,15 +1885,13 @@ def _ref_indexer(
 
     candidate_keys = _ref_candidate_keys(pool_cache, candidates)
     scores = _ref_score(query, candidate_keys, weights)
-    # THE PROBE KEEPS THE UNBOUNDED SCORES, ON PURPOSE. Its one consumer is the tie control, which
-    # asserts the selection was not decided by a tie. The bound below writes `-inf` into every column
-    # a row does not complete, so handing it BOUNDED scores would make the tie control fire on every
-    # row that completes fewer than `select_k` pools -- reporting the behaviour under test as a
-    # fixture problem. The control still does its job on these scores and the reasoning is short: for
-    # a row completing at least `select_k` pools the selection is made among finite columns, and "no
-    # two of all columns tie" implies "no two of those tie"; for a row completing fewer, every
-    # remaining pick is a `-inf` sentinel whose PLACE is pinned by `_ref_canonical_sentinel_order`
-    # rather than chosen. Both cases are therefore decided, and neither is decided by a tie.
+    # THE PROBE KEEPS THE UNBOUNDED SCORES, ON PURPOSE, and its consumer changed at rev 268. It used
+    # to feed a control that asserted no selection was decided by a tie. That control is RETIRED: a
+    # tie at the k-th place among REAL candidates is a legal product state -- the product's own ReLU
+    # floors every all-non-positive candidate to an identical `0.0` -- so no criterion may be stricter
+    # than tie-equivalence, and a reseed moves such a tie without removing it. The probe now feeds a
+    # NON-GATING reading only. (The old comment here also said the bound writes `-inf`; it writes a
+    # finite `BOUND_FILL`.)
     if probe is not None:
         probe.append(scores.detach())
     # `-103` r7 READ 2. Recomputed rather than captured inside `_ref_score`, so the value path above
@@ -1886,6 +1912,22 @@ def _ref_indexer(
     # screens against cannot then disagree with the width the selector was handed.
     pool_ids = _ref_causal_sentinel(bounded, pool_ids, candidates)
     pool_ids = _ref_canonical_sentinel_order(pool_ids)
+    # ADOPTION, and it is CONDITIONAL (rev 268). The reference has now computed its OWN selection
+    # above, which is what the comparison below is against; adoption never replaces that step. When
+    # the kernel's set differs, it is adopted ONLY if it is itself a legal top-k of the same bounded
+    # scores -- checked, not assumed -- so a genuinely wrong selection cannot be laundered into
+    # agreement by handing it to the reference.
+    if adopt_pool_ids is not None:
+        assert tuple(adopt_pool_ids.shape) == tuple(pool_ids.shape), (
+            f"{tie_label or 'adopt'}: the kernel returned selected pool ids of shape "
+            f"{tuple(adopt_pool_ids.shape)} where the reference computed "
+            f"{tuple(pool_ids.shape)}. Adoption compares the two sets row by row, so a different "
+            f"shape is a finding about the seam's contract and not a shape to broadcast past"
+        )
+        check_tie_equivalent_selection(
+            bounded, pool_ids, adopt_pool_ids, tie_label or "adopt"
+        )
+        pool_ids = adopt_pool_ids.to(pool_ids.dtype)
     return _ref_expand(pool_ids, seq_lens, pool)
 
 
@@ -1971,6 +2013,8 @@ def _ref_layer(
     position: int | None = None,
     probe: list[torch.Tensor] | None = None,
     probe_per_head: list[torch.Tensor] | None = None,
+    adopt_pool_ids: torch.Tensor | None = None,
+    tie_label: str | None = None,
 ) -> torch.Tensor:
     """``Glm5NextDSALayer.forward`` (``model_fp8.py:4687-4712``).
 
@@ -2000,6 +2044,8 @@ def _ref_layer(
         position=position,
         probe=probe,
         probe_per_head=probe_per_head,
+        adopt_pool_ids=adopt_pool_ids,
+        tie_label=tie_label,
     )
     attn_out = _ref_attend(
         attention, normed, latent_cache, int(start_position), topk_indices, float(softmax_scale)
@@ -2218,22 +2264,83 @@ def kth_place_gap(scores: torch.Tensor, k: int) -> float:
     return float((top[:, int(k) - 1] - top[:, int(k)]).min())
 
 
-def say_and_check_gaps(gaps: list[tuple[str, float]]) -> None:
-    """Print EVERY label's gap, then assert over all of them at once.
+def say_gaps(gaps: list[tuple[str, float]]) -> None:
+    """Print EVERY label's k-th-place gap. NON-GATING since rev 268, and the rename says so.
 
-    The printing comes first on purpose: a reading that only reaches the transcript when it passes
-    is not a reading. With this order a failing run still shows every label's number, so a reader
-    can see at a glance whether one row was unlucky or the seed is bad everywhere.
+    IT USED TO ASSERT, AND THE ASSERTION WAS WRONG IN KIND. It required every gap to clear
+    :data:`TIE_FLOOR` and told a failing run to reseed. But a tie at the k-th place among REAL
+    candidates is a legal product state, not a bad draw: ``_ref_score`` and the product kernel both
+    apply a ReLU, so every candidate whose per-head scores are all non-positive collapses to the
+    same exact ``0.0``, and at ``prefill-layer2`` two causally-attendable pools sat on that floor
+    with the k-th gap exactly zero. A reseed moves which row ties and cannot remove ties, and
+    upstream's own top-k is arbitrary among equal values -- so no criterion here may be stricter
+    than TIE-EQUIVALENCE, which :func:`check_tie_equivalent_selection` enforces instead.
+
+    The number is still worth reading, so it is still printed: a gap that collapses across a whole
+    leg says something about the fixture even when nothing is wrong with the product.
     """
     for label, gap in gaps:
-        say(label, "kth_place_gap_min", f"{gap:.3e}")
-    bad = [(label, gap) for label, gap in gaps if not gap > TIE_FLOOR]
-    assert not bad, (
-        f"{', '.join(label for label, _ in bad)}: the smallest gap at the k-th place is "
-        f"{', '.join(f'{gap:.3e}' for _, gap in bad)}, so at least one row's selection is "
-        f"effectively a tie and this case cannot tell a tie-break difference from a defect. "
-        f"Reseed the fixture rather than loosening the comparison"
-    )
+        say(label, "kth_place_gap_min", f"{gap:.3e}", "gating", "no")
+
+
+def check_tie_equivalent_selection(
+    bounded: torch.Tensor, ref_ids: torch.Tensor, kernel_ids: torch.Tensor, label: str
+) -> None:
+    """The kernel's selected set must equal the reference's UP TO SUBSTITUTION AMONG EXACT TIES.
+
+    This is the comparison that replaced the retired no-tie control, and it is what makes adoption
+    safe. Two sets may differ only in a way the scores cannot distinguish: every id the kernel chose
+    must score at least as high as every id it did not, compared EXACTLY -- no tolerance, so the
+    boundary case is bit equality at the k-th value. A kernel that dropped a strictly better
+    candidate fails here and is not adopted.
+
+    WHY EXACT AND NOT TOLERANT. A tolerance would admit a kernel that picked a slightly worse
+    candidate, which is precisely the defect this item is meant to catch. The legal case is an exact
+    tie, so the legal case needs no tolerance to pass.
+
+    The sentinel columns are compared as a COUNT, not as places: `-1` marks carry no score, so
+    which slot holds one is not a selection question, and `_ref_canonical_sentinel_order` has
+    already pinned them to the trailing columns on both sides.
+    """
+    scores = bounded.float()
+    rows, width = int(scores.shape[0]), int(scores.shape[1])
+    reported = False
+    for r in range(rows):
+        ref_row = [int(v) for v in ref_ids[r].tolist()]
+        ker_row = [int(v) for v in kernel_ids[r].tolist()]
+        ref_real = sorted(v for v in ref_row if v >= 0)
+        ker_real = sorted(v for v in ker_row if v >= 0)
+
+        assert len(ker_real) == len(ref_real), (
+            f"{label} row {r}: the kernel returned {len(ker_real)} real pool ids where the "
+            f"reference returned {len(ref_real)}. A different COUNT is not a tie substitution -- "
+            f"kernel={ker_row} reference={ref_row}"
+        )
+        if ker_real == ref_real:
+            continue
+
+        chosen = set(ker_real)
+        lo = min(float(scores[r, c]) for c in chosen)
+        unchosen = [c for c in range(width) if c not in chosen]
+        hi = max(float(scores[r, c]) for c in unchosen) if unchosen else float("-inf")
+        # ONE row per leg, and it is the row that actually differs -- the interesting one.
+        if not reported:
+            say(label, "tie_choice", f"row={r}", f"kth_value={lo:.9e}",
+                "kernel_ids=" + ";".join(str(v) for v in ker_real),
+                "ref_ids=" + ";".join(str(v) for v in ref_real))
+            reported = True
+        assert lo >= hi, (
+            f"{label} row {r}: the kernel's selection is not a legal top-k, so it is a WRONG "
+            f"selection and not a tie substitution. Its lowest chosen score is {lo:.9e} while an "
+            f"unchosen column scores {hi:.9e}, which is strictly higher. kernel={ker_real} "
+            f"reference={ref_real}"
+        )
+    if not reported:
+        # The row that came CLOSEST to a tie, so the leg always emits exactly one row.
+        gaps = torch.topk(scores, min(width, 2), dim=-1).values
+        row = int(torch.argmin(gaps[:, 0] - gaps[:, -1])) if width > 1 else 0
+        say(label, "tie_choice", f"row={row}", f"kth_value={float(gaps[row, -1]):.9e}",
+            "kernel_ids=identical", "ref_ids=identical")
 
 
 def say_tie_diagnostics(
@@ -2282,23 +2389,28 @@ def say_tie_diagnostics(
         )
 
 
-def assert_selection_is_not_a_tie(
+def say_selection_tie_readings(
     scores: torch.Tensor, k: int, label: str, per_head: torch.Tensor | None = None
 ) -> None:
-    """No row may be decided by a tie at the k-th place.
+    """Read the selection's tie structure. NON-GATING since rev 268 -- it asserts nothing.
 
-    WHY THIS CONTROL EXISTS. Item (1) compares the layer's FINAL output, and the selection sits in
-    the middle of that chain. If the kernel and the reference broke a tie differently they would
-    attend different cache rows and the numeric comparison would fail for a reason that is not a
-    defect -- or, worse, a real defect could be excused as a tie. ``torch.topk``'s tie order is not
-    contracted to match the kernel's, so the fixture must make ties impossible rather than hope.
+    WHAT IT USED TO DO AND WHY THAT WAS WRONG. It required no row to be decided by a tie at the
+    k-th place, on the reasoning that the kernel and the reference might break a tie differently and
+    the output comparison would then fail for a reason that is not a defect. The premise was right;
+    the remedy was not. Ties among real candidates cannot be excluded by any fixture -- the ReLU in
+    both scorers manufactures them -- so demanding their absence made a legal product state read as
+    a bad draw.
 
-    The single-label form, kept because run 1 reads one label per layer per phase and each of those
-    is its own reading. It now routes through the shared reader above so there is ONE definition of
-    the gap arithmetic and ONE floor.
+    The disagreement it worried about is now handled where it belongs: the reference ADOPTS the
+    kernel's selected set once :func:`check_tie_equivalent_selection` has confirmed the set is a
+    legal top-k. So the two sides attend the same rows by construction, and a wrong selection is
+    caught by the set comparison rather than pre-empted by a floor.
+
+    The single-label form is kept because run 1 reads one label per layer per phase and each of
+    those is its own reading.
     """
     say_tie_diagnostics(scores, int(k), label, per_head)
-    say_and_check_gaps([(label, kth_place_gap(scores, int(k)))])
+    say_gaps([(label, kth_place_gap(scores, int(k)))])
 
 
 # =========================================================================== #
@@ -2318,23 +2430,37 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
 
     THE ORDER OF OPERATIONS IS LOAD-BEARING AND IS NOT AN ACCIDENT OF WRITING:
 
-      1. build the operands once,
-      2. CLONE every mutable cache and run the REFERENCE on the clones,
-      3. reset the counters, and assert the reset landed,
-      4. run the implementation on the originals,
-      5. read the counters, then compare the numbers.
+      1. build the operands once, one cache set PER SIDE,
+      2. reset the counters, and assert the reset landed,
+      3. run the IMPLEMENTATION on the originals, recording each layer's selected pool ids,
+      4. read the counters -- the implementation's dispatches and nothing else,
+      5. run the REFERENCE on its own caches, ADOPTING those ids where they are tie-equivalent,
+      6. compare the two hidden states.
 
-    Steps 2 and 3 are in that order because the caches are mutated in place by BOTH sides -- the
+    Each side gets its OWN cache set because the caches are mutated in place by BOTH sides -- the
     pool cache, the latent cache and the tail ring all are -- so sharing them would compare a run
-    against itself. And the reset sits AFTER the reference because a reference is allowed to move a
-    counter; what the route predicate measures is the IMPLEMENTATION's dispatches alone.
+    against itself.
 
-    THE PROJECTION COUNTER IS THE ONE EXCEPTION TO STEP 3, and it is deliberate rather than an
+    THE REFERENCE RUNS LAST, AND THAT IS A REV 268 CHANGE. It used to run first, with the reset
+    between the two sides so that the readings were the implementation's alone. The reference now
+    ADOPTS the implementation's selected pool ids, so the implementation must run first; the reset
+    therefore moved AHEAD of both, which is strictly stronger -- the readings are now taken with
+    nothing at all having run before the implementation, rather than with a reference cleared out
+    behind them. What the route predicate measures is unchanged: the IMPLEMENTATION's dispatches.
+
+    WHY THE REFERENCE ADOPTS. A tie at the k-th place among real candidates is a legal product
+    state, because the product's own ReLU floors every all-non-positive candidate to an identical
+    ``0.0``. Two different index sets can then both be correct top-k answers, so no criterion here
+    may be stricter than tie-equivalence. Adoption is GATED on that legality being proven
+    (:func:`check_tie_equivalent_selection`), so a genuinely wrong selection still fails.
+
+    THE PROJECTION COUNTER IS THE ONE EXCEPTION TO STEP 2, and it is deliberate rather than an
     inconsistency. It is reset ONCE before the phase loop instead of per phase, because its per-case
     total is the second instrument that the per-call probe is checked against, and a reset inside the
-    loop would leave nothing to check. That is only sound if the reference dispatches nothing, so
-    each leg READS the counter after its own reference and asserts it did not move -- which turns the
-    thing step 3 ASSUMES for the seven families into a measurement for the eighth.
+    loop would leave nothing to check. That is only sound if the reference dispatches nothing, so the
+    reference is BRACKETED by its own before-and-after read of that counter and asserted not to have
+    moved it -- which turns the thing step 2 ASSUMES for the seven families into a measurement for
+    the eighth.
     """
     if not gate_live():
         pytest.skip("the NKI gate is not live; the counter readings would be meaningless")
@@ -2387,76 +2513,20 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         # know what the previous phase left behind.
         projection_mark = read_projection_counter()
 
-        # (2) THE REFERENCE, on its own per-layer caches.
-        candidates = (PREFILL_TOKENS if phase == "prefill" else PREFILL_TOKENS + 1) // pool
-        ref_hidden = step_hidden
-        probe: list[torch.Tensor] = []
-        # `-103` r7 READ 2 collects the per-head scores beside the weighted ones, so a tied row can be
-        # read at the place the ReLU floor is actually reached.
-        probe_per_head: list[torch.Tensor] = []
-        for layer, caches in zip(stack, ref_caches):
-            ref_hidden = _ref_layer(
-                layer,
-                ref_hidden,
-                latent_cache=caches["latent_cache"],
-                pool_cache=caches["pool_cache"],
-                seq_lens=kwargs["seq_lens"],
-                start_position=start,
-                softmax_scale=SOFTMAX_SCALE,
-                candidates=candidates,
-                trash=ops["trash"],
-                slot_mapping=kwargs.get("slot_mapping"),
-                tail=None if phase == "prefill" else caches["tail"],
-                position=kwargs.get("position"),
-                probe=probe,
-                probe_per_head=probe_per_head,
-            )
-        reference = ref_hidden
-
-        # THE TIE CONTROL, on every layer's own selection. Run BEFORE the comparison so a tie is
-        # reported as a fixture problem rather than surfacing as a numeric failure downstream.
-        assert len(probe) == int(layers), (
-            f"the probe collected {len(probe)} score tensors for {layers} layer(s); every layer "
-            f"selects once per phase, so a short count means a layer was skipped"
-        )
-        assert len(probe_per_head) == len(probe), (
-            f"the per-head probe collected {len(probe_per_head)} tensors against the score probe's "
-            f"{len(probe)}; the two are appended in the same call, so a difference means one of them "
-            f"was not threaded through every layer"
-        )
-        for idx, scores in enumerate(probe):
-            assert_selection_is_not_a_tie(
-                scores,
-                int(stack[idx].attention.indexer.select_k()),
-                f"{phase}-layer{idx}",
-                probe_per_head[idx],
-            )
-
-        # THE REFERENCE MOVED NO PROJECTION COUNTER, read rather than assumed. The seven family
-        # counters are reset AFTER the reference precisely because a reference is ALLOWED to move
-        # one; the projection counter is deliberately NOT reset here, because the case total has to
-        # survive both phases. That is only sound if the reference is torch-only, so it is measured
-        # rather than trusted: the reference projects through `_ref_projection`, a plain matmul in
-        # this file, and reaches no seam. If it ever did, the case total would be part reference and
-        # the closed form below would read high for a reason no assertion could name.
-        after_reference = read_projection_counter()
-        say(phase, "projection_after_reference", after_reference, "at_phase_start", projection_mark)
-        assert after_reference == projection_mark, (
-            f"the torch reference moved the projection counter from {projection_mark} to "
-            f"{after_reference} on the {phase} leg. The reference and the implementation have to be "
-            f"computed by different means, and a reference that dispatches the seam under test is "
-            f"comparing the seam against itself"
-        )
-
-        # (3) RESET, and prove the reset landed before anything is measured against it.
+        # (2) RESET FIRST, and prove the reset landed before anything is measured against it. This
+        # sits ahead of BOTH sides at rev 268, where it used to sit between them: the reference now
+        # adopts the implementation's selected pool ids, so the implementation has to run first, and
+        # a reset can no longer come between the two. Ahead of both is strictly stronger -- the
+        # readings below are the implementation's alone because nothing ran before it, rather than
+        # because a reference that already ran was cleared out behind them.
         reset_all_counters()
         after_reset = read_all_counters()
         assert all(v == (0, 0) for v in after_reset.values()), (
             f"the counters did not reset to zero: {after_reset}. Every reading below would then be "
-            f"partly the reference's dispatches, which is exactly the confusion this order avoids"
+            f"partly an earlier leg's dispatches, which is exactly the confusion this order avoids"
         )
 
-        # (4) THE IMPLEMENTATION, on the originals, with the spy installed.
+        # (3) THE IMPLEMENTATION, on the originals, with the spy installed.
         spy_here = SeamSpy()
         spy_here.install(monkeypatch)
         # The projection probe is installed in the SAME window as the spy and is undone by the same
@@ -2486,8 +2556,27 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         # three times each. Two lists filled by one wrapper have to be merged by one step.
         spy.calls.extend(spy_here.calls)
         spy.first_arg_dtypes.extend(spy_here.first_arg_dtypes)
+        spy.selected_pool_ids.extend(spy_here.selected_pool_ids)
 
-        # (5) THE READINGS, then the comparison.
+        # (4) THE CAPTURED SELECTION, checked before anything is allowed to use it. The ids the
+        # reference adopts come from the spy's RECORDED RETURN VALUES and from nowhere else -- the
+        # product is not called a second time and nothing here recomputes them -- so this leg must
+        # hold exactly one recorded set per layer, in layer order. A repeat means a layer ran twice
+        # and a gap means one did not run; either way the adopted set would belong to a different
+        # layer than the reference row it is handed to, which no downstream assertion could name.
+        captured_layers = [int(idx) for idx, _ids in spy_here.selected_pool_ids]
+        say(phase, "pool_ids_captured", len(captured_layers),
+            "layers", "|".join(str(v) for v in captured_layers))
+        assert captured_layers == list(range(int(layers))), (
+            f"the {phase} leg recorded selected pool ids for layers {captured_layers}, where "
+            f"{layers} layer(s) each select exactly once per leg and the expected record is "
+            f"therefore {list(range(int(layers)))}. `build_layer_stack` numbers the stack "
+            f"0..n-1 and the spy reads that same `layer_idx`, so this compares the recording "
+            f"against the stack rather than against a typed count"
+        )
+        kernel_pool_ids = [ids for _idx, ids in spy_here.selected_pool_ids]
+
+        # (5) THE READINGS -- the implementation's alone, taken BEFORE the reference runs at all.
         readings = read_all_counters()
         for family in FAMILIES:
             say(phase, "counter", family, readings[family])
@@ -2514,7 +2603,95 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
             f"this increment must be re-derived rather than this number relaxed"
         )
         spy_here.report(f"{phase}-L{layers}")
+
+        # (6) THE REFERENCE, on its own per-layer caches, ADOPTING the implementation's selection
+        # where that selection is tie-equivalent. It runs LAST because adoption needs the recorded
+        # ids, and it runs after every counter reading above so it cannot touch one of them.
+        #
+        # THE REFERENCE IS BRACKETED BY ITS OWN PROJECTION-COUNTER SNAPSHOT, because the projection
+        # counter is the one counter NOT reset per phase -- the case total after the loop is the
+        # second instrument the per-call probe is checked against, so a per-phase reset would leave
+        # nothing to check it with. That is only sound if the reference dispatches nothing, and here
+        # that is measured rather than trusted: the reference projects through `_ref_projection`, a
+        # plain matmul in this file, and reaches no seam. If it ever did, the case total below would
+        # be part reference and would read high for a reason no assertion could name.
+        candidates = (PREFILL_TOKENS if phase == "prefill" else PREFILL_TOKENS + 1) // pool
+        ref_before = read_projection_counter()
+        ref_hidden = step_hidden
+        probe: list[torch.Tensor] = []
+        # `-103` r7 READ 2 collects the per-head scores beside the weighted ones, so a tied row can be
+        # read at the place the ReLU floor is actually reached.
+        probe_per_head: list[torch.Tensor] = []
+        for idx, (layer, caches) in enumerate(zip(stack, ref_caches)):
+            ref_hidden = _ref_layer(
+                layer,
+                ref_hidden,
+                latent_cache=caches["latent_cache"],
+                pool_cache=caches["pool_cache"],
+                seq_lens=kwargs["seq_lens"],
+                start_position=start,
+                softmax_scale=SOFTMAX_SCALE,
+                candidates=candidates,
+                trash=ops["trash"],
+                slot_mapping=kwargs.get("slot_mapping"),
+                tail=None if phase == "prefill" else caches["tail"],
+                position=kwargs.get("position"),
+                probe=probe,
+                probe_per_head=probe_per_head,
+                # THE ADOPTION, one layer's recorded set per layer, positionally matched to the stack
+                # by the check at step (4) rather than by assumption.
+                adopt_pool_ids=kernel_pool_ids[idx],
+                tie_label=f"{phase}-layer{idx}",
+            )
+        reference = ref_hidden
+
+        # THE TIE READINGS, on every layer's own selection, and they are NON-GATING now. The control
+        # that used to assert no selection was decided by a tie is retired: a k-th-place tie among
+        # real candidates is a legal product state, so the numbers are disclosed and the legality of
+        # the adopted set is what is asserted, inside `_ref_indexer`.
+        assert len(probe) == int(layers), (
+            f"the probe collected {len(probe)} score tensors for {layers} layer(s); every layer "
+            f"selects once per phase, so a short count means a layer was skipped"
+        )
+        assert len(probe_per_head) == len(probe), (
+            f"the per-head probe collected {len(probe_per_head)} tensors against the score probe's "
+            f"{len(probe)}; the two are appended in the same call, so a difference means one of them "
+            f"was not threaded through every layer"
+        )
+        for idx, scores in enumerate(probe):
+            say_selection_tie_readings(
+                scores,
+                int(stack[idx].attention.indexer.select_k()),
+                f"{phase}-layer{idx}",
+                probe_per_head[idx],
+            )
+
+        ref_after = read_projection_counter()
+        say(phase, "projection_after_reference", ref_after, "before_reference", ref_before)
+        assert ref_after == ref_before, (
+            f"the torch reference moved the projection counter from {ref_before} to {ref_after} on "
+            f"the {phase} leg. The reference and the implementation have to be computed by different "
+            f"means, and a reference that dispatches the seam under test is comparing the seam "
+            f"against itself"
+        )
+
+        # (7) THE COMPARISON.
         report_close(f"item-1-{phase}-L{layers}", got, reference)
+
+    # THE ADOPTION'S OWN COUNT, over the whole case rather than per leg. Every layer selects once per
+    # leg, so the case owes exactly layers x legs recorded sets. The per-leg check above already
+    # proved each leg's record is `0..n-1` with no repeat; this one proves no leg was skipped and no
+    # leg recorded a second time, which is the other way the adopted ids could have come from
+    # somewhere other than the run they are compared against.
+    want_pool_id_sets = int(layers) * len(PHASES)
+    say("part1", "pool_id_sets", len(spy.selected_pool_ids), "want", want_pool_id_sets,
+        "layers", int(layers), "legs", len(PHASES))
+    assert len(spy.selected_pool_ids) == want_pool_id_sets, (
+        f"the case recorded {len(spy.selected_pool_ids)} selected-pool-id sets where {layers} "
+        f"layer(s) across {len(PHASES)} leg(s) owe {want_pool_id_sets}, at one per layer per leg. "
+        f"The reference adopted from this record, so a wrong count means it adopted a set from a "
+        f"call it was not compared against"
+    )
 
     # PART 1 OF THE ROUTE PREDICATE, over this case: six of the seven families move here and the
     # pack pair is the DECLARED ZERO entry `aa` ruled. The seventh is run 2's.
@@ -2679,7 +2856,7 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
         )
         scored.append((n, _ref_score(q_own, _ref_candidate_keys(pool_cache, candidates), w_own)))
 
-    say_and_check_gaps(
+    say_gaps(
         [
             (f"arm-request-{b}", kth_place_gap(scores, select_k))
             for b, (_n, scores) in enumerate(scored)
