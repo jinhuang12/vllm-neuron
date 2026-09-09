@@ -2260,14 +2260,38 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # routes on argument 1 and hands argument 2 to the experts, so only argument 1 is
     # perturbed here and argument 2 is left exactly as the main compare had it.
     #
-    # THE PERTURBATION IS PROVED BEFORE IT IS USED, AND THAT PROOF IS THE GATE (R2,
-    # LEAD-LOG 850). The block's OWN router is called on candidate swaps --
-    # ``block.experts.route_tokens``, the same method the forward routes with -- and
-    # what this control requires is that some candidate CHANGE THE SELECTED EXPERT SET
-    # at its token. A router that ignored its input, that read the second argument
-    # instead of the first, or that was permutation-invariant in its channels cannot
-    # produce that change on any candidate, so the discrete reading is what
-    # discriminates and it is read from the block under test.
+    # THE PERTURBATION IS PROVED THROUGH THE FORWARD, AND THAT PROOF IS THE GATE
+    # (R2', LEAD-LOG 858). What stood here proved the swap changed the SELECTED
+    # EXPERT SET when THIS TEST called ``block.experts.route_tokens`` itself, and
+    # gated nothing on the set the FORWARD's own router call returned, so a forward
+    # that routed on argument 2 would have passed the arm whose whole purpose is to
+    # refuse it (round 3, finding F1:
+    # ``reviews/glm-5.3-flash-port/design-and-code-054a-controls-r3-cb12f3d9-findings.md``).
+    # The reading is now taken from INSIDE the forward. The block's own
+    # ``route_tokens`` -- the method ``Glm5NextMoEBlock.forward`` routes with
+    # (``model_fp8.py:3334-3336``) -- is wrapped on the instance for the duration of
+    # each ``block.forward`` call, every call it makes is recorded, and the wrapper
+    # returns the router's own tuple unchanged. It is removed in a ``finally``, so no
+    # later reading in this file sees it.
+    #
+    # THE GATE IS DISCRETE AND IT IS THE FORWARD'S: the set recorded inside the
+    # PERTURBED forward must differ from the set recorded inside the REFERENCE
+    # forward at the swapped token. A forward that routed on argument 2, or on a
+    # tensor it rebuilt, cannot produce that difference, because only argument 1
+    # carries the swap.
+    #
+    # THE DIRECT CALL STAYS AS A SEARCH, NEVER AS A GATE. Finding which of the eight
+    # channel pairs flips a set costs up to 128 router calls; spending 128 forwards
+    # on the same question would cost the whole item. So the cheap oracle picks the
+    # candidates and the forward decides. That order is also why the forward gate
+    # cannot be vacuous on correct code: the oracle has already proved a flip exists
+    # for the pair the forward is then asked about.
+    #
+    # AND THE ARGUMENT-2 ARM, which is what F1's falsifier needs stated positively.
+    # The same swap is placed in argument 2 with argument 1 exactly as the main
+    # compare had it, and the recorded set must NOT move. The two arms together say
+    # the forward routes on the argument this block declares: the swap is visible from
+    # argument 1 and invisible from argument 2.
     #
     # WHY row_gap IS NO LONGER THE GATE. The counted run proved the numeric arm
     # vacuous: the swap that flipped the set moved that token's row by 0.017289 while
@@ -2279,9 +2303,65 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # the row gap the deciding reading, so it stays PRINTED and is not compared.
     #
     # THE STRONGEST CANDIDATE IS KEPT, NOT THE FIRST. One candidate per channel pair,
-    # the first token whose set flips for that pair, and then the kept swap is the one
-    # with the LARGEST row gap of those evaluated. The counts are printed so a reader
-    # knows what the maximum was taken over.
+    # the first token whose set flips for that pair, then the kept swap is the one
+    # with the LARGEST row gap of those whose set moved INSIDE THE FORWARD. The counts
+    # are printed so a reader knows what the maximum was taken over.
+    _real_route_tokens = block.experts.route_tokens
+    _had_own_route_tokens = "route_tokens" in vars(block.experts)
+    _recorded_sets = []
+
+    def _recording_route_tokens(*args, **kwargs):
+        """The block's own router, with the set it returns recorded."""
+        _logits, _index, _affinities = _real_route_tokens(*args, **kwargs)
+        _selected = (_affinities != 0).clone()
+        if _selected.dim() == 3 and int(_selected.shape[0]) == 1:
+            _selected = _selected[0]
+        _recorded_sets.append(_selected)
+        return _logits, _index, _affinities
+
+    def _forward_recording_the_router(_first, _second):
+        """``block.forward(_first, _second)``, and every router call it made."""
+        del _recorded_sets[:]
+        block.experts.route_tokens = _recording_route_tokens
+        try:
+            _out = block.forward(
+                _first,
+                _second,
+                router_gamma=gamma,
+                text_config=text_config,
+                quant_config=quant_config,
+            )
+        finally:
+            if _had_own_route_tokens:
+                block.experts.route_tokens = _real_route_tokens
+            else:
+                del block.experts.route_tokens
+        return _out, list(_recorded_sets)
+
+    def _routed_or_raise(_sets, _which):
+        """The first recorded set, or the raise that names the router path."""
+        if not _sets:
+            raise VacuousControlError(
+                f"the {_which} forward made no call to block.experts.route_tokens, "
+                f"the method this control wrapped and the one "
+                f"Glm5NextMoEBlock.forward routes with: nothing this control "
+                f"perturbs can be read from the router's output, so it cannot speak"
+            )
+        return _sets[0]
+
+    # ---- THE REFERENCE FORWARD, RE-RUN WITH THE ROUTER RECORDED. The item's own
+    # compare above already ran this forward and its route predicate is closed
+    # (control D resets the counters before its own), so this call is counted by
+    # nothing that is registered.
+    _ref_out, _ref_sets = _forward_recording_the_router(pre_norm, normed)
+    _ref_set = _routed_or_raise(_ref_sets, "reference")
+    print(
+        f"TINYFWD|moe_router_recorded|forward=reference"
+        f"|router_calls={len(_ref_sets)}|set_shape={tuple(_ref_set.shape)}"
+        f"|output_repeated_the_item_s_own_call={bool(torch.equal(_ref_out, got))}"
+        f"|note=the calls are counted INSIDE the forward; the repeat of the output"
+        f" is a reading and is gated by nothing"
+    )
     _base_set = affinities != 0
     _probes = 0
     _candidates = []
@@ -2302,26 +2382,85 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         raise VacuousControlError(
             f"no swap among {len(MOE_SWAP_CHANNEL_CANDIDATES)} channel pairs on any "
             f"of the first {MOE_SWAP_TOKEN_SCAN} tokens changed the SELECTED EXPERT "
-            f"SET in {_probes} probes, so this block's own router does not read the "
-            f"channel order of the argument it routes on, and no perturbation this "
-            f"control can make would be visible in its output"
+            f"SET in {_probes} probes of this block's own router, so no perturbation "
+            f"this control can make would be visible in its output and there is "
+            f"nothing for the forward to be asked about"
         )
     _evaluated = []
     for _t, _i, _j, _candidate in _candidates:
-        _probe_out = block.forward(
-            _candidate,
-            normed,
-            router_gamma=gamma,
-            text_config=text_config,
-            quant_config=quant_config,
-        )
+        _probe_out, _probe_sets = _forward_recording_the_router(_candidate, normed)
+        _probe_set = _routed_or_raise(_probe_sets, "perturbed")
+        _through = not torch.equal(_probe_set[_t], _ref_set[_t])
         _probe_gap = float(
             (_probe_out[_t].float() - expected[_t].float()).abs().max()
             / expected[_t].abs().max()
         )
-        _evaluated.append((_probe_gap, _t, _i, _j, _probe_out))
+        print(
+            f"TINYFWD|moe_swap_forward|token={_t}|channels={_i} and {_j}"
+            f"|router_calls={len(_probe_sets)}"
+            f"|selected_set_changed_inside_the_forward={_through}"
+            f"|selected_inside_reference={int(_ref_set[_t].sum())}"
+            f"|selected_inside_perturbed={int(_probe_set[_t].sum())}"
+            f"|row_gap={_probe_gap:.6f}"
+        )
+        if _through:
+            _evaluated.append((_probe_gap, _t, _i, _j, _probe_out))
+    if not _evaluated:
+        raise VacuousControlError(
+            f"{len(_candidates)} channel swaps changed the selected expert set when "
+            f"this control called block.experts.route_tokens itself, and not one of "
+            f"them changed the set THE SAME ROUTER returned INSIDE block.forward: "
+            f"this forward does not route on the argument it was handed the swap in, "
+            f"so its output cannot be read as a consequence of the routing this "
+            f"control perturbed"
+        )
     _best = max(_evaluated, key=lambda item: item[0])
     _row_gap, _swap_token, _swap_i, _swap_j, swapped = _best
+    # ---- THE ARGUMENT-2 ARM. The kept swap, placed in argument 2 while argument 1
+    # stays the main compare's own tensor. The recorded set must not move, because
+    # the router reads argument 1; if it moves, this forward routed on the states it
+    # hands the experts and the arm above proved nothing about its routing.
+    _arm_second = normed.clone()
+    _arm_second[_swap_token, [_swap_i, _swap_j]] = _arm_second[
+        _swap_token, [_swap_j, _swap_i]
+    ]
+    _arm_out, _arm_sets = _forward_recording_the_router(pre_norm, _arm_second)
+    _arm_set = _routed_or_raise(_arm_sets, "argument-2 arm")
+    _arm_changed = not torch.equal(_arm_set[_swap_token], _ref_set[_swap_token])
+    print(
+        f"TINYFWD|moe_swap_arm|branch=the kept swap placed in argument 2"
+        f"|token={_swap_token}|router_calls={len(_arm_sets)}"
+        f"|selected_set_changed_inside_the_forward={_arm_changed}"
+        f"|note=argument 1 is the main compare's own tensor, so the set must not"
+        f" move: the swap is visible from argument 1 and invisible from argument 2"
+    )
+    if _arm_changed:
+        raise VacuousControlError(
+            f"the swap placed in ARGUMENT 2 changed the selected expert set inside "
+            f"the forward at token {_swap_token} while argument 1 was the main "
+            f"compare's own tensor, so this forward routes on the states it hands "
+            f"the experts and the set change measured above followed the wrong "
+            f"argument"
+        )
+    # ---- AND THE RETIRED ARM, MEASURED RATHER THAN GATED. The arm this control
+    # replaced fed the normalised states in both positions. It is run here because
+    # R2' asks for it, and it is a READING: nothing in the router's arithmetic
+    # promises that a different input leaves the top-8-of-16 boundary where it was,
+    # so a gate here could redden a correct block. What it is worth is the number --
+    # whether the retired arm was visible to the router at all.
+    _double_out, _double_sets = _forward_recording_the_router(normed, normed)
+    _double_changed = (
+        bool(not torch.equal(_double_sets[0][_swap_token], _ref_set[_swap_token]))
+        if _double_sets
+        else None
+    )
+    print(
+        f"TINYFWD|moe_swap_arm|branch=the retired arm, normalised states in both"
+        f" positions|token={_swap_token}|router_calls={len(_double_sets)}"
+        f"|selected_set_changed_inside_the_forward={_double_changed}"
+        f"|note=a reading, gated by nothing: a different router input may move the"
+        f" top-k boundary on correct code"
+    )
     print(
         f"TINYFWD|moe_swap_probe|token={_swap_token}|channels={_swap_i} and "
         f"{_swap_j}|probes={_probes}"
@@ -2329,8 +2468,8 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         f"|set_changed_pairs={len(_candidates)} of "
         f"{len(MOE_SWAP_CHANNEL_CANDIDATES)}|evaluated={len(_evaluated)}"
         f"|token_scan={MOE_SWAP_TOKEN_SCAN}"
-        f"|note=one candidate per channel pair, and the kept swap has the largest"
-        f" row gap of those evaluated"
+        f"|note=one candidate per channel pair, the kept swap has the largest row"
+        f" gap of those whose set changed inside the forward"
     )
     _row_identical = bool(torch.equal(swapped[_swap_token], expected[_swap_token]))
     moved = not torch.allclose(swapped[_swap_token].float(),
@@ -2339,12 +2478,14 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     gap = float((swapped.float() - expected.float()).abs().max() / expected.abs().max())
     print(
         f"TINYFWD|moe_control|branch=router input channels {_swap_i} and {_swap_j} "
-        f"swapped at token {_swap_token}|selected_set_changed=True"
+        f"swapped at token {_swap_token}"
+        f"|selected_set_changed_inside_the_forward=True"
         f"|row_bitwise_identical={_row_identical}"
         f"|outside_tolerance={moved}|row_gap={_row_gap:.6f}"
         f"|whole_tensor_gap={gap:.6f}"
-        f"|note=the proved change of the selected set is the gate; every number here"
-        f" is a reading and none is compared against MOE_RTOL"
+        f"|note=the proved change of the set the FORWARD's own router returned is"
+        f" the gate; every number here is a reading and none is compared against"
+        f" MOE_RTOL"
     )
 
     # ---- CONTROL D: A BLOCK WITH NO SHARED EXPERT returns the routed half and
@@ -5248,32 +5389,49 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         )
     print("TINYFWD|root_control|branch=unnamed runner key|refused=True")
 
-    # ---- CONTROL E: THE ROWS ARE THE CALLER'S, AND A PLANTED PERTURBATION PROVES IT
-    # (R3, LEAD-LOG 850). The rolled-positions recompute that stood here could not
-    # discriminate, and it said so: rolling ``(127, 0, 7, 7)`` by one maps position 7
-    # to position 7, and the stack hands the head rows it has already homogenised, so
-    # the recompute landed inside this item's band at a gap of 0.000313 and reddened
-    # the item as a vacuous control
-    # (``increments/launch-054a-r16-driver-20260909T080034Z.out:330``). The round-3
-    # review froze the positions, the head and both tolerance pairs; this repair moves
-    # none of them. It changes WHAT IS PERTURBED, from the position list to the hidden
-    # state, so the control's power stops depending on how far apart two rows of the
-    # stack happen to sit.
+    # ---- CONTROL E: THE ROWS ARE THE CALLER'S, AND THE PRODUCT SAYS SO UNDER A
+    # PLANTED PERTURBATION (R3', LEAD-LOG 858).
+    #
+    # WHAT STOOD HERE AND WHY IT WAS NOT ENOUGH. R3 replaced a rolled-positions
+    # recompute that could not discriminate -- rolling ``(127, 0, 7, 7)`` by one maps
+    # position 7 to position 7 and the stack hands the head rows it has already
+    # homogenised, so the recompute landed inside this item's band at a gap of
+    # 0.000313 (``increments/launch-054a-r16-driver-20260909T080034Z.out:330``) -- with
+    # a perturbation planted on the hidden state, which is sized from the band and
+    # cannot be absorbed by row spread. That much is kept. But both tensors it compared
+    # came from ``_root_reference``, so it proved the TEST's reference selects rows by
+    # position and proved nothing about the product's
+    # ``torch.index_select(hidden_states, dim=0, index=sampling_positions)``
+    # (``model_fp8.py:7918``): a forward reading ``positions - 1``, or one constant
+    # position, passed it (round 3, finding F2).
+    #
+    # HOW THE PLANT REACHES THE PRODUCT. ``root.forward`` takes ``input_ids`` and
+    # builds the hidden state itself, so there is no argument to plant. The one route
+    # its own API allows is the one this control takes: a forward hook on
+    # ``root.model`` RETURNS the planted tensor in place of the stack's output, and
+    # everything after that line -- the index_select this conjunct certifies and the
+    # projection -- is the product's own code, run on a state whose one perturbed row
+    # this control knows. The hook is removed in a ``finally``.
     #
     # THE PLANT IS SIZED FROM THE BAND ITSELF. The hidden state at the position slot 0
     # asks for gains a delta along ONE head row, scaled so the logit that row projects
     # moves by :data:`ROOT_CONTROL_E_MULTIPLE` times the widest allowance any cell of
-    # that slot has, ``ATOL + RTOL * peak``. Only that one position is touched, so the
-    # control states two things a wrong selection cannot satisfy at once:
+    # that slot has, ``ATOL + RTOL * peak``. It is planted in the stack output's own
+    # dtype, because that tensor is handed back to the product and the product's rows
+    # are the bytes it selects. Only that one position is touched, so three things a
+    # wrong selection cannot satisfy together are stated of the PRODUCT's logits:
     #
     #   * slot 0 MUST leave the band, because the planted move is four allowances wide;
-    #   * the slots for positions 0 and 7 MUST be bit-identical to the reference, so a
-    #     forward reading ``positions - 1``, one constant position, or any other row
-    #     would move a row this plant never touched.
+    #   * the slots for positions 0 and 7 MUST come back BIT-IDENTICAL, so a forward
+    #     reading ``positions - 1``, one constant position, or any other row moves a
+    #     row this plant never touched;
+    #   * and the product's logits on the planted state MUST still match the
+    #     reference's, in this item's own compare form -- the gate a wrong row cannot
+    #     pass even when it moves, because the reference knows which row was planted.
     #
     # AND IT CARRIES ITS OWN VACUITY GUARD, which names the head: if the delta maps to
-    # no change at slot 0 the head row is zero or masked, and then the control proves
-    # nothing and says that instead of passing.
+    # no change at slot 0 of the REFERENCE, the head row is zero or masked, and then
+    # the control proves nothing and says that instead of passing.
     _slot = 0
     _plant_position = int(ROOT_SAMPLING_POSITIONS[_slot])
     _slot_peak = float(expected[_slot].abs().max())
@@ -5289,48 +5447,116 @@ def test_tiny_root_forward_matches_the_reference() -> None:
             f"selected"
         )
     _plant_scale = ROOT_CONTROL_E_MULTIPLE * _slot_band
-    _probe_hidden = hidden.float().clone()
+    _probe_hidden = hidden.clone()
     _probe_hidden[_plant_position] = (
-        _probe_hidden[_plant_position]
+        hidden[_plant_position].float()
         + (_plant_scale / _head_norm2) * _head_rows[_head_row]
-    )
+    ).to(hidden.dtype)
     _moved = _root_reference(_probe_hidden, head, ROOT_SAMPLING_POSITIONS)
     _slot_diff = float((_moved[_slot] - expected[_slot]).abs().max())
     print(f"TINYFWD|root_control_e|slot={_slot}|position={_plant_position}"
-          f"|head_row={_head_row}|head_rows={int(_head_rows.shape[0])}"
+          f"|source=reference|head_row={_head_row}"
+          f"|head_rows={int(_head_rows.shape[0])}"
           f"|slot_peak={_slot_peak:.10g}|allowance={_slot_band:.10g}"
           f"|multiple={ROOT_CONTROL_E_MULTIPLE}"
           f"|planted_logit_delta={_plant_scale:.10g}"
+          f"|planted_dtype={_probe_hidden.dtype}"
           f"|measured_slot_max_abs_diff={_slot_diff:.10g}")
     if _slot_diff <= 0.0:
         raise VacuousControlError(
             f"the plant of {_plant_scale:.6g} along head row {_head_row} moved slot "
-            f"{_slot} by exactly nothing, so this head masks it and the control "
-            f"cannot say which rows the root selected"
+            f"{_slot} of the reference by exactly nothing, so this head masks it and "
+            f"the control cannot say which rows the root selected"
         )
     for _other in range(1, len(ROOT_SAMPLING_POSITIONS)):
-        _other_diff = float((_moved[_other] - expected[_other]).abs().max())
         print(f"TINYFWD|root_control_e_untouched|slot={_other}"
-              f"|position={int(ROOT_SAMPLING_POSITIONS[_other])}"
-              f"|max_abs_diff={_other_diff:.10g}")
-        if _other_diff != 0.0:
+              f"|position={int(ROOT_SAMPLING_POSITIONS[_other])}|source=reference"
+              f"|max_abs_diff="
+              f"{float((_moved[_other] - expected[_other]).abs().max()):.10g}"
+              f"|note=a reading; the gate on this slot is the product's own row"
+              f" below")
+    _planted_stack_calls = []
+
+    def _plant_the_stack_output(_module, _args, _kwargs, _output):
+        """Hand the root's own tail the planted state instead of the stack's."""
+        _planted_stack_calls.append(_output)
+        return _probe_hidden
+
+    _replay_carriers = _stack_carriers(layers, selection)
+    _plant_handle = root.model.register_forward_hook(
+        _plant_the_stack_output, with_kwargs=True
+    )
+    try:
+        got_planted = root.forward(
+            input_ids,
+            layer_carriers=_replay_carriers,
+            sampling_positions=positions,
+        )
+    finally:
+        _plant_handle.remove()
+    _stack_repeat = (bool(torch.equal(_planted_stack_calls[0], hidden))
+                     if _planted_stack_calls else None)
+    print(f"TINYFWD|root_control_e_product|stack_calls={len(_planted_stack_calls)}"
+          f"|hidden_dtype={hidden.dtype}|logits_dtype={got_planted.dtype}"
+          f"|shape={tuple(got_planted.shape)}"
+          f"|stack_repeated_its_first_output={_stack_repeat}"
+          f"|note=the hook replaced the stack's output, so the selection and the"
+          f" projection read below are the product's own; the repeat is a reading")
+    if len(_planted_stack_calls) != 1:
+        raise VacuousControlError(
+            f"the planting hook on root.model fired {len(_planted_stack_calls)} "
+            f"times where this control plants once, so the logits it compares are "
+            f"not the product's reading of the planted state and it cannot say "
+            f"which rows the root selected"
+        )
+    if tuple(got_planted.shape) != tuple(got.shape):
+        raise ReferenceShapeError(
+            f"the root returned {tuple(got_planted.shape)} on the planted state and "
+            f"{tuple(got.shape)} on the stack's own, so the two cannot be compared "
+            f"slot by slot"
+        )
+    _p_slot_diff = float(
+        (got_planted[_slot].float() - got[_slot].float()).abs().max()
+    )
+    _p_outside = not torch.allclose(got_planted[_slot].float(),
+                                    got[_slot].float(),
+                                    rtol=RTOL, atol=ATOL)
+    print(f"TINYFWD|root_control_e|slot={_slot}|position={_plant_position}"
+          f"|source=product|planted_logit_delta={_plant_scale:.10g}"
+          f"|allowance={_slot_band:.10g}|max_abs_diff={_p_slot_diff:.10g}"
+          f"|outside_tolerance={_p_outside}")
+    if not _p_outside:
+        raise VacuousControlError(
+            f"the root's own logits for slot {_slot} stayed inside rtol={RTOL}, "
+            f"atol={ATOL} after {_plant_scale:.6g} was planted on position "
+            f"{_plant_position}, the row that slot asks for, so this forward does "
+            f"not read that row"
+        )
+    for _other in range(1, len(ROOT_SAMPLING_POSITIONS)):
+        _o_diff = float(
+            (got_planted[_other].float() - got[_other].float()).abs().max()
+        )
+        _o_identical = bool(torch.equal(got_planted[_other], got[_other]))
+        print(f"TINYFWD|root_control_e_untouched|slot={_other}"
+              f"|position={int(ROOT_SAMPLING_POSITIONS[_other])}|source=product"
+              f"|max_abs_diff={_o_diff:.10g}|bitwise_identical={_o_identical}")
+        if not _o_identical:
             raise VacuousControlError(
                 f"slot {_other} asks for position "
                 f"{int(ROOT_SAMPLING_POSITIONS[_other])}, which this control planted "
-                f"nothing on, and it moved by {_other_diff:.6g}: either the "
-                f"projection mixes rows or the reference is reading a row the caller "
-                f"did not ask for, and neither leaves this control able to speak"
+                f"nothing on, and the root's own logits for it moved by "
+                f"{_o_diff:.6g}: this forward is reading a row the caller did not ask "
+                f"for, or its projection mixes rows"
             )
-    if torch.allclose(_moved[_slot].float(), expected[_slot].float(),
-                      rtol=RTOL, atol=ATOL):
-        raise VacuousControlError(
-            f"slot {_slot} was planted {ROOT_CONTROL_E_MULTIPLE} x its widest "
-            f"allowance of {_slot_band:.6g} and still sits inside rtol={RTOL}, "
-            f"atol={ATOL}, so this item's band cannot see the rows it selects moving"
-        )
+    print(f"TINYFWD|root_control_e_product_vs_reference"
+          f"|max_abs_diff={float((got_planted.float() - _moved).abs().max()):.10g}"
+          f"|peak_reference={float(_moved.abs().max()):.10g}"
+          f"|rtol={RTOL}|atol={ATOL}"
+          f"|note=the item's own compare form, on the planted state")
+    torch.testing.assert_close(got_planted.float(), _moved, rtol=RTOL, atol=ATOL)
     _stack_outside_tolerance(
-        f"the logits recomputed with {_plant_scale:.6g} planted on the hidden state "
+        f"the root's own logits with {_plant_scale:.6g} planted on the hidden state "
         f"at position {_plant_position}, the row slot {_slot} asks for",
-        _moved,
-        expected,
+        got_planted,
+        got,
     )
