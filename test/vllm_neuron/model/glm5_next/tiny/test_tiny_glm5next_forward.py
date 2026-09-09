@@ -3831,6 +3831,106 @@ def test_tiny_model_forward_matches_the_reference() -> None:
               f"|dtype={_sout.dtype}|rows={_spo[0]}|max_spread={_spo[1]:.6g}"
               f"|min_spread={_spo[2]:.6g}|median_spread={_spo[3]:.6g}")
     # ---- end of the BLOCK A readings.
+    # ---- BLOCK C: THE SEAM READINGS. `investigation-054a-seam-r1.md` section 7, taken in BLOCK A
+    # POSITION -- above every comparison -- so a red conjunct cannot suppress them. Every row re-runs
+    # `model_fp8.py:6714`'s own pieces on the RECORDED layer-0 output, which is the object the stack
+    # loop handed forward. READINGS ONLY: nothing here gates and nothing here raises. The whole block
+    # is wrapped so a defect in THESE lines cannot change what the item decides -- the except prints a
+    # named row instead of killing the item.
+    try:
+        import math as _math
+
+        from torch.nn.functional import silu as _silu
+
+        from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm as _bmm
+
+        _L0 = 0
+        _hidden = recorded_out[_L0][1]
+        _layer0 = layers[_L0]
+        _gain0 = _layer0.post_attention_layernorm_weight
+        _mlp0 = _layer0.mlp
+        _normed0 = model._rms_norm(_hidden, _gain0)
+        _out0 = _mlp0(_normed0, quant_config=quant_config)
+        _out0c = _out0.to(_hidden.dtype)
+        _sum0 = _hidden + _out0c
+
+        # The three public scale grids, by the name the product's own lookup builds
+        # (`model_fp8.py:3536-3538`). Read as a dict comprehension rather than a helper, because a
+        # `return` anywhere in this item's body could skip a comparison and the checker below bans one.
+        _grids = {
+            _leaf: getattr(_mlp0, f"{_leaf[: -len('_weight')]}_weight_scale_inv")
+            for _leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
+        }
+
+        # ---- C2, TAKEN FIRST. Absorption is measured DIRECTLY -- the fraction of elements where the
+        # sum equals the FFN term bit for bit -- so the reading does not depend on any ULP argument.
+        # `sum_max_spread` is the faithfulness check: grant 121 read `layer1_in` as 0, and this row
+        # recomputes the same tensor, so a 0 here means this block reproduces the real seam.
+        _hp = float(_hidden.float().abs().max())
+        _fp = float(_out0c.float().abs().max())
+        _ulp = 2.0 ** (int(_math.floor(_math.log2(_fp))) - 7) if _fp > 0.0 else 0.0
+        _absorbed = float((_sum0.float() == _out0c.float()).float().mean())
+        print(f"TINYFWD|seam_add|layer={_L0}|hidden_peak={_hp:.10g}|ffn_peak={_fp:.10g}"
+              f"|ratio={_fp / max(_hp, 1e-30):.6g}|one_ulp_at_ffn_peak={_ulp:.10g}"
+              f"|elements_absorbed_frac={_absorbed:.6f}"
+              f"|sum_max_spread={_row_spread_stats(_sum0)[1]:.6g}"
+              f"|note=absorbed counts elements where hidden plus out equals out bit for bit")
+
+        # ---- C4: the three matmul seams, read BEFORE the clamp. Measured here and not after, because
+        # after the clamp a saturating clamp and a broadcasting kernel are indistinguishable.
+        _gate = _bmm(_normed0, _mlp0.gate_proj_weight, _grids["gate_proj_weight"])
+        _up = _bmm(_normed0, _mlp0.up_proj_weight, _grids["up_proj_weight"])
+        _gs = _row_spread_stats(_gate)
+        _us = _row_spread_stats(_up)
+        print(f"TINYFWD|seam_kernel|layer={_L0}|gate_max_spread={_gs[1]:.6g}"
+              f"|up_max_spread={_us[1]:.6g}|gate_min_spread={_gs[2]:.6g}|up_min_spread={_us[2]:.6g}"
+              f"|gate_peak={float(_gate.float().abs().max()):.10g}"
+              f"|up_peak={float(_up.float().abs().max()):.10g}|measured=before the clamp")
+
+        # ---- C1: the SwiGLU clamps, and the faithfulness check for C4's operands.
+        _lim = float(_mlp0.swiglu_limit)
+        _gc = _gate.clamp(min=None, max=_lim)
+        _uc = _up.clamp(min=-_lim, max=_lim)
+        _act = _silu(_gc) * _uc
+        _re = _bmm(_act.to(_hidden.dtype), _mlp0.down_proj_weight, _grids["down_proj_weight"])
+        print(f"TINYFWD|seam_clamp|layer={_L0}|limit={_lim:.10g}"
+              f"|gate_at_limit_frac={float((_gate.float() >= _lim).float().mean()):.6f}"
+              f"|up_at_limit_frac={float((_up.float().abs() >= _lim).float().mean()):.6f}"
+              f"|activated_max_spread={_row_spread_stats(_act)[1]:.6g}"
+              f"|recompute_matches_real_out={float((_re.float() - _out0.float()).abs().max()):.6g}"
+              f"|note=recompute near zero means the gate and up above are the real pre-clamp ones")
+
+        # ---- C3: direction versus scale. `_row_spread_stats` divides by the mean row norm but does
+        # NOT remove each row's own scale, so it cannot tell parallel rows of different length from
+        # rows pointing different ways. `unit_max_spread` removes the scale first and settles it.
+        _flat0 = _hidden.reshape(_hidden.shape[0], -1).float()
+        _norms0 = _flat0.norm(dim=1)
+        _unit0 = _flat0 / _norms0.unsqueeze(1).clamp_min(1e-30)
+        print(f"TINYFWD|seam_direction|stage=layer0_out"
+              f"|raw_max_spread={_row_spread_stats(_hidden)[1]:.6g}"
+              f"|unit_max_spread={_row_spread_stats(_unit0)[1]:.6g}"
+              f"|normed_max_spread={_row_spread_stats(_normed0)[1]:.6g}"
+              f"|row_norm_min={float(_norms0.min()):.10g}|row_norm_max={float(_norms0.max()):.10g}"
+              f"|note=unit removes each row's scale before the spread, raw does not")
+
+        # ---- THE FIXTURE'S OWN DRAW, so an order-100 FFN output can be traced to the random draw or
+        # ruled out as its cause. The weights are fp8 values times a per-block power-of-two grid, so
+        # both halves are printed: the stored values and the grid that scales them.
+        print(f"TINYFWD|seam_weights|layer={_L0}"
+              f"|gate_abs_max={float(_mlp0.gate_proj_weight.to(torch.float32).abs().max()):.10g}"
+              f"|up_abs_max={float(_mlp0.up_proj_weight.to(torch.float32).abs().max()):.10g}"
+              f"|down_abs_max={float(_mlp0.down_proj_weight.to(torch.float32).abs().max()):.10g}"
+              f"|gate_grid_max={float(_grids['gate_proj_weight'].to(torch.float32).max()):.10g}"
+              f"|up_grid_max={float(_grids['up_proj_weight'].to(torch.float32).max()):.10g}"
+              f"|down_grid_max={float(_grids['down_proj_weight'].to(torch.float32).max()):.10g}"
+              f"|gate_exponents={SHARED_AT_ROUTED_GATE_EXPONENTS}"
+              f"|up_exponents={SHARED_AT_ROUTED_UP_EXPONENTS}"
+              f"|down_exponent={SHARED_AT_ROUTED_DOWN_EXPONENT}"
+              f"|dense_seed_offset={STACK_DENSE_SEED_OFFSETS[0]}"
+              f"|normed_peak={float(_normed0.float().abs().max()):.10g}")
+    except Exception as _seam_exc:
+        print(f"TINYFWD|seam_error|stage=block_c|exception={type(_seam_exc).__name__}: {_seam_exc}")
+    # ---- end of the BLOCK C readings.
 
     # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX. Exact equality, not a tolerance:
     # the lookup copies rows and computes nothing, so a difference of any size is a
