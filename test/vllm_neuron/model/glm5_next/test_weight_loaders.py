@@ -2613,7 +2613,10 @@ def test_fp8_downscale_054e_the_squeeze_factor_is_an_exact_power_of_two() -> Non
     assert smallest_restored == 0.0
     assert zero_restored == 0.0
 
-    # The headroom is real and unused, and no reading anywhere depends on it.
+    # The headroom is real. Two landed readings DID depend on the old factor
+    # reaching exactly 240 -- C2's stored maximum and the weight loader's dense
+    # maximum -- and this increment moved both onto the derived product rather than
+    # deleting them, so the headroom is now asserted rather than merely unused.
     assert float(stored.to(torch.float32).max().item()) == FP8_OCP_MAX * down
     assert FP8_OCP_MAX * down < FP8_DECLARED_CLAMP
 

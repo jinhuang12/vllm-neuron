@@ -882,9 +882,16 @@ _FLOORED_BLOCKS_NAMED_IN_WARNING = 8
 # not a binary fraction and re-rounds instead -- 14 of the 126 positive
 # magnitudes survive the round trip bit-exactly at 15/28, against 118 at 1/2.
 # **The largest that fits** because 448 * 1/2 = 224 is inside 240 and the next
-# power up is not. The 16 counts between 224 and 240 stay unused on purpose: no
-# reader here assumes the squeezed range FILLS 240, every landed reading being
-# per-value rather than range-fill.
+# power up is not. The 16 counts between 224 and 240 stay unused on purpose.
+#
+# TWO LANDED READINGS DID PIN 240 EXACTLY, and an earlier draft of this paragraph
+# wrongly said none did. ``test_weight_loaders.py``'s C2 asserted
+# ``max_abs_stored == 240`` and its weight-loader item asserted the same of the
+# stored dense maximum -- both because 448 * 240/448 IS 240, so "inside the bound"
+# and "at the bound" were one claim. They are two claims at 1/2, so ``-054e``
+# re-argued both onto the DERIVED product ``448 * factor`` = 224 and asserted the
+# strictly-inside-the-clamp part separately. No reading assumes the squeezed range
+# fills 240 NOW; two did before this increment.
 #
 # The cost, plainly: the smallest subnormal does not survive. 2**-9 halves to
 # exactly half a step and round-to-nearest-even sends it to zero. Eight of the
@@ -988,6 +995,11 @@ def needs_240_downscale() -> bool:
     240.0 … On a 448.0-max platform an unconditional 240/448 rescale would
     corrupt correct weights"*. The condition is expressed against the vendor's
     own resolution rather than a second platform query of this module's own.
+
+    The ruling is quoted as issued and NOT edited: ``inc-glm53f-054e`` later moved
+    the squeeze from 240/448 to an exact ``1/2``, so read "240/448" above as the
+    factor at the time of the ruling. What it settled -- that the squeeze is
+    conditional on the resolved clamp -- is what this function still implements.
 
     Why the clamp and not ``get_platform_target()`` directly, which is what the
     llama3 static path uses (``weight_loaders_static_fp8.py:62-66``): that
