@@ -6807,6 +6807,50 @@ class Glm5NextModel(nn.Module):
                 f"{Glm5NextDenseMLP.__name__} or {Glm5NextMoEBlock.__name__} and "
                 f"this forward has no route for anything else"
             )
+
+        # ---- THE ONE ROW-PARALLEL REDUCTION AT THE FFN SITE. ``inc-glm53f-054d``,
+        # and the rider ``inc-glm53f-054a`` left here: the routed bank's, the shared
+        # expert's and the dense MLP's partial sums combine in ONE reduction.
+        #
+        # WHY ALL THREE MEET AT THIS LINE. Every FFN weight family that is declared
+        # row-parallel is declared so on its INTERMEDIATE width (``_SHARD_GEOMETRY``
+        # above: ``down_proj_weight`` for the dense MLP, the shared expert and the
+        # routed bank), so on every route each rank returns a partial sum at the FULL
+        # output width. Both branches above return through the same ``out``, and the
+        # sparse branch's value is already routed-plus-shared (``Glm5NextMoEBlock``
+        # adds them and says so at its own "THE ONE add"), so one reduction here owns
+        # all three. A rank's routed contribution covers only ITS experts and only its
+        # slice of their intermediate width, and the expert-parallel groups partition
+        # the experts, so summing across the whole tensor-parallel world sums each
+        # token's contributions exactly once rather than twice.
+        #
+        # NOTHING ON THIS PATH REDUCED BEFORE. Measured at this pin rather than
+        # assumed: the file's only other collective is ``project_output``'s MLA
+        # ``o_proj`` reduction, ``moe_group`` is forwarded to the MoE branch and read
+        # only by the metadata builder ``build_blockwise_mapping``, and
+        # ``functional/moe/moe_blockwise_fp8.py`` performs no collective at all. What
+        # crosses the wire on the routed path is per-expert token COUNTS, not values.
+        #
+        # THE GROUP, THE FORM AND THE PLACE ARE ``inc-glm53f-100``'s, not a second
+        # convention: :func:`_resolve_tp_group` returns ``None`` at world size 1, so a
+        # single-rank run takes exactly the path it took before this increment -- no
+        # collective and no vllm import -- and ``all_reduce`` is called as a statement
+        # whose return is discarded, the form all 18 shipped row-parallel sites use.
+        #
+        # BEFORE THE CAST, and that ordering is the load-bearing part. ``out`` is the
+        # seam's own dtype here (fp32 on the dense route), so the partial sums are
+        # added at the width they were computed in; reducing after the cast on line
+        # below would round each rank's fraction to the caller's dtype and add the
+        # rounded parts instead of rounding the whole.
+        #
+        # IN-PLACE IS SAFE AGAINST ALIASING for the same reason it is at
+        # ``project_output``: both branches return a freshly allocated tensor -- the
+        # dense route returns the seam's output and the sparse route returns the sum
+        # of two seam outputs -- so neither is a view of a cached weight or of the
+        # residual the caller still holds.
+        group = _resolve_tp_group()
+        if group is not None:
+            group.all_reduce(out)
         return out.to(hidden_states.dtype)
 
     def forward(
