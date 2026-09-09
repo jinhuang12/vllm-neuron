@@ -161,14 +161,24 @@ kernel's own factory needs ``vocab_size >= k`` (``rotational_topk_utils.py:241-2
 SEPARATE 2D-shape assert, so citing it here would name the wrong clause). 32 satisfies
 both with room, and keeps every column reachable by a 128-token row."""
 
-MULTIFOLD_CAUSAL_LENS = [4, 12, 20, 36, 64]
-"""Lengths that complete 1, 3, 5, 9 and 16 pools -- fewer than ``MULTIFOLD_SELECT_K`` on four rows
-and exactly ``MULTIFOLD_SELECT_K`` on the fifth.
+MULTIFOLD_CAUSAL_LENS = [64, 36, 20, 12, 4]
+"""Lengths that complete 16, 9, 5, 3 and 1 pools -- exactly ``MULTIFOLD_SELECT_K`` on the FIRST
+row and fewer on the other four.
 
 A row completing fewer pools than ``k`` is the whole point: the selector must fill the remaining
-slots from an all-``-inf`` buffer, which is where the strike substitution happens. The last row
-completes exactly ``k`` pools and must show ZERO sentinels, so a case that sentinelised
-unconditionally could not pass."""
+slots from an all-fill buffer (``BOUND_FILL``, a finite ``-1e30`` since ``-103``; the earlier
+wording here said ``-inf`` and was stale), which is where the strike substitution happens. The
+first row completes exactly ``k`` pools and must show ZERO sentinels, so a case that sentinelised
+unconditionally could not pass.
+
+WHY THE ORDER IS DESCENDING, AND IT IS NOT COSMETIC (rev 268). The ascending order this list
+carried until rev 268 put the two rows with more than ``topk_per_stage`` real candidates at rows
+3 and 4 -- which are exactly the rows the seam's SECOND program holds, and that program's tile is
+the ragged one. So "the selector breaks above the per-stage count" and "the selector breaks on a
+ragged tile" predicted the same two failing rows, and the reading could not tell them apart. It
+was read as the former and the mechanism was the latter (`design-20260909-bh`). Descending puts
+the high-count rows in the FIRST program, whose tile is full, so the two explanations now predict
+DIFFERENT rows and this case can no longer be read either way."""
 
 PAD_POOL_COLUMNS = 33
 """Candidate columns for the PAD case -- an ODD width, which is what makes the fold uneven.
@@ -533,9 +543,35 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
         min(c // POOL_SIZE, MULTIFOLD_POOL_COLUMNS) for c in MULTIFOLD_CAUSAL_LENS
     ]
     mf_want = [max(0, MULTIFOLD_SELECT_K - c) for c in mf_complete]
-    assert mf_complete == [1, 3, 5, 9, 16], mf_complete
-    assert mf_want == [15, 13, 11, 7, 0], mf_want
-    assert mf_want[-1] == 0, "the last row must have nothing to sentinelise"
+    # The fixture's shape properties, DERIVED rather than typed (rev 268). The typed vectors
+    # that stood here went stale the instant the order changed, and a stale vector is exactly
+    # what makes the next reader trust the wrong premise.
+    assert mf_complete == sorted(mf_complete, reverse=True), (
+        f"the multifold rows must complete STRICTLY DECREASING pool counts, so the rows with "
+        f"the most real candidates land in the seam's FIRST program; got {mf_complete}"
+    )
+    assert len(set(mf_complete)) == ROWS, (
+        f"each row must complete a DIFFERENT number of pools, or two rows read as one case; "
+        f"got {mf_complete}"
+    )
+    assert mf_want[0] == 0, (
+        f"row 0 must complete all {MULTIFOLD_SELECT_K} pools and so owe NO sentinel, which is "
+        f"what a case that sentinelised unconditionally would fail; got {mf_want}"
+    )
+    assert min(mf_want[1:]) > 0, (
+        f"every row after the first must owe at least one sentinel; got {mf_want}"
+    )
+    # THE CONFOUND BREAK, read off the seam's own program count rather than described in prose.
+    # Until rev 268 the high-count rows and the ragged tile's rows were the same rows, so the
+    # per-stage count and the program split predicted one reading and could not be separated.
+    from vllm_neuron.functional.dsa.topk_select import _NUM_PROGRAMS
+
+    mf_rows_per_program = -(-ROWS // _NUM_PROGRAMS)
+    assert min(mf_complete[:mf_rows_per_program]) > max(mf_complete[mf_rows_per_program:]), (
+        f"every row in the FULL first tile must complete more pools than every row in the "
+        f"RAGGED last tile, or the per-stage count and the program split coincide again and "
+        f"this case cannot tell them apart; got {mf_complete} split at {mf_rows_per_program}"
+    )
 
     mf_bounded = dsa_causal_bound(mf_scores, mf_causal, POOL_SIZE)
     assert can_run_dsa_topk_select(mf_bounded, MULTIFOLD_SELECT_K) is True, (
@@ -596,18 +632,33 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
           k2_folds=1, k2_striking=0)
 
     # "EVERY FILLED SLOT AND NO OTHER", the same two halves as above, at the striking k.
-    mf_filled = mf_values <= BOUND_FILL_MARK
+    # THE ``isnan`` TERM MIRRORS THE ORACLE AND IS NOT OPTIONAL (rev 268, r2 audit 4). The marker's
+    # own value arm is ``torch.le(values, BOUND_FILL_MARK) | torch.isnan(values)``
+    # (``causal_bound.py:631``): NaN fails the ``<=`` compare, so without this term the two sides
+    # disagree BY CONSTRUCTION the moment a NaN appears -- this expression would read False exactly
+    # where the marker marks, and the assertion below would fail on a CORRECT marker. It went
+    # unnoticed because an earlier assertion aborted the case first.
+    mf_filled = (mf_values <= BOUND_FILL_MARK) | torch.isnan(mf_values)
     mf_per_row = (mf_got == SENTINEL).sum(dim=1).to(torch.int64)
 
-    # READ 1 (`-103` r7 residual), PRINTED BEFORE ANY ASSERTION CAN ABORT THE CASE. The r7 run read
-    # 16 marks on rows 3 and 4 where the per-stage cap predicts 8, and this case emits `pad_columns=0`
-    # (asserted above), so the marker's index arm CANNOT have fired and every mark came from the
-    # value arm. That makes the returned VALUES the thing to read, so they are printed rather than
-    # reasoned about. Row 2 is the in-run control: it is the last row whose completed-pool count sits
-    # at or under one stage's cap, so a difference between row 2 and row 3 is the cliff itself.
+    # THE PER-ROW READING, PRINTED BEFORE ANY ASSERTION CAN ABORT THE CASE. It began as `-103`'s r7
+    # diagnostic and is kept as a regression reading, but its ORIGINAL INTERPRETATION IS WITHDRAWN
+    # (rev 268). The r7 run read 16 marks holding NaN on rows 3 and 4 and this block called that a
+    # cliff at the selector's per-stage cap, because those were the rows whose completed-pool counts
+    # exceeded it. They were ALSO the rows the seam's second program held on a ragged tile, and the
+    # ragged tile was the mechanism (`design-20260909-bh`): two explanations, one reading, and this
+    # block asserted the wrong one. `MULTIFOLD_CAUSAL_LENS` is now descending precisely so the two
+    # can no longer coincide, which is asserted above rather than described here.
+    # What the rows still usefully read: with a NaN-free return every row's values are finite, its
+    # indices distinct, and its real count exactly `mf_complete[row]`.
     # The block boundary is DERIVED from the config the kernel used, never typed.
     mf_block = MULTIFOLD_POOL_COLUMNS // mf_stages
-    for mf_row in (2, 3, 4):
+    # EVERY row, not a chosen three (rev 268). The old subset was picked because rows 3 and 4 were
+    # the failing ones and row 2 was their control -- a choice that only made sense under the
+    # withdrawn reading, and one that would now print the three LOWEST counts and miss the rows the
+    # reversal moved the high counts to. Five rows is cheap and needs no judgment about which
+    # matter.
+    for mf_row in range(ROWS):
         mf_vrow = mf_values[mf_row].to(torch.float64)
         mf_irow = mf_idx32[mf_row].to(torch.int64)
         _emit(
@@ -631,6 +682,12 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
             block_width=mf_block,
             in_block0=int((mf_irow < mf_block).sum()),
             in_block1=int((mf_irow >= mf_block).sum()),
+            # READ THIS ONE ONLY BESIDE `distinct_indices` (rev 268). It counts returned indices
+            # below the row's completed-pool count, so it is the number of REAL columns the row
+            # got back -- but only when the indices are distinct. In the r7 reading every index
+            # was 0, which is below every non-zero `complete`, so it reported 16 real columns for
+            # a row that had received none. It is a real-count reading when
+            # `distinct_indices == k`, and an artifact otherwise.
             real_columns_returned=int((mf_irow < mf_complete[mf_row]).sum()),
         )
 
@@ -715,8 +772,17 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
         min(c // POOL_SIZE, PAD_POOL_COLUMNS) for c in MULTIFOLD_CAUSAL_LENS
     ]
     pad_want = [max(0, MULTIFOLD_SELECT_K - c) for c in pad_complete]
-    assert pad_complete == [1, 3, 5, 9, 16], pad_complete
-    assert pad_want == [15, 13, 11, 7, 0], pad_want
+    # DERIVED, never typed (rev 268), and this case is why the rule matters: it shares
+    # `MULTIFOLD_CAUSAL_LENS` with the multifold case, so the typed vectors that stood here went
+    # stale the moment that list was reversed, in a case whose subject is padding and not order.
+    assert pad_complete == sorted(pad_complete, reverse=True), (
+        f"this case inherits the multifold lengths, so it inherits their descending order; "
+        f"got {pad_complete}"
+    )
+    assert pad_want[0] == 0 and min(pad_want[1:]) > 0, (
+        f"row 0 completes all {MULTIFOLD_SELECT_K} pools and owes no sentinel, every later row "
+        f"owes at least one; got {pad_want}"
+    )
 
     pad_bounded = dsa_causal_bound(pad_scores, pad_causal, POOL_SIZE)
     assert can_run_dsa_topk_select(pad_bounded, MULTIFOLD_SELECT_K) is True, (

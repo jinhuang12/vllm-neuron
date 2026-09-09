@@ -250,3 +250,121 @@ def test_kernel_identity_is_derived_through_the_seam() -> None:
     assert qualname == "rotational_topk", (
         f"the seam must dispatch rotational_topk; got qualname {qualname}"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# `inc-glm53f-103`, rev 268 (`design-20260909-bh`). SECOND WRITER on this file, partitioned by
+# REGION: everything above is `-043`'s landed acceptance and is byte-unchanged; this section is
+# `-103`'s and adds one item.
+# ---------------------------------------------------------------------------------------------
+
+#: An ODD row count, which is the whole point of the item below. `-043`'s acceptance runs
+#: `ROWS = 4`, and 4 splits evenly across the seam's two programs, so no program ever receives a
+#: partial tile. 5 does not, and a partial tile was the defect.
+ROWS_ODD = 5
+
+
+def _scores_at_rows(rows: int, k: int) -> torch.Tensor:
+    """``[rows, WIDTH]`` float32 scores, all distinct -- ``_scores`` with the row count freed.
+
+    Same scaled-permutation construction, with one deliberate difference. The module
+    docstring's reason for the divisor is EXACT REPRESENTABILITY in ``float32``, which holds
+    for ``_scores`` because ``4 * 4096`` is a power of two. ``5 * 4096`` is not, so this
+    divides by the first power of two at or above it (``2 ** 15``) and keeps the property the
+    docstring's reasoning actually depends on.
+    """
+    gen = torch.Generator().manual_seed(44_000 + rows * 10_000 + k)
+    flat = torch.randperm(rows * WIDTH, generator=gen)
+    return flat.reshape(rows, WIDTH).to(torch.float32) / float(2**15)
+
+
+def test_index_sets_match_torch_at_an_odd_row_count() -> None:
+    """Conjunct (rev 268) -- exact index-set equality at an ODD row count, 5/5 rows.
+
+    Certifies: ``vllm_neuron/functional/vendored_kernels/rotational_topk/rotational_topk.py``
+    -- the ragged-tile guard in ``_topk_rotated_core``, driven through the same seam the items
+    above drive.
+
+    WHAT THIS READS THAT NOTHING ABOVE READS. The seam shards rows across two programs, so a
+    program's tile holds ``ceil(rows / 2)`` rows. At ``rows == 4`` both programs get exactly 2
+    and every partition of the kernel's staging buffer is written. At ``rows == 5`` the second
+    program gets 2 rows against a 3-row tile, and before the guard the leftover partitions
+    reached ``rotate``'s cross-partition ``nisa.nc_matmul`` uninitialised -- which, because that
+    matmul sums every partition with a 0/1 weight, turned one non-finite word into NaN across
+    every output partition and left every index at its zero default. So this item's three
+    readings are the three symptoms: values finite, index sets exact, values bit-equal.
+
+    THE FINITENESS READING IS FIRST ON PURPOSE. It is the one that names the defect, and it is
+    asserted before the set comparison because an all-NaN return would otherwise fail the set
+    comparison with a message about index sets and say nothing about NaN.
+
+    THE ROUTE IS ASSERTED, or this item could pass vacuously: if the gate refused this geometry
+    the seam would quietly answer from ``torch.topk`` -- which has no stages, no partitions and
+    no defect to catch -- and every assertion below would hold while reading nothing.
+    """
+    # The split is READ from the seam's own program count, not typed, so the premise of this
+    # item is a value the code supplies rather than a claim in a docstring.
+    from vllm_neuron.functional.dsa.topk_select import _NUM_PROGRAMS
+
+    rows_per_program = -(-ROWS_ODD // _NUM_PROGRAMS)
+    last_program_rows = ROWS_ODD - rows_per_program * (_NUM_PROGRAMS - 1)
+
+    scores = _scores_at_rows(ROWS_ODD, SELECT_K)
+    distinct = int(torch.unique(scores).numel())
+    print(f"[fixture] case=odd_rows k={SELECT_K} rows={ROWS_ODD} width={WIDTH} "
+          f"distinct_scores={distinct}/{ROWS_ODD * WIDTH} dtype={scores.dtype}")
+    print(f"[geometry] programs={_NUM_PROGRAMS} rows_per_program={rows_per_program} "
+          f"last_program_rows={last_program_rows} "
+          f"tile_is_ragged={last_program_rows < rows_per_program} "
+          f"certifies=vllm_neuron.functional.vendored_kernels.rotational_topk."
+          f"rotational_topk._topk_rotated_core")
+    assert distinct == ROWS_ODD * WIDTH, (
+        f"the fixture must hold {ROWS_ODD * WIDTH} distinct scores for the top-k index set "
+        f"to be unique; got {distinct}"
+    )
+    # If this ever reads False the item has stopped exercising the condition it exists for,
+    # and it must fail loudly rather than pass on a geometry with nothing ragged about it.
+    assert last_program_rows < rows_per_program, (
+        f"this item requires a RAGGED tile: {ROWS_ODD} rows over {_NUM_PROGRAMS} programs "
+        f"gives {rows_per_program} per program and {last_program_rows} on the last, which is "
+        f"not ragged -- the item is no longer reading the guard"
+    )
+
+    reset_topk_select_dispatch_counters()
+    gate = can_run_dsa_topk_select(scores, SELECT_K)
+    values, indices = dsa_topk_select(scores, SELECT_K)
+    nki_dispatch, torch_fallback = topk_select_dispatch_counters()
+
+    want_values, want_indices = torch.topk(scores, SELECT_K, dim=-1)
+    finite = int(torch.isfinite(values).sum())
+    nan_count = int(torch.isnan(values).sum())
+    agree = _rows_whose_index_sets_agree(indices, want_indices)
+    distinct_indices = [len(set(indices[r].tolist())) for r in range(ROWS_ODD)]
+
+    print(f"[acceptance] case=odd_rows k={SELECT_K} finite={finite}/{values.numel()} "
+          f"nan={nan_count} index_set_rows_agree={agree}/{ROWS_ODD} "
+          f"values_bit_equal={torch.equal(values, want_values)} "
+          f"distinct_indices_per_row={distinct_indices} out_shape={tuple(values.shape)}")
+    print(f"[route-predicate] case=odd_rows k={SELECT_K} calls_made=1 "
+          f"nki_dispatch={nki_dispatch} torch_fallback={torch_fallback} "
+          f"can_run_dsa_topk_select={gate} "
+          f"certifies=vllm_neuron.functional.dsa.topk_select.dsa_topk_select")
+
+    assert nki_dispatch == 1 and torch_fallback == 0 and gate is True, (
+        f"this item must read the NKI kernel, not the torch oracle: gate={gate} "
+        f"nki_dispatch={nki_dispatch} torch_fallback={torch_fallback}"
+    )
+    assert nan_count == 0 and finite == values.numel(), (
+        f"every selected value must be finite at an odd row count; got {nan_count} NaN and "
+        f"{values.numel() - finite} non-finite of {values.numel()}"
+    )
+    assert agree == ROWS_ODD, (
+        f"selected index sets must match torch.topk on every row at rows={ROWS_ODD}; "
+        f"{agree} of {ROWS_ODD} rows agree"
+    )
+    assert torch.equal(values, want_values), (
+        "selected values must be bit-equal to the torch reference at an odd row count; "
+        f"max_abs_diff={(values - want_values).abs().max().item():.3e}"
+    )
+    assert indices.shape == (ROWS_ODD, SELECT_K)
+    assert indices.dtype == torch.int64
