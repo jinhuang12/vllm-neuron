@@ -32,6 +32,14 @@ The conjuncts are measured as C01 (3/3 images), C02 (5/5 videos), C03 (0 unrepor
 registration, asserted positively) and C05 (the field config). C00 guards the import origin and C06 reports
 every reading so no number here is silent.
 
+C07 IS NOT ``-056``'s, AND ONE HALF OF C04 IS NO LONGER ``-056``'s EITHER. ``inc-glm53f-110`` -- the increment
+RG-20 minted to put the vision protocol declaration on the model class -- adds the C07 conjunct at the end of
+this file and re-pins one C04 item, which until then asserted that no model-side declaration existed. That
+item's sign is inverted rather than deleted, in the same commit as the declaration, so the boundary ``-056``
+recorded still reads as a boundary and a reader can see who crossed it. C07 is derived against the lead's
+ruling on the campaign record ``scope-lap-rg20-lane-vis2.md`` and carries no plan-revision cite, because
+``-110``'s plan block was being written while these items were authored.
+
 WHERE THE EXPECTED NUMBERS COME FROM. Every value in ``REGISTERED_IMAGE_CASES`` and
 ``REGISTERED_VIDEO_CASES`` was computed from the transformers source and written into
 ``predictions-056-build.txt`` BEFORE this file existed, so this test cannot be a transcription of its own
@@ -435,12 +443,30 @@ def test_c04_an_unregistered_class_carries_no_factories():
     assert getattr(NotRegistered, "_processor_factory", None) is None
 
 
-def test_c04_this_block_declares_no_model_side_protocol():
-    """RG-20 owns the SupportsMultiModal declaration on the model class, so this block must not have added
-    one. The test states the boundary rather than leaving it to a reviewer's memory."""
+def test_c04_the_model_side_declaration_is_present_and_its_retired_boundary_is_gone():
+    """RE-PINNED BY ``inc-glm53f-110``, which is the increment RG-20 minted to add the declaration.
+
+    Until ``-110`` this item asserted the OPPOSITE -- that ``-056`` had added no model-side flag -- because
+    RG-20 was undisposed and the boundary was worth stating rather than leaving to a reviewer's memory. The
+    boundary has now been crossed by its owner, so the same item measures the same fact with the sign the
+    disposition set. Both halves are asserted in one place, per D17: the new expectation holds, AND the
+    retired one is really gone from this file rather than sitting alongside it. The retired fragment is
+    assembled from pieces so that this item's own source cannot satisfy the search for it.
+    """
     from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
 
-    assert getattr(Glm5NextForConditionalGeneration, "supports_multimodal", False) is not True
+    assert getattr(Glm5NextForConditionalGeneration, "supports_multimodal", False) is True
+
+    retired = "is not" + " True"
+    survivors = [
+        line
+        for line in Path(__file__).read_text(encoding="utf-8").splitlines()
+        if "supports_multimodal" in line and retired in line
+    ]
+    assert survivors == [], (
+        f"this file still asserts the flag is absent, on {len(survivors)} line(s); the re-pin must "
+        f"replace the retired expectation, not accompany it: {survivors}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -951,3 +977,229 @@ def test_m09_apply_expands_one_image_to_its_own_token_run(bridge, image_oracle):
     assert sum(1 for token_id in ids if token_id == image_token_id) == expected_tokens
     assert out["mm_kwargs"]["image"][0]["image_grid_thw"].data.tolist() == oracle_grid[0].tolist()
     assert len(ids) > expected_tokens, "the text around the placeholder was dropped"
+
+
+# ---------------------------------------------------------------------------
+# C07 -- ``inc-glm53f-110``: the MODEL-SIDE VISION PROTOCOL DECLARATION.
+#
+# RG-20's disposition. Until ``-110`` the registered class declared none of the
+# plugin's five vision protocols and none of vLLM's multimodal flag, so two
+# separate readers answered the wrong thing about this architecture:
+#
+#   * vLLM's own predicate ``getattr(model, "supports_multimodal", False)``
+#     (``vllm/model_executor/models/interfaces.py:463`` at tag ``v0.24.0``) read
+#     False, which is what ``ModelConfig`` gates ``multimodal_config`` on
+#     (``vllm/config/model.py:664`` guarding ``:701``) and therefore what the
+#     Neuron runner's ``supports_mm_inputs`` reads
+#     (``vllm/worker/neuron_model_runner.py:471``);
+#   * the plugin's own merge-factor hook returned the literal 1
+#     (``vllm_neuron/utils/vision_utils.py:35``) where this checkpoint's factor
+#     is 4, under-counting the vision bucket ceiling by exactly that factor.
+#
+# EVERY ITEM BELOW MEASURES THE REAL READER, never a re-implementation of it:
+# item 1 calls the same helper vLLM's ``_ModelInfo`` is built from
+# (``models/registry.py:778``), and item 2 goes through the plugin's hook so the
+# registry lookup at ``vision_utils.py:31-33`` is the thing under test rather
+# than the class attribute read directly.
+#
+# WHAT THIS CONJUNCT DOES NOT CLAIM. It does not claim the vision bucket ladder
+# changes: ``platform.py:295`` defaults ``max_vision_seq_len`` to the block size
+# and ``:301`` clamps the ladder to it, so the single-bucket resolution is a
+# configuration default and is not this increment's criterion.
+# ---------------------------------------------------------------------------
+def _declared_hf_config():
+    """A config shaped exactly as the two readers under test consume one.
+
+    Both readers touch only ``architectures[0]`` and ``vision_config``, so this
+    carries the fork's own landed vision config -- whose fields ``-008`` set from
+    the real checkpoint -- rather than a literal, and the architecture string is
+    read out of the plugin registry instead of being typed here.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextVisionConfig
+    from vllm_neuron.model.registry import get_models
+
+    arch = next(
+        name for name, cls in get_models() if cls.__name__ == "Glm5NextForConditionalGeneration"
+    )
+
+    class _HfConfig:
+        architectures = [arch]
+        vision_config = Glm5NextVisionConfig()
+
+    return _HfConfig()
+
+
+def test_c07_vllms_own_predicate_reads_this_class_as_multimodal():
+    """The declaration exists to be read by vLLM, so vLLM's own reader is what asks.
+
+    ``supports_multimodal`` is the module-level helper ``models/registry.py:778`` calls to populate
+    ``_ModelInfo.supports_multimodal``, which is the value ``ModelConfig`` gates on. Asserting through it
+    rather than on the attribute means a future vLLM that reads the flag differently fails here instead of
+    passing here and failing at serve time.
+    """
+    from vllm.model_executor.models.interfaces import supports_multimodal
+
+    from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
+
+    assert supports_multimodal(Glm5NextForConditionalGeneration) is True
+
+
+def test_c07_the_merge_factor_reads_the_squared_spatial_merge_size(image_consts):
+    """The hook returns 4, and 4 is derived twice from two independent sources rather than typed.
+
+    Source one is the fork's own vision config (``config.py:401``, ``spatial_merge_size``); source two is the
+    transformers processor's own merge size, which ``GridConstants.from_processor`` read off the shipped
+    processor. The item requires the two to agree BEFORE it uses either as the expected value, so a drift
+    between the fork's config and upstream's processor fails here rather than silently choosing one.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextVisionConfig
+    from vllm_neuron.utils.vision_utils import get_vision_token_merge_factor
+
+    fork_side = int(Glm5NextVisionConfig().spatial_merge_size)
+    upstream_side = int(image_consts.merge_size)
+    assert fork_side == upstream_side, (
+        f"the fork's vision config says spatial_merge_size={fork_side} while the shipped processor says "
+        f"{upstream_side}; the merge factor is ambiguous until they agree"
+    )
+
+    got = get_vision_token_merge_factor(_declared_hf_config())
+    assert got == fork_side**2
+    assert got != 1, "the hook returned the unsatisfied-protocol default, so the declaration is not being seen"
+
+
+def test_c07_the_four_undeclared_protocols_stay_undeclared():
+    """The declaration is deliberately narrow, and the narrowness is measured so a widening is visible.
+
+    RG-20 records that the platform limb consults exactly two protocols. ``SupportsMaxPixels`` is left out
+    because implementing it would put a second copy of the pixel-budget arithmetic ``-056`` CONSUMES from
+    transformers onto the model class; ``SupportsMRoPE`` is left out because this checkpoint's text decoder is
+    NoPE; the remaining two are cited by no criterion. Each is method-only, so ``issubclass`` answers
+    structurally and this item would also catch a member added without its base.
+    """
+    from vllm_neuron.model.interfaces import (
+        SupportsDisaggEncoder,
+        SupportsMaxPixels,
+        SupportsMRoPE,
+        SupportsVisionWarmup,
+    )
+
+    from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
+
+    undeclared = {
+        "SupportsMaxPixels": SupportsMaxPixels,
+        "SupportsMRoPE": SupportsMRoPE,
+        "SupportsVisionWarmup": SupportsVisionWarmup,
+        "SupportsDisaggEncoder": SupportsDisaggEncoder,
+    }
+    satisfied = [
+        name
+        for name, proto in undeclared.items()
+        if issubclass(Glm5NextForConditionalGeneration, proto)
+    ]
+    assert satisfied == [], (
+        f"the class satisfies {satisfied}, which this increment declared out of scope; a protocol gains a "
+        f"criterion by the lead's disposition, not by a member appearing"
+    )
+
+
+def test_c07_falsifiable_an_undeclared_class_collapses_both_readings(monkeypatch):
+    """The firing control. Without it, two assertions that can never fail would read like working ones.
+
+    Arm one runs vLLM's predicate over a class that declares nothing. Arm two keeps the plugin's real hook and
+    the real ``hf_config`` and swaps only what the registry resolves the architecture to, so the hook takes the
+    ``issubclass`` miss at ``vision_utils.py:33`` and returns the literal 1 -- the same branch the pre-``-110``
+    tree took, reached on purpose.
+    """
+    from vllm.model_executor.models.interfaces import supports_multimodal
+
+    from vllm_neuron.model import registry as plugin_registry
+    from vllm_neuron.utils import vision_utils
+
+    class _Undeclared:
+        pass
+
+    assert supports_multimodal(_Undeclared) is False
+
+    hf_config = _declared_hf_config()
+    real = vision_utils.get_vision_token_merge_factor(hf_config)
+    assert real > 1, "the positive arm must read the declared factor, or the contrast below proves nothing"
+
+    monkeypatch.setattr(
+        plugin_registry,
+        "get_models",
+        lambda: [(hf_config.architectures[0], _Undeclared)],
+    )
+    assert vision_utils.get_vision_token_merge_factor(hf_config) == 1
+
+
+def test_c07_the_two_declared_members_live_on_this_class():
+    """``issubclass`` on a method-only Protocol answers structurally, so presence is asserted directly.
+
+    Without this an empty declaration -- the base named, the member never written -- would satisfy the
+    protocol check through some inherited attribute and pass item 2 by accident.
+    """
+    from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
+    from vllm_neuron.model.interfaces import SupportsSpatialMerge
+
+    members = vars(Glm5NextForConditionalGeneration)
+    assert "supports_multimodal" in members
+    assert members["supports_multimodal"] is True
+    assert isinstance(members.get("get_vision_token_merge_factor"), classmethod)
+    assert issubclass(Glm5NextForConditionalGeneration, SupportsSpatialMerge)
+
+
+def test_c07_the_video_temporal_slices_are_read_from_the_real_processor(video_oracle, video_consts, capsys):
+    """A RECORDED READING, not a criterion of this increment -- and the reading the Mac could not take.
+
+    ``vision_encoder.py:491`` feeds ONE temporal slice to the patch embedding, on the ground that a patch row's
+    slices are copies of each other. For IMAGES that is measured exact by ``-060``'s C02. For VIDEO nothing
+    measured it, because a two-frame video collapses to ``grid_t = ceil(2 / 2) = 1`` -- one temporal group
+    carrying two DIFFERENT frames -- and the shared helper in this file fills every frame with one constant,
+    which could only ever report a vacuous zero.
+
+    So this builds the adversarial input on purpose: frame 0 and frame 1 carry different values, and the
+    reshape is the one the encoder performs. Two gated controls keep the reading honest -- the temporal axis
+    really has two slices, and the two input frames really differ. The gap itself is REPORTED, never asserted:
+    a non-zero value is a finding against ``vision_encoder.py:491``, not a failure of the declaration, and it
+    routes to a work item. A zero discharges the video half of that debt on the same measurement that
+    discharged the image half.
+    """
+    frames = torch.stack(
+        [
+            torch.full((3, 112, 112), CONTENT_VALUE_A, dtype=torch.uint8),
+            torch.full((3, 112, 112), CONTENT_VALUE_B, dtype=torch.uint8),
+        ]
+    )
+    assert int(frames.shape[0]) == 2
+    input_frames_differ = int((frames[0] != frames[1]).any())
+
+    out = video_oracle(videos=[frames], do_sample_frames=False, return_tensors="pt")
+    rows = out["pixel_values_videos"]
+    grid = out["video_grid_thw"]
+
+    temporal = int(video_consts.temporal_patch_size)
+    patch = int(video_consts.patch_size)
+    channels = int(rows.shape[1]) // (temporal * patch * patch)
+    assert int(rows.shape[1]) == channels * temporal * patch * patch, (
+        f"a patch row is {int(rows.shape[1])} wide, which is not channels x {temporal} x {patch}^2; the "
+        f"reshape below would not be the encoder's reshape"
+    )
+
+    reshaped = rows.reshape(int(rows.shape[0]), channels, temporal, patch, patch)
+    gap = float((reshaped[:, :, 0].float() - reshaped[:, :, 1].float()).abs().max())
+
+    with capsys.disabled():
+        print(
+            f"\n[v-slice] VIDEO_TEMPORAL_PATCHES={temporal} VIDEO_GRID_T={int(grid[0][0])} "
+            f"VIDEO_PATCH_ROWS={int(rows.shape[0])} INPUT_FRAMES_DIFFER={input_frames_differ} "
+            f"VIDEO_TEMPORAL_SLICE_GAP={gap}"
+        )
+
+    assert temporal == 2, (
+        "the temporal axis carries one slice, so the two-slice comparison above is vacuous and the reading "
+        "must not be recorded as an answer"
+    )
+    assert input_frames_differ == 1, (
+        "the two input frames are identical, so a zero gap would say nothing about whether the encoder's "
+        "single-slice input drops video signal"
+    )

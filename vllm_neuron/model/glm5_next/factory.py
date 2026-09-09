@@ -13,10 +13,12 @@ in model code or allocate weights.
 """
 
 from dataclasses import dataclass
+from typing import ClassVar, Literal
 
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.interfaces import SupportsSpatialMerge
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 
 from .config import Glm5NextExpertConfigError
@@ -265,7 +267,7 @@ def require_uniform_expert_partition(
     )
 
 
-class Glm5NextForConditionalGeneration(nn.Module):
+class Glm5NextForConditionalGeneration(nn.Module, SupportsSpatialMerge):
     """Factory that selects the GLM-5.3-Flash implementation.
 
     Extends nn.Module to satisfy vLLM's ModelRegistry requirements.
@@ -274,7 +276,45 @@ class Glm5NextForConditionalGeneration(nn.Module):
     separately because the text decoder and the vision encoder carry their own
     parallelism and compilation settings -- the same split that
     ``Glm5NextConfig.from_configs`` already models.
+
+    THE VISION PROTOCOL DECLARATION IS ``inc-glm53f-110``'s, AND IT IS A PURE
+    ADDITION BY MEMBER to this co-authored file: ``inc-glm53f-009`` owns this
+    class plus ``from_configs`` / ``_select_implementation``, and the base list
+    and the two members below are the only thing ``-110`` writes. No landed
+    co-author's member or signature is touched.
     """
+
+    #: vLLM's own multimodal predicate is ``getattr(model, "supports_multimodal",
+    #: False)`` (``vllm/model_executor/models/interfaces.py:463`` at tag
+    #: ``v0.24.0``), read into ``_ModelInfo`` at ``models/registry.py:778``. That
+    #: value decides whether ``ModelConfig`` builds a ``multimodal_config`` at
+    #: all (``vllm/config/model.py:664`` guarding ``:701``), which is what
+    #: ``is_multimodal_model`` (``:1565``) reports and what the Neuron runner's
+    #: ``supports_mm_inputs`` reads (``vllm/worker/neuron_model_runner.py:471``).
+    #: Without this line vLLM answers "text-only" for this architecture and
+    #: drops every image without raising.
+    #:
+    #: DECLARED AS THE INLINE FIELD, NOT BY SUBCLASSING vLLM's
+    #: ``SupportsMultiModal``: that protocol also declares ``embed_multimodal``
+    #: and ``get_placeholder_str``, which the SELECTED IMPLEMENTATION owns and
+    #: this selection seam must not claim. The field is the whole of what vLLM's
+    #: predicate reads, and it keeps this module's import graph free of
+    #: ``vllm.model_executor.models`` -- the property ``test_factory.py``'s C03
+    #: items certify.
+    supports_multimodal: ClassVar[Literal[True]] = True
+
+    @classmethod
+    def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:
+        """How many raw vision tokens collapse into one embedding token.
+
+        ``SupportsSpatialMerge``'s only member. The value is READ from the
+        checkpoint's own vision config and squared, never typed: a
+        ``spatial_merge_size`` of 2 merges a 2x2 block, so four raw tokens
+        become one. Unsatisfied, the plugin's hook returns the literal 1
+        (``vllm_neuron/utils/vision_utils.py:35``), which under-counts this
+        architecture's vision bucket ceiling by exactly this factor.
+        """
+        return hf_config.vision_config.spatial_merge_size**2
 
     def __init__(
         self,
