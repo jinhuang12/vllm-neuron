@@ -5349,28 +5349,61 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # ---- CONTROL B: AN UNLOADED HEAD REFUSES BY NAME AND BY MAP LINE, BEFORE THE
     # STACK RUNS. No seam may move -- that is what tells a named refusal from a
     # forward that ran a whole stack and then discovered it had no head.
-    root.lm_head_weight = None
-    _reset_seam_counters()
-    unloaded_before = _read_seam_counters()
-    with pytest.raises(ValueError, match="weight_loaders_fp8.py:383"):
-        root.forward(
-            input_ids,
-            layer_carriers=carriers,
-            sampling_positions=positions,
-        )
-    unloaded_after = _read_seam_counters()
-    moved = {
-        seam: unloaded_after[seam][0] - unloaded_before[seam][0]
-        for seam in _SEAMS
-        if unloaded_after[seam][0] != unloaded_before[seam][0]
-    }
-    print(f"TINYFWD|root_control|branch=forward with no head tensor"
-          f"|refused=True|seams_that_moved={sorted(moved.items())}")
-    if moved:
+    #
+    # THE HEAD IS BORROWED, NOT SPENT, and putting it back is this control's own
+    # business. Unsetting the parameter is how this control makes the product refuse;
+    # leaving it unset hands every later line of this item a root the product will not
+    # run. ``Glm5NextForConditionalGeneration.forward`` resolves the head in its FIRST
+    # statement (``head = self._head_weight()``, ``model_fp8.py:7907``) and the untied
+    # arm raises there when it is None (``model_fp8.py:7795``), so control E's product
+    # call raised THIS control's ValueError, outside any ``pytest.raises``, instead of
+    # measuring which rows the root selected: item 7 failed on correct code (round 4,
+    # finding F1). The restore runs in a ``finally``, so a control that raises still
+    # leaves the root usable for the controls after it.
+    _saved_head = root.lm_head_weight
+    try:
+        root.lm_head_weight = None
+        _reset_seam_counters()
+        unloaded_before = _read_seam_counters()
+        with pytest.raises(ValueError, match="weight_loaders_fp8.py:383"):
+            root.forward(
+                input_ids,
+                layer_carriers=carriers,
+                sampling_positions=positions,
+            )
+        unloaded_after = _read_seam_counters()
+        moved = {
+            seam: unloaded_after[seam][0] - unloaded_before[seam][0]
+            for seam in _SEAMS
+            if unloaded_after[seam][0] != unloaded_before[seam][0]
+        }
+        print(f"TINYFWD|root_control|branch=forward with no head tensor"
+              f"|refused=True|seams_that_moved={sorted(moved.items())}")
+        if moved:
+            raise VacuousControlError(
+                f"the refusal ran after {sorted(moved.items())} dispatched, so the "
+                f"head is resolved after the stack instead of before it"
+            )
+    finally:
+        root.lm_head_weight = _saved_head
+    # AND THE PUT-BACK IS GATED, not assumed: the parameter is the object this control
+    # borrowed, and the product's own resolver hands that same object back.
+    if root.lm_head_weight is not _saved_head:
         raise VacuousControlError(
-            f"the refusal ran after {sorted(moved.items())} dispatched, so the "
-            f"head is resolved after the stack instead of before it"
+            "control B did not put root.lm_head_weight back, so every control after "
+            "it runs against a root whose head the product refuses by name "
+            "(model_fp8.py:7795)"
         )
+    if root._head_weight() is not root.lm_head_weight:
+        raise VacuousControlError(
+            "root._head_weight() no longer returns root.lm_head_weight after control "
+            "B, so the head the product projects with is not the tensor this item "
+            "loaded"
+        )
+    print(f"TINYFWD|root_control|branch=head put back after the unloaded arm"
+          f"|is_the_borrowed_parameter={root.lm_head_weight is _saved_head}"
+          f"|product_resolver_agrees="
+          f"{root._head_weight() is root.lm_head_weight}")
 
     # ---- CONTROL C: THE ROW SELECTION IS REQUIRED. No default, so a caller that
     # forgets it gets a TypeError at the call rather than a whole-prefill projection.
@@ -5432,6 +5465,30 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # AND IT CARRIES ITS OWN VACUITY GUARD, which names the head: if the delta maps to
     # no change at slot 0 of the REFERENCE, the head row is zero or masked, and then
     # the control proves nothing and says that instead of passing.
+    #
+    # IT ALSO REFUSES TO PLANT INTO A ROOT WHOSE HEAD IS NOT THERE. Every gate below
+    # calls the product, and the product resolves the head in its first statement
+    # (``model_fp8.py:7907``), so a control above this one that left ``lm_head_weight``
+    # unset would make this control raise a ValueError about the WEIGHT MAP where the
+    # reader is looking for a row-selection failure -- which is what round 4 found.
+    # Control B borrows the parameter and puts it back in a ``finally``; this is a
+    # guard on that, not a second repair of it, and it is here so this file can never
+    # be red for that reason again without saying so.
+    if root.lm_head_weight is None:
+        raise VacuousControlError(
+            "root.lm_head_weight is None before control E plants anything: control B "
+            "unsets it to make the product refuse and must put it back in its "
+            "finally. The product would refuse by name here, because "
+            "model_fp8.py:7907 resolves the head before the stack runs, instead of "
+            "selecting the rows this control asks about"
+        )
+    if root._head_weight() is not root.lm_head_weight:
+        raise VacuousControlError(
+            "root._head_weight() does not return root.lm_head_weight before control "
+            "E plants anything, so the head the product projects with is not the "
+            "tensor this item loaded and this control cannot say which rows the root "
+            "selected"
+        )
     _slot = 0
     _plant_position = int(ROOT_SAMPLING_POSITIONS[_slot])
     _slot_peak = float(expected[_slot].abs().max())
