@@ -93,6 +93,10 @@ import pytest
 import torch
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE, TILE_SIZE
+from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
+    compensate_block_scales,
+    downscale_fp8_weight_bytes,
+)
 
 #: ``fast`` only. ``forked`` is deliberately absent -- see the paragraph on process
 #: isolation in this module's docstring: the reset-and-difference around each forward
@@ -615,6 +619,20 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
     The block scale is broadcast by ``repeat_interleave`` on both axes rather than
     by an index computation, so this repeats none of the bridge's arithmetic and
     cannot share an off-by-one with it (``test_moe_path.py:677-699``'s reason).
+
+    IT APPLIES THE trn2 PAIR ONCE, ASKED RATHER THAN RETYPED. On a 240-clamp
+    platform the store is a matched pair -- the bytes are squeezed by 240/448 and
+    the grid is compensated by 448/240 -- so a reference that applied neither
+    would disagree with a correct product by 448/240, and one that applied only
+    the squeeze would disagree by the same factor the other way. Both halves come
+    from the loader's own functions, never a constant copied into this file, so a
+    change to the factor moves this reference with it. On a platform where the
+    clamp is 448 both calls are no-ops and this is the arithmetic it always was.
+
+    WHAT IT DELIBERATELY DOES NOT MEASURE. The squeeze re-quantises through fp8,
+    so this states the CHECKPOINT-to-stored invariant and not the fidelity of the
+    stored weight to the raw HF value. That fidelity is ``inc-glm53f-054e``'s
+    acceptance, not this file's.
     """
     if weight_fp8.dim() != 2 or block_scale.dim() != 2:
         raise ReferenceShapeError(
@@ -628,10 +646,10 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
             f"block scale {tuple(block_scale.shape)} does not tile a "
             f"{rows}x{cols} weight at granularity {BLOCK_QUANT_SIZE}"
         )
-    expanded = block_scale.repeat_interleave(
+    expanded = compensate_block_scales(block_scale).scale_inv.repeat_interleave(
         BLOCK_QUANT_SIZE, dim=0
     ).repeat_interleave(BLOCK_QUANT_SIZE, dim=1)
-    return weight_fp8.to(torch.float32) * expanded
+    return downscale_fp8_weight_bytes(weight_fp8).to(torch.float32) * expanded
 
 
 def _scale_grid_attribute(leaf: str) -> str:
@@ -646,16 +664,43 @@ def _scale_grid_attribute(leaf: str) -> str:
     return _impl().Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
 
 
-def _attach(module, leaf: str, weight: torch.Tensor, grid: torch.Tensor) -> None:
+def _attach(
+    module,
+    leaf: str,
+    weight: torch.Tensor,
+    grid: torch.Tensor,
+    *,
+    prep_will_compensate: bool = False,
+) -> None:
     """Bind one declared weight and the plain-attribute grid beside it.
 
     ``nn.Parameter(..., requires_grad=False)`` because the leaf was declared with
     ``register_parameter(name, None)`` and torch refuses a plain tensor there
     (``test_kda_layer.py:412``'s landed form). The grid is a PLAIN attribute and
     not a parameter, which is the arrangement ``_scale_prep_leaves`` documents.
+
+    IT BINDS WHAT THE LOADER DELIVERS, WHICH IS A PAIR. On a 240-clamp platform a
+    real load squeezes the bytes by 240/448 and compensates the grid by 448/240,
+    so binding the checkpoint's own bytes beside the checkpoint's own grid is not
+    a load at all -- it is half of one, and a forward built on it disagrees with a
+    correct product by 448/240. The bytes are therefore always squeezed here.
+
+    ``prep_will_compensate`` IS ABOUT WHERE THE OTHER HALF COMES FROM, NOT WHETHER.
+    A module whose test then calls ``retile_checkpoint_scale_grids`` gets its grid
+    compensated by the load-path prep, so this binds that grid RAW and the pair is
+    completed exactly once. Every other module in this file gets no prep at all,
+    so the compensation has to arrive here or it never arrives. Ten binds in this
+    file, and only the two objects the prep runs on pass the keyword.
     """
-    setattr(module, leaf, torch.nn.Parameter(weight.clone(), requires_grad=False))
-    setattr(module, _scale_grid_attribute(leaf), grid.clone())
+    setattr(
+        module,
+        leaf,
+        torch.nn.Parameter(
+            downscale_fp8_weight_bytes(weight).clone(), requires_grad=False
+        ),
+    )
+    delivered = grid if prep_will_compensate else compensate_block_scales(grid).scale_inv
+    setattr(module, _scale_grid_attribute(leaf), delivered.clone())
 
 
 def _dense_operands() -> dict:
@@ -940,6 +985,7 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
             leaf,
             compute_weight.t().contiguous(),
             checkpoint_grid.t().contiguous(),
+            prep_will_compensate=True,
         )
 
     # ---- CONTROL: the loader's frame ALONE is refused, by name. This is the
@@ -999,6 +1045,61 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     torch.testing.assert_close(
         got_loaded.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
     )
+
+    # ---- CONTROL: THE PAIR, WRONG IN EITHER DIRECTION, IS REFUSED BY NAME.
+    # ``inc-glm53f-054c`` makes the load-path prep compensate the grid, so from here
+    # there are exactly two ways to hold the pair wrong: one compensation too few,
+    # which is un-squeezed bytes under a compensated grid, and one too many, which
+    # is a grid this file compensated and the prep compensated again. The conjunct
+    # above cannot see either, because it would pass unchanged if the reference and
+    # the product moved together -- which is the fault ``-054c`` found in
+    # ``test_load_weights.py``'s own reference. So both are built and refused here.
+    #
+    # THE READINGS ARE ON THE PUBLISHED GRID, NOT THE FORWARD. The SwiGLU clamp
+    # saturates, so an output ratio is compressed below the factor and would be a
+    # misleading number to print; the grid ratio is uniform and exact. The refusal
+    # is what the control asserts, and no tolerance is introduced to state it.
+    for label in ("one_compensation_too_few", "one_compensation_too_many"):
+        wrong = model_fp8.Glm5NextDenseMLP(text_config)
+        for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            compute_weight, public_grid = operands[leaf]
+            checkpoint_grid = public_grid.repeat_interleave(
+                tiles_per_block, dim=0
+            ).repeat_interleave(tiles_per_block, dim=1)
+            loader_weight = compute_weight.t().contiguous()
+            loader_grid = checkpoint_grid.t().contiguous()
+            if label == "one_compensation_too_few":
+                # BY HAND, bypassing the helper on purpose: the control has to state
+                # the defect itself rather than ask the helper that fixes it.
+                setattr(
+                    wrong,
+                    leaf,
+                    torch.nn.Parameter(loader_weight.clone(), requires_grad=False),
+                )
+                setattr(wrong, _scale_grid_attribute(leaf), loader_grid.clone())
+            else:
+                # The keyword is FORGOTTEN -- the one edit that produces the double.
+                _attach(wrong, leaf, loader_weight, loader_grid)
+        if wrong.retile_checkpoint_scale_grids() != 3:
+            raise VacuousControlError(
+                f"the {label} control retiled fewer than 3 projections, so it is "
+                f"not the arrangement this control means to refuse"
+            )
+        for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            attribute = _scale_grid_attribute(leaf)
+            right = getattr(loaded, attribute).to(torch.float32)
+            ratio = (getattr(wrong, attribute).to(torch.float32) / right).unique()
+            print(
+                f"TINYFWD|dense_pair_control|{label}|{leaf}"
+                f"|published_grid_ratio={[round(float(v), 7) for v in ratio]}"
+                f"|bytes_identical_to_the_correct_bind="
+                f"{bool(torch.equal(getattr(wrong, leaf).data, getattr(loaded, leaf).data))}"
+            )
+        got_wrong = wrong.forward(operands["hidden"], quant_config=_quant_config())
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(
+                got_wrong.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1767,6 +1868,7 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
             leaf,
             compute_weight.t().contiguous(),
             checkpoint_grid.t().contiguous(),
+            prep_will_compensate=True,
         )
 
     republished = loaded.retile_checkpoint_scale_grids()

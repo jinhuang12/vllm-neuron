@@ -5214,8 +5214,15 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
 def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
-    """Conjunct (3). The padded ranks hold fp8 zero and grid 1.0, and the pad
-    changes no number the model would compute.
+    """Conjunct (3). The padded ranks hold fp8 zero and the stored pad grid, and
+    the pad changes no number the model would compute.
+
+    "ONES" IN THE NAME IS THE CHECKPOINT'S PAD VALUE, NOT THE STORED ONE. The pad
+    grid is written as 1.0 and ``inc-glm53f-054c`` makes the load path compensate
+    every block by 448/240, so the stored reading is that factor and 1.0 is now the
+    control. The name is kept because filed records cite it. Twice the factor,
+    3.4844, would mean the sharded route compensated a grid that a loader had
+    already compensated, so this line is also that double's only reader.
 
     WHY THE DENSE THREE ARE THE SUBJECT. At world 4 the dense intermediate 512 pads
     to 1024, so ranks 2 and 3 hold no real row at all -- the strongest form of the
@@ -5304,10 +5311,34 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
                     f"{SHARD_INTERMEDIATE} rows, so every element must be fp8 zero; "
                     f"max abs is {as_float.abs().max().item()}"
                 )
-                assert bool((grid.to(torch.float32) == 1.0).all()), (
-                    f"{path}.{leaf}'s grid at rank {rank} must be all 1.0 past the "
-                    f"real rows; it holds values from "
-                    f"{grid.min().item()} to {grid.max().item()}"
+                # THE PAD GRID IS THE STORED ONE, NOT THE CHECKPOINT'S. The pad is
+                # written as 1.0 and the load path then compensates every block, so
+                # what a reader finds here is 1.0 carried through the pair. The
+                # expected value is ASKED of the loader's own function on a grid of
+                # ones rather than typed, so a change to the factor moves this
+                # reading with it, and no tolerance is needed because a uniform
+                # multiply of 1.0 is exact and sits far above the MINVAL floor.
+                pad = compensate_block_scales(torch.ones_like(grid))
+                assert bool(torch.equal(grid.to(torch.float32), pad.scale_inv)), (
+                    f"{path}.{leaf}'s grid at rank {rank} must be the stored pad "
+                    f"value {pad.scale_inv.flatten()[0].item()} past the real rows; "
+                    f"it holds values from {grid.min().item()} to "
+                    f"{grid.max().item()}. Twice that value means the grid was "
+                    f"compensated twice"
+                )
+                # PRE-``-054c`` CONTROL. Raw 1.0 is exactly what this line asserted
+                # while the load path was missing its half of the pair, so where the
+                # compensation applies the old reading has to be refused now.
+                if pad.applied:
+                    assert not bool((grid.to(torch.float32) == 1.0).all()), (
+                        f"{path}.{leaf}'s grid at rank {rank} still reads all 1.0 "
+                        f"with the 240 clamp engaged, so the load path did not "
+                        f"compensate it"
+                    )
+                print(
+                    f"CONJUNCT3D_PAD_GRID|{path}.{leaf}|rank={rank}"
+                    f"|stored={grid.to(torch.float32).flatten()[0].item():.7f}"
+                    f"|compensation_applied={pad.applied}"
                 )
                 zero_ranks += 1
     print(f"CONJUNCT3D_PADDED_RANK_READINGS={zero_ranks}")
