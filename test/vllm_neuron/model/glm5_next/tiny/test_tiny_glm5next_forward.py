@@ -4717,7 +4717,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
 
     # ---- CONJUNCT 5: THE FINAL NORM CLOSES THE CHAIN, on the last layer's own
     # output rather than on any earlier one. TWO COMPARISONS, EACH AT THE BAND THIS
-    # FILE ALREADY REGISTERS FOR ITS PATH (lead ruling, LEAD-LOG section 879):
+    # FILE ALREADY REGISTERS FOR ITS PATH (lead ruling, LEAD-LOG section 880):
     #   5a THE LAYER-2 ROUTED HALF, at ``MOE_RTOL``/``MOE_ATOL`` -- the pair item 4
     #      registers for this same expert bank. Layer 2 is the one layer whose FFN
     #      half reached no bank comparison at all before, because conjunct 4 stops
