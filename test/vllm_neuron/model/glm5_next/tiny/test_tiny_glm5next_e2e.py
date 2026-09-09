@@ -1223,3 +1223,110 @@ def test_the_converter_does_not_hand_the_root_a_kv_page_as_its_quant_block():
             f"layer {index}'s carrier carries page {int(carrier['page_size'])} and its bank "
             f"is paged {int(bank['block_size'])}; the KV page must still reach the layers"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 10. the side caches live across steps, and a fresh sequence starts on an empty ring.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring():
+    """One set of side caches per process, and a new sequence must not inherit the old ring.
+
+    WHAT IS MEASURED, AND WHY IT IS NOT A STYLE POINT. `_glm5next_live_side_caches` allocates
+    the pooled store and the decode ring ONCE and hands the same objects to every step
+    (`neuron_model_runner.py:4870-4881`); that identity is what makes a decode step's ring
+    survive into the next step. Its cost is that a NEW sequence would start on the previous
+    sequence's partial pool -- every real token stashes into the ring
+    (`vllm_neuron/functional/dsa/decode_tail_update.py`) -- and its next completion would pool
+    those stale members with no tolerance and no refusal anywhere below. A prefill at position
+    0 is a new sequence, so the converter clears the ring there.
+
+    THE POOLED STORE IS NOT CLEARED, and this item requires that too. The candidate gather is
+    bounded by this sequence's own `max_seq_len` (`model_fp8.py:5211-5218`) and every complete
+    pool below that bound is written by the prefill, so a row above the bound is unreachable.
+    The planted row above the bound must SURVIVE, so a future blanket clear of both caches
+    fails here and has to argue for itself.
+
+    THE CONTROL IS THE DECODE LEG: the same planted ring, threaded through a decode step, must
+    come back UNCLEARED. A converter that zeroed the ring on every call would satisfy the first
+    conjunct and fail this one, so the item cannot pass by clearing too much.
+
+    WHAT IT DOES NOT MEASURE: the prefill's own remainder is not seeded into the ring by
+    anything in this tree. `model_fp8.py:4631-4636` says the caller persists it, the only code
+    holding the indexer's key and gate for those positions is the model's prefill branch
+    (`:5386-5393`), and a `tail` passed to that forward selects the decode leg (`:5360-5370`).
+    A prompt whose length is not a multiple of `index_kpool` therefore pools its first
+    post-prompt completion from zeros. This file's acceptance cannot see it: `STACK_TOKENS` is
+    128 and `MLA_INDEX_KPOOL` is 4, so the prompt divides evenly. Reported as a design
+    question, not papered over here.
+    """
+    _require_cpu_mode()
+    root = _fixture()["root"]
+    caches = _runner_shaped_caches(root)
+    root.bind_kv_cache(caches)
+    banks = root.glm5next_layer_banks
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+
+    live = runner._glm5next_live_side_caches(banks)
+    again = runner._glm5next_live_side_caches(banks)
+    rings = [side for side in live if "tail" in side]
+    print(f"TINYE2E|side_caches|same_set={live is again}|entries={len(live)}"
+          f"|with_a_ring={len(rings)}")
+    assert live is again, "the side caches must be one set per process, not one per step"
+    assert all(a["tail"] is b["tail"] for a, b in zip(rings, [s for s in again if "tail" in s]))
+    if not rings:
+        raise item.VacuousControlError(
+            "no bank in this stack carries a ring, so this item measures nothing"
+        )
+
+    above_the_bound = int(rings[0]["pool_cache"].shape[0]) - 1
+    candidates = item.STACK_TOKENS // int(root.text_config.index_kpool)
+    print(f"TINYE2E|pool_rows|planted_row={above_the_bound}|this_sequences_candidates="
+          f"{candidates}")
+    if above_the_bound <= candidates:
+        raise item.VacuousControlError(
+            f"row {above_the_bound} is not above this sequence's candidate bound "
+            f"{candidates}, so planting there would be reachable and the second conjunct "
+            f"would be measuring the wrong thing"
+        )
+    for side in rings:
+        side["tail"].fill_(3.0)
+        side["pool_cache"][above_the_bound].fill_(5.0)
+
+    _model_kwargs(
+        runner,
+        input_ids=torch.zeros(item.STACK_TOKENS, dtype=torch.long),
+        cached=0,
+        sampling_row=item.STACK_TOKENS - 1,
+    )
+    cleared = max(float(side["tail"].abs().max()) for side in rings)
+    stale = min(float(side["pool_cache"][above_the_bound].abs().max()) for side in rings)
+    print(f"TINYE2E|fresh_prefill|ring_max={cleared}|planted_pool_row_min={stale}")
+    assert cleared == 0.0, (
+        "a prefill at position 0 is a new sequence and must start on an empty ring; this one "
+        "inherited the planted state"
+    )
+    assert stale == 5.0, (
+        "the pooled store must not be blanket-cleared: the planted row is above this "
+        "sequence's candidate bound and therefore unreachable, and clearing it would hide a "
+        "bound defect instead of exposing one"
+    )
+
+    # ---- THE CONTROL: the decode leg keeps the ring it was handed. The ring IS the state.
+    for side in rings:
+        side["tail"].fill_(7.0)
+    _model_kwargs(
+        runner,
+        input_ids=torch.zeros(1, dtype=torch.long),
+        cached=item.STACK_TOKENS,
+        sampling_row=0,
+    )
+    kept = min(float(side["tail"].abs().max()) for side in rings)
+    print(f"TINYE2E|decode_step|ring_min={kept}")
+    assert kept == 7.0, (
+        "a decode step must not clear the ring; the ring is the decode leg's own state and "
+        "clearing it would lose the partial pool this step is meant to advance"
+    )

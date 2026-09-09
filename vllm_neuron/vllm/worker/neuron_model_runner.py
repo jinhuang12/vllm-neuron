@@ -4866,6 +4866,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         the step and cover every sequence the engine admits, while the carrier
         carries the batch's own ``max_seq_len`` so the indexer's candidate count
         stays the batch's.
+
+        ONE SET FOR THE PROCESS IS ALSO A HAZARD, and the converter answers it. A
+        new sequence would otherwise start on the previous sequence's partial pool,
+        because every real token stashes into the ring
+        (``vllm_neuron/functional/dsa/decode_tail_update.py``) and nothing here
+        empties it. :meth:`_glm5next_model_kwargs` clears the ring when a prefill
+        starts at position 0, which is a new sequence by definition; the pooled
+        store is left alone for the reason given there.
         """
         live = getattr(self, "_glm5next_side_cache_set", None)
         if live is not None and len(live) == len(banks):
@@ -5140,9 +5148,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         is_prefill = legs.pop()
         start_position = starts.pop()
         text_config = self.model.text_config
+        side_caches = self._glm5next_live_side_caches(banks)
+        if is_prefill and int(start_position) == 0:
+            # A FRESH SEQUENCE MUST NOT INHERIT THE LAST ONE'S PARTIAL POOL. The
+            # side caches live for the process (`_glm5next_live_side_caches`), so
+            # the ring still holds whatever the previous sequence stashed, and
+            # every real token stashes (`decode_tail_update.py`). Its next
+            # completion would pool those stale members. A prefill at position 0
+            # is a new sequence, so the ring starts empty here.
+            #
+            # THE POOLED STORE IS LEFT ALONE, deliberately: the candidate gather is
+            # bounded by this sequence's own `max_seq_len`
+            # (`model_fp8.py:5211-5218`), and every complete pool below that bound
+            # is written by this prefill, so a stale row above it is unreachable.
+            # Clearing it would also hide a bound defect rather than expose one.
+            #
+            # THE PREFILL'S REMAINDER IS STILL NOT SEEDED. `model_fp8.py:4631-4636`
+            # says the caller persists it; the only code holding the indexer's key
+            # and gate for those positions is the model's own prefill branch
+            # (`model_fp8.py:5386-5393`), and a `tail` passed to that forward
+            # selects the decode leg (`:5360-5370`), so this runner cannot pass
+            # one. Recorded as a design question, not patched here.
+            for side in side_caches:
+                if "tail" in side:
+                    side["tail"].zero_()
         carriers = self._glm5next_layer_carriers(
             banks,
-            self._glm5next_live_side_caches(banks),
+            side_caches,
             geometries=geometries,
             is_prefill=is_prefill,
             tokens=tokens,
