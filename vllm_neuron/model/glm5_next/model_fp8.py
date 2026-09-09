@@ -958,25 +958,42 @@ class Glm5NextHyperConnection(nn.Module):
     agree, so the transcription rests on two statements rather than on one
     reading of one file.
 
-    THE ONE COMPOSITION QUESTION THIS SECTION HAD TO ANSWER
-    ------------------------------------------------------
-    ``-028``'s seam normalises **one** ``[M, N]`` matrix; the target needs
-    **``T`` independent** ``[S, S]`` ones, and this increment's route predicate
-    declares the Sinkhorn seam is entered **exactly once per layer call**. The
-    two are reconciled by a **block-diagonal embedding**: the ``T`` little
-    matrices are scattered onto the diagonal of one ``[T*S, T*S]`` matrix, so
-    ``-028``'s column target ``M / N`` is exactly ``1`` -- the target's own
-    column target -- and the off-diagonal zeros stay zero under multiplicative
-    rescaling, which makes every row sum and every column sum range over
-    exactly one token's block. **The alternative was measured and rejected:** a
-    flat ``[T*S, S]`` reshape lets ``-028``'s column pass sum ACROSS tokens, and
-    ``probe-030-composition-algebra.out`` reads ``max_abs`` up to ``4.68e-01``
-    against the target for it while the block-diagonal embedding reads
-    ``8.99e-07``, with the off-block maximum exactly ``0.0``. This is layout,
-    not authored numerics: all of the Sinkhorn arithmetic stays inside ``-028``'s
-    kernel.
+    THE ONE COMPOSITION QUESTION THIS SECTION HAD TO ANSWER, AND WHY IT NO
+    LONGER NEEDS AN ANSWER HERE
+    ----------------------------------------------------------------------
+    RE-GROUNDED BY ``inc-glm53f-030c``. The question was real and the answer
+    below is kept as the record of it, not as a description of what this class
+    now does. ``-028``'s square seam normalises **one** ``[M, N]`` matrix while
+    the target needs **``T`` independent** ``[S, S]`` ones, and the route
+    predicate declares the Sinkhorn seam is entered **exactly once per layer
+    call**. ``inc-glm53f-030`` reconciled the two with a **block-diagonal
+    embedding**: the ``T`` little matrices scattered onto the diagonal of one
+    ``[T*S, T*S]`` matrix, so ``-028``'s column target ``M / N`` was exactly
+    ``1`` -- the target's own column target -- and the off-diagonal zeros stayed
+    zero under multiplicative rescaling, which made every row sum and every
+    column sum range over exactly one token's block.
 
-    :func:`torch.block_diag` is torch's own member, reused rather than written.
+    **THE MEASUREMENT THAT CHOSE IT STANDS, and it is why the record is kept
+    rather than deleted:** a flat ``[T*S, S]`` reshape lets ``-028``'s column
+    pass sum ACROSS tokens, and ``probe-030-composition-algebra.out`` reads
+    ``max_abs`` up to ``4.68e-01`` against the target for it, while the
+    block-diagonal embedding reads ``8.99e-07`` with the off-block maximum
+    exactly ``0.0``. Any future seam that flattens the token axis into the
+    normalised matrix meets that ``4.68e-01`` again.
+
+    **WHAT ``inc-glm53f-028b`` THEN MADE UNNECESSARY.** It landed a second,
+    BATCHED form of the seam, ``sinkhorn_normalise_blocks``, which takes
+    ``[T, S, S]`` directly. So the reconciliation is no longer needed at all:
+    ``-030c`` calls that form from :meth:`mhc_pre`, and the embedding, the
+    extraction and the ``[T*S, T*S]`` matrix are all gone. The route predicate
+    is unchanged -- still exactly one dispatch per layer call -- and it now costs
+    ``T * S * S`` values instead of ``(T*S)^2``: 128 KB of fp32 at 2048 tokens
+    against 256 MB (``sinkhorn.py:587-591``). The claim that stood here, that
+    *":func:`torch.block_diag` is torch's own member, reused rather than
+    written"*, is quoted rather than asserted: this class no longer calls it.
+
+    Both the old form and the new one keep all of the Sinkhorn arithmetic inside
+    ``-028``'s kernels, so neither was ever authored numerics here.
 
     TWO DIVERGENCES FROM THE BASE THAT THIS LAYER CANNOT REMOVE
     ----------------------------------------------------------
