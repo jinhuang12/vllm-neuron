@@ -4944,6 +4944,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"inc-glm53f-054b's work and a wrong slice would write this "
                 f"sequence's latents into another sequence's slots"
             )
+        if not is_prefill and int(tokens) != 1:
+            raise ValueError(
+                f"the decode leg advances the indexer's tail ring one position at a "
+                f"time -- its seam takes a single [1, index_head_dim] key row and a "
+                f"single position (model_fp8.py:4739-4742, :5374) -- and this step "
+                f"carries {int(tokens)} token(s); threading a multi-token decode, "
+                f"which is speculative decoding's verify step, is not "
+                f"inc-glm53f-054b's work"
+            )
+
         carriers: list[dict] = []
         for bank, side in zip(banks, side_caches):
             if bank["family"] != "self_attn":

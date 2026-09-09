@@ -49,12 +49,29 @@ from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 # follows the landed convention (`test/vllm_neuron/functional/dsa/test_causal_bound.py:99-110`).
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as item
 
-pytestmark = [pytest.mark.fast]
+pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
-#: Pages of ``MLA_PAGE_SIZE`` slots, enough that one ascending run of them covers the stack
-#: item's token count exactly. The number is DERIVED from the two landed dials rather than
-#: typed, so a change to either moves this with it.
-E2E_BLOCKS = item.STACK_TOKENS // item.MLA_PAGE_SIZE
+#: The acceptance's own token count: "generates **8/8** tokens" (plan `:1183`). The first
+#: comes from the prompt's last row and the other seven from one decode step each, so the
+#: generation exercises both legs and appends exactly eight tokens.
+GENERATED_TOKENS = 8
+
+#: Whole blocks, always DERIVED from a slot count so a change to any landed dial moves them.
+def _blocks_for(slots: int) -> int:
+    """The blocks a sequence of ``slots`` slots occupies, the runner's own rounding."""
+    return -(-int(slots) // item.MLA_PAGE_SIZE)
+
+
+#: The prompt occupies this many blocks, which is the run the converter slices for a prefill.
+PROMPT_BLOCKS = _blocks_for(item.STACK_TOKENS)
+
+#: The bank must hold the prompt AND everything the generation appends, or the last decode
+#: step would write past the end -- which the layer refuses (`model_fp8.py:6398-6402`).
+E2E_BLOCKS = _blocks_for(item.STACK_TOKENS + GENERATED_TOKENS)
+
+#: The longest sequence this file admits, the number the side caches are sized from exactly as
+#: the runner sizes them from ``max_model_len``.
+E2E_MAX_SEQ_LEN = item.STACK_TOKENS + GENERATED_TOKENS
 
 #: The recurrent-state geometry the substituted spec reports. Small and arbitrary: the mapper
 #: under test reads shapes off the spec and never off a layer, so these numbers only have to
@@ -62,6 +79,22 @@ E2E_BLOCKS = item.STACK_TOKENS // item.MLA_PAGE_SIZE
 E2E_CONV_STATE_SHAPE = (2, 3)
 E2E_RECURRENT_STATE_SHAPE = (2, 4, 4)
 E2E_STATE_SLOTS = 8
+
+
+def _fixture(**overrides):
+    """`-054a`'s root fixture, with the ONE dial the registered constraint set names.
+
+    THE OVERRIDE IS `num_key_value_heads = 2`, and it is here rather than in `-054a`'s file
+    for two reasons that both bind: the acceptance this block carries names that value in its
+    constraint set (plan `:1183`), and the plan's Tests bullet says the two halves write
+    different files in one directory and neither edits the other's. `_root_config` takes
+    overrides and they win over its dials (`test_tiny_glm5next_forward.py:2623`), so the
+    constraint is met by asking for it here.
+
+    IT IS THE SAME OVERRIDE FOR EVERY ITEM IN THIS FILE, so one config runs everywhere and no
+    item measures a tree another item did not.
+    """
+    return item._root_fixture(num_key_value_heads=2, **overrides)
 
 
 def _require_cpu_mode() -> None:
@@ -186,7 +219,7 @@ def test_bind_kv_cache_maps_every_sparse_layer_onto_its_own_slots():
       cache depends on, checked directly rather than inferred from the shapes.
     """
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     caches = _runner_shaped_caches(root)
     spec_layers = root.get_kv_spec().layers
 
@@ -247,7 +280,7 @@ def test_bind_kv_cache_maps_recurrent_layers_by_the_fields_the_spec_carries(monk
     pair of items shows the branch is taken from the spec and not from the stack.
     """
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     spec = _recurrent_spec(root)
     monkeypatch.setattr(root, "get_kv_spec", lambda: spec)
     caches = _runner_shaped_caches(root)
@@ -274,7 +307,7 @@ def test_bind_kv_cache_maps_recurrent_layers_by_the_fields_the_spec_carries(monk
 def test_bind_kv_cache_refuses_a_missing_layer_by_name():
     """A layer the dict does not hold refuses and prints what the dict does hold."""
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     caches = _runner_shaped_caches(root)
     absent = root.get_kv_spec().layers[0].name
     caches.pop(absent)
@@ -285,7 +318,7 @@ def test_bind_kv_cache_refuses_a_missing_layer_by_name():
 def test_bind_kv_cache_refuses_a_bank_of_the_wrong_rank():
     """A bank that is not the runner's four-axis allocation refuses rather than being viewed."""
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     caches = _runner_shaped_caches(root)
     name = root.get_kv_spec().layers[0].name
     flat = caches[name][0]
@@ -297,7 +330,7 @@ def test_bind_kv_cache_refuses_a_bank_of_the_wrong_rank():
 def test_bind_kv_cache_refuses_a_bank_whose_geometry_is_not_the_specs():
     """A head count or width the model did not ask for refuses, and says both numbers."""
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     caches = _runner_shaped_caches(root)
     layer_spec = root.get_kv_spec().layers[0]
     caches[layer_spec.name] = [
@@ -314,7 +347,7 @@ def test_bind_kv_cache_refuses_a_bank_whose_geometry_is_not_the_specs():
 def test_bind_kv_cache_refuses_a_partial_recurrent_geometry(monkeypatch):
     """Half a recurrent declaration refuses: the two states are paired positionally."""
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     full = _recurrent_spec(root)
     partial = KVSpec(
         layers=[
@@ -348,7 +381,7 @@ def test_bind_kv_cache_refuses_a_partial_recurrent_geometry(monkeypatch):
 def test_bind_kv_cache_refuses_a_spec_that_disagrees_with_the_stack(monkeypatch):
     """A spec shorter than the stack refuses: the carriers are paired positionally."""
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     short = KVSpec(layers=root.get_kv_spec().layers[:-1])
     caches = _runner_shaped_caches(root)
     monkeypatch.setattr(root, "get_kv_spec", lambda: short)
@@ -426,7 +459,7 @@ def test_side_caches_meet_the_indexers_own_stated_minimum():
     where a store one row short raises inside the indexer instead of being asserted here.
     """
     _require_cpu_mode()
-    root = item._root_fixture()["root"]
+    root = _fixture()["root"]
     caches = _runner_shaped_caches(root)
     root.bind_kv_cache(caches)
     banks = root.glm5next_layer_banks
@@ -480,7 +513,7 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
     or a carrier that reached the wrong layer all fail here, and no tolerance is involved.
     """
     _require_cpu_mode()
-    fixture = item._root_fixture()
+    fixture = _fixture()
     root, layers = fixture["root"], fixture["layers"]
     caches = _runner_shaped_caches(root)
     root.bind_kv_cache(caches)
@@ -497,7 +530,7 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
     carriers = NeuronModelRunner._glm5next_layer_carriers(
         banks,
         side,
-        block_ids=range(E2E_BLOCKS),
+        block_ids=range(PROMPT_BLOCKS),
         state_slot=0,
         is_prefill=True,
         tokens=item.STACK_TOKENS,
@@ -558,3 +591,345 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
             f"layer {index}'s pooled-key store is unchanged after a {item.STACK_TOKENS}-token "
             f"prefill, so the indexer wrote no pool through this carrier"
         )
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 6. the config that ran IS the constraint set the acceptance names.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_tiny_config_is_the_registered_constraint_set():
+    """The five constraints the criterion names, read off the config that ran.
+
+    The acceptance names them as one set: fewer than 32 M parameters, `hidden_size % 256 == 0`,
+    `intermediate_size >= 512`, `head_dim <= 128` and `num_key_value_heads = 2` (plan `:1183`,
+    "the constraint set `model_bringup.md` states for CPU/NKI runs"). An acceptance that
+    asserted the logits and never the fixture would pass on a tree the criterion does not
+    describe, so every constraint is READ here and printed before it is asserted.
+
+    EVERY VALUE COMES OFF THE BUILT CONFIG AND THE BUILT MODULE, never from this file's
+    constants: a fixture that stopped setting one of them must redden this item rather than
+    agree with a copy of the number.
+    """
+    _require_cpu_mode()
+    fixture = _fixture()
+    root, cfg = fixture["root"], fixture["cfg"]
+    missing = [
+        name
+        for name in ("hidden_size", "intermediate_size", "num_key_value_heads",
+                     "qk_nope_head_dim", "v_head_dim", "index_head_dim")
+        if not hasattr(cfg, name)
+    ]
+    if missing:
+        raise item.VacuousControlError(
+            f"the built config declares none of {missing}, so this item cannot read the "
+            f"constraint set the acceptance names off the tree that ran"
+        )
+    parameters = sum(int(p.numel()) for p in root.parameters() if p is not None)
+    head_dims = {
+        name: int(getattr(cfg, name))
+        for name in ("qk_nope_head_dim", "v_head_dim", "index_head_dim")
+    }
+    print(f"TINYE2E|constraint_set|parameters={parameters}|bound=32000000"
+          f"|hidden_size={int(cfg.hidden_size)}|mod256={int(cfg.hidden_size) % 256}"
+          f"|intermediate_size={int(cfg.intermediate_size)}"
+          f"|num_key_value_heads={int(cfg.num_key_value_heads)}"
+          f"|head_dims={sorted(head_dims.items())}")
+    assert parameters < 32_000_000
+    assert int(cfg.hidden_size) % 256 == 0
+    assert int(cfg.intermediate_size) >= 512
+    assert max(head_dims.values()) <= 128
+    assert int(cfg.num_key_value_heads) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 7. THE REGISTERED ACCEPTANCE: eight tokens, the route predicate, and the reference.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def _metadata(*, blocks: int, tokens: int, cached: int, threshold: int = 1) -> dict:
+    """The runner's attention-metadata mapping, one group, at this step's geometry.
+
+    THE KEYS AND THEIR SHAPES ARE THE RUNNER'S OWN, read off the mapping it builds at
+    `neuron_model_runner.py:4417-4429`; the converter under test reads five of them --
+    `block_table_tensor`, `block_size`, `max_query_len`, `decode_token_threshold` and
+    `cached_seq_len` -- and the rest are present so that this is the runner's mapping and not
+    a five-key stand-in. The runner also wraps it in a per-group dict, which is why the
+    converter takes `next(iter(...values()))` (`:7053`), and this reproduces that shape.
+    """
+    table = torch.arange(blocks, dtype=torch.int32).reshape(1, blocks)
+    return {
+        "glm5_next": {
+            "block_table_tensor": table,
+            "full_block_table_tensor": table,
+            "slot_mapping": torch.arange(tokens, dtype=torch.int32) + cached,
+            "max_query_len": int(tokens),
+            "block_size": item.MLA_PAGE_SIZE,
+            "max_blocks_per_seq": int(blocks),
+            "decode_token_threshold": int(threshold),
+            "cached_seq_len": torch.tensor([cached], dtype=torch.int32),
+            "kv_segment_size": int(blocks) * item.MLA_PAGE_SIZE,
+        }
+    }
+
+
+def _model_kwargs(runner, *, input_ids, cached: int, sampling_row: int) -> dict:
+    """One step's generic runner kwargs, translated by the converter under test.
+
+    THE GENERIC KEYS ARE THE ONES THE RUNNER SENDS (`neuron_model_runner.py:7031-7042`),
+    including the six this model implements nowhere, so the converter is measured dropping
+    exactly what it says it drops rather than being handed a pre-cleaned mapping.
+    """
+    tokens = int(input_ids.shape[0])
+    blocks = _blocks_for(cached + tokens)
+    generic = {
+        "input_ids": input_ids,
+        "positions": torch.arange(tokens, dtype=torch.long) + cached,
+        "attn_metadata": _metadata(blocks=blocks, tokens=tokens, cached=cached),
+        "sampling_positions": torch.tensor([sampling_row], dtype=torch.long),
+        "sampling_params": None,
+        "spec_decode_metadata": None,
+        "rank": None,
+        "logit_mask": None,
+    }
+    return runner._glm5next_model_kwargs(generic)
+
+
+def _reference_attention_half(layer, raw, gains, hidden, cfg, *, tokens: int):
+    """`-054a`'s `_stack_attention_half` with its length taken from an argument.
+
+    IT IS THAT FUNCTION, five lines of it re-composed here for ONE reason: the landed one
+    fixes its three cache operands at `STACK_TOKENS` (`test_tiny_glm5next_forward.py:3875-3886`)
+    and this file compares a growing sequence, while the plan's Tests bullet forbids either
+    half from editing the other's file. Every callee is the landed one -- the norm, the
+    projection, the indexer, the pooled store, the latent cache and the dense reference -- so
+    nothing about the reference's arithmetic is re-derived here.
+
+    THE INDEXER IS EXECUTED, which is the landed function's own reason: a pool selection is a
+    discontinuous function of its input, so running the model's own indexer on the reference's
+    own states makes the selection the reference's by construction.
+    """
+    selection = item._mla_selection_operands(tokens=tokens, pages=item.STACK_PAGES)
+    normed = item._ffn_norm(
+        hidden, layer.input_layernorm_weight, float(cfg.rms_norm_eps)
+    )
+    attention = layer.self_attn
+    q_latent = attention.project_query_latent(normed)
+    topk_indices = attention.indexer(
+        normed,
+        q_latent,
+        item._mla_pool_cache(pages=item.STACK_PAGES),
+        selection["seq_lens"],
+        max_seq_len=tokens,
+        page_size=item.MLA_PAGE_SIZE,
+        slot_mapping=selection["slot_mapping"],
+    )
+    attended = item._mla_dense_reference(
+        attention,
+        raw,
+        gains,
+        normed.float(),
+        item._mla_latent_cache(attention, tokens=tokens),
+        topk_indices,
+        softmax_scale=item.MLA_SOFTMAX_SCALE,
+    )
+    return attended
+
+
+def _reference_logits(fixture, token_ids) -> torch.Tensor:
+    """The torch reference model's logits for the LAST row of this token sequence.
+
+    THE COMPOSITION IS `-054a` ITEM 6's, EQUATION FOR EQUATION: the embedding is the table
+    index, each layer adds its attention half to the tensor it received
+    (`test_tiny_glm5next_forward.py:4644`), then adds its FFN half to that
+    (`:4706`), and the stack ends in the final norm (`:4796`); the head projection is item
+    7's `_root_reference` (`:5235`), whose gather is a python loop for its own reason.
+
+    EVERY EPSILON COMES FROM THE CONFIG, which the criterion requires in those words --
+    `text_config.rms_norm_eps` included: `_ffn_norm` is called with `float(cfg.rms_norm_eps)`
+    here and the attention half passes the same value down, so a wrong call-site literal in
+    the module under test reddens this comparison instead of cancelling out.
+
+    IT IS SINGLE-RANK BY CONSTRUCTION. `_root_fixture` refuses a world size other than 1
+    (`:5178`), and this reference reads the fixture's own per-rank operands, so it neither
+    reduces across ranks nor compensates a scale grid -- the two defects `-054c` and `-054d`
+    own are left visible rather than papered over.
+    """
+    cfg, layers = fixture["cfg"], fixture["layers"]
+    tokens = int(token_ids.shape[0])
+    hidden = fixture["table"][token_ids]
+    for index, layer in enumerate(layers):
+        raw, gains = fixture["attention_operands"][index]
+        attended = _reference_attention_half(
+            layer, raw, gains, hidden, cfg, tokens=tokens
+        )
+        hidden = hidden.float() + attended.float()
+        half = item._stack_ffn_half(
+            layer,
+            hidden,
+            cfg,
+            fixture["mlp_operands"][index],
+            routed=index in fixture["moe_at"],
+        )
+        hidden = hidden.float() + half["out"].float()
+    final = item._ffn_norm(hidden, fixture["final_gain"], float(cfg.rms_norm_eps))
+    return item._root_reference(final, fixture["head"], [tokens - 1])
+
+
+def _assert_route_predicate_r3(label: str, before: dict, after: dict) -> None:
+    """The registered predicate, form R-3, in the words it was registered in.
+
+    Three conjuncts, from plan `:1183`'s route bullet and §4b.2:
+
+    1. `can_run_kernel()` is True. Under `VLLM_NEURON_CPU_MODE=1` this reads the
+       `NKI_SIMULATOR` flag, so a run launched without the simulator is refused here instead
+       of passing on the torch oracle.
+    2. the aggregate torch-fallback counter across every seam this campaign owns reads exactly
+       0 over the generation. "Every seam" is made complete by `-054a`'s two registry checks,
+       which are called below rather than re-implemented: one requires every counter family in
+       every registered module to be claimed by a row, the other requires no counter family
+       anywhere in `vllm_neuron.functional` to be unregistered.
+    3. the SET of seam counters that fired is reported and asserted non-empty -- the conjunct
+       that tells this campaign's kernels from `torch` composed end to end.
+
+    IT IS NOT `-054a`'s HELPER. That one takes an expected dispatch count per seam, which is
+    form R-1; this block registered R-3, whose value is which path was taken and not how many
+    times, so predicting counts here would assert something the register does not.
+    """
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    item._assert_every_counter_family_is_registered()
+    item._assert_no_unregistered_counter_family()
+    runnable = bool(can_run_kernel())
+    fired = sorted(
+        name
+        for name, (dispatch, _fallback) in after.items()
+        if dispatch - before[name][0] > 0
+    )
+    fallbacks = {
+        name: after[name][1] - before[name][1]
+        for name in after
+        if after[name][1] - before[name][1]
+    }
+    print(f"TINYE2E|route_predicate|{label}|can_run_kernel={runnable}"
+          f"|fired={fired}|fallback_total={sum(fallbacks.values())}"
+          f"|fallbacks={sorted(fallbacks.items())}")
+    assert runnable, (
+        "can_run_kernel() is False, so this run took the torch oracle and no reading below "
+        "is a reading of this campaign's kernels"
+    )
+    assert not fallbacks, (
+        f"the torch-fallback counters moved on {sorted(fallbacks)}; the registered predicate "
+        f"is exactly 0 across every seam this campaign owns"
+    )
+    assert fired, (
+        "no seam counter moved over the generation, so an 8-token run completed with no NKI "
+        "kernel dispatched at all"
+    )
+
+
+def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
+    """THE REGISTERED ACCEPTANCE. Eight tokens, the route predicate, and eight comparisons.
+
+    The criterion, quoted: a tiny config "generates **8/8** tokens without exception, and its
+    logits match a torch reference model built from the same weights at
+    `assert_close(rtol=1e-2, atol=1e-5)`" (plan `:1183`). The tolerance and the token count are
+    the registered ones and this file holds no other; the constraint set is item 6's.
+
+    HOW THE EIGHT TOKENS ARE PRODUCED. One prefill over the prompt gives the first token from
+    its last row; seven decode steps, each one token with the cache growing between them, give
+    the other seven. Both legs are therefore exercised, and the eight appended tokens are the
+    criterion's `8/8`.
+
+    EVERY STEP GOES THROUGH THE CONVERTER, not through the carrier builder directly: the
+    generic runner kwargs are assembled at each step and `_glm5next_model_kwargs` translates
+    them, so this item measures the production path from the runner's own mapping down to the
+    layers. The runner instance is allocated without running `__init__` -- the converter reads
+    two attributes and this file sets both -- so no engine is constructed to measure a
+    translation.
+
+    THE FIRST COMPARISON IS THE CONTROL FOR THE OTHER SEVEN. Step 0 is the 128-token prompt,
+    which is the composition `-054a`'s items 6 and 7 already measured and whose acceptance
+    passed on hardware. A defect in this file's reference reddens that comparison before any
+    decode-leg claim rests on it.
+    """
+    _require_cpu_mode()
+    fixture = _fixture()
+    root = fixture["root"]
+    _assert_config_matches_landed_dials(root.text_config)
+    caches = _runner_shaped_caches(root)
+    root.bind_kv_cache(caches)
+
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+
+    prompt = torch.randint(
+        0,
+        item.STACK_VOCAB_SIZE,
+        (item.STACK_TOKENS,),
+        generator=torch.Generator().manual_seed(item.SEED_STACK_IDS),
+        dtype=torch.int64,
+    )
+
+    produced: list[torch.Tensor] = []
+    generated: list[int] = []
+    steps: list[tuple[str, int, torch.Tensor]] = []
+
+    item._reset_seam_counters()
+    before = item._read_seam_counters()
+
+    converted = _model_kwargs(
+        runner, input_ids=prompt, cached=0, sampling_row=item.STACK_TOKENS - 1
+    )
+    assert sorted(converted) == [
+        "block_size", "input_ids", "layer_carriers", "sampling_positions"
+    ], f"the converter handed the model {sorted(converted)}"
+    assert "slot_mapping" in converted["layer_carriers"][0], (
+        "the prompt step built a decode carrier; the prefill leg is the one that carries "
+        "slot_mapping"
+    )
+    logits = root.forward(**converted)
+    produced.append(logits[-1].float())
+    steps.append(("prefill", int(prompt.shape[0]), prompt.clone()))
+    generated.append(int(logits[-1].argmax()))
+
+    for step in range(GENERATED_TOKENS - 1):
+        cached = item.STACK_TOKENS + step
+        fed = torch.tensor([generated[-1]], dtype=torch.int64)
+        converted = _model_kwargs(runner, input_ids=fed, cached=cached, sampling_row=0)
+        assert "tail" in converted["layer_carriers"][0], (
+            f"decode step {step} built a prefill carrier; the decode leg is the one that "
+            f"carries tail and position"
+        )
+        assert int(converted["layer_carriers"][0]["position"]) == cached
+        logits = root.forward(**converted)
+        produced.append(logits[-1].float())
+        sequence = torch.cat([prompt, torch.tensor(generated, dtype=torch.int64)])
+        steps.append((f"decode{step}", int(sequence.shape[0]), sequence))
+        generated.append(int(logits[-1].argmax()))
+
+    after = item._read_seam_counters()
+
+    print(f"TINYE2E|generation|tokens={len(generated)}|expected={GENERATED_TOKENS}"
+          f"|decode_steps={GENERATED_TOKENS - 1}|ids={generated}")
+    assert len(generated) == GENERATED_TOKENS, (
+        f"the generation appended {len(generated)} token(s) and the criterion is "
+        f"{GENERATED_TOKENS}/{GENERATED_TOKENS}"
+    )
+    assert len(produced) == GENERATED_TOKENS
+
+    _assert_route_predicate_r3("the 8-token generation", before, after)
+
+    # ---- THE COMPARISON. One reference per step, over the tokens that step was given.
+    for (label, length, sequence), got in zip(steps, produced):
+        want = _reference_logits(fixture, sequence[:length])[0].float()
+        spread = float((got - want).abs().max())
+        print(f"TINYE2E|logits|{label}|tokens={length}|rows={tuple(got.shape)}"
+              f"|max_abs_delta={spread:.6g}|rtol=1e-2|atol=1e-5")
+        assert torch.isfinite(got).all(), f"{label} produced a non-finite logit"
+        torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-5)
+
+    # ---- The caches the runner allocated carry the whole generation, not just the prompt.
+    written = int((caches[root.glm5next_layer_banks[0]["name"]][0] != 0).sum())
+    print(f"TINYE2E|cache_written|nonzero_elements={written}"
+          f"|slots={root.glm5next_layer_banks[0]['slots']}")
+    assert written > 0
