@@ -4176,12 +4176,16 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # and the mapping each layer was handed and the tensor it returned.
     recorded_in: list = []
     recorded_out: list = []
+    recorded_mlp: list = []
 
     def _record_input(module, args, kwargs):
         recorded_in.append((module, args, kwargs))
 
     def _record_output(module, args, kwargs, output):
         recorded_out.append((module, output))
+
+    def _record_mlp(module, args, kwargs, output):
+        recorded_mlp.append((module, output))
 
     handles = []
     for layer in layers:
@@ -4191,6 +4195,14 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         handles.append(
             layer.register_forward_hook(_record_output, with_kwargs=True)
         )
+    # THE LAST LAYER'S MLP TOO, FOR A READING ONLY. Conjunct 5 is the only place the
+    # routed bank's output reaches a comparison, and its own agreement with the torch
+    # recompute is not measured anywhere at this band. This hook lets the reading
+    # below report that term directly instead of leaving it to another round. It
+    # rides the same handle list, so the finally below removes it.
+    handles.append(
+        layers[-1].mlp.register_forward_hook(_record_mlp, with_kwargs=True)
+    )
 
     try:
         _reset_seam_counters()
@@ -4705,8 +4717,22 @@ def test_tiny_model_forward_matches_the_reference() -> None:
 
     # ---- CONJUNCT 5: THE FINAL NORM CLOSES THE CHAIN, on the last layer's own
     # output rather than on any earlier one.
+    #
+    # THE REFERENCE MIRRORS THE MODEL'S OWN CAST POINTS HERE, and round 20 is why it
+    # has to. ``_ffn_half`` rounds its output to the residual's dtype before it
+    # returns (``model_fp8.py:6616``) and ``forward`` adds in that dtype
+    # (``model_fp8.py:6714``), so the tensor the final norm receives is bf16 and the
+    # attention residual is quantised INTO it rather than kept whole. A float32 sum
+    # compares the shipped path against arithmetic it never computes, and at THIS
+    # layer that is not a rounding: the run read ``ffn_share=216.05``, so the
+    # residual is 0.46% of the half, below one bf16 step of 2**-7, and the product's
+    # add drops it at the large cells while a float32 sum keeps all of it. That one
+    # difference is larger than this comparison's whole band.
+    # ``increments/investigation-054a-stack-r20.md`` carries the arithmetic. The band
+    # is NOT widened -- the reference is corrected, because a reference comes from
+    # the model's code.
     last = recorded_out[-1][1]
-    final_input = last.float() + ffn[-1]["out"].float()
+    final_input = last + ffn[-1]["out"].to(last.dtype)
     expected = _ffn_norm(final_input, fixture["final_gain"], float(cfg.rms_norm_eps))
     if tuple(got.shape) != (STACK_TOKENS, STACK_HIDDEN_SIZE):
         raise ReferenceShapeError(
@@ -4714,15 +4740,48 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             f"{(STACK_TOKENS, STACK_HIDDEN_SIZE)}"
         )
     # ---- READINGS ONLY, BLOCK B: what dtype does to the spread, and where this item's worst
-    # element actually is. `final_input` is already float32 where it is built, from two bf16 terms.
-    # If the float32 spread is nonzero while the bf16 spread is zero then storage is what erased the
-    # difference; if both are zero the rows were already equal before any rounding here. Nothing gates.
-    _f32 = _row_spread_stats(final_input)
-    _bf = _row_spread_stats(final_input.to(torch.bfloat16))
+    # element actually is. The float32 sum is the one the model does NOT compute, kept here as an
+    # explicit term so this reading still says what storage does to the rows: if the float32 spread
+    # is nonzero while the bf16 spread is zero then storage is what erased the difference; if both
+    # are zero the rows were already equal before any rounding. Nothing gates.
+    _sum_f32 = last.float() + ffn[-1]["out"].float()
+    _f32 = _row_spread_stats(_sum_f32)
+    _bf = _row_spread_stats(_sum_f32.to(torch.bfloat16))
     print(f"TINYFWD|rowspread_dtype|stage=final_input"
           f"|float32_max_spread={_f32[1]:.6g}|bf16_max_spread={_bf[1]:.6g}"
           f"|float32_median_spread={_f32[3]:.6g}|bf16_median_spread={_bf[3]:.6g}"
-          f"|note=float32 is the tensor as summed, before any bf16 cast on this path")
+          f"|note=float32 is the sum the model does not compute; the compared final_input is the bf16 sum")
+    # ---- READINGS ONLY, BLOCK B2: the cast points this comparison now mirrors, and the one
+    # term left over. `residual_share` below one bf16 step is what reddened round 20, and
+    # `routed_bank_term` is the routed bank's own recompute difference, which no other
+    # comparison in this file measures at this band. Nothing gates.
+    _half_ref = ffn[-1]["out"]
+    _resid_share = float(last.abs().max() / _half_ref.abs().max())
+    print(f"TINYFWD|final_add_castpoints|half_reference_dtype={_half_ref.dtype}"
+          f"|residual_dtype={last.dtype}|sum_dtype={final_input.dtype}"
+          f"|residual_share={_resid_share:.6g}|one_bf16_step={2.0 ** -7:.6g}"
+          f"|residual_below_one_step={bool(_resid_share < 2.0 ** -7)}"
+          f"|note=the model casts the half at model_fp8.py:6616 and adds in that dtype at :6714")
+    if recorded_mlp:
+        _half_product = recorded_mlp[-1][1]
+        if tuple(_half_product.shape) != tuple(_half_ref.shape):
+            print(f"TINYFWD|routed_bank_term|reading_skipped"
+                  f"|product_shape={tuple(_half_product.shape)}"
+                  f"|reference_shape={tuple(_half_ref.shape)}"
+                  f"|note=the shapes disagree, so this reading says nothing here")
+        else:
+            _bank_ae = (_half_product.float() - _half_ref.float()).abs()
+            _bank_peak = float(_half_ref.abs().max())
+            print(f"TINYFWD|routed_bank_term|product_dtype={_half_product.dtype}"
+                  f"|reference_dtype={_half_ref.dtype}"
+                  f"|worst_abs={float(_bank_ae.max()):.10g}|peak={_bank_peak:.10g}"
+                  f"|worst_against_the_peak="
+                  f"{(float(_bank_ae.max()) / _bank_peak if _bank_peak else float('inf')):.6g}"
+                  f"|one_bf16_step={2.0 ** -7:.6g}"
+                  f"|cells_apart_after_the_cast="
+                  f"{int((_half_product.to(last.dtype) != _half_ref.to(last.dtype)).sum())}"
+                  f"|cells={int(_half_ref.numel())}"
+                  f"|note=the term conjunct 5 still carries; item 4 bands this path at MOE_RTOL")
     _got_f, _exp_f = got.float(), expected.float()
     _abs_err = (_got_f - _exp_f).abs()
     _rel_err = _abs_err / _exp_f.abs().clamp_min(1e-30)
