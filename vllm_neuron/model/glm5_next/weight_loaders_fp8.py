@@ -873,6 +873,36 @@ _FLOORED_BLOCKS_NAMED_IN_WARNING = 8
 # reinterpreting a single byte pattern. This is the same downscale-plus-
 # compensation as ``model/llama3/weight_loaders_static_fp8.py:51-110``, moved
 # from per-parameter to per-block granularity.
+#
+# THE FACTOR IS AN EXACT POWER OF TWO, NOT THE RANGE RATIO (``-054e``)
+# -------------------------------------------------------------------
+# It is the largest power of two that fits 448 into 240, and both halves of that
+# sentence are load-bearing. **A power of two** shifts an fp8 exponent and leaves
+# the mantissa alone, so the squeeze loses nothing; the ratio 240/448 = 15/28 is
+# not a binary fraction and re-rounds instead -- 14 of the 126 positive
+# magnitudes survive the round trip bit-exactly at 15/28, against 118 at 1/2.
+# **The largest that fits** because 448 * 1/2 = 224 is inside 240 and the next
+# power up is not. The 16 counts between 224 and 240 stay unused on purpose: no
+# reader here assumes the squeezed range FILLS 240, every landed reading being
+# per-value rather than range-fill.
+#
+# The cost, plainly: the smallest subnormal does not survive. 2**-9 halves to
+# exactly half a step and round-to-nearest-even sends it to zero. Eight of the
+# 126 magnitudes are inexact and all eight are below 2**-5 -- a bounded, named
+# loss in place of re-rounding 112 values across the whole grid.
+#
+# WHY LLAMA3'S STATIC PATH KEEPS THE RATIO AND IS NOT ENTERED HERE.
+# ``model/llama3/weight_loaders_static_fp8.py:58-59`` and
+# ``model/llama3/model_static_fp8.py:149-150`` hold their own copies at 240/448.
+# The exactness argument applies there in kind, but a lost value does not cost
+# the same: this path holds one scale per ``[128,128]`` block, floors it at
+# :data:`MINVAL` and names every floored tile through
+# :func:`report_floored_blocks`, so a block pushed towards zero is visible per
+# tile in the load log. The static path holds one scalar per parameter with no
+# per-block census, so the same loss is not observable at load time and cannot be
+# adjudicated from a transcript. Changing it is its own increment with its own
+# measurement; until then the two factors disagreeing is the recorded design
+# position, not a defect.
 
 #: The dtype the squeezed bytes are stored in. OCP ``float8_e4m3fn``, exactly as
 #: the llama3 static path stores them: the grid of representable magnitudes at or
@@ -886,12 +916,22 @@ _FP8_E4M3_MAX = 240.0
 #: OCP ``float8_e4m3fn`` max finite magnitude (the checkpoint's scale space).
 _FP8_E4M3FN_MAX = 448.0
 
-#: Applied to the weight bytes.
-_FP8_WEIGHT_DOWNSCALE = _FP8_E4M3_MAX / _FP8_E4M3FN_MAX
+#: Applied to the weight bytes: the largest power of two that fits
+#: :data:`_FP8_E4M3FN_MAX` inside :data:`_FP8_E4M3_MAX`, written as the literal it
+#: is rather than derived from the two maxima. The derivation is one line of
+#: arithmetic (``448 * 0.5 = 224 <= 240``, and ``448 * 1.0 = 448 > 240``) and it
+#: is CHECKED, not asserted, by
+#: ``test_fp8_downscale_054e_the_squeeze_factor_is_an_exact_power_of_two``; a
+#: derived expression would hide the property behind a division and re-round the
+#: mantissa of 112 of the 126 magnitudes. See the section header above.
+_FP8_WEIGHT_DOWNSCALE = 0.5
 
 #: Applied to the per-block dequant scales -- the exact inverse, so the product
-#: ``byte * scale`` is preserved up to the bytes' own re-quantisation.
-_FP8_SCALE_COMPENSATION = _FP8_E4M3FN_MAX / _FP8_E4M3_MAX
+#: ``byte * scale`` is preserved up to the bytes' own re-quantisation. Exact in
+#: fp32 because both factors are powers of two: ``0.5 * 2.0 == 1.0`` with no
+#: rounding at all, which is what makes the round trip bit-exact for the 118
+#: magnitudes rather than merely close.
+_FP8_SCALE_COMPENSATION = 2.0
 
 #: Floor for a stored per-block dequant scale.
 #:
@@ -1161,11 +1201,13 @@ def report_floored_blocks(
 def downscale_fp8_weight_bytes(weight: torch.Tensor) -> torch.Tensor:
     """Squeeze fp8 weight bytes into the 240 range, or return them unchanged.
 
-    Conditional on :func:`needs_240_downscale`. The ``clamp`` is defensive: the
-    largest OCP magnitude, 448, maps to exactly 240, which is itself
-    representable, so no in-range input can exceed the bound. It is kept because
-    a checkpoint carrying a non-finite or out-of-spec byte would otherwise store
-    one, and because the llama3 precedent clamps at the same point
+    Conditional on :func:`needs_240_downscale`. The ``clamp`` is defensive and
+    since ``-054e`` it has 16 counts of slack rather than none: the largest OCP
+    magnitude, 448, maps to 224, and the bound stays at 240 because 240 is what
+    the trn2 kernel reads, not what this squeeze produces. So no in-range input
+    can reach the bound, let alone exceed it. It is kept because a checkpoint
+    carrying a non-finite or out-of-spec byte would otherwise store one, and
+    because the llama3 precedent clamps at the same point
     (``weight_loaders_static_fp8.py:69-75``).
     """
     if not needs_240_downscale():

@@ -2416,3 +2416,176 @@ def test_skeleton_no_scale_companion_is_requested_for_a_bf16_tensor(
         c079d_control_suppressed_requests=len(suppressed),
         c079d_control_token=C079_SYNTHETIC_SKIP_TOKEN,
     )
+
+
+# =========================================================================== #
+# inc-glm53f-054e -- the squeeze factor is an EXACT POWER OF TWO
+# =========================================================================== #
+#
+# WHAT IT SETTLES. The load path squeezes fp8 bytes by 1/2 and multiplies the
+# per-block dequant scale by 2 rather than using the range ratio 240/448, and one
+# counted number is the reason: `value -> squeeze -> fp8 -> compensate` is
+# BIT-EXACT for 118 of the 126 positive magnitudes at 1/2 and for 14 at the ratio.
+#
+# `-054e` is this file's FIFTH writer and it APPENDS, so it moves no landed line
+# above. Its one item carries `fp8_downscale` and not `skeleton`, joining `-012`'s
+# numerics selection on purpose -- the factor is that partition's own subject, so
+# a `-k fp8_downscale` run that skipped it would read the numerics with the
+# premise missing.
+#
+# WHY THE CONTROLS ARE THE POINT. A test that only asserted "118" would pass for
+# any reason at all, a parallel helper included. Three things are tied together:
+# the counting helper must produce BYTE-IDENTICAL output to
+# `downscale_fp8_weight_bytes` at the module's own factor, so it is not a second
+# implementation; the same helper at the range ratio must read 14, so the count
+# discriminates; and the platform gate is asserted engaged, because disengaged the
+# production function returns its input and every reading here measures nothing.
+#
+# THE COST IS ASSERTED, NOT MENTIONED. All eight inexact magnitudes are odd
+# multiples of 2**-9 -- halving one lands exactly between grid points and
+# round-to-nearest-even resolves away from it -- so the characterisation is
+# asserted rather than the looser "they are all small", and the minimum subnormal
+# is asserted to restore as 0.0.
+
+#: `-054e`'s factor pair, PINNED as literals here and separately read back from
+#: the module below, so this file states the value instead of restating whatever
+#: the module happens to hold.
+FP8_054E_DOWNSCALE = 0.5
+FP8_054E_COMPENSATION = 2.0
+
+#: The pre-`-054e` factor, kept for ONE purpose: the failing control.
+FP8_054E_RANGE_RATIO = FP8_DECLARED_CLAMP / FP8_OCP_MAX
+
+#: The counted values. Every one is derived in
+#: `artifacts/.../increments/054e-c1-fp8-exactness-emulation-20260909T220108Z.out`
+#: by exact-fraction emulation of e4m3fn round-to-nearest-even, independently of
+#: torch, and the plan's Tier T expects the first two by name.
+FP8_054E_EXACT_AT_POWER_OF_TWO = 118
+FP8_054E_EXACT_AT_RANGE_RATIO = 14
+FP8_054E_INEXACT_AT_POWER_OF_TWO = 8
+
+#: The magnitude below which every inexact value sits, and the grid step whose
+#: odd multiples they are: the minimum subnormal, 2**-9.
+FP8_054E_INEXACT_CEILING = 2.0**-5
+FP8_054E_MIN_SUBNORMAL = 2.0**-9
+
+
+def _054e_squeeze_and_restore(
+    magnitudes: torch.Tensor, down: float, up: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the load path's arithmetic over a tensor of magnitudes at a given factor.
+
+    The four steps are `downscale_fp8_weight_bytes`'s own, in its order -- fp32
+    multiply, clamp at the trn2 bound, cast to the stored dtype -- followed by the
+    compensation the dequant applies to the per-block scale. Returns the stored
+    bytes and the restored fp32 values.
+    """
+    stored = (
+        (magnitudes.to(torch.float32) * down)
+        .clamp(-FP8_DECLARED_CLAMP, FP8_DECLARED_CLAMP)
+        .to(_fp8_module._FP8_DTYPE)
+    )
+    return stored, stored.to(torch.float32) * up
+
+
+def test_fp8_downscale_054e_the_squeeze_factor_is_an_exact_power_of_two() -> None:
+    """The factor is a power of two, it is the largest that fits, and 118 round-trip."""
+    assert needs_240_downscale() is True, (
+        "the platform gate is disengaged, so `downscale_fp8_weight_bytes` returns its "
+        "input unchanged and every count below would measure nothing. The clamp maximum "
+        "is resolved at IMPORT time, so no fixture can repair this -- "
+        "NEURON_PLATFORM_TARGET_OVERRIDE=trn2 belongs in the process invocation."
+    )
+
+    down = _fp8_module._FP8_WEIGHT_DOWNSCALE
+    up = _fp8_module._FP8_SCALE_COMPENSATION
+
+    # (a) The module holds the pinned pair, and both halves are exact powers of
+    # two. `.hex()` reads the bits rather than trusting a decimal literal: a power
+    # of two has significand `1.0000000000000` and nothing else.
+    assert (down, up) == (FP8_054E_DOWNSCALE, FP8_054E_COMPENSATION)
+    assert down.hex() == "0x1.0000000000000p-1"
+    assert up.hex() == "0x1.0000000000000p+1"
+    assert down * up == 1.0
+
+    # (b) It is the LARGEST power of two that fits 448 inside 240 -- the next one
+    # up leaves the OCP maximum outside the bound the trn2 kernel reads.
+    assert FP8_OCP_MAX * down <= FP8_DECLARED_CLAMP
+    assert FP8_OCP_MAX * (down * 2.0) > FP8_DECLARED_CLAMP
+
+    magnitudes = _fp8_representable_magnitudes()
+    assert magnitudes.numel() == 126
+
+    # (c) The counting helper IS the production path, byte for byte. Compared as
+    # uint8 because that asks about the stored bytes and nothing else.
+    stored, restored = _054e_squeeze_and_restore(magnitudes, down, up)
+    production = downscale_fp8_weight_bytes(magnitudes)
+    assert torch.equal(production.view(torch.uint8), stored.view(torch.uint8))
+
+    # (d) THE COUNTED VALUE.
+    exact = restored == magnitudes.to(torch.float32)
+    exact_count = int(exact.sum().item())
+    inexact = magnitudes[~exact]
+
+    # (e) The eight that do not survive, characterised by WHY: each is an odd
+    # multiple of the minimum subnormal, so halving it lands exactly between two
+    # grid points and round-to-nearest-even resolves the tie away from it.
+    odd_multiples = [
+        float(value) / FP8_054E_MIN_SUBNORMAL for value in inexact.tolist()
+    ]
+    smallest_restored = float(
+        _054e_squeeze_and_restore(
+            torch.tensor([FP8_054E_MIN_SUBNORMAL]), down, up
+        )[1].item()
+    )
+
+    # (f) THE FAILING CONTROL: the same helper at the range ratio must read 14.
+    ratio_stored, ratio_restored = _054e_squeeze_and_restore(
+        magnitudes, FP8_054E_RANGE_RATIO, 1.0 / FP8_054E_RANGE_RATIO
+    )
+    ratio_exact_count = int((ratio_restored == magnitudes.to(torch.float32)).sum().item())
+
+    zero_restored = float(
+        _054e_squeeze_and_restore(torch.tensor([0.0]), down, up)[1].item()
+    )
+
+    print(
+        f"S054E|exactness|factor={down}|compensation={up}"
+        f"|exact_round_trips={exact_count}/126|want={FP8_054E_EXACT_AT_POWER_OF_TWO}"
+        f"|at_range_ratio={ratio_exact_count}/126|want={FP8_054E_EXACT_AT_RANGE_RATIO}"
+        f"|inexact={inexact.numel()}|worst_inexact={float(inexact.max().item())}"
+        f"|ceiling={FP8_054E_INEXACT_CEILING}"
+        f"|min_subnormal_restores_as={smallest_restored}|zero_restores_as={zero_restored}"
+        f"|stored_max={float(stored.to(torch.float32).max().item())}"
+        f"|bound={FP8_DECLARED_CLAMP}"
+    )
+    print(f"S054E|inexact_as_multiples_of_the_min_subnormal|{odd_multiples}")
+
+    assert exact_count == FP8_054E_EXACT_AT_POWER_OF_TWO
+    assert ratio_exact_count == FP8_054E_EXACT_AT_RANGE_RATIO
+    assert exact_count > ratio_exact_count
+    assert inexact.numel() == FP8_054E_INEXACT_AT_POWER_OF_TWO
+    assert float(inexact.max().item()) < FP8_054E_INEXACT_CEILING
+    assert all(multiple % 2 == 1 for multiple in odd_multiples)
+    assert smallest_restored == 0.0
+    assert zero_restored == 0.0
+
+    # The headroom is real and unused, and no reading anywhere depends on it.
+    assert float(stored.to(torch.float32).max().item()) == FP8_OCP_MAX * down
+    assert FP8_OCP_MAX * down < FP8_DECLARED_CLAMP
+
+    _record_fp8(
+        c054e_factor=down,
+        c054e_compensation=up,
+        c054e_exact_round_trips=exact_count,
+        c054e_exact_round_trips_at_range_ratio=ratio_exact_count,
+        c054e_inexact=inexact.numel(),
+        c054e_worst_inexact=float(inexact.max().item()),
+        c054e_inexact_as_multiples_of_min_subnormal=odd_multiples,
+        c054e_min_subnormal_restores_as=smallest_restored,
+        c054e_stored_max=float(stored.to(torch.float32).max().item()),
+        c054e_stored_bytes_agree_with_production=True,
+        c054e_range_ratio_stored_max=float(
+            ratio_stored.to(torch.float32).max().item()
+        ),
+    )
