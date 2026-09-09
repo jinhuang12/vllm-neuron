@@ -3686,6 +3686,28 @@ def _stack_outside_tolerance(label: str, moved: torch.Tensor,
 # four-stream carrier; at ``hc_mult`` 1 the reference does not degenerate to an #
 # add either, because its gates are sigmoids plus an epsilon.                    #
 # --------------------------------------------------------------------------- #
+def _row_spread_stats(rows: "torch.Tensor") -> tuple:
+    """Relative L2 spread over every pair of rows: ``(rows, max, min, median)``.
+
+    READING SUPPORT ONLY. Nothing in here gates and nothing in here stops a caller. The metric is the
+    pairwise L2 distance divided by the mean of the two row norms, so it is scale free and comparable
+    across stages whose magnitudes differ by orders of magnitude. Every pair is measured rather than
+    sampled: for ``n`` rows that is ``n * (n - 1) / 2`` values, and the upper triangle is taken so no
+    pair is counted twice and no row is compared against itself.
+    """
+    flat = rows.reshape(rows.shape[0], -1).float()
+    dist = (flat.unsqueeze(1) - flat.unsqueeze(0)).norm(dim=2)
+    norms = flat.norm(dim=1)
+    mean = (norms.unsqueeze(1) + norms.unsqueeze(0)) / 2.0
+    spread = dist / mean.clamp_min(1e-12)
+    upper = torch.triu(torch.ones_like(spread), diagonal=1) > 0
+    vals = spread[upper]
+    if vals.numel() == 0:
+        return (int(flat.shape[0]), 0.0, 0.0, 0.0)
+    return (int(flat.shape[0]), float(vals.max()), float(vals.min()),
+            float(vals.median()))
+
+
 def test_tiny_model_forward_matches_the_reference() -> None:
     """The decoder stack equals its torch composition, layer boundary by boundary.
 
@@ -3787,6 +3809,28 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 f"position {index} of the recorded order is not layer {index} of "
                 f"the stack, so the loop did not run the layers in config order"
             )
+
+    # ---- READINGS ONLY, BLOCK A: is each row of the hidden state distinct, stage by stage.
+    # Placed HERE, above every comparison in this item, so a per-layer redness further down cannot
+    # suppress the rows that would explain it. Grant 117 measured the root item's 128 rows as bit
+    # identical -- spread exactly 0 over all 8128 pairs -- and these rows say whether they are
+    # already equal at the embedding or become equal at a layer, and at which one. Nothing gates.
+    _sp = _row_spread_stats(recorded_in[0][1][0])
+    print(f"TINYFWD|rowspread_stage|stage=embedding"
+          f"|dtype={recorded_in[0][1][0].dtype}|rows={_sp[0]}"
+          f"|max_spread={_sp[1]:.6g}|min_spread={_sp[2]:.6g}|median_spread={_sp[3]:.6g}")
+    for _stage in range(len(layers)):
+        _sin = recorded_in[_stage][1][0]
+        _sout = recorded_out[_stage][1]
+        _spi = _row_spread_stats(_sin)
+        _spo = _row_spread_stats(_sout)
+        print(f"TINYFWD|rowspread_stage|stage=layer{_stage}_in"
+              f"|dtype={_sin.dtype}|rows={_spi[0]}|max_spread={_spi[1]:.6g}"
+              f"|min_spread={_spi[2]:.6g}|median_spread={_spi[3]:.6g}")
+        print(f"TINYFWD|rowspread_stage|stage=layer{_stage}_out"
+              f"|dtype={_sout.dtype}|rows={_spo[0]}|max_spread={_spo[1]:.6g}"
+              f"|min_spread={_spo[2]:.6g}|median_spread={_spo[3]:.6g}")
+    # ---- end of the BLOCK A readings.
 
     # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX. Exact equality, not a tolerance:
     # the lookup copies rows and computes nothing, so a difference of any size is a
@@ -3896,6 +3940,34 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             f"the forward returned {tuple(got.shape)}, expected "
             f"{(STACK_TOKENS, STACK_HIDDEN_SIZE)}"
         )
+    # ---- READINGS ONLY, BLOCK B: what dtype does to the spread, and where this item's worst
+    # element actually is. `final_input` is already float32 where it is built, from two bf16 terms.
+    # If the float32 spread is nonzero while the bf16 spread is zero then storage is what erased the
+    # difference; if both are zero the rows were already equal before any rounding here. Nothing gates.
+    _f32 = _row_spread_stats(final_input)
+    _bf = _row_spread_stats(final_input.to(torch.bfloat16))
+    print(f"TINYFWD|rowspread_dtype|stage=final_input"
+          f"|float32_max_spread={_f32[1]:.6g}|bf16_max_spread={_bf[1]:.6g}"
+          f"|float32_median_spread={_f32[3]:.6g}|bf16_median_spread={_bf[3]:.6g}"
+          f"|note=float32 is the tensor as summed, before any bf16 cast on this path")
+    _got_f, _exp_f = got.float(), expected.float()
+    _abs_err = (_got_f - _exp_f).abs()
+    _rel_err = _abs_err / _exp_f.abs().clamp_min(1e-30)
+    _cols = int(_abs_err.shape[1])
+    _ar, _ac = divmod(int(_abs_err.argmax()), _cols)
+    _rr, _rc = divmod(int(_rel_err.argmax()), _cols)
+    print(f"TINYFWD|model_forward_worst|kind=worst_abs|row={_ar}|col={_ac}"
+          f"|expected={float(_exp_f[_ar, _ac]):.10g}|got={float(_got_f[_ar, _ac]):.10g}"
+          f"|abs={float(_abs_err[_ar, _ac]):.6g}|rel={float(_rel_err[_ar, _ac]):.6g}")
+    print(f"TINYFWD|model_forward_worst|kind=worst_rel|row={_rr}|col={_rc}"
+          f"|expected={float(_exp_f[_rr, _rc]):.10g}|got={float(_got_f[_rr, _rc]):.10g}"
+          f"|abs={float(_abs_err[_rr, _rc]):.6g}|rel={float(_rel_err[_rr, _rc]):.6g}"
+          f"|expected_abs_max={float(_exp_f.abs().max()):.10g}")
+    print(f"TINYFWD|model_forward_worst|kind=grant_117_reported|row=55|col=6"
+          f"|expected={float(_exp_f[55, 6]):.10g}|got={float(_got_f[55, 6]):.10g}"
+          f"|abs={float(_abs_err[55, 6]):.6g}|rel={float(_rel_err[55, 6]):.6g}"
+          f"|one_bf16_ulp_at_1={float(2.0 ** -8):.6g}")
+    # ---- end of the BLOCK B readings.
     print(f"TINYFWD|stack_compare|max_abs_diff="
           f"{float((got.float() - expected.float()).abs().max()):.10g}"
           f"|peak_reference={float(expected.abs().max()):.10g}")
