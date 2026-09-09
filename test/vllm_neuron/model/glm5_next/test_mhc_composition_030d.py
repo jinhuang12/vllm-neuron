@@ -7,13 +7,24 @@ own model file. Neither of them wired the layer into the decoder: the class was
 bound to no layer at all. ``-030d`` does the wiring, in four commits, and this
 file grows with the first three of them.
 
-COMMIT 1 IS THE BIND, and it is the whole subject of every item below. The six
-mHC tensors the checkpoint carries per layer -- ``hc_attn_{base,fn,scale}`` and
-``hc_ffn_{base,fn,scale}``, 270 keys over layers 0-44 -- reach two
-:class:`Glm5NextHyperConnection` instances per layer ONCE, after the load, on the
-same load-time-prep walk this tree already runs for its projection and scale
-preps. Nothing here runs a forward: what a bound site COMPUTES is commit 2's and
-commit 3's subject, measured against the reference pair.
+TWO COMMITS ARE IN THIS FILE SO FAR, and the items are grouped in that order.
+
+**Commit 1, THE BIND.** The six mHC tensors the checkpoint carries per layer --
+``hc_attn_{base,fn,scale}`` and ``hc_ffn_{base,fn,scale}``, 270 keys over layers
+0-44 -- reach two :class:`Glm5NextHyperConnection` instances per layer ONCE, after
+the load, on the same load-time-prep walk this tree already runs for its projection
+and scale preps. Those items run no forward.
+
+**Commit 2, ROUTE R3.** Each layer forward gains ONE optional ``streams``
+keyword: absent is the one-stream residual add the method already did, present runs
+the four-stream mHC pair around the same attention half. The branch REFUSES BOTH
+WAYS, which is arm (4) of this block's acceptance -- two named refusals -- because
+an optional keyword with a default is exactly how a silent wrong route gets in.
+Arm (5), the three landed layer suites re-run unedited with zero edits to their
+expected values, is a RUN rather than an item here.
+
+The feed-forward site and the carrier are commit 3's, and the numeric comparison
+against the reference at ``T = 128`` belongs to that fixture.
 
 WHY THE TWO INSTANCES ARE NOT SUBMODULES, which is the one design decision this
 commit had to make. Registering them would put their three parameters each into
@@ -25,17 +36,18 @@ commit had to make. Registering them would put their three parameters each into
 measures that with a firing control -- a registered site DOES add three names, so
 the counted zero is a reading rather than a tautology.
 
-NO TOLERANCE AND NO COMPARATOR IS REGISTERED HERE. Commit 1 touches no
-arithmetic: every item is a structural or a bookkeeping reading. The registered
-pair stays ``test_mhc_layer.py``'s ``(1e-2, 1e-5)``, cited when commits 2 and 3
-need it (P9).
+NO TOLERANCE AND NO COMPARATOR IS REGISTERED HERE. Every item so far is a
+structural, bookkeeping or counted-route reading, and the one numeric comparison --
+the one-stream route against the same three steps -- is BITWISE, so it needs no
+tolerance at all. The registered pair stays ``test_mhc_layer.py``'s
+``(1e-2, 1e-5)``, cited when commit 3's reference comparison needs it (P9).
 
 THE IMPLEMENTATION MODULE IS IMPORTED INSIDE TEST BODIES, never at module scope,
 for the reason ``test_mhc_layer.py:102-107`` records: ``test_factory.py``'s C03
 asserts ``model_fp8`` is absent from ``sys.modules``, and pytest imports every
 collected module before running any test.
 
-Command (Tier N harness, plan rev 286)::
+Command (Tier N harness, plan rev 288)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \\
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \\
@@ -147,6 +159,73 @@ def _kda_layer(text_config, layer_idx: int = 0):
 
 def _dsa_layer(text_config, layer_idx: int = 1):
     return _impl().Glm5NextDSALayer(text_config, layer_idx, 1)
+
+
+def _layer_of(family: str, text_config):
+    return _kda_layer(text_config) if family == "kda" else _dsa_layer(text_config)
+
+
+class _StubAttention(nn.Module):
+    """Stands in for the attention half, and RECORDS what it was handed.
+
+    The composition around the sublayer is what commit 2 wires, and a real
+    attention half would make every reading here depend on two other increments'
+    kernels. So the stub is deterministic and nonlinear -- ``tanh(x) * 1.5``, the
+    same stand-in ``test_mhc_layer.py:345`` uses -- and it keeps the shape of every
+    input it saw, which is how the items below tell the two routes apart.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[tuple[int, ...]] = []
+
+    def forward(self, hidden_states: torch.Tensor, **_kwargs: object) -> torch.Tensor:
+        self.seen.append(tuple(hidden_states.shape))
+        return torch.tanh(hidden_states) * 1.5
+
+
+def _install_stub(layer) -> _StubAttention:
+    """Replace the attention half, under the attribute the class itself names."""
+    stub = _StubAttention()
+    setattr(layer, type(layer).ATTENTION_ATTR, stub)
+    return stub
+
+
+def _norm_ready(layer, text_config):
+    """Load the one weight ``_input_norm`` reads, so the plain route can run."""
+    setattr(
+        layer,
+        "input_layernorm_weight",
+        nn.Parameter(
+            torch.ones(int(text_config.hidden_size), dtype=torch.float32),
+            requires_grad=False,
+        ),
+    )
+    return layer
+
+
+def _call_kwargs(family: str) -> dict[str, object]:
+    """The carriers each family's forward requires, as values the stub ignores.
+
+    Both forwards cast some of these (``int(start_position)``,
+    ``float(softmax_scale)``), so the types here are the types those casts accept.
+    Nothing below reads them: the attention half is the stub.
+    """
+    if family == "kda":
+        return {
+            "conv_state": torch.zeros(1, dtype=torch.float32),
+            "recurrent_state": torch.zeros(1, dtype=torch.float32),
+            "is_prefill": True,
+        }
+    return {
+        "latent_cache": torch.zeros(1, dtype=torch.float32),
+        "pool_cache": torch.zeros(1, dtype=torch.float32),
+        "seq_lens": torch.ones(1, dtype=torch.int32),
+        "start_position": 0,
+        "softmax_scale": 1.0,
+        "max_seq_len": 8,
+        "page_size": 4,
+    }
 
 
 def _model_source() -> tuple[str, ast.Module]:
@@ -774,3 +853,234 @@ def test_030d_a_second_bind_is_counted_rather_than_refused() -> None:
             f"after the second bind site {site} points somewhere other than the "
             f"layer's own tensor"
         )
+
+
+# --------------------------------------------------------------------------- #
+# COMMIT 2 -- route R3: one optional keyword, and a branch that refuses both   #
+# ways. Arm (4) of the block's acceptance is these two named refusals; arm (5)  #
+# is the three landed layer suites re-run unedited, which is a run and not an   #
+# item here.                                                                   #
+# --------------------------------------------------------------------------- #
+TOKENS = 8
+
+
+def _streams(text_config, *, tokens: int = TOKENS, seed: int = 11) -> torch.Tensor:
+    """``[T, S, H]`` residual streams, small enough to stay out of sigmoid saturation."""
+    gen = torch.Generator().manual_seed(seed)
+    return (
+        torch.randn(
+            tokens,
+            int(text_config.hc_mult),
+            int(text_config.hidden_size),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        * 0.05
+    )
+
+
+def _tokens(text_config, *, tokens: int = TOKENS, seed: int = 12) -> torch.Tensor:
+    gen = torch.Generator().manual_seed(seed)
+    return (
+        torch.randn(
+            tokens, int(text_config.hidden_size), generator=gen, dtype=torch.float32
+        )
+        * 0.05
+    )
+
+
+def test_030d_the_site_names_are_the_leaves_own_middle_words() -> None:
+    """The two site constants are the derived keys, not two strings typed twice.
+
+    ``MHC_ATTENTION_SITE`` and ``MHC_FFN_SITE`` are what the layer forwards index
+    the bound sites with, and :func:`_mhc_leaves_by_site` derives the same two keys
+    off ``MHC_LEAVES``. If those ever disagreed the forward would raise a
+    ``KeyError`` on a served token, so the two are read against each other here.
+    """
+    impl = _impl()
+    derived = sorted(impl._mhc_leaves_by_site())
+    named = sorted({impl.MHC_ATTENTION_SITE, impl.MHC_FFN_SITE})
+    say("site-names", f"derived={derived}", f"named={named}")
+    assert derived == named, (
+        f"the leaves group into {derived} and the forwards index {named}; a "
+        f"mismatch is a KeyError on a served token"
+    )
+    assert impl.MHC_ATTENTION_SITE != impl.MHC_FFN_SITE
+
+
+@pytest.mark.parametrize("family", ["kda", "dsa"])
+def test_030d_the_one_stream_route_computes_what_it_computed_before(
+    family: str,
+) -> None:
+    """No streams on a layer with no mHC weight: pre-norm, attend, plain add.
+
+    The want is computed here from the layer's OWN norm and the same stub, so the
+    reading is that the route still composes those three steps in that order --
+    not that it agrees with a number written down. Bitwise equality, because both
+    sides run the identical operations on the identical operands; a tolerance here
+    would hide a reordering.
+
+    This is the route the draft head takes (``mtp.py:158``) and the route every
+    landed direct caller takes, which is why it must survive the keyword's arrival
+    untouched.
+    """
+    text_config = _text_config()
+    layer = _norm_ready(_layer_of(family, text_config), text_config)
+    stub = _install_stub(layer)
+    hidden = _tokens(text_config)
+
+    got = layer.forward(hidden, **_call_kwargs(family))
+    # The want runs the SAME stub on the SAME norm, so this item cannot pass by
+    # agreeing with a formula copied out of the stub. That second entry is why
+    # ``stub.seen`` reads two shapes below.
+    want = hidden + stub(layer._input_norm(hidden))
+
+    say(f"plain-{family}", f"in={tuple(hidden.shape)}", f"out={tuple(got.shape)}",
+        f"stub_saw={stub.seen}")
+    assert tuple(got.shape) == tuple(hidden.shape)
+    assert got.dtype == hidden.dtype
+    assert torch.equal(got, want), (
+        "the one-stream route no longer computes pre-norm, attend, plain add on "
+        f"the operands it is given; max deviation {float((got - want).abs().max())}"
+    )
+    assert stub.seen == [tuple(hidden.shape), tuple(hidden.shape)], (
+        f"the attention half saw {stub.seen}; it must be entered once by the route "
+        f"and once by the want above, each on the [T, H] tokens"
+    )
+
+
+@pytest.mark.parametrize("family", ["kda", "dsa"])
+def test_030d_a_layer_carrying_mhc_weights_refuses_a_one_stream_call(
+    family: str,
+) -> None:
+    """Refusal 1 of the two the block declares, named.
+
+    A layer that carries the six loaded tensors and is called without streams
+    would run the residual add this block exists to replace, and nothing
+    downstream could tell -- the shapes agree and the numbers are plausible. So it
+    is refused. THE CONTROL IS THE SAME LAYER WITH NO mHC WEIGHT, which the item
+    above reads: without it this refusal could be a fixture artefact.
+    """
+    impl = _impl()
+    text_config = _text_config()
+    layer = _norm_ready(_layer_of(family, text_config), text_config)
+    _install_stub(layer)
+    _load_the_six(layer, text_config)
+
+    with pytest.raises(impl.Glm5NextHyperConnectionError) as raised:
+        layer.forward(_tokens(text_config), **_call_kwargs(family))
+
+    message = str(raised.value)
+    say(f"refusal1-{family}", message[:150])
+    assert "no streams" in message, message
+    assert any(leaf in message for leaf in impl.MHC_LEAVES if leaf.startswith("hc_")), (
+        f"the refusal names no mHC weight, so a reader cannot see why it fired: "
+        f"{message}"
+    )
+
+
+@pytest.mark.parametrize("family", ["kda", "dsa"])
+def test_030d_a_layer_carrying_none_refuses_a_streams_call(family: str) -> None:
+    """Refusal 2 of the two, named -- the draft head's layer called with streams.
+
+    The checkpoint gives layer 45 none of the six leaves (270 keys over layers
+    0-44), so a streams call on such a layer is a caller error rather than a
+    configuration to serve.
+    """
+    impl = _impl()
+    text_config = _text_config()
+    layer = _norm_ready(_layer_of(family, text_config), text_config)
+    _install_stub(layer)
+
+    with pytest.raises(impl.Glm5NextHyperConnectionError) as raised:
+        layer.forward(
+            _tokens(text_config), streams=_streams(text_config), **_call_kwargs(family)
+        )
+
+    message = str(raised.value)
+    say(f"refusal2-{family}", message[:150])
+    assert "carries none of the six" in message, message
+    assert "pass no streams" in message, message
+
+
+def test_030d_a_loaded_but_unbound_layer_refuses_by_naming_the_bind() -> None:
+    """The third way to get this wrong, and it names the step that was skipped.
+
+    A layer can hold the six tensors and still have no site, because the bind runs
+    on the load path. That call cannot be served and it is not the draft head's
+    case either, so the refusal names ``_run_load_time_preps`` rather than telling
+    the caller to drop the streams.
+    """
+    impl = _impl()
+    text_config = _text_config()
+    layer = _norm_ready(_kda_layer(text_config), text_config)
+    _install_stub(layer)
+    _load_the_six(layer, text_config)
+
+    with pytest.raises(impl.Glm5NextHyperConnectionError) as raised:
+        layer.forward(
+            _tokens(text_config), streams=_streams(text_config), **_call_kwargs("kda")
+        )
+
+    message = str(raised.value)
+    say("refusal-unbound", message[:170])
+    assert "no site is bound" in message and "_run_load_time_preps" in message, message
+
+
+@pytest.mark.parametrize("family", ["kda", "dsa"])
+def test_030d_the_streams_route_runs_the_pair_around_the_same_attention_half(
+    family: str,
+) -> None:
+    """The streams route: collapse, norm, attend, re-mix -- one entry per seam.
+
+    FIVE READINGS, all counted rather than asserted:
+
+    1. the attention half is entered exactly ONCE, on the collapsed ``[T, H]``
+       single stream -- so the pair runs AROUND the sublayer, not beside it;
+    2. the return is ``[T, S, H]``, the streams the carrier will keep;
+    3. ``inc-glm53f-028``'s Sinkhorn seam is entered once per layer call;
+    4. ``inc-glm53f-029``'s combine seam is entered once per layer call;
+    5. both torch-fallback counters stay at ZERO -- a fallback would mean the
+       reading measured torch against torch (P13, and the route predicate this
+       block declares in form R-2: it reads the counters the two seams own).
+
+    THE SEAMS HAVE NO TORCH PATH, so this item needs the NKI simulator
+    (``NKI_SIMULATOR=1``, the Tier N harness this file's header records). A bare
+    CPU-mode run raises from the seam, which is the intended behaviour rather than
+    a failure of this route.
+    """
+    from vllm_neuron.functional.mhc import hyper_connection as combine_mod
+    from vllm_neuron.functional.mhc import sinkhorn as sinkhorn_mod
+
+    text_config = _text_config()
+    layer = _norm_ready(_layer_of(family, text_config), text_config)
+    stub = _install_stub(layer)
+    _load_the_six(layer, text_config)
+    layer.bind_hyper_connection_sites(text_config, torch.device("cpu"))
+    streams = _streams(text_config)
+
+    sinkhorn_mod.reset_dispatch_counters()
+    combine_mod.reset_dispatch_counters()
+    got = layer.forward(_tokens(text_config), streams=streams, **_call_kwargs(family))
+    sink, comb = sinkhorn_mod.dispatch_counters(), combine_mod.dispatch_counters()
+
+    say(f"streams-{family}", f"out={tuple(got.shape)}", f"stub_saw={stub.seen}")
+    say(f"streams-{family}-route", f"sinkhorn={sink}", f"combine={comb}")
+
+    tokens, sites, hidden = tuple(streams.shape)
+    assert stub.seen == [(tokens, hidden)], (
+        f"the attention half saw {stub.seen}; the pair must hand it exactly one "
+        f"collapsed [T, H] stream per layer call"
+    )
+    assert tuple(got.shape) == (tokens, sites, hidden), (
+        f"the route returned {tuple(got.shape)}, not the [T, S, H] streams the "
+        f"carrier expects"
+    )
+    assert sink == (1, 0), (
+        f"the Sinkhorn seam read {sink} for one layer call; one NKI dispatch and "
+        f"no fallback is what per-layer-call means"
+    )
+    assert comb == (1, 0), (
+        f"the combine seam read {comb} for one layer call; one NKI dispatch and no "
+        f"fallback is what per-layer-call means"
+    )

@@ -4263,40 +4263,67 @@ class Glm5NextKDALayer(nn.Module):
         recurrent_state: torch.Tensor,
         is_prefill: bool,
         chunk_size: int | None = None,
+        streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Pre-norm, then the linear-attention half, then the residual add.
+        """The linear-attention half, mixed either by mHC or by a plain add.
 
-        WHAT THIS FORWARD DELIBERATELY DOES NOT DO, AND WHY IT IS NOT A GAP.
-        A finished decoder layer also runs its feed-forward half and its
-        hyper-connection mixing. Neither is reachable at this milestone and
-        neither is this increment's to write:
+        TWO ROUTES, AND THE KEYWORD PICKS ONE (``inc-glm53f-030d``, route R3).
 
-        * ``self.mlp`` raises whichever branch ``_build_mlp`` chose --
-          ``Glm5NextDenseMLP.forward`` and ``Glm5NextMoEBlock.forward`` are both
-          still stubs -- and those sections belong to ``inc-glm53f-031`` through
-          ``inc-glm53f-033``.
-        * the six mHC weights sit flat on this layer but no
-          ``Glm5NextHyperConnection`` instance is bound to it yet, and that
-          wiring is ``inc-glm53f-030``'s section.
+        * ``streams`` ABSENT: pre-norm, attention, plain residual add -- the same
+          computation this method did before ``inc-glm53f-030d``, on the same
+          operands. The draft head needs this route (``mtp.py:158`` hands this
+          class a one-stream ``[T, H]``), and so does every landed direct caller.
+        * ``streams`` PRESENT: the four-stream mHC pair runs around the same
+          attention half -- collapse the streams, norm, attend, then re-mix --
+          which is what the target model does (``reference:1293-1305``: ``attn_hc``
+          before ``self_attn``, then the post-and-comb mix instead of an add).
 
-        D14 tells an implementer whose increment would have to touch a class
-        outside its own section to raise that rather than widen its surface, so
-        this forward stops at the attention half and ``inc-glm53f-054`` joins the
-        halves when it writes the 45-layer forward.
+        THE BRANCH REFUSES BOTH WAYS, in :func:`_mhc_attention_site`, so the
+        optional keyword cannot silently reinstate the one-stream network.
 
-        Args and returns are the attention module's, passed through unchanged;
-        see :meth:`Glm5NextKDAAttention.forward` for what the two carriers mean.
+        THE ATTENTION HALF IS WRITTEN ONCE, as ``attention_half`` below, and both
+        routes run that one closure. A second copy of the attention call is how the
+        two routes come to disagree about what they wrap.
+
+        WHAT THIS FORWARD STILL DOES NOT DO. ``self.mlp`` is not called here: the
+        feed-forward half is ``Glm5NextModel._ffn_half``'s
+        (``inc-glm53f-054a``), and the FFN mHC site is composed there by
+        ``inc-glm53f-030d`` part (a). The six mHC weights sit flat on this layer
+        and the two sites are bound to it after the load, by
+        :meth:`bind_hyper_connection_sites`.
+
+        Args:
+            streams: ``[T, S, H]`` residual streams, or ``None`` for the
+                one-stream route. Every other argument is the attention module's,
+                passed through unchanged; see
+                :meth:`Glm5NextKDAAttention.forward` for what the two carriers
+                mean.
+
+        Returns:
+            ``[T, H]`` on the one-stream route -- the input dtype, unchanged. On
+            the streams route, ``[T, S, H]`` fp32: the combine seam's own return
+            dtype, which ``inc-glm53f-030`` deliberately does not re-cast, and the
+            carrier decides what to do with it.
+
+        Raises:
+            Glm5NextHyperConnectionError: from :func:`_mhc_attention_site` when the
+                route and this layer's weights disagree, or from the seams on a
+                geometry they cannot serve.
         """
-        residual = hidden_states
-        normed = self._input_norm(hidden_states)
-        attn_out = self.attention(
-            normed,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
-            is_prefill=is_prefill,
-            chunk_size=chunk_size,
-        )
-        return residual + attn_out
+
+        def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
+            return self.attention(
+                self._input_norm(single_stream),
+                conv_state=conv_state,
+                recurrent_state=recurrent_state,
+                is_prefill=is_prefill,
+                chunk_size=chunk_size,
+            )
+
+        site = _mhc_attention_site(self, streams)
+        if site is None:
+            return hidden_states + attention_half(hidden_states)
+        return site.forward(streams, attention_half)
 
 
 # ---------------------------------------------------------------------------
@@ -6709,8 +6736,9 @@ class Glm5NextDSALayer(nn.Module):
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
         position: int | None = None,
+        streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Pre-norm, then the sparse attention half, then the residual add.
+        """The sparse-attention half, mixed either by mHC or by a plain add.
 
         THE ATTENTION HALF IS ONE CALL NOW (``inc-glm53f-054a``, a declared
         second writer in this section by the invitation two paragraphs down: the
@@ -6734,39 +6762,48 @@ class Glm5NextDSALayer(nn.Module):
         callee states the same ruling, and it is now the one place that realises
         it.
 
-        WHAT THIS FORWARD DELIBERATELY DOES NOT DO, AND WHY IT IS NOT A GAP. The
-        same two absences the KDA sibling records, for the same D14 reason:
+        TWO ROUTES, AND THE KEYWORD PICKS ONE (``inc-glm53f-030d``, route R3). The
+        KDA sibling records the whole rule and this half behaves identically:
+        ``streams`` absent is the plain residual add this method did before, and
+        ``streams`` present runs the four-stream mHC pair around the same sparse
+        attention half. One rule refuses both ways, in
+        :func:`_mhc_attention_site`, and the attention call is written once as
+        ``attention_half`` so the two routes cannot disagree about what they wrap.
 
-        * ``self.mlp`` raises whichever branch ``_build_mlp`` chose, and those
-          sections belong to ``inc-glm53f-031`` through ``inc-glm53f-033``.
-        * the six mHC weights sit flat on this layer but no
-          ``Glm5NextHyperConnection`` instance is bound to it, and that wiring is
-          ``inc-glm53f-030``'s section.
-
-        So this forward stops at the attention half and ``inc-glm53f-054`` joins
-        the halves when it writes the 45-layer forward.
+        WHAT THIS FORWARD STILL DOES NOT DO. ``self.mlp`` is not called here: the
+        feed-forward half is ``Glm5NextModel._ffn_half``'s (``inc-glm53f-054a``)
+        and its mHC site is composed there by ``inc-glm53f-030d`` part (a). The
+        six mHC weights sit flat on this layer and its two sites are bound after
+        the load, by :meth:`bind_hyper_connection_sites`.
 
         THE TWO CARRIERS ARE THE CALLER'S, both written in place: ``latent_cache``
         is ``attend()``'s own contract and ``pool_cache`` and ``tail`` are the
         indexer's. See :meth:`Glm5NextDSAIndexer.forward` for what each means and
-        why ``max_seq_len`` is a python int.
+        why ``max_seq_len`` is a python int. ``streams`` is ``[T, S, H]`` or
+        ``None``; the return is ``[T, H]`` in the input dtype on the one-stream
+        route and ``[T, S, H]`` fp32 on the streams route, which is the combine
+        seam's own return dtype.
         """
-        residual = hidden_states
-        normed = self._input_norm(hidden_states)
-        attn_out = self.attention(
-            normed,
-            latent_cache=latent_cache,
-            pool_cache=pool_cache,
-            seq_lens=seq_lens,
-            start_position=int(start_position),
-            softmax_scale=float(softmax_scale),
-            max_seq_len=int(max_seq_len),
-            page_size=int(page_size),
-            slot_mapping=slot_mapping,
-            tail=tail,
-            position=position,
-        )
-        return residual + attn_out
+
+        def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
+            return self.attention(
+                self._input_norm(single_stream),
+                latent_cache=latent_cache,
+                pool_cache=pool_cache,
+                seq_lens=seq_lens,
+                start_position=int(start_position),
+                softmax_scale=float(softmax_scale),
+                max_seq_len=int(max_seq_len),
+                page_size=int(page_size),
+                slot_mapping=slot_mapping,
+                tail=tail,
+                position=position,
+            )
+
+        site = _mhc_attention_site(self, streams)
+        if site is None:
+            return hidden_states + attention_half(hidden_states)
+        return site.forward(streams, attention_half)
 
 
 def _build_layer(
@@ -7350,6 +7387,16 @@ MHC_ROLE_PARAMETERS: dict[str, str] = {
     "scale": "hc_scale",
 }
 
+#: The two sites, named by the middle word of their own leaves rather than chosen:
+#: ``hc_attn_*`` is the site the attention half runs and ``hc_ffn_*`` the site the
+#: feed-forward half runs, which is the order the target model composes them in
+#: (``design/reference/modeling_glm5_next.py:1277-1278`` builds ``attn_hc`` then
+#: ``ffn_hc``; ``:1293-1305`` runs the first around ``self_attn`` and the second
+#: around ``mlp``). :func:`_mhc_leaves_by_site` derives the same two keys from
+#: ``MHC_LEAVES``, and the acceptance reads the two against each other.
+MHC_ATTENTION_SITE = "attn"
+MHC_FFN_SITE = "ffn"
+
 
 def _mhc_leaves_by_site(
     leaves: Sequence[str] = MHC_LEAVES,
@@ -7382,6 +7429,67 @@ def _mhc_leaves_by_site(
             )
         grouped.setdefault(parts[1], {})[parts[2]] = leaf
     return grouped
+
+
+def _mhc_attention_site(
+    module: nn.Module, streams: torch.Tensor | None
+) -> Glm5NextHyperConnection | None:
+    """Which route ONE layer call takes, refusing both ways.
+
+    Returns the layer's attention-half mHC site when the call carries streams, and
+    ``None`` when the plain residual add is the right thing to do.
+
+    ``inc-glm53f-030d`` part (b), route R3. The keyword is optional because two
+    callers need it absent -- the draft head hands this same sparse-attention class
+    a one-stream ``[T, H]`` (``mtp.py:158``) and the checkpoint gives its layer
+    none of the six mHC leaves -- and optional-with-a-default is exactly how a
+    silent wrong default gets in. So the branch refuses BOTH ways and one rule
+    decides for both layer families:
+
+    * **no streams on a layer that carries mHC weights** is refused. Serving that
+      call would quietly reinstate the one-stream network this block exists to
+      remove, and nothing downstream could tell.
+    * **streams on a layer that has no site to run them** is refused, and the
+      message says which of the two reasons it is: the layer carries none of the
+      six leaves (the draft head's case), or it carries them and the load-time
+      bind never ran, which is a caller that skipped ``_run_load_time_preps``.
+
+    THE CARRY TEST READS THE LEAVES, NOT THE BIND, and that is the plan's own
+    predicate ("a layer holding the six loaded mHC tensors refuses a one-stream
+    call"). Reading the bind instead would let a loaded-but-unbound layer take the
+    plain add silently, which is the same defect wearing a different hat. The read
+    is a short-circuiting ``next`` over six names, so a layer that carries them
+    stops at the first.
+
+    Raises:
+        Glm5NextHyperConnectionError: either way round, naming the case.
+    """
+    carried = next((leaf for leaf in MHC_LEAVES if getattr(module, leaf, None) is not None), None)
+    if streams is None:
+        if carried is not None:
+            raise Glm5NextHyperConnectionError(
+                f"this layer carries the mHC weight {carried} and was called with "
+                f"no streams. A one-stream call here would run the residual add "
+                f"this block replaces, so it is refused rather than served: pass "
+                f"the four streams, or call a layer that carries no mHC weight"
+            )
+        return None
+
+    sites = getattr(module, MHC_SITES_ATTR, {})
+    if not sites:
+        if carried is not None:
+            raise Glm5NextHyperConnectionError(
+                f"this layer carries the mHC weight {carried} but no site is bound "
+                f"to it, so a streams call has nothing to run. The bind happens on "
+                f"the load path, in _run_load_time_preps; a caller that built the "
+                f"tree by hand has to run it too"
+            )
+        raise Glm5NextHyperConnectionError(
+            "this layer carries none of the six mHC weights and was called WITH "
+            "streams. The checkpoint gives the draft head's layer none of them, so "
+            "this call belongs on the one-stream path: pass no streams"
+        )
+    return sites[MHC_ATTENTION_SITE]
 
 
 def _bind_hyper_connection_sites(
