@@ -1890,7 +1890,13 @@ MOE_ROUTER_WEIGHT_SCALE = 0.1
 MOE_ROUTER_BIAS_SCALE = 0.05
 
 
-def _shared_at_routed_operands(*, seed_offset: int = 0) -> dict:
+def _shared_at_routed_operands(
+    *,
+    seed_offset: int = 0,
+    gate_exponents: tuple = SHARED_AT_ROUTED_GATE_EXPONENTS,
+    up_exponents: tuple = SHARED_AT_ROUTED_UP_EXPONENTS,
+    down_exponent: int = SHARED_AT_ROUTED_DOWN_EXPONENT,
+) -> dict:
     """A shared expert's three weights and PUBLIC grids at the bank's hidden size.
 
     The shared route consumes the 256-granularity grid directly -- that is what
@@ -1899,19 +1905,28 @@ def _shared_at_routed_operands(*, seed_offset: int = 0) -> dict:
     is coarsened. Item 1's builder is untouched: it is 256 wide by its own
     declared reading and this item needs 512.
 
-    ``seed_offset`` DEFAULTS TO ZERO, so item 4's call draws exactly what it drew.
-    Item 6 builds two DENSE MLPs from this same shape at two offsets, because two
-    layers holding identical weights cannot show that each layer read its own -- and
-    the offset moves only the draw, never the scale regimes the conditioning
-    arguments above rest on.
+    ``seed_offset`` DEFAULTS TO ZERO and the three EXPONENT arguments default to
+    this module's own, so item 4's call draws exactly what it drew and scales it
+    exactly as it scaled it. Item 6 builds two DENSE MLPs from this same shape at two
+    offsets, because two layers holding identical weights cannot show that each layer
+    read its own.
+
+    THE EXPONENTS ARE ARGUMENTS AND ITEM 6 MOVES THEM. The sentence that used to
+    stand here said the offset moves only the draw and never the scale regimes. It
+    did say that, and at ITEM 6's magnitudes it was wrong: the declared regime is
+    16-above and 2-inside against a limit of 10, and item 6's operands put both
+    blocks at 165 and 20, so both clamped and the item's whole stack collapsed into
+    one row. :data:`STACK_DENSE_GATE_EXPONENTS` and its two siblings carry the shift
+    and the reading it rests on. What is untouched is ITEM 4's call at these
+    DEFAULTS, which is the one the conditioning arguments above rest on.
     """
     h = ROUTED_HIDDEN_SIZE
     i = ROUTED_INTERMEDIATE_SIZE
     blocks = i // BLOCK_QUANT_SIZE
-    if blocks != len(SHARED_AT_ROUTED_GATE_EXPONENTS):
+    if blocks != len(gate_exponents) or blocks != len(up_exponents):
         raise VacuousControlError(
-            f"this fixture declares {len(SHARED_AT_ROUTED_GATE_EXPONENTS)} gate "
-            f"regimes for {blocks} blocks of I"
+            f"this call declares {len(gate_exponents)} gate and "
+            f"{len(up_exponents)} up regimes for {blocks} blocks of I"
         )
 
     gate_w = _fp8_grid_values(SEED_SHARED_GATE + seed_offset, h, i)
@@ -1928,15 +1943,15 @@ def _shared_at_routed_operands(*, seed_offset: int = 0) -> dict:
     return {
         "gate_proj_weight": (
             gate_w.to(_FP8),
-            _pow2_scales(SHARED_AT_ROUTED_GATE_EXPONENTS, h_blocks),
+            _pow2_scales(gate_exponents, h_blocks),
         ),
         "up_proj_weight": (
             up_w.to(_FP8),
-            _pow2_scales(SHARED_AT_ROUTED_UP_EXPONENTS, h_blocks),
+            _pow2_scales(up_exponents, h_blocks),
         ),
         "down_proj_weight": (
             down_w.to(_FP8),
-            _pow2_scales((SHARED_AT_ROUTED_DOWN_EXPONENT,) * h_blocks, i_blocks),
+            _pow2_scales((down_exponent,) * h_blocks, i_blocks),
         ),
     }
 
@@ -2224,30 +2239,96 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     torch.testing.assert_close(got.float(), expected.float(),
                                rtol=MOE_RTOL, atol=MOE_ATOL)
 
-    # ---- CONTROL C: THE ROUTER READS THE PRE-NORM TENSOR. Handing the normalised
-    # states in both positions normalises twice inside the fused kernel, which is
-    # a different router and so a different set of affinities. It must move the
-    # answer outside the tolerance, or this item would pass with the two arguments
-    # swapped and the defect would be invisible.
-    doubled = block.forward(
-        normed,
+    # ---- CONTROL C: THE ROUTER READS THE CHANNEL ORDER IT WAS HANDED.
+    #
+    # WHAT USED TO STAND HERE AND WHY IT IS GONE. The old arm fed the NORMALISED
+    # states in both positions, so the fused kernel normalised twice. The world says
+    # that arm cannot discriminate: it moved the answer by a whole-tensor gap of
+    # 0.0200 (``increments/run054a-diag2-trn2-1-at-88321db0-20260909T052440Z.out``),
+    # which is INSIDE ``MOE_RTOL = 3e-2``, so it raised `VacuousControlError` on a
+    # block that was behaving correctly. Two absorbers explain it, and
+    # ``increments/proposal-054a-controls-r2.md`` section 7.1 names them from the
+    # router's own source: the selected SET moves only when the top-8-of-16 boundary
+    # flips, and the selected weights are NORMALISED over that set, so a shift that
+    # moves the selected sigmoids together largely cancels in the ratio.
+    #
+    # THE REPAIRED CONTROL, section 7.3. Swap two CHANNELS of ONE token's router
+    # input. ``mean(x**2)`` is invariant under a permutation of a row, so the fused
+    # RMSNorm cannot absorb the swap, while ``router_weight``'s columns differ, so
+    # the gate projection is not permutation-invariant. What the arm certifies is
+    # that this forward routes on the argument it was told to route on: the block
+    # routes on argument 1 and hands argument 2 to the experts, so only argument 1 is
+    # perturbed here and argument 2 is left exactly as the main compare had it.
+    #
+    # THE PERTURBATION IS PROVED BEFORE IT IS USED, and that is the whole repair. The
+    # item's own router oracle is called on candidate swaps and the FIRST one whose
+    # SELECTED SET at that token changes is kept. Without a set flip, a two-channel
+    # change of one token divided by this tensor's peak of about 7739 lands far below
+    # ``MOE_RTOL`` even on correct code -- the old arm's defect exactly.
+    #
+    # AND THE GATE IS ROW-LOCAL, section 7.3 item 2, because the perturbation is one
+    # row. The whole-tensor gap is printed as a READING and is never the gate: it is
+    # the wrong denominator for a one-row change, and that is what went wrong twice.
+    _base_set = affinities != 0
+    _probes = 0
+    _swap = None
+    for _t in range(int(pre_norm.shape[0])):
+        for _i, _j in MOE_SWAP_CHANNEL_CANDIDATES:
+            _candidate = pre_norm.clone()
+            _candidate[_t, [_i, _j]] = _candidate[_t, [_j, _i]]
+            if torch.equal(_candidate[_t], pre_norm[_t]):
+                continue
+            _probes += 1
+            _, _, _probe_affinities = block.experts.route_tokens(
+                _candidate.unsqueeze(0), gamma, text_config
+            )
+            if not torch.equal((_probe_affinities != 0)[_t], _base_set[_t]):
+                _swap = (_t, _i, _j, _candidate)
+                break
+        if _swap is not None:
+            break
+    if _swap is None:
+        raise VacuousControlError(
+            f"no swap among {len(MOE_SWAP_CHANNEL_CANDIDATES)} channel pairs on any "
+            f"of {int(pre_norm.shape[0])} tokens changed the SELECTED EXPERT SET in "
+            f"{_probes} probes, so this control has no proved perturbation to gate "
+            f"on, and a row that did not move would be indistinguishable from a "
+            f"router that ignored its input entirely"
+        )
+    _swap_token, _swap_i, _swap_j, _swapped_input = _swap
+    print(
+        f"TINYFWD|moe_swap_probe|token={_swap_token}|channels={_swap_i} and "
+        f"{_swap_j}|probes={_probes}"
+        f"|selected_before={int(_base_set[_swap_token].sum())}"
+        f"|note=kept the first swap whose selected expert set changed"
+    )
+    swapped = block.forward(
+        _swapped_input,
         normed,
         router_gamma=gamma,
         text_config=text_config,
         quant_config=quant_config,
     )
-    moved = not torch.allclose(doubled.float(), expected.float(),
+    moved = not torch.allclose(swapped[_swap_token].float(),
+                               expected[_swap_token].float(),
                                rtol=MOE_RTOL, atol=MOE_ATOL)
-    gap = float((doubled.float() - expected.float()).abs().max() / expected.abs().max())
+    row_gap = float(
+        (swapped[_swap_token].float() - expected[_swap_token].float()).abs().max()
+        / expected[_swap_token].abs().max()
+    )
+    gap = float((swapped.float() - expected.float()).abs().max() / expected.abs().max())
     print(
-        f"TINYFWD|moe_control|branch=router fed the normalised tensor"
-        f"|outside_tolerance={moved}|gap={gap:.4f}"
+        f"TINYFWD|moe_control|branch=router input channels {_swap_i} and {_swap_j} "
+        f"swapped at token {_swap_token}|outside_tolerance={moved}"
+        f"|row_gap={row_gap:.6f}|whole_tensor_gap={gap:.6f}"
+        f"|note=row_gap is the gate and whole_tensor_gap is a reading only"
     )
     if not moved:
         raise VacuousControlError(
-            f"normalising twice leaves the result inside rtol={MOE_RTOL}, "
-            f"atol={MOE_ATOL}; "
-            f"this item cannot tell the pre-norm argument from the normalised one"
+            f"swapping router input channels {_swap_i} and {_swap_j} at token "
+            f"{_swap_token} changed the SELECTED EXPERT SET and still left that "
+            f"token's own output inside rtol={MOE_RTOL}, atol={MOE_ATOL}; this item "
+            f"cannot tell the router's channel order from a permutation of it"
         )
 
     # ---- CONTROL D: A BLOCK WITH NO SHARED EXPERT returns the routed half and
@@ -3173,6 +3254,76 @@ SEED_STACK_ROUTER = 5464
 #: fixture's seed.
 STACK_DENSE_SEED_OFFSETS = (100, 200)
 
+#: THE DENSE LAYERS' SCALE REGIME, SHIFTED OFF ITEM 4'S AND STATED IN ITEM 4'S OWN
+#: TERMS. :data:`SHARED_AT_ROUTED_GATE_EXPONENTS` puts one block of each projection
+#: ABOVE the SwiGLU bound and one STRICTLY INSIDE it, and the comment above those
+#: exponents states the magnitudes it means: 16 and 2 against a limit of 10. At ITEM
+#: 4's operand scale that holds. AT THIS STACK'S SCALE IT DOES NOT. Grant 127 read
+#: layer 0's FFN norm peaking at 5.4375, which drives the gate to 165.42 and the up
+#: to 163.31, so BOTH blocks clamp, 100% of both projections sit at the limit, every
+#: activated row becomes the same constant, the FFN half reaches 3440 against a
+#: hidden peak of 0.4766, and the residual add then absorbs the hidden term in EVERY
+#: element -- after which every row below layer 0 is identical. That is the row
+#: collapse, in one chain, from
+#: ``increments/run054a-diag2-trn2-1-at-88321db0-20260909T052440Z.out``.
+#:
+#: THE SHIFT RESTORES ITEM 4'S DECLARED 16-AND-2 REGIME AT THIS SCALE. Dropping gate
+#: and up by ``2**-3`` puts the ``2**0`` block at a predicted 20.7 and the ``2**-3``
+#: block at 2.59, which is item 4's own 16 and 2 to within 1.3x: one block still
+#: binds and one is strictly inside. Dropping down by ``2**-6`` is a STACK-ONLY
+#: requirement item 4 never had -- item 4 compares one block's output against itself
+#: and lives happily at a peak of 7739, while this item compares a RESIDUAL ADD, and
+#: a half that outweighs the stream it is added to erases the other half instead of
+#: being certified beside it.
+#:
+#: BOTH SHIFTS ARE EXACT POWERS OF TWO on an already exact power-of-two grid, so no
+#: stored weight is re-rounded and the fp8 draw is untouched: the seeds, the shapes
+#: and the negated block stay the ones item 4 declares.
+STACK_DENSE_GATE_UP_SHIFT = -3
+STACK_DENSE_DOWN_SHIFT = -6
+STACK_DENSE_GATE_EXPONENTS = tuple(
+    e + STACK_DENSE_GATE_UP_SHIFT for e in SHARED_AT_ROUTED_GATE_EXPONENTS
+)
+STACK_DENSE_UP_EXPONENTS = tuple(
+    e + STACK_DENSE_GATE_UP_SHIFT for e in SHARED_AT_ROUTED_UP_EXPONENTS
+)
+STACK_DENSE_DOWN_EXPONENT = SHARED_AT_ROUTED_DOWN_EXPONENT + STACK_DENSE_DOWN_SHIFT
+
+#: A PRINTED READING'S BOUND AND NOT A GATE. The reading is the fraction of elements
+#: of a dense layer's residual add where the sum equals the FFN term BIT FOR BIT, so
+#: the hidden term contributed nothing at all; grant 127 read 1.000000 at the old
+#: scale -- every element. Half is where the useful-fixture line probably sits, but
+#: NO RUN HAS MEASURED THIS FRACTION AT THE NEW SCALE, and half a bf16 ULP at a small
+#: FFN peak already absorbs the smallest hidden elements, so a half bound could fail
+#: a healthy fixture on an unmeasured prediction. GUARD (ii) IS STRUCTURAL INSTEAD --
+#: absorption strictly below 1 and a nonzero row spread on the sum, which is exactly
+#: the collapse being absent -- and this bound is printed beside the reading so the
+#: first counted run says where the fraction really sits.
+STACK_ABSORPTION_CEILING = 0.5
+
+#: THE PEAK-SCALED BAND for this item's recomputed comparisons, and the CEILING that
+#: stops a reference from buying its own budget. The reasoning is in
+#: :func:`_stack_peak_band`; the arithmetic is
+#: ``increments/proposal-054a-controls-r2.md`` sections 4.1 to 4.4.
+STACK_RECOMPUTE_RTOL = 2.0**-8
+STACK_RECOMPUTE_ATOL_FACTOR = 2.0**-8
+STACK_RECOMPUTE_PEAK_CEILING = 256.0
+
+#: CANDIDATE CHANNEL PAIRS for item 4's swap control, spread across all four
+#: 256-column blocks of H so no pair lands inside one block of ``router_weight``'s
+#: columns. The control SEARCHES these and keeps the first pair that changes a
+#: token's selected expert set; it never assumes one does.
+MOE_SWAP_CHANNEL_CANDIDATES = (
+    (0, 1),
+    (0, 256),
+    (1, 257),
+    (7, 263),
+    (13, 400),
+    (64, 320),
+    (128, 384),
+    (0, 511),
+)
+
 #: The norm gains, as a rotating pattern of exact eighths near 1. EIGHT values for
 #: SEVEN sites -- two per layer plus the stack's final norm -- so every site gets a
 #: DIFFERENT rotation and a forward that applied one layer's gain at another layer's
@@ -3412,7 +3563,10 @@ def _stack_fixture(model=None) -> dict:
         )
         if index in dense_at:
             operands = _shared_at_routed_operands(
-                seed_offset=STACK_DENSE_SEED_OFFSETS[dense_at.index(index)]
+                seed_offset=STACK_DENSE_SEED_OFFSETS[dense_at.index(index)],
+                gate_exponents=STACK_DENSE_GATE_EXPONENTS,
+                up_exponents=STACK_DENSE_UP_EXPONENTS,
+                down_exponent=STACK_DENSE_DOWN_EXPONENT,
             )
             for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
                 _attach(layer.mlp, leaf, *operands[leaf])
@@ -3606,6 +3760,107 @@ def _stack_ffn_half(layer, hidden, cfg, operands, *, routed: bool, gain=None,
         up_max=limit,
         up_min=-limit,
     )
+
+
+def _stack_peak_band(expected: torch.Tensor, label: str) -> tuple:
+    """``(rtol, atol)`` for one recompute comparison, scaled by the reference's peak.
+
+    WHY A PEAK-SCALED ATOL AND NOT THIS FILE'S ``1e-5``. The two tensors compared at
+    these sites are a bf16 forward against a float32 TORCH RECOMPUTE of the same
+    arithmetic, and the recompute's error is set by the LARGEST INTERMEDIATE it
+    passes through, not by the magnitude of the cell it lands in. Grant 117 read the
+    worst cell at 0.002199 absolute where that cell's own value is at least 0.2189 --
+    4.5 bf16 ULPs at the cell and 1.126 ULPs at the tensor's peak. So a per-cell
+    relative band cannot hold at the near-zero cells, and a flat ``1e-5`` floor sits
+    two orders below the error floor the recompute actually has.
+    ``increments/proposal-054a-controls-r2.md`` sections 4.1 to 4.4 carry the
+    arithmetic, and section 4.3 states plainly what this pair is: a LOOSENING below
+    ``|expected| = 0.3035`` and a TIGHTENING above it, not the dtype's own bound.
+
+    THE PEAK IS READ HERE, AT RUNTIME, from the reference itself, because the dense
+    rescale moves every peak in this item and no constant frozen before the run would
+    still be the peak after it.
+
+    THAT OPENS ONE HOLE AND THIS CLOSES IT: a reference that BLEW UP would buy itself
+    a wider budget. So the peak is refused above
+    :data:`STACK_RECOMPUTE_PEAK_CEILING`, and a peak of zero is refused too, since a
+    zero-peak band is a bare equality test that no real error could fail. The ceiling
+    is 256: every peak this item predicts is at or below about 30, so it leaves
+    roughly 8x of headroom, and it still refuses this fixture's own collapse peak of
+    3440 by more than 13x. At the ceiling the absolute budget is 1.0, which is
+    ``2**-8`` of the tensor it bounds -- so even at the bound the promise stays
+    relative.
+    """
+    peak = float(expected.abs().max())
+    if not peak > 0.0:
+        raise VacuousControlError(
+            f"{label}: the reference's peak is {peak}, so a peak-scaled band would "
+            f"be a bare equality test and this comparison could not fail on any "
+            f"error the recompute makes"
+        )
+    if peak > STACK_RECOMPUTE_PEAK_CEILING:
+        raise VacuousControlError(
+            f"{label}: the reference peaks at {peak:.6g}, above the declared ceiling "
+            f"of {STACK_RECOMPUTE_PEAK_CEILING}. A reference that grew this far may "
+            f"not widen its own tolerance; this fixture's own collapse produced a "
+            f"peak of 3440"
+        )
+    return STACK_RECOMPUTE_RTOL, peak * STACK_RECOMPUTE_ATOL_FACTOR
+
+
+def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
+                         rtol: float, atol: float, label: str) -> None:
+    """Controls A and B for one peak-scaled comparison, run AFTER it has passed.
+
+    ORDERING IS LOAD-BEARING (``proposal-054a-controls-r2.md`` section 6.1). Each
+    probe is built from PRODUCED, so it keeps the product's own error in every other
+    cell; if the real comparison were still failing, a probe's failure would say
+    nothing about the band. The planted cell is the argmin of ``|expected|``, where a
+    peak-scaled atol dominates the relative term and so where the loosening lives,
+    and its value is OVERWRITTEN rather than added to, so the planted delta is
+    exactly the number named.
+
+    Three arms, and each states the precondition under which it discriminates:
+
+    * ``A`` plants ``2 * atol`` and MUST fail. It fails iff ``peak > |expected|`` at
+      the cell.
+    * ``B_under`` plants ``0.5 * atol`` and MUST pass. It passes unconditionally.
+    * ``B_over`` plants ``1.5 * atol`` and MUST fail. It fails iff ``|expected|`` at
+      the cell is below ``peak / 2``. A VIOLATED PRECONDITION MAKES IT PASS, which
+      this reports as the control's own failure rather than as a result.
+    """
+    peak = float(expected.abs().max())
+    cols = int(expected.shape[-1])
+    row, col = divmod(int(expected.abs().reshape(-1).argmin()), cols)
+    a_min = float(expected.abs()[row, col])
+    print(f"TINYFWD|stack_band_control|site={label}|row={row}|col={col}"
+          f"|expected_at_cell={float(expected[row, col]):.10g}"
+          f"|abs_at_cell={a_min:.10g}|peak={peak:.10g}"
+          f"|rtol={rtol:.10g}|atol={atol:.10g}"
+          f"|a_discriminates_iff_peak_gt_cell={peak > a_min}"
+          f"|b_over_discriminates_iff_cell_lt_half_peak={a_min < peak / 2.0}")
+    for arm, factor, must_fail in (("A", 2.0, True),
+                                   ("B_under", 0.5, False),
+                                   ("B_over", 1.5, True)):
+        probe = produced.clone()
+        probe[row, col] = expected[row, col] + factor * atol
+        inside = bool(torch.allclose(probe, expected, rtol=rtol, atol=atol))
+        print(f"TINYFWD|stack_band_control|site={label}|arm={arm}"
+              f"|planted_multiple_of_atol={factor}|delta={factor * atol:.10g}"
+              f"|inside_band={inside}|must_fail={must_fail}")
+        if must_fail and inside:
+            raise VacuousControlError(
+                f"{label}: control {arm} planted {factor} x atol = "
+                f"{factor * atol:.6g} at the argmin cell, where |expected| is "
+                f"{a_min:.6g} and the peak is {peak:.6g}, and the band still "
+                f"accepted it -- so this band cannot see an error of that size"
+            )
+        if not must_fail and not inside:
+            raise VacuousControlError(
+                f"{label}: control {arm} planted {factor} x atol = "
+                f"{factor * atol:.6g} at the argmin cell and the band REFUSED it, "
+                f"so the band is tighter than the atol it reports"
+            )
 
 
 def _stack_outside_tolerance(label: str, moved: torch.Tensor,
@@ -3932,6 +4187,157 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         print(f"TINYFWD|seam_error|stage=block_c|exception={type(_seam_exc).__name__}: {_seam_exc}")
     # ---- end of the BLOCK C readings.
 
+    # ---- BLOCK D: THE THREE SCALE GUARDS, in BLOCK A position -- above every
+    # comparison -- so a red conjunct cannot suppress their readings. Each guard
+    # carries THE OLD SCALE as its EXECUTED failing control.
+    #
+    # WHY THEY EXIST. Grant 127 read layer 0 saturating both SwiGLU clamps at 100%,
+    # which made every activated row the same constant, drove the FFN half to 3440
+    # against a hidden peak of 0.4766, and let the residual add absorb the hidden
+    # term in every element -- after which every row below layer 0 was identical and
+    # three of this file's items could not see a per-token defect at all. These
+    # guards refuse that fixture, and a guard that only ever fired on the scale it
+    # was written for would be untestable, so each one is re-run on the OLD grids and
+    # required to FIRE there.
+    #
+    # LAYER 0'S CONTROL IS EXACT. The FFN half is added OUTSIDE the layer call
+    # (``model_fp8.py:6712-6714``), so ``recorded_out[0][1]`` is the ATTENTION half
+    # and the dense rescale cannot move it. The old-scale recompute at layer 0
+    # therefore runs on the very tensor grant 127 ran on.
+    #
+    # NOTHING HERE TOUCHES A DISPATCH COUNTER. ``_stack_ffn_half`` on a dense layer
+    # reaches ``_ffn_norm`` and ``_dense_output`` only, both pure torch, and the
+    # route predicate's window closed above in any case.
+    from torch.nn.functional import silu as _dsilu
+
+    _old_dense_ops = {}
+    for _di, _dense_index in enumerate(fixture["dense_at"]):
+        _dh = recorded_out[_dense_index][1]
+        _dlimit = float(cfg.swiglu_limit)
+        _old_dense_ops[_dense_index] = _shared_at_routed_operands(
+            seed_offset=STACK_DENSE_SEED_OFFSETS[_di]
+        )
+        _halves = (
+            ("new", _stack_ffn_half(
+                layers[_dense_index], _dh, cfg,
+                fixture["mlp_operands"][_dense_index], routed=False)),
+            ("old", _stack_ffn_half(
+                layers[_dense_index], _dh, cfg,
+                _old_dense_ops[_dense_index], routed=False)),
+        )
+        _readings = {}
+        for _tag, _half in _halves:
+            _g, _u = _half["gate"], _half["up"]
+            _act = _dsilu(_clamped(_g, None, _dlimit)) * _clamped(
+                _u, -_dlimit, _dlimit
+            )
+            _o = _half["out"].to(_dh.dtype)
+            _sum = _dh + _o
+            _reading = (
+                float((_g >= _dlimit).float().mean()),
+                float((_u.abs() >= _dlimit).float().mean()),
+                _row_spread_stats(_act)[1],
+                float((_sum.float() == _o.float()).float().mean()),
+                _row_spread_stats(_sum)[1],
+            )
+            _readings[_tag] = _reading
+            _hpeak = float(_dh.float().abs().max())
+            _fpeak = float(_half["out"].abs().max())
+            print(f"TINYFWD|stack_scale_guard|layer={_dense_index}|scale={_tag}"
+                  f"|gate_peak={float(_g.abs().max()):.10g}"
+                  f"|up_peak={float(_u.abs().max()):.10g}|limit={_dlimit:.10g}"
+                  f"|gate_at_limit_frac={_reading[0]:.6f}"
+                  f"|up_at_limit_frac={_reading[1]:.6f}"
+                  f"|activated_max_spread={_reading[2]:.6g}"
+                  f"|ffn_peak={_fpeak:.10g}|hidden_peak={_hpeak:.10g}"
+                  f"|ffn_share={_fpeak / max(_hpeak, 1e-30):.6g}"
+                  f"|elements_absorbed_frac={_reading[3]:.6f}"
+                  f"|sum_max_spread={_reading[4]:.6g}"
+                  f"|absorption_reading_bound={STACK_ABSORPTION_CEILING}")
+
+        _gf, _uf, _as, _absorbed, _sumspread = _readings["new"]
+        # GUARD (i): THE CLAMP MUST BIND, AND MUST NOT BIND EVERYWHERE. Both
+        # fractions above zero says the SwiGLU bound is live on both projections;
+        # a nonzero activated row spread says it did not saturate every row into one
+        # constant. The fractions themselves are READINGS -- no threshold on them is
+        # ruled yet, and this refuses only the two degenerate ends.
+        if not (_gf > 0.0 and _uf > 0.0 and _as > 0.0):
+            raise VacuousControlError(
+                f"layer {_dense_index}: gate at-limit fraction {_gf:.6f}, up "
+                f"at-limit fraction {_uf:.6f}, activated row spread {_as:.6g}. This "
+                f"item needs the SwiGLU clamp live on BOTH projections and needs the "
+                f"activated rows to still differ: a zero fraction means the clamp is "
+                f"dead at this scale, and a zero spread means it saturated every row "
+                f"into the same constant"
+            )
+        # GUARD (ii): THE RESIDUAL ADD MUST NOT ABSORB THE HIDDEN TERM. STRUCTURAL,
+        # for the same reason guard (i) is: absorption strictly below every element,
+        # and a sum whose rows still differ. That pair IS the collapse being absent,
+        # and it needs no threshold nobody has measured yet -- the fraction itself is
+        # printed above beside :data:`STACK_ABSORPTION_CEILING` as a reading.
+        if not (_absorbed < 1.0 and _sumspread > 0.0):
+            raise VacuousControlError(
+                f"layer {_dense_index}: the residual add absorbs the hidden term in "
+                f"{_absorbed:.6f} of elements and the sum's row spread is "
+                f"{_sumspread:.6g}. The FFN half peaks at "
+                f"{float(_halves[0][1]['out'].abs().max()):.6g} against a hidden "
+                f"peak of {float(_dh.float().abs().max()):.6g}, so the sum carries "
+                f"the FFN half alone and every comparison below it is blind to the "
+                f"other one"
+            )
+        # THE FAILING CONTROLS. The OLD grids must fire BOTH guards, or the guards
+        # are statements no scale in this file's history could have violated.
+        _ogf, _ouf, _oas, _oabs, _osum = _readings["old"]
+        if _ogf > 0.0 and _ouf > 0.0 and _oas > 0.0:
+            raise VacuousControlError(
+                f"layer {_dense_index}: guard (i)'s control did not fire. The OLD "
+                f"exponents give gate at-limit {_ogf:.6f}, up at-limit {_ouf:.6f}, "
+                f"activated spread {_oas:.6g}, all of which the guard accepts -- so "
+                f"the guard is not what tells the two scales apart"
+            )
+        if _oabs < 1.0 and _osum > 0.0:
+            raise VacuousControlError(
+                f"layer {_dense_index}: guard (ii)'s control did not fire. The OLD "
+                f"exponents absorb the hidden term in {_oabs:.6f} of elements and "
+                f"leave the sum's row spread at {_osum:.6g}, both of which the guard "
+                f"accepts -- so the guard is not what tells the two scales apart"
+            )
+
+    # ---- GUARD (iii): EVERY STAGE BELOW LAYER 0 STILL CARRIES DISTINCT ROWS. Grant
+    # 127 read `layer1_in`, `layer1_out`, `layer2_in` and `layer2_out` at a row
+    # spread of EXACTLY ZERO, which is the collapse in one number per stage.
+    for _si in range(1, len(layers)):
+        for _stage, _t in ((f"layer{_si}_in", recorded_in[_si][1][0]),
+                           (f"layer{_si}_out", recorded_out[_si][1])):
+            _rows, _mx, _mn, _md = _row_spread_stats(_t)
+            print(f"TINYFWD|stack_row_guard|stage={_stage}|rows={_rows}"
+                  f"|max_spread={_mx:.6g}|min_spread={_mn:.6g}"
+                  f"|median_spread={_md:.6g}")
+            if not _mx > 0.0:
+                raise VacuousControlError(
+                    f"{_stage} carries {_rows} rows whose pairwise spread is exactly "
+                    f"zero, so every token below layer 0 holds the same vector and "
+                    f"no comparison here can see a per-token defect"
+                )
+    # ITS FAILING CONTROL, at the seam the collapse ran through: layer 1's input
+    # rebuilt with the OLD grids. One dense recompute, not a second stack run.
+    _c0 = fixture["dense_at"][0]
+    _ch = recorded_out[_c0][1]
+    _cold = _stack_ffn_half(
+        layers[_c0], _ch, cfg, _old_dense_ops[_c0], routed=False
+    )["out"].to(_ch.dtype)
+    _cspread = _row_spread_stats(_ch + _cold)[1]
+    print(f"TINYFWD|stack_row_guard|stage=layer{_c0 + 1}_in_at_the_old_scale"
+          f"|max_spread={_cspread:.6g}|bound=0"
+          f"|note=this is the seam grant 127 read at zero")
+    if _cspread > 0.0:
+        raise VacuousControlError(
+            f"guard (iii)'s control did not fire. Layer {_c0 + 1}'s input rebuilt "
+            f"with the OLD exponents has row spread {_cspread:.6g}, which the guard "
+            f"accepts -- so the guard is not what tells the two scales apart"
+        )
+    # ---- end of the BLOCK D guards.
+
     # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX. Exact equality, not a tolerance:
     # the lookup copies rows and computes nothing, so a difference of any size is a
     # different function.
@@ -3981,7 +4387,27 @@ def test_tiny_model_forward_matches_the_reference() -> None:
               f"{float(attended.abs().max() / expected.abs().max()):.6f}"
               f"|max_abs_diff={float((produced - expected).abs().max()):.10g}"
               f"|peak_reference={float(expected.abs().max()):.10g}")
-        torch.testing.assert_close(produced, expected, rtol=RTOL, atol=ATOL)
+        # ---- THE PEAK-SCALED BAND, and the readings that let it be checked. The
+        # frozen pair here was `RTOL`/`ATOL`, and this site is one of the two the
+        # lead's option (b) ruling moves; the module pair itself does not move and
+        # the other seventeen sites that share it are untouched.
+        _rtol, _atol = _stack_peak_band(expected, f"conjunct 3 layer {index}")
+        _ae = (produced - expected).abs()
+        _rel = _ae / expected.abs().clamp_min(1e-30)
+        print(f"TINYFWD|stack_attention_band|layer={index}"
+              f"|peak={float(expected.abs().max()):.10g}"
+              f"|worst_abs={float(_ae.max()):.10g}"
+              f"|worst_rel_against_its_own_cell={float(_rel.max()):.10g}"
+              f"|rtol={_rtol:.10g}|atol={_atol:.10g}"
+              f"|cells_outside_this_pair="
+              f"{int((_ae > (_atol + _rtol * expected.abs())).sum())}"
+              f"|cells_outside_the_old_pair="
+              f"{int((_ae > (ATOL + RTOL * expected.abs())).sum())}"
+              f"|old_pair=rtol {RTOL} atol {ATOL}"
+              f"|note=worst_rel divides each cell's error by that cell's own value")
+        torch.testing.assert_close(produced, expected, rtol=_rtol, atol=_atol)
+        _stack_band_controls(produced, expected, _rtol, _atol,
+                             f"conjunct 3 layer {index}")
 
     # ---- CONJUNCT 4: THE FFN HALF, ITS GAIN, ITS BRANCH AND ITS RESIDUAL ADD. For
     # every layer but the last the next recorded input is the answer; for the last
@@ -4016,19 +4442,48 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 )
         expected = hidden.float() + half["out"].float()
         if index + 1 < len(layers):
-            # THIS COMPARISON NEVER SEES THE ROUTED LAYER, so it stays on the bf16 pair.
-            # The guard above runs it for every layer except the last, and this fixture's
-            # only routed layer IS the last (``STACK_LAYERS = 3``, ``STACK_FIRST_K_DENSE
-            # = 2``), so it compares dense outputs alone. The eight-expert sum reaches a
-            # comparison only through conjunct 5's final norm below, which is frozen at
-            # ``RTOL``/``ATOL``. DO NOT SWITCH THIS TO THE MoE BAND: the routed LAYER does
-            # run, but this comparison never sees it, so a band selector here would widen
-            # nothing today and arm an unruled widening the moment the layer count or the
-            # dense split moves.
-            torch.testing.assert_close(
-                recorded_in[index + 1][1][0].float(), expected,
-                rtol=RTOL, atol=ATOL,
-            )
+            # THIS COMPARISON NEVER SEES THE ROUTED LAYER. The guard above runs it
+            # for every layer except the last, and this fixture's only routed layer IS
+            # the last (``STACK_LAYERS = 3``, ``STACK_FIRST_K_DENSE = 2``), so it
+            # compares DENSE outputs alone. The eight-expert sum reaches a comparison
+            # only through conjunct 5's final norm below.
+            #
+            # DO NOT SWITCH THIS TO THE MoE BAND. That warning stands and it is about
+            # ``MOE_RTOL``/``MOE_ATOL``: the routed LAYER does run, but this comparison
+            # never sees it, so a per-branch MoE selector here would widen nothing today
+            # and would arm an unruled widening the moment the layer count or the dense
+            # split moves.
+            #
+            # THE TWO SENTENCES THAT USED TO SAY "so it stays on the bf16 pair" AND
+            # "conjunct 5's final norm below, which is frozen at ``RTOL``/``ATOL``" ARE
+            # GONE, because both moved. This site and conjunct 5's take the peak-scaled
+            # recompute band, which is not a per-branch selector at all: it is ONE band
+            # at every recompute-against-recorded site in this item, it is TIGHTER than
+            # ``RTOL`` on the large cells, and it is refused outright above a declared
+            # peak ceiling. :func:`_stack_peak_band` carries the reasoning.
+            # ---- THE THIRD SITE THE OPTION (b) RULING MOVES. This comparison
+            # has conjunct 3's exact shape: `expected` is a float32 torch recompute
+            # (`_dense_output`, plain matmuls on dequantised weights) against a bf16
+            # forward, so its error floor is set by the largest intermediate it passes
+            # through and not by each cell's own value, which is what `ATOL = 1e-5`
+            # cannot express. IT HAS NEVER BEEN REACHED -- layer 0's conjunct 3 raised
+            # first on every run so far -- so no world reading exists for it, and both
+            # mismatch counts are printed to say what each pair would have decided.
+            _nx = recorded_in[index + 1][1][0].float()
+            _nrtol, _natol = _stack_peak_band(expected, f"conjunct 4 layer {index}")
+            _nae = (_nx - expected).abs()
+            print(f"TINYFWD|stack_ffn_band|layer={index}"
+                  f"|peak={float(expected.abs().max()):.10g}"
+                  f"|worst_abs={float(_nae.max()):.10g}"
+                  f"|rtol={_nrtol:.10g}|atol={_natol:.10g}"
+                  f"|cells_outside_this_pair="
+                  f"{int((_nae > (_natol + _nrtol * expected.abs())).sum())}"
+                  f"|cells_outside_the_old_pair="
+                  f"{int((_nae > (ATOL + RTOL * expected.abs())).sum())}"
+                  f"|old_pair=rtol {RTOL} atol {ATOL}")
+            torch.testing.assert_close(_nx, expected, rtol=_nrtol, atol=_natol)
+            _stack_band_controls(_nx, expected, _nrtol, _natol,
+                                 f"conjunct 4 layer {index}")
 
     # ---- CONJUNCT 5: THE FINAL NORM CLOSES THE CHAIN, on the last layer's own
     # output rather than on any earlier one.
@@ -4068,10 +4523,23 @@ def test_tiny_model_forward_matches_the_reference() -> None:
           f"|abs={float(_abs_err[55, 6]):.6g}|rel={float(_rel_err[55, 6]):.6g}"
           f"|one_bf16_ulp_at_1={float(2.0 ** -8):.6g}")
     # ---- end of the BLOCK B readings.
-    print(f"TINYFWD|stack_compare|max_abs_diff="
-          f"{float((got.float() - expected.float()).abs().max()):.10g}"
-          f"|peak_reference={float(expected.abs().max()):.10g}")
-    torch.testing.assert_close(got.float(), expected.float(), rtol=RTOL, atol=ATOL)
+    # ---- THE SECOND SITE THE OPTION (b) RULING MOVES. Same reasoning as conjunct
+    # 3's: `expected` here is a float32 torch recompute of the final norm over two
+    # bf16 terms, so its error floor is peak-set, not cell-set.
+    _rtol, _atol = _stack_peak_band(expected.float(), "conjunct 5 the final norm")
+    _ae = (got.float() - expected.float()).abs()
+    print(f"TINYFWD|stack_compare|max_abs_diff={float(_ae.max()):.10g}"
+          f"|peak_reference={float(expected.abs().max()):.10g}"
+          f"|rtol={_rtol:.10g}|atol={_atol:.10g}"
+          f"|cells_outside_this_pair="
+          f"{int((_ae > (_atol + _rtol * expected.float().abs())).sum())}"
+          f"|cells_outside_the_old_pair="
+          f"{int((_ae > (ATOL + RTOL * expected.float().abs())).sum())}"
+          f"|old_pair=rtol {RTOL} atol {ATOL}")
+    torch.testing.assert_close(got.float(), expected.float(),
+                               rtol=_rtol, atol=_atol)
+    _stack_band_controls(got.float(), expected.float(), _rtol, _atol,
+                         "conjunct 5 the final norm")
 
     # ---- CONTROL A: EACH LAYER READ ITS OWN MLP WEIGHTS. The two dense layers'
     # references are swapped and the answer must leave the band, or two layers
