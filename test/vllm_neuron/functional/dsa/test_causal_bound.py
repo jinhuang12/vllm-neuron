@@ -627,11 +627,17 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     _emit("C2_MF_NO_DUPLICATE_LEGAL_ID", rows=ROWS, duplicate_rows=len(mf_dup_rows),
           legal_per_row=[min(c, MULTIFOLD_SELECT_K) for c in mf_complete])
 
-    # THE RETIRED FORM IS ASSERTED RED, NOT PRINTED -- `103r5`, the fresh reader's TEST F1 and
-    # the lead's ruling at `approvals/LEAD-LOG.md` §750. The previous round asserted only
-    # `retired <= current`, which the gather form cannot violate, so it was an inequality that
-    # could not fail; the disagreement was merely printed beside it. The reading this case owes
-    # is that the retired form DISAGREES here, because that is the whole claim of the repair.
+    # THE RETIRED FORM IS DISCLOSED HERE, AND NO LONGER ASSERTED TO DISAGREE. Repair `103r6`
+    # under the lead's ruling at `approvals/LEAD-LOG.md` §766: §752's finite bound fill supersedes
+    # §750's ruling (3), which asked this case to assert that the retired gather form MUST differ
+    # from the value-keyed form. Under a finite fill that demand is false on correct code. At this
+    # geometry the fill folds evenly, no pad column exists, and every pass holds sixteen finite
+    # entries, so the selector's own strike value never appears and `bounded[index]` equals
+    # `value` on every slot -- the two forms AGREE. The struck assertion was therefore a reading
+    # about this case's DIALS, not about the module under test. What survives is the inequality
+    # the gather form cannot violate, plus the printed comparison beside it. The agreement is not
+    # asserted either: agreeing here is a fact about this geometry and not a property of the
+    # retired form.
     # Computed through the ORACLE so no second kernel dispatch is charged to the counters above.
     mf_retired = dsa_causal_sentinel_torch_oracle(
         mf_bounded.gather(1, mf_indices.to(torch.int64)), mf_idx32, MULTIFOLD_POOL_COLUMNS
@@ -644,13 +650,6 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     _emit("C2_MF_RETIRED_GATHER_FORM", retired=mf_retired_counts.tolist(),
           value_keyed=mf_per_row.tolist(),
           disagreeing_rows=int(bool((mf_retired_counts != mf_per_row).any())))
-    assert bool((mf_retired_counts != mf_per_row).any()), (
-        f"the retired gather form AGREED with the value-keyed form at this geometry, so this "
-        f"case does not exercise the strike substitution it exists for: retired "
-        f"{mf_retired_counts.tolist()} against {mf_per_row.tolist()}. A red here is a finding "
-        f"about this case's DIALS -- pick a geometry where a later pass re-matches a struck "
-        f"column -- and not about the module under test"
-    )
     _emit("C2_MF_ROUTE", bound=(mf_bound_nki, mf_bound_fb),
           sentinel=(mf_sent_nki, mf_sent_fb), topk_047=(mf_topk_nki, mf_topk_fb))
 

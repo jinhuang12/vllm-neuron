@@ -2094,8 +2094,8 @@ def prefill_slot_mapping(tokens: int, pool: int) -> torch.Tensor:
     """The pool-granular slot per position: the pool's own id where a pool COMPLETES, else ``-1``.
 
     ``pool_window``'s write mask is ``(slot_mapping >= 0) & (pos >= pool - 1)``
-    (``model_fp8.py:3209``), so a ``-1`` here is how a position says "my window is not a whole pool";
-    those rows are steered to the trash row rather than dropped (``model_fp8.py:3679-3684``).
+    (``model_fp8.py:3569``), so a ``-1`` here is how a position says "my window is not a whole pool";
+    those rows are steered to the trash row rather than dropped (``model_fp8.py:4272-4278``).
     """
     slots = torch.full((int(tokens),), -1, dtype=torch.int32)
     for p in range(int(tokens)):
@@ -2715,7 +2715,7 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     assert mismatches == 0, (
         f"{mismatches} of {int(reference.numel())} meaningful expanded indices differ over the first "
         f"{raw_got} columns. The implementation claims the pack COMMUTES with the row-wise "
-        f"projections bit-for-bit (model_fp8.py:3679-3682); this is that claim failing, not a "
+        f"projections bit-for-bit (model_fp8.py:4437-4448); this is that claim failing, not a "
         f"tolerance to widen"
     )
 
