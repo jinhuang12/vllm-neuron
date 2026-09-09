@@ -12,11 +12,10 @@ WHAT EACH ITEM SETTLES, and which registered expectation it answers.
        tower's whole forward) and arm B compares the pre-merger stage (the
        reference's ``last_hidden_state``), isolating the merger from everything
        upstream of it.
-  C02  The two temporal slices of a REAL processor's patch row are the same
-       pixels. This is the ground the tower's patch embedding stands on: it sums
-       the reference convolution over the temporal axis and feeds one slice, and
-       that is exact only because the slices are copies. Measured against the
-       shipped image processor, not asserted from the source.
+  C02  The two temporal slices of a REAL IMAGE processor's patch row are the same
+       pixels. Measured against the shipped image processor, not asserted from
+       the source. It is NOT a guard on the tower and its old wording wrongly
+       said it was -- see the item's own docstring and C09.
   C03  The rope positions tell a transposed grid apart. Review note B91 N5
        records that neither the landed adapter nor the reference can distinguish
        a (4, 2) grid from a (2, 4) one, because both treat any four consecutive
@@ -31,6 +30,23 @@ WHAT EACH ITEM SETTLES, and which registered expectation it answers.
   C06  The encoder-cache snapshot round-trips at max abs diff EXACTLY 0.0.
   C07  A text-only request snapshots 0 encoder-cache entries.
   C08  This module's activation map has not drifted from the adapter's.
+  C09  `inc-glm53f-111`. A two-frame video with DIFFERING frames, through the real
+       ``Glm5NextVideoProcessor``, embeds through the tower to the reference
+       ``nn.Conv3d``'s own answer at the registered pair -- so frame ``2k+1`` of
+       every temporal pair reaches the patch embedding. Its control that fires:
+       the pre-`-111` computation (filters folded over the temporal axis, slice 0
+       fed) must NOT meet the pair on those same rows, and the item raises on a
+       vacuous reading rather than passing quietly.
+  C10  `inc-glm53f-111`. The cause, named: with the second temporal filter slice
+       zeroed, the folded single-slice computation and the reference agree again
+       at the pair. That is what makes C09's gap the dropped slice and not a
+       dtype, layout or tolerance artefact.
+  C11  `inc-glm53f-111`. Image non-regression: image-processor rows through the
+       per-slice path still equal the reference at the registered pair. The
+       identity is algebraic -- for copies, ``sum_t conv2d(x_0, W_t)`` and
+       ``conv2d(x_0, sum_t W_t)`` are the same map -- but summation order differs
+       in finite precision, so it is MEASURED at the pair and never asserted
+       bit-equal.
 
 HOW THE CACHE ITEMS ARE DRIVEN, and why not through a request. C06 and C07 call
 the runner's four snapshot methods UNBOUND, on a ``SimpleNamespace`` carrying
@@ -49,6 +65,7 @@ certify behaviour rather than new work -- see the increment's evidence record.
 
 from __future__ import annotations
 
+import copy
 import io
 import os
 from pathlib import Path
@@ -64,6 +81,7 @@ from torch.testing import assert_close
 # file go green without ever executing the specification it claims to measure.
 from transformers.models.glm5_next import configuration_glm5_next, modeling_glm5_next
 
+from vllm_neuron.functional.vision.patch_embed import patch_embed as _seam_patch_embed
 from vllm_neuron.model.glm5_next.config import Glm5NextVisionConfig
 from vllm_neuron.model.glm5_next.utils.merge_vision_embeds import (
     Glm5NextVisionMergeError,
@@ -77,6 +95,7 @@ from vllm_neuron.model.glm5_next.utils.vision_preprocessing import (
 from vllm_neuron.model.glm5_next.utils.vision_rope import vision_position_ids
 from vllm_neuron.model.glm5_next.vision_encoder import (
     _ACTIVATIONS,
+    _PATCH_ROWS_PER_CALL,
     Glm5NextVisionEncoder,
     compute_attention_bounds,
     patch_embed_filters_from_conv3d,
@@ -203,9 +222,10 @@ def _fork_tower_with_copied_weights(cfg: Glm5NextVisionConfig, ref) -> Glm5NextV
         return ref_params[name].detach()
 
     with torch.no_grad():
-        # (1) patch embed: [C_out, C_in, T, P, P] -> [1, P, P, C_in, C_out],
-        # summed over the temporal axis. C02 measures the fact that makes the
-        # sum exact.
+        # (1) patch embed: [C_out, C_in, T, P, P] -> [T, P, P, C_in, C_out], a
+        # pure axis reorder that keeps the temporal slices SEPARATE. Nothing is
+        # summed in the weight since `inc-glm53f-111`; the tower sums the seam's
+        # outputs instead, one call per temporal slice (C09, C10, C11).
         tower.patch_embed_filters.copy_(
             patch_embed_filters_from_conv3d(take("patch_embed.proj.weight"))
         )
@@ -443,11 +463,27 @@ def _fork_blocks_only(
 # C02 -- the real processor's temporal slices are the same pixels.
 # ---------------------------------------------------------------------------
 def test_c02_the_two_temporal_patch_slices_are_the_same_pixels():
-    """The patch embedding's temporal sum is exact only if this holds.
+    """An IMAGE patch row's temporal slices are copies. Images only.
 
-    Measured on the shipped processor's own output. If a future checkpoint or
-    processor made the temporal slices differ, the tower's single-slice input
-    would silently drop half the signal, and this item is what fires first.
+    Measured on the shipped IMAGE processor's own output, which broadcasts one
+    frame across the temporal axis (``image_processing_glm5_next.py:206-215``).
+
+    THIS ITEM IS NOT A GUARD ON THE TOWER, and it used to claim it was. Its
+    earlier wording said that if a processor ever made the temporal slices
+    differ "this item is what fires first"; it cannot, because it constructs
+    ``Glm5NextImageProcessor()`` below and the image processor is exactly the one
+    that always copies. The VIDEO processor does not copy -- it is a plain
+    ``view`` over the real frame axis (``video_processing_glm5_next.py:286-316``)
+    -- and the tower no longer depends on copies either way: since
+    ``inc-glm53f-111`` it calls the patch-embed seam once per temporal slice with
+    that slice's own filter and sums the outputs, which is the reference
+    convolution's arithmetic for copies and non-copies alike. C09 is the item
+    that measures the video case, and C11 is the image non-regression.
+
+    What this item still earns its place for: it pins the IMAGE processor's
+    broadcast as a measured property of the shipped code rather than a claim read
+    off the source, so a future processor change that stopped broadcasting for
+    images is reported here by name.
     """
     package = require_transformers_glm5_next()
     processor = package.Glm5NextImageProcessor()
@@ -482,9 +518,11 @@ def test_c02_the_two_temporal_patch_slices_are_the_same_pixels():
         MAX_ABS_GAP_BETWEEN_SLICES=slice_gap,
     )
     assert slice_gap == 0.0, (
-        f"the temporal slices of a patch row differ by {slice_gap}; the tower's "
-        "patch embedding sums the reference convolution over that axis and feeds "
-        "one slice, which is exact only while the slices are copies"
+        f"the temporal slices of an IMAGE patch row differ by {slice_gap}; the "
+        "image processor is expected to broadcast one frame across that axis "
+        "(image_processing_glm5_next.py:206-215), so this is a change in the "
+        "shipped image processor, not a tower defect -- the tower embeds each "
+        "temporal slice with its own filter either way (C09, C11)"
     )
 
 
@@ -812,3 +850,271 @@ def test_c08_the_activation_map_matches_the_adapters():
     )
     for key in _ACTIVATIONS:
         assert _ACTIVATIONS[key] is theirs[key], f"{key} maps to a different class"
+
+
+# ---------------------------------------------------------------------------
+# C09-C11 -- `inc-glm53f-111`: every temporal slice reaches the patch embedding.
+#
+# The tower used to fold the reference convolution's weight over the temporal
+# axis and feed slice 0 only. That is exact when the slices are copies, which the
+# IMAGE processor guarantees and the VIDEO processor does not: `patchify` is a
+# plain `view` over the real frame axis (`video_processing_glm5_next.py:286-316`),
+# so a two-frame video puts frames 0 and 1 in one patch row and the fold dropped
+# frame 1. These three items measure the fix, name its cause, and pin that the
+# image path did not move.
+# ---------------------------------------------------------------------------
+def _real_video_rows():
+    """Two frames that DIFFER, through the shipped video processor.
+
+    The frames are two different constants, so the temporal slices of every patch
+    row must differ; a helper that filled both frames alike would make C09
+    vacuous no matter what the tower did, which is the trap the `-110` reading
+    was rewritten to avoid.
+    """
+    package = require_transformers_glm5_next()
+    processor = package.Glm5NextVideoProcessor()
+    consts = GridConstants.from_processor(processor)
+    frames = torch.stack(
+        [
+            torch.full((3, 112, 112), 40, dtype=torch.uint8),
+            torch.full((3, 112, 112), 200, dtype=torch.uint8),
+        ]
+    )
+    input_frames_differ = int(bool((frames[0] != frames[1]).any()))
+    out = processor(videos=[frames], do_sample_frames=False, return_tensors="pt")
+    rows = out["pixel_values_videos"]
+    rows = rows.reshape(-1, rows.shape[-1]).to(DTYPE)
+    return rows, out["video_grid_thw"], consts, input_frames_differ
+
+
+def _slice_gap(rows: torch.Tensor, consts) -> float:
+    """Largest absolute difference between temporal slice 0 and slice 1 of a row."""
+    reshaped = rows.reshape(
+        rows.shape[0],
+        int(TINY["in_channels"]),
+        int(consts.temporal_patch_size),
+        int(consts.patch_size),
+        int(consts.patch_size),
+    )
+    gap = 0.0
+    for temporal in range(1, int(consts.temporal_patch_size)):
+        gap = max(gap, _max_abs(reshaped[:, :, 0], reshaped[:, :, temporal]))
+    return gap
+
+
+def _folded_single_slice_embed(
+    tower: Glm5NextVisionEncoder,
+    pixel_values: torch.Tensor,
+    filters: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The pre-`-111` computation, kept here so the fix has something to beat.
+
+    Line for line what the tower did before this increment: sum the per-slice
+    filters into one depth-1 filter, feed temporal slice 0, call the same seam.
+    It is built from the tower's OWN filters (or from ``filters`` when a caller
+    wants a modified weight), so it cannot drift away from the weights the tower
+    is holding.
+    """
+    source = tower.patch_embed_filters.detach() if filters is None else filters
+    folded = source.sum(dim=0, keepdim=True)
+    total = pixel_values.shape[0]
+    rows = pixel_values.reshape(
+        total,
+        tower.in_channels,
+        tower.temporal_patch_size,
+        tower.patch_size,
+        tower.patch_size,
+    )[:, :, :1]
+    out = []
+    for start in range(0, total, _PATCH_ROWS_PER_CALL):
+        chunk = rows[start : start + _PATCH_ROWS_PER_CALL]
+        embedded = _seam_patch_embed(
+            chunk,
+            folded,
+            tower.patch_size,
+            bias=tower.patch_embed_bias.detach(),
+        )
+        out.append(embedded.reshape(chunk.shape[0], tower.hidden_size))
+    return torch.cat(out, dim=0)
+
+
+def _meets_the_registered_pair(actual: torch.Tensor, expected: torch.Tensor) -> bool:
+    """Ask the SAME instrument the criterion uses, rather than a hand-rolled bound.
+
+    A control that decided "close enough" with its own comparison could disagree
+    with the assertion the criterion is judged by. This calls ``assert_close`` at
+    the registered pair and reports whether it held.
+    """
+    try:
+        assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+    except AssertionError:
+        return False
+    return True
+
+
+def test_c09_a_two_frame_video_embeds_both_temporal_slices():
+    """The fix, measured against the reference convolution on real video rows.
+
+    The reference ``Glm5NextVisionPatchEmbed`` is a real ``nn.Conv3d`` whose
+    kernel depth is ``temporal_patch_size`` and whose stride equals its kernel
+    (``modeling_glm5_next.py:1720-1721``), so it computes
+    ``sum_t W[:, :, t] * x_t`` over the whole temporal axis. The tower must reach
+    the same value through the depth-1 seam, called once per slice.
+
+    Two input controls keep the reading from being vacuous -- the temporal axis
+    really carries two slices, and the two frames really differ -- and one control
+    FIRES: the pre-`-111` folded computation must fail the registered pair on
+    these same rows. If it were to pass, the fix would be unmeasurable here and
+    the item raises saying so instead of going green.
+    """
+    cfg = _fork_config()
+    ref = _reference_tower()
+    tower = _fork_tower_with_copied_weights(cfg, ref)
+
+    rows, grid, consts, input_frames_differ = _real_video_rows()
+    gap = _slice_gap(rows, consts)
+
+    with torch.no_grad():
+        expected = ref.patch_embed(rows)
+        actual = tower.patch_embed(rows)
+        folded = _folded_single_slice_embed(tower, rows)
+
+    fold_error = _max_abs(folded, expected)
+    fold_meets = _meets_the_registered_pair(folded, expected)
+    _emit(
+        "v-slice-fold",
+        GAP=fold_error,
+        FOLDED_MEETS_THE_PAIR=int(fold_meets),
+        RTOL=RTOL,
+        ATOL=ATOL,
+    )
+    _emit(
+        "c09 video-temporal-slices",
+        grid=tuple(grid[0].tolist()),
+        patch_rows=int(rows.shape[0]),
+        temporal_patch_size=int(consts.temporal_patch_size),
+        INPUT_FRAMES_DIFFER=input_frames_differ,
+        VIDEO_TEMPORAL_SLICE_GAP=gap,
+        PER_SLICE_MAX_ABS_ERROR=_max_abs(actual, expected),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    assert int(consts.temporal_patch_size) == 2, (
+        "the temporal axis carries one slice, so a per-slice sum and a "
+        "single-slice fold are the same computation and this item measures nothing"
+    )
+    assert input_frames_differ == 1, (
+        "the two input frames are identical, so the video rows carry no temporal "
+        "signal and this item measures nothing"
+    )
+    assert gap > 0.0, (
+        f"the video processor returned patch rows whose temporal slices agree "
+        f"(gap {gap}); the fold this item is built to beat would be exact on "
+        "these rows and the reading would be vacuous"
+    )
+    assert not fold_meets, (
+        f"the pre-inc-glm53f-111 fold (filters summed over the temporal axis, "
+        f"slice 0 fed) MET the registered pair on these video rows at max abs "
+        f"error {fold_error}, so this item cannot tell the fix from the defect it "
+        "replaces; the reading is vacuous and must not be recorded as a pass"
+    )
+
+    assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+
+
+def test_c10_zeroing_the_second_temporal_filter_restores_the_fold():
+    """The cause, named: C09's gap IS the dropped slice.
+
+    With ``W[:, :, 1]`` zeroed the reference convolution has nothing to
+    contribute from the second temporal slice, so summing the filters over that
+    axis and feeding slice 0 becomes exact again -- and the old computation meets
+    the registered pair on the very rows where C09 showed it failing. That rules
+    out a dtype, a layout error or a tolerance that is simply too tight as the
+    explanation for C09.
+    """
+    cfg = _fork_config()
+    ref = _reference_tower()
+    tower = _fork_tower_with_copied_weights(cfg, ref)
+    rows, _, consts, _ = _real_video_rows()
+
+    zeroed_weight = ref.patch_embed.proj.weight.detach().clone()
+    zeroed_weight[:, :, 1] = 0.0
+    zeroed_reference = copy.deepcopy(ref.patch_embed)
+    with torch.no_grad():
+        zeroed_reference.proj.weight.copy_(zeroed_weight)
+        expected = zeroed_reference(rows)
+        folded = _folded_single_slice_embed(
+            tower, rows, filters=patch_embed_filters_from_conv3d(zeroed_weight)
+        )
+
+    _emit(
+        "c10 zeroed-second-slice",
+        SECOND_FILTER_SLICE_ABS_SUM=float(zeroed_weight[:, :, 1].abs().sum()),
+        FIRST_FILTER_SLICE_ABS_SUM=float(zeroed_weight[:, :, 0].abs().sum()),
+        FOLD_MAX_ABS_ERROR=_max_abs(folded, expected),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    assert float(zeroed_weight[:, :, 1].abs().sum()) == 0.0, (
+        "the second temporal filter slice was not actually zeroed, so this item "
+        "is not the control it claims to be"
+    )
+    assert float(zeroed_weight[:, :, 0].abs().sum()) > 0.0, (
+        "the first temporal filter slice is all zeros, so both sides would agree "
+        "on an empty computation and the control would be vacuous"
+    )
+    assert _slice_gap(rows, consts) > 0.0, (
+        "these are not the differing-slice rows C09 measured, so agreement here "
+        "would not explain C09's gap"
+    )
+
+    assert_close(folded, expected, rtol=RTOL, atol=ATOL)
+
+
+def test_c11_the_image_path_is_unchanged_by_the_per_slice_sum():
+    """Image non-regression, measured -- not asserted bit-equal.
+
+    For rows whose temporal slices are copies, ``sum_t conv2d(x_0, W_t)`` and
+    ``conv2d(x_0, sum_t W_t)`` are the same linear map, so the per-slice sum
+    cannot change the image answer in exact arithmetic. Finite precision does not
+    inherit that: the two differ in summation order, and float32 addition is not
+    associative. So this is judged at the REGISTERED pair, exactly like C01, and
+    the fold's own error is printed beside it rather than being required to be
+    zero.
+    """
+    cfg = _fork_config()
+    ref = _reference_tower()
+    tower = _fork_tower_with_copied_weights(cfg, ref)
+
+    package = require_transformers_glm5_next()
+    processor = package.Glm5NextImageProcessor()
+    consts = GridConstants.from_processor(processor)
+    image = torch.randint(0, 256, (3, 112, 112), dtype=torch.uint8)
+    out = processor(images=[image], return_tensors="pt")
+    rows = out["pixel_values"]
+    rows = rows.reshape(-1, rows.shape[-1]).to(DTYPE)
+
+    with torch.no_grad():
+        expected = ref.patch_embed(rows)
+        actual = tower.patch_embed(rows)
+        folded = _folded_single_slice_embed(tower, rows)
+
+    _emit(
+        "c11 image-non-regression",
+        grid=tuple(out["image_grid_thw"][0].tolist()),
+        patch_rows=int(rows.shape[0]),
+        IMAGE_TEMPORAL_SLICE_GAP=_slice_gap(rows, consts),
+        PER_SLICE_MAX_ABS_ERROR=_max_abs(actual, expected),
+        FOLDED_MAX_ABS_ERROR=_max_abs(folded, expected),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    assert _slice_gap(rows, consts) == 0.0, (
+        "the image processor's temporal slices differ here, so this is not the "
+        "copies case the algebraic identity is about (see C02)"
+    )
+
+    assert_close(actual, expected, rtol=RTOL, atol=ATOL)

@@ -25,17 +25,31 @@ cache stores -- and not its ``last_hidden_state``.
 Three composition facts were read off the specification rather than assumed, and
 each is what makes the delegation above exact:
 
-1. **The temporal patch axis is a broadcast copy, so the tower's convolution is
-   2-D.** The image processor builds ``pixel_values`` by
+1. **The temporal patch axis is a broadcast copy FOR IMAGES ONLY, so the tower
+   keeps one depth-1 filter per temporal slice and sums their outputs.** The
+   IMAGE processor builds ``pixel_values`` by
    ``patches.unsqueeze(6).expand(-1, -1, -1, -1, -1, -1, temporal_patch_size,
-   -1, -1)`` (``image_processing_glm5_next.py:206-213``): the
-   ``temporal_patch_size`` slices of every patch row are the *same* pixels.
-   The reference's ``nn.Conv3d`` over kernel depth ``temporal_patch_size``
-   therefore computes ``sum_t W[:, :, t] * x_0``, which equals a single depth-1
-   convolution whose weight is ``W`` summed over ``t``. That is exactly the
-   degeneration ``-057``'s seam wires and refuses to be used outside
-   (``patch_embed.py:325-337``), so :func:`patch_embed_filters_from_conv3d`
-   performs the sum and the tower feeds one temporal slice.
+   -1, -1)`` (``image_processing_glm5_next.py:206-215``, the ``expand`` on
+   ``:208``): the ``temporal_patch_size`` slices of an image patch row are the
+   *same* pixels. **The VIDEO processor does not.**
+   ``Glm5NextVideoProcessor.patchify``
+   (``video_processing_glm5_next.py:286-316``) is a plain ``view`` that splits
+   the REAL frame axis into ``(grid_t, temporal_patch_size)`` (``:297-308``)
+   after padding the frame count up by repeating the last frame
+   (``:289-292``), so patch-row group ``k`` holds frames ``2k`` and ``2k+1`` --
+   two *different* frames. The reference's ``nn.Conv3d`` over kernel depth
+   ``temporal_patch_size`` with ``stride = kernel_size``
+   (``modeling_glm5_next.py:1720-1721``) computes ``sum_t W[:, :, t] * x_t``.
+   That degenerates to ``(sum_t W[:, :, t]) * x_0`` only when the slices are
+   copies, which is why folding the weight over ``t`` and feeding one slice was
+   exact for images and dropped frame ``2k+1`` for every video with more than
+   one distinct frame. ``-057``'s seam takes one depth-1 filter and refuses any
+   other depth (``patch_embed.py:325-337``), so
+   :func:`patch_embed_filters_from_conv3d` keeps the temporal slices SEPARATE
+   and :meth:`Glm5NextVisionEncoder.patch_embed` calls the seam once per slice
+   with that slice's own filter and sums the outputs. The sum is now over
+   seam outputs rather than over weights, which is the same arithmetic when the
+   slices are copies and the reference's arithmetic when they are not.
 2. **Attention is bidirectional within one frame.** The reference reaches
    ``get_vision_cu_seqlens`` with ``merge_temporal=False``
    (``modeling_glm5_next.py:1797``; ``vision_utils.py:42-66``), so each frame is
@@ -100,15 +114,20 @@ def patch_embed_filters_from_conv3d(conv_weight: torch.Tensor) -> torch.Tensor:
     The reference holds ``[C_out, C_in, temporal_patch_size, P, P]``
     (``modeling_glm5_next.py:1721``); ``-057``'s seam takes
     ``[K_d, K_h, K_w, C_in, C_out]`` with ``K_d == 1``
-    (``patch_embed.py:310-337``). Summing over the temporal axis is exact, not an
-    approximation, because the input's temporal slices are identical copies --
-    see fact 1 in this module's docstring.
+    (``patch_embed.py:310-337``). This keeps the temporal slices SEPARATE and
+    only reorders the axes, so slice ``t`` of the result is the seam-layout
+    filter for temporal slice ``t`` and ``result[t : t + 1]`` is a whole
+    admissible filter on its own. Nothing is summed here: the tower sums the
+    seam's OUTPUTS instead (:meth:`Glm5NextVisionEncoder.patch_embed`), which is
+    the reference's ``sum_t W[:, :, t] * x_t`` and not the older
+    ``(sum_t W[:, :, t]) * x_0`` -- see fact 1 in this module's docstring for why
+    the two differ for video and agree for images.
 
     Args:
         conv_weight: ``[C_out, C_in, temporal_patch_size, P, P]``.
 
     Returns:
-        ``[1, P, P, C_in, C_out]``.
+        ``[temporal_patch_size, P, P, C_in, C_out]``.
 
     Raises:
         Glm5NextVisionEncoderError: the weight is not 5-D.
@@ -119,8 +138,7 @@ def patch_embed_filters_from_conv3d(conv_weight: torch.Tensor) -> torch.Tensor:
             f"[C_out, C_in, temporal_patch_size, P, P], got "
             f"{conv_weight.dim()}-D {tuple(conv_weight.shape)}"
         )
-    summed = conv_weight.sum(dim=2)
-    return summed.permute(2, 3, 1, 0).unsqueeze(0).contiguous()
+    return conv_weight.permute(2, 3, 4, 1, 0).contiguous()
 
 
 def compute_attention_bounds(
@@ -430,10 +448,13 @@ class Glm5NextVisionEncoder(nn.Module):
         # The patch embedding is held in the seam's own filter layout rather than
         # as an ``nn.Conv3d``, so the tower never has to reshape a weight at
         # every forward. :func:`patch_embed_filters_from_conv3d` converts a
-        # reference checkpoint into it once.
+        # reference checkpoint into it once. The leading axis is the temporal
+        # patch axis: entry ``t`` is the whole depth-1 filter for temporal slice
+        # ``t``, so ``self.patch_embed_filters[t : t + 1]`` is admissible to the
+        # seam exactly as it stands.
         self.patch_embed_filters = nn.Parameter(
             torch.empty(
-                1,
+                config.temporal_patch_size,
                 config.patch_size,
                 config.patch_size,
                 config.in_channels,
@@ -451,6 +472,14 @@ class Glm5NextVisionEncoder(nn.Module):
 
     def patch_embed(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Embed flat patch rows through ``-057``'s NKI seam.
+
+        The seam is called once per temporal slice and the slice outputs are
+        summed, which is the reference convolution's own arithmetic over that
+        axis. An image therefore costs ``temporal_patch_size`` seam calls where
+        the older single-slice form cost one, on rows whose slices are copies;
+        collapsing that back into one depth-``temporal_patch_size`` seam call is
+        a recorded follow-up and needs the seam's depth guard widened, which is
+        kernel-class work this method does not do.
 
         Args:
             pixel_values: ``[total_patches, patch_dim]`` where ``patch_dim`` is
@@ -485,24 +514,38 @@ class Glm5NextVisionEncoder(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        # One temporal slice, because they are copies of each other -- fact 1 in
-        # this module's docstring -- and the filters already carry the sum over
-        # that axis. This is the ``D == 1`` input the seam requires.
-        rows = rows[:, :, :1]
-
         # The seam refuses a batch above its declared range
         # (``patch_embed.py:379-395``), and one patch row is one batch element,
         # so a real image is embedded in chunks.
+        # The bias enters ONCE, on the first temporal slice, because the seam adds
+        # whatever bias it is handed and the reference adds it once to the summed
+        # result. The later slices are handed a ZERO bias rather than ``None``:
+        # both are correct arithmetic, but a real ``[C_out]`` bias is the option
+        # profile every landed call already uses, so no seam call in this loop is
+        # a form the substrate has not seen before.
+        zero_bias = torch.zeros_like(self.patch_embed_bias)
+
         embedded = []
         for start in range(0, total_patches, _PATCH_ROWS_PER_CALL):
             chunk = rows[start : start + _PATCH_ROWS_PER_CALL]
-            out = patch_embed(
-                chunk,
-                self.patch_embed_filters,
-                self.patch_size,
-                bias=self.patch_embed_bias,
-            )
-            embedded.append(out.reshape(chunk.shape[0], self.hidden_size))
+            # ONE seam call per temporal slice, each carrying that slice's own
+            # depth-1 filter and that slice's own pixels, summed: the
+            # reference's ``sum_t W[:, :, t] * x_t``
+            # (``modeling_glm5_next.py:1720-1721``). Every call is the ``D == 1``
+            # input the seam requires (``patch_embed.py:325-337``), so the seam
+            # is called unchanged. For an image the slices are copies and this
+            # returns the same value the older single-slice form did; for a video
+            # it is the value that form dropped.
+            accumulated = None
+            for temporal in range(self.temporal_patch_size):
+                out = patch_embed(
+                    chunk[:, :, temporal : temporal + 1],
+                    self.patch_embed_filters[temporal : temporal + 1],
+                    self.patch_size,
+                    bias=self.patch_embed_bias if temporal == 0 else zero_bias,
+                )
+                accumulated = out if accumulated is None else accumulated + out
+            embedded.append(accumulated.reshape(chunk.shape[0], self.hidden_size))
         return torch.cat(embedded, dim=0)
 
     def forward(
