@@ -703,6 +703,38 @@ def _attach(
     setattr(module, _scale_grid_attribute(leaf), delivered.clone())
 
 
+def _prep_operands_from_the_module(module, leaves, fixture: dict) -> tuple:
+    """The six arguments ``prepare_scale_operands`` takes, read off the MODULE.
+
+    THE PREP IS HANDED WHAT THE LOAD BOUND, NOT WHAT THE FIXTURE HELD.
+    ``_run_load_time_preps`` (``model_fp8.py:7887-7895``) passes this module's own
+    attributes, and a bank's forward multiplies only what this call built. A site that
+    hands the fixture's dict straight through therefore builds operands the load never
+    touched: ``_attach``'s squeeze and compensation are skipped, and on a 240-clamp
+    platform the item measures the checkpoint instead of the store. This file's
+    shared-expert item already reads them off the module in exactly this form, so this
+    is that form asked once rather than written at four more sites.
+
+    THE REFUSAL IS BY IDENTITY, NOT EQUALITY. On a platform where the pair is a no-op
+    a copy of the fixture's tensor compares equal to the module's, so equality could
+    not tell the two apart; ``is`` can.
+
+    Raises:
+        VacuousControlError: if a tensor the fixture holds reached the prep, which
+            means the bind between the fixture and the prep stopped transforming.
+    """
+    weights = tuple(getattr(module, leaf) for leaf in leaves)
+    grids = tuple(getattr(module, _scale_grid_attribute(leaf)) for leaf in leaves)
+    for leaf, weight, grid in zip(leaves, weights, grids):
+        if weight is fixture[leaf][0] or grid is fixture[leaf][1]:
+            raise VacuousControlError(
+                f"{leaf} reached the prep as the fixture's own tensor, so the load's "
+                f"squeeze and compensation were skipped and this item would measure "
+                f"the checkpoint rather than what a load stores"
+            )
+    return weights + grids
+
+
 def _dense_operands() -> dict:
     """The dense MLP's three weights and three public block-scale grids.
 
@@ -1554,12 +1586,7 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
     # per forward step" checkable, so the item runs the prep rather than reaching past
     # it.
     built = module.prepare_scale_operands(
-        gate_proj_weight=operands["gate_proj_weight"][0],
-        up_proj_weight=operands["up_proj_weight"][0],
-        down_proj_weight=operands["down_proj_weight"][0],
-        gate_proj_scale=operands["gate_proj_weight"][1],
-        up_proj_scale=operands["up_proj_weight"][1],
-        down_proj_scale=operands["down_proj_weight"][1],
+        *_prep_operands_from_the_module(module, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), operands)
     )
     health = getattr(module, module.RETILE_HEALTH_ATTR)
     print(
@@ -2162,12 +2189,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
         _attach(block.experts, leaf, *routed[leaf])
     bank_built = block.experts.prepare_scale_operands(
-        gate_proj_weight=routed["gate_proj_weight"][0],
-        up_proj_weight=routed["up_proj_weight"][0],
-        down_proj_weight=routed["down_proj_weight"][0],
-        gate_proj_scale=routed["gate_proj_weight"][1],
-        up_proj_scale=routed["up_proj_weight"][1],
-        down_proj_scale=routed["down_proj_weight"][1],
+        *_prep_operands_from_the_module(block.experts, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), routed)
     )
 
     # ---- THE SHARED EXPERT at the bank's hidden size, and its own prep.
@@ -2616,12 +2638,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
         _attach(bare.experts, leaf, *routed[leaf])
     bare.experts.prepare_scale_operands(
-        gate_proj_weight=routed["gate_proj_weight"][0],
-        up_proj_weight=routed["up_proj_weight"][0],
-        down_proj_weight=routed["down_proj_weight"][0],
-        gate_proj_scale=routed["gate_proj_weight"][1],
-        up_proj_scale=routed["up_proj_weight"][1],
-        down_proj_scale=routed["down_proj_weight"][1],
+        *_prep_operands_from_the_module(bare.experts, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), routed)
     )
     bare.experts.router_weight = block.experts.router_weight
     bare.experts.router_bias = block.experts.router_bias
@@ -3850,12 +3867,9 @@ def _stack_fixture(model=None) -> dict:
         for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
             _attach(layer.mlp.experts, leaf, *operands[leaf])
         built = layer.mlp.experts.prepare_scale_operands(
-            gate_proj_weight=operands["gate_proj_weight"][0],
-            up_proj_weight=operands["up_proj_weight"][0],
-            down_proj_weight=operands["down_proj_weight"][0],
-            gate_proj_scale=operands["gate_proj_weight"][1],
-            up_proj_scale=operands["up_proj_weight"][1],
-            down_proj_scale=operands["down_proj_weight"][1],
+            *_prep_operands_from_the_module(
+                layer.mlp.experts, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), operands
+            )
         )
         if built != 4:
             raise VacuousControlError(
