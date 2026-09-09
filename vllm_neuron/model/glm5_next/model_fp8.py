@@ -1287,8 +1287,26 @@ class Glm5NextHyperConnection(nn.Module):
             comb_start, iters=self.sinkhorn_iters
         )
 
+        # THE COLLAPSE IS COMPUTED IN FP32 AND RETURNED IN THE STREAMS' DTYPE, which
+        # is the reference's own form: `reference:294` ends the same weighted sum with
+        # `.to(hidden_streams.dtype)`. That cast is load-bearing rather than cosmetic --
+        # this value is what every sublayer is handed, and the dense and MoE seams
+        # downstream state their contract as bfloat16 activations (`:2875`), so an fp32
+        # collapse reaches a kernel that loads x at its own dtype with no gate to catch
+        # it. The cast PRESERVES the dtype rather than naming bfloat16, again because
+        # that is what the reference does (`:1291` reads `dtype = hidden_states.dtype`):
+        # a bfloat16 carrier gets bfloat16 here and an fp32 fixture still gets fp32.
+        #
+        # RE-GROUNDED BY ``inc-glm53f-030d`` (part (a), cast points; lead ruling §1060).
+        # This line is ``inc-glm53f-030``'s and the cast is the ONE byte of it this
+        # block changes, which the block's record states as a Surface widening rather
+        # than leaving the next reader to find.
         layer_input = (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1)
-        return post_mix.reshape(tokens, streams, 1), comb_mix, layer_input
+        return (
+            post_mix.reshape(tokens, streams, 1),
+            comb_mix,
+            layer_input.to(residual.dtype),
+        )
 
     # ── mHC post -- ONE combine dispatch ──────────────────────────────────
     def mhc_post(
@@ -1308,7 +1326,11 @@ class Glm5NextHyperConnection(nn.Module):
             comb_res_mix: ``[T, S, S]`` from :meth:`mhc_pre`.
 
         Returns:
-            ``[T, S, H]`` fp32 -- the seam's own return dtype, not re-cast.
+            ``[T, S, H]`` in ``residual``'s dtype. The seam computes in fp32 and the
+            cast back is here, which is the reference's form: it mixes in
+            ``dtype = hidden_states.dtype`` (``reference:1291``, applied at
+            ``:1316-1318`` and ``:1325-1327``). This value is the carrier between
+            layers, so its dtype is the dtype the next sublayer is handed.
 
         Raises:
             HyperConnectionError: from the seam, on any inadmissible rank or
@@ -1323,12 +1345,19 @@ class Glm5NextHyperConnection(nn.Module):
         # Argument names and order are the seam's, which are the base's, so this
         # is a call rather than a translation -- ``hyper_connection.py:375-376``
         # asks for exactly that.
-        return hyper_connection_combine(
+        #
+        # RE-GROUNDED BY ``inc-glm53f-030d`` (cast points, lead ruling §1060). The
+        # docstring used to say "fp32 -- the seam's own return dtype, not re-cast",
+        # and leaving it that way is what put fp32 activations in front of a
+        # bfloat16 kernel contract. The seam still takes fp32 in and still computes
+        # in fp32; only the RETURN is cast back to the carrier's dtype.
+        mixed = hyper_connection_combine(
             x=x.to(torch.float32),
             residual=residual.to(torch.float32),
             post_layer_mix=post_layer_mix.to(torch.float32),
             comb_res_mix=comb_res_mix.to(torch.float32),
         )
+        return mixed.to(residual.dtype)
 
     # ── one layer call ────────────────────────────────────────────────────
     def forward(self, residual: torch.Tensor, sublayer: object) -> torch.Tensor:
@@ -4301,9 +4330,12 @@ class Glm5NextKDALayer(nn.Module):
 
         Returns:
             ``[T, H]`` on the one-stream route -- the input dtype, unchanged. On
-            the streams route, ``[T, S, H]`` fp32: the combine seam's own return
-            dtype, which ``inc-glm53f-030`` deliberately does not re-cast, and the
-            carrier decides what to do with it.
+            the streams route, ``[T, S, H]`` in the STREAMS' dtype: the seams
+            compute in fp32 and :meth:`Glm5NextHyperConnection.mhc_post` casts the
+            mix back, which is what the reference does (``reference:1291`` reads
+            ``dtype = hidden_states.dtype`` and applies it at ``:1316-1318``). So a
+            bfloat16 carrier stays bfloat16 through this layer, which is what the
+            dense and MoE seams downstream ask for (``:2875``).
 
         Raises:
             Glm5NextHyperConnectionError: from :func:`_mhc_attention_site` when the
@@ -7093,10 +7125,12 @@ class Glm5NextModel(nn.Module):
 
         Returns:
             ``[T, H]`` after the final RMSNorm, in the embedding table's dtype. The
-            streams live only inside this method: the mean collapses them and the
-            cast back to the table's dtype is this carrier's, because the combine
-            seam returns fp32 on purpose and leaves the decision here
-            (``inc-glm53f-030``).
+            streams live only inside this method, and they carry the table's dtype
+            the whole way: the expand copies it, both mHC sites cast their mixes back
+            to it (``reference:1291``), the mean keeps it (``reference:302``) and the
+            norm returns it (``reference:75-80``). The ``.to()`` on the collapse is
+            therefore a no-op on the production path and a guard on any fixture that
+            feeds the stack something else.
             Logits are the root's, which is where ``lm_head_weight`` lives.
 
         Raises:

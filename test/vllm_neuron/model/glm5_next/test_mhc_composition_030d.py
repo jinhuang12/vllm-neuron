@@ -175,18 +175,31 @@ class _StubAttention(nn.Module):
     input it saw, which is how the items below tell the two routes apart.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, half=None) -> None:
         super().__init__()
         self.seen: list[tuple[int, ...]] = []
+        # The dtype is recorded BESIDE the shape rather than inside it, because the
+        # landed items compare `seen` to a list of shapes and this commit does not
+        # move their readings (`inc-glm53f-030d` commit 4, the cast points).
+        self.seen_dtypes: list[torch.dtype] = []
+        self._half = half
 
     def forward(self, hidden_states: torch.Tensor, **_kwargs: object) -> torch.Tensor:
         self.seen.append(tuple(hidden_states.shape))
+        self.seen_dtypes.append(hidden_states.dtype)
+        if self._half is not None:
+            return self._half(hidden_states)
         return torch.tanh(hidden_states) * 1.5
 
 
-def _install_stub(layer) -> _StubAttention:
-    """Replace the attention half, under the attribute the class itself names."""
-    stub = _StubAttention()
+def _install_stub(layer, half=None) -> _StubAttention:
+    """Replace the attention half, under the attribute the class itself names.
+
+    ``half``, when given, is the callable the stub runs -- so an item can hand the
+    SAME function to this stack and to the reference stack instead of writing the
+    formula twice.
+    """
+    stub = _StubAttention(half)
     setattr(layer, type(layer).ATTENTION_ATTR, stub)
     return stub
 
@@ -1633,3 +1646,409 @@ def test_030d_the_role_map_agrees_with_the_reference_by_name() -> None:
         "the reference's three parameters do not have three distinct shapes, so this "
         "item cannot catch a swap and the gap it closes is still open"
     )
+
+
+# --------------------------------------------------------------------------- #
+# COMMIT 4 -- THE CAST POINTS, and acceptance arms (1)-(3) OF RECORD.           #
+#                                                                              #
+# The block's acceptance registers five arms. Commit 2 carried arm (4) (the     #
+# two-way refusal) and arm (5) (the three landed layer suites re-run unedited). #
+# Arms (1), (2) and (3) are here, and so is the cast-point reading review round #
+# 2 found missing: the reference casts every sublayer input and both mixes back #
+# to the streams' dtype, and this tree used to hand every sublayer fp32.        #
+#                                                                              #
+# THE TOKEN COUNT IS FORCED, NOT CHOSEN: the dense block-FP8 seam admits only   #
+# positive multiples of 128 and the mHC combine kernel refuses more than 128,   #
+# so 128 is the only count both admit (plan block, ruled Q6).                   #
+# --------------------------------------------------------------------------- #
+ARM_TOKENS = 128
+
+
+def _registered_pair() -> tuple[float, float]:
+    """``(RTOL, ATOL)`` READ OUT OF the landed file that declares them.
+
+    The pair is ``test_mhc_layer.py:162-163``'s and this block registers no new
+    tolerance. Copying the two numbers here would give the campaign two authorities
+    for one frozen value, so they are parsed out of that file instead: if it ever
+    moves, these items move with it rather than disagreeing with it silently.
+    """
+    path = Path(__file__).with_name("test_mhc_layer.py")
+    tree = ast.parse(path.read_text())
+    found: dict[str, float] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name in ("RTOL", "ATOL") and isinstance(node.value, ast.Constant):
+                found[name] = float(node.value.value)
+    assert sorted(found) == ["ATOL", "RTOL"], (
+        f"the registered pair could not be read from {path.name}; found {sorted(found)}"
+    )
+    return found["RTOL"], found["ATOL"]
+
+
+# ---- THE INDEPENDENT REFERENCE ------------------------------------------------
+# Transcribed from `design/reference/modeling_glm5_next.py`, line by line, and from
+# NOTHING in the implementation under test: a reference read off the code it checks
+# proves only that the code agrees with itself. Every function below names the
+# reference lines it transcribes, and the provenance item in this file asserts the
+# reference file's sha256 before any of it is trusted.
+
+
+def _ref_unweighted_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """``reference:216`` -- the mHC's own input norm, no learned gain."""
+    return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps).to(x.dtype)
+
+
+def _ref_weighted_norm(x: torch.Tensor, gain: torch.Tensor, eps: float) -> torch.Tensor:
+    """``reference:75-80`` -- the model's RMSNorm, computed in fp32, returned in dtype."""
+    input_dtype = x.dtype
+    h = x.to(torch.float32)
+    variance = h.pow(2).mean(-1, keepdim=True)
+    h = h * torch.rsqrt(variance + eps)
+    return gain * h.to(input_dtype)
+
+
+def _ref_hc(streams, fn, base, scale, *, hc_mult, iters, hc_eps, rms_eps):
+    """``reference:277-295`` -- ``(post, comb, collapsed)`` from the mHC mapping."""
+    flat = _ref_unweighted_norm(streams.flatten(start_dim=1).float(), rms_eps)
+    mixes = torch.nn.functional.linear(flat, fn.float())
+    pre_w, post_w, comb_w = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
+    pre_b, post_b, comb_b = base.split([hc_mult, hc_mult, hc_mult * hc_mult])
+    pre_scale, post_scale, comb_scale = scale.unbind(0)
+
+    pre = torch.sigmoid(pre_w * pre_scale + pre_b) + hc_eps
+    post = 2 * torch.sigmoid(post_w * post_scale + post_b)
+    comb_logits = comb_w.view(
+        *comb_w.shape[:-1], hc_mult, hc_mult
+    ) * comb_scale + comb_b.view(hc_mult, hc_mult)
+    comb = torch.softmax(comb_logits, dim=-1) + hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+    for _ in range(iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+    # `reference:294` -- the collapse, CAST BACK to the streams' dtype.
+    collapsed = (pre.unsqueeze(-1) * streams).sum(dim=1).to(streams.dtype)
+    return post, comb, collapsed
+
+
+def _ref_mix(sub_out, residual, post, comb):
+    """``reference:1316-1318`` (and the identical ``:1325-1327``) -- the post-and-comb mix."""
+    dtype = residual.dtype
+    return post.to(dtype).unsqueeze(-1) * sub_out.unsqueeze(-2) + torch.matmul(
+        comb.to(dtype).transpose(-1, -2), residual
+    )
+
+
+def _ref_stack(embedded, layers, gain, *, hc_mult, iters, hc_eps, rms_eps,
+               attention_half, ffn_half):
+    """The whole composition, reference-side: expand, both sites per layer, mean, norm.
+
+    ``reference:1477`` expands, ``:1293-1318`` runs the attention site, ``:1320-1327``
+    the feed-forward site, ``:302`` takes the UNWEIGHTED mean and ``:1493`` norms it.
+    ``layers`` is one ``(attn_weights, ffn_weights, input_gain)`` triple per layer, in
+    stack order; the two halves are the same callables the real stack is given.
+    """
+    streams = embedded.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
+    for index, (attn_w, ffn_w, input_gain) in enumerate(layers):
+        post, comb, collapsed = _ref_hc(
+            streams, *attn_w, hc_mult=hc_mult, iters=iters, hc_eps=hc_eps,
+            rms_eps=rms_eps,
+        )
+        normed = _ref_weighted_norm(collapsed, input_gain, rms_eps)
+        streams = _ref_mix(attention_half(normed, index), streams, post, comb)
+
+        post, comb, collapsed = _ref_hc(
+            streams, *ffn_w, hc_mult=hc_mult, iters=iters, hc_eps=hc_eps,
+            rms_eps=rms_eps,
+        )
+        streams = _ref_mix(ffn_half(collapsed, index), streams, post, comb)
+    collapsed = streams.mean(dim=1)
+    return _ref_weighted_norm(collapsed, gain, rms_eps)
+
+
+def _bound_stack(text_config, *, tokens: int = ARM_TOKENS, dtype=torch.float32,
+                 seed: int = 401):
+    """A real two-family stack: six loaded per layer, both sites bound, halves stubbed.
+
+    Returns ``(model, table, input_ids, weights, attention_seen, ffn_seen)``.
+    ``weights`` is the per-layer ``(attn_triple, ffn_triple, input_gain)`` the
+    reference side is handed, taken off the SAME parameters the bind used.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextConfig
+    from vllm_neuron.model.glm5_next.weight_loaders_fp8 import MHC_LEAVES
+
+    impl = _impl()
+    model = impl.Glm5NextModel(Glm5NextConfig(text_config=text_config), 1)
+    hidden = int(text_config.hidden_size)
+    gen = torch.Generator().manual_seed(seed)
+    weights = []
+    for index, layer in enumerate(model.layers):
+        _norm_ready(layer, text_config)
+        _load_the_six(layer, text_config, seed=seed + index)
+        _install_stub(layer)
+        layer.bind_hyper_connection_sites(text_config, torch.device("cpu"))
+        by_site: dict[str, list] = {}
+        for leaf in MHC_LEAVES:
+            site, role = leaf.split("_")[1], leaf.split("_")[2]
+            by_site.setdefault(site, {})[role] = getattr(layer, leaf).detach().clone()
+        weights.append(
+            (
+                (by_site["attn"]["fn"], by_site["attn"]["base"], by_site["attn"]["scale"]),
+                (by_site["ffn"]["fn"], by_site["ffn"]["base"], by_site["ffn"]["scale"]),
+                layer.input_layernorm_weight.detach().clone(),
+            )
+        )
+    table = (
+        torch.randn(VOCAB, hidden, generator=gen, dtype=torch.float32) * 0.05
+    ).to(dtype)
+    model.embed_tokens_weight = nn.Parameter(table, requires_grad=False)
+    model.norm_weight = nn.Parameter(torch.ones(hidden, dtype=dtype), requires_grad=False)
+    input_ids = torch.arange(tokens, dtype=torch.long) % VOCAB
+    return model, table, input_ids, weights
+
+
+def _stub_halves():
+    """The two sublayer stand-ins, and the records of what each one saw.
+
+    THE SAME CALLABLES GO TO BOTH STACKS. If the reference ran a different attention
+    half from the implementation, arm (3) would be measuring the stand-ins.
+    """
+    attention_seen: list[tuple] = []
+    ffn_seen: list[tuple] = []
+
+    def attention_half(x, _index=None):
+        attention_seen.append((tuple(x.shape), x.dtype))
+        return torch.tanh(x) * 1.5
+
+    def ffn_half(x, _index=None):
+        ffn_seen.append((tuple(x.shape), x.dtype))
+        return torch.tanh(x) * 0.75
+
+    return attention_half, ffn_half, attention_seen, ffn_seen
+
+
+def test_030d_arm1_perturbing_one_bound_mhc_weight_moves_the_output() -> None:
+    """ARM (1): perturb ONE loaded mHC weight and the stack's output MOVES.
+
+    The delta is printed rather than compared to a threshold, which is the arm's own
+    form. A zero delta would mean the bound tensors are not the tensors the
+    composition reads.
+
+    THE FAILING CONTROL, in the plan's words: with the class bound to no layer the
+    same perturbation moves NOTHING. So the same edit is applied to a standalone
+    :class:`Glm5NextHyperConnection` -- constructed, never bound -- and the stack's
+    output must be **bitwise** unchanged. That distinguishes "the stack reads the
+    tensors it was bound" from "the stack reads some other copy of them".
+    """
+    impl = _impl()
+    text_config = _text_config()
+    model, _, input_ids, _ = _bound_stack(text_config)
+    attention_half, ffn_half, _, _ = _stub_halves()
+    ffn_recorder, _, _ = _ffn_recorder()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_recorder)
+        before = _run_carrier(model, input_ids,
+                              carriers=[_call_kwargs("kda"), _call_kwargs("dsa")])
+
+        # THE CONTROL FIRST: an instance bound to no layer, same edit, same magnitude.
+        unbound = impl.Glm5NextHyperConnection(text_config, neuron_config=None)
+        with torch.no_grad():
+            unbound.fn[0, 0] += 0.25
+        control = _run_carrier(model, input_ids,
+                              carriers=[_call_kwargs("kda"), _call_kwargs("dsa")])
+
+        # THEN THE ARM: one weight the bind actually handed to a site.
+        target = model.layers[0].hc_attn_fn
+        with torch.no_grad():
+            target[0, 0] += 0.25
+        after = _run_carrier(model, input_ids,
+                             carriers=[_call_kwargs("kda"), _call_kwargs("dsa")])
+
+    control_delta = float((control - before).abs().max())
+    arm_delta = float((after - before).abs().max())
+    say("arm1", f"tokens={len(input_ids)}", f"perturbation=+0.25 on hc_attn_fn[0,0]")
+    say("arm1", f"delta_bound={arm_delta:.6e}", f"delta_unbound_control={control_delta:.6e}")
+
+    assert control_delta == 0.0, (
+        f"perturbing an UNBOUND instance moved the stack by {control_delta}; the "
+        f"composition must read only the tensors the bind handed it"
+    )
+    assert arm_delta > 0.0, (
+        "perturbing a bound mHC weight left the stack's output bit-identical; the "
+        "bound tensors are not the tensors the composition reads"
+    )
+
+
+def test_030d_arm2_the_hybrid_stack_composes_at_both_sites_at_128_tokens() -> None:
+    """ARM (2): a hybrid KDA+DSA stack exercises BOTH sublayer sites at ``T = 128``.
+
+    The count is forced by two seams, not chosen (see this section's note). The
+    reading is that each layer's attention half and feed-forward half were each
+    entered exactly once, on the collapsed ``[128, H]`` stream, through the real
+    :class:`Glm5NextHyperConnection` at both sites.
+    """
+    impl = _impl()
+    text_config = _text_config()
+    model, table, input_ids, _ = _bound_stack(text_config)
+    hidden = int(text_config.hidden_size)
+    ffn_recorder, seen, _ = _ffn_recorder()
+    stubs = [getattr(layer, type(layer).ATTENTION_ATTR) for layer in model.layers]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", ffn_recorder)
+        out = _run_carrier(model, input_ids,
+                           carriers=[_call_kwargs("kda"), _call_kwargs("dsa")])
+
+    families = [type(layer).__name__ for layer in model.layers]
+    sites = [sorted(getattr(layer, impl.MHC_SITES_ATTR)) for layer in model.layers]
+    say("arm2", f"tokens={len(input_ids)}", f"families={families}", f"sites={sites}")
+    say("arm2", f"attention_saw={[s.seen for s in stubs]}",
+        f"ffn_saw={[c['shape'] for c in seen]}")
+    say("arm2", f"out={tuple(out.shape)}", f"dtype={out.dtype}",
+        f"finite={bool(torch.isfinite(out).all())}")
+
+    assert len(input_ids) == ARM_TOKENS == 128
+    assert len(set(families)) == 2, f"arm (2) wants both families, got {families}"
+    want_sites = sorted([impl.MHC_ATTENTION_SITE, impl.MHC_FFN_SITE])
+    assert all(pair == want_sites for pair in sites), f"{sites} != {want_sites}"
+    assert [s.seen for s in stubs] == [[(ARM_TOKENS, hidden)]] * len(stubs)
+    assert [c["shape"] for c in seen] == [(ARM_TOKENS, hidden)] * len(stubs)
+    assert tuple(out.shape) == (ARM_TOKENS, hidden)
+    assert out.dtype == table.dtype
+    assert bool(torch.isfinite(out).all())
+
+
+def test_030d_arm3_the_stack_equals_the_independent_reference() -> None:
+    """ARM (3): the stack equals the reference within the REGISTERED pair, at ``T = 128``.
+
+    The reference is transcribed from the checkpoint's own modelling file, function by
+    function, with each transcription naming its lines; it is never read off the
+    implementation. Its provenance is asserted here before it is trusted -- the same
+    sha256 the campaign records -- so a reference that drifted would stop this item
+    rather than pass it.
+
+    THE PAIR IS READ FROM THE LANDED FILE, not copied: ``rtol`` and ``atol`` come out
+    of ``test_mhc_layer.py`` by parse. This block registers no tolerance of its own.
+    """
+    text_config = _text_config()
+    rtol, atol = _registered_pair()
+    model, table, input_ids, weights = _bound_stack(text_config)
+    attention_half, ffn_half, attention_seen, ffn_seen = _stub_halves()
+
+    def _ffn_as_model_calls_it(self, layer, hidden_states, **_kwargs):
+        return ffn_half(hidden_states)
+
+    # The attention half is installed as the stub MODULE wrapping the shared
+    # callable: assigning a bare function over a registered submodule is a
+    # TypeError, and writing the formula twice is how the two sides drift.
+    for layer in model.layers:
+        _install_stub(layer, half=attention_half)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(model), "_ffn_half", _ffn_as_model_calls_it)
+        got = _run_carrier(model, input_ids,
+                           carriers=[_call_kwargs("kda"), _call_kwargs("dsa")])
+
+    want = _ref_stack(
+        table[input_ids],
+        weights,
+        model.norm_weight.detach(),
+        hc_mult=int(text_config.hc_mult),
+        iters=int(text_config.hc_sinkhorn_iters),
+        hc_eps=float(text_config.hc_eps),
+        rms_eps=float(text_config.rms_norm_eps),
+        attention_half=lambda x, _i=None: attention_half(x),
+        ffn_half=lambda x, _i=None: ffn_half(x),
+    )
+
+    max_abs = float((got - want).abs().max())
+    max_rel = float(((got - want).abs() / (want.abs() + atol)).max())
+    outside = int((~torch.isclose(got, want, rtol=rtol, atol=atol)).sum())
+    say("arm3", f"tokens={len(input_ids)}", f"rtol={rtol}", f"atol={atol}",
+        "(read from test_mhc_layer.py, not copied)")
+    say("arm3", f"max_abs_error={max_abs:.6e}", f"max_rel_error={max_rel:.6e}",
+        f"elements_outside={outside}|of|{got.numel()}")
+    say("arm3", f"reference_spread={float(want.abs().max()):.6e}",
+        f"halves_entered_attention={len(attention_seen)}|ffn={len(ffn_seen)}")
+
+    assert float(want.abs().max()) > 0.0, (
+        "the reference output is all zeros, so any tolerance would pass and this "
+        "item would read nothing"
+    )
+    assert outside == 0, (
+        f"{outside} of {got.numel()} elements fall outside the registered pair "
+        f"(rtol={rtol}, atol={atol}); max_abs={max_abs:.6e} max_rel={max_rel:.6e}"
+    )
+
+
+def test_030d_the_cast_points_are_the_references_own() -> None:
+    """Every sublayer input, both mixes, the mean and the return carry the CARRIER's dtype.
+
+    Review round 2's finding (1): the reference casts back to the streams' dtype at
+    ``reference:294`` (the collapse each sublayer is handed), ``:1316-1318`` and
+    ``:1325-1327`` (both mixes), ``:302`` (the mean) and ``:75-80`` (the norm), while
+    this tree used to hand every sublayer fp32 -- in front of a dense seam whose own
+    docstring says ``bfloat16`` activations (``model_fp8.py:2875``).
+
+    So this item runs the stack on a **bfloat16** table and reads the dtype at every
+    one of those points, and then runs it again on an fp32 table: the cast PRESERVES
+    the carrier's dtype rather than naming one, which is what the reference does
+    (``:1291``) and what keeps ``-030``'s landed fp32 readings true
+    (``test_mhc_layer.py:578``).
+    """
+    text_config = _text_config()
+    seen: dict[str, list] = {}
+    for label, dtype in (("bf16", torch.bfloat16), ("fp32", torch.float32)):
+        model, table, input_ids, _ = _bound_stack(text_config, tokens=ARM_TOKENS,
+                                                 dtype=dtype)
+        ffn_recorder, ffn_calls, _ = _ffn_recorder()
+        stubs = [getattr(layer, type(layer).ATTENTION_ATTR) for layer in model.layers]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(type(model), "_ffn_half", ffn_recorder)
+            out = _run_carrier(model, input_ids,
+                              carriers=[_call_kwargs("kda"), _call_kwargs("dsa")])
+        attention_dtypes = [d for stub in stubs for d in stub.seen_dtypes]
+        ffn_dtypes = [c["tensor"].dtype for c in ffn_calls]
+        seen[label] = [table.dtype, out.dtype, ffn_dtypes, attention_dtypes]
+        say("casts", f"table={label}", f"out={out.dtype}",
+            f"ffn_half_inputs={ffn_dtypes}")
+        assert out.dtype == dtype, (
+            f"a {label} carrier returned {out.dtype}; the norm returns the input "
+            f"dtype (reference:75-80) and the mean keeps it (reference:302)"
+        )
+        assert attention_dtypes == [dtype] * len(model.layers), (
+            f"the attention half was handed {attention_dtypes} from a {label} "
+            f"carrier; reference:294 casts the collapse back to the streams' dtype"
+        )
+        assert ffn_dtypes == [dtype] * len(model.layers), (
+            f"the feed-forward half was handed {ffn_dtypes} from a {label} carrier; "
+            f"reference:294 casts the collapse back to the streams' dtype and the "
+            f"dense seam's contract is bfloat16 activations (model_fp8.py:2875)"
+        )
+    say("casts", f"fp32_return_preserved={seen['fp32'][1]}",
+        f"bf16_return_preserved={seen['bf16'][1]}",
+        "-030's landed fp32 reading (test_mhc_layer.py:578) stays true")
+    assert seen["fp32"][1] is torch.float32 and seen["bf16"][1] is torch.bfloat16
+
+
+def test_030d_the_registered_pair_is_read_not_copied() -> None:
+    """This block registers NO tolerance: the pair is parsed out of the landed file.
+
+    A copied number is a second authority for a frozen value (P9). So the reading is
+    that the two constants are not written in this file at all, and that the values
+    used come from ``test_mhc_layer.py``.
+    """
+    rtol, atol = _registered_pair()
+    mine = Path(__file__).read_text()
+    say("pair", f"rtol={rtol}", f"atol={atol}", "source=test_mhc_layer.py:162-163")
+    assert rtol > 0.0 and atol > 0.0
+    # THE NEEDLES ARE BUILT FROM PIECES: written whole, this list would contain the
+    # spellings it forbids and the item would fail on its own bytes -- the same
+    # "the scanner is not the scanned" trap this campaign has now hit three times.
+    needles = (f"RTOL = {rtol}", f"ATOL = {atol}", "rtol=" + "1e-2", "atol=" + "1e-5")
+    for spelling in needles:
+        assert spelling not in mine, (
+            f"this file spells the registered pair itself ({spelling!r}); it must be "
+            f"read from the file that declares it, never copied"
+        )
