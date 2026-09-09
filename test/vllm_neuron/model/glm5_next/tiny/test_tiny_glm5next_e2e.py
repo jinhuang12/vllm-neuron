@@ -1343,8 +1343,17 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
 
 #: A prompt that does NOT divide into pools, and the same prompt extended to the next pool
 #: boundary. Both are DERIVED from the landed dials, so a change to either moves them.
-REMAINDER_PROMPT = item.STACK_TOKENS + 2
-EVEN_PROMPT = item.STACK_TOKENS + item.MLA_INDEX_KPOOL
+#:
+#: BOTH FIT THROUGH THE DSA PATH IN ONE LEG, which is why they sit BELOW the stack's token
+#: count rather than above it. The `-103` causal-bound kernel binds the query-token axis to one
+#: partition tile, so a prefill of more than `DSA_TOKENS_PER_CALL` tokens raises inside the
+#: kernel (`dma_copy dst partition dimension 132 exceeds maximum 128`, measured on the host and
+#: read back in `054b-r4-accept-20260909T210355Z.out:623`). Widening either dial is not this
+#: item's to do: the kernel increment is the DSA lane's, and until it lands every counted item
+#: keeps prompt and extension inside the ceiling.
+DSA_TOKENS_PER_CALL = 128
+REMAINDER_PROMPT = item.STACK_TOKENS - 2
+EVEN_PROMPT = item.STACK_TOKENS
 
 
 def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
@@ -1389,12 +1398,21 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     completed_pool = (EVEN_PROMPT - 1) // pool
     print(f"TINYE2E|remainder_case|prompt={REMAINDER_PROMPT}|even={EVEN_PROMPT}|pool={pool}"
           f"|remainder={remainder}|completing_position={EVEN_PROMPT - 1}"
-          f"|pool_id={completed_pool}")
+          f"|pool_id={completed_pool}|dsa_ceiling={DSA_TOKENS_PER_CALL}"
+          f"|margin={DSA_TOKENS_PER_CALL - EVEN_PROMPT}")
     if remainder == 0 or EVEN_PROMPT % pool != 0 or EVEN_PROMPT > E2E_MAX_SEQ_LEN:
         raise item.VacuousControlError(
             f"this item needs a prompt that leaves a remainder ({REMAINDER_PROMPT} % {pool} "
             f"= {remainder}), an extension that divides evenly ({EVEN_PROMPT} % {pool} = "
             f"{EVEN_PROMPT % pool}) and both inside {E2E_MAX_SEQ_LEN} slots"
+        )
+    if max(REMAINDER_PROMPT, EVEN_PROMPT) > DSA_TOKENS_PER_CALL:
+        # The kernel's limit, refused here rather than 300 lines down inside NKI: the DSA path
+        # takes the query-token axis as one partition tile, so a longer leg cannot run at all.
+        raise item.VacuousControlError(
+            f"this item prefills {REMAINDER_PROMPT} and {EVEN_PROMPT} tokens in one leg, and "
+            f"the DSA path takes at most {DSA_TOKENS_PER_CALL} per call; a longer leg raises "
+            f"inside the causal-bound kernel instead of measuring the seeding"
         )
 
     ids = torch.arange(EVEN_PROMPT, dtype=torch.long) % int(root.text_config.vocab_size)
