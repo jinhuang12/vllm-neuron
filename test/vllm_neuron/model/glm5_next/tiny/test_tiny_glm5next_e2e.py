@@ -532,6 +532,7 @@ def test_side_caches_meet_the_indexers_own_stated_minimum():
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=item.STACK_TOKENS,
+        request_slots=E2E_STATE_SLOTS,
     )
     candidates = item.STACK_TOKENS // int(text_config.index_kpool)
     print(f"TINYE2E|side_caches|sets={len(side)}|candidates={candidates}"
@@ -539,9 +540,16 @@ def test_side_caches_meet_the_indexers_own_stated_minimum():
           f"|tail={tuple(side[0]['tail'].shape)}")
     assert len(side) == len(banks)
     for entry, bank in zip(side, banks):
-        assert int(entry["pool_cache"].shape[0]) >= candidates + 1
-        assert int(entry["pool_cache"].shape[1]) == int(text_config.index_head_dim)
+        # RE-PINNED (D17.1). ORIGINAL READING: `pool_cache` was `[rows, width]` and
+        # `tail` was `[2, kpool, width]`, one set per LAYER for the whole process.
+        # NEW VALUE: both gain a leading REQUEST-SLOT axis, so one sequence's
+        # indexer state cannot be read by another request. The minimum this item
+        # exists to check is unchanged and is still read on the row axis.
+        assert int(entry["pool_cache"].shape[0]) == E2E_STATE_SLOTS
+        assert int(entry["pool_cache"].shape[1]) >= candidates + 1
+        assert int(entry["pool_cache"].shape[2]) == int(text_config.index_head_dim)
         assert tuple(entry["tail"].shape) == (
+            E2E_STATE_SLOTS,
             2,
             int(text_config.index_kpool),
             int(text_config.index_head_dim),
@@ -588,6 +596,7 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=item.STACK_TOKENS,
+        request_slots=E2E_STATE_SLOTS,
     )
     carriers = NeuronModelRunner._glm5next_layer_carriers(
         banks,
@@ -708,6 +717,22 @@ def test_the_tiny_config_is_the_registered_constraint_set():
 # ══════════════════════════════════════════════════════════════════════════════════════
 # ITEM 7. THE REGISTERED ACCEPTANCE: eight tokens, the route predicate, and the reference.
 # ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def _slot_position(runner, slot=None):
+    """RE-PINNED (D17.1): the scalar ring cursor became one position per request slot.
+
+    ORIGINAL READING: `_slot_position(runner)`, a single int or None --
+    the position the one process-wide ring stood at. NEW VALUE: a dict keyed by the
+    request's state slot, because the rings are per slot now and a scalar cannot say
+    whose position it holds. Every landed item below reads through this helper, so
+    the re-pin is expressed once rather than at each of its call sites.
+    """
+    positions = getattr(runner, "_glm5next_side_cache_positions", None) or {}
+    if slot is None:
+        table = getattr(runner, "_glm5next_request_slot_table", None) or {}
+        slot = table.get("req-0")
+    return None if slot is None else positions.get(int(slot))
 
 
 def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) -> dict:
@@ -1785,6 +1810,7 @@ def test_the_decode_leg_refuses_a_step_carrying_more_than_one_token():
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=item.STACK_TOKENS,
+        request_slots=E2E_STATE_SLOTS,
     )
 
     def build(tokens: int):
@@ -2034,9 +2060,9 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
 
     # ---- 1. the first sequence opens and advances.
     step(0, prompt)
-    opened = int(runner._glm5next_side_cache_cursor)
+    opened = int(_slot_position(runner))
     step(prompt, 1)
-    advanced = int(runner._glm5next_side_cache_cursor)
+    advanced = int(_slot_position(runner))
     print(f"TINYE2E|cursor_first_sequence|opened={opened}|advanced={advanced}"
           f"|prompt={prompt}")
     assert opened == prompt, (
@@ -2056,7 +2082,7 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     assert "stands at position" in message, (
         f"a decode at {stale} raised, but not the cursor refusal this arm names: {message}"
     )
-    assert int(runner._glm5next_side_cache_cursor) == advanced, (
+    assert int(_slot_position(runner)) == advanced, (
         "the refused step moved the cursor; a refusal must leave the ring's recorded "
         "position exactly as it was, or the next legitimate step is refused for a "
         "mismatch the refused one caused"
@@ -2095,8 +2121,8 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
             "builder, so this control never reaches the window between emptying the ring "
             "and opening its cursor -- the window it exists to close"
         )
-    assert runner._glm5next_side_cache_cursor is None, (
-        f"a refused opening left the cursor at {runner._glm5next_side_cache_cursor}, while "
+    assert _slot_position(runner) is None, (
+        f"a refused opening left the cursor at {_slot_position(runner)}, while "
         f"the ring had already been emptied; the previous sequence's next step would then "
         f"be served from blanks instead of refused"
     )
@@ -2113,7 +2139,7 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     for side in _live_rings(runner, banks):
         side["tail"].fill_(PLANTED_RING)
     step(0, prompt)
-    reset = int(runner._glm5next_side_cache_cursor)
+    reset = int(_slot_position(runner))
     planted = max(float(side["tail"].abs().max()) for side in _live_rings(runner, banks))
     print(f"TINYE2E|cursor_second_sequence|reset={reset}|ring_max={planted}"
           f"|planted={PLANTED_RING}")
@@ -2185,10 +2211,10 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
 
     step(0, prompt)
     step(prompt, 1)
-    before = int(runner._glm5next_side_cache_cursor)
+    before = int(_slot_position(runner))
 
     synthetic = step(0, 1)
-    after = runner._glm5next_side_cache_cursor
+    after = _slot_position(runner)
     carrier = synthetic["layer_carriers"][0]
     print(f"TINYE2E|synthetic_decode|cursor_before={before}|cursor_after={after}"
           f"|carrier_keys={sorted(carrier)}")
@@ -2208,7 +2234,7 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
 
     # ---- THE CONTROL: the real sequence is still servable after the synthetic step.
     step(before, 1)
-    resumed = int(runner._glm5next_side_cache_cursor)
+    resumed = int(_slot_position(runner))
     print(f"TINYE2E|synthetic_decode_control|resumed={resumed}|want={before + 1}")
     assert resumed == before + 1, (
         f"after the synthetic step the real sequence resumed to {resumed} rather than "
@@ -2253,7 +2279,7 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
 
     # allocating the ring is what clears the cursor, so do it before reading one
     _live_rings(runner, banks)
-    opened = getattr(runner, "_glm5next_side_cache_cursor", None)
+    opened = _slot_position(runner)
     if opened is not None:
         raise item.VacuousControlError(
             f"this runner already carries a cursor at {opened}, so 'no open sequence' is "
@@ -2271,7 +2297,7 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
 
     # ---- THE CONTROL: the same shape at position 0 is served, cursor untouched.
     served = step(0, 1)
-    after = getattr(runner, "_glm5next_side_cache_cursor", None)
+    after = _slot_position(runner)
     print(f"TINYE2E|real_decode_without_a_sequence_control|at=0"
           f"|carrier_keys={sorted(served['layer_carriers'][0])}|cursor={after}")
     assert after is None, (

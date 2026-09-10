@@ -322,6 +322,110 @@ def _linear_banks(banks) -> list[dict]:
     return [bank for bank in banks if bank["family"] != "self_attn"]
 
 
+def _side_caches(banks):
+    """The indexer's two caches, one set per sparse layer with a slot axis."""
+    return NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=DECLARED_INDEX_KPOOL,
+        index_head_dim=DECLARED_INDEX_HEAD_DIM,
+        max_seq_len=DECLARED_BLOCKS * DECLARED_PAGE_SIZE,
+        request_slots=DECLARED_STATE_SLOTS,
+    )
+
+
+def _carriers_for(banks, side, *, slot: int, rows, cached: int, is_prefill: bool):
+    """One request's carriers at a given slot, built by the code under test."""
+    geometries = [
+        {
+            "block_ids": [int(value) for value in rows],
+            "state_slot": int(slot),
+            "page_size": DECLARED_PAGE_SIZE,
+        }
+        for _ in banks
+    ]
+    return NeuronModelRunner._glm5next_layer_carriers(
+        banks,
+        side,
+        geometries=geometries,
+        is_prefill=is_prefill,
+        tokens=1 if not is_prefill else 4,
+        start_position=int(cached),
+        softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
+        max_seq_len=int(cached) + 4,
+        index_kpool=DECLARED_INDEX_KPOOL,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A3. One request's indexer state is untouched by another request's step.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a3_one_requests_side_caches_are_untouched_by_the_others_step() -> None:
+    """The pooled store and the tail ring belong to a request, not to the process.
+
+    THE TRIPWIRE IS THE LANDED BEHAVIOUR ITSELF. Before this increment both caches
+    were one set per layer for the whole process, so the two carriers below were the
+    SAME storage and a write through one was visible through the other. This item
+    fails on that arrangement twice over: the disjoint-storage assertion and the
+    byte-equality read after the write.
+
+    BOTH LEGS ARE BUILT, because the ring reaches the layer under a different
+    keyword on each (``prefill_tail`` when prefilling, ``tail`` when decoding) and a
+    slot applied on only one of them would leak on the other.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    side = _side_caches(banks)
+    sparse = [index for index, bank in enumerate(banks) if bank["family"] == "self_attn"]
+    if not sparse:
+        raise VacuousControlError(
+            "this item needs a sparse layer, which is the only family holding side "
+            "caches; the harness built none"
+        )
+
+    for leg, ring_key in ((True, "prefill_tail"), (False, "tail")):
+        mine = _carriers_for(
+            banks, side, slot=0, rows=DECLARED_SPARSE_ROWS[0],
+            cached=DECLARED_CACHED_LENGTHS[0], is_prefill=leg,
+        )
+        theirs = _carriers_for(
+            banks, side, slot=1, rows=DECLARED_SPARSE_ROWS[1],
+            cached=DECLARED_CACHED_LENGTHS[1], is_prefill=leg,
+        )
+        for index in sparse:
+            a, b = mine[index], theirs[index]
+            print(f"KEYED|a3|leg={'prefill' if leg else 'decode'}|layer={index}"
+                  f"|pool_a={a['pool_cache'].data_ptr()}"
+                  f"|pool_b={b['pool_cache'].data_ptr()}")
+            assert a["pool_cache"].data_ptr() != b["pool_cache"].data_ptr(), (
+                f"layer {index}: two requests were handed ONE pooled store, so the "
+                f"second would pool into the first's rows"
+            )
+            assert a[ring_key].data_ptr() != b[ring_key].data_ptr(), (
+                f"layer {index}: two requests were handed ONE tail ring under "
+                f"{ring_key!r}"
+            )
+
+            # THE WRITE, AND THE READ THAT PROVES IT DID NOT TRAVEL.
+            untouched = b["pool_cache"].clone()
+            ring_untouched = b[ring_key].clone()
+            a["pool_cache"].fill_(1.5)
+            a[ring_key].fill_(-1.5)
+            assert torch.equal(b["pool_cache"], untouched), (
+                f"layer {index}: writing request A's pooled store changed request "
+                f"B's rows"
+            )
+            assert torch.equal(b[ring_key], ring_untouched), (
+                f"layer {index}: writing request A's ring changed request B's ring"
+            )
+            if not bool(a["pool_cache"].any()):
+                raise VacuousControlError(
+                    "the write this item relies on left request A's pooled store at "
+                    "zero, so the comparison above proves nothing"
+                )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # A1 (slot half). Two requests never share a state slot.
 # ══════════════════════════════════════════════════════════════════════════════

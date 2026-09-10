@@ -4797,9 +4797,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @staticmethod
     def _glm5next_side_caches(
-        banks, *, index_kpool: int, index_head_dim: int, max_seq_len: int
+        banks,
+        *,
+        index_kpool: int,
+        index_head_dim: int,
+        max_seq_len: int,
+        request_slots: int,
     ) -> list[dict]:
         """The two DSA caches NO ``LayerSpec`` declares, one set per sparse layer.
+
+        ONE SET PER REQUEST SLOT, NOT ONE PER PROCESS. Both caches carry a leading
+        request-slot axis, because each holds ONE sequence's indexer state: the
+        pooled store accumulates that sequence's keys and the ring holds its most
+        recent pool. Sharing them across requests is what made a second request
+        read the first one's rows, and no shape disagreed while it happened. The
+        slot axis is the recurrent banks' own slot count, so a request's recurrent
+        state and its indexer state live at ONE slot number.
 
         WHY THE KV MACHINERY DOES NOT ALLOCATE THESE. A sparse-attention layer needs
         a pooled-key store and a decode tail ring besides its latent cache, and
@@ -4835,6 +4848,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         if int(max_seq_len) <= 0:
             raise ValueError(f"max_seq_len must be positive; got {max_seq_len!r}")
+        slots = int(request_slots)
+        if slots <= 0:
+            raise ValueError(
+                f"the side caches are allocated one set per request slot, so the "
+                f"slot count must be positive; got {request_slots!r}"
+            )
         rows = int(max_seq_len) // pool + 1
         side: list[dict] = []
         for bank in banks:
@@ -4845,12 +4864,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             side.append(
                 {
                     "pool_cache": torch.zeros(
-                        (rows, width),
+                        (slots, rows, width),
                         dtype=reference.dtype,
                         device=reference.device,
                     ),
                     "tail": torch.zeros(
-                        (2, pool, width),
+                        (slots, 2, pool, width),
                         dtype=reference.dtype,
                         device=reference.device,
                     ),
@@ -4884,16 +4903,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index_kpool=int(text_config.index_kpool),
             index_head_dim=int(text_config.index_head_dim),
             max_seq_len=int(self.max_model_len),
+            request_slots=self._glm5next_state_slot_count(banks),
         )
         self._glm5next_side_cache_set = live
-        # A FRESHLY ALLOCATED RING IS OWNED BY NOBODY. The cursor set in
-        # :meth:`_glm5next_model_kwargs` names the position the live ring has been
-        # advanced to, which is this process's only record of WHICH sequence the ring
-        # holds. Allocating a new set discards that history, so the cursor is cleared
-        # with it and the next step must open a sequence rather than continue a dead
-        # one. Leaving a stale cursor here would let the first step after a
-        # reallocation continue a sequence whose rows no longer exist.
-        self._glm5next_side_cache_cursor = None
+        # A FRESHLY ALLOCATED SET IS OWNED BY NOBODY, and the ownership record goes
+        # with it. The slot table names which request holds which slot; allocating a
+        # new set discards the rows those claims referred to, so a surviving table
+        # would let a live request keep reading a slot whose contents no longer
+        # exist. Both are cleared together, which is the same invariant the retired
+        # scalar cursor carried, now keyed per request.
+        self._glm5next_request_slot_table = {}
+        self._glm5next_side_cache_positions = {}
         return live
 
     def _glm5next_request_identities(self, *, synthetic: bool) -> list:
@@ -4953,7 +4973,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         return counts.pop()
 
-    def _glm5next_request_slots(self, banks, request_ids, *, synthetic: bool):
+    def _glm5next_request_slots(
+        self, banks, request_ids, *, synthetic: bool, side_caches=None
+    ):
         """One recurrent-state slot per request, keyed by the request's own id.
 
         WHY THE SLOT IS NOT READ OFF THE BLOCK TABLE ANY MORE. It used to be the
@@ -4986,8 +5008,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if table is None:
             table = {}
             self._glm5next_request_slot_table = table
+        positions = getattr(self, "_glm5next_side_cache_positions", None)
+        if positions is None:
+            positions = {}
+            self._glm5next_side_cache_positions = positions
         live = set(request_ids)
         for finished in [key for key in table if key not in live]:
+            positions.pop(table[finished], None)
             del table[finished]
         for request_id in request_ids:
             if request_id in table:
@@ -5008,6 +5035,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     continue
                 bank["conv_state"][free].zero_()
                 bank["recurrent_state"][free].zero_()
+            # THE INDEXER'S TWO CACHES ARE ZEROED AT THE SAME MOMENT, because they
+            # hold the same request's state and a half-fresh slot is the defect
+            # this table exists to close: the ring would still carry the previous
+            # owner's pool and its next completion would pool those stale members.
+            for side in side_caches or ():
+                if not side:
+                    continue
+                side["pool_cache"][free].zero_()
+                side["tail"][free].zero_()
+            positions.pop(free, None)
             table[request_id] = free
         return [table[request_id] for request_id in request_ids]
 
@@ -5125,13 +5162,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"{int(geometry['page_size'])}; the slice and the layer's own page "
                     f"are one number or the slice is wrong"
                 )
+            # THE SIDE CACHES ARE INDEXED BY THE SAME SLOT as the recurrent states,
+            # so an out-of-range slot is refused BY NAME here rather than reaching a
+            # bare IndexError from the row lookup below.
+            side_slots = int(side["pool_cache"].shape[0])
+            if not 0 <= state_slot < side_slots:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' holds {side_slots} indexer side-cache "
+                    f"slot(s) and this request was given slot {state_slot}; a "
+                    f"request's recurrent state and its indexer state live at one "
+                    f"slot number"
+                )
             latent = bank["latent_cache"][
                 ids[0] * block_size : (ids[-1] + 1) * block_size
             ]
             device = latent.device
             carrier = {
                 "latent_cache": latent,
-                "pool_cache": side["pool_cache"],
+                # THE REQUEST'S OWN ROW OF EACH SIDE CACHE. The slot is the one
+                # the request table assigned, so two requests in one batch reach
+                # two disjoint views and neither can see the other's pool.
+                "pool_cache": side["pool_cache"][state_slot],
                 "seq_lens": cls._glm5next_row_seq_lens(
                     tokens=tokens, start_position=start_position, device=device
                 ),
@@ -5155,10 +5206,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # sequence, equal to this sequence's end only while the batch is
                 # one request -- which this half refuses to exceed, but the model
                 # must not depend on that.
-                carrier["prefill_tail"] = side["tail"]
+                carrier["prefill_tail"] = side["tail"][state_slot]
                 carrier["prefill_end_position"] = int(start_position) + int(tokens)
             else:
-                carrier["tail"] = side["tail"]
+                carrier["tail"] = side["tail"][state_slot]
                 carrier["position"] = int(start_position)
             carriers.append(carrier)
         return carriers
@@ -5314,7 +5365,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # nothing about whose state a row held.
         request_ids = self._glm5next_request_identities(synthetic=synthetic_step)
         state_slots = self._glm5next_request_slots(
-            banks, request_ids, synthetic=synthetic_step
+            banks, request_ids, synthetic=synthetic_step, side_caches=side_caches
         )
         # ONE SEQUENCE STILL, so one slot serves every bank's geometry. The
         # per-request geometry walk arrives with the refusals this half retires.
@@ -5351,10 +5402,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # through the cursor's own gap. Clearing the owner alongside the rows leaves
             # the ring belonging to nobody, so a refused opening makes the next
             # non-opening step refuse by name instead of reading blanks.
-            self._glm5next_side_cache_cursor = None
+            # ONLY THIS REQUEST'S ROW IS CLEARED. The rows are per slot now, so a
+            # fresh sequence opening cannot disturb a concurrent request's ring --
+            # which the process-wide zeroing this replaces did on every prefill.
+            self._glm5next_side_cache_positions.pop(int(state_slots[0]), None)
             for side in side_caches:
                 if "tail" in side:
-                    side["tail"].zero_()
+                    side["tail"][int(state_slots[0])].zero_()
         elif not synthetic_step:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so
@@ -5369,22 +5423,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # prefix-cache hit produces. `inc-glm53f-054b`'s acceptance runs one
             # sequence and cannot reach it, so the honest move is to refuse the step
             # this half does not implement instead of guessing which rows are whose.
+            # WHAT THE SLOT AXIS ALREADY CLOSED, so this refusal is NARROWER than the
+            # scalar one it replaces: a step of a DIFFERENT request can no longer be
+            # served from this request's rows at all, because the two hold different
+            # slots. What stays reachable is ONE request arriving at a position its
+            # own slot was never advanced to -- which is what an automatic
+            # prefix-cache hit produces -- and that is refused, not guessed.
             leg = "prefill" if is_prefill else "decode"
-            cursor = getattr(self, "_glm5next_side_cache_cursor", None)
-            if cursor is None:
+            slot = int(state_slots[0])
+            stood_at = self._glm5next_side_cache_positions.get(slot)
+            if stood_at is None:
                 raise ValueError(
-                    f"the live indexer ring holds no sequence cursor, so this step has "
-                    f"no sequence to continue; a prefill at position 0 opens one, and "
-                    f"this step is a {leg} at position {int(start_position)}. Serving "
-                    f"it would read whatever the previous sequence left in the ring"
+                    f"slot {slot}'s indexer ring holds no recorded position, so this "
+                    f"step has no sequence to continue; a prefill at position 0 opens "
+                    f"one, and this step is a {leg} at position "
+                    f"{int(start_position)}. Serving it would read whatever the "
+                    f"previous owner of this slot left in the ring"
                 )
-            if int(start_position) != int(cursor):
+            if int(start_position) != int(stood_at):
                 raise ValueError(
-                    f"this step is a {leg} at position {int(start_position)} and the "
-                    f"live indexer ring stands at position {int(cursor)}; the ring "
-                    f"carries one sequence's state with no sequence identity, so "
-                    f"serving a step that does not continue it would read the previous "
-                    f"sequence's rows silently"
+                    f"this step is a {leg} at position {int(start_position)} and slot "
+                    f"{slot}'s indexer ring stands at position {int(stood_at)}; the "
+                    f"rows carry no position of their own, so serving a step that does "
+                    f"not continue this slot's sequence would read another point of it "
+                    f"silently"
                 )
         carriers = self._glm5next_layer_carriers(
             banks,
@@ -5414,7 +5476,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # not write one here, so a warmup between two real steps of one sequence is
         # invisible to that sequence.
         if not synthetic_step:
-            self._glm5next_side_cache_cursor = int(start_position) + tokens
+            self._glm5next_side_cache_positions[int(state_slots[0])] = (
+                int(start_position) + tokens
+            )
         return {
             "input_ids": input_ids,
             "layer_carriers": carriers,
