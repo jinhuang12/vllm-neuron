@@ -1036,25 +1036,42 @@ class Glm5NextHyperConnection(nn.Module):
     agree, so the transcription rests on two statements rather than on one
     reading of one file.
 
-    THE ONE COMPOSITION QUESTION THIS SECTION HAD TO ANSWER
-    ------------------------------------------------------
-    ``-028``'s seam normalises **one** ``[M, N]`` matrix; the target needs
-    **``T`` independent** ``[S, S]`` ones, and this increment's route predicate
-    declares the Sinkhorn seam is entered **exactly once per layer call**. The
-    two are reconciled by a **block-diagonal embedding**: the ``T`` little
-    matrices are scattered onto the diagonal of one ``[T*S, T*S]`` matrix, so
-    ``-028``'s column target ``M / N`` is exactly ``1`` -- the target's own
-    column target -- and the off-diagonal zeros stay zero under multiplicative
-    rescaling, which makes every row sum and every column sum range over
-    exactly one token's block. **The alternative was measured and rejected:** a
-    flat ``[T*S, S]`` reshape lets ``-028``'s column pass sum ACROSS tokens, and
-    ``probe-030-composition-algebra.out`` reads ``max_abs`` up to ``4.68e-01``
-    against the target for it while the block-diagonal embedding reads
-    ``8.99e-07``, with the off-block maximum exactly ``0.0``. This is layout,
-    not authored numerics: all of the Sinkhorn arithmetic stays inside ``-028``'s
-    kernel.
+    THE ONE COMPOSITION QUESTION THIS SECTION HAD TO ANSWER, AND WHY IT NO
+    LONGER NEEDS AN ANSWER HERE
+    ----------------------------------------------------------------------
+    RE-GROUNDED BY ``inc-glm53f-030c``. The question was real and the answer
+    below is kept as the record of it, not as a description of what this class
+    now does. ``-028``'s square seam normalises **one** ``[M, N]`` matrix while
+    the target needs **``T`` independent** ``[S, S]`` ones, and the route
+    predicate declares the Sinkhorn seam is entered **exactly once per layer
+    call**. ``inc-glm53f-030`` reconciled the two with a **block-diagonal
+    embedding**: the ``T`` little matrices scattered onto the diagonal of one
+    ``[T*S, T*S]`` matrix, so ``-028``'s column target ``M / N`` was exactly
+    ``1`` -- the target's own column target -- and the off-diagonal zeros stayed
+    zero under multiplicative rescaling, which made every row sum and every
+    column sum range over exactly one token's block.
 
-    :func:`torch.block_diag` is torch's own member, reused rather than written.
+    **THE MEASUREMENT THAT CHOSE IT STANDS, and it is why the record is kept
+    rather than deleted:** a flat ``[T*S, S]`` reshape lets ``-028``'s column
+    pass sum ACROSS tokens, and ``probe-030-composition-algebra.out`` reads
+    ``max_abs`` up to ``4.68e-01`` against the target for it, while the
+    block-diagonal embedding reads ``8.99e-07`` with the off-block maximum
+    exactly ``0.0``. Any future seam that flattens the token axis into the
+    normalised matrix meets that ``4.68e-01`` again.
+
+    **WHAT ``inc-glm53f-028b`` THEN MADE UNNECESSARY.** It landed a second,
+    BATCHED form of the seam, ``sinkhorn_normalise_blocks``, which takes
+    ``[T, S, S]`` directly. So the reconciliation is no longer needed at all:
+    ``-030c`` calls that form from :meth:`mhc_pre`, and the embedding, the
+    extraction and the ``[T*S, T*S]`` matrix are all gone. The route predicate
+    is unchanged -- still exactly one dispatch per layer call -- and it now costs
+    ``T * S * S`` values instead of ``(T*S)^2``: 128 KB of fp32 at 2048 tokens
+    against 256 MB (``sinkhorn.py:587-591``). The claim that stood here, that
+    *":func:`torch.block_diag` is torch's own member, reused rather than
+    written"*, is quoted rather than asserted: this class no longer calls it.
+
+    Both the old form and the new one keep all of the Sinkhorn arithmetic inside
+    ``-028``'s kernels, so neither was ever authored numerics here.
 
     TWO DIVERGENCES FROM THE BASE THAT THIS LAYER CANNOT REMOVE
     ----------------------------------------------------------
@@ -1084,7 +1101,7 @@ class Glm5NextHyperConnection(nn.Module):
         self,
         text_config: Glm5NextTextConfig,
         neuron_config: NeuronConfig | None = None,
-        post_mult_value: float = 1.0,
+        post_mult_value: float = 2.0,
     ) -> None:
         """Size the layer from the checkpoint's own dials.
 
@@ -1095,36 +1112,60 @@ class Glm5NextHyperConnection(nn.Module):
                 ``mhc_eps`` (``neuron_config.py:194,197``) win when not
                 ``None``, which is the override contract ``-013``'s section note
                 for this class already stated.
-            post_mult_value: the base's ``hc_post_mult_value``. **Its default is
-                the base's own test value**, ``hc_post_alpha = 1.0``
-                (``tests/kernels/test_mhc_kernels.py:126``); no fork config
-                field carries it, so it is a constructor argument rather than an
-                invented config default.
+            post_mult_value: the multiplier on the post gate. **Its default is
+                ``2.0``, which is the target model's own number**, and that is
+                ``inc-glm53f-030c`` correcting ``inc-glm53f-030``:
+                ``Glm5NextTextHyperConnection.forward`` computes
+                ``post = 2 * torch.sigmoid(post_w * post_scale + post_b)``
+                (``design/reference/modeling_glm5_next.py:284``, sha256
+                ``2092bbb4...``), and its own shape guide names the range:
+                "block-output placement, range [0, 2]" (``reference:246``).
+                The earlier default of ``1.0`` came from the pinned base's
+                kernel test (``hc_post_alpha = 1.0``,
+                ``tests/kernels/test_mhc_kernels.py:126``) -- the base's test
+                value, not the target's model value -- so every post term this
+                layer produced was HALF the target's. No fork config field
+                carries the multiplier, so it stays a constructor argument
+                rather than an invented config default, and passing ``1.0``
+                explicitly is how ``-030c``'s failing control reproduces the
+                defect.
 
-        TWO EPSILONS FOR THE BASE'S THREE, GROUNDED ON THE CHECKPOINT. The
+        TWO EPSILONS, EACH AT THE SITE THE TARGET MODEL PLACES IT. The pinned
         base's signature takes three (``rms_eps``, ``hc_pre_eps``,
-        ``hc_sinkhorn_eps``) and the fork's config carries two fields. The
-        split follows what the checkpoint sets, not what the base's test sets:
+        ``hc_sinkhorn_eps``); the fork's config carries two fields, and the
+        target model reads exactly two constants at three sites:
 
-        * ``hc_pre_eps`` and ``hc_sinkhorn_eps`` are mHC-native, and the
-          checkpoint's own ``text_config.hc_eps`` is ``1e-06``, so both keep
-          ``hc_eps`` and the base's collapse onto one value is faithful for
-          them. That is the value ``inc-glm53f-030`` measured its tiny case on,
-          and nothing it recorded moves.
-        * ``rms_eps`` is an RMSNorm epsilon, and the checkpoint's RMSNorm
-          epsilon is ``1e-05`` -- a different number. It lives on
-          ``Glm5NextTextConfig.rms_norm_eps`` (``inc-glm53f-080``) and reaches
-          the router seam through :meth:`Glm5NextRoutedExperts.route_tokens`.
-          It reaches no mHC line: ``self.hc_eps`` and the three sites that
-          consume it below are unchanged.
+        * ``hc_pre_eps`` and ``hc_sinkhorn_eps`` are mHC-native and both read
+          ``text_config.hc_eps`` (``1e-06``). The target agrees: it adds
+          ``self.hc_eps`` after the pre sigmoid
+          (``design/reference/modeling_glm5_next.py:283``) and after the comb
+          softmax (``reference:286``), which are the two sites
+          :meth:`mhc_pre` adds it at.
+        * ``rms_eps`` is the RMSNorm epsilon and reads
+          ``text_config.rms_norm_eps`` (``1e-05``) -- a DIFFERENT number, on
+          the same config object (``config.py:256``, beside ``hc_eps`` at
+          ``:262``).
 
-        WHAT THIS CORRECTS. The earlier wording argued the single field was
-        faithful for all three uses, and grounded that on the base's own kernel
-        test setting ``hc_sinkhorn_eps = hc_pre_eps = rms_eps = 1e-6``
-        (``tests/kernels/test_mhc_kernels.py:121``). That is the base's number,
-        not the target's. Two thirds of the claim stand on the checkpoint's own
-        ``hc_eps``; the RMSNorm third is settled against the checkpoint
-        instead, which is where it always belonged.
+        WHAT ``inc-glm53f-030c`` CORRECTS HERE, and it is a correction of a
+        recorded claim rather than a re-opening. The bullet this replaces said
+        of ``rms_eps``: "It reaches no mHC line: ``self.hc_eps`` and the three
+        sites that consume it below are unchanged." **The target model
+        falsifies that sentence.** Its mHC layer normalises the folded input
+        through its own RMSNorm, built with the model's RMSNorm epsilon --
+        ``self.input_norm = Glm5NextTextUnweightedRMSNorm(eps=config.rms_norm_eps)``
+        (``reference:257``), whose forward is
+        ``x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)``
+        (``reference:216``) -- and that norm is applied before the projection
+        (``reference:278``). So the RMSNorm epsilon reaches exactly ONE mHC
+        line, and it is the RMS denominator in :meth:`mhc_pre`, which read
+        ``hc_eps`` until this increment. :attr:`rms_eps` below carries it.
+
+        WHY THE OVERRIDE CONTRACT NARROWS, stated rather than left to be
+        discovered: ``neuron_config.mhc_eps`` still overrides ``hc_eps`` and so
+        still reaches the pre and comb sites, but it no longer reaches the RMS
+        denominator, because that site now reads the model's own RMSNorm
+        epsilon. No ``mhc_rms_eps`` override field exists and this increment
+        invents none.
 
         Raises:
             Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
@@ -1160,6 +1201,12 @@ class Glm5NextHyperConnection(nn.Module):
         self.hidden_size = hidden
         self.sinkhorn_iters = iters
         self.hc_eps = eps
+        # The RMSNorm epsilon, at the ONE mHC site the target model puts it:
+        # `mhc_pre`'s RMS denominator. Read off the same config object as
+        # `hc_eps` and deliberately NOT overridable by `neuron_config.mhc_eps`,
+        # because it is the model's RMSNorm constant rather than an mHC dial
+        # (`reference:257`, `reference:216`; `inc-glm53f-030c`).
+        self.rms_eps = float(text_config.rms_norm_eps)
         self.post_mult_value = float(post_mult_value)
 
         # ``hc_mult3`` is the base's own name for the projection's output width:
@@ -1192,7 +1239,7 @@ class Glm5NextHyperConnection(nn.Module):
     def mhc_pre(
         self, residual: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The base's ``mhc_pre``, with its Sinkhorn on ``-028``'s kernel.
+        """The base's ``mhc_pre``, with its Sinkhorn on ``-028b``'s BATCHED kernel.
 
         Args:
             residual: ``[T, S, H]`` -- the ``S = hc_mult`` residual streams.
@@ -1203,24 +1250,33 @@ class Glm5NextHyperConnection(nn.Module):
             weights input stream ``i`` into output stream ``j``, the base's
             convention and the one ``-029``'s kernel reads.
 
-        THE TOKEN CEILING, MEASURED AND DELIBERATELY NOT WORKED AROUND. The
-        block-diagonal embedding puts ``T * S`` on the Sinkhorn's ``M``, and
-        ``-028`` refuses ``M > PARTITION_MAX``. So this layer serves
-        ``T <= PARTITION_MAX // S`` -- **32** at the checkpoint's ``hc_mult 4``
-        -- where ``-029``'s combine kernel on its own would serve ``T <= 128``.
-        The Sinkhorn therefore binds first. Nothing here pads, tiles or falls
-        back: the seam's ``SinkhornError`` propagates to the caller unchanged,
-        which is what the lead ruled and what P13 requires. The reading is in
-        ``probe-030-m129.out``.
+        THE TOKEN CEILING, AND WHICH SEAM NOW SETS IT. ``inc-glm53f-030c``
+        replaced the note that stood here. It said the block-diagonal embedding
+        put ``T * S`` on the Sinkhorn's ``M``, that ``-028`` refused
+        ``M > PARTITION_MAX``, and that this layer therefore served **32**
+        tokens at ``hc_mult 4``. **Every clause of that is now false**, in two
+        steps: ``inc-glm53f-028b`` tiled the row axis and removed the ``M``
+        refusal, which moved the bound to the square matrix's ``N``; and this
+        increment stops building a square matrix at all. The Sinkhorn is called
+        on ``[T, S, S]`` blocks, where ``N`` per block is ``S`` and
+        :func:`_require_blocks_admissible` carries **no token bound**.
+
+        So the ceiling is now ``-029``'s combine kernel alone: ``T <=
+        PARTITION_MAX`` -- **128**, refused with ``HyperConnectionError`` from
+        :meth:`mhc_post`. The NUMBER did not move (the old square ceiling was
+        ``MOVING_FMAX // S``, also 128); the axis, the seam and the exception
+        class did. Lifting 128 is ``inc-glm53f-029b``'s registered work, not a
+        pad and not a torch path here (P13).
 
         Raises:
             Glm5NextHyperConnectionError: on a non-3-D ``residual`` or a stream
                 or hidden extent that contradicts this layer's configuration.
-            SinkhornError: from the seam, on a token count this layer's
-                embedding puts above ``-028``'s ``M`` bound. Propagated, never
-                caught.
+            SinkhornError: from the seam, on a non-3-D block input, a
+                non-square block, or an unavailable NKI route -- the batched
+                seam ships no torch path, so an absent route raises rather than
+                falling back. Propagated, never caught.
         """
-        from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise
+        from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
         tokens, streams, hidden = self._require_streams(residual)
 
@@ -1230,15 +1286,35 @@ class Glm5NextHyperConnection(nn.Module):
         # projection's own input width -- ``hc_mult * hidden_size`` in
         # ``mhc_pre_torch``, ``fn.shape[-1]`` in ``mhc_pre_ref`` -- and those are
         # the same number.
+        # THE EPSILON HERE IS THE MODEL'S RMSNorm EPSILON, not the mHC one, and
+        # that is `inc-glm53f-030c` correcting `inc-glm53f-030`. The target builds
+        # this norm as `Glm5NextTextUnweightedRMSNorm(eps=config.rms_norm_eps)`
+        # (`reference:257`) and applies it to the folded input before the
+        # projection (`reference:278`); `self.rms_eps` is that constant. The
+        # `sum / (S * H)` above is the same reduction as the target's
+        # `.mean(-1)` (`reference:216`), and scaling `mixes` after the matmul is
+        # the same result as normalising `flat` before it, because the projection
+        # carries no bias and is therefore homogeneous.
         sqrsum = flat.square().sum(dim=-1, keepdim=True)
-        mixes = mixes * torch.rsqrt(sqrsum / float(streams * hidden) + self.hc_eps)
+        mixes = mixes * torch.rsqrt(sqrsum / float(streams * hidden) + self.rms_eps)
 
         scale = self.hc_scale.to(torch.float32)
         base = self.hc_base.to(torch.float32)
+        # `+ self.hc_eps` on the PRE gate and nothing on the POST gate, which is
+        # the target's own asymmetry rather than an omission here:
+        # `pre = torch.sigmoid(...) + self.hc_eps` (`reference:283`) against
+        # `post = 2 * torch.sigmoid(...)` (`reference:284`), with no epsilon on
+        # the post term. `-030c`'s epsilon control reads that asymmetry directly:
+        # moving `hc_eps` must move `layer_input` and `comb_mix` and must leave
+        # `post_mix` bit-identical.
         pre_mix = (
             torch.sigmoid(mixes[:, :streams] * scale[0] + base[:streams])
             + self.hc_eps
         )
+        # `post_mult_value` defaults to the target's `2` (`reference:284`); the
+        # multiply is written after the sigmoid rather than before it, which is
+        # the same number in IEEE-754 and keeps the value a settable argument so
+        # the failing control can put the old `1.0` back.
         post_mix = (
             torch.sigmoid(
                 mixes[:, streams : 2 * streams] * scale[1]
@@ -1249,18 +1325,35 @@ class Glm5NextHyperConnection(nn.Module):
         comb_logits = mixes[:, 2 * streams :].reshape(
             tokens, streams, streams
         ) * scale[2] + base[2 * streams :].reshape(1, streams, streams)
-        # ``softmax`` and the ``+ eps`` are the base's, and they sit OUTSIDE the
-        # seam because ``-028``'s kernel starts from an affinity matrix. This is
-        # elementwise glue, which P13 leaves to torch.
+        # ``softmax`` and the ``+ eps`` are the base's, and the target agrees
+        # line for line: ``comb = torch.softmax(comb_logits, dim=-1) +
+        # self.hc_eps`` (``reference:286``), so this is the SECOND of the two
+        # sites ``hc_eps`` belongs at. They sit OUTSIDE the seam because
+        # ``-028``'s kernel starts from an affinity matrix. This is elementwise
+        # glue, which P13 leaves to torch.
         comb_start = torch.softmax(comb_logits, dim=-1) + self.hc_eps
 
-        # ---- ENTRY 1 of 1 into ``-028``'s Sinkhorn seam. ----------------- #
-        # The counted dispatch. One call for all ``T`` tokens, which is what the
-        # block-diagonal embedding buys and what the route predicate declares.
-        normalised = sinkhorn_normalise(
-            torch.block_diag(*comb_start.unbind(0)), iters=self.sinkhorn_iters
+        # ---- ENTRY 1 of 1 into ``-028b``'s BATCHED Sinkhorn seam. -------- #
+        # The counted dispatch, still exactly one for all ``T`` tokens.
+        #
+        # `inc-glm53f-030c` moved this off the square form. It used to embed the
+        # ``T`` blocks down the diagonal of a ``[T*S, T*S]`` matrix, normalise
+        # that, and extract the diagonal blocks back out. The off-diagonal of
+        # that matrix is all zero and a zero stays zero under row and column
+        # rescaling, so it carried no information and cost ``(T*S)^2`` values --
+        # 256 MB of fp32 at 2048 tokens against 128 KB for the blocks, which is
+        # the reading `sinkhorn.py:587-591` records. The batched seam takes the
+        # blocks directly, so the embedding and the extraction both go away and
+        # `_diagonal_blocks` is deleted with them.
+        #
+        # `comb_start` is ALREADY `[T, S, S]`, which is the seam's own input
+        # shape, so this is a call rather than a translation. The seam ships NO
+        # torch path (`sinkhorn.py:957-964`): an absent NKI route raises instead
+        # of quietly normalising 2048 tokens in torch, which is what P13 and D6
+        # require of kernel-class work.
+        comb_mix = sinkhorn_normalise_blocks(
+            comb_start, iters=self.sinkhorn_iters
         )
-        comb_mix = self._diagonal_blocks(normalised, tokens, streams)
 
         layer_input = (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1)
         return post_mix.reshape(tokens, streams, 1), comb_mix, layer_input
@@ -1376,19 +1469,6 @@ class Glm5NextHyperConnection(nn.Module):
             )
         return tokens, streams, hidden
 
-    @staticmethod
-    def _diagonal_blocks(
-        normalised: torch.Tensor, tokens: int, streams: int
-    ) -> torch.Tensor:
-        """Read the ``T`` per-token blocks back off a ``[T*S, T*S]`` diagonal.
-
-        The inverse of :func:`torch.block_diag` for equal-sized blocks. Pure
-        indexing: it selects, and computes nothing.
-        """
-        index = torch.arange(tokens, device=normalised.device)
-        return normalised.reshape(tokens, streams, tokens, streams)[
-            index, :, index, :
-        ]
 
 
 # ---------------------------------------------------------------------------
