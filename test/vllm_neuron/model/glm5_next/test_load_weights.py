@@ -91,9 +91,10 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 
 # ``_is_fp8_dtype`` is imported deliberately, private name and all: it is the
 # EXACT predicate ``_dequantised_projection_weight`` branches on
-# (``model_fp8.py:2827``), so an item asking whether the dequant branch is
-# reachable has to ask the same question the branch asks rather than a
-# look-alike dtype comparison of its own.
+# (``model_fp8.py::Glm5NextMLAAttention._dequantised_projection_weight``), so
+# an item asking whether the dequant branch is reachable has to ask the same
+# question the branch asks rather than a look-alike dtype comparison of its
+# own.
 
 # --------------------------------------------------------------------------- #
 # The real published fixtures, and the two exclusion prefixes.
@@ -125,12 +126,13 @@ MINI_ROUTED_EXPERTS = 4
 MINI_SHARED_EXPERTS = 1
 MINI_FIRST_K_DENSE = 1
 
-#: All four layers dense. ``model_fp8.py:2013`` and ``weight_loaders_fp8.py:412``
-#: both branch on ``layer_idx < first_k_dense_replace``, the tree and the map on
-#: the same field, so this one number is the whole difference between a
-#: configuration that loads and one that refuses. ``n_routed_experts`` is left at
-#: its miniature value rather than zeroed: the config validator requires at least
-#: one (``config.py:277``), and no layer builds a bank here anyway.
+#: All four layers dense. ``model_fp8.py::_build_mlp`` and
+#: ``weight_loaders_fp8.py:412`` both branch on
+#: ``layer_idx < first_k_dense_replace``, the tree and the map on the same field,
+#: so this one number is the whole difference between a configuration that loads
+#: and one that refuses. ``n_routed_experts`` is left at its miniature value
+#: rather than zeroed: the config validator requires at least one
+#: (``config.py:277``), and no layer builds a bank here anyway.
 MINI_ALL_DENSE_FIRST_K = MINI_LAYERS
 
 #: The miniature tensor shapes. A weight is one full 128x128 quantisation block
@@ -455,7 +457,7 @@ def _token_checkpoint_directory(tmp_path: Path) -> Path:
     """A directory that gets past ``load_weights``'s opener and holds no weights.
 
     ``load_weights`` refuses a checkpoint whose ``get_num_files()`` reads zero
-    (``model_fp8.py:3379-3384``), so even a dict-level reading needs ONE
+    (``model_fp8.py::Glm5NextForConditionalGeneration.load_weights``), so even a dict-level reading needs ONE
     ``.safetensors`` file to exist. This one holds a single one-element tensor and
     is never opened: the run refuses at materialisation, which is before
     ``load_sharded_pipelined``, so not one tensor byte of it is read. Writing the
@@ -476,7 +478,7 @@ def _mappings_flow_in_load_weights() -> tuple[int, int]:
 
     This reads ``load_weights``'s own source, because the fact needed is about the
     code rather than about one run. The hand-over to ``load_sharded_pipelined``
-    (``model_fp8.py:3418``) cannot be reached while a routed expert bank refuses,
+    (``model_fp8.py::Glm5NextForConditionalGeneration.load_weights``) cannot be reached while a routed expert bank refuses,
     so the item observes the map one line earlier and needs to know the two lines
     cannot disagree: ONE binding, and a hand-over passing THAT SAME NAME, is what
     makes the observed object the object the hand-over would pass.
@@ -827,9 +829,10 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
     observed: list[dict[str, str | list[str]]] = []
 
     # The reader is a method on the checkpoint object ``load_weights`` builds
-    # locally (``model_fp8.py:3736``), so the patch is on the class and the
-    # fixture restores it. The call site passes all five arguments positionally,
-    # so a signature change there reaches this observer as a loud TypeError.
+    # locally (``model_fp8.py::Glm5NextForConditionalGeneration.load_weights``),
+    # so the patch is on the class and the fixture restores it. The call site
+    # passes all five arguments positionally, so a signature change there
+    # reaches this observer as a loud TypeError.
     def observer(_checkpoint, rank, world_size, _model, handed_over, _device):
         observed.append(handed_over)
         raise _MapCaptured(
@@ -1668,8 +1671,10 @@ def test_the_load_time_preps_run_after_the_device_by_name(
     assert on_disk == module_source, "the mutation reached the file on disk"
 
     # Case A: the prep's own refusal when a scale was never materialised. It is
-    # -090's landed message at ``model_fp8.py:1563-1568``, and NOT ``:1589``,
-    # which is a different method's never-ran refusal.
+    # -090's landed message at
+    # ``model_fp8.py::Glm5NextSharedExperts.prepare_scale_operands``, and NOT
+    # ``::Glm5NextSharedExperts._prepared_scale_operand``, which is a different
+    # method's never-ran refusal.
     shared = Glm5NextSharedExperts(_dense_config().text_config)
     with pytest.raises(Glm5NextSharedExpertRouteError) as case_a:
         shared.prepare_scale_operands(
@@ -1904,7 +1909,7 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 # argued: ``increments/probe-095-collateral-host.out`` reads
 # ``BlockwiseFp8MmError: weight extent [128,128] is not a whole number of
 # 256x256 blocks`` from ``blockwise_fp8_mm.py:283-287``, reached through
-# ``model_fp8.py:1576``.
+# ``model_fp8.py::Glm5NextSharedExperts.prepare_scale_operands``.
 #
 # So these items set ``n_shared_experts=0``, which ``model_fp8.py`` reads as "build
 # no shared-expert module", and the routed load completes on the bank's own path.
@@ -2052,7 +2057,7 @@ def _stacked_model() -> Glm5NextForConditionalGeneration:
     """The routed model at the fork's own expert-parallel degree, which is 1.
 
     ``Glm5NextForConditionalGeneration.__init__`` takes a config and nothing else
-    (``model_fp8.py:3454``), so a degree is not something a test can pass in
+    (``model_fp8.py::Glm5NextForConditionalGeneration.__init__``), so a degree is not something a test can pass in
     here. Conjunct 3 therefore declares its two-rank geometry on a stand-in owner
     (:func:`_stacked_bank_geometry`) and calls the loader directly, which is also
     the honest shape of that reading: the loader's contract is with whatever
@@ -3350,12 +3355,13 @@ def _shard_pattern(
 
 #: The classes whose LOAD PATH coarsens a checkpoint scale grid onto the consumer's
 #: 256 granularity. Read off the two call sites that do it -- the republish the two
-#: dense-shaped classes go through (``model_fp8.py:6915``) and the routed bank's own
+#: dense-shaped classes go through
+#: (``model_fp8.py::_publish_compute_frame_operands``) and the routed bank's own
 #: prep (``:2281-2293``) -- rather than from a guess about which families are
 #: quantised. A family outside this tuple keeps :func:`_shard_pattern`'s ramp,
 #: because nothing rescales its weights there and the ramp's per-128-tile
-#: distinctness is the stronger position reading.
-#: The families whose LOAD PATH still coarsens a 128 grid onto a 256 one.
+#: distinctness is the stronger position reading. The families whose LOAD PATH still
+#: coarsens a 128 grid onto a 256 one.
 #:
 #: NARROWED TO ONE BY ``inc-glm53f-112``, and the narrowing is the increment. The two
 #: dense families used to coarsen inside ``_publish_compute_frame_operands``; that
@@ -3603,7 +3609,7 @@ def _load_at_world(
 
     The world size is patched at the RESOLVER and the model built afterwards, and
     that ordering is the point: ``Glm5NextKDAAttention.__init__`` divides its head
-    count by the world size it is given (``model_fp8.py:2215``), so a model built
+    count by the world size it is given (``model_fp8.py::Glm5NextKDAAttention.__init__``), so a model built
     at world size 1 and re-labelled 2 would carry a full-width head count and a
     sharding loader at once -- the exact defect these items exist to detect,
     constructed by the test itself.
@@ -4403,10 +4409,10 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     # WHAT THE DEFECT WAS. ``Glm5NextRoutedExperts`` keeps two degrees:
     # ``tp_degree``, the tensor-parallel world size, and ``ep_degree``, the
     # expert-parallel degree the bank's partition is built from
-    # (``model_fp8.py:1029-1037``). This campaign's production expert-parallel
-    # degree is 1 (``factory.py:204-211``), so the partition holds ONE rank while
-    # the load supplies the GLOBAL rank -- and every global rank above 0 was
-    # refused (``factory.py:132-137``).
+    # (``model_fp8.py::Glm5NextRoutedExperts.__init__``). This campaign's
+    # production expert-parallel degree is 1 (``factory.py:204-211``), so the
+    # partition holds ONE rank while the load supplies the GLOBAL rank -- and
+    # every global rank above 0 was refused (``factory.py:132-137``).
     #
     # WHAT THE REPAIR IS. ``_expert_parallel_rank_map`` maps the global rank to the
     # rank the partition was built over BEFORE the owner is asked which experts are
@@ -4542,11 +4548,12 @@ DEFERRED_EP_GROUP_CLASSES = ("Glm5NextRoutedExperts",)
 #: The extent no family in THIS fixture shards, and the reason it is 256 rather
 #: than :data:`SHARD_NARROW`'s 8. These items load a model that HAS a shared
 #: expert, so the load path runs the landed
-#: ``Glm5NextSharedExperts.prepare_scale_operands`` (``model_fp8.py:1857``), which
-#: goes through the consumer's own ``scale_grid_shape`` -- and that function
-#: refuses an extent that is not a whole number of 256 x 256 blocks on EITHER
-#: dimension (``functional/blockwise_fp8_mm.py:284``). At narrow width 8 every one
-#: of these items died there, measured at ``accept-101-r8-host.out``
+#: ``Glm5NextSharedExperts.prepare_scale_operands``
+#: (``model_fp8.py::Glm5NextSharedExperts.prepare_scale_operands``), which goes
+#: through the consumer's own ``scale_grid_shape`` -- and that function refuses an
+#: extent that is not a whole number of 256 x 256 blocks on EITHER dimension
+#: (``functional/blockwise_fp8_mm.py:284``). At narrow width 8 every one of these
+#: items died there, measured at ``accept-101-r8-host.out``
 #: (``weight extent [512,8] is not a whole number of 256x256 blocks``). 256 is the
 #: smallest width the consumer admits, ruled at DECISIONS §83 ruling 1.
 #:
@@ -4574,9 +4581,9 @@ DEFERRED_NARROW = 256
 #: whose subject is the pad passes this width, and it passes it to the checkpoint AND
 #: to every load so both sides describe one model. ``intermediate_size`` reaches
 #: exactly one module in the package, ``Glm5NextDenseMLP``
-#: (``model_fp8.py:3564``), so this width moves the dense three and nothing else --
-#: the shared expert takes ``moe_intermediate_size`` (``config.py:223``) and the bank
-#: its own width.
+#: (``model_fp8.py::Glm5NextDenseMLP.__init__``), so this width moves the dense three
+#: and nothing else -- the shared expert takes ``moe_intermediate_size``
+#: (``config.py:223``) and the bank its own width.
 PAD_DENSE_INTERMEDIATE = 256
 
 
@@ -5805,7 +5812,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         The trn2 encoding is a matched pair -- the weight bytes are squeezed into the
         240 range and the per-block grid is multiplied by the inverse factor -- and
         ``_publish_compute_frame_operands`` applies the second half at
-        ``model_fp8.py:7118``. Before ``-054c`` NOTHING applied it for these two
+        ``model_fp8.py::_publish_compute_frame_operands``. Before ``-054c`` NOTHING applied it for these two
         classes, so a reference carrying only the squeeze agreed with the product, and
         this reading passed while the effective matrix stood at ``240/448`` of the
         checkpoint's magnitude.
@@ -7680,12 +7687,14 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
     #
     # THE TWO DICT-SHAPED RECORDS, EACH NAMED. A suffix scan over
     # ``dir(type(module))`` also matches the ROUTED bank's own
-    # ``RETILE_HEALTH_ATTR`` (``model_fp8.py:2143``), and that one publishes a dict
-    # of TUPLES -- ``(emitted_unsupplied, input_scales_dropped, inexact_rescales)``
-    # per projection (``:2334-2352``) -- so ``record.get`` reached a tuple and a
+    # ``RETILE_HEALTH_ATTR`` (``model_fp8.py::Glm5NextRoutedExperts``), and that
+    # one publishes a dict of TUPLES --
+    # ``(emitted_unsupplied, input_scales_dropped, inexact_rescales)`` per
+    # projection (``:2334-2352``) -- so ``record.get`` reached a tuple and a
     # CORRECT load raised ``AttributeError``. The deferred fixture has four routed
     # experts and the load path prepares every module that offers a prep
-    # (``model_fp8.py:7899``), so it was reached every time.
+    # (``model_fp8.py::Glm5NextForConditionalGeneration._run_load_time_preps``), so
+    # it was reached every time.
     #
     # NAMING BOTH IS A POSITIVE SELECTION, not a filter. "Skip anything that is not
     # a dict" would also pass on the day the shared or dense record changed shape:
@@ -7698,7 +7707,8 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
     # THE ROUTED BANK'S COUNTS ARE THEREFORE NOT IN THIS TOTAL, and the row says so.
     # Reading them needs an index convention for a nameless tuple, which is a
     # different change from this repair; the shared and dense records carry
-    # ``inexact_rescales`` by name (``model_fp8.py:7191-7199``).
+    # ``inexact_rescales`` by name
+    # (``model_fp8.py::_publish_compute_frame_operands``).
     health_records: dict[tuple[str, str], dict] = {}
     for path, module in ramp_loaded.named_modules():
         for attribute_name in (

@@ -270,11 +270,12 @@ def _impl():
 #: "every seam this campaign owns" and every module below is named in this
 #: campaign's plan. Ten families were unregistered before repair R and one of them
 #: is dispatched by a forward this file already tested: ``route_tokens`` enters
-#: ``functional/moe/router.py`` (``model_fp8.py:1489-1494``), whose family
-#: increments once per call (``router.py:1664``). So item 4's fallback aggregate was
-#: reading thirteen of the fourteen seams its own forward could reach, and the
-#: earlier disclosure that "the router's own seam defines no dispatch counters" was
-#: false of the tree.
+#: ``functional/moe/router.py``
+#: (``model_fp8.py::Glm5NextRoutedExperts.route_tokens``), whose family increments
+#: once per call (``router.py:1664``). So item 4's fallback aggregate was reading
+#: thirteen of the fourteen seams its own forward could reach, and the earlier
+#: disclosure that "the router's own seam defines no dispatch counters" was false of
+#: the tree.
 #:
 #: Naming the reader rather than discovering it stays deliberate:
 #: ``test_dsa_layer.py:380`` discovers the pair by scanning for the
@@ -551,7 +552,7 @@ def _declare_bound_and_sentinel(expected: dict) -> None:
     """Declare ``-103``'s two causal families at the SELECTOR's count, not at a number.
 
     ``Glm5NextDSAIndexer.select_bounded_pools`` composes the three seams in one
-    straight-line method with no branch between them (``model_fp8.py:5003-5009``):
+    straight-line method with no branch between them (``model_fp8.py::Glm5NextDSAIndexer.select_bounded_pools``):
     ``dsa_causal_bound``, then ``dsa_topk_select``, then ``dsa_causal_sentinel``. So
     whatever an item declares for the selector is arithmetically what these two owe,
     per item and per layer, and taking it FROM the selector's own entry is what stops
@@ -816,7 +817,7 @@ def _prep_operands_from_the_module(module, leaves, fixture: dict) -> tuple:
     """The six arguments ``prepare_scale_operands`` takes, read off the MODULE.
 
     THE PREP IS HANDED WHAT THE LOAD BOUND, NOT WHAT THE FIXTURE HELD.
-    ``_run_load_time_preps`` (``model_fp8.py:7887-7895``) passes this module's own
+    ``_run_load_time_preps`` (``model_fp8.py::Glm5NextForConditionalGeneration._run_load_time_preps``) passes this module's own
     attributes, and a bank's forward multiplies only what this call built. A site that
     hands the fixture's dict straight through therefore builds operands the load never
     touched: ``_attach``'s squeeze and compensation are skipped, and on a 240-clamp
@@ -1095,11 +1096,11 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     # at the PUBLISHED granularity -- and that is not what a checkpoint load
     # delivers. The loader delivers the checkpoint's own layout, gate and up
     # ``[I, H]`` and down ``[H, I]`` (the shard table shards gate and up on dim 0,
-    # "the intermediate width", ``model_fp8.py:503-513``), at the checkpoint's 128
-    # granularity. So the fixture above was the loader's job done by hand, in the
-    # opposite frame, and it passed 7 of 7 while a real load into this class refused
-    # at the first of GLM-5.3-Flash's three dense layers. The review that found it
-    # is ``bless-054a-code-ebcff0ce-findings.md`` finding 1.
+    # "the intermediate width", ``model_fp8.py::_SHARD_GEOMETRY``), at the
+    # checkpoint's 128 granularity. So the fixture above was the loader's job done
+    # by hand, in the opposite frame, and it passed 7 of 7 while a real load into
+    # this class refused at the first of GLM-5.3-Flash's three dense layers. The
+    # review that found it is ``bless-054a-code-ebcff0ce-findings.md`` finding 1.
     #
     # WHAT THIS CONJUNCT DOES. It binds the SAME numbers in the loader's frame at
     # the loader's granularity, runs the load-path prep that the real
@@ -2473,12 +2474,13 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # the expert kernel, or the bank through three dense calls, fails instead of
     # passing on a total.
     #
-    # THE ROUTER'S DISPATCH IS COUNTED SINCE REPAIR R, and the line this replaces
-    # said the router seam defines no counters. It defines
-    # ``noaux_tc_dispatch_counters`` (``router.py:1017``) and increments it once per
-    # call (``:1664``), and ``route_tokens`` is what this forward enters
-    # (``model_fp8.py:1489-1494``) -- so the fallback aggregate over this forward used
-    # to omit the one seam whose fallback the item's own control D discusses.
+    # THE ROUTER'S DISPATCH IS COUNTED SINCE REPAIR R, and the line this replaces said
+    # the router seam defines no counters. It defines ``noaux_tc_dispatch_counters``
+    # (``router.py:1017``) and increments it once per call (``:1664``), and
+    # ``route_tokens`` is what this forward enters
+    # (``model_fp8.py::Glm5NextRoutedExperts.route_tokens``) -- so the fallback
+    # aggregate over this forward used to omit the one seam whose fallback the item's
+    # own control D discusses.
     _assert_route_predicate(
         "4 MoE block",
         {"blockwise_fp8_moe": 1, "blockwise_fp8_mm": 3, "noaux_tc_router": 1},
@@ -2516,19 +2518,18 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # routes on argument 1 and hands argument 2 to the experts, so only argument 1 is
     # perturbed here and argument 2 is left exactly as the main compare had it.
     #
-    # THE PERTURBATION IS PROVED THROUGH THE FORWARD, AND THAT PROOF IS THE GATE
-    # (R2', LEAD-LOG 858). What stood here proved the swap changed the SELECTED
-    # EXPERT SET when THIS TEST called ``block.experts.route_tokens`` itself, and
-    # gated nothing on the set the FORWARD's own router call returned, so a forward
-    # that routed on argument 2 would have passed the arm whose whole purpose is to
-    # refuse it (round 3, finding F1:
+    # THE PERTURBATION IS PROVED THROUGH THE FORWARD, AND THAT PROOF IS THE GATE (R2',
+    # LEAD-LOG 858). What stood here proved the swap changed the SELECTED EXPERT SET when
+    # THIS TEST called ``block.experts.route_tokens`` itself, and gated nothing on the set
+    # the FORWARD's own router call returned, so a forward that routed on argument 2 would
+    # have passed the arm whose whole purpose is to refuse it (round 3, finding F1:
     # ``reviews/glm-5.3-flash-port/design-and-code-054a-controls-r3-cb12f3d9-findings.md``).
-    # The reading is now taken from INSIDE the forward. The block's own
-    # ``route_tokens`` -- the method ``Glm5NextMoEBlock.forward`` routes with
-    # (``model_fp8.py:3334-3336``) -- is wrapped on the instance for the duration of
-    # each ``block.forward`` call, every call it makes is recorded, and the wrapper
-    # returns the router's own tuple unchanged. It is removed in a ``finally``, so no
-    # later reading in this file sees it.
+    # The reading is now taken from INSIDE the forward. The block's own ``route_tokens`` --
+    # the method ``Glm5NextMoEBlock.forward`` routes with
+    # (``model_fp8.py::Glm5NextMoEBlock.forward``) -- is wrapped on the instance for the
+    # duration of each ``block.forward`` call, every call it makes is recorded, and the
+    # wrapper returns the router's own tuple unchanged. It is removed in a ``finally``, so
+    # no later reading in this file sees it.
     #
     # THE GATE IS DISCRETE AND IT IS THE FORWARD'S: the set recorded inside the
     # PERTURBED forward must differ from the set recorded inside the REFERENCE
@@ -3670,8 +3671,9 @@ SEED_STACK_MHC = 5471
 #: Two mHC sites per layer -- ``hc_attn_*`` around the attention half and ``hc_ffn_*``
 #: around the feed-forward half. NOT a dial: the count is the number of sites
 #: ``_mhc_leaves_by_site`` derives from the map's own six names
-#: (``model_fp8.py:7643-7653``), and this constant is what the fixture's bind is
-#: checked against so a half-bound layer refuses rather than mixing with zeros.
+#: (``model_fp8.py::_mhc_leaves_by_site``), and this constant is what the fixture's
+#: bind is checked against so a half-bound layer refuses rather than mixing with
+#: zeros.
 MHC_SITES_PER_LAYER = 2
 
 #: Added to :func:`_shared_at_routed_operands`' three seeds, one offset per dense
@@ -3945,7 +3947,7 @@ def _stack_load_the_six(layer, cfg, *, seed: int) -> dict:
     THE LEAVES ARE FLOAT32 while this stack's activations are bfloat16. That is the
     checkpoint's own arrangement -- the six keys are plain, unquantised tensors -- and
     ``mhc_pre`` casts ``fn`` to float32 before the projection anyway
-    (``model_fp8.py:1270``), so nothing here rounds.
+    (``model_fp8.py::Glm5NextHyperConnection.mhc_pre``), so nothing here rounds.
     """
     generator = torch.Generator().manual_seed(seed)
     placed = {}
@@ -4029,7 +4031,7 @@ def _stack_fixture(model=None) -> dict:
 
     # ---- THE FOUR-STREAM CARRIER'S OWN WEIGHTS, and why they are here at all.
     # ``inc-glm53f-030d`` part (a) made ``Glm5NextModel.forward`` pass streams
-    # UNCONDITIONALLY (``model_fp8.py:7258``), and ``_mhc_site`` refuses a streams call
+    # UNCONDITIONALLY (``model_fp8.py::Glm5NextModel.forward``), and ``_mhc_site`` refuses a streams call
     # on a layer that carries none of the six mHC leaves (``:7719-7723``). So a stack
     # whose layers hold no mHC weight can no longer be run at all: this fixture loads
     # the six per layer and binds the two sites, exactly as the load path does, or every
@@ -4055,7 +4057,7 @@ def _stack_fixture(model=None) -> dict:
         # ---- THE SIX LEAVES AND THE BIND, per layer, in the load path's own order:
         # the weights land first and the bind runs after, because the leaves are
         # ``register_parameter(name, None)`` declarations until something fills them
-        # and a site bound before that would hold ``None`` (``model_fp8.py:7757-7763``).
+        # and a site bound before that would hold ``None`` (``model_fp8.py::_bind_hyper_connection_sites``).
         # Each layer draws from its own seed, so a bind that handed two layers one set
         # of sites is a different number in every comparison below.
         mhc_operands[index] = _stack_load_the_six(
@@ -4130,7 +4132,7 @@ def _stack_fixture(model=None) -> dict:
         mlp_operands[index] = operands
 
     # ---- THE BIND'S OWN RECORD, read back off the tree rather than restated. The bind
-    # writes a health mapping per layer (``model_fp8.py:7899-7911``) and this row prints
+    # writes a health mapping per layer (``model_fp8.py::_bind_hyper_connection_sites``) and this row prints
     # what each layer ended up with, so a transcript says which sites were bound, at
     # which epsilon and post multiplier, without a second instrument.
     for index, layer in enumerate(layers):
@@ -4242,7 +4244,7 @@ def _stack_mhc_pre(site, streams, label: str):
     it, so nothing about the composition is taken on trust.
 
     ``layer_input`` COMES BACK IN THE STREAMS' DTYPE, which is what the product hands
-    the sublayer (``model_fp8.py:1362`` casts it back), so the reference's half runs on
+    the sublayer (``model_fp8.py::Glm5NextHyperConnection.mhc_pre`` casts it back), so the reference's half runs on
     the very tensor the product's half ran on.
     """
     post_mix, comb_mix, layer_input = site.mhc_pre(streams)
@@ -4271,7 +4273,7 @@ def _stack_mhc_post(site, half, streams, post_mix, comb_mix):
     """The mixed streams in FLOAT32, from the site's own combine.
 
     ``streams`` is handed over as float32 ON PURPOSE. :meth:`mhc_post` returns in its
-    residual argument's dtype (``model_fp8.py:1414``, the cast ``inc-glm53f-030d``
+    residual argument's dtype (``model_fp8.py::Glm5NextHyperConnection.mhc_post``, the cast ``inc-glm53f-030d``
     commit 4 put there), so a bfloat16 residual would round the REFERENCE as well as
     the forward and this item's whole precision argument is that each comparison
     carries the forward's own roundings and none of its own.
@@ -4616,7 +4618,7 @@ def _stack_outside_tolerance(label: str, moved: torch.Tensor,
 # WHAT THAT CHANGED HERE, in four places and no more. The FIXTURE loads the six #
 # mHC leaves per layer and runs the load path's bind, because the stack passes  #
 # streams unconditionally and ``_mhc_site`` refuses a streams call on a layer   #
-# carrying none of them (``model_fp8.py:7719-7723``) -- so an unloaded fixture  #
+# carrying none of them (``model_fp8.py::_mhc_site``) -- so an unloaded fixture #
 # no longer measures a plain add, it refuses. CONJUNCT 1 compares the expand as #
 # well as the index. CONJUNCT 2 expects the one extra ``streams`` keyword and   #
 # requires it to be the same object the layer got positionally. CONJUNCTS 3, 4  #
@@ -4633,11 +4635,13 @@ def _stack_outside_tolerance(label: str, moved: torch.Tensor,
 # stack that ran one site per layer instead of two fails on the count.          #
 #                                                                              #
 # THE PRECISION BUDGET GAINS ONE TERM AND LOSES NONE. Both mHC seams compute in #
-# float32 and cast back to the carrier's dtype (``model_fp8.py:1362``, :1414``),#
-# so each half's boundary carries the same bf16 rounding it did; the references #
-# below hand the post their residual in FLOAT32 so the reference itself rounds  #
-# nowhere the forward does not. The collapse's mean is the one new rounding and #
-# it lands inside conjunct 5, where the comparison is against the product's own #
+# float32 and cast back to the carrier's dtype                                  #
+# (``model_fp8.py::Glm5NextHyperConnection.mhc_pre`` and                        #
+# ``::Glm5NextHyperConnection.mhc_post``), so each half's boundary carries the  #
+# same bf16 rounding it did; the references below hand the post their residual  #
+# in FLOAT32 so the reference itself rounds nowhere the forward does not. The   #
+# collapse's mean is the one new rounding and it lands inside conjunct 5, where #
+# the comparison is against the product's own                                   #
 # tensors rather than a recompute of the path.                                   #
 # --------------------------------------------------------------------------- #
 def _row_spread_stats(rows: "torch.Tensor") -> tuple:
@@ -4753,7 +4757,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
         # ---- THE TWO mHC SEAMS, ``inc-glm53f-030d`` commit 4c. TWO SITES PER LAYER,
         # and each site's one call is one Sinkhorn and one combine: the attention half's
-        # site runs inside the layer (``model_fp8.py:6918``) and the feed-forward half's
+        # site runs inside the layer (``model_fp8.py::Glm5NextDSALayer.forward``) and the feed-forward half's
         # runs in the stack loop (``:7265``), both through
         # ``Glm5NextHyperConnection.forward``, which is one ``mhc_pre`` and one
         # ``mhc_post`` per call (``:1444-1455``). Each of those enters its seam exactly
@@ -4806,7 +4810,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # ---- end of the BLOCK A readings.
     # ---- BLOCK C: THE SEAM READINGS. `investigation-054a-seam-r1.md` section 7, taken in BLOCK A
     # POSITION -- above every comparison -- so a red conjunct cannot suppress them. Every row re-runs
-    # `model_fp8.py:6714`'s own pieces on the RECORDED layer-0 output, which is the object the stack
+    # `model_fp8.py::Glm5NextModel._ffn_half`'s own pieces on the RECORDED layer-0 output, which is the object the stack
     # loop handed forward. READINGS ONLY: nothing here gates and nothing here raises. The whole block
     # is wrapped so a defect in THESE lines cannot change what the item decides -- the except prints a
     # named row instead of killing the item.
@@ -4820,8 +4824,9 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         _L0 = 0
         # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. ``recorded_out[0][1]`` is now the
         # four STREAMS, and the MLP is handed the single stream the feed-forward site
-        # collapses them into (``model_fp8.py:7264-7276``). So every row below re-runs the
-        # seam's pieces on THAT tensor, which is still the object the stack handed forward.
+        # collapses them into (``model_fp8.py::Glm5NextModel.forward``). So every row below
+        # re-runs the seam's pieces on THAT tensor, which is still the object the stack
+        # handed forward.
         _streams0 = recorded_out[_L0][1]
         _site0 = _stack_mhc_site(layers[_L0], _impl().MHC_FFN_SITE, "block C layer 0")
         _post0, _comb0, _hidden = _stack_mhc_pre(_site0, _streams0, "block C layer 0")
@@ -4841,8 +4846,9 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         )
 
         # The three public scale grids, by the name the product's own lookup builds
-        # (`model_fp8.py:3536-3538`). Read as a dict comprehension rather than a helper, because a
-        # `return` anywhere in this item's body could skip a comparison and the checker below bans one.
+        # (`model_fp8.py::Glm5NextForConditionalGeneration._sibling_scale_grid_name`). Read as a dict
+        # comprehension rather than a helper, because a `return` anywhere in this item's body could
+        # skip a comparison and the checker below bans one.
         _grids = {
             _leaf: getattr(_mlp0, f"{_leaf[: -len('_weight')]}_weight_scale_inv")
             for _leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
@@ -4933,10 +4939,11 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # required to FIRE there.
     #
     # LAYER 0'S CONTROL IS EXACT. The FFN half is MIXED IN OUTSIDE the layer call
-    # (``model_fp8.py:7264-7276``, where the feed-forward site wraps ``_ffn_half``), so
-    # ``recorded_out[0][1]`` is the streams after the ATTENTION half alone and the dense
-    # rescale cannot move it. The old-scale recompute at layer 0 therefore runs on the
-    # very tensor grant 127 ran on, now read through that layer's own site.
+    # (``model_fp8.py::Glm5NextModel.forward``, where the feed-forward site wraps
+    # ``_ffn_half``), so ``recorded_out[0][1]`` is the streams after the ATTENTION half
+    # alone and the dense rescale cannot move it. The old-scale recompute at layer 0
+    # therefore runs on the very tensor grant 127 ran on, now read through that layer's
+    # own site.
     #
     # WHAT THIS BLOCK NOW TOUCHES, DISCLOSED. ``_stack_ffn_half`` on a dense layer still
     # reaches ``_ffn_norm`` and ``_dense_output`` only, both pure torch -- but collapsing
@@ -5211,7 +5218,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # function. RE-POINTED BY ``inc-glm53f-030d`` commit 4c: the first layer is now
     # handed ``[T, S, H]`` rather than ``[T, H]``, and the claim is a conjunction --
     # the table is still indexed, and every stream starts as the SAME token vector
-    # (``reference:1477``, ``model_fp8.py:7251``). Comparing only the expanded tensor
+    # (``reference:1477``, ``model_fp8.py::Glm5NextModel.forward``). Comparing only the expanded tensor
     # would pass on a forward that expanded the wrong rows.
     first_input = recorded_in[0][1][0]
     embedded = fixture["table"][input_ids]
@@ -5248,12 +5255,12 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     #
     # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. The stack now passes ONE MORE
     # KEYWORD, ``streams``, and passes the SAME OBJECT positionally
-    # (``model_fp8.py:7258``): the keyword is the route selector and the positional is
-    # the one-stream route's operand, which a bound layer refuses to take. So the
-    # keyword set is the carrier's plus that one name, and the two arguments are
-    # required to be the same object -- a stack that handed a layer one tensor
-    # positionally and a different one by keyword would run the mHC pre on states no
-    # sublayer ever saw, and nothing downstream could tell.
+    # (``model_fp8.py::Glm5NextModel.forward``): the keyword is the route selector and
+    # the positional is the one-stream route's operand, which a bound layer refuses to
+    # take. So the keyword set is the carrier's plus that one name, and the two
+    # arguments are required to be the same object -- a stack that handed a layer one
+    # tensor positionally and a different one by keyword would run the mHC pre on
+    # states no sublayer ever saw, and nothing downstream could tell.
     _streams_keyword = "streams"
     for index, carrier in enumerate(carriers):
         got_kwargs = recorded_in[index][2]
@@ -5288,10 +5295,10 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # change is legible: this conjunct used to compare ``hidden + attended`` against the
     # layer's return, which was the one-stream residual add. The layer no longer does
     # that add. It runs its ``hc_attn_*`` site around the same attention half
-    # (``model_fp8.py:6915-6918``), so the composition is now three steps and the
-    # reference follows each: the site's pre collapses the four streams into the single
-    # ``[T, H]`` the half takes, the half runs on THAT tensor, and the site's post mixes
-    # the half's output back across the streams.
+    # (``model_fp8.py::Glm5NextDSALayer.forward``), so the composition is now three
+    # steps and the reference follows each: the site's pre collapses the four streams
+    # into the single ``[T, H]`` the half takes, the half runs on THAT tensor, and the
+    # site's post mixes the half's output back across the streams.
     #
     # WHAT MOVED AND WHAT DID NOT. The attention numerics are still item 5's and are
     # still recomputed here in float32 from the tensor the layer received. The mHC pre
@@ -5361,7 +5368,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         # ---- THE FEED-FORWARD SITE. ``_ffn_half`` is unchanged and is still handed a
         # single ``[T, H]`` stream; what moved is WHERE that stream comes from and where
         # the return goes. The stack collapses the streams through its ``hc_ffn_*`` site,
-        # calls the half, and mixes the return back (``model_fp8.py:7264-7276``), which
+        # calls the half, and mixes the return back (``model_fp8.py::Glm5NextModel.forward``), which
         # is the reference's order here too.
         site = _stack_mhc_site(layer, _impl().MHC_FFN_SITE, f"conjunct 4 layer {index}")
         post_mix, comb_mix, layer_input = _stack_mhc_pre(
@@ -5454,11 +5461,11 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # WHY THE SPLIT, MEASURED RATHER THAN ARGUED. One comparison over both paths is
     # structurally unpassable, and two counted runs proved it. Round 20 read 179 of
     # 65536 cells outside while the reference summed in float32. Round 21 mirrored
-    # the model's cast points -- ``model_fp8.py:6616`` casts the half to the
-    # residual's dtype, ``:6714`` adds in that dtype, ``:6532`` casts the norm's
-    # output -- and still read 751 cells outside, because the reading added with that
-    # fix measured the term left over: ``routed_bank_term`` put the bank's own
-    # recompute at 0.95% of its peak, 1.22 bf16 steps, with 31193 of 65536 cells
+    # the model's cast points -- ``model_fp8.py::Glm5NextModel._ffn_half`` casts the
+    # half to the residual's dtype, ``:6714`` adds in that dtype, ``:6532`` casts the
+    # norm's output -- and still read 751 cells outside, because the reading added
+    # with that fix measured the term left over: ``routed_bank_term`` put the bank's
+    # own recompute at 0.95% of its peak, 1.22 bf16 steps, with 31193 of 65536 cells
     # landing on a different bf16 value after the cast. A 1.22-step term cannot fit a
     # band whose whole allowance is one step, and this file already says where that
     # term belongs. So the band does NOT move and never did; the comparison is split
@@ -5488,9 +5495,9 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # four steps, not two: the last layer's FFN site mixes the product's own half back
     # into the streams, an UNWEIGHTED MEAN collapses the stream axis, the collapse is cast
     # to the embedding table's dtype and the norm runs on that
-    # (``model_fp8.py:7287-7288``, ``reference:302`` and ``:1493``). The mean carries no
-    # learned weight at all -- the target model's own comment says so, and it is why this
-    # step is a mean and not a third mHC site.
+    # (``model_fp8.py::Glm5NextModel.forward``, ``reference:302`` and ``:1493``). The mean
+    # carries no learned weight at all -- the target model's own comment says so, and it
+    # is why this step is a mean and not a third mHC site.
     #
     # THE CASTS ARE THE PRODUCT'S, deliberately, and that is unchanged from what this
     # comparison already did: ``expected`` is built from the PRODUCT's own tensors, so it
@@ -5540,7 +5547,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
           f"|residual_below_one_step={bool(_resid_share < 2.0 ** -7)}"
           f"|mix_gain={float(final_streams.float().abs().max() / max(float(last.float().abs().max()), 1e-30)):.6g}"
           f"|collapse_gain={float(final_input.float().abs().max() / max(float(final_streams.float().abs().max()), 1e-30)):.6g}"
-          f"|note=the site mixes at model_fp8.py:1408-1414 and the mean collapses at :7287; the residual share is a reading the mix no longer decides alone")
+          f"|note=the site mixes at model_fp8.py::Glm5NextHyperConnection.mhc_post and the mean collapses at :7287; the residual share is a reading the mix no longer decides alone")
     _bank_ae = (_half_product.float() - _half_ref.float()).abs()
     _bank_peak = float(_half_ref.abs().max())
     print(f"TINYFWD|routed_bank_term|product_dtype={_half_product.dtype}"
@@ -5630,7 +5637,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # ---- CONTROL C: THE ORDER THE PRODUCT HANDED ITS TWO ACTIVATION TENSORS IN,
     # CERTIFIED BY STRUCTURE AND NOT BY A BAND. ``_ffn_half`` passes the PRE-NORM states
     # first, the normalised tensor second and the norm's gain as ``router_gamma``
-    # (``model_fp8.py:6595-6598``), and that order is this forward's decision; item 4 owns
+    # (``model_fp8.py::Glm5NextModel._ffn_half``), and that order is this forward's decision; item 4 owns
     # what the block does with them. THIS FIXTURE CANNOT SEE THE ORDER THROUGH THE BANK:
     # layer 2's routed half is clamp-saturated here, so every expert's SwiGLU term is
     # constant and the half moves with the affinities alone -- the two readings at the end
@@ -5891,7 +5898,7 @@ def _root_fixture(**overrides) -> dict:
     here too, so the references below are item 6's references.
 
     ``world_size`` IS ASSERTED, not assumed. The root resolves it from the process
-    group (``model_fp8.py:179-182``) and every per-rank width in this fixture is
+    group (``model_fp8.py::_resolve_world_size``) and every per-rank width in this fixture is
     written for one rank, so a distributed session would shard the tree while this
     file's references stayed whole.
     """
@@ -6012,10 +6019,10 @@ def _root_reference(hidden: torch.Tensor, head: torch.Tensor,
 # mHC leaves and the two bound sites per layer arrive with it -- required,        #
 # because the stack passes streams unconditionally and ``_mhc_site`` refuses a    #
 # streams call on a layer that carries none of them                              #
-# (``model_fp8.py:7719-7723``). And the route predicate below declares the two    #
-# mHC seams, two dispatches per layer each. EVERY CONJUNCT IS UNCHANGED: the      #
-# stack still hands the root a ``[T, H]``, so the row selection, the head arm and #
-# the projection see exactly what they saw before.                                #
+# (``model_fp8.py::_mhc_site``). And the route predicate below declares the two   #
+# mHC seams, two dispatches per layer each. EVERY CONJUNCT IS UNCHANGED: the stack#
+# still hands the root a ``[T, H]``, so the row selection, the head arm and the   #
+# projection see exactly what they saw before.                                    #
 #                                                                              #
 # WHAT IT DOES NOT TOUCH. On-device sampling: ``sampling_params``,               #
 # ``logit_mask`` and ``spec_decode_metadata`` are runner keys this tree          #
@@ -6308,16 +6315,18 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # STACK RUNS. No seam may move -- that is what tells a named refusal from a
     # forward that ran a whole stack and then discovered it had no head.
     #
-    # THE HEAD IS BORROWED, NOT SPENT, and putting it back is this control's own
-    # business. Unsetting the parameter is how this control makes the product refuse;
-    # leaving it unset hands every later line of this item a root the product will not
-    # run. ``Glm5NextForConditionalGeneration.forward`` resolves the head in its FIRST
-    # statement (``head = self._head_weight()``, ``model_fp8.py:8746``) and the untied
-    # arm raises there when it is None (``model_fp8.py:8633-8634``), so control E's product
-    # call raised THIS control's ValueError, outside any ``pytest.raises``, instead of
-    # measuring which rows the root selected: item 7 failed on correct code (round 4,
-    # finding F1). The restore runs in a ``finally``, so a control that raises still
-    # leaves the root usable for the controls after it.
+    # THE HEAD IS BORROWED, NOT SPENT, and putting it back is this control's own business.
+    # Unsetting the parameter is how this control makes the product refuse; leaving it
+    # unset hands every later line of this item a root the product will not run.
+    # ``Glm5NextForConditionalGeneration.forward`` resolves the head in its FIRST statement
+    # (``head = self._head_weight()``,
+    # ``model_fp8.py::Glm5NextForConditionalGeneration.forward``) and the untied arm raises
+    # there when it is None
+    # (``model_fp8.py::Glm5NextForConditionalGeneration._head_weight``), so control E's
+    # product call raised THIS control's ValueError, outside any ``pytest.raises``, instead
+    # of measuring which rows the root selected: item 7 failed on correct code (round 4,
+    # finding F1). The restore runs in a ``finally``, so a control that raises still leaves
+    # the root usable for the controls after it.
     _saved_head = root.lm_head_weight
     try:
         root.lm_head_weight = None
@@ -6350,7 +6359,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         raise VacuousControlError(
             "control B did not put root.lm_head_weight back, so every control after "
             "it runs against a root whose head the product refuses by name "
-            "(model_fp8.py:8633-8634)"
+            "(model_fp8.py::Glm5NextForConditionalGeneration._head_weight)"
         )
     if root._head_weight() is not root.lm_head_weight:
         raise VacuousControlError(
@@ -6386,15 +6395,15 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # WHAT STOOD HERE AND WHY IT WAS NOT ENOUGH. R3 replaced a rolled-positions
     # recompute that could not discriminate -- rolling ``(127, 0, 7, 7)`` by one maps
     # position 7 to position 7 and the stack hands the head rows it has already
-    # homogenised, so the recompute landed inside this item's band at a gap of
-    # 0.000313 (``increments/launch-054a-r16-driver-20260909T080034Z.out:330``) -- with
-    # a perturbation planted on the hidden state, which is sized from the band and
-    # cannot be absorbed by row spread. That much is kept. But both tensors it compared
-    # came from ``_root_reference``, so it proved the TEST's reference selects rows by
+    # homogenised, so the recompute landed inside this item's band at a gap of 0.000313
+    # (``increments/launch-054a-r16-driver-20260909T080034Z.out:330``) -- with a
+    # perturbation planted on the hidden state, which is sized from the band and cannot
+    # be absorbed by row spread. That much is kept. But both tensors it compared came
+    # from ``_root_reference``, so it proved the TEST's reference selects rows by
     # position and proved nothing about the product's
     # ``torch.index_select(hidden_states, dim=0, index=sampling_positions)``
-    # (``model_fp8.py:8757``): a forward reading ``positions - 1``, or one constant
-    # position, passed it (round 3, finding F2).
+    # (``model_fp8.py::Glm5NextForConditionalGeneration.forward``): a forward reading
+    # ``positions - 1``, or one constant position, passed it (round 3, finding F2).
     #
     # HOW THE PLANT REACHES THE PRODUCT. ``root.forward`` takes ``input_ids`` and
     # builds the hidden state itself, so there is no argument to plant. The one route
@@ -6426,18 +6435,18 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     #
     # IT ALSO REFUSES TO PLANT INTO A ROOT WHOSE HEAD IS NOT THERE. Every gate below
     # calls the product, and the product resolves the head in its first statement
-    # (``model_fp8.py:8746``), so a control above this one that left ``lm_head_weight``
-    # unset would make this control raise a ValueError about the WEIGHT MAP where the
-    # reader is looking for a row-selection failure -- which is what round 4 found.
-    # Control B borrows the parameter and puts it back in a ``finally``; this is a
-    # guard on that, not a second repair of it, and it is here so this file can never
-    # be red for that reason again without saying so.
+    # (``model_fp8.py::Glm5NextForConditionalGeneration.forward``), so a control above
+    # this one that left ``lm_head_weight`` unset would make this control raise a
+    # ValueError about the WEIGHT MAP where the reader is looking for a row-selection
+    # failure -- which is what round 4 found. Control B borrows the parameter and puts
+    # it back in a ``finally``; this is a guard on that, not a second repair of it, and
+    # it is here so this file can never be red for that reason again without saying so.
     if root.lm_head_weight is None:
         raise VacuousControlError(
             "root.lm_head_weight is None before control E plants anything: control B "
             "unsets it to make the product refuse and must put it back in its "
             "finally. The product would refuse by name here, because "
-            "model_fp8.py:8746 resolves the head before the stack runs, instead of "
+            "model_fp8.py::Glm5NextForConditionalGeneration.forward resolves the head before the stack runs, instead of "
             "selecting the rows this control asks about"
         )
     if root._head_weight() is not root.lm_head_weight:
