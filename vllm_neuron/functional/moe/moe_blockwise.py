@@ -532,6 +532,10 @@ def _can_use_indexed_flatten_kernel(
     if not can_run_kernel(tensor):
         return False
 
+    # T < 16 makes f_len 0 upstream; a routing predicate answers, never divides (-054g).
+    if f_len < 1:
+        return False
+
     # T must be divisible by f_len
     if T % f_len != 0:
         return False
