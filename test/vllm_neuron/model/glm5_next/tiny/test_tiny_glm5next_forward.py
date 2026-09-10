@@ -255,9 +255,16 @@ def _impl():
 #: that changed on a counterexample rather than on taste (``inc-glm53f-054a``,
 #: repair R; ``probe-054a-counter-population-r1``, 21 modules and 24 families read
 #: from the package's own source). ``inc-glm53f-054e`` c6 re-read the same source
-#: with the control's own regex and finds 22 modules and 26 families: the extra two
+#: with the control's own regex and found 22 modules and 26 families: the extra two
 #: are ``inc-glm53f-103``'s causal bound and causal sentinel, and grant 181's run
-#: names them itself (``TINYFWD|counter_population|found=26|claimed=24``). The
+#: names them itself (``TINYFWD|counter_population|found=26|claimed=24``).
+#: ``inc-glm53f-113`` c3 then registered three more in a module already named -- the
+#: MoE gate/up projection, the SwiGLU activation and the down projection -- so the
+#: same regex now finds 22 modules and 29 families. The MODULE count did not move,
+#: because all three live in ``functional/moe/moe_blockwise_fp8``, which a row
+#: already named; the reading that caught them says so
+#: (``probe-113-landed-discovery-controls-r2``: 29 found against 26 claimed before
+#: the rows, 29 against 29 after). The
 #: convention IS ``"reset_" + read`` in twenty-one of the twenty-two modules, and
 #: ``functional/moe/router.py`` breaks it: its
 #: reader is ``noaux_tc_dispatch_counters`` and its reset is
@@ -281,8 +288,12 @@ def _impl():
 #: ``test_dsa_layer.py:380`` discovers the pair by scanning for the
 #: ``_dispatch_counters`` suffix and asserts exactly one pair per module, which is
 #: true of every module below EXCEPT ``mla_sparse`` (three families),
-#: ``kda/chunked_recurrence`` (two) and, since ``inc-glm53f-054e`` c6 registered it,
-#: ``dsa/causal_bound`` (two). That file already knows it: its own
+#: ``kda/chunked_recurrence`` (two), ``dsa/causal_bound`` (two) since
+#: ``inc-glm53f-054e`` c6 registered it, and ``functional/moe/moe_blockwise_fp8``
+#: (three) since ``inc-glm53f-113`` c3 -- three rather than four, because that
+#: module's oldest accessor is ``dispatch_counters`` with NO leading underscore, so
+#: this rule's suffix has never matched it: the list under-counted that module
+#: before c3 as well as after. That file already knows it: its own
 #: ``_causal_bound_apis`` asserts two readers and two resets there and asserts the
 #: single-pair helper REFUSES the module (``test_dsa_layer.py:3665-3692``). The two
 #: coverage controls below keep the naming
@@ -295,6 +306,32 @@ _SEAM_REGISTRY = {
     "blockwise_fp8_moe": (
         "vllm_neuron.functional.moe.moe_blockwise_fp8",
         "dispatch_counters", "reset_dispatch_counters"),
+    # ``inc-glm53f-113`` c3: the three families ``-113a`` and ``-113b`` added to the
+    # module the row above already names -- the gate/up projection, the SwiGLU
+    # activation and the down projection, each an authored NKI limb with its own
+    # seam. The two coverage controls below read the gap themselves at ``-113b``'s
+    # tip: ``found=29`` against ``claimed=26``
+    # (``probe-113-landed-discovery-controls-r1``), which is the same reading that
+    # refused grant 181 with 26 against 24. One row per family, because the three
+    # limbs dispatch separately and one summed pair could not tell which of them
+    # took a torch route.
+    #
+    # ALL THREE READ ``(0, 0)`` IN THIS FILE TODAY, and that is correct rather than
+    # a gap: the block seam ``blockwise_fp8_moe`` still enters the vendor member, so
+    # no forward here reaches a limb. The route predicate collects only seams whose
+    # dispatch count MOVED, so a family at zero joins no item's fired set and adds
+    # nothing to the torch-fallback total. When ``inc-glm53f-113c`` switches the
+    # seam, these rows are what make the switch visible to every item in this file
+    # without one of them being edited.
+    "moe_gate_up": (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "gate_up_dispatch_counters", "reset_gate_up_dispatch_counters"),
+    "moe_swiglu": (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "swiglu_dispatch_counters", "reset_swiglu_dispatch_counters"),
+    "moe_down": (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "down_dispatch_counters", "reset_down_dispatch_counters"),
     "noaux_tc_router": (
         "vllm_neuron.functional.moe.router",
         "noaux_tc_dispatch_counters", "reset_noaux_tc_counters"),
