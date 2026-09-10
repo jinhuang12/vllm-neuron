@@ -8644,15 +8644,23 @@ class Glm5NextForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
-        THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC
-        carrier is ``inc-glm53f-030b``'s. This root returns logits taken from a
-        ONE-stream residual carrier. The reference keeps ``hc_mult`` parallel
-        streams the whole way down and collapses them with an unweighted mean
-        just before the final norm (``modeling_glm5_next.py:1493``, ``:302``), so
-        the tensor this method projects is not the reference's tensor at
-        ``hc_mult`` > 1 -- a declared exclusion, recorded here as well as on
-        :meth:`Glm5NextModel.forward` because this is where a reader arrives
-        first.
+        THE EXCLUSION THAT STOOD HERE IS RETIRED BY ``inc-glm53f-030d``. This note
+        used to say the inter-layer carrier was a one-stream ``[T, H]`` add, that
+        the checkpoint's four-stream mHC carrier was ``inc-glm53f-030b``'s, and
+        that the tensor this method projects was therefore not the reference's at
+        ``hc_mult`` > 1. **All three clauses are now false.**
+        :meth:`Glm5NextModel.forward` expands the embedding across the stream axis
+        (``modeling_glm5_next.py:1477``), mixes each sublayer output back through
+        its mHC site at both per-layer sites, and collapses the streams with an
+        UNWEIGHTED MEAN before the final norm (``reference:302``, ``:1493``). So
+        the ``[T, H]`` this root receives is the post-collapse hidden state the
+        reference projects, and there is no exclusion left to declare.
+
+        What this root itself does with the carrier is still NOTHING, and that is
+        the point: the streams begin and end inside the decoder stack, so the
+        head sees the same shape it always saw. The cross-reference to
+        :meth:`Glm5NextModel.forward` stays because that is where the three steps
+        and their citations live, and this is where a reader arrives first.
 
         THE HEAD IS A PLAIN ``torch`` PROJECTION AND THAT IS THE CHECKPOINT'S OWN
         DECLARATION, not a fallback (P13). ``lm_head`` is one of the nine bare

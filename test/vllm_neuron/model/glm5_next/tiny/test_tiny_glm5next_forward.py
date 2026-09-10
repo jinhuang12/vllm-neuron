@@ -4148,14 +4148,25 @@ def _stack_outside_tolerance(label: str, moved: torch.Tensor,
 # about the loop -- that it holds no per-family branch and hands each layer its #
 # own mapping -- is measured exactly as well by one family as by two.           #
 #                                                                              #
-# THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC    #
-# carrier is ``inc-glm53f-030b``'s. The reference implementation carries        #
-# ``hc_mult`` parallel residual streams between layers and mixes each sublayer  #
-# output back through a hyper-connection at both sites                          #
-# (``modeling_glm5_next.py:1477``, ``:1316-1318``, ``:1325-1327``, ``:1493``,   #
-# ``:302``). This item certifies the ONE-STREAM add and nothing about the       #
-# four-stream carrier; at ``hc_mult`` 1 the reference does not degenerate to an #
-# add either, because its gates are sigmoids plus an epsilon.                    #
+# THE ONE-STREAM EXCLUSION THAT STOOD HERE IS RETIRED, AND THIS ITEM IS BEING  #
+# RE-POINTED. It used to say the inter-layer carrier was a ``[T, H]`` add and   #
+# that the checkpoint's 4-stream mHC carrier was ``inc-glm53f-030b``'s.         #
+# ``inc-glm53f-030d`` part (a) built that carrier in                            #
+# ``Glm5NextModel.forward``: the embedding is expanded across the stream axis   #
+# (``modeling_glm5_next.py:1477``), both per-layer sites mix                    #
+# (``:1316-1318``, ``:1325-1327``) and an unweighted mean collapses the streams #
+# before the final norm (``:1493``, ``:302``).                                  #
+#                                                                              #
+# SO THE PER-LAYER ADD THIS ITEM READS THROUGH ITS HOOKS IS FALSE BY            #
+# CONSTRUCTION, and saying so is the honest state of this file rather than a    #
+# claim that the body already changed. The stack passes streams unconditionally #
+# and ``_mhc_site`` REFUSES a streams call on a layer carrying none of the six  #
+# mHC leaves (``model_fp8.py:7578-7582``), which this fixture does not load, so #
+# this item cannot run against the carrier until its fixture loads those        #
+# leaves, binds the sites, and its conjuncts compare the mixes instead of the   #
+# adds. That is the re-point ruled at §943 Q5 and it is the NEXT commit's, not  #
+# this one's; the plan carries it as this block's own work rather than a        #
+# deletion.                                                                     #
 # --------------------------------------------------------------------------- #
 def _row_spread_stats(rows: "torch.Tensor") -> tuple:
     """Relative L2 spread over every pair of rows: ``(rows, max, min, median)``.
@@ -5274,14 +5285,21 @@ def _root_reference(hidden: torch.Tensor, head: torch.Tensor,
 # is the sharp test for "reads the table itself rather than a copy", and a second #
 # 3-layer forward is not spent to re-measure shared code.                        #
 #                                                                              #
-# THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC     #
-# carrier is ``inc-glm53f-030b``'s. The logits this item compares are taken from #
-# a ONE-stream residual carrier. The reference keeps ``hc_mult`` parallel        #
-# streams and collapses them with an unweighted mean before the final norm       #
-# (``modeling_glm5_next.py:1493``, ``:302``), so at ``hc_mult`` > 1 the tensor    #
-# projected here is not the reference's tensor; that is a declared exclusion and #
-# not an approximation, and at ``hc_mult`` 1 the reference does not degenerate   #
-# to an add either.                                                              #
+# THE ONE-STREAM EXCLUSION THAT STOOD HERE IS RETIRED, AND THIS ITEM IS BEING    #
+# RE-POINTED, on the same terms as the model-forward item above. It used to say   #
+# the logits came from a one-stream carrier and that the four-stream carrier was  #
+# ``inc-glm53f-030b``'s; ``inc-glm53f-030d`` part (a) built that carrier in       #
+# ``Glm5NextModel.forward``, which now collapses the streams with an unweighted   #
+# mean before the final norm (``modeling_glm5_next.py:1493``, ``:302``). The      #
+# ``[T, H]`` the root projects is therefore the reference's own post-collapse     #
+# tensor and the exclusion has nothing left to exclude.                           #
+#                                                                              #
+# THIS ITEM STILL CANNOT RUN AGAINST THAT CARRIER until its fixture loads the six #
+# mHC leaves per layer and binds the sites, because the stack passes streams      #
+# unconditionally and ``_mhc_site`` refuses a streams call on a layer that        #
+# carries none of them (``model_fp8.py:7578-7582``). That re-point is the NEXT    #
+# commit's (ruled §943 Q5, never a deletion); this comment states the true        #
+# state of the file rather than a change that has not happened yet.               #
 #                                                                              #
 # WHAT IT DOES NOT TOUCH. On-device sampling: ``sampling_params``,               #
 # ``logit_mask`` and ``spec_decode_metadata`` are runner keys this tree          #
