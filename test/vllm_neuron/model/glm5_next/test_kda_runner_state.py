@@ -210,6 +210,10 @@ def _runner(text_config, banks) -> NeuronModelRunner:
     something new would raise here instead of quietly finding a stand-in value.
     """
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = SimpleNamespace(
         text_config=text_config, glm5next_layer_banks=banks
     )

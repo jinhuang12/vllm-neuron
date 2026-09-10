@@ -315,3 +315,150 @@ def _two_request_decode(runner, banks):
         f"the converter returned {sorted(converted)}"
     )
     return converted["layer_carriers"]
+
+
+def _linear_banks(banks) -> list[dict]:
+    """The recurrent banks, which are the ones a state slot indexes."""
+    return [bank for bank in banks if bank["family"] != "self_attn"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A1 (slot half). Two requests never share a state slot.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a1_two_requests_are_assigned_distinct_state_slots() -> None:
+    """The slot is the request's identity, not the block table's first block id.
+
+    THIS IS THE SLOT HALF OF A1. The carrier-view half needs the per-request
+    carrier container, which arrives with this increment's model-side sliver after
+    the sibling increment's fold; this item asserts what the runner alone decides.
+
+    THE TRIPWIRE: a table that hands both requests one slot. The assertion is that
+    the two slots DIFFER, so such a table fails here rather than downstream where
+    one request's recurrence would silently continue the other's.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    request_ids = list(runner.input_batch.req_ids)
+    assert len(request_ids) == DECLARED_REQUESTS, (
+        f"this item needs {DECLARED_REQUESTS} requests to have a collision to rule "
+        f"out; the harness offered {len(request_ids)}"
+    )
+
+    slots = runner._glm5next_request_slots(banks, request_ids, synthetic=False)
+
+    print(f"KEYED|a1|requests={request_ids}|slots={slots}")
+    assert len(slots) == len(request_ids)
+    assert len(set(slots)) == len(slots), (
+        f"the two requests were handed slots {slots}; two live requests sharing a "
+        f"slot means one continues the other's recurrence"
+    )
+    for slot in slots:
+        assert 0 <= slot < DECLARED_STATE_SLOTS, (
+            f"slot {slot} is outside the {DECLARED_STATE_SLOTS}-slot bank"
+        )
+    # The mapping is STABLE: asking again inside one request's life returns the
+    # same slots, because a slot that moved would abandon the state it holds.
+    again = runner._glm5next_request_slots(banks, request_ids, synthetic=False)
+    assert again == slots, f"the slots moved from {slots} to {again} within one life"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A2. A finished request's slot is freed, and its next owner gets it zeroed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
+    """Freed, reused, and ZEROED at the moment ownership changes.
+
+    THE TWO TRIPWIRES, BOTH ASSERTED RATHER THAN DESCRIBED. A table that never
+    frees cannot seat the later request at all, so the reuse assertion fails on a
+    raised refusal. A table that frees WITHOUT zeroing hands the new owner the last
+    one's recurrence, which the zero read fails on -- and the read is only
+    meaningful because this item dirties the rows first, which it asserts it did.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    first = ["req-0"]
+
+    seated = runner._glm5next_request_slots(banks, first, synthetic=False)
+    slot = seated[0]
+
+    # DIRTY THE SLOT, and prove it is dirty. Without this the zero read below
+    # would pass against a slot that was never written.
+    for bank in _linear_banks(banks):
+        bank["conv_state"][slot].fill_(3.0)
+        bank["recurrent_state"][slot].fill_(-2.0)
+    dirtied = [
+        bool(bank["conv_state"][slot].any()) and bool(bank["recurrent_state"][slot].any())
+        for bank in _linear_banks(banks)
+    ]
+    print(f"KEYED|a2|slot={slot}|dirtied={dirtied}")
+    if not all(dirtied):
+        raise VacuousControlError(
+            "this item needs the freed slot to hold non-zero state before hand-out, "
+            f"and the banks read {dirtied}"
+        )
+
+    # A LATER BATCH WITHOUT req-0 IS req-0 FINISHING. Nothing else is told.
+    later = runner._glm5next_request_slots(banks, ["req-2"], synthetic=False)
+
+    print(f"KEYED|a2|reused={later}|freed_slot={slot}")
+    assert later == [slot], (
+        f"the finished request's slot {slot} was not handed to the next request, "
+        f"which got {later}; a table that never frees leaks its slots"
+    )
+    for bank in _linear_banks(banks):
+        assert not bank["conv_state"][slot].any(), (
+            f"bank {bank['name']}'s conv state at slot {slot} still holds the "
+            f"previous request's values on hand-out"
+        )
+        assert not bank["recurrent_state"][slot].any(), (
+            f"bank {bank['name']}'s recurrent state at slot {slot} still holds the "
+            f"previous request's values on hand-out"
+        )
+
+
+def test_a2_more_live_requests_than_slots_refuses_by_name() -> None:
+    """The bank is a fixed size, so an over-admission refuses instead of colliding.
+
+    Called at the helper rather than through the converter on purpose: the
+    converter still refuses a multi-row block table at this stage of the
+    increment, so the over-admission case is only reachable here. The refusal is
+    matched on its own message, not on the exception type alone.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    too_many = [f"req-{index}" for index in range(DECLARED_STATE_SLOTS + 1)]
+
+    print(f"KEYED|a2|requested={len(too_many)}|slots={DECLARED_STATE_SLOTS}")
+    with pytest.raises(ValueError, match="has no free slot"):
+        runner._glm5next_request_slots(banks, too_many, synthetic=False)
+
+
+def test_a2_a_synthetic_step_takes_no_claim() -> None:
+    """Warmup is served without an identity and leaves the table untouched.
+
+    THE TRIPWIRE: a synthetic step that seated itself would evict a live request
+    on a busy bank, so this asserts the table is byte-identical across it AND that
+    the step was still served with a usable slot.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    runner._glm5next_request_slots(banks, ["req-0"], synthetic=False)
+    before = dict(runner._glm5next_request_slot_table)
+
+    served = runner._glm5next_request_slots(banks, [None], synthetic=True)
+
+    after = dict(runner._glm5next_request_slot_table)
+    print(f"KEYED|a2|synthetic_served={served}|table_before={before}|after={after}")
+    assert served == [0], f"a synthetic step was served slots {served}"
+    assert after == before, (
+        f"a synthetic step changed the slot table from {before} to {after}; warmup "
+        f"is not a sequence step and must take no claim"
+    )

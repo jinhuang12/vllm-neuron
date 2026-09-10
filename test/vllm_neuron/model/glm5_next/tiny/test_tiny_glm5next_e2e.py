@@ -47,6 +47,7 @@ from __future__ import annotations
 import inspect
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -936,6 +937,10 @@ def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
     root.bind_kv_cache(caches)
 
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
 
@@ -1088,6 +1093,10 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
         )
 
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
     tokens = GENERATED_TOKENS
@@ -1112,14 +1121,30 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
             )
             assert int(carrier["latent_cache"].shape[0]) == len(sparse_row) * page
         else:
-            print(f"TINYE2E|group_slice|{index}|recurrent|state_slot={state_slot}")
+            # RE-PINNED (D17.1). ORIGINAL READING, kept beside the new one so the
+            # change is legible: this asserted the carrier was a view of
+            # `bank[...][state_slot]` where `state_slot = E2E_STATE_SLOTS - 1` was
+            # the recurrent group's own block-table row value, because the
+            # converter read the slot as that row's FIRST BLOCK ID. NEW VALUE: the
+            # slot is the one the runner's request-keyed table assigned, read off
+            # the table rather than restated, so the block number and the slot are
+            # no longer the same number by construction.
+            #
+            # THE ITEM'S PURPOSE IS UNCHANGED and does not rest on this half: the
+            # per-group reading is still measured by the sparse arm above and by
+            # this item's own single-table control below, and the recurrent group's
+            # own entry is still what reaches this carrier -- the `state_cached=1`
+            # arm further down refuses precisely because that entry is read.
+            assigned = runner._glm5next_request_slot_table["req-0"]
+            print(f"TINYE2E|group_slice|{index}|recurrent|assigned_slot={assigned}"
+                  f"|group_row={state_slot}")
             assert (carrier["conv_state"].data_ptr()
-                    == bank["conv_state"][state_slot].data_ptr()), (
-                f"layer {index} is recurrent and its conv state is not the slot its own "
-                f"group's table names"
+                    == bank["conv_state"][assigned].data_ptr()), (
+                f"layer {index} is recurrent and its conv state is not the slot the "
+                f"runner's request table assigned"
             )
             assert (carrier["recurrent_state"].data_ptr()
-                    == bank["recurrent_state"][state_slot].data_ptr())
+                    == bank["recurrent_state"][assigned].data_ptr())
 
     # ---- A layer with no entry of its own refuses by name rather than borrowing one.
     short = dict(grouped)
@@ -1193,6 +1218,10 @@ def test_the_converter_does_not_hand_the_root_a_kv_page_as_its_quant_block():
     caches = _runner_shaped_caches(root)
     root.bind_kv_cache(caches)
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
 
@@ -1273,6 +1302,10 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     root.bind_kv_cache(caches)
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
 
@@ -1533,6 +1566,10 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     banks = root.glm5next_layer_banks
     pool = int(root.text_config.index_kpool)
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
 
@@ -1808,6 +1845,10 @@ def test_the_indexer_refuses_a_prefill_ring_handed_to_a_decode_step():
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
     indexer = _sparse_indexer(layers)
@@ -1883,6 +1924,10 @@ def test_the_indexer_refuses_a_prefill_ring_with_no_end_position():
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
     indexer = _sparse_indexer(layers)
@@ -1960,6 +2005,10 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
     prompt = int(item.STACK_TOKENS)
@@ -2118,6 +2167,10 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
     root = _fixture()["root"]
     root.bind_kv_cache(_runner_shaped_caches(root))
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
     prompt = int(item.STACK_TOKENS)
@@ -2183,6 +2236,10 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
 

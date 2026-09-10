@@ -4896,6 +4896,121 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._glm5next_side_cache_cursor = None
         return live
 
+    def _glm5next_request_identities(self, *, synthetic: bool) -> list:
+        """The requests this step serves, in the batch order the tables use.
+
+        THE IDENTITY IS THE ENGINE'S OWN AND IS NOT DERIVED HERE. ``req_ids`` is
+        batch-ordered (``:1126``) and the block table's row ``i`` is appended by
+        the same request index (``:2108``), so identity and paging come from one
+        ordering and cannot fall out of step.
+
+        WHY THIS IS ONE METHOD. It is the only place the identity's SOURCE is
+        named, so a change of source is a change here and nowhere else; the slot
+        table below takes whatever this returns and never asks what it is.
+
+        A SYNTHETIC STEP HAS NO REQUEST. Warmup and the idle data-parallel dummy
+        step are not sequence steps, so they are served without an identity rather
+        than borrowing a live request's; the caller passes them through with no
+        claim taken.
+
+        A MISSING BATCH ON A REAL STEP REFUSES BY NAME. Serving a real step with no
+        identity is what the block-id slot did, and it is the defect this method
+        exists to close, so it raises instead of inventing one.
+        """
+        if synthetic:
+            return [None]
+        batch = getattr(self, "input_batch", None)
+        request_ids = list(getattr(batch, "req_ids", None) or ())
+        if not request_ids:
+            raise ValueError(
+                "a GLM-5.3-Flash step needs the engine's request ids to key its "
+                "per-request cache state, and this runner's input batch carries "
+                "none; a real step served without an identity would read whichever "
+                "state the last request left"
+            )
+        return request_ids
+
+    def _glm5next_state_slot_count(self, banks) -> int:
+        """How many recurrent state slots this stack holds, refusing a disagreement.
+
+        Every linear layer's bank was allocated with the same leading slot
+        dimension, because one request's states across the stack live at one slot
+        number. A stack whose banks disagree has no single slot to hand a request,
+        so it refuses here rather than handing different layers different slots.
+        """
+        counts = {
+            int(bank["state_slots"])
+            for bank in banks
+            if bank["family"] != "self_attn"
+        }
+        if not counts:
+            return 0
+        if len(counts) != 1:
+            raise ValueError(
+                f"the recurrent banks of one stack report {sorted(counts)} state "
+                f"slot(s); a request's states across the stack live at one slot "
+                f"number, so a disagreement has no slot to hand it"
+            )
+        return counts.pop()
+
+    def _glm5next_request_slots(self, banks, request_ids, *, synthetic: bool):
+        """One recurrent-state slot per request, keyed by the request's own id.
+
+        WHY THE SLOT IS NOT READ OFF THE BLOCK TABLE ANY MORE. It used to be the
+        row's FIRST BLOCK ID, which is a paging artefact and not a request
+        identity: two requests are two rows of one table, and nothing about a
+        block number says whose state it holds. This table is the identity, so a
+        step is served from the slot its own request owns or from no slot at all.
+
+        ALLOCATION ZEROES, AND THAT IS THE POINT rather than tidiness. The banks
+        live for the process, so a freed slot still holds the last owner's
+        recurrence. Its next owner would continue a sequence it never ran. Zeroing
+        on hand-out is what a fresh sequence means, and it happens here -- at the
+        moment ownership changes -- rather than on release, where a crash between
+        the two would leave a dirty slot looking clean.
+
+        A FINISHED REQUEST IS ONE THAT STOPPED APPEARING. The engine hands this
+        runner the batch it scheduled and nothing else, so a request absent from
+        it is done and its slot returns to the pool. That derivation needs no
+        second bookkeeping to fall out of step with the batch.
+
+        A SYNTHETIC STEP TAKES NO CLAIM. Warmup and the idle data-parallel dummy
+        step reach this converter too, and they are not sequence steps: they are
+        served from slot 0 with the table neither read nor written, so a warmup
+        between two real steps of one sequence cannot evict it.
+        """
+        slots = self._glm5next_state_slot_count(banks)
+        if synthetic:
+            return [0 for _ in request_ids]
+        table = getattr(self, "_glm5next_request_slot_table", None)
+        if table is None:
+            table = {}
+            self._glm5next_request_slot_table = table
+        live = set(request_ids)
+        for finished in [key for key in table if key not in live]:
+            del table[finished]
+        for request_id in request_ids:
+            if request_id in table:
+                continue
+            taken = set(table.values())
+            free = next(
+                (slot for slot in range(slots) if slot not in taken), None
+            )
+            if free is None:
+                raise ValueError(
+                    f"this stack holds {slots} recurrent state slot(s) and all of "
+                    f"them are owned by live requests, so request "
+                    f"{request_id!r} has no free slot; the engine admitted more "
+                    f"concurrent requests than the cache was allocated for"
+                )
+            for bank in banks:
+                if bank["family"] == "self_attn":
+                    continue
+                bank["conv_state"][free].zero_()
+                bank["recurrent_state"][free].zero_()
+            table[request_id] = free
+        return [table[request_id] for request_id in request_ids]
+
     @classmethod
     def _glm5next_layer_carriers(
         cls,
@@ -5148,7 +5263,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             geometries.append(
                 {
                     "block_ids": [int(value) for value in row[:blocks_used]],
-                    "state_slot": int(row[0]),
                     "page_size": block_size,
                 }
             )
@@ -5192,6 +5306,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # `is_prefill`, so a one-token prompt never cleared the ring either -- so this
         # rule preserves the existing behaviour instead of introducing it.
         synthetic_step = not is_prefill and int(start_position) == 0
+        # THE STATE SLOT IS THE REQUEST'S, AND IT IS SETTLED HERE rather than in the
+        # walk above, because a synthetic step must take no claim and whether this
+        # step is synthetic is only known once the leg and the position are read.
+        # The slot used to be the block table's FIRST BLOCK ID, which is a paging
+        # artefact: it forced the bank to be as large as the block space and said
+        # nothing about whose state a row held.
+        request_ids = self._glm5next_request_identities(synthetic=synthetic_step)
+        state_slots = self._glm5next_request_slots(
+            banks, request_ids, synthetic=synthetic_step
+        )
+        # ONE SEQUENCE STILL, so one slot serves every bank's geometry. The
+        # per-request geometry walk arrives with the refusals this half retires.
+        for geometry in geometries:
+            geometry["state_slot"] = int(state_slots[0])
         if is_prefill and int(start_position) == 0:
             # A FRESH SEQUENCE MUST NOT INHERIT THE LAST ONE'S PARTIAL POOL. The
             # side caches live for the process (`_glm5next_live_side_caches`), so
