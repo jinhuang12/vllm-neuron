@@ -743,10 +743,17 @@ def test_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
     )
 
 
+#: ``rows_over_max`` WAS the first case here, expecting
+#: ``exceeds PARTITION_MAX={PARTITION_MAX}`` at ``PARTITION_MAX + 1``. It was
+#: retargeted by `inc-glm53f-029b`, which tiles the token axis inside the kernel:
+#: that extent is now ADMITTED, so the refusal it asserted would be a false
+#: refusal. The admission is asserted instead, by name, in
+#: :func:`test_admits_the_extent_the_old_ceiling_refused` below. Every remaining
+#: case here is a rank or extent MISMATCH between arguments, which tiling does not
+#: touch.
 @pytest.mark.parametrize(
     ("mutate", "needle"),
     [
-        ("rows_over_max", f"exceeds PARTITION_MAX={PARTITION_MAX}"),
         ("x_rows", "expected [T, H]"),
         ("x_hidden", "expected [T, H]"),
         ("x_rank", "x must be 2-D [T, H]"),
@@ -765,11 +772,7 @@ def test_refuses_inadmissible_geometry_by_name(mutate: str, needle: str) -> None
     "tensor `unnamed`", or a raw broadcast failure.
     """
     x, residual, post_layer_mix, comb_res_mix = _inputs(rows=8, hidden=32)
-    if mutate == "rows_over_max":
-        x, residual, post_layer_mix, comb_res_mix = _inputs(
-            rows=PARTITION_MAX + 1, hidden=8
-        )
-    elif mutate == "x_rows":
+    if mutate == "x_rows":
         x = x[:-1]
     elif mutate == "x_hidden":
         x = x[:, :-1]
@@ -788,17 +791,79 @@ def test_refuses_inadmissible_geometry_by_name(mutate: str, needle: str) -> None
     assert needle in message, f"[{mutate}] message was: {message}"
 
 
-def test_seam_refuses_before_the_kernel_traps() -> None:
-    """The seam refuses on the same shapes, not just the gate helper.
+def test_admits_the_extent_the_old_ceiling_refused() -> None:
+    """``PARTITION_MAX + 1`` tokens are ADMITTED, and the numbers are right.
 
-    ``can_run_hyper_connection`` is what the refusal tests above drive directly.
-    This measures that the SEAM reaches that check before it reaches the kernel,
-    so a caller gets the named error rather than the NKI trap.
+    RETARGETED by `inc-glm53f-029b`. This was the ``rows_over_max`` case of
+    :func:`test_refuses_inadmissible_geometry_by_name`, which asserted the gate
+    helper refused this extent by name. The kernel now walks the token axis in
+    tiles of ``nl.tile_size.pmax``, so the extent is served and the refusal it
+    asserted would be false.
+
+    Admission alone would be satisfied by a gate that stopped checking, so the
+    kernel is also RUN at the extent and its output compared against the
+    reference. The reference is :func:`_oracle_authored_here`, the base's second
+    (``bmm``) spelling, at the SAME registered pair the tolerance case uses -- no
+    new tolerance. The untiled NKI body cannot be the reference at this extent
+    because it traps here by measurement; that comparison lives at ``T = 5`` and
+    ``T = 128`` in ``test_hyper_connection_029b.py``, where the untiled body runs.
     """
-    x, residual, post_layer_mix, comb_res_mix = _inputs(
-        rows=PARTITION_MAX + 1, hidden=8
+    rows = PARTITION_MAX + 1
+    x, residual, post_layer_mix, comb_res_mix = _inputs(rows=rows, hidden=8)
+
+    admitted = can_run_hyper_connection(x, residual, post_layer_mix, comb_res_mix)
+    print(
+        f"[admits-over-old-ceiling] rows={rows} PARTITION_MAX={PARTITION_MAX} "
+        f"tiles={-(-rows // PARTITION_MAX)} last_tile_rows={rows % PARTITION_MAX} "
+        f"gate_admitted={admitted}"
     )
-    with pytest.raises(HyperConnectionError) as excinfo:
-        hyper_connection_combine(x, residual, post_layer_mix, comb_res_mix)
-    assert f"exceeds PARTITION_MAX={PARTITION_MAX}" in str(excinfo.value)
-    print(f"[seam-refusal] {str(excinfo.value)[:140]!r}")
+    assert rows > PARTITION_MAX, rows
+    assert admitted is True, (
+        f"the gate refused {rows} tokens, but -029b tiles the token axis, so this "
+        f"extent is served"
+    )
+
+    reset_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = hyper_connection_combine(x, residual, post_layer_mix, comb_res_mix)
+    _assert_route(sim, 1, "admits-over-old-ceiling")
+
+    want = _oracle_authored_here(x, residual, post_layer_mix, comb_res_mix)
+    max_abs, max_rel = _errors(got, want)
+    print(
+        f"[admits-over-old-ceiling] max_abs_error={max_abs:.6e} "
+        f"max_rel_error={max_rel:.6e} rtol={RTOL} atol={ATOL} "
+        f"want_absmax={float(want.abs().max()):.6e}"
+    )
+    if float(want.abs().max()) == 0.0:
+        raise VacuousControlError("the reference is all zero at this extent")
+    assert tuple(got.shape) == (rows, S, 8), tuple(got.shape)
+    torch.testing.assert_close(got.to(torch.float32), want, rtol=RTOL, atol=ATOL)
+
+
+def test_seam_admits_over_the_old_ceiling_and_the_kernel_does_not_trap() -> None:
+    """The SEAM serves the same extent, not just the gate helper.
+
+    RETARGETED by `inc-glm53f-029b`; this was
+    ``test_seam_refuses_before_the_kernel_traps``. The measurement shape is kept:
+    it still reads whether the seam consults the gate BEFORE it reaches the
+    kernel. What changed is the answer the gate gives at this extent, so the
+    reading is now "admitted, then dispatched" rather than "refused before the
+    trap".
+
+    The ORDERING is read off the counter rather than asserted in prose:
+    ``nki_dispatch == 1`` can only be reached through
+    ``can_run_hyper_connection`` returning True, and ``torch_fallback == 0`` says
+    the gate did not route away. So one dispatch is evidence the gate ran,
+    admitted, and only then the kernel ran -- and the caller got neither the named
+    refusal nor the raw NKI partition trap.
+    """
+    rows = PARTITION_MAX + 1
+    x, residual, post_layer_mix, comb_res_mix = _inputs(rows=rows, hidden=8)
+
+    reset_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = hyper_connection_combine(x, residual, post_layer_mix, comb_res_mix)
+    reading = _assert_route(sim, 1, "seam-admits")
+    print(f"[seam-admits] rows={rows} out_shape={tuple(got.shape)} {reading}")
+    assert tuple(got.shape) == (rows, S, 8), tuple(got.shape)
