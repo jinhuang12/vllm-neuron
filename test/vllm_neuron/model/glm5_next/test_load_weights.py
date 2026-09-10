@@ -4574,7 +4574,7 @@ DEFERRED_NARROW = 256
 #: whose subject is the pad passes this width, and it passes it to the checkpoint AND
 #: to every load so both sides describe one model. ``intermediate_size`` reaches
 #: exactly one module in the package, ``Glm5NextDenseMLP``
-#: (``model_fp8.py:3484``), so this width moves the dense three and nothing else --
+#: (``model_fp8.py:3564``), so this width moves the dense three and nothing else --
 #: the shared expert takes ``moe_intermediate_size`` (``config.py:223``) and the bank
 #: its own width.
 PAD_DENSE_INTERMEDIATE = 256

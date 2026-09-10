@@ -5821,8 +5821,8 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # business. Unsetting the parameter is how this control makes the product refuse;
     # leaving it unset hands every later line of this item a root the product will not
     # run. ``Glm5NextForConditionalGeneration.forward`` resolves the head in its FIRST
-    # statement (``head = self._head_weight()``, ``model_fp8.py:7907``) and the untied
-    # arm raises there when it is None (``model_fp8.py:7795``), so control E's product
+    # statement (``head = self._head_weight()``, ``model_fp8.py:8746``) and the untied
+    # arm raises there when it is None (``model_fp8.py:8633-8634``), so control E's product
     # call raised THIS control's ValueError, outside any ``pytest.raises``, instead of
     # measuring which rows the root selected: item 7 failed on correct code (round 4,
     # finding F1). The restore runs in a ``finally``, so a control that raises still
@@ -5902,7 +5902,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # came from ``_root_reference``, so it proved the TEST's reference selects rows by
     # position and proved nothing about the product's
     # ``torch.index_select(hidden_states, dim=0, index=sampling_positions)``
-    # (``model_fp8.py:7918``): a forward reading ``positions - 1``, or one constant
+    # (``model_fp8.py:8757``): a forward reading ``positions - 1``, or one constant
     # position, passed it (round 3, finding F2).
     #
     # HOW THE PLANT REACHES THE PRODUCT. ``root.forward`` takes ``input_ids`` and
@@ -5935,7 +5935,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     #
     # IT ALSO REFUSES TO PLANT INTO A ROOT WHOSE HEAD IS NOT THERE. Every gate below
     # calls the product, and the product resolves the head in its first statement
-    # (``model_fp8.py:7907``), so a control above this one that left ``lm_head_weight``
+    # (``model_fp8.py:8746``), so a control above this one that left ``lm_head_weight``
     # unset would make this control raise a ValueError about the WEIGHT MAP where the
     # reader is looking for a row-selection failure -- which is what round 4 found.
     # Control B borrows the parameter and puts it back in a ``finally``; this is a
