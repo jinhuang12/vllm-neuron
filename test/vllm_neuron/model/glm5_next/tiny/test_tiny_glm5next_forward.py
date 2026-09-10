@@ -294,6 +294,32 @@ _SEAM_REGISTRY = {
     "blockwise_fp8_moe": (
         "vllm_neuron.functional.moe.moe_blockwise_fp8",
         "dispatch_counters", "reset_dispatch_counters"),
+    # ``inc-glm53f-113`` c3: the three families ``-113a`` and ``-113b`` added to the
+    # module the row above already names -- the gate/up projection, the SwiGLU
+    # activation and the down projection, each an authored NKI limb with its own
+    # seam. The two coverage controls below read the gap themselves at ``-113b``'s
+    # tip: ``found=29`` against ``claimed=26``
+    # (``probe-113-landed-discovery-controls-r1``), which is the same reading that
+    # refused grant 181 with 26 against 24. One row per family, because the three
+    # limbs dispatch separately and one summed pair could not tell which of them
+    # took a torch route.
+    #
+    # ALL THREE READ ``(0, 0)`` IN THIS FILE TODAY, and that is correct rather than
+    # a gap: the block seam ``blockwise_fp8_moe`` still enters the vendor member, so
+    # no forward here reaches a limb. The route predicate collects only seams whose
+    # dispatch count MOVED, so a family at zero joins no item's fired set and adds
+    # nothing to the torch-fallback total. When ``inc-glm53f-113c`` switches the
+    # seam, these rows are what make the switch visible to every item in this file
+    # without one of them being edited.
+    "moe_gate_up": (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "gate_up_dispatch_counters", "reset_gate_up_dispatch_counters"),
+    "moe_swiglu": (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "swiglu_dispatch_counters", "reset_swiglu_dispatch_counters"),
+    "moe_down": (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "down_dispatch_counters", "reset_down_dispatch_counters"),
     "noaux_tc_router": (
         "vllm_neuron.functional.moe.router",
         "noaux_tc_dispatch_counters", "reset_noaux_tc_counters"),
