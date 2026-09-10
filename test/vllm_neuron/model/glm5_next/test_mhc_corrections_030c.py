@@ -564,6 +564,81 @@ WRONG_RMS_EPS = 1.0
 RMS_CONTROL_FLOOR_STEPS = 16.0
 
 
+def _predicted_control_deltas(
+    layer,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    eps_wrong: float,
+) -> dict[str, float]:
+    """Predicted ``|delta|`` per return under the epsilon swap, from THIS layer's own draw.
+
+    WHY A PREDICTION AND NOT JUST A FLOOR. The control below needs the swap to
+    arrive at every return. How far it arrives depends on ``hc_scale``, which the
+    fixture DRAWS: the gates multiply ``mixes`` by ``hc_scale`` before the sigmoid,
+    so a draw an order of magnitude smaller would attenuate the signal below one
+    fp32 step and the control would go red on correct code. That is the same defect
+    the arm above was rewritten to remove, and a floor alone does not catch it. So
+    the reachability is computed from the layer's own numbers first, and an
+    unreachable control REFUSES by name instead of failing.
+
+    THE CHAIN, differentiated once and evaluated on the real values rather than
+    bounded by magnitudes:
+
+    * the RMS scale's own relative change is exact, not first-order --
+      ``1 - sqrt((ms + eps_real) / (ms + eps_wrong))`` -- and it multiplies every
+      entry of ``mixes`` for that token, because it is one scalar per token;
+    * a sigmoid gate carries it through as ``sigma * (1 - sigma)`` times the change
+      in its pre-activation, which is ``|mixes * hc_scale|`` times that relative
+      change;
+    * ``post_mix`` then multiplies by the layer's own ``post_mult_value``;
+    * ``layer_input`` sums ``hc_mult`` gated streams against the residual, so the
+      prediction sums ``|delta_pre| * |residual|`` -- the worst case where the
+      terms align, which makes this an upper estimate for that return;
+    * ``comb_mix``'s prediction stops at the SOFTMAX, where
+      ``delta_p_j = p_j * (delta_a_j - sum_k p_k delta_a_k)``. The Sinkhorn seam
+      runs after it and is a kernel this function does not model, so treat the comb
+      number as a reachability proxy rather than a forecast.
+
+    The formulas are checked against the control's own measurement: on the landed
+    fixture the ``post_mix`` prediction and measurement agree to the step, and
+    ``layer_input``'s runs about 9 percent high, which is the alignment bound.
+    """
+    tokens = residual.shape[0]
+    flat = residual.flatten(start_dim=1).to(torch.float32)
+    mean_square = flat.square().mean(dim=-1, keepdim=True)
+    eps_real = float(layer.rms_eps)
+    shrink = 1.0 - torch.sqrt((mean_square + eps_real) / (mean_square + eps_wrong))
+    mixes = (flat @ fn.to(torch.float32).t()) * torch.rsqrt(mean_square + eps_real)
+    scale = hc_scale.to(torch.float32)
+    base = hc_base.to(torch.float32)
+
+    def gate_delta(block: torch.Tensor, gate_scale: torch.Tensor, gate_base: torch.Tensor):
+        gate = torch.sigmoid(block * gate_scale + gate_base)
+        return gate * (1.0 - gate) * (block * gate_scale).abs() * shrink
+
+    pre_block, post_block = mixes[:, :S], mixes[:, S : 2 * S]
+    comb_block = mixes[:, 2 * S :].reshape(tokens, S, S)
+
+    delta_pre = gate_delta(pre_block, scale[0], base[:S])
+    delta_post = gate_delta(post_block, scale[1], base[S : 2 * S]) * float(
+        layer.post_mult_value
+    )
+    delta_input = (delta_pre.unsqueeze(-1) * residual.to(torch.float32).abs()).sum(dim=1)
+
+    probs = torch.softmax(comb_block * scale[2] + base[2 * S :].reshape(1, S, S), dim=-1)
+    delta_logit = (comb_block * scale[2]).abs() * shrink.unsqueeze(-1)
+    delta_comb = probs * (
+        delta_logit + (probs * delta_logit).sum(dim=-1, keepdim=True)
+    )
+    return {
+        "post_mix": float(delta_post.max()),
+        "comb_mix": float(delta_comb.max()),
+        "layer_input": float(delta_input.max()),
+    }
+
+
 def test_030c_control_a_wrong_rms_epsilon_moves_every_return() -> None:
     """CONTROL for COUNTED VALUE 2, site 1: ``mhc_pre``'s OWN CODE reads ``rms_eps``.
 
@@ -614,31 +689,71 @@ def test_030c_control_a_wrong_rms_epsilon_moves_every_return() -> None:
 
     sinkhorn_mod.reset_dispatch_counters()
     real = layer.mhc_pre(residual)
-    layer.rms_eps = WRONG_RMS_EPS
-    wrong = layer.mhc_pre(residual)
-    _route_reading("value-2-rms-control", calls=2)
 
     print(
         f"[value-2-site-rms-control] rms_eps {eps_real} -> {WRONG_RMS_EPS} "
         f"scale_change_rel={scale_change:.6e} "
-        f"floor_steps={RMS_CONTROL_FLOOR_STEPS:.0f}"
+        f"floor_steps={RMS_CONTROL_FLOOR_STEPS:.0f} "
+        f"hc_scale={[round(float(v), 6) for v in hc_scale]}"
     )
+    # ---- IS THIS CONTROL REACHABLE ON THIS DRAW? Asked BEFORE the second call, and
+    # against the SAME denominator the measurement uses, so prediction and
+    # measurement are the same quantity in the same units.
+    predicted = _predicted_control_deltas(
+        layer, fn, hc_scale, hc_base, residual, WRONG_RMS_EPS
+    )
+    steps_at = {
+        name: float(_ulp(tensor).max())
+        for name, tensor in zip(("post_mix", "comb_mix", "layer_input"), real)
+    }
+    for name in ("post_mix", "comb_mix", "layer_input"):
+        one_step = steps_at[name]
+        predicted_steps = predicted[name] / one_step if one_step > 0.0 else float("nan")
+        print(
+            f"[value-2-site-rms-predicted] {name} "
+            f"predicted_delta={predicted[name]:.6e} one_step={one_step:.6e} "
+            f"predicted_steps={predicted_steps:.2f} "
+            f"floor={RMS_CONTROL_FLOOR_STEPS:.0f}"
+        )
+        if not predicted_steps >= RMS_CONTROL_FLOOR_STEPS:
+            raise VacuousControlError(
+                f"this fixture's draw cannot carry the control to {name}: the "
+                f"epsilon swap predicts {predicted_steps:.2f} fp32 steps there, "
+                f"under the floor of {RMS_CONTROL_FLOOR_STEPS:.0f}. The gates "
+                f"multiply by hc_scale={[round(float(v), 6) for v in hc_scale]} "
+                f"before the sigmoid, so a small draw attenuates the signal below "
+                f"the resolution the assertion needs. This is an UNREACHABLE "
+                f"control on this draw, not a layer that ignores self.rms_eps"
+            )
+
+    layer.rms_eps = WRONG_RMS_EPS
+    wrong = layer.mhc_pre(residual)
+    _route_reading("value-2-rms-control", calls=2)
+
     for name, before, after in zip(("post_mix", "comb_mix", "layer_input"), real, wrong):
         delta = float((before - after).abs().max())
-        # One step at the tensor's LARGEST magnitude, which is the biggest step in
-        # the tensor and therefore the smallest, most conservative step count.
-        step = float(_ulp(before).max())
+        # The SAME denominator the prediction used -- one step at the tensor's largest
+        # magnitude, which is the biggest step in the tensor and therefore the
+        # smallest, most conservative step count. Reusing the value rather than
+        # recomputing the expression is what makes the two numbers comparable by
+        # construction instead of by a reader checking that two lines match.
+        step = steps_at[name]
         steps = delta / step if step > 0.0 else float("nan")
+        predicted_steps = predicted[name] / step if step > 0.0 else float("nan")
         print(
             f"[value-2-site-rms-control] {name} delta={delta:.6e} "
-            f"one_step={step:.6e} steps={steps:.2f}"
+            f"one_step={step:.6e} steps={steps:.2f} "
+            f"predicted_steps={predicted_steps:.2f} "
+            f"measured_over_predicted={(steps / predicted_steps):.3f}"
         )
         assert steps >= RMS_CONTROL_FLOOR_STEPS, (
             f"installing the wrong RMS epsilon {WRONG_RMS_EPS} moved {name} by "
             f"{delta:.6e}, only {steps:.2f} fp32 steps of its own magnitude and "
-            f"under the floor of {RMS_CONTROL_FLOOR_STEPS:.0f}; a change this "
-            f"large at the norm ({scale_change:.6e} relative on its scale) has to "
-            f"arrive, so this layer's arithmetic does not read self.rms_eps"
+            f"under the floor of {RMS_CONTROL_FLOOR_STEPS:.0f} -- while this "
+            f"fixture's own draw predicted {predicted_steps:.2f} steps, so the "
+            f"signal was reachable and did not arrive. A change this large at the "
+            f"norm ({scale_change:.6e} relative on its scale) has to arrive, so "
+            f"this layer's arithmetic does not read self.rms_eps"
         )
 
 
