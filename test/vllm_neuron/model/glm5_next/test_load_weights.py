@@ -3694,10 +3694,14 @@ def _as_the_loader_left_it(
     bit-exact reassembly are all still asserted against the same numbers this file
     always asserted them against.
 
-    THE UNDO IS A TRANSPOSE AND NOTHING ELSE. The republish's other step, coarsening
-    a ``128``-tile grid onto the ``256`` public one, is NOT undone here and cannot
-    be: it requantises. A reading that needs the raw grid VALUES of a republished
-    class has to say so itself; this helper only restores the FRAME.
+    THE UNDO IS A TRANSPOSE AND NOTHING ELSE, AND SINCE ``inc-glm53f-112`` SO IS THE
+    PUBLISH. The step used to have a second half -- coarsening a ``128``-tile grid onto
+    a ``256`` public one -- which this helper never undid and could not, because it
+    requantises. That half is gone on this path: the dense step now publishes the
+    checkpoint's own grid, so restoring the frame restores the whole of what the step
+    did. The sentence is kept in this shape because the ROUTED bank still coarsens and
+    a reading that needs the raw grid VALUES of a coarsened class still has to say so
+    itself; this helper only ever restores the FRAME.
 
     It keys on the class rather than on a shape, because a square weight's frame is
     invisible in its shape and a reading that guessed from the shape would silently
@@ -5270,13 +5274,14 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
             # republished classes no longer store that layout, so a cat on the
             # stored dim would join along the wrong axis.
             #
-            # THE FRAME IS ALL THIS UNDOES. The republish's other step requantises a
-            # 128-tile grid onto the 256 public one for any weight whose extents are
-            # whole blocks, and this item's comparison is bit-exact, so it also
-            # depends on that coarsening being lossless on THIS fixture's grids. That
-            # is a property of the fixture, not of the loader, and the first host run
-            # of this file is what settles it -- ``inc-glm53f-054a`` hands that
-            # reading forward rather than weakening the equality to hide it.
+            # THE FRAME IS ALL THIS UNDOES, AND SINCE ``inc-glm53f-112`` THE FRAME IS
+            # ALL THE STEP DID. The step used to requantise a 128-tile grid onto a 256
+            # public one for any weight whose extents were whole blocks, so this
+            # bit-exact comparison also depended on that coarsening being lossless on
+            # THIS fixture's grids -- a property of the fixture rather than of the
+            # loader, which ``inc-glm53f-054a`` handed forward rather than weakening the
+            # equality to hide it. The dense path no longer coarsens, so the dependency
+            # is gone and the equality now rests on the loader alone.
             got = torch.cat(
                 [
                     _as_the_loader_left_it(
@@ -5541,13 +5546,19 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     )
 
     # THE REPUBLISH'S OWN LOSSLESSNESS COUNTER, read off its health record and
-    # asserted at zero for these projections (DECISIONS §706 item 4). The coarsening
-    # keeps one scale per 256 block and rescales the other three 128 tiles into it, so
-    # it is exact only where each ratio is a power of two; the counter is the
-    # republish's own report of how often it was not. Asserting it here means a red
-    # run names the CAUSE, not only the moved number, and it is a finding on the
-    # landed retile rather than a tolerance to widen.
+    # asserted at zero for these projections (DECISIONS §706 item 4). It used to be a
+    # measurement: the coarsening kept one scale per 256 block and rescaled the other
+    # three 128 tiles into it, exact only where each ratio was a power of two, and the
+    # counter was the step's own report of how often it was not. Since
+    # ``inc-glm53f-112`` the dense step rescales nothing, so on this path the zero is
+    # true BY ABSENCE rather than by arithmetic -- and the assertion is kept exactly as
+    # it was, because it is what would speak first if the rescaling ever came back.
+    # A red run therefore still names the CAUSE and not only the moved number, and it
+    # is a finding on the landed step rather than a tolerance to widen.
     inexact: dict[tuple[int, str], int] = {}
+    #: The set that must stay EMPTY since ``inc-glm53f-112``: dense projections whose
+    #: health record still reports a coarsening.
+    coarsened: dict[tuple[int, str], int] = {}
     for rank in range(SHARD_EP_WORLD):
         module = models[rank].get_submodule(path)
         health = getattr(module, module.DENSE_RETILE_HEALTH_ATTR, None)
@@ -5556,17 +5567,26 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
             f"load, so the load-time prep loop never reached Glm5NextDenseMLP"
         )
         for leaf, record in health.items():
-            # RE-PINNED BY ``inc-glm53f-112``: gated on ``published`` rather than on
-            # ``retiled``, because the dense step no longer coarsens and ``retiled`` is
-            # now always False. The counter is still read and still asserted zero -- it
-            # now reads zero BY ABSENCE, which is a stronger statement than the exact
-            # coarsening it used to make, and the reading stops being vacuous the same
-            # way it did before: on whether any projection got that far.
+            # RE-PINNED BY ``inc-glm53f-112``, AND THE CONTROL IS INVERTED (§1191). The
+            # dense step no longer coarsens anything, so the interesting set is now the
+            # EMPTY one: a coarsened dense projection appearing here is the 256 retile
+            # coming back, which is red. The published set carries the vacuity guard
+            # instead -- it is what says a projection got far enough for the exactness
+            # below to be about anything.
+            if record.get("retiled"):
+                coarsened[(rank, leaf)] = int(record["inexact_rescales"])
             if not record.get("published"):
                 continue
             inexact[(rank, leaf)] = int(record["inexact_rescales"])
     print(f"CONJUNCT3D_PUBLISHED_PROJECTIONS={len(inexact)}")
+    print(f"CONJUNCT3D_COARSENED_DENSE_PROJECTIONS={len(coarsened)}")
     print(f"CONJUNCT3D_RETILE_INEXACT_RESCALES={sorted(inexact.values())}")
+    assert not coarsened, (
+        f"{len(coarsened)} dense projections report a COARSENING: {sorted(coarsened)}. "
+        f"Since `inc-glm53f-112` the dense load path publishes the checkpoint's own "
+        f"grid and coarsens nothing, so a non-empty set here means the 256 retile is "
+        f"back on this path and the exactness below is measuring something else"
+    )
     assert inexact, (
         f"no dense projection was published at world size {SHARD_EP_WORLD}, so this "
         f"reading is vacuous and the exactness below is not testing the load path at "
@@ -5584,12 +5604,14 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     def _dequantised(rank: int, leaf: str) -> torch.Tensor:
         """One rank's shard, dequantised AT THE GRID THE MODULE ACTUALLY CARRIES.
 
-        The block size is derived from the weight and its grid rather than named as a
-        constant, because the republish leaves a whole-block weight at the consumer's
-        256 granularity and leaves any other extent at the checkpoint's 128. A
-        constant would be right for one of those and silently wrong for the other;
-        derived, a grid that does not divide its weight is refused by
-        ``dequantise_blockwise`` itself.
+        The block size is DERIVED from the weight and its grid rather than named as a
+        constant. It was derived because the republish used to leave a whole-block
+        weight at the consumer's 256 granularity and any other extent at the
+        checkpoint's 128, so a constant would have been right for one and silently
+        wrong for the other. Since ``inc-glm53f-112`` every dense grid comes back at the
+        checkpoint's 128, and the derivation is KEPT: it reads what the module actually
+        carries, so a grid at some other granularity is refused by
+        ``dequantise_blockwise`` itself instead of being assumed away here.
 
         Both tensors are put back in the loader's frame first, so what this returns
         is the checkpoint's own layout and the concatenations below still join on the
@@ -5712,9 +5734,10 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
             f"{leaf}'s real rows differ from the checkpoint's own tensor by "
             f"{raw_diff} at the checkpoint's own convention. The load path is meant "
             f"to change this tensor's LAYOUT and not its numbers, so a non-zero "
-            f"reading here is a finding against the republish -- most likely its 256 "
-            f"coarsening requantising a block whose four 128 tiles do not share a "
-            f"power-of-two scale ratio. It is never a tolerance to widen and never a "
+            f"reading here is a finding against the republish. Since `inc-glm53f-112` "
+            f"the dense step publishes the checkpoint's own grid, so check first "
+            f"whether a 256 coarsening is back on this path -- the set above "
+            f"reads empty when it is not. It is never a tolerance to widen and never a "
             f"fixture to retune (DECISIONS §706 item 4): hand it back with this "
             f"number"
         )
@@ -7215,7 +7238,7 @@ def _modules_named(
     ]
 
 
-def test_blocked_the_shared_expert_prep_completes_a_load_and_the_retile_ran(
+def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """Item (iii). The shared expert's prep runs inside a COMPLETING load.
@@ -7592,3 +7615,172 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
             f"of refusing rather than emitting NaN is that the message locates the "
             f"block and reports the counters"
         )
+
+
+def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """``inc-glm53f-112``: on the DENSE path the ramp hazard is gone, and it is SHOWN.
+
+    WHAT THIS ITEM ADDS TO THE ITEM ABOVE. That one guards a REFUSAL: a grid the
+    ``256`` coarsening cannot reproduce must be refused rather than turned into NaN.
+    That refusal is the MoE producer's, inside the routed bank's own prep, and
+    ``inc-glm53f-112`` leaves it exactly where it was. The same hazard used to exist
+    on the DENSE path too, because the dense load path coarsened as well, and there it
+    is gone: the step publishes the checkpoint's own ``128`` grid and rescales no
+    weight byte. A removed hazard deserves a positive reading rather than silence, so
+    this item takes the very fixture the refusal item calls dangerous and reads the
+    dense side of it.
+
+    THE READING IS AGAINST THE CHECKPOINT'S OWN TENSORS, not against the module
+    itself. ``_deferred_checkpoint`` returns the tensors it wrote, so the reference
+    here is the fixture's own numbers put through the trn2 pair the loader applies --
+    the byte squeeze and the matching per-block compensation -- exactly as
+    :func:`test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly` builds
+    it. Comparing the module against a transposed copy of itself would have been a
+    tautology and would have passed on the old path too.
+
+    WHAT WOULD HAVE FAILED BEFORE. Three things this item asserts were false at the
+    parent commit. The carried block would have been ``256`` and not the checkpoint's
+    ``128``; ``inexact_rescales`` was NOT zero on the ramp -- the item above prints
+    those non-zero counts as readings -- so the dequantised product moved; and the
+    older reference could only be reached on the POW2 fixture, which
+    :func:`_pow2_block_grid_pattern` exists solely to arrange. The ramp is the grid
+    family the coarsening could not hold, and the publish holds it.
+
+    THE CONTROL is the pad item's control, reused: the same reference with the
+    compensation NOT applied must NOT match. Without it an equality here could not
+    tell the paired encoding from a half-applied one.
+
+    NO TOLERANCE IS INTRODUCED (P9): both readings are ``max abs diff`` against
+    exactly ``0.0``, which is what the two landed exactness items already assert.
+    """
+    ramp_directory, overrides, mappings = _deferred_checkpoint(
+        tmp_path, ramp_grids=True, name="deferred-ramp-dense"
+    )
+    loaded = _load_blocked(ramp_directory, monkeypatch)
+
+    read: list[str] = []
+    for path, module in loaded.named_modules():
+        # THE BANK IS OUT OF SCOPE HERE BY NAME, not by a shape filter: its record is
+        # a dict of TUPLES and its checkpoint keys are one per expert, which is a
+        # different reading, and its coarsening is the one -112 leaves alone.
+        if type(module).__name__ not in _REPUBLISHED_CLASSES:
+            continue
+        for attribute_name in (
+            "SHARED_RETILE_HEALTH_ATTR",
+            "DENSE_RETILE_HEALTH_ATTR",
+        ):
+            attribute = getattr(type(module), attribute_name, None)
+            if attribute is None:
+                continue
+            health = getattr(module, attribute, None)
+            if not health:
+                continue
+            for leaf, record in health.items():
+                dotted = f"{path}.{leaf}"
+                assert record.get("published") is True, (
+                    f"{dotted} was not published on a ramp grid: "
+                    f"{record.get('reason')}. The publish reads EXTENTS and never "
+                    f"values, so a legal grid it declines to publish means the step "
+                    f"could not read the extents it was handed"
+                )
+                assert record.get("retiled") is False, (
+                    f"{dotted} reports a coarsening on the dense path, so the 256 "
+                    f"retile is back here and the hazard this item says is gone is "
+                    f"not gone"
+                )
+                assert int(record.get("inexact_rescales", 0)) == 0, (
+                    f"{dotted} rescaled {record['inexact_rescales']} tiles "
+                    f"inexactly. The publish rescales nothing, so any non-zero count "
+                    f"is arithmetic that should not have run -- and on this ramp it is "
+                    f"the arithmetic the old coarsening did"
+                )
+
+                keys = _keys_of(mappings, dotted)
+                scales = scale_keys(keys)
+                weight_key = next(key for key in keys if key not in scales)
+                grid_name = f"{leaf[: -len(_WEIGHT_LEAF_SUFFIX)]}_{FP8_SCALE_SUFFIX}"
+
+                # BOTH TENSORS GO BACK IN THE LOADER'S FRAME, and the block is derived
+                # from the pair the module carries rather than named, so a grid at any
+                # other granularity is refused by ``dequantise_blockwise`` itself.
+                weight = _as_the_loader_left_it(module, leaf, _loaded(loaded, dotted))
+                grid = _as_the_loader_left_it(
+                    module, grid_name, getattr(module, grid_name)
+                )
+                block = (
+                    weight.shape[0] // grid.shape[0],
+                    weight.shape[1] // grid.shape[1],
+                )
+                got = dequantise_blockwise(weight, grid, block).to(torch.float32)
+
+                reference = dequantise_blockwise(
+                    downscale_fp8_weight_bytes(overrides[weight_key]),
+                    compensate_block_scales(overrides[scales[0]]).scale_inv,
+                    DEFAULT_WEIGHT_BLOCK_SIZE,
+                ).to(torch.float32)
+                uncompensated = dequantise_blockwise(
+                    downscale_fp8_weight_bytes(overrides[weight_key]),
+                    overrides[scales[0]],
+                    DEFAULT_WEIGHT_BLOCK_SIZE,
+                ).to(torch.float32)
+
+                # The pad is item (3)'s reading, so a padded extent is compared on its
+                # real rows only -- and the row below says whether there was a pad.
+                real = got[: reference.shape[0], : reference.shape[1]]
+                paired_diff = _max_abs_diff(real, reference)
+                uncompensated_diff = _max_abs_diff(real, uncompensated)
+                print(
+                    f"RAMPPUBLISH|{dotted}|carried_block={block}"
+                    f"|checkpoint_block={tuple(DEFAULT_WEIGHT_BLOCK_SIZE)}"
+                    f"|loaded={tuple(got.shape)}|checkpoint={tuple(reference.shape)}"
+                    f"|vs_checkpoint_paired={paired_diff}"
+                    f"|vs_uncompensated={uncompensated_diff}"
+                )
+
+                assert block == tuple(DEFAULT_WEIGHT_BLOCK_SIZE), (
+                    f"{dotted} carries a grid at {block} granularity, not the "
+                    f"checkpoint's own {tuple(DEFAULT_WEIGHT_BLOCK_SIZE)}. This is the "
+                    f"whole of `inc-glm53f-112` read at the module: a 256 block here "
+                    f"means the coarsening is back"
+                )
+                assert real.shape == reference.shape, (
+                    f"{dotted} loaded to {tuple(got.shape)}, whose leading extents do "
+                    f"not cover the checkpoint's {tuple(reference.shape)}"
+                )
+                assert uncompensated_diff != 0.0, (
+                    f"{dotted} matches the UNCOMPENSATED reference as well as the "
+                    f"paired one, so the compensation is not reaching this grid and "
+                    f"the equality below cannot tell the two encodings apart"
+                )
+                assert paired_diff == 0.0, (
+                    f"{dotted} dequantises to something {paired_diff} away from the "
+                    f"checkpoint's own numbers on a RAMP grid. The load path is "
+                    f"entitled to change this tensor's layout and not its numbers, so "
+                    f"this is a finding to hand back with the number -- never a "
+                    f"tolerance to widen and never a fixture to retune (DECISIONS "
+                    f"§706 item 4)"
+                )
+                read.append(dotted)
+
+    print(f"RAMPPUBLISH_PROJECTIONS_READ={len(read)}|{sorted(read)}")
+    assert read, (
+        "the ramp load published no dense or shared-expert health record, so this "
+        "item read nothing and its exactness claim would be vacuous"
+    )
+
+    # The half of the retired candidate's claim that still applies to this path: the
+    # completed load holds no NaN. Kept because it is cheap and it is what the word
+    # "instead of emitting NaN" was protecting.
+    nonfinite = [
+        name
+        for name, tensor in list(loaded.named_parameters())
+        + list(loaded.named_buffers())
+        if not bool(torch.isfinite(tensor.detach().to(torch.float32)).all())
+    ]
+    print(f"RAMPPUBLISH_NONFINITE={nonfinite[:6]}")
+    assert not nonfinite, (
+        f"the ramp load published non-finite values in {nonfinite[:6]}, reached on a "
+        f"path that no longer coarsens at all"
+    )
