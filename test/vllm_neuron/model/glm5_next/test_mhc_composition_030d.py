@@ -1151,6 +1151,16 @@ class _StubLayer(nn.Module):
     non-vacuous: if it returned them untouched, "the mean collapsed the last
     layer's streams" and "the mean collapsed the embedding" would be the same
     sentence.
+
+    IT CAN ALSO TELL THE STREAMS APART, and only if an item asks it to.
+    ``stream_gains`` defaults to ``None``, which is the arithmetic every item in this
+    file was written against -- one gain for all four streams -- so setting it changes
+    nothing anywhere else. The first real host run (grant 215) showed why the opt-in
+    has to exist: every other step of this fixture treats the four streams alike, so
+    four identical streams at entry stay identical for the whole stack, and an item
+    that needs them to DIFFER cannot get there from the default. See
+    :func:`test_030d_the_carrier_collapses_with_an_unweighted_mean`, which is the one
+    item in this file that reads a stream spread.
     """
 
     def __init__(self, family: str) -> None:
@@ -1158,6 +1168,9 @@ class _StubLayer(nn.Module):
         self.family = family
         self.calls: list[dict] = []
         self.seen_streams: list[torch.Tensor] = []
+        # PER-STREAM GAINS, OFF BY DEFAULT. A 1-D tensor of one gain per stream, or
+        # None for the single gain below.
+        self.stream_gains = None
 
     def forward(self, hidden_states: torch.Tensor, *, streams=None, **kwargs):
         self.calls.append(
@@ -1171,7 +1184,12 @@ class _StubLayer(nn.Module):
         self.seen_streams.append(streams)
         if streams is None:
             return hidden_states
-        return streams * 1.25 + 0.01
+        if self.stream_gains is None:
+            return streams * 1.25 + 0.01
+        # THE GAIN IS INDEXED ON THE STREAM AXIS, so a config carrying a different
+        # ``hc_mult`` reaches the item's own check rather than a broadcast error here.
+        gains = self.stream_gains.to(streams.dtype)
+        return streams * gains[None, : streams.shape[1], None] + 0.01
 
 
 def _stub_stack(text_config, *, tokens: int = TOKENS, dtype=torch.float32):
@@ -1307,11 +1325,33 @@ def test_030d_the_carrier_collapses_with_an_unweighted_mean() -> None:
     THE CONTROL IS A WEIGHTED COLLAPSE over the same streams. It differs, printed,
     so this item distinguishes the mean from the mHC-style collapse the two sites
     use -- which is the mistake a reader of this file would most plausibly make.
+
+    AND THE STREAMS ARE MADE TO DIFFER, because on the default fixture they cannot.
+    Grant 215's run measured ``stream_spread=0`` and ``weighted_control_delta=0`` here,
+    and that is a property of the fixture rather than of the product: entry expands one
+    token vector into four identical streams, the stub site collapses with a mean and
+    adds the SAME row back to every stream, and both the stub layer's default gain and
+    the stub feed-forward are elementwise -- so identical streams in stay identical
+    streams out, forever. On identical streams the control's weights (which sum to 1.0)
+    make a weighted collapse EQUAL a mean, so the item could not tell them apart and
+    its own guard below correctly refused. Per-stream gains break that symmetry, which
+    makes this item stricter rather than easier: the control now genuinely differs.
     """
     text_config = _text_config()
     # BF16 TABLE, FP32 SEAM RETURN: the streams come back from each site in fp32, so
     # the output's dtype reads the carrier's cast rather than the fixture's one dtype.
     model, stubs, table, input_ids = _stub_stack(text_config, dtype=torch.bfloat16)
+    # DISTINCT GAINS, ONE PER STREAM, derived from the stream count so a different
+    # ``hc_mult`` reaches this item rather than an index error. They are not all equal,
+    # which is the whole point, and the guard below reads the spread they produce
+    # instead of trusting them to have worked.
+    gains = torch.linspace(1.0, 1.3, int(text_config.hc_mult), dtype=torch.float32)
+    assert float(gains.max() - gains.min()) > 0.0, (
+        "the per-stream gains are all equal, so this fixture cannot tell a mean from a "
+        "weighted collapse and every reading below would be vacuous"
+    )
+    for stub in stubs:
+        stub.stream_gains = gains
     ffn_half, _, _ = _ffn_recorder()
     normed: list[torch.Tensor] = []
     real_norm = type(model)._rms_norm
@@ -1338,6 +1378,13 @@ def test_030d_the_carrier_collapses_with_an_unweighted_mean() -> None:
         f"out_dtype={out.dtype}")
     say("carrier-mean", f"stream_spread={spread:.6g}",
         f"weighted_control_delta={float((weighted - want).abs().max()):.6g}")
+    # THE FIXTURE'S OWN GAINS ARE PRINTED, so a reader can see which symmetry was
+    # broken to make the two collapses differ, and grant 215's zero row stays legible
+    # against this one.
+    say("carrier-mean", f"stream_gains={[round(float(g), 4) for g in gains]}",
+        f"gain_span={float(gains.max() - gains.min()):.6g}",
+        "note=grant 215 ran this item on one gain for all four streams and read "
+        "stream_spread=0; the gains are what make the weighted control differ")
 
     assert len(normed) == 1, (
         f"the final norm ran {len(normed)} times; the carrier norms once, after the "
