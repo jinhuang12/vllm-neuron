@@ -9,21 +9,31 @@ THE DECLARED ACCEPTANCE, the Tier N harness this campaign uses:
       -s -rA -p no:randomly -p no:cacheprovider --timeout 60
 
 EVERY ITEM IN THIS FILE FAILS AT THE BASE COMMIT, WITH ONE NAMED EXCEPTION, AND
-THAT IS THE POINT. The converter refuses a block table carrying more than one row
-(``neuron_model_runner.py:5136-5141`` at base), so at base each two-request item
+THAT IS THE POINT. At base the converter refused a block table carrying more than
+one row (``neuron_model_runner.py:5136-5141`` at base), so each two-request item
 below raises that refusal instead of reading a value, and the helper-level items
 raise ``AttributeError`` for methods base does not have. An item that passed at
-base would be measuring nothing. THE EXCEPTION is the prefill-warmup arm of A2,
+base would be measuring nothing. THAT REFUSAL IS NOW THE SPARSE FAMILY'S: the walk
+admits a batch, the linear family serves it, and the sparse carrier refuses a
+second request by name because its slice is contiguous -- which is the arm A1's
+fourth item reads. THE EXCEPTION is the prefill-warmup arm of A2,
 which passes at base BECAUSE base served that step: it is a regression arm, it
 pins the base's behaviour, and it fails on the bytes of this increment's fifth
 commit, which is where review round 1 found the regression.
 
 THE ITEMS HERE, and each names the tripwire it must fail on.
 
-* A1, SLOT HALF -- two admitted requests get DIFFERENT recurrent state slots, and
-  the assignment is stable within one request's life. Tripwire: a table that
-  returns one slot for both. The carrier-VIEW half of A1 needs the per-request
-  carrier container and arrives with this increment's model-side sliver.
+* A1, FOUR ARMS -- the SLOT half: two admitted requests get DIFFERENT recurrent
+  state slots, stable within one request's life (tripwire: a table returning one
+  slot for both). The CARRIER half: each request's entry is a storage view of its
+  OWN bank row, the two entries are different storage, each request's position
+  travels with it, and a write through one entry reaches the bank while the other
+  request's row stays equal (tripwire: a carrier of copies passes every pointer
+  read and fails that write). The CONVERTER arm: a two-request batch on a linear
+  stack is served end to end and each request's ring records its own advance
+  (tripwire: the previous commit's walk refused a second row). The SPARSE arm: on a
+  hybrid stack the same batch is refused by name at the sparse carrier, which takes
+  one contiguous slice of the paged latent bank.
 * A2, FOUR ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
   over-admission refuses by name; a synthetic step takes no claim; and the prefill
   WARMUP's own shape, which has no request at all, is served from slot 0 and takes
@@ -336,21 +346,21 @@ def _generic(*, tokens: int, metadata: dict) -> dict:
     }
 
 
-def _two_request_decode(runner, banks):
-    """One decode step carrying one token for each of the two requests.
+def _two_request_step(runner, banks, *, tokens: int, cached):
+    """One step carrying both requests, converted by the code under test.
 
     Returned as the converter's own output, because every item below reads what
     the runner decided to hand the layers and never builds a carrier itself.
     """
     metadata = _metadata(
         banks,
-        tokens=DECLARED_REQUESTS,
+        tokens=int(tokens),
         sparse_rows=DECLARED_SPARSE_ROWS,
         state_rows=DECLARED_SPARSE_ROWS,
-        cached=DECLARED_CACHED_LENGTHS,
+        cached=cached,
     )
     converted = runner._glm5next_model_kwargs(_generic(
-        tokens=DECLARED_REQUESTS, metadata=metadata
+        tokens=int(tokens), metadata=metadata
     ))
     assert sorted(converted) == ["input_ids", "layer_carriers", "sampling_positions"], (
         f"the converter returned {sorted(converted)}"
@@ -648,6 +658,63 @@ def test_a1_each_requests_carrier_is_a_view_of_its_own_bank_row() -> None:
     )
 
 
+def test_a1_a_two_request_linear_batch_is_served_through_the_converter() -> None:
+    """The whole runner path, not the builder: two requests in one batch, end to end.
+
+    WHAT THE BUILDER-LEVEL ITEM ABOVE CANNOT REACH. The converter is what reads the
+    block tables, pairs identity with paging, classifies each request's position and
+    records what each one advanced to. So this drives it twice on a LINEAR stack --
+    an opening prefill, then a decode carrying one token per request -- and reads the
+    carrier and the recorded positions afterwards.
+
+    THE TRIPWIRE IS THE PREVIOUS COMMIT. Its walk refused any block table with more
+    than one row, so this item raises there instead of reading a carrier; the refusal
+    now belongs to the sparse family, which is the arm below.
+
+    THE TWO REQUESTS OPEN AT THE SAME LENGTH, and that is a limit of the CONVERTER
+    path rather than a choice: opening two sequences at different lengths needs one
+    request fresh beside one continuing, which is the mixed batch this block refuses
+    by design. The per-request POSITIONS at different lengths are read at the builder
+    in the item above, where they can be declared directly.
+    """
+    _require_cpu_mode()
+    banks = _linear_banks(_banks())
+    runner = _runner(banks)
+    request_ids = list(runner.input_batch.req_ids)
+    opening = DECLARED_CACHED_LENGTHS[0]
+
+    _two_request_step(
+        runner, banks, tokens=opening * DECLARED_REQUESTS, cached=(0, 0)
+    )
+    carriers = _two_request_step(
+        runner, banks, tokens=DECLARED_REQUESTS, cached=(opening,) * DECLARED_REQUESTS
+    )
+
+    carrier = carriers[0]
+    table = runner._glm5next_request_slot_table
+    slots = [table[request_id] for request_id in request_ids]
+    positions = runner._glm5next_side_cache_positions
+    print(f"KEYED|a1|converter_batch|slots={slots}|carrier_positions="
+          f"{carrier['start_position']}|recorded={[positions[slot] for slot in slots]}")
+    assert len(set(slots)) == DECLARED_REQUESTS, (
+        f"the converter seated both requests at {slots}"
+    )
+    assert carrier["start_position"] == (opening,) * DECLARED_REQUESTS, (
+        f"the carrier carries positions {carrier['start_position']} for a decode at "
+        f"{opening}"
+    )
+    for index, slot in enumerate(slots):
+        assert carrier["conv_state"][index].data_ptr() == (
+            banks[0]["conv_state"][slot].data_ptr()
+        ), f"request {index}'s conv entry is not the slot the converter assigned it"
+    for slot in slots:
+        assert int(positions[slot]) == opening + 1, (
+            f"slot {slot}'s ring records {positions[slot]} after a one-token decode "
+            f"at {opening}; each request advances by ITS OWN tokens, and recording "
+            f"the batch's total would refuse that request's next step"
+        )
+
+
 def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
     """The sparse carrier is one contiguous slice, so it says so instead of guessing.
 
@@ -685,6 +752,32 @@ def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
         )
 
 
+def test_a1_the_converter_hands_a_two_request_batch_to_the_sparse_refusal() -> None:
+    """On a HYBRID stack the batch is admitted, walked, and refused where the limit is.
+
+    THE POINT OF THE ARM. The refusal used to stand in the bank walk, where it read
+    every family's table and said the whole forward threads one sequence. That is no
+    longer true: the linear family is concurrent. So the batch now travels through the
+    walk, the identity pairing and the position arms, and meets the refusal at the
+    SPARSE carrier, which names the contiguous latent slice and the increment that
+    lifts it.
+
+    THE TRIPWIRE: a builder that served the first request's slice for the whole batch
+    would hand both requests one sequence's latents, silently.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+
+    with pytest.raises(ValueError, match="ONE contiguous slice"):
+        _two_request_step(
+            runner,
+            banks,
+            tokens=DECLARED_CACHED_LENGTHS[0] * DECLARED_REQUESTS,
+            cached=(0, 0),
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # A2. A finished request's slot is freed, and its next owner gets it zeroed.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -702,19 +795,36 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
     _require_cpu_mode()
     banks = _banks()
     runner = _runner(banks)
+    side = _side_caches(banks)
+    rings = [entry for entry in side if entry]
+    if not rings:
+        raise VacuousControlError(
+            "no bank in this stack carries indexer side caches, so the second half of "
+            "this item -- that they are zeroed at the same moment -- measures nothing"
+        )
     first = ["req-0"]
 
-    seated = runner._glm5next_request_slots(banks, first, synthetic=False)
+    seated = runner._glm5next_request_slots(
+        banks, first, synthetic=False, side_caches=side
+    )
     slot = seated[0]
 
     # DIRTY THE SLOT, and prove it is dirty. Without this the zero read below
-    # would pass against a slot that was never written.
+    # would pass against a slot that was never written. BOTH the recurrent state and
+    # the indexer's two caches are dirtied, because a HALF-fresh slot -- fresh
+    # recurrence beside a stale pool -- is the defect the joint zeroing closes.
     for bank in _linear_banks(banks):
         bank["conv_state"][slot].fill_(3.0)
         bank["recurrent_state"][slot].fill_(-2.0)
+    for entry in rings:
+        entry["pool_cache"][slot].fill_(5.0)
+        entry["tail"][slot].fill_(-7.0)
     dirtied = [
         bool(bank["conv_state"][slot].any()) and bool(bank["recurrent_state"][slot].any())
         for bank in _linear_banks(banks)
+    ] + [
+        bool(entry["pool_cache"][slot].any()) and bool(entry["tail"][slot].any())
+        for entry in rings
     ]
     print(f"KEYED|a2|slot={slot}|dirtied={dirtied}")
     if not all(dirtied):
@@ -724,7 +834,9 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
         )
 
     # A LATER BATCH WITHOUT req-0 IS req-0 FINISHING. Nothing else is told.
-    later = runner._glm5next_request_slots(banks, ["req-2"], synthetic=False)
+    later = runner._glm5next_request_slots(
+        banks, ["req-2"], synthetic=False, side_caches=side
+    )
 
     print(f"KEYED|a2|reused={later}|freed_slot={slot}")
     assert later == [slot], (
@@ -740,15 +852,28 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
             f"bank {bank['name']}'s recurrent state at slot {slot} still holds the "
             f"previous request's values on hand-out"
         )
+    # THE INDEXER'S TWO CACHES ARE ZEROED AT THE SAME MOMENT. A slot handed over with
+    # a fresh recurrence and the last owner's pooled keys would complete its next
+    # pool from another request's members, with nothing shaped wrongly.
+    for entry in rings:
+        assert not entry["pool_cache"][slot].any(), (
+            f"the pooled store at slot {slot} still holds the previous owner's rows "
+            f"on hand-out, while its recurrent state was cleared"
+        )
+        assert not entry["tail"][slot].any(), (
+            f"the tail ring at slot {slot} still holds the previous owner's rows on "
+            f"hand-out, while its recurrent state was cleared"
+        )
 
 
 def test_a2_more_live_requests_than_slots_refuses_by_name() -> None:
     """The bank is a fixed size, so an over-admission refuses instead of colliding.
 
-    Called at the helper rather than through the converter on purpose: the
-    converter still refuses a multi-row block table at this stage of the
-    increment, so the over-admission case is only reachable here. The refusal is
-    matched on its own message, not on the exception type alone.
+    Called at the helper rather than through the converter on purpose: an
+    over-admission needs MORE live requests than the bank has slots, and the
+    converter's own batch is bounded by the pinned launch shape, so the case is
+    only reachable here. The refusal is matched on its own message, not on the
+    exception type alone.
     """
     _require_cpu_mode()
     banks = _banks()

@@ -5461,7 +5461,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         tokens = int(input_ids.shape[0])
         geometries: list[dict] = []
         legs: set[bool] = set()
-        starts: set[int] = set()
+        # THE CACHED LENGTHS TRAVEL AS A TUPLE PER GROUP, one entry per request in the
+        # batch's own row order, and the GROUPS must agree on that tuple. The check
+        # that used to stand here required ONE length for the whole call, which is a
+        # restriction on the BATCH rather than an agreement between the groups: two
+        # requests at different points of their sequences is the ordinary concurrent
+        # case. What must still agree is what the groups say about the SAME requests,
+        # because the layers of one forward are stepped together.
+        starts: set[tuple] = set()
         for bank in banks:
             name = bank["name"]
             if name not in metadata_map:
@@ -5473,21 +5480,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             metadata = metadata_map[name]
             block_size = int(metadata["block_size"])
             table = metadata["block_table_tensor"]
-            if int(table.shape[0]) != 1:
-                raise ValueError(
-                    f"this half threads ONE sequence per forward, because the layers "
-                    f"take a single sequence's cache slots (inc-glm53f-051's declared "
-                    f"interface); this batch carries {int(table.shape[0])} request(s)"
-                )
             cached = metadata["cached_seq_len"]
-            start_position = (
-                int(cached.reshape(-1)[0]) if torch.is_tensor(cached) else int(cached)
+            # ONE ROW AND ONE CACHED LENGTH PER REQUEST, and the two are paired by
+            # request index: the runner appends row `i` for request `i` (`:2108`) and
+            # writes that request's cached length at the same index. A disagreement in
+            # their counts would pair one request's pages with another's position, so
+            # it refuses here rather than being resolved by whichever is shorter.
+            rows = int(table.shape[0])
+            lengths = (
+                [int(value) for value in cached.reshape(-1)[:rows]]
+                if torch.is_tensor(cached)
+                else [int(cached)] * rows
             )
-            row = table[0].reshape(-1)
-            blocks_used = -(-(start_position + tokens) // block_size)
+            if len(lengths) != rows:
+                raise ValueError(
+                    f"KV layer '{name}'s group carries {rows} block-table row(s) and "
+                    f"{len(lengths)} cached length(s); each request contributes one of "
+                    f"each and they are paired by request index"
+                )
+            # THE BLOCKS EACH REQUEST USES ARE ITS OWN ROW'S. A batch's requests are
+            # different lengths, so the count is taken per request rather than from
+            # the batch's token total.
+            per_request_tokens = max(1, tokens // max(rows, 1))
+            request_blocks = []
+            for index in range(rows):
+                row = table[index].reshape(-1)
+                blocks_used = -(
+                    -(lengths[index] + per_request_tokens) // block_size
+                )
+                request_blocks.append([int(value) for value in row[:blocks_used]])
             geometries.append(
                 {
-                    "block_ids": [int(value) for value in row[:blocks_used]],
+                    "block_ids": request_blocks[0],
+                    "request_block_ids": request_blocks,
                     "page_size": block_size,
                 }
             )
@@ -5495,16 +5520,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 int(metadata["max_query_len"])
                 > int(metadata["decode_token_threshold"])
             )
-            starts.add(start_position)
+            starts.add(tuple(lengths))
         if len(legs) != 1 or len(starts) != 1:
             raise ValueError(
                 f"the layers of one forward are stepped together, so their KV-cache "
-                f"groups must agree on the leg and the cached length; this call "
-                f"site's entries carry prefill flags {sorted(legs)} and cached "
-                f"lengths {sorted(starts)}"
+                f"groups must agree on the leg and on each request's cached length; "
+                f"this call site's entries carry prefill flags {sorted(legs)} and "
+                f"cached lengths {sorted(starts)}"
             )
         is_prefill = legs.pop()
-        start_position = starts.pop()
+        request_starts = list(starts.pop())
+        # THE SCALAR IS THE FIRST REQUEST'S, and it is what the sparse family reads.
+        # That family still serves one sequence per forward -- its carrier is one
+        # contiguous slice of the paged latent bank -- and refuses a second request BY
+        # NAME in the carrier builder, so the scalar can never reach an answer for a
+        # request it does not describe.
+        start_position = request_starts[0]
         text_config = self.model.text_config
         side_caches = self._glm5next_live_side_caches(banks)
         # A SYNTHETIC DECODE IS NOT A SEQUENCE STEP, AND WARMUP IS PART OF SERVING.
@@ -5546,9 +5577,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # close. Such a step still refuses by name below. So the two conditions here
         # are the two request-less shapes the runner actually builds, and neither
         # widens into the class the refusal must keep catching.
-        synthetic_step = int(start_position) == 0 and (
-            not is_prefill or not self._glm5next_batch_request_ids()
-        )
+        synthetic_step = all(
+            int(position) == 0 for position in request_starts
+        ) and (not is_prefill or not self._glm5next_batch_request_ids())
         # THE STATE SLOT IS THE REQUEST'S, AND IT IS SETTLED HERE rather than in the
         # walk above, because a synthetic step must take no claim and whether this
         # step is synthetic is only known once the leg and the position are read.
@@ -5560,13 +5591,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             banks, request_ids, synthetic=synthetic_step, side_caches=side_caches
         )
         # THE SLOTS TRAVEL AS A LIST, one entry per request, and the singular key
-        # stays beside it because landed readers name it. The walk above still
-        # admits one row per forward, so this list holds one slot today; writing it
-        # as a list here rather than at the point it grows is what keeps the carrier
-        # builder's own derivation single.
+        # stays beside it because landed readers name it.
         for geometry in geometries:
             geometry["state_slot"] = int(state_slots[0])
             geometry["state_slots"] = [int(value) for value in state_slots]
+        # IDENTITY AND PAGING MUST DESCRIBE THE SAME REQUESTS. The slots come from the
+        # engine's request ids and the positions from the block tables, and the two
+        # are read from different places, so a disagreement pairs one request's state
+        # with another's position. A synthetic step is exempt: it has no request and is
+        # served from slot 0 whatever the tables carry.
+        if not synthetic_step and len(state_slots) != len(request_starts):
+            raise ValueError(
+                f"this step names {len(state_slots)} request(s) and its block tables "
+                f"carry {len(request_starts)} cached length(s); identity and paging "
+                f"come from one batch and must describe the same requests"
+            )
         if synthetic_step:
             # A SYNTHETIC STEP LEAVES THE RING AND ITS RECORDED POSITION ALONE, and
             # this branch exists to say so in one place rather than by omission. A
@@ -5578,7 +5617,73 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # rows are freshly allocated zeros, so leaving them is also the value the
             # process-wide clearing this replaces produced.
             pass
-        elif is_prefill and int(start_position) == 0:
+        else:
+            # EACH REQUEST IS CLASSIFIED ON ITS OWN POSITION. A batch's requests are at
+            # different points of their own sequences: one may be opening while another
+            # continues. Reading the batch's first position for all of them would open
+            # a ring that a live request is standing in, or refuse a request that is
+            # legitimately fresh, so the two arms below are taken per request.
+            for one_slot, one_start in zip(state_slots, request_starts):
+                self._glm5next_position_arm(
+                    int(one_slot),
+                    int(one_start),
+                    side_caches=side_caches,
+                    is_prefill=is_prefill,
+                )
+        carriers = self._glm5next_layer_carriers(
+            banks,
+            side_caches,
+            geometries=geometries,
+            is_prefill=is_prefill,
+            tokens=tokens,
+            start_position=start_position,
+            softmax_scale=float(
+                (
+                    int(text_config.qk_nope_head_dim)
+                    + int(text_config.qk_rope_head_dim)
+                )
+                ** -0.5
+            ),
+            max_seq_len=max(request_starts) + max(1, tokens // len(request_starts)),
+            index_kpool=int(text_config.index_kpool),
+            requests=len(state_slots),
+            request_starts=request_starts,
+        )
+        # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
+        # several shapes of its own -- a multi-token decode, a bank whose paging
+        # disagrees with its group, a state slot out of range -- and each of those
+        # raises after this converter has already decided the step is well positioned.
+        # Advancing before the call returns would leave the ring's recorded position
+        # ahead of the work actually done, so the NEXT step would be refused for a
+        # mismatch this one caused. A refused step must leave no trace.
+        # A SYNTHETIC STEP LEAVES NO CLAIM. It never read the cursor above and it does
+        # not write one here, so a warmup between two real steps of one sequence is
+        # invisible to that sequence.
+        # EACH REQUEST ADVANCES BY ITS OWN TOKENS, not by the batch's total, or a
+        # concurrent decode would record every sequence as if it had consumed the
+        # whole batch.
+        if not synthetic_step:
+            advance = max(1, tokens // len(request_starts))
+            for one_slot, one_start in zip(state_slots, request_starts):
+                self._glm5next_side_cache_positions[int(one_slot)] = (
+                    int(one_start) + advance
+                )
+        return {
+            "input_ids": kwargs["input_ids"],
+            "layer_carriers": carriers,
+            "sampling_positions": kwargs["sampling_positions"],
+        }
+
+    def _glm5next_position_arm(
+        self, slot: int, start_position: int, *, side_caches, is_prefill: bool
+    ) -> None:
+        """One request's ring: opened at position 0, or required to continue.
+
+        THE TWO ARMS ARE ONE REQUEST'S, and they were one step's before a batch could
+        hold more than one. Nothing about either arm changed; what changed is that the
+        caller runs them per request.
+        """
+        if is_prefill and int(start_position) == 0:
             # A FRESH SEQUENCE MUST NOT INHERIT THE LAST ONE'S PARTIAL POOL. The
             # side caches live for the process (`_glm5next_live_side_caches`), so
             # the ring still holds whatever the previous sequence stashed, and
@@ -5612,10 +5717,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # ONLY THIS REQUEST'S ROW IS CLEARED. The rows are per slot now, so a
             # fresh sequence opening cannot disturb a concurrent request's ring --
             # which the process-wide zeroing this replaces did on every prefill.
-            self._glm5next_side_cache_positions.pop(int(state_slots[0]), None)
+            self._glm5next_side_cache_positions.pop(int(slot), None)
             for side in side_caches:
                 if "tail" in side:
-                    side["tail"][int(state_slots[0])].zero_()
+                    side["tail"][int(slot)].zero_()
         else:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so
@@ -5637,8 +5742,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # own slot was never advanced to -- which is what an automatic
             # prefix-cache hit produces -- and that is refused, not guessed.
             leg = "prefill" if is_prefill else "decode"
-            slot = int(state_slots[0])
-            stood_at = self._glm5next_side_cache_positions.get(slot)
+            stood_at = self._glm5next_side_cache_positions.get(int(slot))
             if stood_at is None:
                 raise ValueError(
                     f"slot {slot}'s indexer ring holds no recorded position, so this "
@@ -5655,45 +5759,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"not continue this slot's sequence would read another point of it "
                     f"silently"
                 )
-        carriers = self._glm5next_layer_carriers(
-            banks,
-            side_caches,
-            geometries=geometries,
-            is_prefill=is_prefill,
-            tokens=tokens,
-            start_position=start_position,
-            softmax_scale=float(
-                (
-                    int(text_config.qk_nope_head_dim)
-                    + int(text_config.qk_rope_head_dim)
-                )
-                ** -0.5
-            ),
-            max_seq_len=start_position + tokens,
-            index_kpool=int(text_config.index_kpool),
-            requests=len(state_slots),
-            request_starts=[start_position] * len(state_slots),
-        )
-        # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
-        # several shapes of its own -- a multi-token decode, a bank whose paging
-        # disagrees with its group, a state slot out of range -- and each of those
-        # raises after this converter has already decided the step is well positioned.
-        # Advancing before the call returns would leave the ring's recorded position
-        # ahead of the work actually done, so the NEXT step would be refused for a
-        # mismatch this one caused. A refused step must leave no trace.
-        # A SYNTHETIC STEP LEAVES NO CLAIM. It never read the cursor above and it does
-        # not write one here, so a warmup between two real steps of one sequence is
-        # invisible to that sequence.
-        if not synthetic_step:
-            self._glm5next_side_cache_positions[int(state_slots[0])] = (
-                int(start_position) + tokens
-            )
-        return {
-            "input_ids": input_ids,
-            "layer_carriers": carriers,
-            "sampling_positions": kwargs["sampling_positions"],
-        }
-
 
     def _build_decode_synthetic_inputs(
         self,

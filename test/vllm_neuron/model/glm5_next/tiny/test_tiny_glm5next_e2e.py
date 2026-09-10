@@ -1975,7 +1975,13 @@ def test_the_indexer_refuses_a_prefill_ring_handed_to_a_decode_step():
             "the live side caches carry no ring, so there is no prefill_tail to hand a "
             "decode step and this arm cannot reach its refusal"
         )
-    ring = rings[0]["tail"]
+    # RE-PINNED (D17.1): ORIGINAL READING `rings[0]["tail"]`, the one
+    # process-wide ring. NEW VALUE: `[0]`, one request's ring, because the rows
+    # gained a leading request-slot axis. Without the index the seam receives a
+    # four-dimensional tensor: the named refusals below still fire on the argument
+    # being absent, so the arm would still pass, but the CONTROL would no longer
+    # reach the seam it exists to exercise.
+    ring = rings[0]["tail"][0]
     pool_cache = item._mla_pool_cache(pages=item.STACK_PAGES)
     # THE OPERAND HELPER HAS A PRECONDITION OF ITS OWN, and commit 1 tripped it. At
     # `tokens=1` the helper computes `1 // index_kpool(4) = 0` candidate pools, which is
@@ -2054,7 +2060,13 @@ def test_the_indexer_refuses_a_prefill_ring_with_no_end_position():
             "the live side caches carry no ring, so there is no prefill_tail to seed and "
             "this arm cannot reach its refusal"
         )
-    ring = rings[0]["tail"]
+    # RE-PINNED (D17.1): ORIGINAL READING `rings[0]["tail"]`, the one
+    # process-wide ring. NEW VALUE: `[0]`, one request's ring, because the rows
+    # gained a leading request-slot axis. Without the index the seam receives a
+    # four-dimensional tensor: the named refusals below still fire on the argument
+    # being absent, so the arm would still pass, but the CONTROL would no longer
+    # reach the seam it exists to exercise.
+    ring = rings[0]["tail"][0]
     pool_cache = item._mla_pool_cache(pages=item.STACK_PAGES)
     selection = item._mla_selection_operands(
         tokens=item.STACK_TOKENS, pages=item.STACK_PAGES
