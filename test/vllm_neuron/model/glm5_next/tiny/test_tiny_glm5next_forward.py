@@ -3661,6 +3661,18 @@ SEED_STACK_BANK_GATE = 5461
 SEED_STACK_BANK_UP = 5462
 SEED_STACK_BANK_DOWN = 5463
 SEED_STACK_ROUTER = 5464
+#: The mHC leaves' base seed, one draw per layer (``inc-glm53f-030d`` commit 4c). A
+#: BASE plus the layer index, for the same reason the attention seed is: two layers
+#: sharing one draw of the six leaves would make "each layer mixed with its own
+#: carrier weights" unmeasurable.
+SEED_STACK_MHC = 5471
+
+#: Two mHC sites per layer -- ``hc_attn_*`` around the attention half and ``hc_ffn_*``
+#: around the feed-forward half. NOT a dial: the count is the number of sites
+#: ``_mhc_leaves_by_site`` derives from the map's own six names
+#: (``model_fp8.py:7643-7653``), and this constant is what the fixture's bind is
+#: checked against so a half-bound layer refuses rather than mixing with zeros.
+MHC_SITES_PER_LAYER = 2
 
 #: Added to :func:`_shared_at_routed_operands`' three seeds, one offset per dense
 #: layer. 100 and 200 rather than 0 and 1 so neither offset can land on another
@@ -3895,6 +3907,55 @@ def _stack_bank_operands() -> dict:
     }
 
 
+def _stack_leaf_shapes(cfg) -> dict:
+    """The shape each of the six mHC leaves has in the checkpoint, DERIVED from the config.
+
+    ``fn`` is ``[mix, hc_mult * hidden]``, ``base`` is ``[mix]`` and ``scale`` is ``[3]``,
+    with ``mix = (2 + hc_mult) * hc_mult`` -- the target model's own closed forms
+    (``design/reference/modeling_glm5_next.py:258-265``), which
+    :class:`Glm5NextHyperConnection` restates as ``hc_mult3``. Read off ``MHC_LEAVES``'s
+    own name shape ``hc_<site>_<role>`` so the six names live in one place, the weight
+    map, exactly as ``test_mhc_composition_030d.py:119-134`` derives them.
+    """
+    from vllm_neuron.model.glm5_next.weight_loaders_fp8 import MHC_LEAVES
+
+    hc_mult = int(cfg.hc_mult)
+    hidden = int(cfg.hidden_size)
+    mix = (2 + hc_mult) * hc_mult
+    by_role = {"fn": (mix, hc_mult * hidden), "base": (mix,), "scale": (3,)}
+    return {leaf: by_role[leaf.split("_")[2]] for leaf in MHC_LEAVES}
+
+
+def _stack_load_the_six(layer, cfg, *, seed: int) -> dict:
+    """Put a real tensor on each of one layer's six mHC leaves, the way a load leaves them.
+
+    ``setattr`` of an ``nn.Parameter`` over the leaf's declared ``None``, which is this
+    suite's idiom for a loaded leaf and the one ``test_mhc_composition_030d.py:151``
+    already uses. Returns ``{leaf: tensor}``.
+
+    THE DRAW IS SMALL ON PURPOSE, and the reason is arithmetic rather than taste. Both
+    gates read ``mixes * hc_scale + hc_base`` through a sigmoid, and ``mixes`` is the
+    RMS-normalised projection of the folded streams, so a large ``hc_scale`` saturates
+    the sigmoid and every stream is then weighted by the same constant -- which is the
+    four-stream analogue of the clamp saturation this item's BLOCK D guards refuse.
+    ``0.1`` keeps both gates in their linear region; ``inc-glm53f-030c`` commit 7
+    measured a real draw at ``hc_scale = [0.110834, -0.083877, -0.030093]``, so this is
+    the magnitude that increment's own control is written against.
+
+    THE LEAVES ARE FLOAT32 while this stack's activations are bfloat16. That is the
+    checkpoint's own arrangement -- the six keys are plain, unquantised tensors -- and
+    ``mhc_pre`` casts ``fn`` to float32 before the projection anyway
+    (``model_fp8.py:1270``), so nothing here rounds.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    placed = {}
+    for leaf, shape in sorted(_stack_leaf_shapes(cfg).items()):
+        tensor = torch.randn(shape, generator=generator, dtype=torch.float32) * 0.1
+        setattr(layer, leaf, torch.nn.Parameter(tensor, requires_grad=False))
+        placed[leaf] = tensor
+    return placed
+
+
 def _stack_fixture(model=None) -> dict:
     """The whole tiny stack, every mapped tensor bound and every load-time prep run.
 
@@ -3966,8 +4027,24 @@ def _stack_fixture(model=None) -> dict:
     final_gain = _stack_gain(2 * STACK_LAYERS)
     model.norm_weight = torch.nn.Parameter(final_gain, requires_grad=False)
 
+    # ---- THE FOUR-STREAM CARRIER'S OWN WEIGHTS, and why they are here at all.
+    # ``inc-glm53f-030d`` part (a) made ``Glm5NextModel.forward`` pass streams
+    # UNCONDITIONALLY (``model_fp8.py:7258``), and ``_mhc_site`` refuses a streams call
+    # on a layer that carries none of the six mHC leaves (``:7719-7723``). So a stack
+    # whose layers hold no mHC weight can no longer be run at all: this fixture loads
+    # the six per layer and binds the two sites, exactly as the load path does, or every
+    # item below refuses instead of measuring.
+    hc_mult = int(cfg.hc_mult)
+    if hc_mult < 2:
+        raise VacuousControlError(
+            f"the config declares hc_mult={hc_mult}; one stream would make every "
+            f"comparison below a plain residual add wearing the streams route's name, "
+            f"which is the network this block exists to remove"
+        )
+
     attention_operands = []
     mlp_operands: dict = {}
+    mhc_operands: dict = {}
     for index, layer in enumerate(layers):
         layer.input_layernorm_weight = torch.nn.Parameter(
             _stack_gain(2 * index), requires_grad=False
@@ -3975,6 +4052,22 @@ def _stack_fixture(model=None) -> dict:
         layer.post_attention_layernorm_weight = torch.nn.Parameter(
             _stack_gain(2 * index + 1), requires_grad=False
         )
+        # ---- THE SIX LEAVES AND THE BIND, per layer, in the load path's own order:
+        # the weights land first and the bind runs after, because the leaves are
+        # ``register_parameter(name, None)`` declarations until something fills them
+        # and a site bound before that would hold ``None`` (``model_fp8.py:7757-7763``).
+        # Each layer draws from its own seed, so a bind that handed two layers one set
+        # of sites is a different number in every comparison below.
+        mhc_operands[index] = _stack_load_the_six(
+            layer, cfg, seed=SEED_STACK_MHC + index
+        )
+        bound = layer.bind_hyper_connection_sites(cfg, torch.device("cpu"))
+        if bound != MHC_SITES_PER_LAYER:
+            raise VacuousControlError(
+                f"layer {index} bound {bound} mHC sites and this stack needs "
+                f"{MHC_SITES_PER_LAYER} -- one for the attention half and one for the "
+                f"feed-forward half; a layer short of a site refuses its own forward"
+            )
         attention_operands.append(
             _materialise_mla_attention(
                 layer.self_attn,
@@ -4036,6 +4129,23 @@ def _stack_fixture(model=None) -> dict:
         )
         mlp_operands[index] = operands
 
+    # ---- THE BIND'S OWN RECORD, read back off the tree rather than restated. The bind
+    # writes a health mapping per layer (``model_fp8.py:7899-7911``) and this row prints
+    # what each layer ended up with, so a transcript says which sites were bound, at
+    # which epsilon and post multiplier, without a second instrument.
+    for index, layer in enumerate(layers):
+        health = getattr(layer, _impl().MHC_BIND_HEALTH_ATTR, None)
+        if health is None:
+            raise VacuousControlError(
+                f"layer {index} carries no mHC bind record, so the bind above did not "
+                f"run on this layer and its two sites are not this fixture's"
+            )
+        print(f"TINYFWD|stack_mhc_bind|layer={index}"
+              f"|bound_sites={health['bound_sites']}|binds={health['binds']}"
+              f"|hc_mult={hc_mult}|sinkhorn_iters={health['sinkhorn_iters']}"
+              f"|hc_eps={health['hc_eps']}|post_mult_value={health['post_mult_value']}"
+              f"|leaf_shapes={sorted((leaf, tuple(t.shape)) for leaf, t in mhc_operands[index].items())}")
+
     parameters = sum(int(p.numel()) for p in model.parameters() if p is not None)
     widths = {
         "qk_nope_head_dim": int(cfg.qk_nope_head_dim),
@@ -4066,6 +4176,8 @@ def _stack_fixture(model=None) -> dict:
         "final_gain": final_gain,
         "attention_operands": attention_operands,
         "mlp_operands": mlp_operands,
+        "mhc_operands": mhc_operands,
+        "hc_mult": hc_mult,
         "dense_at": dense_at,
         "moe_at": moe_at,
     }
@@ -4095,6 +4207,76 @@ def _stack_carriers(layers, selection: dict) -> list:
         }
         for layer in layers
     ]
+
+
+def _stack_mhc_site(layer, which: str, label: str):
+    """The bound mHC site this half's call will run, taken off the layer the product uses.
+
+    ``which`` is ``"attn"`` or ``"ffn"``, the two keys the bind derives from the map's
+    own leaf names. Refuses rather than returning ``None``: every comparison that calls
+    this one is written for the streams route, so an unbound layer is a fixture defect
+    and not a second route to fall back to.
+    """
+    impl = _impl()
+    sites = getattr(layer, impl.MHC_SITES_ATTR, {})
+    if not sites or which not in sites:
+        raise VacuousControlError(
+            f"{label}: this layer has {sorted(sites)} bound and this comparison needs "
+            f"the {which!r} site. The streams route runs one site per half, so an "
+            f"unbound site means the fixture's load-time bind did not reach this layer"
+        )
+    return sites[which]
+
+
+def _stack_mhc_pre(site, streams, label: str):
+    """``(post_mix, comb_mix, layer_input)`` for one half, from the site's OWN ``mhc_pre``.
+
+    THE SITE'S PRE IS EXECUTED, NOT RECOMPUTED, and that is this file's own convention
+    rather than a shortcut. :func:`_stack_attention_half` executes the indexer for the
+    same reason: the mHC pre carries a Sinkhorn dispatch whose arithmetic
+    ``inc-glm53f-028b`` owns and whose per-token normalisation ``test_mhc_layer.py``
+    certifies at this campaign's registered pair, so recomputing it here would measure
+    that kernel a second time instead of measuring what THIS item is named for -- that
+    the stack mixes each half with the streams it was handed, at the site whose weights
+    that layer carries. The mix itself is torch glue and :func:`_stack_mhc_post` closes
+    it, so nothing about the composition is taken on trust.
+
+    ``layer_input`` COMES BACK IN THE STREAMS' DTYPE, which is what the product hands
+    the sublayer (``model_fp8.py:1362`` casts it back), so the reference's half runs on
+    the very tensor the product's half ran on.
+    """
+    post_mix, comb_mix, layer_input = site.mhc_pre(streams)
+    tokens, hc_mult, hidden = (int(v) for v in streams.shape)
+    want = ((tokens, hc_mult, 1), (tokens, hc_mult, hc_mult), (tokens, hidden))
+    got = (tuple(post_mix.shape), tuple(comb_mix.shape), tuple(layer_input.shape))
+    if got != want:
+        raise ReferenceShapeError(
+            f"{label}: the site's pre returned {got} for {tuple(streams.shape)} "
+            f"streams and this comparison is written for {want}; the post gate is one "
+            f"weight per stream, the combine is stream by stream and the collapsed "
+            f"input is the single stream the sublayer takes"
+        )
+    print(f"TINYFWD|stack_mhc_pre|{label}|streams={tuple(streams.shape)}"
+          f"|post_mix_peak={float(post_mix.float().abs().max()):.10g}"
+          f"|comb_row_sums={float(comb_mix.float().sum(dim=-1).min()):.6g}"
+          f"..{float(comb_mix.float().sum(dim=-1).max()):.6g}"
+          f"|layer_input_peak={float(layer_input.float().abs().max()):.10g}"
+          f"|streams_peak={float(streams.float().abs().max()):.10g}"
+          f"|collapse_gain={float(layer_input.float().abs().max() / max(float(streams.float().abs().max()), 1e-30)):.6g}"
+          f"|layer_input_dtype={layer_input.dtype}")
+    return post_mix, comb_mix, layer_input
+
+
+def _stack_mhc_post(site, half, streams, post_mix, comb_mix):
+    """The mixed streams in FLOAT32, from the site's own combine.
+
+    ``streams`` is handed over as float32 ON PURPOSE. :meth:`mhc_post` returns in its
+    residual argument's dtype (``model_fp8.py:1414``, the cast ``inc-glm53f-030d``
+    commit 4 put there), so a bfloat16 residual would round the REFERENCE as well as
+    the forward and this item's whole precision argument is that each comparison
+    carries the forward's own roundings and none of its own.
+    """
+    return site.mhc_post(half.float(), streams.float(), post_mix, comb_mix)
 
 
 def _stack_attention_half(layer, raw, gains, hidden, cfg, selection):
@@ -4234,6 +4416,28 @@ def _stack_peak_band(expected: torch.Tensor, label: str) -> tuple:
     return STACK_RECOMPUTE_RTOL, peak * STACK_RECOMPUTE_ATOL_FACTOR
 
 
+def _stack_argmin_cell(values: torch.Tensor) -> tuple:
+    """The cell holding the smallest ``|value|``, as a FULL-SHAPE index tuple.
+
+    RANK-AGNOSTIC, AND THAT IS THE WHOLE POINT (``inc-glm53f-030d`` commit 4e, round-3
+    finding 1). The band control used to address its cell with ``row, col =
+    divmod(argmin, expected.shape[-1])``, which is a two-dimensional address. Commit 4c
+    started handing it three-dimensional ``[T, S, H]`` streams, and on those the two
+    indices land on dims 0 and 1 instead: ``row`` runs to ``H`` against an extent of
+    ``T`` and ``col`` runs to ``H`` against an extent of ``S``, so the read raised
+    ``IndexError`` on a CORRECT product, and the cases that survived returned a vector
+    that ``float()`` refuses. A tuple index addresses any rank, and on a 2-D tensor it
+    is the same cell ``divmod`` chose, so the callers that were always 2-D see no
+    change.
+    """
+    flat = int(values.abs().reshape(-1).argmin())
+    cell: list[int] = []
+    for extent in reversed(tuple(values.shape)):
+        cell.append(flat % int(extent))
+        flat //= int(extent)
+    return tuple(reversed(cell))
+
+
 def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
                          rtol: float, atol: float, label: str) -> None:
     """Controls A and B for one peak-scaled comparison, run AFTER it has passed.
@@ -4268,12 +4472,11 @@ def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
     requirement, which is a statement about the band and never about the data.
     """
     peak = float(expected.abs().max())
-    cols = int(expected.shape[-1])
-    row, col = divmod(int(expected.abs().reshape(-1).argmin()), cols)
-    a_min = float(expected.abs()[row, col])
+    cell = _stack_argmin_cell(expected)
+    a_min = float(expected.abs()[cell])
     allowance = atol + rtol * a_min
-    print(f"TINYFWD|stack_band_control|site={label}|row={row}|col={col}"
-          f"|expected_at_cell={float(expected[row, col]):.10g}"
+    print(f"TINYFWD|stack_band_control|site={label}|cell={cell}|rank={len(cell)}"
+          f"|expected_at_cell={float(expected[cell]):.10g}"
           f"|abs_at_cell={a_min:.10g}|peak={peak:.10g}"
           f"|rtol={rtol:.10g}|atol={atol:.10g}"
           f"|allowance_at_cell={allowance:.10g}"
@@ -4285,7 +4488,7 @@ def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
                                    ("B_under", 0.5, False),
                                    ("B_over", 1.5, True)):
         probe = produced.clone()
-        probe[row, col] = expected[row, col] + factor * allowance
+        probe[cell] = expected[cell] + factor * allowance
         inside = bool(torch.allclose(probe, expected, rtol=rtol, atol=atol))
         print(f"TINYFWD|stack_band_control|site={label}|arm={arm}"
               f"|planted_multiple_of_allowance={factor}"
@@ -4400,14 +4603,42 @@ def _stack_outside_tolerance(label: str, moved: torch.Tensor,
 # about the loop -- that it holds no per-family branch and hands each layer its #
 # own mapping -- is measured exactly as well by one family as by two.           #
 #                                                                              #
-# THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC    #
-# carrier is ``inc-glm53f-030b``'s. The reference implementation carries        #
-# ``hc_mult`` parallel residual streams between layers and mixes each sublayer  #
-# output back through a hyper-connection at both sites                          #
-# (``modeling_glm5_next.py:1477``, ``:1316-1318``, ``:1325-1327``, ``:1493``,   #
-# ``:302``). This item certifies the ONE-STREAM add and nothing about the       #
-# four-stream carrier; at ``hc_mult`` 1 the reference does not degenerate to an #
-# add either, because its gates are sigmoids plus an epsilon.                    #
+# THE ONE-STREAM EXCLUSION THAT STOOD HERE IS RETIRED, AND THIS ITEM IS NOW    #
+# RE-POINTED AT THE FOUR-STREAM CARRIER (``inc-glm53f-030d`` commit 4c, ruled   #
+# at §943 Q5). It used to say the inter-layer carrier was a ``[T, H]`` add and  #
+# that the checkpoint's 4-stream mHC carrier was ``inc-glm53f-030b``'s.         #
+# ``inc-glm53f-030d`` part (a) built that carrier in                            #
+# ``Glm5NextModel.forward``: the embedding is expanded across the stream axis   #
+# (``modeling_glm5_next.py:1477``), both per-layer sites mix                    #
+# (``:1316-1318``, ``:1325-1327``) and an unweighted mean collapses the streams #
+# before the final norm (``:1493``, ``:302``).                                  #
+#                                                                              #
+# WHAT THAT CHANGED HERE, in four places and no more. The FIXTURE loads the six #
+# mHC leaves per layer and runs the load path's bind, because the stack passes  #
+# streams unconditionally and ``_mhc_site`` refuses a streams call on a layer   #
+# carrying none of them (``model_fp8.py:7719-7723``) -- so an unloaded fixture  #
+# no longer measures a plain add, it refuses. CONJUNCT 1 compares the expand as #
+# well as the index. CONJUNCT 2 expects the one extra ``streams`` keyword and   #
+# requires it to be the same object the layer got positionally. CONJUNCTS 3, 4  #
+# AND 5 compare the site's MIX where they compared a residual add: the site's   #
+# pre collapses the streams into the single ``[T, H]`` each half has always     #
+# taken, the half is unchanged, and the site's post mixes its return back.      #
+#                                                                              #
+# THE mHC PRE AND POST ARE EXECUTED, NOT RECOMPUTED, which is this file's own   #
+# convention for a seam another item certifies -- the same reason the indexer is #
+# executed in :func:`_stack_attention_half`. Their arithmetic is                #
+# ``test_mhc_layer.py``'s and ``test_mhc_corrections_030c.py``'s at this        #
+# campaign's registered pair; what THIS item measures is the composition around #
+# them, and the two dispatch counts are declared in the route predicate so a    #
+# stack that ran one site per layer instead of two fails on the count.          #
+#                                                                              #
+# THE PRECISION BUDGET GAINS ONE TERM AND LOSES NONE. Both mHC seams compute in #
+# float32 and cast back to the carrier's dtype (``model_fp8.py:1362``, :1414``),#
+# so each half's boundary carries the same bf16 rounding it did; the references #
+# below hand the post their residual in FLOAT32 so the reference itself rounds  #
+# nowhere the forward does not. The collapse's mean is the one new rounding and #
+# it lands inside conjunct 5, where the comparison is against the product's own #
+# tensors rather than a recompute of the path.                                   #
 # --------------------------------------------------------------------------- #
 def _row_spread_stats(rows: "torch.Tensor") -> tuple:
     """Relative L2 spread over every pair of rows: ``(rows, max, min, median)``.
@@ -4520,6 +4751,16 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
         "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+        # ---- THE TWO mHC SEAMS, ``inc-glm53f-030d`` commit 4c. TWO SITES PER LAYER,
+        # and each site's one call is one Sinkhorn and one combine: the attention half's
+        # site runs inside the layer (``model_fp8.py:6918``) and the feed-forward half's
+        # runs in the stack loop (``:7265``), both through
+        # ``Glm5NextHyperConnection.forward``, which is one ``mhc_pre`` and one
+        # ``mhc_post`` per call (``:1444-1455``). Each of those enters its seam exactly
+        # once (``:1340``, ``:1408``), so the count is the SITE count and not a token or
+        # stream count -- the batched Sinkhorn takes all T blocks in one dispatch.
+        "mhc_sinkhorn": MHC_SITES_PER_LAYER * STACK_LAYERS,
+        "mhc_hyper_connection": MHC_SITES_PER_LAYER * STACK_LAYERS,
     }
     _declare_bound_and_sentinel(route_expected)
     _assert_route_predicate("6 the decoder stack", route_expected, before, after)
@@ -4577,14 +4818,27 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm as _bmm
 
         _L0 = 0
-        _hidden = recorded_out[_L0][1]
+        # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. ``recorded_out[0][1]`` is now the
+        # four STREAMS, and the MLP is handed the single stream the feed-forward site
+        # collapses them into (``model_fp8.py:7264-7276``). So every row below re-runs the
+        # seam's pieces on THAT tensor, which is still the object the stack handed forward.
+        _streams0 = recorded_out[_L0][1]
+        _site0 = _stack_mhc_site(layers[_L0], _impl().MHC_FFN_SITE, "block C layer 0")
+        _post0, _comb0, _hidden = _stack_mhc_pre(_site0, _streams0, "block C layer 0")
         _layer0 = layers[_L0]
         _gain0 = _layer0.post_attention_layernorm_weight
         _mlp0 = _layer0.mlp
         _normed0 = model._rms_norm(_hidden, _gain0)
         _out0 = _mlp0(_normed0, quant_config=quant_config)
         _out0c = _out0.to(_hidden.dtype)
-        _sum0 = _hidden + _out0c
+        # THE MIX, NOT AN ADD. ``_streams_only`` re-runs the same combine with the streams
+        # ZEROED, which isolates the half's own term inside the mix -- so "absorbed" below
+        # still means what it meant when this was ``hidden + out``: the fraction of
+        # elements where the streams contributed nothing the mix could keep.
+        _sum0 = _site0.mhc_post(_out0, _streams0, _post0, _comb0)
+        _half_only0 = _site0.mhc_post(
+            _out0, torch.zeros_like(_streams0), _post0, _comb0
+        )
 
         # The three public scale grids, by the name the product's own lookup builds
         # (`model_fp8.py:3536-3538`). Read as a dict comprehension rather than a helper, because a
@@ -4601,12 +4855,13 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         _hp = float(_hidden.float().abs().max())
         _fp = float(_out0c.float().abs().max())
         _ulp = 2.0 ** (int(_math.floor(_math.log2(_fp))) - 7) if _fp > 0.0 else 0.0
-        _absorbed = float((_sum0.float() == _out0c.float()).float().mean())
+        _absorbed = float((_sum0.float() == _half_only0.float()).float().mean())
         print(f"TINYFWD|seam_add|layer={_L0}|hidden_peak={_hp:.10g}|ffn_peak={_fp:.10g}"
               f"|ratio={_fp / max(_hp, 1e-30):.6g}|one_ulp_at_ffn_peak={_ulp:.10g}"
               f"|elements_absorbed_frac={_absorbed:.6f}"
               f"|sum_max_spread={_row_spread_stats(_sum0)[1]:.6g}"
-              f"|note=absorbed counts elements where hidden plus out equals out bit for bit")
+              f"|mix_peak={float(_sum0.float().abs().max()):.10g}"
+              f"|note=absorbed counts elements where the mix equals the same mix with the streams zeroed")
 
         # ---- C4: the three matmul seams, read BEFORE the clamp. Measured here and not after, because
         # after the clamp a saturating clamp and a broadcasting kernel are indistinguishable.
@@ -4677,19 +4932,32 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # was written for would be untestable, so each one is re-run on the OLD grids and
     # required to FIRE there.
     #
-    # LAYER 0'S CONTROL IS EXACT. The FFN half is added OUTSIDE the layer call
-    # (``model_fp8.py:6712-6714``), so ``recorded_out[0][1]`` is the ATTENTION half
-    # and the dense rescale cannot move it. The old-scale recompute at layer 0
-    # therefore runs on the very tensor grant 127 ran on.
+    # LAYER 0'S CONTROL IS EXACT. The FFN half is MIXED IN OUTSIDE the layer call
+    # (``model_fp8.py:7264-7276``, where the feed-forward site wraps ``_ffn_half``), so
+    # ``recorded_out[0][1]`` is the streams after the ATTENTION half alone and the dense
+    # rescale cannot move it. The old-scale recompute at layer 0 therefore runs on the
+    # very tensor grant 127 ran on, now read through that layer's own site.
     #
-    # NOTHING HERE TOUCHES A DISPATCH COUNTER. ``_stack_ffn_half`` on a dense layer
-    # reaches ``_ffn_norm`` and ``_dense_output`` only, both pure torch, and the
-    # route predicate's window closed above in any case.
+    # WHAT THIS BLOCK NOW TOUCHES, DISCLOSED. ``_stack_ffn_half`` on a dense layer still
+    # reaches ``_ffn_norm`` and ``_dense_output`` only, both pure torch -- but collapsing
+    # the streams and mixing back runs the site's own pre and post, which ARE two
+    # dispatches each. That is why the route predicate's window closes above this block
+    # and not below it: everything from here on is a recompute, and the counted figures
+    # belong to the forward alone.
     from torch.nn.functional import silu as _dsilu
 
     _old_dense_ops = {}
     for _di, _dense_index in enumerate(fixture["dense_at"]):
-        _dh = recorded_out[_dense_index][1]
+        # RE-POINTED BY ``inc-glm53f-030d`` commit 4c, exactly as BLOCK C is: the layer
+        # returns the four STREAMS and the dense MLP is handed the single stream its
+        # feed-forward site collapses them into. The guards below are about that half's
+        # numerics, so they run on the tensor the half actually gets.
+        _dstreams = recorded_out[_dense_index][1]
+        _dsite = _stack_mhc_site(layers[_dense_index], _impl().MHC_FFN_SITE,
+                                 f"block D layer {_dense_index}")
+        _dpost, _dcomb, _dh = _stack_mhc_pre(
+            _dsite, _dstreams, f"block D layer {_dense_index}"
+        )
         _dlimit = float(cfg.swiglu_limit)
         _old_dense_ops[_dense_index] = _shared_at_routed_operands(
             seed_offset=STACK_DENSE_SEED_OFFSETS[_di]
@@ -4709,13 +4977,24 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 _u, -_dlimit, _dlimit
             )
             _o = _half["out"].to(_dh.dtype)
-            _sum = _dh + _o
+            # THE MIX AND ITS STREAMS-ZEROED TWIN, for the same reason BLOCK C carries
+            # them: guard (ii) below asks whether the streams' own term survived, and the
+            # zeroed twin is what isolates the half's term inside the combine.
+            _sum = _dsite.mhc_post(_half["out"], _dstreams, _dpost, _dcomb)
+            _half_only = _dsite.mhc_post(
+                _half["out"], torch.zeros_like(_dstreams), _dpost, _dcomb
+            )
             _reading = (
                 float((_g >= _dlimit).float().mean()),
                 float((_u.abs() >= _dlimit).float().mean()),
                 _row_spread_stats(_act)[1],
-                float((_sum.float() == _o.float()).float().mean()),
+                float((_sum.float() == _half_only.float()).float().mean()),
                 _row_spread_stats(_sum)[1],
+                # GUARD (iii)'S TENSOR, ADDED BY ``inc-glm53f-030d`` COMMIT 4e (round-3
+                # finding 2). The collapse grant 127 read is a collapse of THIS tensor --
+                # the dense half's own output rows -- and it is the same recompute both
+                # scales already run here, so the guard costs nothing new.
+                _row_spread_stats(_half["out"])[1],
             )
             _readings[_tag] = _reading
             _hpeak = float(_dh.float().abs().max())
@@ -4730,9 +5009,10 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                   f"|ffn_share={_fpeak / max(_hpeak, 1e-30):.6g}"
                   f"|elements_absorbed_frac={_reading[3]:.6f}"
                   f"|sum_max_spread={_reading[4]:.6g}"
+                  f"|ffn_out_max_spread={_reading[5]:.6g}"
                   f"|absorption_reading_bound={STACK_ABSORPTION_CEILING}")
 
-        _gf, _uf, _as, _absorbed, _sumspread = _readings["new"]
+        _gf, _uf, _as, _absorbed, _sumspread, _ffnspread = _readings["new"]
         # GUARD (i): THE CLAMP MUST BIND, AND MUST NOT BIND EVERYWHERE. Both
         # fractions above zero says the SwiGLU bound is live on both projections;
         # a nonzero activated row spread says it did not saturate every row into one
@@ -4747,30 +5027,48 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 f"dead at this scale, and a zero spread means it saturated every row "
                 f"into the same constant"
             )
-        # GUARD (ii): THE RESIDUAL ADD MUST NOT ABSORB THE HIDDEN TERM. STRUCTURAL,
+        # GUARD (ii): THE mHC MIX MUST NOT ABSORB THE STREAMS' OWN TERM. STRUCTURAL,
         # for the same reason guard (i) is: absorption strictly below every element,
         # and a sum whose rows still differ. That pair IS the collapse being absent,
         # and it needs no threshold nobody has measured yet -- the fraction itself is
         # printed above beside :data:`STACK_ABSORPTION_CEILING` as a reading.
         if not (_absorbed < 1.0 and _sumspread > 0.0):
             raise VacuousControlError(
-                f"layer {_dense_index}: the residual add absorbs the hidden term in "
-                f"{_absorbed:.6f} of elements and the sum's row spread is "
-                f"{_sumspread:.6g}. The FFN half peaks at "
-                f"{float(_halves[0][1]['out'].abs().max()):.6g} against a hidden "
-                f"peak of {float(_dh.float().abs().max()):.6g}, so the sum carries "
-                f"the FFN half alone and every comparison below it is blind to the "
-                f"other one"
+                f"layer {_dense_index}: the mHC mix equals the same mix with the "
+                f"streams zeroed in {_absorbed:.6f} of elements and the mix's row "
+                f"spread is {_sumspread:.6g}. The FFN half peaks at "
+                f"{float(_halves[0][1]['out'].abs().max()):.6g} against a collapsed "
+                f"stream peak of {float(_dh.float().abs().max()):.6g}, so the mix "
+                f"carries the FFN half alone and every comparison below it is blind "
+                f"to the streams it was supposed to mix"
+            )
+        # GUARD (iii): THE DENSE HALF MUST NOT COLLAPSE EVERY TOKEN INTO ONE ROW. This
+        # is the guard grant 127 earned, and ``inc-glm53f-030d`` commit 4e moved it onto
+        # the tensor that collapse actually flattens -- the dense half's OWN output rows,
+        # `half["out"]` -- for the reason round-3 finding 2 gives. It used to read the
+        # per-layer STREAMS below layer 0, and under mHC that reading cannot fail: the
+        # mix multiplies each token's row by its own `post` gate, so a fully collapsed
+        # half still leaves every row a DIFFERENT scalar multiple of one vector, and the
+        # metric here is scale free, so the spread comes back positive on exactly the
+        # fixture the guard exists to refuse. The half's own rows carry no per-token
+        # gate, so a saturated SwiGLU shows there as the zero it is.
+        if not _ffnspread > 0.0:
+            raise VacuousControlError(
+                f"layer {_dense_index}: the dense half's own output rows have pairwise "
+                f"spread {_ffnspread:.6g}, so every token leaves this half holding the "
+                f"same vector. That is grant 127's collapse, and no comparison below it "
+                f"can see a per-token defect -- the mix cannot repair it either, because "
+                f"a per-token gate on one constant row is still one direction"
             )
         # THE FAILING CONTROLS, EXECUTED ONLY WHERE THE CONTROL TENSOR IS EXACT.
         #
-        # The OLD grids must fire BOTH guards, or the guards are statements no scale
-        # in this file's history could have violated. But this control is a
-        # REPRODUCTION of grant 127, and it reproduces only where it runs on the
-        # tensor grant 127 ran on. Layer 0 is that place: the FFN half is added
-        # OUTSIDE the layer call, so ``recorded_out[0][1]`` is the attention half and
-        # this commit cannot move it. Layer 1 is not: its input carries layer 0's FFN
-        # half AT THE NEW SCALE, which no run has measured.
+        # A guard is re-run on the OLD grids and required to FIRE there, or it is a
+        # statement no scale in this file's history could have violated. But this control
+        # is a REPRODUCTION of grant 127, and it reproduces only where it runs on the
+        # tensor grant 127 ran on. Layer 0 is that place: the FFN half is mixed in
+        # OUTSIDE the layer call, so ``recorded_out[0][1]`` is the streams after the
+        # attention half alone and this commit cannot move it. Layer 1 is not: its input
+        # carries layer 0's FFN half AT THE NEW SCALE, which no run has measured.
         #
         # WHY REQUIRING IT THERE WOULD BE A FALSE RED. At the old scale a layer-1 row
         # sums about 3200 per column, so one bf16 ULP is 16 and half a ULP is 8; a
@@ -4779,11 +5077,30 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         # ``_oas == 0`` needs EVERY gate element and EVERY |up| element at or past
         # the limit in EVERY row, which grant 127 proved for layer 0 only.
         #
-        # SO THE RAISES RUN WHERE THE CONTROL IS EXACT, and layer 1's old-scale
-        # numbers stay the READINGS they always were: the ``scale=old`` row above
-        # prints them, and the legend row below says which layer's control gates and
-        # which only reads. Nothing else about the guards moves.
-        _ogf, _ouf, _oas, _oabs, _osum = _readings["old"]
+        # WHICH GUARDS THE OLD GRID ACTUALLY VIOLATES -- MEASURED, NOT PREDICTED. Grant
+        # 215 ran this block for the first time anywhere. At layer 0 the old grid read
+        # ``gate_at_limit_frac=1.000000``, ``up_at_limit_frac=1.000000``,
+        # ``activated_max_spread=0`` and ``ffn_out_max_spread=0``, against 0.500000,
+        # 0.500000, 0.162277 and 0.146685 at the new grid -- so guards (i) and (iii)
+        # both fire on the old grid, and both of them gate below. It also read
+        # ``elements_absorbed_frac=0.993000`` and ``sum_max_spread=0.0993485``, which
+        # guard (ii) ACCEPTS. So the old grid is not the fixture guard (ii) refuses, and
+        # requiring it to fire there was this block's own mistake -- not a defect in the
+        # product and not a defect in the guard. Grant 127's collapse is a saturated
+        # SwiGLU, which is exactly what a zero activated spread and a zero half-output
+        # spread ARE. Guard (ii) refuses a different degeneracy, a mix that carries the
+        # FFN half alone, and at the old grid 0.7 percent of elements still moved.
+        #
+        # SO GUARD (ii)'S CONTROL IS A READING HERE, with its own falsifier measured
+        # beside it and nothing gated on that measurement. Gating on a number no run had
+        # produced is what put the false red in this block in the first place, so the
+        # ladder below reports where guard (ii)'s predicate does fire and a later round
+        # may gate it once a transcript shows the answer.
+        #
+        # Layer 1's old-scale numbers stay the READINGS they always were: the
+        # ``scale=old`` row above prints them, and the legend row below says which
+        # layer's control gates and which only reads. No guard's own predicate moves.
+        _ogf, _ouf, _oas, _oabs, _osum, _offn = _readings["old"]
         _control_is_exact = not any(
             _below < _dense_index for _below in fixture["dense_at"]
         )
@@ -4795,7 +5112,10 @@ def test_tiny_model_forward_matches_the_reference() -> None:
               f"|old_activated_max_spread={_oas:.6g}"
               f"|old_elements_absorbed_frac={_oabs:.6f}"
               f"|old_sum_max_spread={_osum:.6g}"
+              f"|old_ffn_out_max_spread={_offn:.6g}"
               f"|gates_iff_no_dense_layer_sits_below_this_one={_control_is_exact}"
+              f"|guards_that_gate_on_the_old_grid=(i),(iii)"
+              f"|guard_ii_control=reading_only"
               f"|note=only there is the old-scale recompute the tensor grant 127 read")
         if _control_is_exact:
             if _ogf > 0.0 and _ouf > 0.0 and _oas > 0.0:
@@ -4806,71 +5126,142 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                     f"of which the guard accepts -- so the guard is not what "
                     f"tells the two scales apart"
                 )
-            if _oabs < 1.0 and _osum > 0.0:
+            # GUARD (ii)'S CONTROL, AS A READING AND NOT A GATE, for the reason the
+            # header gives: the old grid absorbs 0.993 of elements where guard (ii)
+            # wants strictly below 1.0, so it does not fire here, and this block reports
+            # that in a row instead of raising on it.
+            _ii_fired_on_the_old_grid = not (_oabs < 1.0 and _osum > 0.0)
+            # ITS OWN FALSIFIER, MEASURED. What guard (ii) refuses is TOTAL absorption,
+            # and that is reached by SCALING the old half's own output until the streams'
+            # term falls under one ULP everywhere. The ladder prints the first factor
+            # that gets there, so the row states how much headroom the old grid still had
+            # at 0.993. It is wrapped and it gates on nothing, because a defect in these
+            # lines must not change what this item decides -- BLOCK C's convention, for
+            # the same reason.
+            try:
+                _old_out = dict(_halves)["old"]["out"]
+                _rungs = []
+                _ii_fires_at = None
+                for _factor in (1.0, 2.0 ** 4, 2.0 ** 8, 2.0 ** 12):
+                    _fs = _old_out * _factor
+                    _fsum = _dsite.mhc_post(_fs, _dstreams, _dpost, _dcomb)
+                    _fhalf = _dsite.mhc_post(
+                        _fs, torch.zeros_like(_dstreams), _dpost, _dcomb
+                    )
+                    _ffrac = float((_fsum.float() == _fhalf.float()).float().mean())
+                    _fspread = _row_spread_stats(_fsum)[1]
+                    _rungs.append(f"{_factor:g}:{_ffrac:.6f}")
+                    if _ii_fires_at is None and not (_ffrac < 1.0 and _fspread > 0.0):
+                        _ii_fires_at = _factor
+                print(f"TINYFWD|stack_guard_ii_control|layer={_dense_index}"
+                      f"|fired_on_the_old_grid={_ii_fired_on_the_old_grid}"
+                      f"|old_absorbed={_oabs:.6f}|old_sum_max_spread={_osum:.6g}"
+                      f"|absorbed_by_scale_factor={';'.join(_rungs)}"
+                      f"|predicate_first_fires_at_factor={_ii_fires_at}"
+                      f"|class=reading_only"
+                      f"|note=guard (ii) refuses a mix carrying the FFN half alone; the "
+                      f"old grid does not reach that, so this is read and gated nowhere")
+            except Exception as _ii_exc:  # a reading must not decide the item
+                print(f"TINYFWD|stack_guard_ii_control|layer={_dense_index}"
+                      f"|class=reading_only|unavailable={type(_ii_exc).__name__}"
+                      f"|detail={_ii_exc}")
+            # GUARD (iii)'S FAILING CONTROL, on the same tensor the guard now reads and
+            # at the same layer the other two controls gate: the OLD grids saturate both
+            # SwiGLU clamps into one constant activated row, and a constant row through a
+            # linear down-projection is a constant row, so this half's rows must read a
+            # spread of EXACTLY zero. That is grant 127's number, on grant 127's tensor.
+            # ``inc-glm53f-030d`` commit 4e replaced a control that rebuilt the next
+            # layer's input THROUGH the mix and demanded zero of it: the mix's per-token
+            # gate makes those rows differ by construction, so the old control raised on
+            # a correct product (round-3 finding 2).
+            if _offn > 0.0:
                 raise VacuousControlError(
-                    f"layer {_dense_index}: guard (ii)'s control did not "
-                    f"fire. The OLD exponents absorb the hidden term in "
-                    f"{_oabs:.6f} of elements and leave the sum's row spread "
-                    f"at {_osum:.6g}, both of which the guard accepts -- so "
-                    f"the guard is not what tells the two scales apart"
+                    f"layer {_dense_index}: guard (iii)'s control did not fire. The OLD "
+                    f"exponents leave the dense half's own output rows at spread "
+                    f"{_offn:.6g} instead of zero, so the guard above is not what tells "
+                    f"the two scales apart -- and the saturation grant 127 measured is "
+                    f"not what this recompute reproduced"
                 )
 
-    # ---- GUARD (iii): EVERY STAGE BELOW LAYER 0 STILL CARRIES DISTINCT ROWS. Grant
-    # 127 read `layer1_in`, `layer1_out`, `layer2_in` and `layer2_out` at a row
-    # spread of EXACTLY ZERO, which is the collapse in one number per stage.
+    # ---- THE PER-STAGE ROW SPREADS, READINGS AND NOT A GATE (``inc-glm53f-030d``
+    # commit 4e, round-3 finding 2). Grant 127 read `layer1_in`, `layer1_out`,
+    # `layer2_in` and `layer2_out` at a row spread of EXACTLY ZERO, which is why these
+    # four numbers are printed and why they were once the gate. They cannot BE the gate
+    # on the streams path: every one of these tensors has been through the mix, and the
+    # mix multiplies each token's row by that token's own `post` gate, so even a fully
+    # collapsed half comes back as a different scalar multiple of one vector per token --
+    # and this metric is scale free, so it reports that as spread. A reading that cannot
+    # take the value it refuses is not a guard, so the gate moved up to the dense half's
+    # own output rows, where the collapse still shows as zero; these stay as the
+    # per-stage evidence grant 127's records are compared against.
     for _si in range(1, len(layers)):
         for _stage, _t in ((f"layer{_si}_in", recorded_in[_si][1][0]),
                            (f"layer{_si}_out", recorded_out[_si][1])):
             _rows, _mx, _mn, _md = _row_spread_stats(_t)
             print(f"TINYFWD|stack_row_guard|stage={_stage}|rows={_rows}"
                   f"|max_spread={_mx:.6g}|min_spread={_mn:.6g}"
-                  f"|median_spread={_md:.6g}")
-            if not _mx > 0.0:
-                raise VacuousControlError(
-                    f"{_stage} carries {_rows} rows whose pairwise spread is exactly "
-                    f"zero, so every token below layer 0 holds the same vector and "
-                    f"no comparison here can see a per-token defect"
-                )
-    # ITS FAILING CONTROL, at the seam the collapse ran through: layer 1's input
-    # rebuilt with the OLD grids. One dense recompute, not a second stack run.
-    _c0 = fixture["dense_at"][0]
-    _ch = recorded_out[_c0][1]
-    _cold = _stack_ffn_half(
-        layers[_c0], _ch, cfg, _old_dense_ops[_c0], routed=False
-    )["out"].to(_ch.dtype)
-    _cspread = _row_spread_stats(_ch + _cold)[1]
-    print(f"TINYFWD|stack_row_guard|stage=layer{_c0 + 1}_in_at_the_old_scale"
-          f"|max_spread={_cspread:.6g}|bound=0"
-          f"|note=this is the seam grant 127 read at zero")
-    if _cspread > 0.0:
-        raise VacuousControlError(
-            f"guard (iii)'s control did not fire. Layer {_c0 + 1}'s input rebuilt "
-            f"with the OLD exponents has row spread {_cspread:.6g}, which the guard "
-            f"accepts -- so the guard is not what tells the two scales apart"
-        )
+                  f"|median_spread={_md:.6g}|class=reading_only"
+                  f"|note=gated at the dense half's own rows instead; the mHC per-token"
+                  f" gate makes a collapsed half read nonzero here")
     # ---- end of the BLOCK D guards.
 
-    # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX. Exact equality, not a tolerance:
-    # the lookup copies rows and computes nothing, so a difference of any size is a
-    # different function.
+    # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX, EXPANDED ACROSS THE STREAM AXIS.
+    # Exact equality, not a tolerance: the lookup copies rows, the expand copies them
+    # again and neither computes anything, so a difference of any size is a different
+    # function. RE-POINTED BY ``inc-glm53f-030d`` commit 4c: the first layer is now
+    # handed ``[T, S, H]`` rather than ``[T, H]``, and the claim is a conjunction --
+    # the table is still indexed, and every stream starts as the SAME token vector
+    # (``reference:1477``, ``model_fp8.py:7251``). Comparing only the expanded tensor
+    # would pass on a forward that expanded the wrong rows.
     first_input = recorded_in[0][1][0]
-    if not torch.equal(first_input, fixture["table"][input_ids]):
+    embedded = fixture["table"][input_ids]
+    expanded = embedded.unsqueeze(1).expand(-1, fixture["hc_mult"], -1)
+    print(f"TINYFWD|stack_embedding|first_input={tuple(first_input.shape)}"
+          f"|embedded={tuple(embedded.shape)}|hc_mult={fixture['hc_mult']}"
+          f"|dtype={first_input.dtype}")
+    if tuple(first_input.shape) != tuple(expanded.shape):
+        raise ReferenceShapeError(
+            f"the first layer was handed {tuple(first_input.shape)} and the expanded "
+            f"embedding is {tuple(expanded.shape)}; the stack's carrier is "
+            f"[T, hc_mult, H] and a different rank is a different network, not a "
+            f"numeric difference"
+        )
+    if not torch.equal(first_input, expanded):
         raise VacuousControlError(
             "the first layer was handed a tensor that is not "
-            "embed_tokens_weight[input_ids], so the embedding is not the index "
-            "this forward's docstring declares"
+            "embed_tokens_weight[input_ids] expanded across the stream axis, so "
+            "either the embedding is not the index this forward's docstring declares "
+            "or the four streams did not start as one token vector"
         )
+    for _stream in range(int(first_input.shape[1])):
+        if not torch.equal(first_input[:, _stream, :], embedded):
+            raise VacuousControlError(
+                f"stream {_stream} of the first layer's input is not the embedding "
+                f"itself, so the expand carried something other than the token vector"
+            )
 
-    # ---- CONJUNCT 2: EACH LAYER RECEIVED EXACTLY ITS OWN CARRIER. Identity, not
-    # equality: ``**mapping`` hands the callee the very objects the caller put in the
-    # mapping, so ``is`` is the sharp test and a carrier built for another layer --
-    # another layer's latent cache above all -- fails it.
+    # ---- CONJUNCT 2: EACH LAYER RECEIVED EXACTLY ITS OWN CARRIER, AND THE STREAMS IT
+    # WAS HANDED POSITIONALLY. Identity, not equality: ``**mapping`` hands the callee
+    # the very objects the caller put in the mapping, so ``is`` is the sharp test and a
+    # carrier built for another layer -- another layer's latent cache above all -- fails
+    # it.
+    #
+    # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. The stack now passes ONE MORE
+    # KEYWORD, ``streams``, and passes the SAME OBJECT positionally
+    # (``model_fp8.py:7258``): the keyword is the route selector and the positional is
+    # the one-stream route's operand, which a bound layer refuses to take. So the
+    # keyword set is the carrier's plus that one name, and the two arguments are
+    # required to be the same object -- a stack that handed a layer one tensor
+    # positionally and a different one by keyword would run the mHC pre on states no
+    # sublayer ever saw, and nothing downstream could tell.
+    _streams_keyword = "streams"
     for index, carrier in enumerate(carriers):
         got_kwargs = recorded_in[index][2]
-        if set(got_kwargs) != set(carrier):
+        if set(got_kwargs) != set(carrier) | {_streams_keyword}:
             raise VacuousControlError(
-                f"layer {index} was handed the keywords {sorted(got_kwargs)} and "
-                f"its carrier declares {sorted(carrier)}"
+                f"layer {index} was handed the keywords {sorted(got_kwargs)} and this "
+                f"item declares its carrier's {sorted(carrier)} plus "
+                f"{_streams_keyword!r}, the route selector the streams path adds"
             )
         wrong = [key for key in carrier if got_kwargs[key] is not carrier[key]]
         if wrong:
@@ -4879,26 +5270,64 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 f"own carrier mapping, so the per-layer state is not bound to the "
                 f"layer that owns it"
             )
+        if got_kwargs[_streams_keyword] is not recorded_in[index][1][0]:
+            raise VacuousControlError(
+                f"layer {index} was handed one tensor positionally and a different "
+                f"object as {_streams_keyword!r}; the stack passes one tensor as both "
+                f"arguments on purpose, so a split here means the mHC pre and the "
+                f"one-stream operand disagree about what this layer's input is"
+            )
     print(f"TINYFWD|stack_carriers|layers={len(carriers)}"
-          f"|keys={sorted(carriers[0])}|bound_by_identity=True")
+          f"|keys={sorted(carriers[0])}|bound_by_identity=True"
+          f"|streams_keyword_present=True|streams_is_the_positional=True")
 
-    # ---- CONJUNCT 3: THE ATTENTION HALF AND ITS RESIDUAL ADD, per layer. The
-    # reference reads the recorded input, so its selection is that layer's own.
+    # ---- CONJUNCT 3: THE ATTENTION HALF AND ITS mHC MIX, per layer. The reference
+    # reads the recorded input, so its selection is that layer's own.
+    #
+    # RE-POINTED BY ``inc-glm53f-030d`` commit 4c, and the old form is stated so the
+    # change is legible: this conjunct used to compare ``hidden + attended`` against the
+    # layer's return, which was the one-stream residual add. The layer no longer does
+    # that add. It runs its ``hc_attn_*`` site around the same attention half
+    # (``model_fp8.py:6915-6918``), so the composition is now three steps and the
+    # reference follows each: the site's pre collapses the four streams into the single
+    # ``[T, H]`` the half takes, the half runs on THAT tensor, and the site's post mixes
+    # the half's output back across the streams.
+    #
+    # WHAT MOVED AND WHAT DID NOT. The attention numerics are still item 5's and are
+    # still recomputed here in float32 from the tensor the layer received. The mHC pre
+    # and post are EXECUTED rather than recomputed, for the reason
+    # :func:`_stack_mhc_pre` records -- they carry two kernel dispatches whose arithmetic
+    # ``test_mhc_layer.py`` certifies at the registered pair -- so what this conjunct
+    # measures is the COMPOSITION: that each layer mixed its own half's output, at its
+    # own site, into the streams it was handed.
     for index, layer in enumerate(layers):
         raw, gains = fixture["attention_operands"][index]
         hidden = recorded_in[index][1][0]
-        _normed, topk_indices, attended = _stack_attention_half(
-            layer, raw, gains, hidden, cfg, selection
+        site = _stack_mhc_site(layer, _impl().MHC_ATTENTION_SITE,
+                               f"conjunct 3 layer {index}")
+        post_mix, comb_mix, layer_input = _stack_mhc_pre(
+            site, hidden, f"conjunct 3 layer {index}"
         )
-        expected = hidden.float() + attended.float()
+        _normed, topk_indices, attended = _stack_attention_half(
+            layer, raw, gains, layer_input, cfg, selection
+        )
+        expected = _stack_mhc_post(site, attended, hidden, post_mix, comb_mix)
         produced = recorded_out[index][1].float()
+        if tuple(produced.shape) != tuple(expected.shape):
+            raise ReferenceShapeError(
+                f"layer {index} returned {tuple(produced.shape)} and the mixed "
+                f"reference is {tuple(expected.shape)}; the streams route returns the "
+                f"streams, so a rank disagreement is a route disagreement"
+            )
         print(f"TINYFWD|stack_attention|layer={index}"
               f"|selected={tuple(topk_indices.shape)}"
               f"|sentinels={int((topk_indices < 0).sum())}"
               f"|attention_share="
               f"{float(attended.abs().max() / expected.abs().max()):.6f}"
               f"|max_abs_diff={float((produced - expected).abs().max()):.10g}"
-              f"|peak_reference={float(expected.abs().max()):.10g}")
+              f"|peak_reference={float(expected.abs().max()):.10g}"
+              f"|half_input=the site's collapsed layer_input"
+              f"|mix=the site's own post")
         # ---- THE PEAK-SCALED BAND, and the readings that let it be checked. The
         # frozen pair here was `RTOL`/`ATOL`, and this site is one of the two the
         # lead's option (b) ruling moves; the module pair itself does not move and
@@ -4925,20 +5354,32 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # every layer but the last the next recorded input is the answer; for the last
     # one the stack's final norm is, which is conjunct 5.
     ffn = []
+    ffn_mix = []
     for index, layer in enumerate(layers):
         hidden = recorded_out[index][1]
         routed = index in fixture["moe_at"]
+        # ---- THE FEED-FORWARD SITE. ``_ffn_half`` is unchanged and is still handed a
+        # single ``[T, H]`` stream; what moved is WHERE that stream comes from and where
+        # the return goes. The stack collapses the streams through its ``hc_ffn_*`` site,
+        # calls the half, and mixes the return back (``model_fp8.py:7264-7276``), which
+        # is the reference's order here too.
+        site = _stack_mhc_site(layer, _impl().MHC_FFN_SITE, f"conjunct 4 layer {index}")
+        post_mix, comb_mix, layer_input = _stack_mhc_pre(
+            site, hidden, f"conjunct 4 layer {index}"
+        )
         half = _stack_ffn_half(
-            layer, hidden, cfg, fixture["mlp_operands"][index], routed=routed
+            layer, layer_input, cfg, fixture["mlp_operands"][index], routed=routed
         )
         ffn.append(half)
+        ffn_mix.append((site, post_mix, comb_mix, layer_input))
         limit = float(cfg.swiglu_limit)
         print(f"TINYFWD|stack_ffn|layer={index}"
               f"|branch={'routed' if routed else 'dense'}|limit={limit}"
               f"|gate_peak={float(half['gate'].abs().max()):.4f}"
               f"|up_peak={float(half['up'].abs().max()):.4f}"
               f"|clamp_binds={bool(float(half['gate'].abs().max()) > limit or float(half['up'].abs().max()) > limit)}"
-              f"|ffn_share={float(half['out'].abs().max() / hidden.abs().max()):.6f}")
+              f"|ffn_share={float(half['out'].abs().max() / max(float(layer_input.float().abs().max()), 1e-30)):.6f}"
+              f"|half_input=the ffn site's collapsed layer_input")
         if routed:
             print(f"TINYFWD|stack_conditioning|layer={index}"
                   f"|condition={half['condition']:.4f}"
@@ -4952,7 +5393,9 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                     f"large opposing terms, so every reading here is inflated by "
                     f"a vanishing denominator"
                 )
-        expected = hidden.float() + half["out"].float()
+        # RE-POINTED BY ``inc-glm53f-030d`` commit 4c: the residual add is gone and the
+        # site's post takes its place, over the same streams the half was collapsed from.
+        expected = _stack_mhc_post(site, half["out"], hidden, post_mix, comb_mix)
         if index + 1 < len(layers):
             # THIS COMPARISON NEVER SEES THE ROUTED LAYER. The guard above runs it
             # for every layer except the last, and this fixture's only routed layer IS
@@ -5041,7 +5484,29 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             f"cell by cell and adds one of them to the residual, so a shape "
             f"disagreement is a refusal and not a skip"
         )
-    final_input = last + _half_product.to(last.dtype)
+    # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. The chain the final norm closes is now
+    # four steps, not two: the last layer's FFN site mixes the product's own half back
+    # into the streams, an UNWEIGHTED MEAN collapses the stream axis, the collapse is cast
+    # to the embedding table's dtype and the norm runs on that
+    # (``model_fp8.py:7287-7288``, ``reference:302`` and ``:1493``). The mean carries no
+    # learned weight at all -- the target model's own comment says so, and it is why this
+    # step is a mean and not a third mHC site.
+    #
+    # THE CASTS ARE THE PRODUCT'S, deliberately, and that is unchanged from what this
+    # comparison already did: ``expected`` is built from the PRODUCT's own tensors, so it
+    # takes the product's own dtypes at each step and the error this band must hold is
+    # the norm's own rounding rather than a whole path's recompute.
+    _final_site, _final_post_mix, _final_comb_mix, _final_layer_input = ffn_mix[-1]
+    final_streams = _final_site.mhc_post(
+        _half_product, last, _final_post_mix, _final_comb_mix
+    )
+    if tuple(final_streams.shape) != tuple(last.shape):
+        raise ReferenceShapeError(
+            f"the last layer's feed-forward site returned "
+            f"{tuple(final_streams.shape)} for {tuple(last.shape)} streams; the mix "
+            f"returns the streams it was handed, and the mean below reduces that axis"
+        )
+    final_input = final_streams.mean(dim=1).to(fixture["table"].dtype)
     expected = _ffn_norm(final_input, fixture["final_gain"], float(cfg.rms_norm_eps))
     if tuple(got.shape) != (STACK_TOKENS, STACK_HIDDEN_SIZE):
         raise ReferenceShapeError(
@@ -5053,13 +5518,15 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # explicit term so this reading still says what storage does to the rows: if the float32 spread
     # is nonzero while the bf16 spread is zero then storage is what erased the difference; if both
     # are zero the rows were already equal before any rounding. Nothing gates.
-    _sum_f32 = last.float() + ffn[-1]["out"].float()
+    _sum_f32 = _stack_mhc_post(
+        _final_site, ffn[-1]["out"], last, _final_post_mix, _final_comb_mix
+    ).mean(dim=1)
     _f32 = _row_spread_stats(_sum_f32)
     _bf = _row_spread_stats(_sum_f32.to(torch.bfloat16))
     print(f"TINYFWD|rowspread_dtype|stage=final_input"
           f"|float32_max_spread={_f32[1]:.6g}|bf16_max_spread={_bf[1]:.6g}"
           f"|float32_median_spread={_f32[3]:.6g}|bf16_median_spread={_bf[3]:.6g}"
-          f"|note=float32 is the sum the model does not compute; the compared final_input is the bf16 sum")
+          f"|note=float32 is the mix and mean the model does not compute in fp32; the compared final_input is the bf16 one")
     # ---- READINGS ONLY, BLOCK B2: the cast points 5b mirrors, and the term 5a owns.
     # `residual_share` below one bf16 step is what reddened round 20, and `routed_bank_term`
     # is the bank's own recompute difference, which round 21 measured at 1.22 bf16 steps and
@@ -5067,10 +5534,13 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # already proved the operands, so a guard here would be dead. Nothing gates.
     _resid_share = float(last.abs().max() / _half_ref.abs().max())
     print(f"TINYFWD|final_add_castpoints|half_reference_dtype={_half_ref.dtype}"
-          f"|residual_dtype={last.dtype}|sum_dtype={final_input.dtype}"
+          f"|residual_dtype={last.dtype}|mixed_dtype={final_streams.dtype}"
+          f"|collapsed_dtype={final_input.dtype}"
           f"|residual_share={_resid_share:.6g}|one_bf16_step={2.0 ** -7:.6g}"
           f"|residual_below_one_step={bool(_resid_share < 2.0 ** -7)}"
-          f"|note=the model casts the half at model_fp8.py:6616 and adds in that dtype at :6714")
+          f"|mix_gain={float(final_streams.float().abs().max() / max(float(last.float().abs().max()), 1e-30)):.6g}"
+          f"|collapse_gain={float(final_input.float().abs().max() / max(float(final_streams.float().abs().max()), 1e-30)):.6g}"
+          f"|note=the site mixes at model_fp8.py:1408-1414 and the mean collapses at :7287; the residual share is a reading the mix no longer decides alone")
     _bank_ae = (_half_product.float() - _half_ref.float()).abs()
     _bank_peak = float(_half_ref.abs().max())
     print(f"TINYFWD|routed_bank_term|product_dtype={_half_product.dtype}"
@@ -5132,11 +5602,13 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # ---- CONTROL A: EACH LAYER READ ITS OWN MLP WEIGHTS. The two dense layers'
     # references are swapped and the answer must leave the band, or two layers
     # holding different weights would be indistinguishable from two sharing one set.
+    # Both controls recompute on the SAME collapsed stream conjunct 4 used -- the tensor
+    # the site handed the half -- so the only thing they move is the operand or the gain.
     first_dense, second_dense = fixture["dense_at"]
     _stack_outside_tolerance(
         f"layer {second_dense}'s FFN recomputed with layer {first_dense}'s weights",
         _stack_ffn_half(
-            layers[second_dense], recorded_out[second_dense][1], cfg,
+            layers[second_dense], ffn_mix[second_dense][3], cfg,
             fixture["mlp_operands"][first_dense], routed=False,
         )["out"],
         ffn[second_dense]["out"],
@@ -5148,7 +5620,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     _stack_outside_tolerance(
         f"layer {first_dense}'s FFN normalised with its INPUT gain",
         _stack_ffn_half(
-            layers[first_dense], recorded_out[first_dense][1], cfg,
+            layers[first_dense], ffn_mix[first_dense][3], cfg,
             fixture["mlp_operands"][first_dense], routed=False,
             gain=layers[first_dense].input_layernorm_weight,
         )["out"],
@@ -5169,7 +5641,9 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # itself. The arm below plants the swap in the reading and requires it to fail, which
     # is what stops this certificate from holding no matter what the product did.
     moe_layer = fixture["moe_at"][0]
-    moe_input = recorded_out[moe_layer][1]
+    # The collapsed stream the routed block was handed, which is conjunct 4's own operand
+    # for this layer -- not the layer's [T, S, H] return.
+    moe_input = ffn_mix[moe_layer][3]
     _c_gain = layers[-1].post_attention_layernorm_weight
     _c_eps = float(cfg.rms_norm_eps)
     _c_args = recorded_mlp[-1][1]
@@ -5523,14 +5997,25 @@ def _root_reference(hidden: torch.Tensor, head: torch.Tensor,
 # is the sharp test for "reads the table itself rather than a copy", and a second #
 # 3-layer forward is not spent to re-measure shared code.                        #
 #                                                                              #
-# THE INTER-LAYER CARRIER IS ``[T, H]`` (add); the checkpoint's 4-stream mHC     #
-# carrier is ``inc-glm53f-030b``'s. The logits this item compares are taken from #
-# a ONE-stream residual carrier. The reference keeps ``hc_mult`` parallel        #
-# streams and collapses them with an unweighted mean before the final norm       #
-# (``modeling_glm5_next.py:1493``, ``:302``), so at ``hc_mult`` > 1 the tensor    #
-# projected here is not the reference's tensor; that is a declared exclusion and #
-# not an approximation, and at ``hc_mult`` 1 the reference does not degenerate   #
-# to an add either.                                                              #
+# THE ONE-STREAM EXCLUSION THAT STOOD HERE IS RETIRED, AND THIS ITEM IS NOW      #
+# RE-POINTED, on the same terms as the model-forward item above                   #
+# (``inc-glm53f-030d`` commit 4c). It used to say the logits came from a          #
+# one-stream carrier and that the four-stream carrier was ``inc-glm53f-030b``'s;  #
+# ``inc-glm53f-030d`` part (a) built that carrier in ``Glm5NextModel.forward``,   #
+# which now collapses the streams with an unweighted mean before the final norm   #
+# (``modeling_glm5_next.py:1493``, ``:302``). The ``[T, H]`` the root projects is #
+# therefore the reference's own post-collapse tensor and the exclusion has        #
+# nothing left to exclude.                                                        #
+#                                                                              #
+# WHAT COMMIT 4c CHANGED IN THIS ITEM: two lines and nothing else, and that is    #
+# the whole point of where the collapse sits. Its fixture is item 6's, so the six #
+# mHC leaves and the two bound sites per layer arrive with it -- required,        #
+# because the stack passes streams unconditionally and ``_mhc_site`` refuses a    #
+# streams call on a layer that carries none of them                              #
+# (``model_fp8.py:7719-7723``). And the route predicate below declares the two    #
+# mHC seams, two dispatches per layer each. EVERY CONJUNCT IS UNCHANGED: the      #
+# stack still hands the root a ``[T, H]``, so the row selection, the head arm and #
+# the projection see exactly what they saw before.                                #
 #                                                                              #
 # WHAT IT DOES NOT TOUCH. On-device sampling: ``sampling_params``,               #
 # ``logit_mask`` and ``spec_decode_metadata`` are runner keys this tree          #
@@ -5597,6 +6082,12 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
         "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+        # The two mHC seams, on item 6's figures and for item 6's reason: two sites per
+        # layer, one Sinkhorn and one combine each. Declared again here rather than
+        # shared, which is this item's own rule -- a root that smuggled in one extra
+        # dispatch has to fail on this item's declaration.
+        "mhc_sinkhorn": MHC_SITES_PER_LAYER * STACK_LAYERS,
+        "mhc_hyper_connection": MHC_SITES_PER_LAYER * STACK_LAYERS,
     }
     _declare_bound_and_sentinel(route_expected)
     _assert_route_predicate("7 the root", route_expected, before, after)
