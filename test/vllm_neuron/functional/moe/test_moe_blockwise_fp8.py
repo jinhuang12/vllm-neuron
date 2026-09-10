@@ -838,32 +838,42 @@ def test_cte_128_limb_identities_are_derived_through_their_own_seams() -> None:
         assert (fallback.__module__, fallback.__qualname__) == intact[limb], limb
 
 
-def test_cte_128_a_substituted_import_does_not_move_a_limb_reading(
+def test_cte_128_a_broken_limb_derivation_refuses_instead_of_answering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The reading is bound to the SEAM's call, not to this module's name for it.
+    """MEASURED: break the gate/up derivation and the reading RAISES, never falls back.
 
-    The arm above shows a broken derivation raises. This one shows the other
-    direction on an intact tree: rebind the module-level NAME of a limb kernel to a
-    different object and the reading must not follow, because the seam still calls
-    the kernel it always called. A reading that resolved the module attribute would
-    answer with the substitute and this arm would catch it.
+    The seam resolves its kernel through this module's own name at call time, so
+    rebinding that name moves the call and the reading together: an arm asking the
+    reading to survive a substitution would be asking for something the seam does not
+    do. What a unit test can settle is that there is no fall back to the import --
+    break the derivation and the reading must refuse -- and the control below shows
+    the attribute it could have fallen back to was bound all along, so the refusal is
+    a choice rather than an absent name.
     """
     import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
 
-    before = gate_up_kernel_identity()
+    intact = gate_up_kernel_identity()
+    assert intact[0] == moe.__name__, intact
 
-    def _decoy():
-        raise AssertionError("the decoy must never be called by anything")
+    sentinel = "the derivation was broken by this arm, on purpose"
 
-    monkeypatch.setattr(moe, "moe_gate_up_blockwise_fp8_kernel", _decoy)
-    after = moe.gate_up_kernel_identity()
-    print(f"[identity] before={before} after_substitution={after}")
-    assert after == before, (
-        f"the gate/up reading followed a substituted module attribute: {before} -> "
-        f"{after}. It must resolve the object the seam calls"
+    def _refuse(*_args, **_kwargs):
+        raise MoeBlockwiseFp8Error(sentinel)
+
+    monkeypatch.setattr(moe, "_wrapped_object_of", _refuse)
+    with pytest.raises(MoeBlockwiseFp8Error) as broken:
+        moe.gate_up_kernel_identity()
+    assert sentinel in str(broken.value), str(broken.value)
+
+    fallback = moe._unwrap_nki(moe.moe_gate_up_blockwise_fp8_kernel)
+    reading = (fallback.__module__, fallback.__qualname__)
+    print(f"[identity] intact={intact} available_fall_back={reading}")
+    assert reading == intact, (
+        f"the attribute this reading could have fallen back to names {reading}, not "
+        f"{intact}, so the refusal above would be a missing name rather than a "
+        f"refused fall back"
     )
-    assert after[1] != "_decoy", after
 
 
 @pytest.mark.parametrize(
@@ -1758,12 +1768,12 @@ def test_cte_128_a_one_hot_scale_moves_only_its_own_output_columns() -> None:
 
     reset_gate_up_dispatch_counters()
     with _SimulatorCounter() as sim:
-        baseline = moe_gate_up_blockwise_fp8(
+        baseline = _gate_up_one_block(
             case["hidden"][0],
             case["weight_fused"][0],
             to_gate_up_kernel_scale_operand(ones, G128_H, G128_I),
         ).to(torch.float32)
-        probed = moe_gate_up_blockwise_fp8(
+        probed = _gate_up_one_block(
             case["hidden"][0],
             case["weight_fused"][0],
             to_gate_up_kernel_scale_operand(doubled, G128_H, G128_I),
@@ -1822,7 +1832,7 @@ def test_cte_128_the_folded_dequantisation_is_load_bearing() -> None:
 
     reset_gate_up_dispatch_counters()
     with _SimulatorCounter() as sim:
-        without_scales = moe_gate_up_blockwise_fp8(
+        without_scales = _gate_up_one_block(
             case["hidden"][0],
             case["weight_fused"][0],
             to_gate_up_kernel_scale_operand(ones, G128_H, G128_I),
