@@ -5211,22 +5211,52 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
             row = table[0].reshape(-1)
             blocks_used = -(-(start_position + tokens) // block_size)
-            # THE WINDOW THE LAYER IS HANDED IS THE BUCKET'S, NOT THIS STEP'S. It is
-            # read off the block table's own SHAPE, which is `max_blocks_per_seq` for
-            # this bucket and is real even when the table's VALUES are meta. A length
-            # derived from the cached position instead would change with every decode
-            # step, and a captured graph would fit only the position it was captured
-            # at. The metadata says the same number; both are host ints, so they are
-            # compared rather than one of them trusted.
-            window_blocks = int(table.shape[1])
-            declared_window = int(metadata.get("max_blocks_per_seq", window_blocks))
-            if declared_window != window_blocks:
+            # THE WINDOW THE LAYER IS HANDED IS THE LEG'S BUCKET SPAN, not this step's
+            # span and not the table's width. A length derived from the cached position
+            # would change with every decode step and a captured graph would fit only
+            # the position it was captured at; a length taken from the table's width
+            # would be the whole model length on the prefill leg, because that width
+            # falls back to `max_model_len` when a group has no context bucket
+            # (`:4314-4327`). The seam copies every row of the window into on-chip
+            # memory, so that width is not merely wasteful -- it does not fit.
+            #
+            # Both numbers below are python ints the metadata already carries, so the
+            # window is constant per captured graph without reading a tensor value:
+            # a decode step's span IS the context bucket, which is what
+            # `max_blocks_per_seq` holds for a decode group, and a prefill chunk's span
+            # is the segment it may carry plus the chunk itself. The table's width is
+            # the ceiling for both, since a window wider than the table would name
+            # blocks the request cannot have been given.
+            table_width = int(table.shape[1])
+            declared_window = int(metadata.get("max_blocks_per_seq", table_width))
+            if declared_window != table_width:
                 raise ValueError(
-                    f"KV layer '{name}' reports a block table of {window_blocks} "
+                    f"KV layer '{name}' reports a block table of {table_width} "
                     f"block(s) per sequence and metadata declaring {declared_window}; "
                     f"the window handed to the layer is one number or the slice is "
                     f"wrong"
                 )
+            leg_is_prefill = int(metadata["max_query_len"]) > int(
+                metadata["decode_token_threshold"]
+            )
+            segment = int(metadata.get("kv_segment_size", 0))
+            if not leg_is_prefill:
+                # A DECODE STEP'S SPAN IS ITS CONTEXT BUCKET, which for a decode group
+                # is the whole block table: the bucket was chosen so the longest
+                # sequence in it fits, so its table is not the model length.
+                span_blocks = table_width
+            elif segment > 0:
+                span_blocks = -(
+                    -(segment + int(metadata["max_query_len"])) // block_size
+                )
+            else:
+                # A PREFILL CHUNK WITH NO SEGMENT BUCKET STATED. Nothing here says how
+                # much context this chunk may carry, so the table's width is the only
+                # honest ceiling left -- and on this leg that width is the fallback
+                # above, the expensive case. It is taken rather than guessed, and a
+                # serving configuration that reaches it has to be measured first.
+                span_blocks = table_width
+            window_blocks = min(table_width, max(1, span_blocks))
             geometries.append(
                 {
                     "block_ids": [int(value) for value in row[:blocks_used]],
@@ -5235,10 +5265,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     "window_blocks": window_blocks,
                 }
             )
-            legs.add(
-                int(metadata["max_query_len"])
-                > int(metadata["decode_token_threshold"])
-            )
+            # ONE READING OF THE LEG PER GROUP, the one the window was sized from. Two
+            # evaluations of the same test are two things that can drift apart, and the
+            # window would then be sized for a leg this step is not on.
+            legs.add(leg_is_prefill)
             starts.add(start_position)
         if len(legs) != 1 or len(starts) != 1:
             raise ValueError(
