@@ -4344,6 +4344,28 @@ def _stack_peak_band(expected: torch.Tensor, label: str) -> tuple:
     return STACK_RECOMPUTE_RTOL, peak * STACK_RECOMPUTE_ATOL_FACTOR
 
 
+def _stack_argmin_cell(values: torch.Tensor) -> tuple:
+    """The cell holding the smallest ``|value|``, as a FULL-SHAPE index tuple.
+
+    RANK-AGNOSTIC, AND THAT IS THE WHOLE POINT (``inc-glm53f-030d`` commit 4e, round-3
+    finding 1). The band control used to address its cell with ``row, col =
+    divmod(argmin, expected.shape[-1])``, which is a two-dimensional address. Commit 4c
+    started handing it three-dimensional ``[T, S, H]`` streams, and on those the two
+    indices land on dims 0 and 1 instead: ``row`` runs to ``H`` against an extent of
+    ``T`` and ``col`` runs to ``H`` against an extent of ``S``, so the read raised
+    ``IndexError`` on a CORRECT product, and the cases that survived returned a vector
+    that ``float()`` refuses. A tuple index addresses any rank, and on a 2-D tensor it
+    is the same cell ``divmod`` chose, so the callers that were always 2-D see no
+    change.
+    """
+    flat = int(values.abs().reshape(-1).argmin())
+    cell: list[int] = []
+    for extent in reversed(tuple(values.shape)):
+        cell.append(flat % int(extent))
+        flat //= int(extent)
+    return tuple(reversed(cell))
+
+
 def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
                          rtol: float, atol: float, label: str) -> None:
     """Controls A and B for one peak-scaled comparison, run AFTER it has passed.
@@ -4378,12 +4400,11 @@ def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
     requirement, which is a statement about the band and never about the data.
     """
     peak = float(expected.abs().max())
-    cols = int(expected.shape[-1])
-    row, col = divmod(int(expected.abs().reshape(-1).argmin()), cols)
-    a_min = float(expected.abs()[row, col])
+    cell = _stack_argmin_cell(expected)
+    a_min = float(expected.abs()[cell])
     allowance = atol + rtol * a_min
-    print(f"TINYFWD|stack_band_control|site={label}|row={row}|col={col}"
-          f"|expected_at_cell={float(expected[row, col]):.10g}"
+    print(f"TINYFWD|stack_band_control|site={label}|cell={cell}|rank={len(cell)}"
+          f"|expected_at_cell={float(expected[cell]):.10g}"
           f"|abs_at_cell={a_min:.10g}|peak={peak:.10g}"
           f"|rtol={rtol:.10g}|atol={atol:.10g}"
           f"|allowance_at_cell={allowance:.10g}"
@@ -4395,7 +4416,7 @@ def _stack_band_controls(produced: torch.Tensor, expected: torch.Tensor,
                                    ("B_under", 0.5, False),
                                    ("B_over", 1.5, True)):
         probe = produced.clone()
-        probe[row, col] = expected[row, col] + factor * allowance
+        probe[cell] = expected[cell] + factor * allowance
         inside = bool(torch.allclose(probe, expected, rtol=rtol, atol=atol))
         print(f"TINYFWD|stack_band_control|site={label}|arm={arm}"
               f"|planted_multiple_of_allowance={factor}"
@@ -4897,6 +4918,11 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 _row_spread_stats(_act)[1],
                 float((_sum.float() == _half_only.float()).float().mean()),
                 _row_spread_stats(_sum)[1],
+                # GUARD (iii)'S TENSOR, ADDED BY ``inc-glm53f-030d`` COMMIT 4e (round-3
+                # finding 2). The collapse grant 127 read is a collapse of THIS tensor --
+                # the dense half's own output rows -- and it is the same recompute both
+                # scales already run here, so the guard costs nothing new.
+                _row_spread_stats(_half["out"])[1],
             )
             _readings[_tag] = _reading
             _hpeak = float(_dh.float().abs().max())
@@ -4911,9 +4937,10 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                   f"|ffn_share={_fpeak / max(_hpeak, 1e-30):.6g}"
                   f"|elements_absorbed_frac={_reading[3]:.6f}"
                   f"|sum_max_spread={_reading[4]:.6g}"
+                  f"|ffn_out_max_spread={_reading[5]:.6g}"
                   f"|absorption_reading_bound={STACK_ABSORPTION_CEILING}")
 
-        _gf, _uf, _as, _absorbed, _sumspread = _readings["new"]
+        _gf, _uf, _as, _absorbed, _sumspread, _ffnspread = _readings["new"]
         # GUARD (i): THE CLAMP MUST BIND, AND MUST NOT BIND EVERYWHERE. Both
         # fractions above zero says the SwiGLU bound is live on both projections;
         # a nonzero activated row spread says it did not saturate every row into one
@@ -4943,6 +4970,24 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 f"carries the FFN half alone and every comparison below it is blind "
                 f"to the streams it was supposed to mix"
             )
+        # GUARD (iii): THE DENSE HALF MUST NOT COLLAPSE EVERY TOKEN INTO ONE ROW. This
+        # is the guard grant 127 earned, and ``inc-glm53f-030d`` commit 4e moved it onto
+        # the tensor that collapse actually flattens -- the dense half's OWN output rows,
+        # `half["out"]` -- for the reason round-3 finding 2 gives. It used to read the
+        # per-layer STREAMS below layer 0, and under mHC that reading cannot fail: the
+        # mix multiplies each token's row by its own `post` gate, so a fully collapsed
+        # half still leaves every row a DIFFERENT scalar multiple of one vector, and the
+        # metric here is scale free, so the spread comes back positive on exactly the
+        # fixture the guard exists to refuse. The half's own rows carry no per-token
+        # gate, so a saturated SwiGLU shows there as the zero it is.
+        if not _ffnspread > 0.0:
+            raise VacuousControlError(
+                f"layer {_dense_index}: the dense half's own output rows have pairwise "
+                f"spread {_ffnspread:.6g}, so every token leaves this half holding the "
+                f"same vector. That is grant 127's collapse, and no comparison below it "
+                f"can see a per-token defect -- the mix cannot repair it either, because "
+                f"a per-token gate on one constant row is still one direction"
+            )
         # THE FAILING CONTROLS, EXECUTED ONLY WHERE THE CONTROL TENSOR IS EXACT.
         #
         # The OLD grids must fire BOTH guards, or the guards are statements no scale
@@ -4964,7 +5009,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         # numbers stay the READINGS they always were: the ``scale=old`` row above
         # prints them, and the legend row below says which layer's control gates and
         # which only reads. Nothing else about the guards moves.
-        _ogf, _ouf, _oas, _oabs, _osum = _readings["old"]
+        _ogf, _ouf, _oas, _oabs, _osum, _offn = _readings["old"]
         _control_is_exact = not any(
             _below < _dense_index for _below in fixture["dense_at"]
         )
@@ -4976,6 +5021,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
               f"|old_activated_max_spread={_oas:.6g}"
               f"|old_elements_absorbed_frac={_oabs:.6f}"
               f"|old_sum_max_spread={_osum:.6g}"
+              f"|old_ffn_out_max_spread={_offn:.6g}"
               f"|gates_iff_no_dense_layer_sits_below_this_one={_control_is_exact}"
               f"|note=only there is the old-scale recompute the tensor grant 127 read")
         if _control_is_exact:
@@ -4995,47 +5041,44 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                     f"at {_osum:.6g}, both of which the guard accepts -- so "
                     f"the guard is not what tells the two scales apart"
                 )
+            # GUARD (iii)'S FAILING CONTROL, on the same tensor the guard now reads and
+            # at the same layer the other two controls gate: the OLD grids saturate both
+            # SwiGLU clamps into one constant activated row, and a constant row through a
+            # linear down-projection is a constant row, so this half's rows must read a
+            # spread of EXACTLY zero. That is grant 127's number, on grant 127's tensor.
+            # ``inc-glm53f-030d`` commit 4e replaced a control that rebuilt the next
+            # layer's input THROUGH the mix and demanded zero of it: the mix's per-token
+            # gate makes those rows differ by construction, so the old control raised on
+            # a correct product (round-3 finding 2).
+            if _offn > 0.0:
+                raise VacuousControlError(
+                    f"layer {_dense_index}: guard (iii)'s control did not fire. The OLD "
+                    f"exponents leave the dense half's own output rows at spread "
+                    f"{_offn:.6g} instead of zero, so the guard above is not what tells "
+                    f"the two scales apart -- and the saturation grant 127 measured is "
+                    f"not what this recompute reproduced"
+                )
 
-    # ---- GUARD (iii): EVERY STAGE BELOW LAYER 0 STILL CARRIES DISTINCT ROWS. Grant
-    # 127 read `layer1_in`, `layer1_out`, `layer2_in` and `layer2_out` at a row
-    # spread of EXACTLY ZERO, which is the collapse in one number per stage.
+    # ---- THE PER-STAGE ROW SPREADS, READINGS AND NOT A GATE (``inc-glm53f-030d``
+    # commit 4e, round-3 finding 2). Grant 127 read `layer1_in`, `layer1_out`,
+    # `layer2_in` and `layer2_out` at a row spread of EXACTLY ZERO, which is why these
+    # four numbers are printed and why they were once the gate. They cannot BE the gate
+    # on the streams path: every one of these tensors has been through the mix, and the
+    # mix multiplies each token's row by that token's own `post` gate, so even a fully
+    # collapsed half comes back as a different scalar multiple of one vector per token --
+    # and this metric is scale free, so it reports that as spread. A reading that cannot
+    # take the value it refuses is not a guard, so the gate moved up to the dense half's
+    # own output rows, where the collapse still shows as zero; these stay as the
+    # per-stage evidence grant 127's records are compared against.
     for _si in range(1, len(layers)):
         for _stage, _t in ((f"layer{_si}_in", recorded_in[_si][1][0]),
                            (f"layer{_si}_out", recorded_out[_si][1])):
             _rows, _mx, _mn, _md = _row_spread_stats(_t)
             print(f"TINYFWD|stack_row_guard|stage={_stage}|rows={_rows}"
                   f"|max_spread={_mx:.6g}|min_spread={_mn:.6g}"
-                  f"|median_spread={_md:.6g}")
-            if not _mx > 0.0:
-                raise VacuousControlError(
-                    f"{_stage} carries {_rows} rows whose pairwise spread is exactly "
-                    f"zero, so every token below layer 0 holds the same vector and "
-                    f"no comparison here can see a per-token defect"
-                )
-    # ITS FAILING CONTROL, at the seam the collapse ran through: layer 1's input
-    # rebuilt with the OLD grids. One dense recompute, not a second stack run.
-    _c0 = fixture["dense_at"][0]
-    _cstreams = recorded_out[_c0][1]
-    _csite = _stack_mhc_site(layers[_c0], _impl().MHC_FFN_SITE,
-                             "guard (iii) control")
-    _cpost, _ccomb, _ch = _stack_mhc_pre(_csite, _cstreams, "guard (iii) control")
-    _cold = _stack_ffn_half(
-        layers[_c0], _ch, cfg, _old_dense_ops[_c0], routed=False
-    )["out"].to(_ch.dtype)
-    # The next layer's input at the old scale, built the way the stack builds it now:
-    # the site's mix over the recorded streams rather than a residual add.
-    _cspread = _row_spread_stats(
-        _csite.mhc_post(_cold, _cstreams, _cpost, _ccomb)
-    )[1]
-    print(f"TINYFWD|stack_row_guard|stage=layer{_c0 + 1}_in_at_the_old_scale"
-          f"|max_spread={_cspread:.6g}|bound=0"
-          f"|note=this is the seam grant 127 read at zero, now through the mHC mix")
-    if _cspread > 0.0:
-        raise VacuousControlError(
-            f"guard (iii)'s control did not fire. Layer {_c0 + 1}'s input rebuilt "
-            f"with the OLD exponents has row spread {_cspread:.6g}, which the guard "
-            f"accepts -- so the guard is not what tells the two scales apart"
-        )
+                  f"|median_spread={_md:.6g}|class=reading_only"
+                  f"|note=gated at the dense half's own rows instead; the mHC per-token"
+                  f" gate makes a collapsed half read nonzero here")
     # ---- end of the BLOCK D guards.
 
     # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX, EXPANDED ACROSS THE STREAM AXIS.
