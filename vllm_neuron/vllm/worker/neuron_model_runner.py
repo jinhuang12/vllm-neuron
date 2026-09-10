@@ -5168,6 +5168,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         start_position = starts.pop()
         text_config = self.model.text_config
         side_caches = self._glm5next_live_side_caches(banks)
+        # A SYNTHETIC DECODE IS NOT A SEQUENCE STEP, AND WARMUP IS PART OF SERVING.
+        # The decode warmup and the idle-data-parallel dummy step reach this converter
+        # through `_build_decode_synthetic_inputs` and
+        # `_build_warmup_attention_metadata`, whose `cached_seq_len` is 0, so they
+        # arrive as a DECODE at position 0. A decode continues a sequence and therefore
+        # has at least one cached token; a decode with none has no sequence to continue
+        # and is not a real step. It is served with the cursor neither read nor written,
+        # so a warmup can never open, advance or destroy a real sequence's claim.
+        #
+        # THIS IS THE POSITION RULE, chosen over threading an explicit synthetic flag
+        # through the warmup builders, for two reasons recorded here. Those builders are
+        # shared with paths this campaign does not own, and `inc-glm53f-054b` routes
+        # warmup surface changes to the lead rather than editing them. And the rule
+        # cannot hide the defect the cursor exists to refuse, because that defect is a
+        # fresh request arriving at a cached length ABOVE zero -- the opposite condition.
+        #
+        # THE RESIDUAL, STATED RATHER THAN LEFT TO BE FOUND: a one-token PROMPT also
+        # reads as a decode here, because the leg is decided by
+        # `max_query_len > decode_token_threshold` and one token does not exceed a
+        # threshold of one. Such a request is served with the cursor untouched too. That
+        # is exactly what `-054b` already did -- its fresh-sequence gate keys on
+        # `is_prefill`, so a one-token prompt never cleared the ring either -- so this
+        # rule preserves the existing behaviour instead of introducing it.
+        synthetic_step = not is_prefill and int(start_position) == 0
         if is_prefill and int(start_position) == 0:
             # A FRESH SEQUENCE MUST NOT INHERIT THE LAST ONE'S PARTIAL POOL. The
             # side caches live for the process (`_glm5next_live_side_caches`), so
@@ -5188,10 +5212,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # converter binds -- `prefill_tail` with `prefill_end_position` -- using
             # `seed_tail` (`model_fp8.py:4631-4638`). Commit 6 of `inc-glm53f-054b`, on
             # the lead's ruling; item 11 of the tiny end-to-end file measures it.
+            # THE RING AND ITS OWNER ARE CLEARED TOGETHER, AND BOTH BEFORE THE CARRIERS
+            # ARE BUILT. Commit 1 zeroed the ring here and opened the cursor only after
+            # the builder returned, which left one step in between where the two
+            # disagreed: if the builder refused this opening -- a paging disagreement or
+            # a state slot out of range, both reachable -- the ring was empty while the
+            # cursor still named the PREVIOUS sequence's position, so that sequence's
+            # next step passed the check below and was served from an emptied ring in
+            # silence. That is the exact class this cursor exists to refuse, reached
+            # through the cursor's own gap. Clearing the owner alongside the rows leaves
+            # the ring belonging to nobody, so a refused opening makes the next
+            # non-opening step refuse by name instead of reading blanks.
+            self._glm5next_side_cache_cursor = None
             for side in side_caches:
                 if "tail" in side:
                     side["tail"].zero_()
-        else:
+        elif not synthetic_step:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so
             # a step belonging to a DIFFERENT request would be served from the last
@@ -5246,7 +5282,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Advancing before the call returns would leave the ring's recorded position
         # ahead of the work actually done, so the NEXT step would be refused for a
         # mismatch this one caused. A refused step must leave no trace.
-        self._glm5next_side_cache_cursor = int(start_position) + tokens
+        # A SYNTHETIC STEP LEAVES NO CLAIM. It never read the cursor above and it does
+        # not write one here, so a warmup between two real steps of one sequence is
+        # invisible to that sequence.
+        if not synthetic_step:
+            self._glm5next_side_cache_cursor = int(start_position) + tokens
         return {
             "input_ids": input_ids,
             "layer_carriers": carriers,

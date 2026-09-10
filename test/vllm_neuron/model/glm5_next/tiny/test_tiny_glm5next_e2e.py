@@ -1676,8 +1676,14 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# ITEMS 12-15 (`inc-glm53f-054f`). THE THREE REFUSALS THAT HAD NO TEST ARM, AND THE
+# ITEMS 12-17 (`inc-glm53f-054f`). THE THREE REFUSALS THAT HAD NO TEST ARM, AND THE
 # POSITION CURSOR THAT GIVES THE LIVE RING A SEQUENCE IDENTITY.
+#
+# ITEMS 16 AND 17 ARE THE CARVE-OUT AND ITS EDGE. Warmup is part of serving: the decode
+# warmup and the idle dummy step arrive as a decode at cached length 0, so they are served
+# with the cursor neither read nor written. Item 16 proves a real sequence's claim survives
+# one, and item 17 proves the exemption stops at position 0 rather than admitting any
+# unowned continuation.
 #
 # WHY THESE FOUR ARE HERE AND NOT IN `-054b`. The three refusals were written by `-054b`
 # and nothing measured them, so nothing would have noticed if one stopped firing. The
@@ -1813,7 +1819,15 @@ def test_the_indexer_refuses_a_prefill_ring_handed_to_a_decode_step():
         )
     ring = rings[0]["tail"]
     pool_cache = item._mla_pool_cache(pages=item.STACK_PAGES)
-    selection = item._mla_selection_operands(tokens=1, pages=item.STACK_PAGES)
+    # THE OPERAND HELPER HAS A PRECONDITION OF ITS OWN, and commit 1 tripped it. At
+    # `tokens=1` the helper computes `1 // index_kpool(4) = 0` candidate pools, which is
+    # not more than the 2 it selects, so it raised `VacuousControlError` at fixture time
+    # -- before `pytest.raises` below ever ran. The arm could not pass on correct code.
+    # A prompt-length count is what the sibling arm uses, and it is sufficient here
+    # because the refusal under test fires before `seq_lens` is read at all.
+    selection = item._mla_selection_operands(
+        tokens=item.STACK_TOKENS, pages=item.STACK_PAGES
+    )
     minimal = torch.zeros(1, 1, dtype=pool_cache.dtype)
 
     def call(**extra):
@@ -1999,6 +2013,53 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
         "mismatch the refused one caused"
     )
 
+    # ---- 2b. A REFUSED OPENING LEAVES THE RING TO NOBODY, not to the last sequence.
+    #      Commit 1 emptied the ring before the carriers were built and opened the cursor
+    #      only after, so an opening refused in between left an EMPTY ring under the
+    #      PREVIOUS sequence's cursor, and that sequence's next step was then served from
+    #      blanks in silence -- the very class this cursor exists to refuse, reached
+    #      through a gap in the cursor itself. This forces that refusal, using a
+    #      position-0 prefill whose page disagrees with the bank's own paging, and then
+    #      requires the old claim to be gone and its next step refused by name.
+    for side in _live_rings(runner, banks):
+        side["tail"].fill_(PLANTED_RING)
+    wrong_page = {
+        bank["name"]: _entry(
+            row=range(PROMPT_BLOCKS),
+            tokens=prompt,
+            cached=0,
+            threshold=1,
+            block_size=int(item.MLA_PAGE_SIZE) * 2,
+        )
+        for bank in banks
+    }
+    with pytest.raises(ValueError) as opening:
+        runner._glm5next_model_kwargs(
+            _generic(tokens=prompt, metadata=wrong_page, sampling_row=prompt - 1)
+        )
+    refused_opening = str(opening.value)
+    print(f"TINYE2E|cursor_refused_opening|{refused_opening}")
+    if ("stands at position" in refused_opening
+            or "holds no sequence cursor" in refused_opening):
+        raise item.VacuousControlError(
+            "the position-0 prefill was refused by the cursor rather than by the carriers "
+            "builder, so this control never reaches the window between emptying the ring "
+            "and opening its cursor -- the window it exists to close"
+        )
+    assert runner._glm5next_side_cache_cursor is None, (
+        f"a refused opening left the cursor at {runner._glm5next_side_cache_cursor}, while "
+        f"the ring had already been emptied; the previous sequence's next step would then "
+        f"be served from blanks instead of refused"
+    )
+    with pytest.raises(ValueError) as orphan:
+        step(advanced, 1)
+    orphaned = str(orphan.value)
+    print(f"TINYE2E|cursor_refused_opening_control|old_next={advanced}|{orphaned}")
+    assert "holds no sequence cursor" in orphaned, (
+        f"after a refused opening, the previous sequence's next step at {advanced} was not "
+        f"refused for want of an owner: {orphaned}"
+    )
+
     # ---- 3. a second fresh sequence resets the cursor and empties the ring.
     for side in _live_rings(runner, banks):
         side["tail"].fill_(PLANTED_RING)
@@ -2029,4 +2090,134 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     assert str(reset) in control, (
         "the refusal does not report the position the ring actually stands at, so a reader "
         "cannot tell which sequence owns the ring"
+    )
+
+
+def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alone():
+    """ITEM 16. Warmup is part of serving, so a synthetic step must not disturb a real
+    sequence's claim on the ring.
+
+    WHY THIS ARM EXISTS. The decode warmup and the idle dummy step reach this converter as
+    a DECODE at cached length 0, because the warmup metadata builder defaults its cached
+    length to 0. A rule that demanded every non-opening step continue the cursor would
+    refuse every GLM decode warmup. A decode with no cached token has no sequence to
+    continue and is not a real step, so it is served with the cursor neither read nor
+    written.
+
+    THE MUST-FAIL CONTROL IS THE SECOND HALF: a real sequence's cursor must be exactly
+    where it was after the synthetic step, AND that sequence's next step must still be
+    served. If the synthetic step advanced the cursor or cleared it, the real step after
+    it would be refused, and that is what this arm would report.
+
+    THE VACUOUS GUARD is the leg itself. If the synthetic call were classified as a
+    prefill, it would clear the ring and open the cursor, and this arm would be measuring
+    the opening path instead. The carrier it produces is checked for the decode leg's own
+    keyword, so a mis-classified call cannot pass quietly.
+    """
+    _require_cpu_mode()
+    root = _fixture()["root"]
+    root.bind_kv_cache(_runner_shaped_caches(root))
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+    prompt = int(item.STACK_TOKENS)
+
+    def step(cached: int, tokens: int):
+        return _model_kwargs(
+            runner,
+            input_ids=torch.zeros(tokens, dtype=torch.long),
+            cached=cached,
+            sampling_row=tokens - 1 if tokens > 1 else 0,
+        )
+
+    step(0, prompt)
+    step(prompt, 1)
+    before = int(runner._glm5next_side_cache_cursor)
+
+    synthetic = step(0, 1)
+    after = runner._glm5next_side_cache_cursor
+    carrier = synthetic["layer_carriers"][0]
+    print(f"TINYE2E|synthetic_decode|cursor_before={before}|cursor_after={after}"
+          f"|carrier_keys={sorted(carrier)}")
+    if "slot_mapping" in carrier:
+        raise item.VacuousControlError(
+            "the synthetic call at cached length 0 built a PREFILL carrier, so it went down "
+            "the opening path and this arm is not measuring the synthetic decode at all"
+        )
+    assert "tail" in carrier and "position" in carrier, (
+        f"the synthetic call did not build a decode carrier; its keys are {sorted(carrier)} "
+        f"and the decode leg's own keywords are tail and position"
+    )
+    assert after is not None and int(after) == before, (
+        f"the synthetic decode moved the cursor from {before} to {after}; a warmup between "
+        f"two real steps must be invisible to the sequence that owns the ring"
+    )
+
+    # ---- THE CONTROL: the real sequence is still servable after the synthetic step.
+    step(before, 1)
+    resumed = int(runner._glm5next_side_cache_cursor)
+    print(f"TINYE2E|synthetic_decode_control|resumed={resumed}|want={before + 1}")
+    assert resumed == before + 1, (
+        f"after the synthetic step the real sequence resumed to {resumed} rather than "
+        f"{before + 1}; if the synthetic step had taken or cleared the claim, this step "
+        f"would have been refused instead"
+    )
+
+
+def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
+    """ITEM 17. The synthetic carve-out is bounded by position, and this arm is the bound.
+
+    A carve-out is only as good as its edge. A decode at position 1 or above IS a real
+    sequence step, so with no sequence open -- a fresh process, or the moment after a
+    refused opening -- there is nothing for it to continue and it must still be refused by
+    name. Otherwise the warmup exemption would be a hole a real continuation could walk
+    through.
+
+    THE MUST-FAIL CONTROL is the same call one position lower. At position 0 it is served,
+    which is what shows the refusal is decided by the position rather than by something
+    incidental to the call. If both positions refused, the carve-out would be dead and
+    every warmup broken; if neither refused, the cursor would guard nothing.
+    """
+    _require_cpu_mode()
+    root = _fixture()["root"]
+    root.bind_kv_cache(_runner_shaped_caches(root))
+    banks = root.glm5next_layer_banks
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+
+    def step(cached: int, tokens: int):
+        return _model_kwargs(
+            runner,
+            input_ids=torch.zeros(tokens, dtype=torch.long),
+            cached=cached,
+            sampling_row=0,
+        )
+
+    # allocating the ring is what clears the cursor, so do it before reading one
+    _live_rings(runner, banks)
+    opened = getattr(runner, "_glm5next_side_cache_cursor", None)
+    if opened is not None:
+        raise item.VacuousControlError(
+            f"this runner already carries a cursor at {opened}, so 'no open sequence' is "
+            f"not the state being measured"
+        )
+
+    with pytest.raises(ValueError) as caught:
+        step(1, 1)
+    message = str(caught.value)
+    print(f"TINYE2E|real_decode_without_a_sequence|at=1|{message}")
+    assert "holds no sequence cursor" in message, (
+        f"a decode at position 1 with no sequence open raised, but not the refusal this arm "
+        f"names: {message}"
+    )
+
+    # ---- THE CONTROL: the same shape at position 0 is served, cursor untouched.
+    served = step(0, 1)
+    after = getattr(runner, "_glm5next_side_cache_cursor", None)
+    print(f"TINYE2E|real_decode_without_a_sequence_control|at=0"
+          f"|carrier_keys={sorted(served['layer_carriers'][0])}|cursor={after}")
+    assert after is None, (
+        f"the synthetic step at position 0 opened a cursor at {after}; a step that is not a "
+        f"real sequence step must leave the ring unclaimed"
     )
