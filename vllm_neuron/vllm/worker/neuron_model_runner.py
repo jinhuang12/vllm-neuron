@@ -4993,6 +4993,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._glm5next_side_cache_positions = {}
         return live
 
+    def _glm5next_batch_request_ids(self) -> list:
+        """The engine's request ids for this step, as this runner's batch carries them.
+
+        ONE READ OF THE SOURCE. Both the identity below and the caller's reading of
+        whether this step has any request at all come through here, so the source
+        cannot be named in two places and drift.
+        """
+        batch = getattr(self, "input_batch", None)
+        return list(getattr(batch, "req_ids", None) or ())
+
     def _glm5next_request_identities(self, *, synthetic: bool) -> list:
         """The requests this step serves, in the batch order the tables use.
 
@@ -5012,12 +5022,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         A MISSING BATCH ON A REAL STEP REFUSES BY NAME. Serving a real step with no
         identity is what the block-id slot did, and it is the defect this method
-        exists to close, so it raises instead of inventing one.
+        exists to close, so it raises instead of inventing one. The request-less step
+        the runner does build -- warmup, on either leg -- is classified synthetic by
+        the caller and never arrives here as a real one, so what this refuses is a
+        CONTINUATION with nobody to continue: a step at a cached length above zero
+        whose batch names no request.
         """
         if synthetic:
             return [None]
-        batch = getattr(self, "input_batch", None)
-        request_ids = list(getattr(batch, "req_ids", None) or ())
+        request_ids = self._glm5next_batch_request_ids()
         if not request_ids:
             raise ValueError(
                 "a GLM-5.3-Flash step needs the engine's request ids to key its "
@@ -5443,7 +5456,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # is exactly what `-054b` already did -- its fresh-sequence gate keys on
         # `is_prefill`, so a one-token prompt never cleared the ring either -- so this
         # rule preserves the existing behaviour instead of introducing it.
-        synthetic_step = not is_prefill and int(start_position) == 0
+        # THE PREFILL WARMUP IS THE SECOND REQUEST-LESS STEP, and the position rule
+        # above does not reach it. `warmup_prefill` builds its inputs with
+        # `cached_seq_len = 0`, one request and a whole bucket of tokens against a
+        # threshold of one (`_build_prefill_synthetic_inputs`), so it arrives as a
+        # PREFILL at position 0 and reads as a real step by leg and position alone.
+        # It has no request: the engine has scheduled nothing, so the input batch
+        # carries no id. A step with no request cannot be keyed by one, and there is
+        # no request whose state it could disturb, so it is served synthetically --
+        # from slot 0, taking no claim, exactly as the decode warmup is.
+        #
+        # WHY THE ABSENT IDENTITY IS READ ONLY AT POSITION 0 and not everywhere. A
+        # step at a cached length ABOVE zero continues a sequence, and continuing one
+        # without knowing whose it is is precisely the defect the slot table exists to
+        # close. Such a step still refuses by name below. So the two conditions here
+        # are the two request-less shapes the runner actually builds, and neither
+        # widens into the class the refusal must keep catching.
+        synthetic_step = int(start_position) == 0 and (
+            not is_prefill or not self._glm5next_batch_request_ids()
+        )
         # THE STATE SLOT IS THE REQUEST'S, AND IT IS SETTLED HERE rather than in the
         # walk above, because a synthetic step must take no claim and whether this
         # step is synthetic is only known once the leg and the position are read.
@@ -5458,7 +5489,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # per-request geometry walk arrives with the refusals this half retires.
         for geometry in geometries:
             geometry["state_slot"] = int(state_slots[0])
-        if is_prefill and int(start_position) == 0:
+        if synthetic_step:
+            # A SYNTHETIC STEP LEAVES THE RING AND ITS RECORDED POSITION ALONE, and
+            # this branch exists to say so in one place rather than by omission. A
+            # warmup is not a sequence: it opens nothing, so it must close nothing.
+            # A request-less PREFILL at position 0 reaches here, and clearing slot 0's
+            # ring on its way through would destroy the ring of whichever request
+            # happens to own that slot -- the same cross-request clearing the slot axis
+            # was introduced to end. At start-up, where the warmup actually runs, the
+            # rows are freshly allocated zeros, so leaving them is also the value the
+            # process-wide clearing this replaces produced.
+            pass
+        elif is_prefill and int(start_position) == 0:
             # A FRESH SEQUENCE MUST NOT INHERIT THE LAST ONE'S PARTIAL POOL. The
             # side caches live for the process (`_glm5next_live_side_caches`), so
             # the ring still holds whatever the previous sequence stashed, and
@@ -5496,7 +5538,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             for side in side_caches:
                 if "tail" in side:
                     side["tail"][int(state_slots[0])].zero_()
-        elif not synthetic_step:
+        else:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so
             # a step belonging to a DIFFERENT request would be served from the last

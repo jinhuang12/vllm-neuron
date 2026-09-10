@@ -8,11 +8,15 @@ THE DECLARED ACCEPTANCE, the Tier N harness this campaign uses:
       test/vllm_neuron/model/glm5_next/test_request_keyed_state_117.py \\
       -s -rA -p no:randomly -p no:cacheprovider --timeout 60
 
-EVERY ITEM IN THIS FILE FAILS AT THE BASE COMMIT, AND THAT IS THE POINT. The
-converter refuses a block table carrying more than one row
-(``neuron_model_runner.py:5136-5141``), so at base each item below raises that
-refusal instead of reading a value. An item that passed at base would be
-measuring nothing.
+EVERY ITEM IN THIS FILE FAILS AT THE BASE COMMIT, WITH ONE NAMED EXCEPTION, AND
+THAT IS THE POINT. The converter refuses a block table carrying more than one row
+(``neuron_model_runner.py:5136-5141`` at base), so at base each two-request item
+below raises that refusal instead of reading a value, and the helper-level items
+raise ``AttributeError`` for methods base does not have. An item that passed at
+base would be measuring nothing. THE EXCEPTION is the prefill-warmup arm of A2,
+which passes at base BECAUSE base served that step: it is a regression arm, it
+pins the base's behaviour, and it fails on the bytes of this increment's fifth
+commit, which is where review round 1 found the regression.
 
 THE ITEMS HERE, and each names the tripwire it must fail on.
 
@@ -20,11 +24,13 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   the assignment is stable within one request's life. Tripwire: a table that
   returns one slot for both. The carrier-VIEW half of A1 needs the per-request
   carrier container and arrives with this increment's model-side sliver.
-* A2, THREE ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
-  over-admission refuses by name; a synthetic step takes no claim. Tripwires: a
-  table that never frees cannot seat the later request, one that frees without
-  zeroing fails the zero read, and a synthetic step that seated itself changes the
-  table.
+* A2, FOUR ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
+  over-admission refuses by name; a synthetic step takes no claim; and the prefill
+  WARMUP's own shape, which has no request at all, is served from slot 0 and takes
+  no claim either. Tripwires: a table that never frees cannot seat the later
+  request, one that frees without zeroing fails the zero read, a synthetic step
+  that seated itself changes the table, and a converter that demands an identity
+  from warmup raises where the base served it.
 * A3 -- one request's pooled store and tail ring are byte-unchanged by a step of
   the other request, on both legs. Tripwire: the process-wide allocation, which
   made the two carriers one storage.
@@ -37,9 +43,19 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   the read-back miss; the neighbouring-slot control catches a write that landed
   wider than one slot.
 
-STILL TO COME IN THIS FILE: A6 (the sharpened decode refusal) and A7 (padded rows
-write nowhere). A5's write-and-read-back clause, the interleaved-vs-sequential
-differential and the R-3 seam readings belong to this increment's kernel half.
+* A6 -- a decode carrying more tokens than it has requests refuses by name, reaches
+  no seam, and leaves the slot table and the pooled stores byte-identical, with the
+  admitted case built in the same item. Tripwire: the landed refusal read "one
+  token", which is the batch's count and not the per-request one.
+* A7 -- a padded decode row's latent slot is a sentinel and never slot 0. Tripwire:
+  the padding value the KV machinery writes is ``NULL_BLOCK_ID``, which is zero and
+  therefore a REAL slot; the item asserts that value is inside the addressable range
+  before asserting no padded entry lands there.
+
+STILL TO COME IN THIS FILE: A1's carrier-VIEW half, which needs the per-request
+carrier container and arrives with this increment's model-side sliver. A5's
+write-and-read-back clause, the interleaved-vs-sequential differential and the R-3
+seam readings belong to this increment's kernel half.
 
 WHY THE HARNESS IS RE-AUTHORED HERE rather than imported. The two landed files
 with a converter harness -- ``test_kda_runner_state.py`` and
@@ -116,6 +132,11 @@ DECLARED_SPARSE_ROWS = ((0, 1), (4, 5))
 #: The decode bucket A7 pads up to. Two real requests in a bucket of four leaves
 #: two padded rows, which is the case the padding writer produces.
 DECLARED_DECODE_BUCKET = 4
+
+#: The prefill warmup's token count. The real value is a launch-shape bucket; the
+#: only property the converter reads is that it EXCEEDS the decode threshold, which
+#: is what makes the warmup step read as a prefill (``neuron_model_runner.py:4303``).
+DECLARED_WARMUP_BUCKET = 4
 
 #: The state-carrier keys, in the model's own declared spelling
 #: (``model_fp8.py:4149``). The carrier is splatted into the layer, so an extra
@@ -205,22 +226,27 @@ def _banks() -> list[dict]:
     return [sparse, linear]
 
 
-def _runner(banks) -> NeuronModelRunner:
+def _runner(banks, *, request_ids=None) -> NeuronModelRunner:
     """A runner carrying ONLY what the converter reads.
 
     ``input_batch.req_ids`` is here because the request identity the slot table
     keys on is the runner's own batch-ordered list, paired with block-table rows
     by request index (``neuron_model_runner.py:1126``, ``:2108``). Building the
     object with ``__new__`` keeps every other attribute absent.
+
+    ``request_ids`` overrides that list, and the EMPTY list is a real shape rather
+    than a test contrivance: at warmup the runner's input batch holds no request
+    (``initialize_kv_cache`` builds it before anything is scheduled), which is the
+    state the warmup arm below drives.
     """
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.model = SimpleNamespace(
         text_config=_text_config(), glm5next_layer_banks=tuple(banks)
     )
     runner.max_model_len = DECLARED_BLOCKS * DECLARED_PAGE_SIZE
-    runner.input_batch = SimpleNamespace(
-        req_ids=[f"req-{index}" for index in range(DECLARED_REQUESTS)]
-    )
+    if request_ids is None:
+        request_ids = [f"req-{index}" for index in range(DECLARED_REQUESTS)]
+    runner.input_batch = SimpleNamespace(req_ids=list(request_ids))
     return runner
 
 
@@ -603,6 +629,68 @@ def test_a2_a_synthetic_step_takes_no_claim() -> None:
     assert after == before, (
         f"a synthetic step changed the slot table from {before} to {after}; warmup "
         f"is not a sequence step and must take no claim"
+    )
+
+
+def test_a2_the_prefill_warmups_own_shape_is_served_and_takes_no_claim() -> None:
+    """The prefill warmup has no request, and it must still be served.
+
+    THIS IS A REGRESSION ARM, and it is the one item in this file that PASSES at the
+    base commit -- deliberately, because what it pins is the base's own behaviour.
+    Review round 1 found the regression it exists to catch: the prefill warmup
+    arrives as a PREFILL at position 0 with an input batch that names no request
+    (``_build_prefill_synthetic_inputs`` builds ``cached_seq_len = 0``, one request
+    and a whole bucket of tokens against ``decode_token_threshold = 1``), and the
+    position rule covered only a decode at 0, so the converter asked for an identity
+    that warmup cannot have and raised. The first bucket of ``warmup_prefill`` is
+    unconditional, so a server would have died before READY.
+
+    THE SHAPE IS DRIVEN THROUGH THE CONVERTER, not asserted about: this calls
+    ``_glm5next_model_kwargs`` with the warmup shape, so the classification, the slot
+    hand-out and the carrier build all run.
+
+    THE TRIPWIRE, and it is a value rather than a hope: the step must be served from
+    slot 0 -- read as a VIEW of the bank's slot 0, by storage -- and the slot table
+    must still be empty afterwards. A converter that seated warmup would leave a key
+    behind, and warmup between two real steps would then evict a live request.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks, request_ids=[])
+    metadata = _metadata(
+        banks,
+        tokens=DECLARED_WARMUP_BUCKET,
+        sparse_rows=(DECLARED_SPARSE_ROWS[0],),
+        state_rows=(DECLARED_SPARSE_ROWS[0],),
+        cached=(0,),
+    )
+
+    converted = runner._glm5next_model_kwargs(
+        _generic(tokens=DECLARED_WARMUP_BUCKET, metadata=metadata)
+    )
+
+    carriers = converted["layer_carriers"]
+    table = getattr(runner, "_glm5next_request_slot_table", None) or {}
+    linear = _linear_banks(banks)[0]
+    served = [
+        index
+        for index in range(DECLARED_STATE_SLOTS)
+        if carriers[1]["conv_state"].data_ptr() == linear["conv_state"][index].data_ptr()
+    ]
+    print(f"KEYED|a2|warmup_tokens={DECLARED_WARMUP_BUCKET}|carriers={len(carriers)}"
+          f"|served_slot={served}|table={table}")
+    assert len(carriers) == len(banks), (
+        f"the prefill warmup was served {len(carriers)} carrier(s) for "
+        f"{len(banks)} bank(s)"
+    )
+    assert served == [0], (
+        f"the prefill warmup's linear carrier is not slot 0's row; it matched "
+        f"{served}, and a warmup served from a live request's slot would run over "
+        f"that request's state"
+    )
+    assert table == {}, (
+        f"the prefill warmup left {table} in the slot table; it is not a sequence "
+        f"step and must take no claim, or a warmup would evict a live request"
     )
 
 

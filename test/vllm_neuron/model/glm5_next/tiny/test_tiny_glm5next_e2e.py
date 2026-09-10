@@ -722,7 +722,7 @@ def test_the_tiny_config_is_the_registered_constraint_set():
 def _slot_position(runner, slot=None):
     """RE-PINNED (D17.1): the scalar ring cursor became one position per request slot.
 
-    ORIGINAL READING: `_slot_position(runner)`, a single int or None --
+    ORIGINAL READING: `runner._glm5next_side_cache_cursor`, a single int or None --
     the position the one process-wide ring stood at. NEW VALUE: a dict keyed by the
     request's state slot, because the rings are per slot now and a scalar cannot say
     whose position it holds. Every landed item below reads through this helper, so
@@ -733,6 +733,29 @@ def _slot_position(runner, slot=None):
         table = getattr(runner, "_glm5next_request_slot_table", None) or {}
         slot = table.get("req-0")
     return None if slot is None else positions.get(int(slot))
+
+
+def _own_slot(runner, key: str = "req-0") -> int:
+    """RE-PINNED (D17.1): a side cache's ROWS are one request's rows, not the process's.
+
+    ORIGINAL READING: `side["tail"]` and `side["pool_cache"]` whole, because one set
+    served every step. NEW VALUE: `[_own_slot(runner)]` of each, the row set the
+    request owns, because both caches gained a leading request-slot axis. The items
+    below plant and read through this index, so the re-pin is expressed once.
+
+    THE SLOT IS THE RUNNER'S ANSWER, never this file's guess: it is read out of the
+    table the converter wrote. Reading it demands that a real step has already run,
+    which is why the items that plant before their first step claim the slot first --
+    hand-out zeroes BOTH of a new owner's caches (`neuron_model_runner.py:5119-5123`),
+    so a plant made before the claim would be wiped by the step that took it.
+    """
+    table = getattr(runner, "_glm5next_request_slot_table", None) or {}
+    if key not in table:
+        raise item.VacuousControlError(
+            f"no state slot is assigned to {key!r} yet, so a per-request row cannot "
+            f"be read; a real step must claim the slot before this is called"
+        )
+    return int(table[key])
 
 
 def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) -> dict:
@@ -1346,7 +1369,20 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
             "no bank in this stack carries a ring, so this item measures nothing"
         )
 
-    above_the_bound = int(rings[0]["pool_cache"].shape[0]) - 1
+    # RE-PINNED: the request claims its slot before anything is planted. Hand-out
+    # zeroes both of a new owner's caches, so a plant made before the claim would be
+    # wiped by the step that took the slot rather than by the property under test.
+    _model_kwargs(
+        runner,
+        input_ids=torch.zeros(item.STACK_TOKENS, dtype=torch.long),
+        cached=0,
+        sampling_row=item.STACK_TOKENS - 1,
+    )
+    own = _own_slot(runner)
+    # RE-PINNED: ORIGINAL READING `rings[0]["pool_cache"].shape[0]`, the pool ROW
+    # count. NEW VALUE `shape[1]`: axis 0 is the request-slot axis now, and reading it
+    # here would compare a slot count against a candidate count.
+    above_the_bound = int(rings[0]["pool_cache"].shape[1]) - 1
     candidates = item.STACK_TOKENS // int(root.text_config.index_kpool)
     print(f"TINYE2E|pool_rows|planted_row={above_the_bound}|this_sequences_candidates="
           f"{candidates}")
@@ -1356,9 +1392,15 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
             f"{candidates}, so planting there would be reachable and the second conjunct "
             f"would be measuring the wrong thing"
         )
+    # RE-PINNED: the plant fills EVERY slot's ring, and the reads below take this
+    # request's own row. ORIGINAL READING: `side["tail"]` and
+    # `side["pool_cache"][above_the_bound]` whole, one set per process. Planting wide
+    # and reading narrow is what makes the clearing's SCOPE visible: the other slots
+    # must keep their planted values, because a fresh sequence clears its own ring
+    # and not a concurrent request's.
     for side in rings:
         side["tail"].fill_(3.0)
-        side["pool_cache"][above_the_bound].fill_(5.0)
+        side["pool_cache"][:, above_the_bound].fill_(5.0)
 
     _model_kwargs(
         runner,
@@ -1366,12 +1408,32 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
         cached=0,
         sampling_row=item.STACK_TOKENS - 1,
     )
-    cleared = max(float(side["tail"].abs().max()) for side in rings)
-    stale = min(float(side["pool_cache"][above_the_bound].abs().max()) for side in rings)
-    print(f"TINYE2E|fresh_prefill|ring_max={cleared}|planted_pool_row_min={stale}")
+    cleared = max(float(side["tail"][own].abs().max()) for side in rings)
+    stale = min(
+        float(side["pool_cache"][own][above_the_bound].abs().max()) for side in rings
+    )
+    others = [
+        float(side["tail"][index].abs().max())
+        for side in rings
+        for index in range(int(side["tail"].shape[0]))
+        if index != own
+    ]
+    if not others:
+        raise item.VacuousControlError(
+            "this fixture allocates one state slot, so there is no other request's "
+            "row to check the clearing's scope against"
+        )
+    untouched = min(others)
+    print(f"TINYE2E|fresh_prefill|slot={own}|ring_max={cleared}|planted_pool_row_min={stale}"
+          f"|other_slots_min={untouched}")
     assert cleared == 0.0, (
         "a prefill at position 0 is a new sequence and must start on an empty ring; this one "
         "inherited the planted state"
+    )
+    assert untouched == 3.0, (
+        "the fresh prefill cleared a ring row this request does not own; the rows are per "
+        "request now, so clearing wider than one slot is the cross-request destruction the "
+        "slot axis exists to end"
     )
     assert stale == 5.0, (
         "the pooled store must not be blanket-cleared: the planted row is above this "
@@ -1388,8 +1450,8 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
         cached=item.STACK_TOKENS,
         sampling_row=0,
     )
-    kept = min(float(side["tail"].abs().max()) for side in rings)
-    print(f"TINYE2E|decode_step|ring_min={kept}")
+    kept = min(float(side["tail"][own].abs().max()) for side in rings)
+    print(f"TINYE2E|decode_step|slot={own}|ring_min={kept}")
     assert kept == 7.0, (
         "a decode step must not clear the ring; the ring is the decode leg's own state and "
         "clearing it would lose the partial pool this step is meant to advance"
@@ -1625,8 +1687,19 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     if not rings:
         raise item.VacuousControlError("no bank in this stack carries a ring")
 
+    # RE-PINNED: the request claims its slot before any row is read or cleared,
+    # because hand-out zeroes both of a new owner's caches and would otherwise wipe
+    # the row this item compares part-way through Route A.
+    _model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
+                  sampling_row=REMAINDER_PROMPT - 1)
+    own = _own_slot(runner)
+
     def _rows() -> list[torch.Tensor]:
-        return [entry["pool_cache"][completed_pool] for entry in rings]
+        """RE-PINNED: ORIGINAL READING `entry["pool_cache"][completed_pool]`, the pool
+        row of the one process-wide store. NEW VALUE `[own][completed_pool]`: axis 0 is
+        the request-slot axis now, so the pool id belongs on axis 1.
+        """
+        return [entry["pool_cache"][own][completed_pool] for entry in rings]
 
     def _clear_the_row() -> None:
         for row in _rows():
@@ -1660,8 +1733,12 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     _clear_the_row()
     root(**_model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
                          sampling_row=REMAINDER_PROMPT - 1))
-    low = min(float(entry["tail"][0, :remainder].abs().max()) for entry in rings)
-    high = max(float(entry["tail"][0, remainder:].abs().max()) for entry in rings)
+    # RE-PINNED: ORIGINAL READING `entry["tail"][0, :remainder]`, ring 0's low
+    # positions of the one process-wide ring. NEW VALUE `[own][0, :remainder]`: the
+    # leading axis is the request slot, so ring 0 and the positions both shift right
+    # by one -- without this the slice selected slot 0 and sliced the two-ring axis.
+    low = min(float(entry["tail"][own][0, :remainder].abs().max()) for entry in rings)
+    high = max(float(entry["tail"][own][0, remainder:].abs().max()) for entry in rings)
     print(f"TINYE2E|seeded_ring|low_slots_min={low:.6g}|high_slots_max={high:.6g}"
           f"|seeded_slots={remainder}")
     assert low > 0.0, (
@@ -1697,7 +1774,10 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     root(**_model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
                          sampling_row=REMAINDER_PROMPT - 1))
     for entry in rings:
-        entry["tail"].zero_()
+        # RE-PINNED: ORIGINAL READING `entry["tail"].zero_()`, the whole ring. NEW
+        # VALUE: this request's own ring. The control takes the seeding back out of
+        # the sequence under test, so it must reach that sequence's rows and no other.
+        entry["tail"][own].zero_()
     for step in range(remainder):
         position = REMAINDER_PROMPT + step
         root(**_model_kwargs(runner, input_ids=ids[position:position + 1], cached=position,
@@ -2140,7 +2220,15 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
         side["tail"].fill_(PLANTED_RING)
     step(0, prompt)
     reset = int(_slot_position(runner))
-    planted = max(float(side["tail"].abs().max()) for side in _live_rings(runner, banks))
+    # RE-PINNED: ORIGINAL READING `side["tail"]` whole, the one process-wide ring.
+    # NEW VALUE: this request's own row. The plant above still fills EVERY slot, so
+    # what this reads is the clearing's SCOPE as well as its effect: the fresh
+    # sequence empties its own row and the other slots keep the planted value, which
+    # is what makes two concurrent requests possible at all.
+    own = _own_slot(runner)
+    planted = max(
+        float(side["tail"][own].abs().max()) for side in _live_rings(runner, banks)
+    )
     print(f"TINYE2E|cursor_second_sequence|reset={reset}|ring_max={planted}"
           f"|planted={PLANTED_RING}")
     assert reset == prompt, (
