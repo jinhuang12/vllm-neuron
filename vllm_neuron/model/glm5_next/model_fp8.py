@@ -467,8 +467,8 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # which floors through the same ``_per_rank``, so the width a loader slices to and
 # the width ``projection_widths`` expects are the same expression on the same two
 # inputs. They also read the same world size in production: the root binds
-# ``self.world_size = _resolve_world_size()`` (``:5022``) and passes exactly that
-# to ``_shard_geometry_for`` (``:5231``, ``:5552``), which is what the class's
+# ``self.world_size = _resolve_world_size()`` (``:7557``) and passes exactly that
+# to ``_shard_geometry_for`` (``:7794``, ``:8046``, ``:8095``) -- what the class's
 # reader resolves too. If a caller ever made the two disagree the load would stop
 # at ``prepare_projection_weights``'s width check with the site named, rather
 # than compute the wrong function at plausible shapes -- and conjunct (1) of this
@@ -3553,7 +3553,7 @@ class Glm5NextDenseMLP(nn.Module):
     # the call behave exactly as it did before ``inc-glm53f-090``
     # (``blockwise_fp8_mm.py:441``, ``:449-456``). ``-090``'s load-time prep is
     # reached by ``_run_load_time_preps`` through
-    # ``hasattr(type(module), "prepare_scale_operands")`` (``:6106``), which is
+    # ``hasattr(type(module), "prepare_scale_operands")`` (``:8179``), which is
     # a per-class opt-in this class does not take. Adding that prep is a
     # separate decision with its own acceptance, and NOT something to smuggle
     # into a forward: it would change what the load path does.
@@ -3637,7 +3637,7 @@ class Glm5NextDenseMLP(nn.Module):
             )
 
         # ---- THE OPERANDS. The grid name is DERIVED by the rule the landed
-        # prep loop uses (``_sibling_scale_grid_name``, ``:5649``) rather than
+        # prep loop uses (``_sibling_scale_grid_name``, ``:7700``) rather than
         # spelled out here, so the two cannot drift. The grids are plain
         # attributes and not declared parameters, for the reason recorded on
         # ``_load_out_of_band_scales``, which is why this is a ``getattr``.
