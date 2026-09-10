@@ -122,7 +122,7 @@ class _StandInBackend:
 
     The real backend is a ``torch.compile`` wrapper whose neuron sidecar traces the graph
     and then throws that exception, which the capture entry points swallow as the success
-    signal (``neuron_model_runner.py:4575``). This stand-in keeps both halves of that
+    signal (``neuron_model_runner.py:4576``). This stand-in keeps both halves of that
     contract, and it CALLS THE MODEL FOR REAL: the defect under repair is a ``TypeError``
     raised by the root's own signature, so a stand-in that only recorded its arguments
     could not produce it and the control below would be inert.
