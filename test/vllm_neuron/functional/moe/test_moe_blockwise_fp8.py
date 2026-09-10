@@ -66,18 +66,28 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     blockwise_fp8_moe,
     blockwise_fp8_moe_torch_oracle,
     can_run_blockwise_fp8_moe,
+    can_run_moe_down_blockwise_fp8,
     can_run_moe_gate_up_blockwise_fp8,
     dispatch_counters,
+    down_dispatch_counters,
+    down_kernel_identity,
     gate_up_dispatch_counters,
     gate_up_flat_scale_index,
     gate_up_kernel_identity,
     gate_up_kernel_scale_shape,
     kernel_identity,
     kernel_scale_shape,
+    moe_down_blockwise_fp8,
     moe_gate_up_blockwise_fp8,
+    moe_swiglu_transposed,
     reset_dispatch_counters,
+    reset_down_dispatch_counters,
     reset_gate_up_dispatch_counters,
+    reset_swiglu_dispatch_counters,
     seam_identity,
+    swiglu_dispatch_counters,
+    swiglu_kernel_identity,
+    to_down_kernel_scale_operand,
     to_gate_up_kernel_scale_operand,
     to_kernel_scale_layout,
 )
@@ -1855,3 +1865,459 @@ def test_cte_128_the_activation_transpose_is_load_bearing() -> None:
         "contracting the axis this kernel's operand orientation assumes and the "
         "orientation argument in the module comment is wrong"
     )
+
+
+# ===========================================================================
+# `inc-glm53f-113b` -- the activation and the down projection, both in NKI.
+# ===========================================================================
+#
+# WHAT EACH READING SETTLES. The down projection carries the same EXACT equality
+# `-113a` does, on the same kind of fixture, and it carries it in two arms: with
+# every affinity at `1.0`, where the compared tensor is literally the plan's pinned
+# pre-affinity matmul output, and with exactly-representable affinities, where the
+# affinity multiply is inside the equality and cannot hide. The activation cannot
+# be read by an equality in general -- a device sigmoid is not reproducible by a
+# torch reference bit for bit -- so it is read twice instead: at the file's ALREADY
+# DECLARED tolerance on the general fixture (no new tolerance pair, P9), and at
+# BIT EQUALITY on a zero-gate fixture, where `SiLU(0) * up` is exactly `+0.0` and
+# any plumbing error still shows.
+#
+# WHAT IS NOT HERE. The block seam is not switched, so the four landed items that
+# assert the vendor identity stay byte-unchanged; the module comment names the
+# three device-side constructs the switch needs and the campaign rule that says
+# they are measured before they are used.
+
+#: The affinity values, all exactly representable, so the affinity arm of the
+#: equality stays bit-exact rather than becoming a tolerance reading.
+_G128_AFFINITIES = (1.0, 0.5, 0.75, 0.25)
+
+
+def _g128_down_grid() -> torch.Tensor:
+    """``[E, I//128, H//128]`` fp32 down scales, mixing both families in every quad."""
+    n_i, n_h = G128_I // GATE_UP_SCALE_BLOCK, G128_H // GATE_UP_SCALE_BLOCK
+    grid = torch.empty((E, n_i, n_h), dtype=torch.float32)
+    for expert in range(E):
+        for i_block in range(n_i):
+            for h_block in range(n_h):
+                value = _G128_SCALE_VALUES[(i_block % 2) * 2 + (h_block % 2)]
+                quad = (i_block // 2) * (n_h // 2) + (h_block // 2)
+                grid[expert, i_block, h_block] = value * (
+                    2.0 ** (((quad + expert) % 4) - 2)
+                )
+    return grid
+
+
+def _build_down_128_case() -> dict:
+    """One transposed intermediate, one down weight and one affinity column per expert."""
+    grid = _g128_down_grid()
+    # `[E, I, B]`: the activation seam's own output orientation.
+    intermediate_t = _g128_fp8_values(201, E, G128_I, G128_TOKENS)
+    down_weight = _g128_fp8_values(202, E, G128_I, G128_H).to(_FP8)
+    affinity = torch.empty((E, G128_TOKENS, 1), dtype=torch.float32)
+    for expert in range(E):
+        for token in range(G128_TOKENS):
+            affinity[expert, token, 0] = _G128_AFFINITIES[
+                (token + expert) % len(_G128_AFFINITIES)
+            ]
+    return {
+        "grid": grid,
+        "intermediate_t": intermediate_t,
+        "down_weight": down_weight,
+        "affinity": affinity,
+        "ones": torch.ones((E, G128_TOKENS, 1), dtype=torch.float32),
+        "operands": [
+            to_down_kernel_scale_operand(grid[expert], G128_I, G128_H)
+            for expert in range(E)
+        ],
+    }
+
+
+def _down_expanded_scales(grid: torch.Tensor, expert: int) -> torch.Tensor:
+    """``[I, H]`` -- one scale per weight element."""
+    per_block = grid[expert]
+    expanded = per_block.repeat_interleave(GATE_UP_SCALE_BLOCK, dim=0)
+    return expanded.repeat_interleave(GATE_UP_SCALE_BLOCK, dim=1)
+
+
+def _down_reference(case: dict, expert: int, affinity_key: str) -> torch.Tensor:
+    """The model-derived reference: dequantise, one matmul, then the affinity."""
+    weight = case["down_weight"][expert].to(torch.float32)
+    dequantised = weight * _down_expanded_scales(case["grid"], expert)
+    intermediate = case["intermediate_t"][expert].t().to(torch.float32)
+    return (intermediate @ dequantised) * case[affinity_key][expert]
+
+
+def _down_reference_blockwise(case: dict, expert: int) -> torch.Tensor:
+    """The same reference in the kernel's order: per contraction block, scale, add."""
+    weight = case["down_weight"][expert].to(torch.float32)
+    intermediate = case["intermediate_t"][expert].t().to(torch.float32)
+    accumulator = torch.zeros((G128_TOKENS, G128_H), dtype=torch.float32)
+    for i_block in range(G128_I // GATE_UP_SCALE_BLOCK):
+        rows = slice(
+            i_block * GATE_UP_SCALE_BLOCK, (i_block + 1) * GATE_UP_SCALE_BLOCK
+        )
+        partial = intermediate[:, rows] @ weight[rows, :]
+        column_scales = case["grid"][expert, i_block].repeat_interleave(
+            GATE_UP_SCALE_BLOCK
+        )
+        accumulator += partial * column_scales
+    return accumulator * case["ones"][expert]
+
+
+def _down_precondition(case: dict, expert: int) -> tuple[bool, float, bool]:
+    """``(fp64_agrees, gap, forms_agree)`` for the down projection, printed first."""
+    weight64 = case["down_weight"][expert].to(torch.float64)
+    scales64 = _down_expanded_scales(case["grid"], expert).to(torch.float64)
+    intermediate64 = case["intermediate_t"][expert].t().to(torch.float64)
+    reference64 = intermediate64 @ (weight64 * scales64)
+    flat32 = _down_reference(case, expert, "ones")
+    gap = float((reference64 - flat32.to(torch.float64)).abs().max())
+    return (
+        bool(torch.equal(reference64, flat32.to(torch.float64))),
+        gap,
+        bool(torch.equal(flat32, _down_reference_blockwise(case, expert))),
+    )
+
+
+def _assert_limb_route_128(counters, sim, expected_dispatches: int, label: str) -> str:
+    """The three declared route values for one `-113b` limb, each read as a number."""
+    nki_dispatch, torch_fallback = counters()
+    gate = can_run_kernel(torch.zeros(1))
+    reading = (
+        f"nki_dispatch={nki_dispatch} torch_fallback={torch_fallback} "
+        f"can_run_kernel={gate} simulate_kernel_calls={sim.calls}"
+    )
+    _emit_128(label, reading)
+    if nki_dispatch != expected_dispatches:
+        raise RouteInstrumentError(
+            f"{label}: the limb's dispatch counter read {nki_dispatch}, declared "
+            f"{expected_dispatches}. {reading}"
+        )
+    if torch_fallback != 0:
+        raise RouteInstrumentError(
+            f"{label}: the torch-fallback counter read {torch_fallback}, declared "
+            f"exactly 0. {reading}"
+        )
+    if gate is not True:
+        raise RouteInstrumentError(f"{label}: can_run_kernel() read {gate!r}. {reading}")
+    if sim.calls != expected_dispatches:
+        raise RouteInstrumentError(
+            f"{label}: nki.simulator.simulate_kernel ran {sim.calls} times, declared "
+            f"{expected_dispatches}. A numeric pass without a simulator call is the "
+            f"F1 false green. {reading}"
+        )
+    return reading
+
+
+def test_cte_128_down_matches_the_model_reference_per_expert_block() -> None:
+    """The down projection equals the model-derived reference, bit for bit, twice.
+
+    Arm 1 sets every affinity to ``1.0``, so the compared tensor is exactly the
+    plan's pinned pre-affinity matmul output. Arm 2 uses exactly-representable
+    affinities, so the affinity multiply is inside the equality and a wrong
+    placement or a wrong broadcast cannot pass.
+    """
+    case = _build_down_128_case()
+    reset_down_dispatch_counters()
+
+    for expert in range(E):
+        exact, gap, forms_agree = _down_precondition(case, expert)
+        _emit_128(
+            "down-precondition",
+            f"expert={expert} fp64_vs_fp32_bit_equal={int(exact)} "
+            f"max_gap={gap:.6e} flat_form_equals_block_form={int(forms_agree)}",
+        )
+        if not exact or not forms_agree:
+            raise GateUpExactnessError(
+                f"expert {expert}: exactness precondition failed "
+                f"(fp64 agrees={exact}, forms agree={forms_agree}, gap={gap:.6e}), "
+                f"so an equality here would be a statement about rounding"
+            )
+
+    with _SimulatorCounter() as sim:
+        outputs = {
+            (expert, key): moe_down_blockwise_fp8(
+                case["intermediate_t"][expert],
+                case["down_weight"][expert],
+                case["operands"][expert],
+                case[key][expert],
+            )
+            for expert in range(E)
+            for key in ("ones", "affinity")
+        }
+    _assert_limb_route_128(down_dispatch_counters, sim, 2 * E, "down-acceptance")
+
+    passed = 0
+    worst = -1.0
+    for (expert, key), output in outputs.items():
+        got = output.to(torch.float32)
+        want = _down_reference(case, expert, key)
+        assert tuple(got.shape) == (G128_TOKENS, G128_H), tuple(got.shape)
+        if float(want.abs().max()) == 0.0:
+            raise VacuousControlError(
+                f"expert {expert} [{key}]: the reference is all zero"
+            )
+        max_abs_diff = float((got - want).abs().max())
+        worst = max(worst, max_abs_diff)
+        _emit_128(
+            "down-equality",
+            f"expert={expert} affinity={key} "
+            f"bit_equal={int(bool(torch.equal(got, want)))} "
+            f"max_abs_diff={max_abs_diff} want_absmax={float(want.abs().max()):.6e}",
+        )
+        assert torch.equal(got, want), (
+            f"expert {expert} [{key}]: the down projection and the model-derived "
+            f"reference are not bit-equal; max_abs_diff={max_abs_diff}"
+        )
+        assert max_abs_diff == 0
+        passed += 1
+
+    _emit_128(
+        "down-verdict",
+        f"expert_block_arms_passing={passed}/{2 * E} worst_max_abs_diff={worst}",
+    )
+    assert passed == 2 * E
+
+
+def test_cte_128_down_a_lossy_256_retile_must_not_reach_exactness() -> None:
+    """The `256` quad-maximum mapping must not reach exactness on the down grid either.
+
+    Armed the same way as the gate/up control: every quad is shown to mix both
+    mantissa families before the result is read, because a single-family quad
+    retiles losslessly.
+    """
+    case = _build_down_128_case()
+    grid = case["grid"]
+    n_i, n_h = grid.shape[1], grid.shape[2]
+
+    quads = 0
+    for expert in range(E):
+        for quad_i in range(n_i // 2):
+            for quad_h in range(n_h // 2):
+                values = grid[
+                    expert,
+                    2 * quad_i : 2 * quad_i + 2,
+                    2 * quad_h : 2 * quad_h + 2,
+                ].reshape(-1)
+                families = {_mantissa_family_128(float(v)) for v in values}
+                if families != {"A", "B"}:
+                    raise VacuousControlError(
+                        f"down quad (expert={expert}, i={quad_i}, h={quad_h}) draws "
+                        f"from {sorted(families)} only, values "
+                        f"{[float(v) for v in values]}; a single-family quad "
+                        f"retiles losslessly and this control would read zero for "
+                        f"the wrong reason"
+                    )
+                quads += 1
+    _emit_128("down-control-arming", f"quads_mixing_both_families={quads}/{quads}")
+
+    lossy = grid.clone()
+    for expert in range(E):
+        for quad_i in range(n_i // 2):
+            for quad_h in range(n_h // 2):
+                rows = slice(2 * quad_i, 2 * quad_i + 2)
+                cols = slice(2 * quad_h, 2 * quad_h + 2)
+                lossy[expert, rows, cols] = grid[expert, rows, cols].max()
+    if torch.equal(lossy, grid):
+        raise VacuousControlError("the lossy 256 mapping changed no down scale")
+
+    reset_down_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = moe_down_blockwise_fp8(
+            case["intermediate_t"][0],
+            case["down_weight"][0],
+            to_down_kernel_scale_operand(lossy[0], G128_I, G128_H),
+            case["ones"][0],
+        ).to(torch.float32)
+    _assert_limb_route_128(down_dispatch_counters, sim, 1, "down-control-route")
+
+    max_abs_diff = float((got - _down_reference(case, 0, "ones")).abs().max())
+    _emit_128(
+        "down-control",
+        f"lossy_256_max_abs_diff={max_abs_diff} "
+        f"reached_zero={int(max_abs_diff == 0)}",
+    )
+    assert max_abs_diff != 0, (
+        "the lossy 256 retile reached bit equality on the down projection, so this "
+        "limb's equality does not discriminate the two granularities"
+    )
+
+
+def test_cte_128_the_affinity_scaling_is_load_bearing() -> None:
+    """Changing the affinities must change the down result, by exactly their ratio.
+
+    Two readings rather than one: the two arms differ (so the affinity reaches the
+    arithmetic at all), and their ratio is exactly the affinity column (so it is
+    applied per TOKEN and not per anything else).
+    """
+    case = _build_down_128_case()
+    reset_down_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        plain = moe_down_blockwise_fp8(
+            case["intermediate_t"][0],
+            case["down_weight"][0],
+            case["operands"][0],
+            case["ones"][0],
+        ).to(torch.float32)
+        scaled = moe_down_blockwise_fp8(
+            case["intermediate_t"][0],
+            case["down_weight"][0],
+            case["operands"][0],
+            case["affinity"][0],
+        ).to(torch.float32)
+    _assert_limb_route_128(down_dispatch_counters, sim, 2, "affinity-route")
+
+    if torch.equal(case["affinity"][0], case["ones"][0]):
+        raise VacuousControlError("the two affinity columns are identical")
+    moved = float((scaled - plain).abs().max())
+    ratio_exact = bool(torch.equal(scaled, plain * case["affinity"][0]))
+    _emit_128(
+        "affinity",
+        f"max_abs_change={moved} scaled_equals_plain_times_affinity="
+        f"{int(ratio_exact)}",
+    )
+    assert moved != 0, (
+        "the affinity column changed nothing, so it does not reach the kernel's "
+        "arithmetic and the equality above certifies nothing about it"
+    )
+    assert ratio_exact, (
+        "the two arms differ but not by the affinity column, so the affinity is "
+        "applied along the wrong axis"
+    )
+
+
+def test_cte_128_swiglu_matches_torch_and_is_exact_where_it_can_be() -> None:
+    """The activation, read twice: at the declared tolerance, and at bit equality.
+
+    A device sigmoid is not reproducible by a torch reference bit for bit, so the
+    general arm is bounded by the tolerance this file ALREADY declares (no new
+    pair, P9) and reports its own error as a number. The zero-gate arm is exact:
+    ``SiLU(0) * up`` is ``+0.0``, so plumbing errors still have nowhere to hide.
+    """
+    gate_up = torch.empty(
+        (G128_TOKENS, GATE_UP_FUSION * G128_I), dtype=torch.float32
+    )
+    gate_up[:, :G128_I] = _g128_fp8_values(301, G128_TOKENS, G128_I) - 0.5
+    gate_up[:, G128_I:] = _g128_fp8_values(302, G128_TOKENS, G128_I)
+
+    reset_swiglu_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = moe_swiglu_transposed(gate_up).to(torch.float32)
+    _assert_limb_route_128(swiglu_dispatch_counters, sim, 1, "swiglu-route")
+
+    assert tuple(got.shape) == (G128_I, G128_TOKENS), (
+        f"the activation seam returned {tuple(got.shape)}, expected the transposed "
+        f"{(G128_I, G128_TOKENS)} its contract declares"
+    )
+    want = (
+        torch.nn.functional.silu(gate_up[:, :G128_I]) * gate_up[:, G128_I:]
+    ).t().contiguous()
+    max_rel = _max_rel_error(got, want)
+    _emit_128(
+        "swiglu",
+        f"max_rel_error={max_rel:.6e} rtol={RTOL} atol={ATOL} "
+        f"want_absmax={float(want.abs().max()):.6e}",
+    )
+    if float(want.abs().max()) == 0.0:
+        raise VacuousControlError("the activation reference is all zero")
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+    # The exact arm: a zero gate makes SiLU(gate) * up exactly +0.0.
+    zero_gate = gate_up.clone()
+    zero_gate[:, :G128_I] = 0.0
+    reset_swiglu_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        zeros = moe_swiglu_transposed(zero_gate).to(torch.float32)
+    _assert_limb_route_128(swiglu_dispatch_counters, sim, 1, "swiglu-zero-route")
+    max_abs_diff = float(zeros.abs().max())
+    _emit_128(
+        "swiglu",
+        f"zero_gate_max_abs={max_abs_diff} "
+        f"bit_equal_to_positive_zero="
+        f"{int(bool(torch.equal(zeros, torch.zeros_like(zeros))))} "
+        f"signbits_set={int((torch.signbit(zeros)).sum())}",
+    )
+    assert torch.equal(zeros, torch.zeros_like(zeros)), max_abs_diff
+    # +0.0 and not -0.0: the sign bit is a real distinction the campaign has been
+    # bitten by before (`functional/dsa/ragged_pack.py` records the measurement).
+    assert int(torch.signbit(zeros).sum()) == 0
+
+
+def test_cte_128_swiglu_and_down_identities_are_authored_in_this_campaign() -> None:
+    """Both new seams dispatch to kernels this module authors, derived through the seam."""
+    import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
+
+    for label, reading, expected in (
+        ("swiglu", swiglu_kernel_identity(), "moe_swiglu_transposed_kernel"),
+        ("down", down_kernel_identity(), "moe_down_blockwise_fp8_kernel"),
+    ):
+        module, qualname = reading
+        _emit_128("identity", f"{label}_kernel={module}.{qualname}")
+        assert module == "vllm_neuron.functional.moe.moe_blockwise_fp8", module
+        assert qualname == expected, qualname
+        assert "nkilib" not in module
+
+    # Non-vacuity: the vendor member is still bound here and reads differently.
+    vendor = moe._unwrap_nki(moe.blockwise_mm_baseline_shard_intermediate)
+    assert (vendor.__module__, vendor.__qualname__) != (
+        "vllm_neuron.functional.moe.moe_blockwise_fp8",
+        "moe_down_blockwise_fp8_kernel",
+    )
+    # And the three campaign limbs are three different kernels, not one read thrice.
+    identities = {
+        gate_up_kernel_identity(),
+        swiglu_kernel_identity(),
+        down_kernel_identity(),
+    }
+    _emit_128("identity", f"distinct_campaign_kernels={len(identities)}/3")
+    assert len(identities) == 3
+
+
+@pytest.mark.parametrize(
+    "tokens,rows,cols,needle",
+    [
+        (200, 512, 512, "B=200 is not a positive multiple"),
+        (256, 500, 512, "I=500 is not a positive multiple"),
+        (256, 512, 500, "H=500 is not a positive multiple"),
+    ],
+)
+def test_cte_128_down_refuses_inadmissible_geometry_by_name(
+    tokens: int, rows: int, cols: int, needle: str
+) -> None:
+    """Every down refusal names the offending extent."""
+    with pytest.raises(MoeBlockwiseFp8Error) as excinfo:
+        can_run_moe_down_blockwise_fp8(torch.zeros(1), tokens, rows, cols)
+    assert needle in str(excinfo.value), str(excinfo.value)
+
+
+def test_cte_128_down_and_swiglu_refuse_wrong_operands_by_name() -> None:
+    """Rank, orientation, operand shape and affinity shape are each refused by name."""
+    case = _build_down_128_case()
+    inter, weight = case["intermediate_t"][0], case["down_weight"][0]
+    operand, affinity = case["operands"][0], case["ones"][0]
+
+    with pytest.raises(MoeBlockwiseFp8Error) as rank:
+        moe_down_blockwise_fp8(inter.unsqueeze(0), weight, operand, affinity)
+    assert "must have rank 2" in str(rank.value)
+
+    wrong_way = torch.zeros((G128_H, G128_I), dtype=torch.float32).to(_FP8)
+    with pytest.raises(MoeBlockwiseFp8Error) as orientation:
+        moe_down_blockwise_fp8(inter, wrong_way, operand, affinity)
+    assert "contraction-major" in str(orientation.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as shape:
+        moe_down_blockwise_fp8(inter, weight, operand[:, :-1].contiguous(), affinity)
+    assert "to_down_kernel_scale_operand" in str(shape.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as columns:
+        moe_down_blockwise_fp8(inter, weight, operand, affinity[:-1])
+    assert "affinity must be [B, 1]" in str(columns.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as grid:
+        to_down_kernel_scale_operand(case["grid"][0][:, :-1].contiguous(), G128_I, G128_H)
+    assert "mis-sized" in str(grid.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as activation:
+        moe_swiglu_transposed(torch.zeros((G128_TOKENS, 3), dtype=torch.float32))
+    assert "GATE_UP_FUSION" in str(activation.value)
+    _emit_128("refusal", "down_and_swiglu_refusals=6 all_named")

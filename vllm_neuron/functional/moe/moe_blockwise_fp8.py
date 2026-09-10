@@ -165,19 +165,33 @@ __all__ = [
     "blockwise_fp8_moe",
     "blockwise_fp8_moe_torch_oracle",
     "can_run_blockwise_fp8_moe",
+    "can_run_moe_down_blockwise_fp8",
     "can_run_moe_gate_up_blockwise_fp8",
     "dispatch_counters",
+    "down_dispatch_counters",
+    "down_flat_scale_index",
+    "down_kernel_identity",
+    "down_kernel_scale_shape",
     "gate_up_dispatch_counters",
     "gate_up_flat_scale_index",
     "gate_up_kernel_identity",
     "gate_up_kernel_scale_shape",
     "kernel_identity",
     "kernel_scale_shape",
+    "moe_down_blockwise_fp8",
+    "moe_down_blockwise_fp8_kernel",
     "moe_gate_up_blockwise_fp8",
     "moe_gate_up_blockwise_fp8_kernel",
+    "moe_swiglu_transposed",
+    "moe_swiglu_transposed_kernel",
     "reset_dispatch_counters",
+    "reset_down_dispatch_counters",
     "reset_gate_up_dispatch_counters",
+    "reset_swiglu_dispatch_counters",
     "seam_identity",
+    "swiglu_dispatch_counters",
+    "swiglu_kernel_identity",
+    "to_down_kernel_scale_operand",
     "to_gate_up_kernel_scale_operand",
     "to_kernel_scale_layout",
 ]
@@ -935,6 +949,57 @@ def moe_gate_up_blockwise_fp8_kernel(hidden, fused_weight, scale_operand):
     return out
 
 
+# --------------------------------------------------------------------------- #
+# `inc-glm53f-113b`: the activation and the down projection, both in NKI.        #
+# --------------------------------------------------------------------------- #
+# WHAT THESE TWO LIMBS ARE. Together with `-113a` they complete the block's
+# arithmetic: ``SiLU(gate) * up`` on the gate/up result, then the down projection
+# with its own ``128 x 128`` block dequantisation folded in, then the expert
+# affinity on the down result -- which is where the plan block puts it. No torch
+# arithmetic stands between any two stages; each stage is a kernel and the seam
+# only passes tensors.
+#
+# WHY TWO SEAMS AND NOT ONE FUSED KERNEL. The plan pins the compared tensor as the
+# down projection's own fp32 matmul output, and ``SiLU`` is transcendental: no
+# reference this repository can write reproduces a device sigmoid bit for bit, so
+# a kernel that computed the activation and the matmul in one pass could not be
+# read by an equality at all. Splitting them keeps the matmul's equality EXACT and
+# gives the activation its own reading at the file's already-declared tolerance.
+# One consequence is stated rather than hidden: the intermediate goes out to HBM
+# between the two, which a later fusion increment may remove -- and cannot remove
+# by weakening this equality.
+#
+# WHY THE INTERMEDIATE COMES BACK TRANSPOSED. ``nc_matmul`` contracts the
+# PARTITION axis, and the down projection contracts ``I``. The activation produces
+# its result with tokens on partitions, so somebody must transpose; doing it once
+# inside the activation kernel with the landed ``nisa.nc_transpose`` idiom
+# (``functional/kda/gate_clamp.py:166``) costs one on-chip transpose per tile and
+# lets the down kernel load both operands straight from HBM.
+#
+# WHY ``nisa.tensor_tensor`` IS NOWHERE HERE. An elementwise tensor-times-tensor
+# is what the activation needs twice, and this image's parameter names for that
+# member are not measured by this campaign. The three-operand form IS measured --
+# `-113a` folds a scale with it -- so it is used with ``1.0`` as the identity
+# scalar. That is one wasted multiply and a construct this seat can check, which
+# is the trade an unmeasured API does not deserve.
+#
+# WHY THE AFFINITY IS A ``tensor_scalar`` OPERAND. ``operand0`` is a PER-PARTITION
+# column, broadcast along the free axis only, and the down accumulator carries
+# tokens on partitions -- so one affinity value per token is exactly the operand
+# shape that member takes (``gate_clamp.py:178-195`` records the refusal that
+# happens when it is not).
+#
+# WHAT IS STILL NOT HERE, AND WHY IT IS NOT A GAP IN THIS COMMIT. The block seam
+# ``blockwise_fp8_moe`` still enters the vendor member. Switching it needs three
+# device-side constructs -- an indirect row gather for the tokens, a per-block
+# device scalar for the expert index, and an indirect row scatter for the output --
+# which ARE landed idioms in this campaign (`inc-glm53f-044`'s paged gather and
+# `-045`'s ragged pack, both reading ``.ap(vector_offset=..., indirect_dim=0)`` off
+# the vendor's own ``scatter_add``). `-045`'s module docstring also records the
+# campaign's standing rule about them: the mechanism is measured on this image, at
+# the dtype and the width it will be used at, BEFORE the file that uses it is
+# authored. That measurement is a simulator round this seat cannot run, so the
+# switch waits for it rather than being guessed here.
 def can_run_moe_gate_up_blockwise_fp8(
     hidden_states: Tensor, tokens: int, rows: int, cols: int
 ) -> bool:
@@ -1007,6 +1072,365 @@ def moe_gate_up_blockwise_fp8(
         hidden_states.to(torch.bfloat16),
         fused_gate_up_weight,
         gate_up_scale_operand.to(torch.float32),
+    )
+
+
+def down_flat_scale_index(i_block: int, h_block: int, n_h_blocks: int) -> int:
+    """Column of the down kernel's scale operand holding one block's scale.
+
+    The order is the C-order flattening of the checkpoint's own ``[I//128, H//128]``
+    down grid -- contraction-block major -- which is the same relationship the
+    ``256``-era logical shape ``[E, I_256, H_256, TILE_SIZE]`` records at the top of
+    this file.
+    """
+    if n_h_blocks < 1:
+        raise MoeBlockwiseFp8Error(f"n_h_blocks must be >= 1, got {n_h_blocks}")
+    return i_block * n_h_blocks + h_block
+
+
+def down_kernel_scale_shape(rows: int, cols: int) -> tuple[int, int]:
+    """``[TILE_SIZE, n_blocks]`` for the down projection. ``rows`` is ``I``, ``cols`` is ``H``."""
+    _require_gate_up_weight_blocked(rows, cols)
+    n_blocks = (rows // GATE_UP_SCALE_BLOCK) * (cols // GATE_UP_SCALE_BLOCK)
+    return (TILE_SIZE, n_blocks)
+
+
+def to_down_kernel_scale_operand(
+    checkpoint_scales: Tensor, rows: int, cols: int
+) -> Tensor:
+    """One expert's ``[I//128, H//128]`` down scales -> the kernel operand.
+
+    Raises:
+        MoeBlockwiseFp8Error: if the grid is not the shape the extents imply. A
+            mis-sized grid reshapes without error onto a different block-to-scale
+            assignment, which is a wrong answer rather than a failure.
+    """
+    _require_gate_up_weight_blocked(rows, cols)
+    expected = (rows // GATE_UP_SCALE_BLOCK, cols // GATE_UP_SCALE_BLOCK)
+    if tuple(checkpoint_scales.shape) != expected:
+        raise MoeBlockwiseFp8Error(
+            f"mis-sized down scale grid: got {tuple(checkpoint_scales.shape)}, "
+            f"expected {expected} at [I={rows}, H={cols}] and block "
+            f"{GATE_UP_SCALE_BLOCK}."
+        )
+    flat = checkpoint_scales.to(torch.float32).reshape(1, -1)
+    return flat.expand(TILE_SIZE, flat.shape[1]).contiguous()
+
+
+def _require_down_blocked(tokens: int, rows: int, cols: int) -> None:
+    """The down kernel's own extent conditions. ``rows`` is ``I``, ``cols`` is ``H``."""
+    problems: list[str] = []
+    if tokens <= 0 or tokens % TILE_SIZE:
+        problems.append(
+            f"B={tokens} is not a positive multiple of TILE_SIZE={TILE_SIZE}"
+        )
+    if rows <= 0 or rows % GATE_UP_SCALE_BLOCK:
+        problems.append(
+            f"I={rows} is not a positive multiple of "
+            f"GATE_UP_SCALE_BLOCK={GATE_UP_SCALE_BLOCK}"
+        )
+    if cols <= 0 or cols % GATE_UP_SCALE_BLOCK:
+        problems.append(
+            f"H={cols} is not a positive multiple of "
+            f"GATE_UP_SCALE_BLOCK={GATE_UP_SCALE_BLOCK}"
+        )
+    if GATE_UP_H_TILES_PER_BLOCK != 1:
+        # The kernel below walks one contraction TILE per scale BLOCK. The quotient
+        # is 1 at this granularity and the guard is here so a changed constant
+        # fails loudly instead of dropping contraction tiles silently.
+        problems.append(
+            f"GATE_UP_H_TILES_PER_BLOCK={GATE_UP_H_TILES_PER_BLOCK}, and the down "
+            f"kernel is written for exactly 1 contraction tile per scale block"
+        )
+    _refuse_gate_up(problems)
+
+
+@dataclass
+class _SwigluDispatchCounters:
+    """The activation limb's route, counted separately from the two matmul limbs."""
+
+    nki_dispatch: int = 0
+    torch_fallback: int = 0
+
+
+@dataclass
+class _DownDispatchCounters:
+    """The down limb's route, counted separately from the other two."""
+
+    nki_dispatch: int = 0
+    torch_fallback: int = 0
+
+
+_SWIGLU_COUNTERS = _SwigluDispatchCounters()
+_DOWN_COUNTERS = _DownDispatchCounters()
+
+
+def reset_swiglu_dispatch_counters() -> None:
+    """Zero the activation limb's counters."""
+    _SWIGLU_COUNTERS.nki_dispatch = 0
+    _SWIGLU_COUNTERS.torch_fallback = 0
+
+
+def swiglu_dispatch_counters() -> tuple[int, int]:
+    """``(nki_dispatch, torch_fallback)`` for the activation limb. The second is 0 by construction."""
+    return _SWIGLU_COUNTERS.nki_dispatch, _SWIGLU_COUNTERS.torch_fallback
+
+
+def reset_down_dispatch_counters() -> None:
+    """Zero the down limb's counters."""
+    _DOWN_COUNTERS.nki_dispatch = 0
+    _DOWN_COUNTERS.torch_fallback = 0
+
+
+def down_dispatch_counters() -> tuple[int, int]:
+    """``(nki_dispatch, torch_fallback)`` for the down limb. The second is 0 by construction."""
+    return _DOWN_COUNTERS.nki_dispatch, _DOWN_COUNTERS.torch_fallback
+
+
+@nki.jit
+def moe_swiglu_transposed_kernel(gate_up):
+    """``SiLU(gate) * up`` for one token block, returned as ``[I, B]`` fp32.
+
+    Args:
+        gate_up: ``[B, 2*I]`` -- `-113a`'s pre-activation output, gate columns then
+            up columns.
+
+    Returns:
+        ``[I, B]`` fp32, transposed so the down projection can contract ``I`` on the
+        partition axis without transposing anything itself.
+    """
+    tokens, fused_cols = gate_up.shape
+    i_extent = fused_cols // GATE_UP_FUSION
+    out = nl.ndarray((i_extent, tokens), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    for m_tile in range(tokens // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        for i_block in range(i_extent // GATE_UP_SCALE_BLOCK):
+            i0 = i_block * GATE_UP_SCALE_BLOCK
+            gate = nl.load(
+                gate_up[m0 : m0 + TILE_SIZE, i0 : i0 + GATE_UP_SCALE_BLOCK],
+                dtype=nl.float32,
+            )
+            up = nl.load(
+                gate_up[
+                    m0 : m0 + TILE_SIZE,
+                    i_extent + i0 : i_extent + i0 + GATE_UP_SCALE_BLOCK,
+                ],
+                dtype=nl.float32,
+            )
+            # sigmoid is one activation-engine op on this image, not a composition.
+            squashed = _gate_up_sbuf()
+            nisa.activation(dst=squashed, data=gate, op=nl.sigmoid)
+            # SiLU(gate) = gate * sigmoid(gate). ``1.0`` is the identity scalar the
+            # three-operand form needs; see the section comment on tensor_tensor.
+            silu = _gate_up_sbuf()
+            nisa.scalar_tensor_tensor(
+                dst=silu,
+                data=gate,
+                op0=nl.multiply,
+                operand0=1.0,
+                op1=nl.multiply,
+                operand1=squashed,
+            )
+            gated = _gate_up_sbuf()
+            nisa.scalar_tensor_tensor(
+                dst=gated,
+                data=silu,
+                op0=nl.multiply,
+                operand0=1.0,
+                op1=nl.multiply,
+                operand1=up,
+            )
+            # [B, I] -> [I, B], the orientation the down projection contracts on.
+            transposed = _gate_up_psum()
+            nisa.nc_transpose(dst=transposed, data=gated)
+            out_sb = _gate_up_sbuf()
+            nisa.tensor_copy(dst=out_sb, src=transposed)
+            nl.store(
+                out[i0 : i0 + GATE_UP_SCALE_BLOCK, m0 : m0 + TILE_SIZE],
+                value=out_sb,
+            )
+    return out
+
+
+def moe_swiglu_transposed(gate_up: Tensor) -> Tensor:
+    """The counted activation seam. ``[B, 2*I]`` in, ``[I, B]`` fp32 out.
+
+    No torch route: an inadmissible shape raises (P13). The transposed return is
+    part of the contract, not an implementation detail -- the section comment says
+    why the transpose lives here.
+    """
+    if gate_up.ndim != 2:
+        raise MoeBlockwiseFp8Error(
+            f"gate_up must be [B, 2*I]; got {tuple(gate_up.shape)}"
+        )
+    tokens, fused_cols = int(gate_up.shape[0]), int(gate_up.shape[1])
+    if fused_cols % GATE_UP_FUSION:
+        raise MoeBlockwiseFp8Error(
+            f"gate_up has {fused_cols} columns, which is not a multiple of "
+            f"GATE_UP_FUSION={GATE_UP_FUSION}"
+        )
+    problems: list[str] = []
+    if tokens <= 0 or tokens % TILE_SIZE:
+        problems.append(
+            f"B={tokens} is not a positive multiple of TILE_SIZE={TILE_SIZE}"
+        )
+    half = fused_cols // GATE_UP_FUSION
+    if half <= 0 or half % GATE_UP_SCALE_BLOCK:
+        problems.append(
+            f"I={half} is not a positive multiple of "
+            f"GATE_UP_SCALE_BLOCK={GATE_UP_SCALE_BLOCK}"
+        )
+    _refuse_gate_up(problems)
+
+    _SWIGLU_COUNTERS.nki_dispatch += 1
+    return wrap_nki(moe_swiglu_transposed_kernel)(gate_up.to(torch.float32))
+
+
+@nki.jit
+def moe_down_blockwise_fp8_kernel(intermediate_t, down_weight, scale_operand, affinity):
+    """``out[B, H] = (intermediate[B, I] @ dequantise(down_weight[I, H])) * affinity``.
+
+    Args:
+        intermediate_t: ``[I, B]`` -- the activation seam's transposed output.
+            Loaded as bf16, which is the compute dtype the vendor kernel uses too.
+        down_weight: ``[I, H]`` fp8-e4m3, contraction-major. Upcast on the DMA.
+        scale_operand: ``[TILE_SIZE, n_blocks]`` fp32 from
+            :func:`to_down_kernel_scale_operand`.
+        affinity: ``[B, 1]`` fp32 -- one expert affinity per token, applied to the
+            down result, which is where the plan block puts it.
+
+    Returns:
+        ``[B, H]`` fp32.
+
+    One contraction tile per scale block at this granularity, so ``accumulate`` is
+    False on every matmul and each block's scale multiplies exactly the partial sum
+    it belongs to. The seam refuses the geometry if that quotient ever stops being
+    one.
+    """
+    i_extent, tokens = intermediate_t.shape
+    _, h_extent = down_weight.shape
+    n_i_blocks = i_extent // GATE_UP_SCALE_BLOCK
+    n_h_blocks = h_extent // GATE_UP_SCALE_BLOCK
+
+    out = nl.ndarray((tokens, h_extent), dtype=nl.float32, buffer=nl.shared_hbm)
+    scale_sb = nl.load(scale_operand)
+    affinity_sb = nl.load(affinity, dtype=nl.float32)
+
+    for m_tile in range(tokens // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        for h_block in range(n_h_blocks):
+            h0 = h_block * GATE_UP_SCALE_BLOCK
+            acc = _gate_up_sbuf()
+            for i_block in range(n_i_blocks):
+                i0 = i_block * GATE_UP_SCALE_BLOCK
+                psum = _gate_up_psum()
+                inter_tile = nl.load(
+                    intermediate_t[i0 : i0 + TILE_SIZE, m0 : m0 + TILE_SIZE],
+                    dtype=nl.bfloat16,
+                )
+                w_tile = nl.load(
+                    down_weight[i0 : i0 + TILE_SIZE, h0 : h0 + GATE_UP_SCALE_BLOCK],
+                    dtype=nl.bfloat16,
+                )
+                nisa.nc_matmul(
+                    dst=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    stationary=inter_tile,
+                    moving=w_tile,
+                    accumulate=False,
+                )
+                flat = i_block * n_h_blocks + h_block
+                if i_block == 0:
+                    nisa.tensor_scalar(
+                        dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                    )
+                else:
+                    nisa.scalar_tensor_tensor(
+                        dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                        op1=nl.add,
+                        operand1=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    )
+            # The affinity is a per-partition column and the partition axis is the
+            # token axis, so one value per token is exactly this operand's shape.
+            scaled = _gate_up_sbuf()
+            nisa.tensor_scalar(
+                dst=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                data=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                op0=nl.multiply,
+                operand0=affinity_sb[m0 : m0 + TILE_SIZE, 0:1],
+            )
+            nl.store(
+                out[m0 : m0 + TILE_SIZE, h0 : h0 + GATE_UP_SCALE_BLOCK],
+                value=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+            )
+    return out
+
+
+def can_run_moe_down_blockwise_fp8(
+    intermediate_t: Tensor, tokens: int, rows: int, cols: int
+) -> bool:
+    """Is the NKI route available *and* is this down geometry admissible?
+
+    Raises:
+        MoeBlockwiseFp8Error: if the geometry is inadmissible.
+    """
+    _require_down_blocked(tokens, rows, cols)
+    return can_run_kernel(intermediate_t)
+
+
+def moe_down_blockwise_fp8(
+    intermediate_t: Tensor,
+    down_weight: Tensor,
+    down_scale_operand: Tensor,
+    affinity: Tensor,
+) -> Tensor:
+    """The counted down seam. ``[I, B]``, ``[I, H]``, operand and ``[B, 1]`` in; ``[B, H]`` fp32 out."""
+    for name, tensor, rank in (
+        ("intermediate_t", intermediate_t, 2),
+        ("down_weight", down_weight, 2),
+        ("affinity", affinity, 2),
+    ):
+        if tensor.ndim != rank:
+            raise MoeBlockwiseFp8Error(
+                f"{name} must have rank {rank}; got shape {tuple(tensor.shape)}"
+            )
+    rows, tokens = int(intermediate_t.shape[0]), int(intermediate_t.shape[1])
+    if int(down_weight.shape[0]) != rows:
+        raise MoeBlockwiseFp8Error(
+            f"down_weight is contraction-major, so its axis 0 must equal "
+            f"intermediate_t.shape[0]; got weight {tuple(down_weight.shape)} "
+            f"against intermediate {tuple(intermediate_t.shape)}. A [H, I] weight "
+            f"is the likely cause -- this seam does not accept that orientation"
+        )
+    cols = int(down_weight.shape[1])
+    _require_down_blocked(tokens, rows, cols)
+
+    expected = down_kernel_scale_shape(rows, cols)
+    if tuple(down_scale_operand.shape) != expected:
+        raise MoeBlockwiseFp8Error(
+            f"down_scale_operand has shape {tuple(down_scale_operand.shape)}, "
+            f"expected {expected} at [B={tokens}, I={rows}, H={cols}]. Build it "
+            f"with to_down_kernel_scale_operand rather than by hand."
+        )
+    if tuple(affinity.shape) != (tokens, 1):
+        raise MoeBlockwiseFp8Error(
+            f"affinity must be [B, 1] = {(tokens, 1)}; got "
+            f"{tuple(affinity.shape)}. One expert affinity per token, which is the "
+            f"per-partition operand shape the kernel applies it as."
+        )
+
+    _DOWN_COUNTERS.nki_dispatch += 1
+    return wrap_nki(moe_down_blockwise_fp8_kernel)(
+        intermediate_t.to(torch.float32),
+        down_weight,
+        down_scale_operand.to(torch.float32),
+        affinity.to(torch.float32),
     )
 
 
@@ -1220,4 +1644,20 @@ def gate_up_kernel_identity() -> tuple[str, str]:
             deliberately no fall back to this module's own kernel name.
     """
     obj = _unwrap_nki(_wrapped_object_of(moe_gate_up_blockwise_fp8, "the gate/up seam"))
+    return obj.__module__, obj.__qualname__
+
+
+def swiglu_kernel_identity() -> tuple[str, str]:
+    """``(module, qualname)`` of the kernel the activation seam dispatches to.
+
+    Derived through the seam by the same rule as the reading above, so a
+    substitution moves it instead of leaving it silent.
+    """
+    obj = _unwrap_nki(_wrapped_object_of(moe_swiglu_transposed, "the activation seam"))
+    return obj.__module__, obj.__qualname__
+
+
+def down_kernel_identity() -> tuple[str, str]:
+    """``(module, qualname)`` of the kernel the down seam dispatches to."""
+    obj = _unwrap_nki(_wrapped_object_of(moe_down_blockwise_fp8, "the down seam"))
     return obj.__module__, obj.__qualname__
