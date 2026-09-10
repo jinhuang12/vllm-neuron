@@ -6893,8 +6893,16 @@ class Glm5NextDSALayer(nn.Module):
         indexer's. See :meth:`Glm5NextDSAIndexer.forward` for what each means and
         why ``max_seq_len`` is a python int. ``streams`` is ``[T, S, H]`` or
         ``None``; the return is ``[T, H]`` in the input dtype on the one-stream
-        route and ``[T, S, H]`` fp32 on the streams route, which is the combine
-        seam's own return dtype.
+        route and ``[T, S, H]`` in the STREAMS' OWN DTYPE on the streams route.
+
+        THAT DTYPE CLAIM WAS STALE AND ``inc-glm53f-030d`` COMMIT 4 IS WHY. It said
+        fp32, "the combine seam's own return dtype". Commit 4 moved the cast:
+        :meth:`Glm5NextHyperConnection.mhc_post` computes the mix in fp32 and
+        returns ``mixed.to(residual.dtype)`` (``model_fp8.py:1414``), and its own
+        ``Returns`` says so. This forward hands that value back unchanged --
+        ``site.forward(streams, attention_half)`` is the last thing it does on the
+        streams route -- so the carrier the next layer is handed is in the streams'
+        dtype, never fp32. Comment only: no cast moved with this correction.
         """
 
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
