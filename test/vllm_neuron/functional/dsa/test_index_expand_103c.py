@@ -92,7 +92,18 @@ TRAP_ROWS = 132
 """The row count the observed trap was reported at -- and a non-multiple of 128, so one reading."""
 
 TILED_ROWS = 2048
-"""The registered envelope in query tokens (``acceptance-preregistration.md`` A-5)."""
+"""The registered envelope in query tokens (``acceptance-preregistration.md`` A-5).
+
+IT IS A WHOLE NUMBER OF TILES -- 16 x 128, remainder 0 -- so it has NO short last tile. Item 4 used to
+claim it probed one here; see :data:`TAIL_TILE_ROWS`."""
+
+TAIL_TILE_ROWS = 16 * PARTITION_MAX + 4
+"""2,052 rows: the SMALLEST selecting-regime extent that has a short last tile, and item 4's second one.
+
+The regime this kernel serves starts at a longest sequence of 2,052 tokens, and 2,052 is 16 x 128 + 4 --
+seventeen tiles, the last of them 4 rows tall. That is where a remainder bug lives, and the envelope
+cannot show it: the registered 2,048 divides by 128 exactly. Written as arithmetic on
+:data:`PARTITION_MAX` so the two facts cannot drift apart."""
 
 TILED_LADDER = [SMALL_ROWS, PARTITION_MAX, TRAP_ROWS, 2 * PARTITION_MAX, TILED_ROWS]
 """Every edge of the tiling: the landed shape, the last single tile, the observed trap and
@@ -518,19 +529,43 @@ def test_tiled_matches_the_torch_oracle_at_every_declared_extent() -> None:
 def test_tiled_rows_stay_independent_across_a_tile_boundary() -> None:
     """Item 4. Perturbing one row's ids and length moves that row's output row and NOTHING else.
 
-    Two probes: the FIRST ROW OF THE SECOND TILE, which a boundary bug reaches first, and a row inside the
-    SHORT LAST TILE, which a remainder bug reaches. Both inputs are perturbed because they enter by
-    different routes -- the ids as the tile itself, the length as the per-row column operand. Each probe
-    row is asserted to have a non-empty tail and at least one live pool, so the item cannot pass
-    vacuously. Certifying component (D1.4): ``_index_expand_nki`` through ``dsa_index_expand``.
-    """
-    rows = TILED_ROWS
-    pool_ids = _pool_ids(rows)
-    seq_lens = _seq_lens(rows)
-    base = dsa_index_expand(pool_ids, seq_lens, POOL_SIZE)
+    TWO EXTENTS, one probe each, because one extent cannot carry both readings:
 
-    probes = (PARTITION_MAX, rows - 3)
-    for probe in probes:
+      * T = 2,048, the registered envelope, probed at the FIRST ROW OF THE SECOND TILE (row 128), which
+        is where a boundary bug shows first. This extent is 16 x 128 exactly, so it has NO short tile.
+      * T = 2,052, probed at a row INSIDE the 4-row LAST TILE (row 2,050), which is where a remainder bug
+        shows. 2,052 is the smallest selecting-regime extent with a short last tile.
+
+    Earlier revisions of this item claimed a short-tile probe at 2,048 and did not have one -- the second
+    probe sat in the last FULL tile. The tile a probe lands in is now ASSERTED from the tile list rather
+    than described, so the claim and the reading cannot part company again.
+
+    Both inputs are perturbed because they enter by different routes -- the ids as the tile itself, the
+    length as the per-row column operand. Each probe row is asserted to have a non-empty tail and at
+    least one live pool, so neither case can pass vacuously.
+    Certifying component (D1.4): ``_index_expand_nki`` through ``dsa_index_expand``.
+    """
+    cases = 0
+    for rows, want_short in ((TILED_ROWS, False), (TAIL_TILE_ROWS, True)):
+        tiles = row_tiles(rows)
+        # THE PROBE IS DERIVED FROM THE TILE LIST, never typed: the first row of the second tile, or a
+        # row two into the last tile. A typed row number is what let the short-tile claim go stale.
+        if want_short:
+            probe = tiles[-1][0] + 2
+            assert tiles[-1][1] < PARTITION_MAX, (rows, tiles[-1])
+            assert tiles[-1][1] == rows % PARTITION_MAX, (rows, tiles[-1])
+            assert tiles[-1][0] <= probe < rows, (probe, tiles[-1])
+        else:
+            probe = tiles[1][0]
+            assert tiles[-1][1] == PARTITION_MAX, (rows, tiles[-1])
+            assert rows % PARTITION_MAX == 0, rows
+        probe_tile = probe // PARTITION_MAX
+        assert (probe_tile == len(tiles) - 1) is want_short, (probe, probe_tile, len(tiles))
+
+        pool_ids = _pool_ids(rows)
+        seq_lens = _seq_lens(rows)
+        base = dsa_index_expand(pool_ids, seq_lens, POOL_SIZE)
+
         live = int((pool_ids[probe] >= 0).sum())
         tail = int(seq_lens[probe]) % POOL_SIZE
         assert live > 0, f"probe row {probe} selects no pool at all"
@@ -550,11 +585,18 @@ def test_tiled_rows_stay_independent_across_a_tile_boundary() -> None:
         assert torch.equal(got[keep], base[keep]), f"perturbing row {probe} moved another row's bits"
         want = mod._dsa_index_expand_torch(moved_ids, moved_lens, POOL_SIZE)
         assert torch.equal(got, want)
-        _emit('I4_ROW_INDEPENDENCE', probe=probe, tile=probe // PARTITION_MAX, live_pools=live,
-              tail_tokens=tail, moved_rows=int((got != base).any(dim=1).sum()),
-              other_rows_bit_identical=int(keep.sum()), max_abs_diff_vs_oracle=_max_abs_diff(got, want))
+        cases += 1
+        _emit("I4_ROW_INDEPENDENCE", rows=rows, probe=probe, tile=probe_tile, tiles=len(tiles),
+              probe_tile_height=tiles[probe_tile][1], tile_is_short=int(want_short),
+              live_pools=live, tail_tokens=tail,
+              moved_rows=int((got != base).any(dim=1).sum()),
+              other_rows_bit_identical=int(keep.sum()),
+              max_abs_diff_vs_oracle=_max_abs_diff(got, want))
 
-    _emit("I4_PROBES", probes=list(probes), rows=rows, tiles=row_tile_count(rows))
+    assert cases == 2, cases
+    _emit("I4_PROBES", cases=cases, extents=[TILED_ROWS, TAIL_TILE_ROWS],
+          tiles=[row_tile_count(TILED_ROWS), row_tile_count(TAIL_TILE_ROWS)],
+          remainders=[TILED_ROWS % PARTITION_MAX, TAIL_TILE_ROWS % PARTITION_MAX])
 
 
 
