@@ -1216,13 +1216,14 @@ def test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere() -> Non
     instrument.
     """
     from vllm_neuron.functional import blockwise_fp8_mm
+    from vllm_neuron.functional.blockwise_fp8_mm import scale_grid_shape
 
     dense_m, dense_k, dense_n = 128, 256, 256
     activations = _fp8_grid_values(281, dense_m, dense_k).to(torch.bfloat16)
     weight = _fp8_grid_values(282, dense_k, dense_n).to(_FP8)
-    weight_scale = torch.ones(
-        dense_k // BLOCK_QUANT_SIZE, dense_n // BLOCK_QUANT_SIZE, dtype=torch.float32
-    )
+    # The dense module's own statement of its grid, not a granularity constant,
+    # so this site cannot drift again if the kernel's block size ever moves.
+    weight_scale = torch.ones(scale_grid_shape(dense_k, dense_n), dtype=torch.float32)
 
     with _AttributedSimulatorCounter() as sim:
         blockwise_fp8_mm(activations, weight, weight_scale)

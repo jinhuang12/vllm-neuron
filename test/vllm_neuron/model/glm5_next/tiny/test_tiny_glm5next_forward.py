@@ -92,11 +92,43 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
 from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE, TILE_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     compensate_block_scales,
     downscale_fp8_weight_bytes,
 )
+
+#: THE DENSE AND SHARED-EXPERT CONSUMER'S BLOCK, IMPORTED (``inc-glm53f-112`` round 2,
+#: ruling 2). Two block constants live in this file now and each belongs to one
+#: consumer: ``DENSE_BLOCK`` for every grid bound onto a ``Glm5NextDenseMLP`` or a
+#: ``Glm5NextSharedExperts``, which ``blockwise_fp8_mm`` dequantises, and
+#: ``BLOCK_QUANT_SIZE`` for the ROUTED BANK, whose own producer still builds its
+#: operands at 256. Building a dense grid at the bank's number is what `-112` made a
+#: refusal, and it is why this file was red before this change.
+DENSE_BLOCK = SCALE_BLOCK_SIZE
+#: How many dense blocks fit in one declared scale regime. The fixtures below declare
+#: one regime per ``BLOCK_QUANT_SIZE`` column of I, which is how they were written, so
+#: this is what keeps their numbers identical as the dense granularity narrows.
+_DENSE_BLOCKS_PER_REGIME = BLOCK_QUANT_SIZE // DENSE_BLOCK
+
+
+def _per_dense_block(regimes: tuple[int, ...]) -> tuple[int, ...]:
+    """Each declared scale regime repeated over the dense blocks it covers.
+
+    WHY REPEATED RATHER THAN EXTENDED. A dense grid at ``DENSE_BLOCK`` holds
+    ``_DENSE_BLOCKS_PER_REGIME`` times as many entries as the same grid at the
+    producer's block. Giving each new entry its own exponent would move the effective
+    matrix and every reference in this file with it; repeating the regime that entry
+    sits inside leaves the dequantised weight BIT-IDENTICAL, so the tolerances and
+    comparators registered for these items are untouched.
+
+    WHAT IT GIVES UP, disclosed: :func:`_pow2_scales` states its exponents are
+    distinct per column, and adjacent entries inside one regime are now equal, so a
+    permutation WITHIN a regime would not be caught. Across regimes it still is, and a
+    transpose still is, because these grids are not square.
+    """
+    return tuple(e for e in regimes for _ in range(_DENSE_BLOCKS_PER_REGIME))
 
 #: ``fast`` only. ``forked`` is deliberately absent -- see the paragraph on process
 #: isolation in this module's docstring: the reset-and-difference around each forward
@@ -119,12 +151,14 @@ FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a
 # THE TINY-CONFIG CONSTRAINT SET, adopted from the end-to-end criterion.        #
 # --------------------------------------------------------------------------- #
 #: ``hidden_size % 256 == 0``. It is also the contraction extent of the two
-#: parallel projections, and 256 is exactly ONE ``BLOCK_QUANT_SIZE`` row of scale
-#: grid -- the smallest admissible value rather than a round number.
+#: parallel projections, and 256 is exactly ONE ``BLOCK_QUANT_SIZE`` row -- so TWO
+#: ``DENSE_BLOCK`` rows -- of scale grid: the smallest admissible value rather than a
+#: round number.
 HIDDEN_SIZE = 256
-#: ``intermediate_size >= 512``. FOUR ``BLOCK_QUANT_SIZE`` columns rather than the
-#: minimum two, because the clamp controls need blocks above the bound, inside it
-#: and below its negation, and two blocks cannot carry three regimes.
+#: ``intermediate_size >= 512``. FOUR DECLARED SCALE REGIMES rather than the minimum
+#: two, because the clamp controls need blocks above the bound, inside it and below its
+#: negation, and two blocks cannot carry three regimes. One regime per
+#: ``BLOCK_QUANT_SIZE`` column, hence eight ``DENSE_BLOCK`` columns of grid.
 INTERMEDIATE_SIZE = 1024
 #: ``num_key_value_heads = 2`` and ``head_dim <= 128``, carried for the attention
 #: items further down this file; the MLP items do not read them.
@@ -670,7 +704,7 @@ def _pow2_scales(exponents: tuple[int, ...], rows: int) -> torch.Tensor:
 
 
 def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Tensor:
-    """``weight[k, n] * scale[k // 256, n // 256]``, expanded, in fp32.
+    """``weight[k, n] * scale[k // block_rows, n // block_cols]``, expanded, in fp32.
 
     The block scale is broadcast by ``repeat_interleave`` on both axes rather than
     by an index computation, so this repeats none of the bridge's arithmetic and
@@ -697,15 +731,31 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
             f"{tuple(weight_fp8.shape)} and {tuple(block_scale.shape)}"
         )
     rows, cols = weight_fp8.shape
-    want = (rows // BLOCK_QUANT_SIZE, cols // BLOCK_QUANT_SIZE)
-    if tuple(block_scale.shape) != want:
+    # THE GRANULARITY IS DERIVED FROM THE PAIR (``inc-glm53f-112`` round 2), because
+    # this reference now serves two consumers: a dense or shared-expert grid at
+    # ``DENSE_BLOCK`` and a routed-bank grid at ``BLOCK_QUANT_SIZE``. A constant here
+    # would be right for one of them and silently wrong for the other, and a grid that
+    # does not tile its weight is still refused -- by the divisibility check below
+    # rather than by a comparison against one named number.
+    grid_rows, grid_cols = block_scale.shape
+    if grid_rows <= 0 or grid_cols <= 0 or rows % grid_rows or cols % grid_cols:
         raise ReferenceShapeError(
             f"block scale {tuple(block_scale.shape)} does not tile a "
-            f"{rows}x{cols} weight at granularity {BLOCK_QUANT_SIZE}"
+            f"{rows}x{cols} weight at any whole granularity"
+        )
+    block_rows, block_cols = rows // grid_rows, cols // grid_cols
+    if block_rows not in (DENSE_BLOCK, BLOCK_QUANT_SIZE) or block_cols not in (
+        DENSE_BLOCK,
+        BLOCK_QUANT_SIZE,
+    ):
+        raise ReferenceShapeError(
+            f"block scale {tuple(block_scale.shape)} tiles a {rows}x{cols} weight at "
+            f"{(block_rows, block_cols)}, which is neither the dense consumer's "
+            f"{DENSE_BLOCK} nor the routed bank's {BLOCK_QUANT_SIZE}"
         )
     expanded = compensate_block_scales(block_scale).scale_inv.repeat_interleave(
-        BLOCK_QUANT_SIZE, dim=0
-    ).repeat_interleave(BLOCK_QUANT_SIZE, dim=1)
+        block_rows, dim=0
+    ).repeat_interleave(block_cols, dim=1)
     return downscale_fp8_weight_bytes(weight_fp8).to(torch.float32) * expanded
 
 
@@ -844,14 +894,19 @@ def _dense_operands() -> dict:
     up_w[:, -BLOCK_QUANT_SIZE:] = -up_w[:, -BLOCK_QUANT_SIZE:]
     down_w = _fp8_grid_values(SEED_DOWN, INTERMEDIATE_SIZE, HIDDEN_SIZE)
 
-    k_blocks_parallel = HIDDEN_SIZE // BLOCK_QUANT_SIZE
-    k_blocks_down = INTERMEDIATE_SIZE // BLOCK_QUANT_SIZE
-    gate_s = _pow2_scales((-3, -1, 1, 3), k_blocks_parallel)
-    up_s = _pow2_scales((1, 3, -3, 1), k_blocks_parallel)
-    # ``down`` is ``[I, H]``, so its grid is ``[I//256, H//256]`` -- FOUR rows and
-    # ONE column, which is why it is built column-wise and then filled per row.
-    down_s = _pow2_scales((-3,), k_blocks_down)
-    down_s[-1, :] = float(2.0**3)
+    # THE DENSE CONSUMER'S BLOCK (``inc-glm53f-112`` round 2). The regimes above are
+    # declared one per ``BLOCK_QUANT_SIZE`` column, so they are repeated over the dense
+    # blocks each one covers and every dequantised number stays what it was.
+    k_blocks_parallel = HIDDEN_SIZE // DENSE_BLOCK
+    k_blocks_down = INTERMEDIATE_SIZE // DENSE_BLOCK
+    gate_s = _pow2_scales(_per_dense_block((-3, -1, 1, 3)), k_blocks_parallel)
+    up_s = _pow2_scales(_per_dense_block((1, 3, -3, 1)), k_blocks_parallel)
+    # ``down`` is ``[I, H]``, so its grid is ``[I//DENSE_BLOCK, H//DENSE_BLOCK]``, and
+    # it is built column-wise and then filled per row. The LAST declared regime is the
+    # dominating one, so the assignment covers the dense blocks that regime spans --
+    # one row while the two granularities were equal, ``_DENSE_BLOCKS_PER_REGIME`` now.
+    down_s = _pow2_scales((-3,) * (HIDDEN_SIZE // DENSE_BLOCK), k_blocks_down)
+    down_s[-_DENSE_BLOCKS_PER_REGIME:, :] = float(2.0**3)
 
     return {
         "hidden": hidden.to(torch.bfloat16),
@@ -1037,7 +1092,7 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     #
     # WHAT WENT WRONG, so the next reader knows what this is guarding. Everything
     # above binds weights in the frame the KERNEL multiplies in, with grids already
-    # at the public 256 granularity -- and that is not what a checkpoint load
+    # at the PUBLISHED granularity -- and that is not what a checkpoint load
     # delivers. The loader delivers the checkpoint's own layout, gate and up
     # ``[I, H]`` and down ``[H, I]`` (the shard table shards gate and up on dim 0,
     # "the intermediate width", ``model_fp8.py:503-513``), at the checkpoint's 128
@@ -1054,14 +1109,20 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     # prep does not publish the compute frame, the forward refuses or the numbers
     # move, and either way this conjunct fails.
     #
-    # WHY THE 128 GRID IS BUILT BY REPEATING THE PUBLIC ONE. Each 256 block then
-    # carries ONE scale across its four 128 tiles, so the coarsening is lossless and
-    # the published weight is item 1's weight again -- which is what lets this
-    # conjunct compare against the reference already computed, at the tolerance
-    # already registered, instead of needing a second reference that would have to
-    # model the requantisation. The losslessness is REPORTED below rather than
-    # assumed, and the comparison that decides the item is the forward's output.
-    tiles_per_block = BLOCK_QUANT_SIZE // TILE_SIZE
+    # WHY THE CHECKPOINT GRID IS BUILT BY REPEATING THE PUBLISHED ONE. Each consumer
+    # block then carries ONE scale across the ``TILE_SIZE`` tiles inside it, so the
+    # load-time step moves no number and the published weight is item 1's weight again
+    # -- which is what lets this conjunct compare against the reference already
+    # computed, at the tolerance already registered, instead of needing a second
+    # reference that would have to model a requantisation. The losslessness is REPORTED
+    # below rather than assumed, and the comparison that decides the item is the
+    # forward's output.
+    #
+    # SINCE ``inc-glm53f-112`` THE FACTOR IS 1 and this repeat is an identity: the
+    # dense consumer's block IS the checkpoint tile, so the grid the loader delivers is
+    # the grid the module publishes. It is DERIVED rather than deleted, so the
+    # conjunct still manufactures the loader's own input the day either number moves.
+    tiles_per_block = DENSE_BLOCK // TILE_SIZE
     loaded = model_fp8.Glm5NextDenseMLP(text_config)
     for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
         compute_weight, public_grid = operands[leaf]
@@ -1092,9 +1153,9 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     retiled = loaded.retile_checkpoint_scale_grids()
     if retiled != 3:
         raise VacuousControlError(
-            f"the load-path prep retiled {retiled} projections, not 3; at "
+            f"the load-path prep published {retiled} projections, not 3; at "
             f"[{HIDDEN_SIZE},{INTERMEDIATE_SIZE}] every extent is a whole "
-            f"{BLOCK_QUANT_SIZE} block, so a skip means it could not read them"
+            f"{DENSE_BLOCK} block, so a skip means it could not read them"
         )
     health = getattr(loaded, loaded.DENSE_RETILE_HEALTH_ATTR)
     for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
@@ -1942,7 +2003,11 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
     # transpose has to happen BEFORE this prep reads the module, and the chain below
     # is run in the order ``_run_load_time_preps`` runs it -- retile and republish,
     # THEN prepare, then forward.
-    tiles_per_block = BLOCK_QUANT_SIZE // TILE_SIZE
+    # THE DENSE CONSUMER'S BLOCK, for the reason the dense conjunct above records: the
+    # shared expert is dequantised by the same kernel, so its checkpoint grid repeats
+    # the published one over ``DENSE_BLOCK // TILE_SIZE`` tiles -- 1 since
+    # ``inc-glm53f-112``, which makes this manufacture an identity and moves no number.
+    tiles_per_block = DENSE_BLOCK // TILE_SIZE
     loaded = model_fp8.Glm5NextSharedExperts(text_config)
     for leaf in leaves:
         compute_weight, public_grid = operands[leaf]
@@ -1960,8 +2025,8 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
     republished = loaded.retile_checkpoint_scale_grids()
     if republished != 3:
         raise VacuousControlError(
-            f"the load-path prep retiled {republished} projections, not 3; every "
-            f"extent here is a whole {BLOCK_QUANT_SIZE} block"
+            f"the load-path prep published {republished} projections, not 3; every "
+            f"extent here is a whole {DENSE_BLOCK} block"
         )
     health = getattr(loaded, loaded.SHARED_RETILE_HEALTH_ATTR)
     for leaf in leaves:
@@ -2036,8 +2101,10 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
 # so it reuses item 2's bank fixture whole and needs a shared expert at the      #
 # bank's own hidden size, which item 1's 256-wide one is not.                    #
 # --------------------------------------------------------------------------- #
-#: The shared expert's scale exponents at ``ROUTED_HIDDEN_SIZE``, one per 256-block
-#: of I. The magnitudes follow item 2's lattice reading, which is the same
+#: The shared expert's scale exponents at ``ROUTED_HIDDEN_SIZE``, one DECLARED per
+#: 256-block of I -- :func:`_per_dense_block` repeats each over the ``DENSE_BLOCK``
+#: entries it covers, so the numbers below are the numbers the grid carries.
+#: The magnitudes follow item 2's lattice reading, which is the same
 #: arithmetic on the same axis: with weights on the fp8 ``1/8`` grid and hidden
 #: states scaled by ``2**HIDDEN_SCALE_EXPONENT``, a block's pre-activation at
 #: H=512 is exactly ``16 * 2**e``. Against the checkpoint's bound of 10 that puts
@@ -2088,11 +2155,13 @@ def _shared_at_routed_operands(
 ) -> dict:
     """A shared expert's three weights and PUBLIC grids at the bank's hidden size.
 
-    The shared route consumes the 256-granularity grid directly -- that is what
-    ``prepare_scale_operands`` takes and what the load-path retile publishes -- so
-    unlike the bank's fixture this one supplies no ``TILE_SIZE`` grid and nothing
-    is coarsened. Item 1's builder is untouched: it is 256 wide by its own
-    declared reading and this item needs 512.
+    The shared route consumes the grid at ``DENSE_BLOCK`` -- that is what
+    ``prepare_scale_operands`` takes and what the load-path publish delivers, since
+    `inc-glm53f-112` the checkpoint's own granularity -- so unlike the bank's fixture
+    this one supplies no coarser grid and nothing is retiled. Only the EXTENTS here
+    are the bank's; the block this grid is on is the dense consumer's. Item 1's
+    builder is untouched: it is 256 wide by its own declared reading and this item
+    needs 512.
 
     ``seed_offset`` DEFAULTS TO ZERO and the three EXPONENT arguments default to
     this module's own, so item 4's call draws exactly what it drew and scales it
@@ -2127,16 +2196,19 @@ def _shared_at_routed_operands(
     up_w[:, columns] = -up_w[:, columns]
     down_w = _fp8_grid_values(SEED_SHARED_DOWN + seed_offset, i, h)
 
-    h_blocks = h // BLOCK_QUANT_SIZE
-    i_blocks = i // BLOCK_QUANT_SIZE
+    # THE DENSE CONSUMER'S BLOCK (``inc-glm53f-112`` round 2). The regimes are declared
+    # one per ``BLOCK_QUANT_SIZE`` column, so they are repeated over the dense blocks
+    # each one covers and every dequantised number stays what it was.
+    h_blocks = h // DENSE_BLOCK
+    i_blocks = i // DENSE_BLOCK
     return {
         "gate_proj_weight": (
             gate_w.to(_FP8),
-            _pow2_scales(gate_exponents, h_blocks),
+            _pow2_scales(_per_dense_block(gate_exponents), h_blocks),
         ),
         "up_proj_weight": (
             up_w.to(_FP8),
-            _pow2_scales(up_exponents, h_blocks),
+            _pow2_scales(_per_dense_block(up_exponents), h_blocks),
         ),
         "down_proj_weight": (
             down_w.to(_FP8),
@@ -3519,7 +3591,7 @@ STACK_PAGES = 16
 #: 512 wide by 1024, which is four ``BLOCK_QUANT_SIZE`` column blocks and exactly what
 #: :func:`_shared_at_routed_operands` builds. Reused rather than re-derived because
 #: ``Glm5NextSharedExperts`` and ``Glm5NextDenseMLP`` consume the SAME three leaves in
-#: the same orientation at the same 256-granularity grid.
+#: the same orientation at the same ``DENSE_BLOCK`` grid.
 STACK_DENSE_INTERMEDIATE_SIZE = ROUTED_INTERMEDIATE_SIZE
 
 #: The bank's intermediate extent, and 512 is the SMALLEST the MoE seam admits: it

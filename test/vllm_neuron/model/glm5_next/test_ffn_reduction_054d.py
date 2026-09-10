@@ -48,14 +48,22 @@ from pathlib import Path
 
 import torch
 
-BLOCK_QUANT_SIZE = 256
+from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
+
+#: THE DENSE CONSUMER'S BLOCK, IMPORTED (``inc-glm53f-112`` round 2, ruling 2). This
+#: file used to type ``BLOCK_QUANT_SIZE = 256`` and build its grids at that number,
+#: which the dense seam refuses since `-112`: the kernel indexes the checkpoint's own
+#: tiles. It is imported rather than re-typed as 128 so this fixture follows the
+#: kernel the next time that number moves, instead of going stale beside it.
+DENSE_BLOCK = SCALE_BLOCK_SIZE
 TILE_SIZE = 128
 
-#: ``hidden_size % 256 == 0`` and exactly ONE scale-grid row: the smallest
-#: admissible contraction extent for the two parallel projections.
+#: ``hidden_size % 256 == 0`` and, at the dense block, TWO scale-grid rows: the
+#: smallest admissible contraction extent for the two parallel projections.
 HIDDEN_SIZE = 256
-#: TWO ``BLOCK_QUANT_SIZE`` columns, so each of two ranks holds exactly one whole
-#: scale block after the shard. One column could not be split at all, and four
+#: FOUR ``DENSE_BLOCK`` columns, so each of two ranks holds two whole scale blocks
+#: after the shard -- it was two columns and one block per rank while the grids were
+#: built at 256. One column could not be split at all, and doubling the width again
 #: would pay for the same reading twice.
 INTERMEDIATE_SIZE = 512
 #: A whole number of ``TILE_SIZE`` rows. The dense seam does not pad, so a
@@ -140,6 +148,30 @@ def _pow2_scales(exponents: tuple[int, ...], rows: int) -> torch.Tensor:
     return row.repeat(rows, 1)
 
 
+#: How many DENSE blocks one declared scale regime covers, DERIVED rather than typed.
+#: The regimes are written one per RANK's share of the intermediate width, which is
+#: what this item's two ranks divide.
+_BLOCKS_PER_REGIME = SHARD_INTERMEDIATE // DENSE_BLOCK
+
+
+def _per_regime(regimes: tuple[int, ...]) -> tuple[int, ...]:
+    """Each declared regime repeated over the dense blocks it covers.
+
+    WHY THE REGIMES REPEAT RATHER THAN MULTIPLY (``inc-glm53f-112`` round 2). Moving
+    the grids from the producer's 256 to the dense kernel's 128 doubles the number of
+    scale entries. Giving each new entry its own exponent would change the effective
+    matrix and every reference number in this file with it; repeating the regime the
+    entry sits inside leaves the dequantised weight BIT-IDENTICAL, so the bands and
+    the comparators registered for these two items are untouched.
+
+    WHAT IT GIVES UP, disclosed: :func:`_pow2_scales` says its exponents are distinct
+    per column, and adjacent pairs are now equal, so a permutation WITHIN one former
+    256 block would not be caught. A permutation across regimes still is, and so is a
+    transpose, because the grid is not square.
+    """
+    return tuple(e for e in regimes for _ in range(_BLOCKS_PER_REGIME))
+
+
 def _scale_grid_attribute(leaf: str) -> str:
     """The grid's attribute name, ASKED of its one definition rather than retyped."""
     return _impl().Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
@@ -154,22 +186,22 @@ def _attach(module, leaf: str, weight: torch.Tensor, grid: torch.Tensor) -> None
 def _whole_operands() -> dict:
     """The unsharded dense MLP's three weights and three public block-scale grids."""
     hidden = _fp8_grid_values(SEED_HIDDEN, TOKENS, HIDDEN_SIZE) * float(2.0**-3)
-    k_parallel = HIDDEN_SIZE // BLOCK_QUANT_SIZE
-    k_down = INTERMEDIATE_SIZE // BLOCK_QUANT_SIZE
+    k_parallel = HIDDEN_SIZE // DENSE_BLOCK
+    k_down = INTERMEDIATE_SIZE // DENSE_BLOCK
     return {
         "hidden": hidden.to(torch.bfloat16),
         "gain": _fp8_grid_values(SEED_GAIN, HIDDEN_SIZE).to(torch.bfloat16),
         "gate_proj_weight": (
             _fp8_grid_values(SEED_GATE, HIDDEN_SIZE, INTERMEDIATE_SIZE),
-            _pow2_scales((-1, 1), k_parallel),
+            _pow2_scales(_per_regime((-1, 1)), k_parallel),
         ),
         "up_proj_weight": (
             _fp8_grid_values(SEED_UP, HIDDEN_SIZE, INTERMEDIATE_SIZE),
-            _pow2_scales((1, -1), k_parallel),
+            _pow2_scales(_per_regime((1, -1)), k_parallel),
         ),
         "down_proj_weight": (
             _fp8_grid_values(SEED_DOWN, INTERMEDIATE_SIZE, HIDDEN_SIZE),
-            _pow2_scales((-1,), k_down),
+            _pow2_scales((-1,) * (HIDDEN_SIZE // DENSE_BLOCK), k_down),
         ),
     }
 
@@ -183,7 +215,7 @@ def _shard(operands: dict, rank: int) -> dict:
     grid is sliced on the axis its weight was sliced on and at grid granularity.
     """
     lo, hi = rank * SHARD_INTERMEDIATE, (rank + 1) * SHARD_INTERMEDIATE
-    glo, ghi = lo // BLOCK_QUANT_SIZE, hi // BLOCK_QUANT_SIZE
+    glo, ghi = lo // DENSE_BLOCK, hi // DENSE_BLOCK
     out = {}
     for leaf in ("gate_proj_weight", "up_proj_weight"):
         weight, grid = operands[leaf]

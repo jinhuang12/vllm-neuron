@@ -85,7 +85,7 @@ import nki
 import nki.simulator
 
 from vllm_neuron.functional.blockwise_fp8_mm import (
-    BLOCK_QUANT_SIZE,
+    SCALE_BLOCK_SIZE,
     TILE_SIZE,
     BlockwiseFp8MmError,
     blockwise_fp8_mm,
@@ -102,6 +102,7 @@ from vllm_neuron.functional.blockwise_fp8_mm import (
 from vllm_neuron.functional.moe.blockwise_fp8_retile import (
     DOWN,
     is_pow2_exact,
+    BLOCK_QUANT_SIZE as _PRODUCER_BLOCK_SIZE,
     retile_block_scales,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -110,13 +111,32 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # The tiny config. Every extent is forced by the kernel's own tiling.           #
 # --------------------------------------------------------------------------- #
 M = 256   # tokens; a whole number of TILE_SIZE PSUM partition tiles
-K = 512   # contraction; a whole number of BLOCK_QUANT_SIZE scale blocks
-N = 512   # output width; a whole number of BLOCK_QUANT_SIZE scale blocks
+K = 512   # contraction; a whole number of SCALE_BLOCK_SIZE scale blocks
+N = 512   # output width; a whole number of SCALE_BLOCK_SIZE scale blocks
 
 M_TILES = M // TILE_SIZE            # 2
-K_BLOCKS = K // BLOCK_QUANT_SIZE    # 2
-N_BLOCKS = N // BLOCK_QUANT_SIZE    # 2
-OUTPUT_TILES = M_TILES * N_BLOCKS   # 4 -- the "per output tile" population
+# RE-PINNED by `inc-glm53f-112` (D17.1). The kernel's scale grid IS the
+# checkpoint's, so these are the 128-block counts. The producer's 256 grid keeps
+# its own names below, because two items in this file are about the PRODUCER and
+# not about the kernel's index granularity -- one name for both would be exactly
+# the drift the re-pin removes.
+K_BLOCKS = K // SCALE_BLOCK_SIZE    # 4
+N_BLOCKS = N // SCALE_BLOCK_SIZE    # 4
+OUTPUT_TILES = M_TILES * N_BLOCKS   # 8 -- the "per output tile" population
+
+#: `inc-glm53f-112`. 384 was inadmissible at the producer's old 256 granularity
+#: but is a whole number of 128 blocks (384 % 128 == 0), so it stopped raising
+#: when the kernel's own granularity narrowed. DERIVED from SCALE_BLOCK_SIZE
+#: rather than typed: it must stay a non-multiple of SCALE_BLOCK_SIZE or this row
+#: stops testing a refusal.
+INADMISSIBLE_K = SCALE_BLOCK_SIZE * 2 + SCALE_BLOCK_SIZE // 2   # 320
+
+#: The MoE retile producer's block extent, imported from the producer itself.
+PRODUCER_BLOCK_SIZE = _PRODUCER_BLOCK_SIZE
+PRODUCER_K_BLOCKS = K // PRODUCER_BLOCK_SIZE    # 2
+PRODUCER_N_BLOCKS = N // PRODUCER_BLOCK_SIZE    # 2
+#: 128-tiles per producer block, per axis. Derived, never typed as ``2``.
+TILES_PER_PRODUCER_BLOCK = PRODUCER_BLOCK_SIZE // TILE_SIZE
 
 #: The declared tolerance pair, from the plan block. Not moved anywhere below.
 RTOL = 3e-2
@@ -261,16 +281,21 @@ def _pow2_checkpoint_scales(uniform_one: bool = False) -> torch.Tensor:
         return torch.ones(grid, dtype=torch.float32)
 
     exponents = torch.zeros(grid[1:], dtype=torch.int64)
-    for k_block in range(K_BLOCKS):
-        for n_block in range(N_BLOCKS):
+    # The quad structure is the PRODUCER's: one 256 block spans a
+    # TILES_PER_PRODUCER_BLOCK square of 128 checkpoint tiles. Driven by the
+    # producer's counts since `inc-glm53f-112`, because the kernel's own block
+    # count is no longer 2 and this loop was never about the kernel.
+    for k_block in range(PRODUCER_K_BLOCKS):
+        for n_block in range(PRODUCER_N_BLOCKS):
             base = _BLOCK_EXPONENTS[
-                (k_block * N_BLOCKS + n_block) % len(_BLOCK_EXPONENTS)
+                (k_block * PRODUCER_N_BLOCKS + n_block) % len(_BLOCK_EXPONENTS)
             ]
-            for d_k in range(2):
-                for d_n in range(2):
-                    exponents[k_block * 2 + d_k, n_block * 2 + d_n] = (
-                        base + _RATIO_OFFSETS[d_k][d_n]
-                    )
+            for d_k in range(TILES_PER_PRODUCER_BLOCK):
+                for d_n in range(TILES_PER_PRODUCER_BLOCK):
+                    exponents[
+                        k_block * TILES_PER_PRODUCER_BLOCK + d_k,
+                        n_block * TILES_PER_PRODUCER_BLOCK + d_n,
+                    ] = base + _RATIO_OFFSETS[d_k][d_n]
     return torch.ldexp(torch.ones(grid, dtype=torch.float32), exponents.unsqueeze(0))
 
 
@@ -300,7 +325,19 @@ def _fp8_grid(seed: int, *shape: int, signed: bool = False) -> torch.Tensor:
 
 
 def _build_case(uniform_one: bool = False, signed: bool = False) -> dict:
-    """The tiny config, retiled through `inc-glm53f-024`'s landed producer."""
+    """The tiny config the kernel consumes, plus the producer's pair beside it.
+
+    RE-PINNED by `inc-glm53f-112` (D17.1), and this is the increment in one
+    function. The kernel used to be handed the producer's RETILED pair --
+    weights re-expressed against ``256``-granular scales -- because it indexed
+    its scales by ``256`` blocks. It now indexes by the ``128`` blocks the
+    checkpoint itself stores, so ``weight`` and ``weight_scale`` ARE the
+    checkpoint's own pair and no producer step stands between them.
+
+    The producer's pair is still built and still returned, under
+    ``retiled_weight`` and ``retiled_scale``, because two items in this file are
+    about the producer's axis mapping and not about the kernel.
+    """
     checkpoint = _pow2_checkpoint_scales(uniform_one=uniform_one)
     weights = _fp8_grid(21, 1, K, N, signed=signed)
 
@@ -309,14 +346,18 @@ def _build_case(uniform_one: bool = False, signed: bool = False) -> dict:
     # The producer's block_scales are (E, i_256, h_256) with rows=K and cols=N,
     # so the transpose lands on this module's [k_block, n_block]. The mapping is
     # settled by test_retile_reuse_is_dequantisation_invariant, not asserted here.
-    block_scales = result.block_scales[0].t().contiguous()
-    weight = result.retiled_weights[0].contiguous()
+    retiled_scale = result.block_scales[0].t().contiguous()
+    retiled_weight = result.retiled_weights[0].contiguous()
+    # The checkpoint grid is already ``(1, K//128, N//128)`` = [k_block, n_block],
+    # so it needs no transpose: that is what reading the stored grid means.
     x = _fp8_grid(31, M, K, signed=signed).to(torch.bfloat16)
 
     return {
         "x": x,
-        "weight": weight,
-        "weight_scale": block_scales,
+        "weight": weights[0].to(_FP8).contiguous(),
+        "weight_scale": checkpoint[0].contiguous(),
+        "retiled_weight": retiled_weight,
+        "retiled_scale": retiled_scale,
         "checkpoint": checkpoint,
         "raw_weights": weights,
         "result": result,
@@ -327,13 +368,13 @@ def _tile(index: int) -> tuple[slice, slice]:
     """Output tile ``index`` as ``(row slice, column slice)``.
 
     Tiles are ``(m_tile, n_block)`` pairs: ``TILE_SIZE`` rows by
-    ``BLOCK_QUANT_SIZE`` columns, which is exactly the region the kernel
+    ``SCALE_BLOCK_SIZE`` columns, which is exactly the region the kernel
     accumulates and stores in one pass.
     """
     m_tile, n_block = divmod(index, N_BLOCKS)
     return (
         slice(m_tile * TILE_SIZE, (m_tile + 1) * TILE_SIZE),
-        slice(n_block * BLOCK_QUANT_SIZE, (n_block + 1) * BLOCK_QUANT_SIZE),
+        slice(n_block * SCALE_BLOCK_SIZE, (n_block + 1) * SCALE_BLOCK_SIZE),
     )
 
 
@@ -668,8 +709,13 @@ def test_f1_precondition_complete_condition_n_over_n() -> None:
     assert lossless == len(records), (
         f"{lossless}/{len(records)} blocks satisfy both conjuncts"
     )
-    assert len(records) == K_BLOCKS * N_BLOCKS, (
-        f"expected {K_BLOCKS * N_BLOCKS} block records, got {len(records)}"
+    # The population is the PRODUCER's: one record per 256 block, which is
+    # PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS and NOT the kernel's block count.
+    # Since `inc-glm53f-112` the two differ (4 against 16), and this item reads
+    # the producer's emission.
+    assert len(records) == PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS, (
+        f"expected {PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS} block records, got "
+        f"{len(records)}"
     )
     # The retile must be bit-exact on the weights it rescaled, or the kernel
     # would be fed a weight the checkpoint does not contain.
@@ -757,17 +803,20 @@ def test_retile_reuse_is_dequantisation_invariant() -> None:
     weight by powers of two, which is exact in fp32 barring overflow.
     """
     case = _build_case()
-    retiled = case["weight"].to(torch.float32) * case[
-        "weight_scale"
-    ].repeat_interleave(BLOCK_QUANT_SIZE, 0).repeat_interleave(BLOCK_QUANT_SIZE, 1)
+    retiled = case["retiled_weight"].to(torch.float32) * case[
+        "retiled_scale"
+    ].repeat_interleave(PRODUCER_BLOCK_SIZE, 0).repeat_interleave(
+        PRODUCER_BLOCK_SIZE, 1
+    )
     checkpoint = case["raw_weights"][0] * case["checkpoint"][0].repeat_interleave(
         TILE_SIZE, 0
     ).repeat_interleave(TILE_SIZE, 1)
 
-    distinct = case["weight_scale"].unique().numel()
+    distinct = case["retiled_scale"].unique().numel()
     print(
         f"[retile-reuse] distinct_block_scales={distinct} of "
-        f"{K_BLOCKS * N_BLOCKS} bit_exact={bool(torch.equal(retiled, checkpoint))} "
+        f"{PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS} "
+        f"bit_exact={bool(torch.equal(retiled, checkpoint))} "
         f"max_abs_diff={float((retiled - checkpoint).abs().max()):.6e}"
     )
     if distinct < 2:
@@ -782,10 +831,10 @@ def test_retile_reuse_is_dequantisation_invariant() -> None:
     )
 
     # Control: the reading must move when the mapping is wrong.
-    transposed = case["weight_scale"].t().contiguous()
-    mistaken = case["weight"].to(torch.float32) * transposed.repeat_interleave(
-        BLOCK_QUANT_SIZE, 0
-    ).repeat_interleave(BLOCK_QUANT_SIZE, 1)
+    transposed = case["retiled_scale"].t().contiguous()
+    mistaken = case["retiled_weight"].to(torch.float32) * transposed.repeat_interleave(
+        PRODUCER_BLOCK_SIZE, 0
+    ).repeat_interleave(PRODUCER_BLOCK_SIZE, 1)
     print(
         f"[retile-reuse] control transposed_mapping_bit_exact="
         f"{bool(torch.equal(mistaken, checkpoint))}"
@@ -831,7 +880,7 @@ def test_flat_scale_index_maps_block_to_predicted_output_columns() -> None:
     per_block = [
         float(
             delta[
-                :, n * BLOCK_QUANT_SIZE : (n + 1) * BLOCK_QUANT_SIZE
+                :, n * SCALE_BLOCK_SIZE : (n + 1) * SCALE_BLOCK_SIZE
             ].max()
         )
         for n in range(N_BLOCKS)
@@ -1054,7 +1103,7 @@ def test_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
     "tokens,rows,cols,needle",
     [
         (200, 512, 512, "M=200 is not a positive multiple of TILE_SIZE"),
-        (256, 384, 512, "K=384 is not a positive multiple of"),
+        (256, INADMISSIBLE_K, 512, f"K={INADMISSIBLE_K} is not a positive multiple of"),
         (256, 512, 300, "N=300 is not a positive multiple of"),
         (0, 512, 512, "M=0 is not a positive multiple of TILE_SIZE"),
     ],

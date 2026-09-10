@@ -38,6 +38,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
 from vllm_neuron.model.glm5_next.quantization import DEFAULT_WEIGHT_BLOCK_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MAPPED_KEY_QUANTISED_WEIGHT,
@@ -71,8 +72,15 @@ FP8_E4M3FN_MAX = 448.0
 SQUEEZE = 0.5                                     # was FP8_E4M3_MAX / FP8_E4M3FN_MAX
 MLP_SQUEEZE = SQUEEZE**3                          # 0.125, was 0.1537445335276968
 
+#: The PRODUCER's block, kept only to size the extents below in whole 256 blocks so
+#: this file's geometry does not move. Nothing dequantises at it any more.
 BLOCK = 256
-TILE = 128
+#: THE CHECKPOINT'S TILE, AND SINCE ``inc-glm53f-112`` THE GRID THE MODULE CARRIES.
+#: IMPORTED from the dense kernel rather than typed: the publish now hands the
+#: checkpoint's own grid to ``blockwise_fp8_mm``, which indexes at
+#: ``SCALE_BLOCK_SIZE``, so a literal here would be a second place for that number to
+#: live and would go stale the day the kernel's granularity moves again.
+TILE = SCALE_BLOCK_SIZE
 HIDDEN = 2 * BLOCK          # 512, a whole number of 256-blocks so the retile runs
 INTERMEDIATE = 2 * BLOCK    # 512
 FP8 = torch.float8_e4m3fn
@@ -202,13 +210,19 @@ def _effective_matrix(module, weight_name: str, grid_name: str) -> torch.Tensor:
     """Rebuild what the kernel will multiply, undoing ONLY the compute-frame transpose.
 
     The prep leaves the weight and its grid transposed into the kernel's frame, so both
-    are transposed back here and nothing else is touched. The grid is public 256 by then,
-    which is why the dequantise runs at 256 rather than at the checkpoint's 128.
+    are transposed back here and nothing else is touched.
+
+    THE GRANULARITY IS THE CHECKPOINT'S OWN, RE-PINNED BY ``inc-glm53f-112``. The prep
+    used to coarsen the 128 grid onto a public 256 one, so this rebuild ran at 256. It
+    publishes the checkpoint's grid unchanged now, so the rebuild runs at ``TILE`` --
+    which is the dense kernel's ``SCALE_BLOCK_SIZE``, imported. Nothing else about this
+    reading moves: the compensation is still applied by the load path and still read
+    here, and the reference is still the checkpoint's own numbers.
     """
     weight = getattr(module, weight_name)
     grid = getattr(module, grid_name)
     return dequantise_blockwise(
-        weight.data.t().contiguous(), grid.t().contiguous(), (BLOCK, BLOCK)
+        weight.data.t().contiguous(), grid.t().contiguous(), (TILE, TILE)
     ).to(torch.float32)
 
 
