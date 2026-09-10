@@ -226,11 +226,23 @@ def test_kv_cache_spec_c01_the_pin_six_argument_form_constructs_unbroken() -> No
 
 
 def test_kv_cache_spec_c02_four_of_four_new_field_defaults_read_none() -> None:
-    """The four declared fields are appended, in order, all defaulting None."""
+    """The four declared fields are appended, in order, all defaulting None.
+
+    The name spells four because it predates the fifth appended field, the latent
+    key/value declaration. It is a collected item id, so it stays byte-unchanged;
+    what this item claims is append-only-with-defaults, which arity eleven keeps.
+    """
     names = tuple(f.name for f in fields(LayerSpec))
     assert names[:6] == PIN_LAYER_SPEC_FIELDS
-    assert len(names) == 10
-    assert names[6:] == DECLARED_KDA_FIELDS
+    # The two readings this replaces, verbatim, from before the latent field was
+    # appended: `assert len(names) == 10` and `assert names[6:] ==
+    # DECLARED_KDA_FIELDS`. The pin's six still lead and every field after them
+    # still carries a default; only the tail is one member longer.
+    assert len(names) == 11
+    assert names[6:10] == DECLARED_KDA_FIELDS
+    assert names[10] == "latent_kv"
+    latent_default = next(f.default for f in fields(LayerSpec) if f.name == "latent_kv")
+    assert latent_default is False
 
     # Declared defaults, read off the dataclass rather than off an instance.
     declared_defaults = {
