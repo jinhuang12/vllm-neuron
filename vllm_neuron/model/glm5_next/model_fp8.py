@@ -1232,9 +1232,17 @@ class Glm5NextHyperConnection(nn.Module):
 
         Returns:
             ``(post_mix, comb_mix, layer_input)`` -- ``[T, S, 1]``,
-            ``[T, S, S]`` and ``[T, H]``, all fp32. ``comb_mix[t, i, j]``
-            weights input stream ``i`` into output stream ``j``, the base's
-            convention and the one ``-029``'s kernel reads.
+            ``[T, S, S]`` and ``[T, H]``. ``post_mix`` and ``comb_mix`` are
+            fp32. ``layer_input`` IS THE STREAMS' OWN DTYPE, and the "all
+            fp32" that stood here was wrong about it: this method's own
+            return ends ``layer_input.to(residual.dtype)``, the reference's
+            form at ``reference:294``, so a bfloat16 carrier is handed
+            bfloat16 and an fp32 fixture still gets fp32. The comment above
+            that line has said so since ``inc-glm53f-030``; only this
+            ``Returns`` was left behind, and ``inc-glm53f-030d`` commit 4f
+            is where it caught up. ``comb_mix[t, i, j]`` weights input
+            stream ``i`` into output stream ``j``, the base's convention and
+            the one ``-029``'s kernel reads.
 
         THE TOKEN CEILING, AND WHICH SEAM NOW SETS IT. ``inc-glm53f-030c``
         replaced the note that stood here. It said the block-diagonal embedding
@@ -1251,8 +1259,21 @@ class Glm5NextHyperConnection(nn.Module):
         PARTITION_MAX`` -- **128**, refused with ``HyperConnectionError`` from
         :meth:`mhc_post`. The NUMBER did not move (the old square ceiling was
         ``MOVING_FMAX // S``, also 128); the axis, the seam and the exception
-        class did. Lifting 128 is ``inc-glm53f-029b``'s registered work, not a
-        pad and not a torch path here (P13).
+        class did.
+
+        LIFTING 128 IS ``inc-glm53f-029b``'S WORK AND THAT WORK HAS LANDED --
+        on the campaign tip, not yet on this branch. So the refusal described
+        above is still exactly what this branch's kernel does
+        (``functional/mhc/hyper_connection.py:261`` refuses
+        ``T > PARTITION_MAX``), and it stops being true the moment the tip
+        merges in: after ``-029b`` the combine bounds no token extent at all,
+        ``PARTITION_MAX`` is the tile height rather than a ceiling, and the
+        only bounds left are ``block <= PARTITION_MAX`` and the Sinkhorn's
+        ``cols <= MOVING_FMAX`` (512) -- both on ``S``, which is 4 here and
+        never reaches either. This paragraph is therefore rewritten in the
+        wake of that merge, and is left standing now because it is true now.
+        Either way the answer is never a pad and never a torch path here
+        (P13).
 
         Raises:
             Glm5NextHyperConnectionError: on a non-3-D ``residual`` or a stream
@@ -1430,7 +1451,12 @@ class Glm5NextHyperConnection(nn.Module):
                 every import in this section is function-local.
 
         Returns:
-            ``[T, S, H]`` fp32 -- the re-mixed streams.
+            ``[T, S, H]`` IN THE STREAMS' OWN DTYPE -- the re-mixed streams.
+            The "fp32" that stood here was stale for the same reason
+            :meth:`mhc_pre`'s was. This method returns whatever
+            :meth:`mhc_post` returns, and ``inc-glm53f-030d`` commit 4 moved
+            that cast: :meth:`mhc_post` computes the mix in fp32 and returns
+            ``mixed.to(residual.dtype)``, which its own ``Returns`` states.
 
         Raises:
             Glm5NextHyperConnectionError: if ``sublayer`` is not callable, or if
