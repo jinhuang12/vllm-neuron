@@ -215,8 +215,12 @@ def test_decode_graph_capture_hands_the_root_its_carriers():
     runner.capture_backend_model = backend
     before_banks = [caches[bank["name"]][0].clone() for bank in root.glm5next_layer_banks]
 
+    item._reset_seam_counters()
+    before_seams = item._read_seam_counters()
+
     runner.extract_decode_graphs(DECODE_BATCH)
 
+    after_seams = item._read_seam_counters()
     kwargs = _assert_translated("decode", backend.seen)
     assert int(kwargs["input_ids"].shape[0]) == DECODE_BATCH
     carrier = kwargs["layer_carriers"][0]
@@ -227,6 +231,7 @@ def test_decode_graph_capture_hands_the_root_its_carriers():
     )
     _assert_finite_logits("decode", backend.output, rows=DECODE_BATCH)
     _assert_wrote_the_banks("decode", root, caches, before_banks)
+    landed._assert_route_predicate_r3("decode-capture", before_seams, after_seams)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
