@@ -926,9 +926,7 @@ class _TorchLimbs:
     index arithmetic, and a shared off-by-one would then cancel.
     """
 
-    def __init__(
-        self, gate_up_grid: torch.Tensor, down_grid: torch.Tensor
-    ) -> None:
+    def __init__(self, gate_up_grid: torch.Tensor, down_grid: torch.Tensor) -> None:
         self.gate_up_grid = gate_up_grid
         self.down_grid = down_grid
 
@@ -939,13 +937,9 @@ class _TorchLimbs:
         return torch.where(rows < 0, torch.full_like(rows, pad_row), rows)
 
     def gate_up(
-        self,
-        hidden_states: torch.Tensor,
-        weight_bank: torch.Tensor,
-        scale_bank: torch.Tensor,
-        row_index: torch.Tensor,
-        expert_index: torch.Tensor,
-        block: int,
+        self, hidden_states: torch.Tensor, weight_bank: torch.Tensor,
+        scale_bank: torch.Tensor, row_index: torch.Tensor,
+        expert_index: torch.Tensor, block: int,
     ) -> torch.Tensor:
         """``[T + 1, H]`` in, ``[P, 2*I]`` fp32 out, block order."""
         experts, contraction = int(weight_bank.shape[0]), int(weight_bank.shape[1])
@@ -959,20 +953,16 @@ class _TorchLimbs:
             span = slice(position * block, (position + 1) * block)
             local = hidden_states[rows[span]].to(torch.float32)
             slab = weight_bank[expert].reshape(contraction, 2, half)
-            for gate_or_up in range(2):
-                weight = _dequantise(
-                    slab[:, gate_or_up, :],
-                    self.gate_up_grid[expert, :, gate_or_up, :],
-                )
-                out[span, gate_or_up * half : (gate_or_up + 1) * half] = (
-                    local @ weight
-                )
+            for half_index in range(2):
+                grid = self.gate_up_grid[expert, :, half_index, :]
+                weight = _dequantise(slab[:, half_index, :], grid)
+                columns = slice(half_index * half, (half_index + 1) * half)
+                out[span, columns] = local @ weight
         return out
 
     @staticmethod
     def swiglu(
-        gate_up: torch.Tensor,
-        gate_upper: float | None = None,
+        gate_up: torch.Tensor, gate_upper: float | None = None,
         up_upper: float | None = None,
     ) -> torch.Tensor:
         """``[B, 2*I]`` in, ``[I, B]`` fp32 out. The transpose is the limb's contract."""
@@ -987,14 +977,9 @@ class _TorchLimbs:
         return intermediate.transpose(0, 1).contiguous()
 
     def down(
-        self,
-        intermediate_t: torch.Tensor,
-        weight_bank: torch.Tensor,
-        scale_bank: torch.Tensor,
-        affinity_bank: torch.Tensor,
-        row_index: torch.Tensor,
-        expert_index: torch.Tensor,
-        block: int,
+        self, intermediate_t: torch.Tensor, weight_bank: torch.Tensor,
+        scale_bank: torch.Tensor, affinity_bank: torch.Tensor,
+        row_index: torch.Tensor, expert_index: torch.Tensor, block: int,
         tokens: int,
     ) -> torch.Tensor:
         """``[I, P]`` in, ``[P, H]`` fp32 out, block order, affinity applied here."""
@@ -1407,9 +1392,8 @@ def test_moe_path_f1_numeric_arm_alone_cannot_discriminate(
         f"shipped route and not the hazard"
     )
     # NOT ``sim.total == 0``: the token-block mapping dispatches its own NKI
-    # subkernels inside this call, which is the reading
-    # :func:`_run_mapping` requires. What must be zero is the share attributed
-    # to the limb file, because that is the share the acceptance counts.
+    # subkernels inside this call, which is the reading :func:`_run_mapping`
+    # requires. Zero is the share ATTRIBUTED to the limb module.
     assert sim.through_seam == 0, (
         f"{sim.through_seam} of {sim.total} simulator entries were attributed to "
         f"{_SEAM_FILE} while all three limbs were substituted, so the "
@@ -2101,11 +2085,9 @@ def test_moe_path_kernel_identity_is_the_three_limb_kernels() -> None:
     read through its own seam, so a substituted limb changes a reading rather than
     going silent.
     """
-    readings = {
-        "gate_up": gate_up_kernel_identity(),
-        "swiglu": swiglu_kernel_identity(),
-        "down": down_kernel_identity(),
-    }
+    readings = {"gate_up": gate_up_kernel_identity(),
+                "swiglu": swiglu_kernel_identity(),
+                "down": down_kernel_identity()}
     print(f"[kernel-identity] {readings}")
     for limb, (module, qualname) in readings.items():
         assert module == _seam_module.__name__, (

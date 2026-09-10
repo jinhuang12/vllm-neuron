@@ -316,13 +316,9 @@ _SEAM_REGISTRY = {
     # limbs dispatch separately and one summed pair could not tell which of them
     # took a torch route.
     #
-    # ALL THREE READ ``(0, 0)`` IN THIS FILE TODAY, and that is correct rather than
-    # a gap: the block seam ``blockwise_fp8_moe`` still enters the vendor member, so
-    # no forward here reaches a limb. The route predicate collects only seams whose
-    # dispatch count MOVED, so a family at zero joins no item's fired set and adds
-    # nothing to the torch-fallback total. When ``inc-glm53f-113c`` switches the
-    # seam, these rows are what make the switch visible to every item in this file
-    # without one of them being edited.
+    # ALL THREE NOW MOVE, one dispatch each per MoE layer, and the block seam above
+    # reads ``(0, 0)``: the call site reaches the three limbs, not the vendor member.
+    # Its row stays as the negative -- a forward that went back to it fails below.
     "moe_gate_up": (
         "vllm_neuron.functional.moe.moe_blockwise_fp8",
         "gate_up_dispatch_counters", "reset_gate_up_dispatch_counters"),
@@ -1868,11 +1864,14 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
         _quant_config(),
     )
     after = _read_seam_counters()
-    # ONE dispatch on the MoE seam and nothing on the dense one. The bank reaches
-    # ``blockwise_fp8_moe`` exactly once per forward and no dense projection at all, so
-    # naming only that seam is what makes a forward which took the wrong route fail
-    # instead of passing on a total.
-    _assert_route_predicate("2 routed experts", {"blockwise_fp8_moe": 1}, before, after)
+    # ONE dispatch on each routed limb and nothing on the dense seam. The bank reaches
+    # the three limbs exactly once per forward and no dense projection at all, so naming
+    # only those three is what makes a forward which took the wrong route fail instead
+    # of passing on a total.
+    _assert_route_predicate(
+        "2 routed experts", {"moe_gate_up": 1, "moe_swiglu": 1, "moe_down": 1},
+        before, after,
+    )
 
     if tuple(got.shape) != (TOKENS, ROUTED_HIDDEN_SIZE):
         raise ReferenceShapeError(
@@ -2520,7 +2519,8 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # own control D discusses.
     _assert_route_predicate(
         "4 MoE block",
-        {"blockwise_fp8_moe": 1, "blockwise_fp8_mm": 3, "noaux_tc_router": 1},
+        {"moe_gate_up": 1, "moe_swiglu": 1, "moe_down": 1,
+         "blockwise_fp8_mm": 3, "noaux_tc_router": 1},
         before,
         after,
     )
@@ -2824,7 +2824,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     after = _read_seam_counters()
     _assert_route_predicate(
         "4 MoE block, no shared expert",
-        {"blockwise_fp8_moe": 1, "noaux_tc_router": 1},
+        {"moe_gate_up": 1, "moe_swiglu": 1, "moe_down": 1, "noaux_tc_router": 1},
         before,
         after,
     )
@@ -4790,7 +4790,9 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         "dsa_topk_select": 1 * STACK_LAYERS,
         "dsa_index_expand": 1 * STACK_LAYERS,
         "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-        "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+        "moe_gate_up": 1 * STACK_MOE_LAYERS,
+        "moe_swiglu": 1 * STACK_MOE_LAYERS,
+        "moe_down": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
         # ---- THE TWO mHC SEAMS, ``inc-glm53f-030d`` commit 4c. TWO SITES PER LAYER,
         # and each site's one call is one Sinkhorn and one combine: the attention half's
@@ -6124,7 +6126,9 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         "dsa_topk_select": 1 * STACK_LAYERS,
         "dsa_index_expand": 1 * STACK_LAYERS,
         "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-        "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+        "moe_gate_up": 1 * STACK_MOE_LAYERS,
+        "moe_swiglu": 1 * STACK_MOE_LAYERS,
+        "moe_down": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
         # The two mHC seams, on item 6's figures and for item 6's reason: two sites per
         # layer, one Sinkhorn and one combine each. Declared again here rather than
