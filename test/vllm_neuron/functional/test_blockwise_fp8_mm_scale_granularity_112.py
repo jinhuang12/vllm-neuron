@@ -19,9 +19,19 @@ dequantise first, then one fp32 matmul. It never consults ``flat_scale_index``, 
 flattening inside the bridge shows up as a numeric disagreement rather than as agreement with
 itself.
 
-THE FOUR KERNEL DEFAULTS EACH OWN A FAILING CONTROL. A default that is never falsified is a claim,
-not a reading, so each of the four is re-run through a TEST-LOCAL variant kernel that differs in
-exactly that one choice, and each variant must NOT reach ``max_abs_diff == 0``.
+THREE KERNEL DEFAULTS EACH OWN A FAILING CONTROL. A default that is never falsified is a claim, not
+a reading, so each of the three is re-run through a TEST-LOCAL variant kernel that differs in
+exactly that one choice, and each variant must produce a FINITE, strictly positive difference, or a
+refusal. A ``nan`` or an ``inf`` is a THIRD outcome and fails the item: it means the variant read
+memory nothing had written, which is a defect in the variant and says nothing about the default.
+
+THE FOURTH DEFAULT IS RECORDED, NOT FALSIFIED. No number on this route can falsify the fp8-to-bf16
+upcast on the weight DMA. The module states that conversion is bit-exact
+(``blockwise_fp8_mm.py:47-50``), so dropping it cannot change a result -- the counted run measured
+exactly that, ``max_abs_diff=0.0`` with no refusal -- and what the default really buys, that the
+Tensor Engine is handed an operand dtype it accepts, is a device-side reading a CPU-mode run cannot
+take. So the default is PRINTED as a non-control row with that reason instead of being falsified
+here, and the device-side claim is carried as debt ``D-112-UPCAST-DEVICE-ACCEPTANCE``.
 
 Nothing here runs on hardware: the NKI simulator executes the kernel, as ``-026``'s landed
 acceptance does.
@@ -29,6 +39,7 @@ acceptance does.
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -68,6 +79,17 @@ N_BLOCKS = N // SCALE_BLOCK_SIZE
 _FAMILY_A = (1.25, 2.5)
 _FAMILY_B = (1.75, 3.5)
 _SCALE_VALUES = (1.25, 1.75, 2.5, 3.5)
+
+#: The kernel default that LEFT the falsification family, with the reason and the debt that carries
+#: the reading this route cannot take. Printed by item 1 so the family is four defaults on the
+#: transcript even though only three of them own a control.
+_NON_CONTROL_DEFAULT = (
+    "fp8_to_bf16_upcast_on_the_weight_dma",
+    "the module states the conversion is bit-exact (blockwise_fp8_mm.py:47-50), so no fixture can "
+    "make it change a number; its value is device-side operand-dtype acceptance, which a CPU-mode "
+    "run cannot read",
+    "D-112-UPCAST-DEVICE-ACCEPTANCE",
+)
 
 
 class VacuousReadingError(AssertionError):
@@ -177,6 +199,11 @@ def test_the_kernel_indexes_the_checkpoints_own_grid_exactly() -> None:
         f"grid={K_BLOCKS}x{N_BLOCKS} blocks={K_BLOCKS * N_BLOCKS} "
         f"bit_equal={int(bool(torch.equal(got, want)))} max_abs_diff={max_abs_diff} "
         f"nki_dispatch={nki_dispatch} torch_fallback={torch_fallback}",
+    )
+    name, reason, debt = _NON_CONTROL_DEFAULT
+    _emit(
+        "I1_NON_CONTROL",
+        f"default={name} falsifiable_on_this_route=0 debt={debt} reason={reason}",
     )
     assert torch.equal(got, want), (
         f"the kernel and the model's own dequantisation statement disagree: "
@@ -298,8 +325,23 @@ def _variant_accumulate_true(x, weight, weight_scale_t):
     ``accumulate=True`` is FOR: block ``k`` then adds its raw product onto block ``k-1``'s before
     either is scaled, so every block after the first multiplies a running sum by its own scale.
     That is exactly the defect ``accumulate=False`` prevents once ``K_TILES_PER_BLOCK`` is 1 and
-    each product carries exactly one scale, and it is a different number by arithmetic rather
-    than by whatever the simulator leaves in a fresh tile.
+    each product carries exactly one scale.
+
+    THE FIRST MATMUL MUST DEFINE THE HOISTED TILE. The counted run read ``max_abs_diff=nan`` here,
+    because ``accumulate=True`` on the FIRST matmul adds a product onto a PSUM tile nothing has
+    written yet, so this file was comparing against uninitialised bytes -- a pass on garbage rather
+    than on the arithmetic below. ``accumulate=(k_block > 0)`` is how this codebase starts a hoisted
+    accumulator: three landed call sites read ``accumulate=(li > 0)``
+    (``vllm_neuron/functional/attention/mla_sparse.py:387``, ``:730``, ``:1111``) and no landed
+    kernel memsets a PSUM tile. The inversion survives intact, because what the shipped kernel does
+    is give every ``k`` block its OWN tile and pass ``accumulate=False`` on every matmul; this
+    variant keeps one tile and accumulates across blocks.
+
+    So the difference is arithmetic. With per-block products ``P0..P3`` and scales ``s0..s3`` this
+    computes ``P0*s0 + (P0+P1)*s1 + (P0+P1+P2)*s2 + (P0+P1+P2+P3)*s3`` where the kernel computes
+    ``P0*s0 + P1*s1 + P2*s2 + P3*s3``, an excess of ``P0*(s1+s2+s3) + P1*(s2+s3) + P2*s3`` -- and on
+    this fixture's bounded positive integers and positive scales that excess is strictly positive
+    and far inside fp32, so it is finite.
     """
     m_extent, k_extent = x.shape
     _, n_extent = weight.shape
@@ -329,68 +371,9 @@ def _variant_accumulate_true(x, weight, weight_scale_t):
                     dst=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
                     stationary=x_t,
                     moving=w_tile,
-                    accumulate=True,
-                )
-                flat = k_block * n_n_blocks + n_block
-                if k_block == 0:
-                    nisa.tensor_scalar(
-                        dst=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-                        data=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
-                    )
-                else:
-                    nisa.scalar_tensor_tensor(
-                        dst=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-                        data=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
-                        op1=nl.add,
-                        operand1=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-                    )
-            nl.store(
-                out[m0 : m0 + TILE_SIZE, n0 : n0 + SCALE_BLOCK_SIZE],
-                value=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-            )
-    return out
-
-
-@nki.jit
-def _variant_no_fp8_upcast(x, weight, weight_scale_t):
-    """DEFAULT (b) inverted: the fp8 weight tile is loaded without the bf16 upcast.
-
-    A DTYPE REFUSAL BY NAME COUNTS AS THIS CONTROL FIRING (ruled, LEAD-LOG §1173 item 5b). The
-    upcast is bit-exact by the module's own statement, so on this integer fixture there is no
-    different NUMBER to read: what the default buys is that the Tensor Engine is handed an operand
-    dtype it accepts. So a refusal naming the dtype is the falsification, and it is recorded as
-    ``refused=1`` with the exception text; only "reached exact equality" fails the item, and a
-    silent ``max_abs_diff == 0`` is the red reading.
-    """
-    m_extent, k_extent = x.shape
-    _, n_extent = weight.shape
-    n_n_blocks = n_extent // SCALE_BLOCK_SIZE
-    n_k_blocks = k_extent // SCALE_BLOCK_SIZE
-    out = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.shared_hbm)
-    scale_sb = nl.load(weight_scale_t)
-    for m_tile in range(m_extent // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
-        for n_block in range(n_n_blocks):
-            n0 = n_block * SCALE_BLOCK_SIZE
-            acc = nl.ndarray(
-                (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.sbuf
-            )
-            for k_block in range(n_k_blocks):
-                psum = nl.ndarray(
-                    (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.psum
-                )
-                k0 = k_block * SCALE_BLOCK_SIZE
-                x_t = nl.load_transpose2d(x[m0 : m0 + TILE_SIZE, k0 : k0 + TILE_SIZE])
-                w_tile = nl.load(weight[k0 : k0 + TILE_SIZE, n0 : n0 + SCALE_BLOCK_SIZE])
-                nisa.nc_matmul(
-                    dst=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-                    stationary=x_t,
-                    moving=w_tile,
-                    accumulate=False,
+                    # The first product DEFINES the hoisted tile; every later one accumulates onto
+                    # it. That is the inversion, and it reads no byte nothing wrote.
+                    accumulate=(k_block > 0),
                 )
                 flat = k_block * n_n_blocks + n_block
                 if k_block == 0:
@@ -418,28 +401,71 @@ def _variant_no_fp8_upcast(x, weight, weight_scale_t):
 
 @nki.jit
 def _variant_no_transpose(x, weight, weight_scale_t):
-    """DEFAULT (c) inverted: the activation is loaded WITHOUT the DMA-side transpose."""
+    """DEFAULT (c) inverted: the activation is loaded WITHOUT the DMA-side transpose.
+
+    ONE CHANGE from the shipped body, and it is this load: ``nl.load`` where the kernel writes
+    ``nl.load_transpose2d``. The activation tile is square, so ``nc_matmul`` accepts the operand and
+    nothing refuses; what it then contracts is the tile's TRANSPOSE against the weight, which is a
+    different number on any tile that is not symmetric.
+
+    EVERY OUTPUT TILE IS STORED, which is the second half of this repair. The counted run read
+    ``max_abs_diff=nan`` here because the earlier body computed the single tile
+    ``out[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE]`` and left the rest of a ``256x512`` ``shared_hbm``
+    output never written, so 114,688 of its 131,072 elements were uninitialised bytes at comparison
+    time. Covering the whole output is also what makes this a ONE-change inversion of the shipped
+    kernel rather than a second, smaller kernel.
+    """
     m_extent, k_extent = x.shape
     _, n_extent = weight.shape
+    n_n_blocks = n_extent // SCALE_BLOCK_SIZE
+    n_k_blocks = k_extent // SCALE_BLOCK_SIZE
     out = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     scale_sb = nl.load(weight_scale_t)
-    psum = nl.ndarray((TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.psum)
-    x_plain = nl.load(x[0:TILE_SIZE, 0:TILE_SIZE])
-    w_tile = nl.load(weight[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE], dtype=nl.bfloat16)
-    nisa.nc_matmul(
-        dst=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-        stationary=x_plain,
-        moving=w_tile,
-        accumulate=False,
-    )
-    acc = nl.ndarray((TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(
-        dst=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-        data=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
-        op0=nl.multiply,
-        operand0=scale_sb[0:TILE_SIZE, 0:1],
-    )
-    nl.store(out[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE], value=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE])
+    for m_tile in range(m_extent // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        for n_block in range(n_n_blocks):
+            n0 = n_block * SCALE_BLOCK_SIZE
+            acc = nl.ndarray(
+                (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.sbuf
+            )
+            for k_block in range(n_k_blocks):
+                psum = nl.ndarray(
+                    (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.psum
+                )
+                k0 = k_block * SCALE_BLOCK_SIZE
+                # THE INVERSION: a plain load where the kernel transposes on the DMA.
+                x_plain = nl.load(x[m0 : m0 + TILE_SIZE, k0 : k0 + TILE_SIZE])
+                w_tile = nl.load(
+                    weight[k0 : k0 + TILE_SIZE, n0 : n0 + SCALE_BLOCK_SIZE],
+                    dtype=nl.bfloat16,
+                )
+                nisa.nc_matmul(
+                    dst=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                    stationary=x_plain,
+                    moving=w_tile,
+                    accumulate=False,
+                )
+                flat = k_block * n_n_blocks + n_block
+                if k_block == 0:
+                    nisa.tensor_scalar(
+                        dst=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                        data=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                    )
+                else:
+                    nisa.scalar_tensor_tensor(
+                        dst=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                        data=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                        op1=nl.add,
+                        operand1=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                    )
+            nl.store(
+                out[m0 : m0 + TILE_SIZE, n0 : n0 + SCALE_BLOCK_SIZE],
+                value=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+            )
     return out
 
 
@@ -497,17 +523,21 @@ def _variant_no_block_scale(x, weight, weight_scale_t):
     "default_name, variant",
     [
         ("accumulate_false_on_every_matmul", _variant_accumulate_true),
-        ("fp8_to_bf16_upcast_on_the_weight_dma", _variant_no_fp8_upcast),
         ("load_transpose2d_for_the_activation", _variant_no_transpose),
         ("per_block_scale_applied", _variant_no_block_scale),
     ],
 )
 def test_each_kept_kernel_default_is_load_bearing(default_name, variant) -> None:
-    """Each kept default, falsified: the variant that drops it must NOT reach exactness.
+    """Each kept default, falsified: the variant that drops it must produce a DIFFERENT number.
 
-    A variant may also REFUSE -- an operand shape the Tensor Engine will not take is as good a
-    falsification as a wrong number, and better than a silent one. Both outcomes are recorded, and
-    only "reached exact equality" fails the item.
+    THREE OUTCOMES, NOT TWO. A finite, strictly positive ``max_abs_diff`` falsifies the default. A
+    REFUSAL falsifies it too -- an operand the Tensor Engine will not take is as good a reading as a
+    wrong number and better than a silent one. Anything else FAILS: exact equality says the default
+    is not load-bearing, and a ``nan`` or an ``inf`` says the variant read memory nothing had
+    written, which is a defect in the variant and no evidence about the default.
+
+    The fourth default of the shipped kernel is not in this family. It is printed by item 1 as a
+    non-control row, with its reason and its debt id; see this module's docstring.
     """
     case = _case()
     want = _model_reference(case)
@@ -523,10 +553,19 @@ def test_each_kept_kernel_default_is_load_bearing(default_name, variant) -> None
             refusal = f"shape {tuple(got.shape)} != {tuple(want.shape)}"
     except Exception as exc:  # noqa: BLE001 -- the refusal itself is the reading
         refusal = f"{type(exc).__name__}: {str(exc)[:120]}"
+    finite = math.isfinite(max_abs_diff)
     _emit(
         "I3_DEFAULT_CONTROL",
-        f"default={default_name} max_abs_diff={max_abs_diff} "
+        f"default={default_name} max_abs_diff={max_abs_diff} finite={int(finite)} "
         f"refused={int(bool(refusal))} reached_zero={int(reached_zero)} detail={refusal or 'none'}",
+    )
+    if refusal:
+        return  # A refusal IS the falsification; there is no number to read.
+    assert finite, (
+        f"the variant without '{default_name}' read {max_abs_diff}, which is not a number: it "
+        f"compared against memory nothing had written -- an undefined PSUM tile, or an output region "
+        f"the variant never stored. That is a defect in THIS variant and says nothing about the "
+        f"default, so the item fails rather than passing on garbage"
     )
     assert not reached_zero, (
         f"the variant without '{default_name}' still reached exact equality, so that default is "
