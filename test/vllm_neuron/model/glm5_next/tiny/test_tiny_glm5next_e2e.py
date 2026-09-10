@@ -124,11 +124,17 @@ def _require_cpu_mode() -> None:
 def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
     """The dict ``initialize_kv_cache`` hands ``bind_kv_cache``, built the runner's own way.
 
-    Every shape here is the runner's: a sparse layer gets a key/value PAIR of
-    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:9002-9038``)
-    and a recurrent layer gets two ``[slots, *state shape]`` banks in conv-then-recurrent
-    order (``:9100-9130``). The geometry is read off the spec the model itself produced, so
-    this helper cannot disagree with the model about what was asked for.
+    Every shape here is the runner's: a layer that declares a latent cache gets ONE bank of
+    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:9118-9136``),
+    a layer that does not still gets a key/value PAIR of that shape, and a recurrent layer
+    gets two ``[slots, *state shape]`` banks in conv-then-recurrent order (``:9100-9130``).
+    The geometry is read off the spec the model itself produced, so this helper cannot
+    disagree with the model about what was asked for.
+
+    The reading this replaces, kept verbatim: "a sparse layer gets a key/value PAIR of
+    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:9002-9038``)".
+    It described the runner before the latent cache became one buffer; the branch below now
+    keys on the layer's own declaration, so both classes are still mirrored here.
     """
     caches: dict[str, list[torch.Tensor]] = {}
     for layer_spec in root.get_kv_spec().layers:
@@ -154,9 +160,9 @@ def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
             item.MLA_PAGE_SIZE,
             int(layer_spec.head_size),
         )
+        banks = 1 if layer_spec.latent_kv else 2
         caches[layer_spec.name] = [
-            torch.zeros(shape, dtype=layer_spec.dtype),
-            torch.zeros(shape, dtype=layer_spec.dtype),
+            torch.zeros(shape, dtype=layer_spec.dtype) for _ in range(banks)
         ]
     return caches
 
@@ -383,7 +389,10 @@ def test_bind_kv_cache_refuses_a_bank_of_the_wrong_rank():
     caches = _runner_shaped_caches(root)
     name = root.get_kv_spec().layers[0].name
     flat = caches[name][0]
-    caches[name] = [flat.reshape(-1), caches[name][1]]
+    # Bank zero is flattened and every other bank is kept as allocated. The reading this
+    # replaces, verbatim: `caches[name] = [flat.reshape(-1), caches[name][1]]` — it named
+    # bank one, which a latent layer no longer has.
+    caches[name] = [flat.reshape(-1), *caches[name][1:]]
     with pytest.raises(ValueError, match="the runner allocates"):
         root.bind_kv_cache(caches)
 
@@ -394,12 +403,15 @@ def test_bind_kv_cache_refuses_a_bank_whose_geometry_is_not_the_specs():
     root = _fixture()["root"]
     caches = _runner_shaped_caches(root)
     layer_spec = root.get_kv_spec().layers[0]
+    # The wrong head count goes in bank zero and every other bank is kept as allocated. The
+    # reading this replaces, verbatim: the list ended `caches[layer_spec.name][1],` — it
+    # named bank one, which a latent layer no longer has.
     caches[layer_spec.name] = [
         torch.zeros(
             (E2E_BLOCKS, 2, item.MLA_PAGE_SIZE, int(layer_spec.head_size)),
             dtype=layer_spec.dtype,
         ),
-        caches[layer_spec.name][1],
+        *caches[layer_spec.name][1:],
     ]
     with pytest.raises(ValueError, match="head count and width"):
         root.bind_kv_cache(caches)

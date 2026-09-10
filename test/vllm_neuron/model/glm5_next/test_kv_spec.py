@@ -307,18 +307,28 @@ def test_kv_spec_the_pin_dataclass_is_not_widened() -> None:
     The function NAME is deliberately byte-unchanged: it is the item id this
     file's landed ``-013`` acceptance command collects, and renaming it would
     silently change that collected set to buy a more accurate label.
+
+    The arity reading is eleven since a fifth field was appended, the latent
+    key/value declaration. The name still holds: what it denies is a WIDENED pin,
+    and the pin's own six are untouched, in order, with every later field
+    defaulted.
     """
     from dataclasses import fields
 
     names = tuple(f.name for f in fields(LayerSpec))
     assert names[:6] == PIN_LAYER_SPEC_FIELDS
-    assert len(names) == 10
+    # The two readings this replaces, verbatim, from before the latent field was
+    # appended: `assert len(names) == 10` and a four-member tail ending at
+    # `kda_recurrent_state_dtype`.
+    assert len(names) == 11
     assert names[6:] == (
         "kda_conv_state_shape",
         "kda_recurrent_state_shape",
         "kda_conv_state_dtype",
         "kda_recurrent_state_dtype",
+        "latent_kv",
     )
+    assert next(f.default for f in fields(LayerSpec) if f.name == "latent_kv") is False
     assert tuple(f.name for f in fields(KVSpec)) == ("layers",)
 
     # The pin's exact 6-argument positional form still constructs.
