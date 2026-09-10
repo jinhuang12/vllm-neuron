@@ -1274,8 +1274,10 @@ def test_moe_path_planted_routing_operands_must_fail() -> None:
 
     The limbs pick their rows, their expert slab and their affinities from operands
     the mapping produces, so the acceptance is load-bearing only if a wrong operand
-    can fail it: one arm rolls every row index by one position, the other points
-    block ``0`` at the next expert. Each requires the route reading to stay the
+    can fail it: one arm moves every real row index one real slot along, which
+    carries the last real row of each block over the boundary into the next block's
+    first slot and so under a different expert, and the other points block ``0``
+    at the next expert. Each requires the route reading to stay the
     routed triple, so it fails for the operand and not for a stopped kernel, and
     each measures that the planting moved the numbers before its failure counts.
     """
@@ -1286,30 +1288,43 @@ def test_moe_path_planted_routing_operands_must_fail() -> None:
     case = _build_case()
     real_mapping = functional_hub.build_blockwise_mapping
 
-    def _plant(roll_rows: bool, next_expert: bool):
+    def _shift_real_slots(positions, block_to_expert):
+        # Rolling the WHOLE vector is inert on this fixture: its blocks are half
+        # padding, so every real row stays inside its own block and only padding
+        # crosses. Rolling the real slots ALONE carries the last real row of each
+        # block into the next one, and the number of rows that land under a
+        # different expert is returned so the arm can refuse a vacuous planting.
+        flat = positions.reshape(-1)
+        real = torch.nonzero(flat >= 0, as_tuple=False).reshape(-1)
+        shifted = flat.clone()
+        shifted[real] = flat[real].roll(1, 0)
+        experts = block_to_expert.reshape(-1)[real.div(B, rounding_mode="floor")]
+        return shifted.reshape(positions.shape), int((experts.roll(-1) != experts).sum())
+
+    def _plant(shift_rows: bool, next_expert: bool):
         def mapping(**kwargs):
             masked, positions, block_to_expert, conditions = real_mapping(**kwargs)
-            if roll_rows:
-                positions = torch.roll(positions, 1, dims=0)
+            if shift_rows:
+                positions, mapping.crossed = _shift_real_slots(positions, block_to_expert)
             if next_expert:
                 block_to_expert = block_to_expert.clone()
                 flat = block_to_expert.reshape(-1)
                 flat[0] = (int(flat[0]) + 1) % E
             return masked, positions, block_to_expert, conditions
 
+        mapping.crossed = 0
         return mapping
 
     want = _configured_reference(case, bank)
     _nonempty_or_raise(want, "planted-routing")
 
     for label, planting in (
-        ("row_index_rolled_one_position", dict(roll_rows=True, next_expert=False)),
-        ("block_0_expert_incremented", dict(roll_rows=False, next_expert=True)),
+        ("real_rows_shifted_one_real_slot", dict(shift_rows=True, next_expert=False)),
+        ("block_0_expert_incremented", dict(shift_rows=False, next_expert=True)),
     ):
+        planted = _plant(**planting)
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(
-                functional_hub, "build_blockwise_mapping", _plant(**planting)
-            )
+            patch.setattr(functional_hub, "build_blockwise_mapping", planted)
             _reset_limb_counters()
             got = bank.block_quant_expert_mm(
                 quant_config=quant_config, block_size=B, **case["call_site_inputs"]
@@ -1318,6 +1333,7 @@ def test_moe_path_planted_routing_operands_must_fail() -> None:
         separation = float((got - want).abs().max())
         print(
             f"[planted-routing] {label} limb_counters={counters} "
+            f"crossed_a_block_boundary={planted.crossed} "
             f"separation_from_reference_absmax={separation:.6e} "
             f"max_rel_error={_max_rel_error(got, want):.6e} "
             f"rtol={RTOL} atol={ATOL}"
@@ -1327,6 +1343,12 @@ def test_moe_path_planted_routing_operands_must_fail() -> None:
             f"{DECLARED_LIMB_DISPATCHES}; this arm must fail for the planted "
             f"operand, not because the route stopped running"
         )
+        if planting["shift_rows"] and not planted.crossed > 0:
+            raise VacuousControlError(
+                f"{label}: the shift left every real row under the expert it "
+                f"already had (crossings {planted.crossed!r}), measured on the real "
+                f"mapping's own operands, so it cannot change the output at all"
+            )
         if not separation > 0.0:
             raise VacuousControlError(
                 f"{label}: the planting left the output numerically identical "
@@ -1335,6 +1357,122 @@ def test_moe_path_planted_routing_operands_must_fail() -> None:
             )
         with pytest.raises(AssertionError):
             torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+# ===========================================================================
+# The routing is device-side, so the routed call traces whole.
+# ===========================================================================
+_DYNAMO_REFUSAL_NAMES = ("Unsupported", "GraphBreakError", "FullGraphError")
+
+
+def _dynamo_refusal_classes() -> tuple[type, ...]:
+    """Resolve, by name, the classes dynamo raises when a traced region breaks."""
+    from torch._dynamo import exc as dynamo_exc
+
+    found = tuple(
+        getattr(dynamo_exc, name)
+        for name in _DYNAMO_REFUSAL_NAMES
+        if isinstance(getattr(dynamo_exc, name, None), type)
+    )
+    if not found:
+        raise VacuousControlError(
+            f"none of {_DYNAMO_REFUSAL_NAMES} names a class in torch._dynamo.exc "
+            f"on this torch, so requiring the refusal by name would accept anything"
+        )
+    return found
+
+
+def _compiled_route(bank, quant_config):
+    """The bank's routed call, compiled with the runner's own fullgraph setting."""
+    from vllm_neuron import envs as neuron_envs
+
+    if neuron_envs.VLLM_NEURON_DEBUG_MODE:
+        raise VacuousControlError(
+            "VLLM_NEURON_DEBUG_MODE is set, so the runner would compile with "
+            "fullgraph=False and this reading would measure nothing"
+        )
+
+    def routed(**inputs):
+        return bank.block_quant_expert_mm(
+            quant_config=quant_config, block_size=B, **inputs
+        )
+
+    return torch.compile(routed, fullgraph=True)
+
+
+def test_moe_path_routed_call_traces_under_fullgraph() -> None:
+    """MEASURED: the routed call traces whole under ``fullgraph=True`` and returns.
+
+    The runner compiles the model with ``fullgraph`` on unless the debug door is open
+    (``neuron_model_runner.py:1457-1462``), so a host read anywhere in the routing is
+    fatal in service, and this item passes only if the compiled call RETURNS, with the
+    routed triple read and the configured reference's numbers. The backend is dynamo's
+    own: the runner's remaining options are ``neuronx-cc`` arguments that reach the
+    compiler and never the tracer, so they cannot change whether the trace breaks, and
+    what the neuron backend then makes of this graph is the host run's COMPILE step.
+    """
+    bank, _text_config = _build_bank()
+    quant_config = _block_quant_config()
+    case = _build_case()
+    want = _configured_reference(case, bank)
+    _nonempty_or_raise(want, "fullgraph")
+
+    _reset_limb_counters()
+    got = _compiled_route(bank, quant_config)(**case["call_site_inputs"]).to(
+        torch.float32
+    )
+    counters = _limb_counters()
+    print(
+        f"[fullgraph] limb_counters={counters} returned_shape={tuple(got.shape)} "
+        f"max_rel_error={_max_rel_error(got, want):.6e} rtol={RTOL} atol={ATOL}"
+    )
+    assert counters == DECLARED_LIMB_DISPATCHES, (
+        f"the compiled call read {counters}, declared {DECLARED_LIMB_DISPATCHES}; "
+        f"a trace that returns without running the limbs proves nothing"
+    )
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+def test_moe_path_planted_host_read_breaks_the_fullgraph_trace() -> None:
+    """MEASURED: one ``.item()`` in the routing turns the item above RED, by name.
+
+    The plant reads one element of the mapping's own row index to the host and hands
+    back every operand unchanged, so the arithmetic is untouched -- asserted first,
+    uncompiled -- and the read is all the compiled arm has left to fail on. The
+    refusal must be a class :data:`_DYNAMO_REFUSAL_NAMES` names, and the resolver
+    refuses when this torch carries none of them.
+    """
+    from vllm_neuron import functional as functional_hub
+
+    bank, _text_config = _build_bank()
+    quant_config = _block_quant_config()
+    case = _build_case()
+    real_mapping = functional_hub.build_blockwise_mapping
+    want = _configured_reference(case, bank)
+    _nonempty_or_raise(want, "planted-host-read")
+    read: list[int] = []
+
+    def mapping(**kwargs):
+        masked, positions, block_to_expert, conditions = real_mapping(**kwargs)
+        read.append(int(positions.reshape(-1)[0].item()))
+        return masked, positions, block_to_expert, conditions
+
+    refusals = _dynamo_refusal_classes()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(functional_hub, "build_blockwise_mapping", mapping)
+        _reset_limb_counters()
+        eager = bank.block_quant_expert_mm(
+            quant_config=quant_config, block_size=B, **case["call_site_inputs"]
+        ).to(torch.float32)
+        torch.testing.assert_close(eager, want, rtol=RTOL, atol=ATOL)
+        with pytest.raises(refusals) as refused:
+            _compiled_route(bank, quant_config)(**case["call_site_inputs"])
+    print(
+        f"[planted-host-read] host_reads={read[:1]} "
+        f"refusal={type(refused.value).__name__} "
+        f"declared={[cls.__name__ for cls in refusals]} "
+        f"message_head={str(refused.value).splitlines()[:1]}"
+    )
 
 
 # ===========================================================================

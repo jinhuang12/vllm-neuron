@@ -27,16 +27,13 @@ it says why, and the two limbs share this module without sharing a route.
 
 The `-113a` gate/up limb, in one paragraph
 -----------------------------------------
-`inc-glm53f-113a` authors this campaign's own NKI kernel for the gate/up
-projection of one expert's token block, indexing the checkpoint's ``128 x 128``
-scales directly, and returns the **pre-activation** fp32 result. It is a
-separate seam with its own counters and its own identity reading, and this
-commit changes NO byte of the route above: :func:`blockwise_fp8_moe` still
-enters the vendor member, because the block's overall return also needs the
-down projection, the activation and the affinity scaling, which are
-`inc-glm53f-113b`. The single sentence "the vendor member stops being called on
-the block-quant limb" is therefore `-113b`'s to make true, not this
-increment's, and nothing here pretends otherwise.
+This limb authors the campaign's own NKI kernel for the gate/up projection of
+one expert's token block, indexing the checkpoint's ``128 x 128`` scales
+directly, and returns the **pre-activation** fp32 result. It is a separate seam
+with its own counters and its own identity reading. The model's block-quant call
+site now enters it and its two siblings -- the activation and the down
+projection -- and no longer enters :func:`blockwise_fp8_moe`, which stays for
+whatever still routes through the vendor member.
 
 The scale layout this module consumes -- SETTLED, not assumed
 ------------------------------------------------------------
@@ -1000,8 +997,10 @@ def moe_gate_up_blockwise_fp8_kernel(
     # already used. Transposing on chip instead would save this staging buffer and
     # cost an unmeasured bf16 ``nc_transpose`` feeding a matmul's stationary operand;
     # the campaign's rule is that the mechanism is measured at its own dtype and
-    # width before the file that uses it is authored, and that one is not.
-    staged = nl.ndarray((positions, h_extent), dtype=hidden.dtype, buffer=nl.shared_hbm)
+    # width before the file that uses it is authored, and that one is not. The
+    # staging is kernel-internal, so it is ``private_hbm``: only a RETURNED tensor
+    # is ``shared_hbm``, which is the convention this package's landed kernels use.
+    staged = nl.ndarray((positions, h_extent), dtype=hidden.dtype, buffer=nl.private_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
 
     for m_tile in range(positions // TILE_SIZE):
@@ -1173,17 +1172,12 @@ def moe_gate_up_blockwise_fp8_kernel(
 # shape that member takes (``gate_clamp.py:178-195`` records the refusal that
 # happens when it is not).
 #
-# WHAT IS STILL NOT HERE, AND WHY IT IS NOT A GAP IN THIS COMMIT. The block seam
-# ``blockwise_fp8_moe`` still enters the vendor member. Switching it needs three
-# device-side constructs -- an indirect row gather for the tokens, a per-block
-# device scalar for the expert index, and an indirect row scatter for the output --
-# which ARE landed idioms in this campaign (`inc-glm53f-044`'s paged gather and
-# `-045`'s ragged pack, both reading ``.ap(vector_offset=..., indirect_dim=0)`` off
-# the vendor's own ``scatter_add``). `-045`'s module docstring also records the
-# campaign's standing rule about them: the mechanism is measured on this image, at
-# the dtype and the width it will be used at, BEFORE the file that uses it is
-# authored. That measurement is a simulator round this seat cannot run, so the
-# switch waits for it rather than being guessed here.
+# WHAT THE ROUTE DOES NOW. The model's block-quant call site enters the three
+# limbs above, not the vendor member: the switch this paragraph once deferred is
+# landed, built from the indirect row gather, the per-block device scalar for the
+# expert index and the indirect row scatter -- idioms already landed in this
+# package, each reading ``.ap(vector_offset=..., indirect_dim=0)`` off the
+# vendor's own ``scatter_add``. The seam below stays for the vendor route.
 def can_run_moe_gate_up_blockwise_fp8(
     hidden_states: Tensor, tokens: int, rows: int, cols: int
 ) -> bool:
