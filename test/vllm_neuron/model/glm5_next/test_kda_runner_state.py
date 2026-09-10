@@ -583,14 +583,22 @@ def test_kda_runner_state_b03_the_runner_carries_the_state_through_the_layer(
     for step, carriers in enumerate(run.decode_carriers):
         for index, carrier in enumerate(carriers):
             bank = run.banks[index]
-            assert carrier["recurrent_state"].data_ptr() == (
+            # RE-PINNED (D17.1): the carrier's two state values are a per-request
+            # TUPLE of views now, because two concurrent requests hold two rows of
+            # one bank and cannot be one tensor. ORIGINAL READING:
+            # `carrier["recurrent_state"].data_ptr()` and
+            # `carrier["conv_state"].data_ptr()`, the bare view. NEW VALUE: entry
+            # `[0]`, this single request's view. What the item measures -- a VIEW and
+            # not a copy, on every step -- is unchanged, and it is the entry that
+            # must be the view, because that is what the layer advances in place.
+            assert carrier["recurrent_state"][0].data_ptr() == (
                 bank["recurrent_state"][DECLARED_STATE_SLOT].data_ptr()
             ), (
                 f"step {step}: bank {index}'s recurrent carrier is not a view of "
                 f"its own slot, so the layer's in-place advance is written where "
                 f"the next step will not read it"
             )
-            assert carrier["conv_state"].data_ptr() == (
+            assert carrier["conv_state"][0].data_ptr() == (
                 bank["conv_state"][DECLARED_STATE_SLOT].data_ptr()
             ), f"step {step}: bank {index}'s conv carrier is not a view of its own slot"
             assert carrier["is_prefill"] is False, (

@@ -5154,6 +5154,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_seq_len: int,
         index_kpool: int,
         requests: int = 1,
+        request_starts=None,
     ) -> list[dict]:
         """One mapping per layer, in stack order, each holding THAT layer's own state.
 
@@ -5171,6 +5172,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ``recurrent_state``, ``is_prefill`` and ``start_position`` (``:4149``).
         Which leg is running is the caller's reading of the batch, passed in
         rather than guessed here.
+
+        THE LINEAR FAMILY'S THREE PER-REQUEST VALUES ARE TUPLES, one entry per
+        request in the batch's order, because two requests' states are two rows of
+        one bank and cannot be one tensor. The key NAMES are unchanged, the entries
+        are VIEWS so the in-place advance lands in the bank, and the tuple is used
+        at one request too so the two shapes share one derivation.
 
         BOTH FAMILIES READ THE POSITION FROM ONE VARIABLE. The linear family
         needs it for the same reason the sparse one does: a prompt longer than one
@@ -5228,26 +5235,82 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"verify step, is not inc-glm53f-054b's work"
             )
 
+        # THE REQUESTS ARE A LIST OF (SLOT, POSITION) PAIRS, and the singular
+        # arguments are the one-request case of it rather than a separate path. A
+        # geometry may carry `state_slots` for a batch; when it carries only
+        # `state_slot` this is one request, and `request_starts` defaults to the one
+        # position the caller passed. So the concurrent form and the pinned
+        # one-sequence form share this derivation and cannot drift apart.
+        starts = (
+            [int(value) for value in request_starts]
+            if request_starts is not None
+            else [int(start_position)]
+        )
+        if request_starts is not None and len(starts) != int(requests):
+            raise ValueError(
+                f"this call declares {int(requests)} request(s) and hands "
+                f"{len(starts)} cached length(s); the count and the per-request "
+                f"positions come from one batch and must agree"
+            )
         carriers: list[dict] = []
         for bank, side, geometry in zip(banks, side_caches, geometries):
-            state_slot = int(geometry["state_slot"])
+            state_slots = [
+                int(value)
+                for value in geometry.get("state_slots", [geometry["state_slot"]])
+            ]
+            state_slot = state_slots[0]
+            if len(state_slots) != len(starts):
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {len(state_slots)} state "
+                    f"slot(s) against {len(starts)} cached length(s); each request "
+                    f"contributes one of each, so a disagreement pairs one request's "
+                    f"state with another's position"
+                )
             if bank["family"] != "self_attn":
                 slots = int(bank["state_slots"])
-                if not 0 <= int(state_slot) < slots:
-                    raise ValueError(
-                        f"KV layer '{bank['name']}' holds {slots} recurrent state "
-                        f"slot(s) and this request was given slot "
-                        f"{int(state_slot)}"
-                    )
+                for one_slot in state_slots:
+                    if not 0 <= int(one_slot) < slots:
+                        raise ValueError(
+                            f"KV layer '{bank['name']}' holds {slots} recurrent state "
+                            f"slot(s) and this request was given slot "
+                            f"{int(one_slot)}"
+                        )
+                # ONE ENTRY PER REQUEST, UNDER THE LANDED KEY NAMES. The states of two
+                # requests are two rows of one bank, so they cannot be one tensor; the
+                # layer takes the tuple and serves the requests one at a time. VIEWS,
+                # never copies: the recurrence advances its state in place, and a copy
+                # would leave the bank holding the state of a step that already ran.
+                # The tuple form is used at ONE request too, so the pinned one-sequence
+                # shape runs the same derivation the concurrent shape does.
                 carriers.append(
                     {
-                        "conv_state": bank["conv_state"][int(state_slot)],
-                        "recurrent_state": bank["recurrent_state"][int(state_slot)],
+                        "conv_state": tuple(
+                            bank["conv_state"][one_slot] for one_slot in state_slots
+                        ),
+                        "recurrent_state": tuple(
+                            bank["recurrent_state"][one_slot]
+                            for one_slot in state_slots
+                        ),
                         "is_prefill": bool(is_prefill),
-                        "start_position": int(start_position),
+                        "start_position": tuple(starts),
                     }
                 )
                 continue
+            if len(state_slots) != 1:
+                # THE SPARSE FAMILY STILL THREADS ONE SEQUENCE, and this is where that
+                # boundary lives now. Its carrier is ONE CONTIGUOUS SLICE of the paged
+                # latent bank, and two requests' pages are not one run, so a second
+                # request cannot be expressed here at all -- the paged gather inside
+                # the kernel is what lifts it (`inc-glm53f-117b`). The linear family
+                # above is already concurrent, so the refusal is the sparse family's
+                # rather than the whole forward's.
+                raise ValueError(
+                    f"KV layer '{bank['name']}' is a sparse-attention layer and takes "
+                    f"ONE contiguous slice of the paged latent bank, so it serves one "
+                    f"sequence per forward; this call carries {len(state_slots)} "
+                    f"request(s). The paged gather inside the kernel is what lifts "
+                    f"this, not the runner"
+                )
             ids = [int(value) for value in geometry["block_ids"]]
             if not ids:
                 raise ValueError(
@@ -5496,10 +5559,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         state_slots = self._glm5next_request_slots(
             banks, request_ids, synthetic=synthetic_step, side_caches=side_caches
         )
-        # ONE SEQUENCE STILL, so one slot serves every bank's geometry. The
-        # per-request geometry walk arrives with the refusals this half retires.
+        # THE SLOTS TRAVEL AS A LIST, one entry per request, and the singular key
+        # stays beside it because landed readers name it. The walk above still
+        # admits one row per forward, so this list holds one slot today; writing it
+        # as a list here rather than at the point it grows is what keeps the carrier
+        # builder's own derivation single.
         for geometry in geometries:
             geometry["state_slot"] = int(state_slots[0])
+            geometry["state_slots"] = [int(value) for value in state_slots]
         if synthetic_step:
             # A SYNTHETIC STEP LEAVES THE RING AND ITS RECORDED POSITION ALONE, and
             # this branch exists to say so in one place rather than by omission. A
@@ -5604,6 +5671,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ),
             max_seq_len=start_position + tokens,
             index_kpool=int(text_config.index_kpool),
+            requests=len(state_slots),
+            request_starts=[start_position] * len(state_slots),
         )
         # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
         # several shapes of its own -- a multi-token decode, a bank whose paging

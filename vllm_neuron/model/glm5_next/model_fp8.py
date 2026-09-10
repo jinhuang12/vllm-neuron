@@ -4122,10 +4122,10 @@ class Glm5NextKDAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        conv_state: torch.Tensor,
-        recurrent_state: torch.Tensor,
+        conv_state: torch.Tensor | tuple[torch.Tensor, ...],
+        recurrent_state: torch.Tensor | tuple[torch.Tensor, ...],
         is_prefill: bool,
-        start_position: int = 0,
+        start_position: int | tuple[int, ...] = 0,
         chunk_size: int | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
@@ -4158,6 +4158,13 @@ class Glm5NextKDAAttention(nn.Module):
                 whether the recurrence enters with the carrier's state.
             chunk_size: overrides the resolved chunk width, for a test that
                 needs to name it.
+
+        THE THREE PER-REQUEST ARGUMENTS ALSO TAKE A TUPLE, one entry per request
+        in the batch's order, which is how a concurrent decode arrives: each
+        request's states live at its own slot of the bank, so they cannot be one
+        tensor. The tuple form is served one request at a time by this same
+        method and refused on the prefill leg, where the carrier says nothing
+        about where one request's tokens end. A bare tensor is one request.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -4202,6 +4209,62 @@ class Glm5NextKDAAttention(nn.Module):
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
             )
+        # ONE CARRIER PER REQUEST, AND THE LOOP IS THE DISPATCH. Concurrent requests
+        # hold their states at different slots of one bank, so what arrives here is a
+        # tuple of views -- one per request, in the batch's own order -- rather than
+        # one sequence's state. Each request is then served by this same method on
+        # its own token, which keeps the recurrence one request's from end to end and
+        # leaves the arithmetic below untouched. The cost is one dispatch per request
+        # per layer, taken deliberately: batching the requests into the seams needs
+        # the seams to carry a request axis, which is not this layer's to decide.
+        #
+        # THE VIEWS ARE NOT COPIED, which is what makes the loop correct at all. The
+        # recurrence advances its state in place, so each request's write has to land
+        # in the bank row its own view names.
+        states = tuple(
+            tuple(part) if isinstance(part, (tuple, list)) else (part,)
+            for part in (conv_state, recurrent_state, start_position)
+        )
+        counts = {len(part) for part in states}
+        if len(counts) != 1:
+            raise ValueError(
+                f"the two state carriers and the position describe the same requests, "
+                f"so they arrive in equal numbers; this call carries "
+                f"{len(states[0])} conv, {len(states[1])} recurrent and "
+                f"{len(states[2])} position entry(ies)"
+            )
+        if len(states[0]) > 1:
+            requests = len(states[0])
+            if is_prefill:
+                raise ValueError(
+                    f"this call prefills {requests} requests together, and a prefill "
+                    f"carries a different number of tokens for each of them; the "
+                    f"carrier says nothing about where one request's tokens end and "
+                    f"the next one's begin, so serving it would run every request "
+                    f"over the whole batch's tokens. Concurrent DECODE is what this "
+                    f"layer serves"
+                )
+            if int(hidden_states.shape[0]) != requests:
+                raise ValueError(
+                    f"a decode step advances each sequence by one token, so this call "
+                    f"carries one token per request; it holds "
+                    f"{int(hidden_states.shape[0])} token(s) for {requests} request(s)"
+                )
+            return torch.cat(
+                [
+                    self.forward(
+                        hidden_states[index : index + 1],
+                        conv_state=conv,
+                        recurrent_state=recurrent,
+                        is_prefill=is_prefill,
+                        start_position=position,
+                        chunk_size=chunk_size,
+                    )
+                    for index, (conv, recurrent, position) in enumerate(zip(*states))
+                ],
+                dim=0,
+            )
+        conv_state, recurrent_state, start_position = (part[0] for part in states)
         tokens = int(hidden_states.shape[0])
         heads = int(self.num_kv_heads_per_rank)
         kdim = int(self.head_dim)
@@ -4463,10 +4526,10 @@ class Glm5NextKDALayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        conv_state: torch.Tensor,
-        recurrent_state: torch.Tensor,
+        conv_state: torch.Tensor | tuple[torch.Tensor, ...],
+        recurrent_state: torch.Tensor | tuple[torch.Tensor, ...],
         is_prefill: bool,
-        start_position: int = 0,
+        start_position: int | tuple[int, ...] = 0,
         chunk_size: int | None = None,
         streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -4500,9 +4563,10 @@ class Glm5NextKDALayer(nn.Module):
         Args:
             streams: ``[T, S, H]`` residual streams, or ``None`` for the
                 one-stream route. Every other argument is the attention module's,
-                passed through unchanged; see
-                :meth:`Glm5NextKDAAttention.forward` for what the two carriers
-                and the position mean.
+                passed through unchanged -- including the per-request TUPLE form
+                of the two carriers and the position, which this method neither
+                reads nor splits; see :meth:`Glm5NextKDAAttention.forward` for
+                what the two carriers and the position mean.
 
         Returns:
             ``[T, H]`` on the one-stream route -- the input dtype, unchanged. On

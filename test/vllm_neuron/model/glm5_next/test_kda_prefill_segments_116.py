@@ -384,20 +384,27 @@ def test_kda_prefill_segments_c05_the_runner_hands_the_position_to_the_layer(
     continuing = runner_half._carriers(
         runner, banks, tokens=ALIGNED_SEGMENT, cached=ALIGNED_SEGMENT
     )
+    # RE-PINNED (D17.1): the linear carrier's position is a per-request TUPLE now,
+    # one entry per request in the batch's order, because each request continues its
+    # own sequence at its own position. ORIGINAL READING: `int(c["start_position"])`,
+    # one position for the whole carrier. NEW VALUE: entry `[0]`, this single
+    # request's position. The item's reading -- that the RUNNER decides the position
+    # and hands it to the layer -- is unchanged.
     print(
         f"SEGPREFILL|item5|keys={sorted(fresh[0])}|"
-        f"fresh_positions={[int(c['start_position']) for c in fresh]}|"
-        f"continuing_positions={[int(c['start_position']) for c in continuing]}",
+        f"fresh_positions={[int(c['start_position'][0]) for c in fresh]}|"
+        f"continuing_positions={[int(c['start_position'][0]) for c in continuing]}",
         flush=True,
     )
-    assert all(int(c["start_position"]) == 0 for c in fresh), (
-        f"a prefill at cached length 0 built {[int(c['start_position']) for c in fresh]}"
+    assert all(int(c["start_position"][0]) == 0 for c in fresh), (
+        f"a prefill at cached length 0 built "
+        f"{[int(c['start_position'][0]) for c in fresh]}"
     )
     assert all(
-        int(c["start_position"]) == ALIGNED_SEGMENT for c in continuing
+        int(c["start_position"][0]) == ALIGNED_SEGMENT for c in continuing
     ), (
         f"a prefill at cached length {ALIGNED_SEGMENT} built "
-        f"{[int(c['start_position']) for c in continuing]}"
+        f"{[int(c['start_position'][0]) for c in continuing]}"
     )
 
     hidden = stack.tokens[:ALIGNED_SEGMENT]

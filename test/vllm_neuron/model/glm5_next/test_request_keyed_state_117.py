@@ -140,8 +140,15 @@ DECLARED_WARMUP_BUCKET = 4
 
 #: The state-carrier keys, in the model's own declared spelling
 #: (``model_fp8.py:4149``). The carrier is splatted into the layer, so an extra
-#: key is a TypeError and a missing one is served as a default.
-DECLARED_STATE_CARRIER_KEYS = {"conv_state", "recurrent_state", "is_prefill"}
+#: key is a TypeError and a missing one is served as a default. RE-PINNED: the
+#: fourth key is the sibling increment's, which landed by tip merge; the original
+#: reading was the three-key set.
+DECLARED_STATE_CARRIER_KEYS = {
+    "conv_state",
+    "recurrent_state",
+    "is_prefill",
+    "start_position",
+}
 
 #: The conv and recurrent state shapes per slot. Small, and their only
 #: requirement is that the two differ so a mixed-up carrier is visible.
@@ -533,6 +540,151 @@ def test_a1_two_requests_are_assigned_distinct_state_slots() -> None:
     assert again == slots, f"the slots moved from {slots} to {again} within one life"
 
 
+def test_a1_each_requests_carrier_is_a_view_of_its_own_bank_row() -> None:
+    """The carrier half of A1: two requests, two views, and the writes land in the bank.
+
+    WHAT THE SLOT HALF ABOVE CANNOT SHOW. A table that hands out two different
+    slot NUMBERS is still wrong if the carrier then hands both requests the same
+    tensor, or hands out copies. So this reads the carrier the runner built: each
+    request's entry must be a storage view of ITS OWN bank row, the two entries
+    must be different storage, and each request's declared position must travel
+    with it.
+
+    THE TRIPWIRES, three, each on a different wrong implementation. A table
+    returning one slot for both fails the different-storage read. A carrier built
+    from one request's slot for the whole batch fails the per-request pointer read.
+    A carrier that COPIED the rows passes both pointer reads by accident, so the
+    last conjunct writes through the second request's carrier and requires the
+    BANK's own row to change while the first request's row does not -- a copy
+    leaves the bank untouched and fails there.
+
+    ONE FAMILY, DELIBERATELY. The sparse family still takes one contiguous slice of
+    the paged latent bank, so a second request cannot be expressed in its carrier
+    at all; the arm below reads that refusal by name. This item is the linear
+    family's, which is the half that becomes concurrent here.
+    """
+    _require_cpu_mode()
+    banks = _linear_banks(_banks())
+    bank = banks[0]
+    side = NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=DECLARED_INDEX_KPOOL,
+        index_head_dim=DECLARED_INDEX_HEAD_DIM,
+        max_seq_len=DECLARED_BLOCKS * DECLARED_PAGE_SIZE,
+        request_slots=DECLARED_STATE_SLOTS,
+    )
+    slots = [0, 2]
+    if len(set(slots)) != DECLARED_REQUESTS:
+        raise VacuousControlError(
+            f"this item needs {DECLARED_REQUESTS} distinct slots to tell the two "
+            f"requests' storage apart; it declares {slots}"
+        )
+    geometries = [
+        {
+            "block_ids": [int(value) for value in DECLARED_SPARSE_ROWS[0]],
+            "state_slot": slots[0],
+            "state_slots": slots,
+            "page_size": DECLARED_PAGE_SIZE,
+        }
+        for _ in banks
+    ]
+
+    carriers = NeuronModelRunner._glm5next_layer_carriers(
+        banks,
+        side,
+        geometries=geometries,
+        is_prefill=False,
+        tokens=DECLARED_REQUESTS,
+        start_position=DECLARED_CACHED_LENGTHS[0],
+        softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
+        max_seq_len=max(DECLARED_CACHED_LENGTHS) + 1,
+        index_kpool=DECLARED_INDEX_KPOOL,
+        requests=DECLARED_REQUESTS,
+        request_starts=list(DECLARED_CACHED_LENGTHS),
+    )
+
+    carrier = carriers[0]
+    pointers = [value.data_ptr() for value in carrier["conv_state"]]
+    print(f"KEYED|a1|keys={sorted(carrier)}|slots={slots}"
+          f"|positions={carrier['start_position']}|conv_pointers={pointers}")
+    assert set(carrier) == DECLARED_STATE_CARRIER_KEYS, (
+        f"the linear carrier holds {sorted(carrier)}, not "
+        f"{sorted(DECLARED_STATE_CARRIER_KEYS)}; the layer takes these as keywords, "
+        f"so an extra key raises and a missing one is served as a default"
+    )
+    assert len(carrier["conv_state"]) == DECLARED_REQUESTS, (
+        f"the carrier holds {len(carrier['conv_state'])} conv entry(ies) for "
+        f"{DECLARED_REQUESTS} requests"
+    )
+    assert carrier["start_position"] == tuple(DECLARED_CACHED_LENGTHS), (
+        f"the carrier carries positions {carrier['start_position']} rather than each "
+        f"request's own {tuple(DECLARED_CACHED_LENGTHS)}; one position for the batch "
+        f"would enter the second request's recurrence at the first one's point"
+    )
+    for index, slot in enumerate(slots):
+        assert carrier["conv_state"][index].data_ptr() == (
+            bank["conv_state"][slot].data_ptr()
+        ), f"request {index}'s conv entry is not slot {slot}'s own row"
+        assert carrier["recurrent_state"][index].data_ptr() == (
+            bank["recurrent_state"][slot].data_ptr()
+        ), f"request {index}'s recurrent entry is not slot {slot}'s own row"
+    assert len(set(pointers)) == DECLARED_REQUESTS, (
+        f"the two requests' conv entries share storage {pointers}; one request's "
+        f"advance would then be the other's entering state"
+    )
+
+    # ---- THE VIEW READ, which a copy cannot pass: write through the carrier.
+    untouched = bank["recurrent_state"][slots[0]].clone()
+    carrier["recurrent_state"][1].fill_(3.0)
+    landed = float(bank["recurrent_state"][slots[1]].abs().max())
+    print(f"KEYED|a1|wrote_through_request_1|bank_row_max={landed}")
+    assert landed == 3.0, (
+        "a write through the second request's carrier did not reach its bank row, so "
+        "the carrier is a copy and the layer's in-place advance would be discarded"
+    )
+    assert torch.equal(bank["recurrent_state"][slots[0]], untouched), (
+        "the write reached the FIRST request's row as well; the two requests' states "
+        "must be disjoint or one continues the other's sequence"
+    )
+
+
+def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
+    """The sparse carrier is one contiguous slice, so it says so instead of guessing.
+
+    THE TRIPWIRE: a builder that silently served the first request's slice for a
+    two-request batch would hand both requests one sequence's latents. The refusal
+    names the paged gather as what lifts it, so the boundary is readable at the
+    failure rather than only in the plan.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    side = _side_caches(banks)
+    geometries = [
+        {
+            "block_ids": [int(value) for value in DECLARED_SPARSE_ROWS[0]],
+            "state_slot": 0,
+            "state_slots": [0, 2],
+            "page_size": DECLARED_PAGE_SIZE,
+        }
+        for _ in banks
+    ]
+
+    with pytest.raises(ValueError, match="ONE contiguous slice"):
+        NeuronModelRunner._glm5next_layer_carriers(
+            banks,
+            side,
+            geometries=geometries,
+            is_prefill=False,
+            tokens=DECLARED_REQUESTS,
+            start_position=DECLARED_CACHED_LENGTHS[0],
+            softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
+            max_seq_len=max(DECLARED_CACHED_LENGTHS) + 1,
+            index_kpool=DECLARED_INDEX_KPOOL,
+            requests=DECLARED_REQUESTS,
+            request_starts=list(DECLARED_CACHED_LENGTHS),
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # A2. A finished request's slot is freed, and its next owner gets it zeroed.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -675,7 +827,8 @@ def test_a2_the_prefill_warmups_own_shape_is_served_and_takes_no_claim() -> None
     served = [
         index
         for index in range(DECLARED_STATE_SLOTS)
-        if carriers[1]["conv_state"].data_ptr() == linear["conv_state"][index].data_ptr()
+        if carriers[1]["conv_state"][0].data_ptr()
+        == linear["conv_state"][index].data_ptr()
     ]
     print(f"KEYED|a2|warmup_tokens={DECLARED_WARMUP_BUCKET}|carriers={len(carriers)}"
           f"|served_slot={served}|table={table}")

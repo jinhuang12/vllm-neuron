@@ -629,7 +629,14 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
             f"which the landed prefill carrier declares"
         )
         assert tuple(got["latent_cache"].shape) == tuple(want["latent_cache"].shape)
-        assert int(got["start_position"]) == 0
+        # RE-PINNED (D17.1): ORIGINAL READING `int(got["start_position"])`, one
+        # number for every family. NEW VALUE: the LINEAR family's position is a
+        # per-request tuple, while the SPARSE family's stays one number until its
+        # own paged gather lands, so this reads the first entry when it is a tuple.
+        # The asymmetry is the two families' different boundaries, stated rather
+        # than hidden behind a cast that would raise on one of them.
+        position = got["start_position"]
+        assert int(position[0] if isinstance(position, tuple) else position) == 0
         assert float(got["softmax_scale"]) == float(item.MLA_SOFTMAX_SCALE)
 
     input_ids = torch.randint(
@@ -1186,12 +1193,16 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
             assigned = runner._glm5next_request_slot_table["req-0"]
             print(f"TINYE2E|group_slice|{index}|recurrent|assigned_slot={assigned}"
                   f"|group_row={state_slot}")
-            assert (carrier["conv_state"].data_ptr()
+            # RE-PINNED (D17.1) a second time, for the per-request TUPLE the linear
+            # carrier's state values became. ORIGINAL READING:
+            # `carrier["conv_state"].data_ptr()`, the bare view. NEW VALUE: entry
+            # `[0]`, this single request's view.
+            assert (carrier["conv_state"][0].data_ptr()
                     == bank["conv_state"][assigned].data_ptr()), (
                 f"layer {index} is recurrent and its conv state is not the slot the "
                 f"runner's request table assigned"
             )
-            assert (carrier["recurrent_state"].data_ptr()
+            assert (carrier["recurrent_state"][0].data_ptr()
                     == bank["recurrent_state"][assigned].data_ptr())
 
     # ---- A layer with no entry of its own refuses by name rather than borrowing one.
