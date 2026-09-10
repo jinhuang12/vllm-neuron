@@ -4233,6 +4233,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     padded_num_reqs, dtype=torch.int32, device=self.device
                 )
 
+            # The host's own arrays, carried beside the device tensors for the
+            # geometry a step decides before its traced call. ``num_reqs`` rows and
+            # not the padded count: a padding row names no request, and its cached
+            # length is the previous occupant's. Both are CPU TENSORS rather than
+            # the numpy view beside them, because this mapping is an input to the
+            # compiled model for every other family in this tree: a tensor entry
+            # guards on dtype and shape, while a value that changes every step
+            # would guard on its contents and recompile.
+            num_reqs = self.input_batch.num_reqs
+            host_block_table = blk_table.get_cpu_tensor()[:num_reqs]
+            host_num_computed_tokens = self.input_batch.num_computed_tokens_cpu_tensor[
+                :num_reqs
+            ]
+
             attn_metadata_i = {
                 "block_table_tensor": blk_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4241,6 +4255,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "max_blocks_per_seq": blk_table_tensor.shape[1],
                 "decode_token_threshold": decode_token_threshold,
                 "cached_seq_len": cached_seq_len_tensor,
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 # Full (untrimmed) block_table_tensor for use cases that
                 # need to compute slot indices into the *full* KV cache,
@@ -4414,6 +4430,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.neuron_config.kv_segment_size_buckets is not None:
                 kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
 
+            # The same host-side geometry the serving builder carries, so a capture
+            # reads its numbers the one way and needs no case of its own: this
+            # bucket's own blocks, and the cached length warmup declares.
+            host_block_table = (
+                torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(num_reqs, -1)
+                .contiguous()
+            )
+            host_num_computed_tokens = torch.full(
+                (num_reqs,), int(cached_seq_len), dtype=torch.int32
+            )
+
             attn_metadata_i = {
                 "block_table_tensor": block_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4424,6 +4453,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "cached_seq_len": torch.tensor(
                     [[cached_seq_len]], dtype=torch.int32, device=device
                 ),
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 "full_block_table_tensor": full_block_table_tensor,
             }
@@ -4798,6 +4829,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
     @staticmethod
+    def _glm5next_host_geometry(metadata: dict, key: str, name: str) -> list:
+        """One metadata entry's host-side geometry, as plain Python integers.
+
+        A device tensor is refused by name rather than read: this runs before the
+        traced call, where reading a value off a ``meta`` or device tensor is the
+        thing a captured graph cannot do.
+        """
+        if key not in metadata:
+            raise ValueError(
+                f"KV layer '{name}' has no '{key}' entry; the runner writes the "
+                f"host-side geometry beside the device tensors of every KV-cache "
+                f"group, and this call site handed {sorted(metadata)}"
+            )
+        value = metadata[key]
+        if torch.is_tensor(value) and value.device.type != "cpu":
+            raise ValueError(
+                f"KV layer '{name}'s '{key}' is a {value.device.type} tensor; the "
+                f"geometry of a step is decided on the host, so it comes from the "
+                f"runner's own host arrays and never from a device or meta tensor"
+            )
+        return value.tolist() if hasattr(value, "tolist") else list(value)
+
+    @staticmethod
     def _glm5next_side_caches(
         banks, *, index_kpool: int, index_head_dim: int, max_seq_len: int
     ) -> list[dict]:
@@ -5078,6 +5132,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         this function needs and cannot find refuses by name with what the site did
         hand it.
 
+        EVERY GEOMETRY NUMBER COMES FROM THE HOST, AND A DEVICE TENSOR IS REFUSED.
+        The cached length and the block-table row are read from the entry's
+        ``host_num_computed_tokens`` and ``host_block_table``, which both builders
+        fill from the runner's own host arrays. The device tensors beside them carry
+        the same numbers for the kernels, but reading a value off one costs a
+        ``Tensor.item()``, which a graph capture cannot do at all: under
+        ``VLLM_NEURON_CPU_COMPILE`` the whole batch is on ``meta``, where a value
+        does not exist. ``_glm5next_host_geometry`` therefore refuses a non-CPU
+        tensor by name instead of converting it, so the rule holds for a call site
+        that has not been written yet.
+
         ``block_size`` IS NOT PASSED EITHER, AND THAT IS THE POINT. The root's
         parameter of that name is the FP8 WEIGHT-QUANT block, "tokens per block,
         forwarded to the expert bank unread" (``model_fp8.py:8386``), and the bank
@@ -5143,23 +5208,36 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             metadata = metadata_map[name]
             block_size = int(metadata["block_size"])
-            table = metadata["block_table_tensor"]
-            if int(table.shape[0]) != 1:
+            rows = self._glm5next_host_geometry(metadata, "host_block_table", name)
+            positions = self._glm5next_host_geometry(
+                metadata, "host_num_computed_tokens", name
+            )
+            if len(rows) != len(positions):
+                raise ValueError(
+                    f"KV layer '{name}' was handed {len(rows)} block-table row(s) "
+                    f"against {len(positions)} cached length(s); both are the "
+                    f"batch's own rows, so there is one of each per request"
+                )
+            if len(rows) != 1:
                 raise ValueError(
                     f"this half threads ONE sequence per forward, because the layers "
                     f"take a single sequence's cache slots (inc-glm53f-051's declared "
-                    f"interface); this batch carries {int(table.shape[0])} request(s)"
+                    f"interface); this batch carries {len(rows)} request(s)"
                 )
-            cached = metadata["cached_seq_len"]
-            start_position = (
-                int(cached.reshape(-1)[0]) if torch.is_tensor(cached) else int(cached)
-            )
-            row = table[0].reshape(-1)
+            row = [int(value) for value in rows[0]]
+            start_position = int(positions[0])
             blocks_used = -(-(start_position + tokens) // block_size)
+            if blocks_used > len(row):
+                raise ValueError(
+                    f"KV layer '{name}' holds {start_position + tokens} slot(s) of "
+                    f"sequence, which occupy {blocks_used} page(s), and its "
+                    f"block-table row is {len(row)} entry(ies) wide; a row that "
+                    f"cannot address the step would slice another sequence's pages"
+                )
             geometries.append(
                 {
-                    "block_ids": [int(value) for value in row[:blocks_used]],
-                    "state_slot": int(row[0]),
+                    "block_ids": row[:blocks_used],
+                    "state_slot": row[0],
                     "page_size": block_size,
                 }
             )

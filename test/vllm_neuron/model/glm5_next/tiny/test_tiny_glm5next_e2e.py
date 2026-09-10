@@ -713,10 +713,11 @@ def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) ->
     """ONE KV-cache group's attention-metadata entry, at this step's geometry.
 
     THE KEYS AND THEIR SHAPES ARE THE RUNNER'S OWN, read off the mapping it builds at
-    `neuron_model_runner.py:4417-4429`; the converter under test reads five of them --
-    `block_table_tensor`, `block_size`, `max_query_len`, `decode_token_threshold` and
-    `cached_seq_len` -- and the rest are present so that this is the runner's mapping and not
-    a five-key stand-in.
+    `neuron_model_runner.py:4417-4441`; the converter under test reads five of them --
+    `host_block_table`, `host_num_computed_tokens`, `block_size`, `max_query_len` and
+    `decode_token_threshold` -- and the rest are present so that this is the runner's mapping
+    and not a five-key stand-in. The device copies of the first two are among the rest: the
+    converter is measured NOT reading them.
     """
     table = torch.tensor([[int(value) for value in row]], dtype=torch.int32)
     return {
@@ -728,6 +729,8 @@ def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) ->
         "max_blocks_per_seq": int(table.shape[1]),
         "decode_token_threshold": int(threshold),
         "cached_seq_len": torch.tensor([cached], dtype=torch.int32),
+        "host_block_table": table,
+        "host_num_computed_tokens": [int(cached)],
         "kv_segment_size": int(table.shape[1]) * int(block_size),
     }
 
