@@ -557,7 +557,12 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
         # One value per head, not per channel.
         "b_proj_weight": _DeclaredShard(0, _kda_head_count, "one row per head"),
         "A_log": _DeclaredShard(0, _kda_head_count, "one decay per head"),
-        "dt_bias": _DeclaredShard(0, _kda_head_count, "one bias per head"),
+        # One value per CHANNEL, not per head: the forward reshapes this bias flat
+        # (``:4280``) and takes ``[h * head_dim : (h + 1) * head_dim]`` from it per
+        # head (``:4285``), so the extent it reads is the head WIDTH.
+        "dt_bias": _DeclaredShard(
+            0, _kda_head_width, "one bias per channel -- the forward slices it per head width"
+        ),
     },
     # -- inc-glm53f-100 -- the MLA families the ratified table defers to it
     #    (``increments/shard-table-094.md`` Part 5, Group B). THREE leaves, one per

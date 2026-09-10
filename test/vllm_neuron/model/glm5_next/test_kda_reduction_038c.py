@@ -18,6 +18,9 @@ the whole sum needs a collective. Four items, one test each:
   the caller's shape.
 * A04 -- one rank changes nothing: no collective is entered and the returned
   tensor is bit-identical to the tensor built without one.
+* A05 -- the declared shard extents of the three KDA per-head families are the
+  widths the forward reads: the gate bias per channel, the decay and the beta
+  projection per head.
 """
 
 from pathlib import Path
@@ -111,13 +114,13 @@ def _full_weights(hidden: int, heads: int, head_dim: int, kernel: int) -> dict:
     }
 
 
-#: ``dt_bias`` is declared in the shard table by HEAD COUNT, but the forward reads
-#: it per CHANNEL -- ``model_fp8.py:4275`` reshapes it flat and ``:4280`` takes
-#: ``[h * head_dim : (h + 1) * head_dim]`` per head, and the landed builder at
-#: ``test_kda_layer.py:367`` allocates it at the head width to match. This case
-#: therefore shards it by the width the forward indexes, so a mismatch in that
-#: table cannot redden the reduction under test. The table row itself belongs to
-#: whoever owns it; this file only records which reading it followed.
+#: ``dt_bias`` is read per CHANNEL by the forward -- ``model_fp8.py:4280`` reshapes
+#: it flat and ``:4285`` takes ``[h * head_dim : (h + 1) * head_dim]`` per head --
+#: and the landed builder at ``test_kda_layer.py:367`` allocates it at the head
+#: width to match. The shard table declares that same width, and A05 is the item
+#: that reads the table and says so. This case still takes its slice from the width
+#: the forward indexes rather than from the table, so the reduction under test
+#: stays measurable on a tree whose table disagrees with the forward.
 _BY_HEAD_WIDTH = ("dt_bias",)
 _REPLICATED = ("f_a_proj_weight", "g_a_proj_weight", "o_norm_weight")
 
@@ -283,3 +286,45 @@ def test_a04_one_rank_enters_no_collective_and_is_bit_identical() -> None:
     print(f"A04|calls={group.calls}|equal_bytes={torch.equal(outputs[0], outputs[1])}")
     assert group.calls == 0
     assert torch.equal(outputs[0], outputs[1])
+
+
+def test_a05_the_declared_kda_extents_are_the_widths_the_forward_reads() -> None:
+    """The gate bias is declared per channel; the decay and beta rows stay per head."""
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    impl = _impl()
+    module = impl.Glm5NextKDAAttention(Glm5NextTextConfig(), WORLD)
+    heads = int(module.num_kv_heads_per_rank)
+    channels = heads * DECLARED_KDA_HEAD_SIZE
+    declared = {
+        leaf: impl._shard_geometry_for(module, leaf, WORLD)
+        for leaf in ("dt_bias", "A_log", "b_proj_weight")
+    }
+    extents = {leaf: None if g is None else int(g.shard_size) for leaf, g in declared.items()}
+    print(f"A05|heads_per_rank={heads}|channels_per_rank={channels}|declared={extents}")
+    assert extents["dt_bias"] == channels
+    assert extents["A_log"] == heads
+    assert extents["b_proj_weight"] == heads
+
+    # The slice the forward actually reads: each rank must get the channels of its
+    # own heads, and the value at every position says which head it came from.
+    full = torch.arange(
+        DECLARED_KDA_NUM_HEADS * DECLARED_KDA_HEAD_SIZE, dtype=torch.float32
+    )
+    size = extents["dt_bias"]
+    for rank in range(WORLD):
+        shard = full.narrow(0, rank * size, size)
+        first = rank * heads
+        expected = full.narrow(
+            0, first * DECLARED_KDA_HEAD_SIZE, heads * DECLARED_KDA_HEAD_SIZE
+        )
+        print(f"A05|rank={rank}|shard={tuple(shard.shape)}|first_head={first}")
+        assert torch.equal(shard, expected)
+
+    # The must-fail arm: the same narrow under a per-head extent hands one rank a
+    # fraction of one head's channels, so a table declaring that width cannot be
+    # the width the forward reads.
+    stale = int(impl._kda_head_count(module, WORLD))
+    print(f"A05|per_head_extent={stale}|per_channel_extent={size}")
+    assert stale != size
+    assert full.narrow(0, 0, stale).numel() < DECLARED_KDA_HEAD_SIZE
