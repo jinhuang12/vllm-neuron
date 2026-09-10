@@ -557,7 +557,12 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
         # One value per head, not per channel.
         "b_proj_weight": _DeclaredShard(0, _kda_head_count, "one row per head"),
         "A_log": _DeclaredShard(0, _kda_head_count, "one decay per head"),
-        "dt_bias": _DeclaredShard(0, _kda_head_count, "one bias per head"),
+        # One value per CHANNEL, not per head: the forward reshapes this bias flat
+        # (``:4280``) and takes ``[h * head_dim : (h + 1) * head_dim]`` from it per
+        # head (``:4285``), so the extent it reads is the head WIDTH.
+        "dt_bias": _DeclaredShard(
+            0, _kda_head_width, "one bias per channel -- the forward slices it per head width"
+        ),
     },
     # -- inc-glm53f-100 -- the MLA families the ratified table defers to it
     #    (``increments/shard-table-094.md`` Part 5, Group B). THREE leaves, one per
@@ -4125,6 +4130,7 @@ class Glm5NextKDAAttention(nn.Module):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         is_prefill: bool,
+        start_position: int = 0,
         chunk_size: int | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
@@ -4151,20 +4157,29 @@ class Glm5NextKDAAttention(nn.Module):
                 than implied. Written in place.
             is_prefill: whether this call is a prefill. It selects the
                 recurrence route and nothing else.
+            start_position: how many tokens of this sequence are already
+                computed. Zero means this call opens the sequence; above zero on
+                a prefill means this call CONTINUES one, which is what decides
+                whether the recurrence enters with the carrier's state.
             chunk_size: overrides the resolved chunk width, for a test that
                 needs to name it.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
 
-        THE PREFILL ARM ENTERS THE CHUNKED SEAMS WITH A ZERO STATE, BY
-        CONSTRUCTION. Neither chunked seam accepts an entering state, so a
-        prefill starts the recurrence at zero and ``recurrent_state`` is
-        OVERWRITTEN by this call rather than read by it. That is this block's
-        declared NON-GOAL held as code, not an oversight: carrying a state into
-        a chunked prefill is what chunked prefill, prefix caching or
-        multi-token prediction would need, and none of the three exists at the
-        pin.
+        A PREFILL ENTERS WITH ZERO ONLY WHEN IT OPENS THE SEQUENCE. A prompt
+        longer than one batch of tokens is prefilled in segments, and the second
+        segment has to continue the recurrence the first left, so the entering
+        state is the carrier's whenever ``start_position`` is above zero. At
+        position zero it is zero whatever the slot holds, because a fresh
+        sequence must not inherit the last one's state; the position, not the
+        contents of the slot, is what decides that.
+
+        THE POSITION IS ENOUGH TO DECIDE IT, and that rests on the caller rather
+        than on this method: the runner refuses a step that does not continue the
+        sequence its cursor names, so a prefill arriving here above zero is a
+        later segment of a sequence this process already prefilled, and a warmup
+        or an idle step arrives at zero.
 
         WHOLE CHUNKS GO THROUGH THE CHUNKED PAIR AND THE REMAINDER WALKS. A
         prefill of ``T = n * chunk + r`` tokens takes one intra-chunk and one
@@ -4308,7 +4323,7 @@ class Glm5NextKDAAttention(nn.Module):
             gk_h = gate_parts[h]
             beta_h = beta[:, h].contiguous()
 
-            if is_prefill:
+            if is_prefill and int(start_position) == 0:
                 state = torch.zeros(kdim, kdim, dtype=torch.float32)
             else:
                 state = recurrent_state[h].to(torch.float32)
@@ -4329,6 +4344,7 @@ class Glm5NextKDAAttention(nn.Module):
                     gk_h[:chunked].reshape(shape).contiguous(),
                     q_h[:chunked].reshape(shape).contiguous(),
                     intra.aqk,
+                    state=state,
                 )
                 core[:chunked, span] = inter.o.reshape(chunked, kdim)
                 state = inter.final_state
@@ -4363,6 +4379,15 @@ class Glm5NextKDAAttention(nn.Module):
         attn_out = shaped.reshape(tokens, width) @ (
             self.o_proj_weight.to(torch.float32).t()
         )
+        # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
+        # Reduce it in fp32, before the cast below: partials add at the width they
+        # were computed in, and reducing after the cast would round each rank's
+        # fraction to the caller's dtype and add the rounded parts instead of
+        # rounding the whole. In place is safe -- ``attn_out`` is a fresh matmul
+        # result, not a view of a cached weight or of the caller's residual.
+        group = _resolve_tp_group()
+        if group is not None:
+            group.all_reduce(attn_out)
         return attn_out.to(hidden_states.dtype)
 
 
@@ -4455,6 +4480,7 @@ class Glm5NextKDALayer(nn.Module):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         is_prefill: bool,
+        start_position: int = 0,
         chunk_size: int | None = None,
         streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -4490,7 +4516,7 @@ class Glm5NextKDALayer(nn.Module):
                 one-stream route. Every other argument is the attention module's,
                 passed through unchanged; see
                 :meth:`Glm5NextKDAAttention.forward` for what the two carriers
-                mean.
+                and the position mean.
 
         Returns:
             ``[T, H]`` on the one-stream route -- the input dtype, unchanged. On
@@ -4513,6 +4539,7 @@ class Glm5NextKDALayer(nn.Module):
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
                 is_prefill=is_prefill,
+                start_position=start_position,
                 chunk_size=chunk_size,
             )
 
