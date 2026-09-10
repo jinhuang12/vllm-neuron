@@ -88,11 +88,12 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     build_weight_mappings,
     classify_mapped_keys,
     compensate_block_scales,
-    consumer_block_quant_size,
     DeferredShardGeometry,
+    dense_consumer_block_quant_size,
     dequantise_blockwise,
     loader_for_mapped_keys,
     report_floored_blocks,
+    routed_bank_consumer_block_quant_size,
     scale_keys,
     sharded_scale_grid_loader,
     ShardGeometry,
@@ -315,11 +316,15 @@ class _DeclaredShard:
     width source that cannot disagree with the weights.
 
     ``pad_to_consumer_block`` rounds the full width UP to the smallest multiple of
-    ``world_size * BLOCK_QUANT_SIZE`` before dividing, so every rank's shard is a
-    whole consumer block. It is a FLAG and not the number, because the number
-    lives in the consumer and is imported at attachment time rather than at
-    import time -- see
-    :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.consumer_block_quant_size`.
+    ``world_size * dense_consumer_block_quant_size()`` before dividing, so every
+    rank's shard is a whole consumer block. It is a FLAG and not the number, because
+    the number lives in the consumer and is imported at attachment time rather than at
+    import time -- which is why narrowing that number to ``128`` in
+    ``inc-glm53f-112`` moved this pad without touching this class. The DENSE
+    consumer's is the one this flag reads: the families that declare it are the dense
+    MLP and the shared expert, and ``blockwise_fp8_mm`` is what dequantises both --
+    see
+    :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.dense_consumer_block_quant_size`.
     Ruled at design entry ``design-20260905-ap``, remedy part 2.
     """
 
@@ -427,14 +432,24 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # THE DENSE MLP'S WIDTH FUNCTION IS GONE (``inc-glm53f-101``), and its removal is
 # the fix rather than a tidy-up. It read ``_per_rank(module.intermediate_size,
 # world_size)``, which FLOORS: at the registered TP=64 the real 12288 gave 192 rows
-# per rank, and 192 is neither a whole 128-row checkpoint tile nor a whole 256-row
-# consumer block, so every dense projection on every dense layer refused by name
-# and the model could not load at all. Measured in
+# per rank, and 192 was neither a whole 128-row checkpoint tile nor a whole
+# 256-row consumer block, so every dense projection on every dense layer refused by
+# name and the model could not load at all. Measured in
 # ``increments/probe-101-grid-host-r6.out``. The three families now declare
 # ``width=None`` with ``pad_to_consumer_block=True``: the width is read off the
-# checkpoint tensor and rounded UP to a multiple of ``world_size * 256``, which is
-# 16384 at 64 and 32 ranks and 12288 unchanged at 16 or fewer. Ruled at design
-# entry ``design-20260905-ap``, remedy part 2.
+# checkpoint tensor and rounded UP to a multiple of
+# ``world_size * dense_consumer_block_quant_size()``. Ruled at design entry
+# ``design-20260905-ap``, remedy part 2.
+#
+# THE PAD SHRANK IN ``inc-glm53f-112`` and nothing here changed to make it: the
+# consumer block narrowed from 256 to 128, so the multiple is now
+# ``world_size * 128``. The padded widths that follow are 16384 at 64 ranks, and
+# 12288 UNCHANGED at 32 or fewer -- where the 256 block had padded 32 ranks up to
+# 16384. Less padding for the same load, and the readings that check it derive the
+# block from ``dense_consumer_block_quant_size()`` rather than typing a number, so
+# they followed on their own. The ROUTED BANK's own rule keeps the 256 it always had
+# and is read from its own producer -- one block constant per consumer, round 2's
+# first finding.
 
 
 # -- inc-glm53f-100 -- the MLA families' three widths. ---------------------- #
@@ -458,8 +473,8 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # which floors through the same ``_per_rank``, so the width a loader slices to and
 # the width ``projection_widths`` expects are the same expression on the same two
 # inputs. They also read the same world size in production: the root binds
-# ``self.world_size = _resolve_world_size()`` (``:5022``) and passes exactly that
-# to ``_shard_geometry_for`` (``:5231``, ``:5552``), which is what the class's
+# ``self.world_size = _resolve_world_size()`` (``:7557``) and passes exactly that
+# to ``_shard_geometry_for`` (``:7794``, ``:8046``, ``:8095``) -- what the class's
 # reader resolves too. If a caller ever made the two disagree the load would stop
 # at ``prepare_projection_weights``'s width check with the site named, rather
 # than compute the wrong function at plausible shapes -- and conjunct (1) of this
@@ -725,19 +740,28 @@ def _shard_geometry_for(
             # path is the right one.
             return None
     if declared.width is None:
-        # Both flags read the SAME number from the consumer and mean opposite things
-        # about an inadmissible width: pad it up, or refuse it. ``inc-glm53f-106`` adds
-        # the second. The number is imported either way, never typed here, for the
-        # reason ``consumer_block_quant_size``'s own docstring gives.
+        # The two flags mean opposite things about an inadmissible width -- pad it up,
+        # or refuse it -- and since `inc-glm53f-112` round 2 they read TWO DIFFERENT
+        # NUMBERS, each from the producer that enforces it. The pad belongs to the
+        # dense MLP and the shared expert, whose weights ``blockwise_fp8_mm``
+        # dequantises at ``SCALE_BLOCK_SIZE``; the requirement belongs to the routed
+        # bank alone (``inc-glm53f-106``), whose scale operands the MoE retile builds
+        # at ``BLOCK_QUANT_SIZE``. Reading one number for both admitted a bank shard
+        # the bank itself refuses later, inside its prep. Both are imported, never
+        # typed here.
         return DeferredShardGeometry(
             shard_dim=declared.shard_dim,
             num_shards=num_shards,
             pad_to_multiple_of=(
-                consumer_block_quant_size() if declared.pad_to_consumer_block else None
+                dense_consumer_block_quant_size()
+                if declared.pad_to_consumer_block
+                else None
             ),
             expert_parallel_degree=ep_degree,
             require_multiple_of=(
-                consumer_block_quant_size() if declared.require_consumer_block else None
+                routed_bank_consumer_block_quant_size()
+                if declared.require_consumer_block
+                else None
             ),
         )
     if declared.shards_within_expert_parallel_group:
@@ -2688,8 +2712,9 @@ class Glm5NextSharedExperts(nn.Module):
     # takes ``(consumer_scales, num_experts, rows, cols, projection)``).
     # ``blockwise_fp8_mm`` applies the dense one ITSELF at
     # ``blockwise_fp8_mm.py:491``, so this site passes the public
-    # ``[K//256, N//256]`` grid and imports neither -- the disambiguation
-    # hazard is removed rather than navigated.
+    # ``[K//128, N//128]`` grid -- the checkpoint's own, since ``inc-glm53f-112`` --
+    # and imports neither: the disambiguation hazard is removed rather than
+    # navigated.
     # **`inc-glm53f-090` REVERSES THE PARAGRAPH ABOVE. The dense helper IS now
     # imported here, by ``prepare_scale_operands`` below, and the seam applies it
     # itself ONLY when no prebuilt operand arrives. The disambiguation hazard is
@@ -2740,29 +2765,39 @@ class Glm5NextSharedExperts(nn.Module):
     #: and the reader, and neither should spell it twice.
     PREPARED_SCALE_OPERANDS_ATTR = "_prepared_scale_operands"
 
-    #: Where :meth:`retile_checkpoint_scale_grids` records what the coarsening
-    #: cost, per projection, and which projections it left alone. This block's
-    #: acceptance reads it; no consumer does.
+    #: Where :meth:`retile_checkpoint_scale_grids` records what it published per
+    #: projection, and which projections it left alone. It recorded what the
+    #: coarsening cost until ``inc-glm53f-112`` removed the coarsening; the three
+    #: producer counters remain in the record, reading zero by absence. This
+    #: block's acceptance reads it; no consumer does.
     SHARED_RETILE_HEALTH_ATTR = "_shared_expert_retile_health"
 
-    # ── the load-path retile -- ``inc-glm53f-054a`` hand-off item (iv) ─────
+    # ── the load-path grid publish -- ``inc-glm53f-054a`` hand-off item (iv),
+    #    and the retile it used to be, removed by ``inc-glm53f-112`` ─────
     #
-    # WHAT IT FIXES. The checkpoint stores one scale per ``128 x 128`` tile and
-    # :meth:`prepare_scale_operands` above consumes the PUBLIC grid, one scale per
-    # ``256 x 256`` block. Nothing on this module's load path bridged the two, so a
-    # real load reached the prep with a ``(4, 2)`` grid where it wanted ``(2, 1)``
+    # WHAT IT FIXED, AND WHY THE FIX IS NOW SMALLER. The checkpoint stores one scale
+    # per ``128 x 128`` tile. :meth:`prepare_scale_operands` above used to consume a
+    # PUBLIC grid of one scale per ``256 x 256`` block, because that is what the
+    # dense kernel indexed, and nothing on this module's load path bridged the two:
+    # a real load reached the prep with a ``(4, 2)`` grid where it wanted ``(2, 1)``
     # and refused. ``inc-glm53f-101`` attempt 2 recorded that refusal by name
     # (``BlockwiseFp8MmError: weight_scale has shape (4, 2), expected (2, 1) for a
     # [K=512, N=256] weight``) and DECISIONS §84 placed the bridge here.
     #
-    # THE WEIGHT MOVES WITH THE GRID, and that is the whole reason this is a
-    # retile and not a grid rewrite. Coarsening keeps ONE of the four tile scales
-    # per block, so the other three tiles' values are wrong against the retained
-    # scale until they are rescaled by their own ratio -- which is what
-    # ``retile_block_scales`` does to the weight it returns
+    # ``inc-glm53f-112`` REMOVED THE GAP RATHER THAN THE BRIDGE'S ARITHMETIC. The
+    # kernel now indexes the ``128`` tiles the checkpoint already stores, so the
+    # grid the loader delivers is the grid the prep wants and there is nothing to
+    # coarsen. The step below publishes it and transposes it; it rescales no weight.
+    #
+    # WHY THE WEIGHT USED TO MOVE WITH THE GRID, kept because it is the reason the
+    # removal is safe rather than convenient. Coarsening kept ONE of the four tile
+    # scales per block, so the other three tiles' values were wrong against the
+    # retained scale until rescaled by their own ratio -- which is what
+    # ``retile_block_scales`` did to the weight it returned
     # (``blockwise_fp8_retile.py:414-424``). Publishing the coarser grid beside the
-    # original weight would change no shape and every number, and the seam's
-    # element-count check would pass it. So both are replaced or neither is.
+    # original weight would have changed no shape and every number, and the seam's
+    # element-count check would have passed it. Not coarsening at all is the one
+    # option that needs neither half of that pair.
     #
     # IT MOVES NO LANDED COUNT, and that is measured rather than hoped. A module of
     # this class exists only where a MoE block does, and of the fixtures in
@@ -2774,32 +2809,38 @@ class Glm5NextSharedExperts(nn.Module):
     # the flip in its own words. So no green load changes what it reports.
     #
     # THE SKIP IS RECORDED, NEVER SILENT. A weight whose extents are not whole
-    # ``256`` blocks has no public grid to build, so this method leaves that
+    # ``128`` blocks has no grid the kernel can index, so this method leaves that
     # projection exactly as the loader left it and says so in the health record.
-    # Skipping quietly is how a missing retile would look like a working one.
+    # Skipping quietly is how a missing publish would look like a working one.
 
     def retile_checkpoint_scale_grids(self) -> int:
-        """Coarsen this module's grids onto the public grid and publish the frame.
+        """Publish this module's grids at the kernel's granularity and set the frame.
 
         ``inc-glm53f-054a`` repair round 1 moved the body into
         :func:`_publish_compute_frame_operands`, which the dense MLP now shares,
-        and added a second step there: after the coarsening, each weight and its
-        grid are transposed ONCE into the frame ``blockwise_fp8_mm`` multiplies in.
-        Before that repair this method left the loader's own frame in place and
-        :meth:`shared_expert_mm` refused it at layer 0 of a real load.
+        and added a second step there: each weight and its grid are transposed ONCE
+        into the frame ``blockwise_fp8_mm`` multiplies in. Before that repair this
+        method left the loader's own frame in place and :meth:`shared_expert_mm`
+        refused it at layer 0 of a real load.
 
-        Returns how many projections were RETILED -- ``3`` on a checkpoint whose
-        extents are whole ``256`` blocks, ``0`` on a miniature that has no public
-        grid to build. The return value is unchanged by the repair, so the landed
-        readings that count it do not move; what the transpose did is in the health
-        record, per projection, under :attr:`SHARED_RETILE_HEALTH_ATTR`.
+        THE NAME IS NOW A MISNOMER, KEPT ON PURPOSE. Since ``inc-glm53f-112`` the
+        dense kernel indexes the checkpoint's own ``128``-tile grid, so nothing is
+        coarsened here and no weight byte is rescaled: the step publishes what the
+        loader delivered. The method name is landed API -- five landed test call
+        sites read it -- so renaming it is a separate change and is recorded as
+        debt rather than taken here.
+
+        Returns how many projections were PUBLISHED -- ``3`` on a checkpoint whose
+        extents are whole ``128`` blocks, ``0`` on a miniature whose are not. The
+        count's set only grew when the granularity narrowed, so the landed readings
+        that count it do not move; what the transpose did is in the health record,
+        per projection, under :attr:`SHARED_RETILE_HEALTH_ATTR`.
 
         Raises:
             Glm5NextSharedExpertRouteError: if a weight or grid is not 2-D, or a
-                grid is not at the checkpoint's own ``128``-tile granularity. An
-                already-public grid is refused rather than passed over, because a
-                second retile of an already-retiled grid would rescale the weight
-                twice and no shape would object.
+                grid is not at the checkpoint's own ``128``-tile granularity. A grid
+                at any other granularity is refused rather than reshaped: it was
+                built for a different consumer and no shape would object.
         """
         return _publish_compute_frame_operands(
             self, Glm5NextSharedExpertRouteError, self.SHARED_RETILE_HEALTH_ATTR
@@ -2830,9 +2871,10 @@ class Glm5NextSharedExperts(nn.Module):
             gate_proj_weight: ``[H, I]`` fp8-e4m3. Read for its extents only.
             up_proj_weight: ``[H, I]`` fp8-e4m3.
             down_proj_weight: ``[I, H]`` fp8-e4m3.
-            gate_proj_scale: ``[H//256, I//256]`` fp32, the PUBLIC grid.
+            gate_proj_scale: ``[H//128, I//128]`` fp32 -- the checkpoint's own grid,
+                which since ``inc-glm53f-112`` is the grid the kernel indexes.
             up_proj_scale: the same, for ``up_proj_weight``.
-            down_proj_scale: ``[I//256, H//256]`` fp32, for ``down_proj_weight``.
+            down_proj_scale: ``[I//128, H//128]`` fp32, for ``down_proj_weight``.
 
         Returns:
             How many operands were built -- ``3`` on every successful call.
@@ -2926,11 +2968,12 @@ class Glm5NextSharedExperts(nn.Module):
                 ``gate_proj_scale``.
             up_proj_weight: ``[H, I]`` fp8-e4m3.
             down_proj_weight: ``[I, H]`` fp8-e4m3.
-            gate_proj_scale: ``[H//256, I//256]`` fp32, the PUBLIC block-scale
-                grid :func:`~vllm_neuron.functional.blockwise_fp8_mm.scale_grid_shape`
-                declares -- one scale per ``256 x 256`` weight block.
+            gate_proj_scale: ``[H//128, I//128]`` fp32, the block-scale grid
+                :func:`~vllm_neuron.functional.blockwise_fp8_mm.scale_grid_shape`
+                declares -- one scale per ``128 x 128`` weight block, which since
+                ``inc-glm53f-112`` is the checkpoint's own grid.
             up_proj_scale: the same, for ``up_proj_weight``.
-            down_proj_scale: ``[I//256, H//256]`` fp32, for ``down_proj_weight``.
+            down_proj_scale: ``[I//128, H//128]`` fp32, for ``down_proj_weight``.
             quant_config: the resolved per-model quantisation policy, and the
                 route selector; see the section note above.
 
@@ -2980,9 +3023,10 @@ class Glm5NextSharedExperts(nn.Module):
         if block_shape is None or tuple(block_shape) != (TILE_SIZE, TILE_SIZE):
             raise Glm5NextSharedExpertRouteError(
                 f"quant_config declares weight_block_size={block_shape!r}; this "
-                f"route consumes scales retiled from ({TILE_SIZE}, {TILE_SIZE}) "
-                f"checkpoint blocks onto BLOCK_QUANT_SIZE granularity and has no "
-                f"path for any other checkpoint block shape."
+                f"route consumes the checkpoint's own ({TILE_SIZE}, {TILE_SIZE}) "
+                f"blocks directly -- since inc-glm53f-112 the dense kernel "
+                f"indexes at that granularity and nothing is retiled -- and has "
+                f"no path for any other checkpoint block shape."
             )
 
         # ---- Extents, read off the operands rather than off the config. -- #
@@ -3225,9 +3269,11 @@ class Glm5NextSharedExperts(nn.Module):
                 raise Glm5NextSharedExpertRouteError(
                     f"{grid_name} is not on this module. The block-scale grids "
                     f"are plain attributes the weight loader attaches beside "
-                    f"each declared weight, and this route consumes the PUBLIC "
-                    f"grid at BLOCK_QUANT_SIZE granularity that "
-                    f"retile_checkpoint_scale_grids publishes. Refusing rather "
+                    f"each declared weight, and this route consumes the grid at "
+                    f"blockwise_fp8_mm.SCALE_BLOCK_SIZE granularity that "
+                    f"retile_checkpoint_scale_grids publishes -- the checkpoint's "
+                    f"own, since `inc-glm53f-112`, and NOT the routed bank's "
+                    f"larger block. Refusing rather "
                     f"than running an unscaled matmul, which returns plausible "
                     f"numbers."
                 )
@@ -3549,7 +3595,7 @@ class Glm5NextDenseMLP(nn.Module):
     DENSE_RETILE_HEALTH_ATTR = "_dense_mlp_retile_health"
 
     def retile_checkpoint_scale_grids(self) -> int:
-        """Coarsen this module's grids onto the public grid and publish the frame.
+        """Publish this module's grids at the kernel's granularity and set the frame.
 
         ``inc-glm53f-054a`` repair round 1. THE OPT-IN THIS CLASS TAKES, and the
         reason it must. The loader delivers the checkpoint's own layout -- gate and
@@ -3559,18 +3605,27 @@ class Glm5NextDenseMLP(nn.Module):
         this repair nothing on the dense MLP's load path bridged either gap, so a
         real ``load_weights`` into this class refused at layer 0 of the first three
         layers of GLM-5.3-Flash and the tiny fixture could not see it: that fixture
-        binds hand-drawn compute-frame weights and ``256`` grids straight onto the
-        module, which is the loader's job and not the fixture's.
+        binds hand-drawn compute-frame weights and their grids straight onto the
+        module, which is the loader's job and not the fixture's. Those grids were
+        ``256`` until ``inc-glm53f-112`` narrowed the kernel to the checkpoint's own
+        ``128``. THAT FIXTURE DID NOT FOLLOW ON ITS OWN, and the sentence here used to
+        claim it did: it built its grids from the MoE producer's constant, so `-112`
+        round 2 had to re-pin it, and three sibling suites with it, to
+        ``blockwise_fp8_mm.SCALE_BLOCK_SIZE``. Any new fixture for this class reads
+        that name.
 
         The whole body is :func:`_publish_compute_frame_operands`, shared with
         :class:`Glm5NextSharedExperts` -- one definition of the frame rule, not a
         mirrored copy that can drift. ``_run_load_time_preps`` enrols this class by
         ``hasattr``, so declaring the method is the whole enrolment.
 
-        Returns how many projections were retiled: ``3`` when the extents are whole
-        ``256`` blocks, ``0`` on a miniature with no public grid to build. The
-        transpose is not conditional on that, and both frames are in the health
-        record under :attr:`DENSE_RETILE_HEALTH_ATTR`.
+        Returns how many projections were PUBLISHED: ``3`` when the extents are
+        whole ``128`` blocks, ``0`` when they are not. Since ``inc-glm53f-112``
+        nothing is coarsened here -- the kernel indexes the checkpoint's own grid, so
+        the step publishes what the loader delivered and the method name is a
+        misnomer kept because it is landed API. The transpose is not conditional on
+        that, and both frames are in the health record under
+        :attr:`DENSE_RETILE_HEALTH_ATTR`.
 
         Raises:
             Glm5NextDenseMLPRouteError: if a weight or grid is not 2-D, or a grid
@@ -3598,7 +3653,7 @@ class Glm5NextDenseMLP(nn.Module):
     # the call behave exactly as it did before ``inc-glm53f-090``
     # (``blockwise_fp8_mm.py:441``, ``:449-456``). ``-090``'s load-time prep is
     # reached by ``_run_load_time_preps`` through
-    # ``hasattr(type(module), "prepare_scale_operands")`` (``:6106``), which is
+    # ``hasattr(type(module), "prepare_scale_operands")`` (``:8179``), which is
     # a per-class opt-in this class does not take. Adding that prep is a
     # separate decision with its own acceptance, and NOT something to smuggle
     # into a forward: it would change what the load path does.
@@ -3637,10 +3692,12 @@ class Glm5NextDenseMLP(nn.Module):
 
         WHICH FRAME THE WEIGHTS ARRIVE IN, and who put them there. This method
         consumes the frame the kernel multiplies in -- gate and up ``[H, I]``, down
-        ``[I, H]``, each with the ``256`` public grid beside it. That is NOT the
-        frame the loader delivers: the checkpoint's own layout is the transpose of
-        it at the checkpoint's ``128`` granularity. :meth:`retile_checkpoint_scale_grids`
-        bridges both gaps once, on the load path, and this method refuses the
+        ``[I, H]``, each with the ``128`` grid beside it. That is NOT the frame the
+        loader delivers: the checkpoint's own layout is the transpose of it, at the
+        same ``128`` granularity since ``inc-glm53f-112``, so what is left to bridge
+        is the FRAME and no longer the granularity.
+        :meth:`retile_checkpoint_scale_grids`
+        bridges it once, on the load path, and this method refuses the
         loader's frame by name rather than transposing it per token. A caller that
         binds weights straight onto the module -- a fixture, say -- must bind what
         the load path would have published, or take the refusal.
@@ -3673,13 +3730,14 @@ class Glm5NextDenseMLP(nn.Module):
         if block_shape is None or tuple(block_shape) != (TILE_SIZE, TILE_SIZE):
             raise Glm5NextDenseMLPRouteError(
                 f"quant_config declares weight_block_size={block_shape!r}; this "
-                f"route consumes scales retiled from ({TILE_SIZE}, {TILE_SIZE}) "
-                f"checkpoint blocks onto BLOCK_QUANT_SIZE granularity and has "
+                f"route consumes the checkpoint's own ({TILE_SIZE}, {TILE_SIZE}) "
+                f"blocks directly -- since inc-glm53f-112 the dense kernel "
+                f"indexes at that granularity and nothing is retiled -- and has "
                 f"no path for any other checkpoint block shape."
             )
 
         # ---- THE OPERANDS. The grid name is DERIVED by the rule the landed
-        # prep loop uses (``_sibling_scale_grid_name``, ``:5649``) rather than
+        # prep loop uses (``_sibling_scale_grid_name``, ``:7700``) rather than
         # spelled out here, so the two cannot drift. The grids are plain
         # attributes and not declared parameters, for the reason recorded on
         # ``_load_out_of_band_scales``, which is why this is a ``getattr``.
@@ -7322,9 +7380,18 @@ def _publish_compute_frame_operands(
 
     ``inc-glm53f-054a`` repair round 1, one definition for the dense MLP and the
     shared expert, which load the same three projections onto the same seam.
-    Returns how many projections were RETILED -- the number the landed readings of
-    this step already count. The transpose count and both frames go into the health
-    record on ``health_attr``.
+    Returns how many projections were PUBLISHED at the granularity the dense kernel
+    indexes -- the number the landed readings of this step already count. The
+    transpose count and both frames go into the health record on ``health_attr``.
+
+    STEP 2 NO LONGER RETILES (``inc-glm53f-112``). It used to coarsen the
+    checkpoint's ``128`` grid onto a ``256`` public grid and requantise the weight
+    bytes with it, because the dense kernel indexed its scales by ``256`` blocks.
+    The kernel now indexes the ``128`` blocks the checkpoint itself stores, so the
+    pair the loader delivered is the pair the kernel consumes and step 2 publishes
+    it unchanged. The health record's ``published`` flag says so per projection, and
+    ``retiled`` is now always ``False`` on this path rather than being deleted, so a
+    reader of an old transcript can tell the two eras apart.
 
     THREE STEPS, INDEPENDENT, IN THIS ORDER.
 
@@ -7338,27 +7405,29 @@ def _publish_compute_frame_operands(
        never conditional on extents -- the compensator's own platform gate decides
        whether the multiply happens, and on a platform that needs no squeeze it is
        a no-op that still reports.
-    2. Coarsen the checkpoint's ``128``-tile scale grid onto the ``256`` public
-       grid, which also requantises the weight. This runs only for extents that
-       are whole ``256`` blocks; a miniature with no public grid to build is
-       RECORDED and skipped, because a silent skip looks exactly like a working
-       retile.
+    2. Publish the checkpoint's own ``128``-tile scale grid as the grid the kernel
+       indexes, unchanged. This runs for extents that are whole ``128`` blocks; a
+       weight whose extents are not is RECORDED and skipped, because a silent skip
+       looks exactly like a working publish. No weight byte is rescaled here.
     3. Transpose the weight and its grid into the compute frame. This is NEVER
        skipped: a skipped transpose leaves the forward refusing at layer 0.
 
-    STEP 1 RUNS BEFORE STEP 2 AND THE ORDER IS LOAD-BEARING. Step 2's refusal
-    predicate reads ``scales[tile] / retained``, and a uniform multiply of the whole
-    grid cancels in that ratio, so compensating first leaves which blocks step 2
-    refuses unchanged -- EXCEPT where the ``MINVAL`` floor engages on a block and
-    breaks the uniformity, which is why the floored count is recorded per leaf.
+    STEP 1 STILL RUNS BEFORE STEP 2, and the ORDER NO LONGER CARRIES ARITHMETIC.
+    While step 2 retiled, its refusal predicate read ``scales[tile] / retained`` and
+    the order mattered because a uniform multiply cancels in that ratio -- except
+    where the ``MINVAL`` floor broke the uniformity, which is why the floored count
+    is recorded per leaf. Step 2 now publishes rather than rescales, so the only
+    thing the order still protects is that the grid the module carries is the
+    COMPENSATED one; the floored count stays recorded because the floor is step 1's
+    and is unchanged.
 
     WHY THE TRANSPOSE IS HERE AND NOT IN THE FORWARD. The loader delivers the
     checkpoint's own layout -- ``[I, H]`` for gate and up, ``[H, I]`` for down (the
     shard table shards gate and up on dim 0, "the intermediate width", ``:503-513``
     and ``:523-533``) -- while ``blockwise_fp8_mm`` reads its weight as ``[K, N]``
     with ``K`` the contraction extent (``blockwise_fp8_mm.scale_grid_shape``, whose
-    public grid is ``(K // 256, N // 256)``). The two frames are opposite, so
-    somebody must transpose.
+    grid is ``(K // 128, N // 128)`` since ``inc-glm53f-112``). The two frames are
+    opposite, so somebody must transpose.
 
     This package's recorded rule is that every consumer transposes at COMPUTE time
     (``weight_loaders_fp8.py:1764``), and this step deliberately does not follow
@@ -7371,12 +7440,12 @@ def _publish_compute_frame_operands(
     reads the module keeps ONE frame authority for the whole load path, and costs
     one copy per projection per LOAD rather than one per token on the served path.
 
-    THE TRANSPOSE RUNS AFTER THE RETILE, so the retile's arithmetic is untouched by
-    this repair: ``retile_block_scales`` sees exactly the operands and the frame it
-    saw before, and what follows it is a relabelling of two axes, not a second
-    requantisation. A ``256`` block of the transposed weight is the transpose of the
-    matching block of the original, so the coarsened scale that block carries is
-    the same number either way.
+    THE TRANSPOSE RUNS AFTER THE PUBLISH, and since ``inc-glm53f-112`` there is no
+    arithmetic between them to disturb: the publish attaches the grid the loader
+    delivered and the transpose relabels two axes. A ``128`` block of the transposed
+    weight is the transpose of the matching block of the original, so the scale that
+    block carries is the same number either way -- which was the reason the order was
+    safe while step 2 still retiled, and is now simply the reason the frames agree.
 
     Args:
         module: the loaded module, with all three weights and their sibling grids
@@ -7388,19 +7457,19 @@ def _publish_compute_frame_operands(
 
     Raises:
         error_cls: if a weight or a grid is not 2-D, or if a grid is not at the
-            checkpoint's own ``128``-tile granularity. An already-public grid is
-            refused rather than passed over, because retiling twice rescales the
-            weight twice and no shape check would object.
+            checkpoint's own ``128``-tile granularity. A grid at any other
+            granularity is refused rather than reshaped: it was built for a
+            different consumer, and no shape check downstream would object.
     """
-    from vllm_neuron.functional.moe.blockwise_fp8_retile import (
-        BLOCK_QUANT_SIZE,
-        DOWN,
-        TILE_SIZE,
-        retile_block_scales,
-    )
+    # ``SCALE_BLOCK_SIZE`` is the DENSE kernel's own declaration of the grid it
+    # indexes (128 since `inc-glm53f-112`); ``TILE_SIZE`` is the checkpoint's
+    # tiling. They are equal today and are still read from their own modules, so
+    # the day one moves this step follows the one that moved.
+    from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
+    from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 
     health: dict[str, dict[str, object]] = {}
-    retiled = 0
+    published = 0
     for leaf in _scale_prep_leaves(module):
         grid_name = Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
         weight = getattr(module, leaf)
@@ -7459,16 +7528,17 @@ def _publish_compute_frame_operands(
         record["scale_compensated"] = compensation.applied
         record["scale_blocks_floored"] = len(compensation.floored_blocks)
 
-        if rows % BLOCK_QUANT_SIZE or cols % BLOCK_QUANT_SIZE:
-            # No public grid exists for these extents. Recorded, not silent. The
-            # transpose below still runs: the frame is wrong for the kernel
-            # whatever the granularity is.
+        if rows % SCALE_BLOCK_SIZE or cols % SCALE_BLOCK_SIZE:
+            # No grid the kernel can index exists for these extents. Recorded, not
+            # silent. The transpose below still runs: the frame is wrong for the
+            # kernel whatever the granularity is.
             record.update(
                 {
                     "retiled": False,
+                    "published": False,
                     "reason": (
                         f"[{rows},{cols}] is not a whole number of "
-                        f"{BLOCK_QUANT_SIZE}x{BLOCK_QUANT_SIZE} blocks"
+                        f"{SCALE_BLOCK_SIZE}x{SCALE_BLOCK_SIZE} blocks"
                     ),
                 }
             )
@@ -7476,49 +7546,48 @@ def _publish_compute_frame_operands(
             checkpoint_grid = (rows // TILE_SIZE, cols // TILE_SIZE)
             if tuple(grid.shape) != checkpoint_grid:
                 raise error_cls(
-                    f"{grid_name} has shape {tuple(grid.shape)}; this retile "
-                    f"consumes the checkpoint's own {TILE_SIZE}-tile grid "
-                    f"{checkpoint_grid} for a [{rows},{cols}] weight. A grid "
-                    f"already at {BLOCK_QUANT_SIZE} granularity is refused here "
-                    f"rather than passed over: retiling twice rescales the weight "
-                    f"twice and no shape check would see it."
+                    f"{grid_name} has shape {tuple(grid.shape)}; this step "
+                    f"publishes the checkpoint's own {TILE_SIZE}-tile grid "
+                    f"{checkpoint_grid} for a [{rows},{cols}] weight, which since "
+                    f"`inc-glm53f-112` is the grid the dense kernel indexes. A "
+                    f"grid at any other granularity is refused rather than "
+                    f"reshaped: it was built for a different consumer."
                 )
-            # ``DOWN`` selects the CONSUMER flattening, and this function reads
-            # neither consumer field -- only ``block_scales`` (the retained scale
-            # per block) and ``retiled_weights``. DOWN is named because its
-            # flattening writes every emitted slot exactly once, so the two health
-            # counters below stay readable; GATE_UP leaves half its slots NaN by
-            # design and would make them say nothing here.
-            result = retile_block_scales(
-                weight.data.unsqueeze(0).contiguous(),
-                grid.unsqueeze(0).contiguous(),
-                DOWN,
-            )
-            # ``block_scales`` is ``(E, i_256, h_256)``
-            # (``blockwise_fp8_retile.py:371``, written at ``:382``), so the
-            # transpose puts it back in the weight's own ``(rows, cols)`` frame,
-            # which is the frame ``to_kernel_scale_layout`` compares against.
-            public = result.block_scales[0].t().contiguous()
-            # ``.data`` ASSIGNMENT, not a rebind. ``setattr(module, leaf, tensor)``
-            # would drop the ``nn.Parameter`` and with it every landed reading that
-            # counts ``named_parameters()``. The device is carried over explicitly
-            # because the producer allocates its grid with ``torch.full`` and no
-            # device (``blockwise_fp8_retile.py:371``), which lands on the CPU.
-            weight.data = result.retiled_weights[0].to(
-                device=weight.device, dtype=weight.dtype
-            )
-            setattr(module, grid_name, public.to(device=grid.device))
+            # NO RETILE, AND THAT IS THIS INCREMENT (`inc-glm53f-112`). This arm
+            # used to call ``retile_block_scales`` to coarsen the checkpoint's 128
+            # grid onto a 256 public grid AND requantise the weight bytes against
+            # the retained scale, because the dense kernel indexed its scales by
+            # 256 blocks. The kernel now indexes the 128 blocks the checkpoint
+            # itself stores, so the pair the checkpoint delivered IS the pair the
+            # kernel consumes and there is nothing to rescale. Removing the call
+            # removes arithmetic from the load path; it does not move it elsewhere.
+            #
+            # The MoE bank is NOT this path and still retiles: it prepares its own
+            # operands in ``Glm5NextRoutedExperts.prepare_scale_operands`` against
+            # the 256-granular MoE kernel, and `moe/blockwise_fp8_retile.py` is
+            # untouched.
             record.update(
                 {
-                    "retiled": True,
+                    "retiled": False,
+                    "published": True,
+                    "reason": (
+                        f"since `inc-glm53f-112` the dense kernel indexes the "
+                        f"checkpoint's own {TILE_SIZE}-tile grid, so this "
+                        f"projection is published as loaded and no retile runs"
+                    ),
                     "checkpoint_grid": checkpoint_grid,
-                    "public_grid": tuple(public.shape),
-                    "emitted_unsupplied": result.emitted_unsupplied,
-                    "input_scales_dropped": result.input_scales_dropped,
-                    "inexact_rescales": result.inexact_rescales,
+                    "public_grid": checkpoint_grid,
+                    # ZERO BY ABSENCE, NOT BY MEASUREMENT. No producer ran on this
+                    # path, so nothing was emitted unsupplied, nothing was dropped
+                    # and nothing was rescaled inexactly. The keys stay because
+                    # landed readings assert them, and ``published`` above is what
+                    # says WHY they are zero.
+                    "emitted_unsupplied": 0,
+                    "input_scales_dropped": 0,
+                    "inexact_rescales": 0,
                 }
             )
-            retiled += 1
+            published += 1
 
         # ---- STEP 2, unconditional. ``.contiguous()`` and not a bare view: the
         # seam hands its weight to a kernel that reads it as a dense buffer, and a
@@ -7531,7 +7600,18 @@ def _publish_compute_frame_operands(
         record["compute_grid"] = tuple(transposed_grid.shape)
         health[leaf] = record
     setattr(module, health_attr, health)
-    return retiled
+    # THE COUNT is how many projections left this step with a grid the dense kernel
+    # can index. Before `inc-glm53f-112` that meant "retiled onto the 256 public
+    # grid"; it now means "published at the checkpoint's own 128 grid".
+    #
+    # The set only GREW, and in one direction. Every whole-256 extent is a whole-128
+    # extent, so nothing that counted before stops counting and the landed readings
+    # that expect 3 still read 3. What is new is that an extent which is a whole 128
+    # block but not a whole 256 one -- 384, the width `inc-glm53f-101` recorded as
+    # refused -- now counts instead of being skipped. That widening IS this
+    # increment, and the landed items that asserted the narrower set are re-pinned
+    # in this same commit.
+    return published
 
 
 class Glm5NextWeightLoadError(ValueError):
@@ -8174,11 +8254,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # module. So the signature stays exactly as it landed.
                 if hasattr(type(module), "prepare_absorb_weights"):
                     module.prepare_absorb_weights()
-            # ``inc-glm53f-054a`` hand-off item (iv). The checkpoint's grids are
-            # at 128-tile granularity and the shared expert's prep consumes the
-            # 256 public grid, so the bridge runs HERE -- on the load path, after
-            # the shards are attached and BEFORE the prep reads the grid two
-            # branches below. Gated by the same ``hasattr`` test this loop already
+            # ``inc-glm53f-054a`` hand-off item (iv). The checkpoint's grids are at
+            # 128-tile granularity and arrive in the loader's frame, so the bridge
+            # runs HERE -- on the load path, after the shards are attached and
+            # BEFORE the prep reads the grid two branches below. It used to bridge
+            # the GRANULARITY too, onto a 256 public grid; since ``inc-glm53f-112``
+            # the prep consumes the checkpoint's own 128 grid and only the FRAME is
+            # bridged. Gated by the same ``hasattr`` test this loop already
             # uses on the preps, so a module that declares no retile is skipped and
             # the routed bank -- which retiles inside its own prep -- is untouched.
             #

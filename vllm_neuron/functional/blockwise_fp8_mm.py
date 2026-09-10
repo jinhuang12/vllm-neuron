@@ -15,21 +15,32 @@ shipped implementation.
 What the kernel computes
 ------------------------
 ``out[M, N] = x[M, K] @ dequantise(weight[K, N])``, where ``weight`` is fp8-e4m3
-carrying one fp32 scale per ``256 x 256`` block of ``(K, N)``::
+carrying one fp32 scale per ``128 x 128`` block of ``(K, N)``::
 
-    dequantise(weight)[k, n] = weight[k, n] * weight_scale[k // 256, n // 256]
+    dequantise(weight)[k, n] = weight[k, n] * weight_scale[k // 128, n // 128]
 
-Accumulate-then-scale, and why that order is load-bearing
----------------------------------------------------------
-The two ``128``-wide contraction tiles of one ``256`` block accumulate in PSUM,
-and the block scale is applied **after** that accumulation, then added into an
-fp32 SBUF accumulator. This is deliberately the same order the MoE consumer
-uses (``nkilib/core/moe/moe_cte/bwmm_shard_on_I.py:2113``-``:2151``), because
-that order is what makes the F1 power-of-two precondition load-bearing:
-``increments/evidence-071.md`` F1 measured **720 fp32 ulp** of retile-remapping
-error under a non-pow2 ``256``-block scale against **0** under a pow2 one. A
-scale-then-accumulate kernel would hide that, and the campaign's tolerance would
-then certify something other than kernel error.
+That is the granularity the CHECKPOINT stores, and reading it directly is
+`inc-glm53f-112`. The kernel formerly indexed by ``256`` blocks, which meant the
+checkpoint's scales had to be retiled up to ``256`` before this kernel could use
+them -- four scales replaced by one, which is arithmetic on a scale and is
+exactly what the retile's error was.
+
+One scale per product, so no arithmetic touches a scale
+-------------------------------------------------------
+At this granularity a scale block holds exactly ONE ``128``-wide contraction
+tile (``K_TILES_PER_BLOCK == 1``), so each ``nc_matmul`` result is multiplied by
+exactly one scale and then added into an fp32 SBUF accumulator. Nothing is
+accumulated across two different scales, and no scale is ever rescaled,
+compensated or combined with another.
+
+The order is still written as accumulate-then-scale, and that is deliberate: the
+form matches the MoE consumer's (``nkilib/core/moe/moe_cte/bwmm_shard_on_I.py``
+``:2113``-``:2151``) and it stays correct if the granularity ever widens again.
+What changed is that the order stopped being load-bearing. Under the ``256``
+grid, ``increments/evidence-071.md`` F1 measured **720 fp32 ulp** of
+retile-remapping error for a non-power-of-two block scale against **0** for a
+power-of-two one; at ``128`` there is no remapping to be wrong, so the
+acceptance reads EXACT equality instead of a tolerance.
 
 Precision, stated rather than implied
 -------------------------------------
@@ -82,28 +93,37 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.functional.moe.blockwise_fp8_retile import (
-    BLOCK_QUANT_SIZE,
-    TILE_SIZE,
-)
+from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
 
-#: Contraction tiles per ``256`` scale block. Re-derived from the two constants
-#: rather than written as ``2``, so the pair cannot drift from the quotient.
-K_TILES_PER_BLOCK = BLOCK_QUANT_SIZE // TILE_SIZE
+#: The scale-block extent this module indexes by: the granularity the CHECKPOINT
+#: stores, one fp32 scale per ``128 x 128`` block of the weight.
+#:
+#: `inc-glm53f-112`. It is declared here and equals ``TILE_SIZE`` rather than
+#: being imported from ``blockwise_fp8_retile``, whose ``BLOCK_QUANT_SIZE`` is
+#: the MoE consumer's ``256`` and is not this kernel's business. Two names for
+#: one granularity is the drift D17.1 exists to prevent, so this module carries
+#: exactly one, and no ``256`` is read by any expression in this file.
+SCALE_BLOCK_SIZE = TILE_SIZE
+
+#: Contraction tiles per scale block. Re-derived from the two constants rather
+#: than written as ``1``, so the pair cannot drift from the quotient. At this
+#: granularity the quotient IS ``1``: one contraction tile per scale block, which
+#: is why no partial sum is ever accumulated across two different scales.
+K_TILES_PER_BLOCK = SCALE_BLOCK_SIZE // TILE_SIZE
 
 #: Tensor Engine operand bounds, from ``nl.tile_size``:
 #: ``pmax=128``, ``gemm_stationary_fmax=128``, ``gemm_moving_fmax=512``, and
-#: ``psum_bank_fmax=512`` fp32 elements per PSUM bank. ``BLOCK_QUANT_SIZE``
-#: (256) is the moving free extent this kernel uses, so it sits inside both the
+#: ``psum_bank_fmax=512`` fp32 elements per PSUM bank. ``SCALE_BLOCK_SIZE``
+#: (128) is the moving free extent this kernel uses, so it sits inside both the
 #: moving bound and the PSUM bank bound with room to spare.
 STATIONARY_FMAX = 128
 MOVING_FMAX = 512
 
 __all__ = [
-    "BLOCK_QUANT_SIZE",
+    "SCALE_BLOCK_SIZE",
     "TILE_SIZE",
     "BlockwiseFp8MmError",
     "blockwise_fp8_mm",
@@ -138,14 +158,14 @@ def blockwise_fp8_mm_kernel(x, weight, weight_scale_t):
 
     Args:
         x: ``[M, K]`` activations, bf16. ``M`` is tiled by ``TILE_SIZE`` over the
-            PSUM partition axis and ``K`` by ``BLOCK_QUANT_SIZE`` over the
+            PSUM partition axis and ``K`` by ``SCALE_BLOCK_SIZE`` over the
             contraction axis.
         weight: ``[K, N]`` fp8-e4m3 weights, already expressed against the
-            ``256``-granular scales (that re-expression is `inc-glm53f-024`'s
-            producer, not this kernel's business).
-        weight_scale_t: ``[TILE_SIZE, (K // 256) * (N // 256)]`` fp32, the
+            ``128``-granular scales the checkpoint itself stores, so no
+            producer-side re-expression stands between the two).
+        weight_scale_t: ``[TILE_SIZE, (K // 128) * (N // 128)]`` fp32, the
             kernel operand layout :func:`to_kernel_scale_layout` builds: one
-            column per ``256 x 256`` block, replicated across the partition axis
+            column per ``128 x 128`` block, replicated across the partition axis
             because ``nisa.tensor_scalar`` broadcasts only along the free
             dimension.
 
@@ -159,8 +179,8 @@ def blockwise_fp8_mm_kernel(x, weight, weight_scale_t):
     """
     m_extent, k_extent = x.shape
     _, n_extent = weight.shape
-    n_n_blocks = n_extent // BLOCK_QUANT_SIZE
-    n_k_blocks = k_extent // BLOCK_QUANT_SIZE
+    n_n_blocks = n_extent // SCALE_BLOCK_SIZE
+    n_k_blocks = k_extent // SCALE_BLOCK_SIZE
 
     out = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     # One load: the scale operand is (partitions x blocks) and tiny.
@@ -169,33 +189,33 @@ def blockwise_fp8_mm_kernel(x, weight, weight_scale_t):
     for m_tile in range(m_extent // TILE_SIZE):
         m0 = m_tile * TILE_SIZE
         for n_block in range(n_n_blocks):
-            n0 = n_block * BLOCK_QUANT_SIZE
+            n0 = n_block * SCALE_BLOCK_SIZE
             # fp32 accumulator over the K blocks, in SBUF: PSUM is reclaimed per
             # block so the block scale can be applied between blocks.
             acc = nl.ndarray(
-                (TILE_SIZE, BLOCK_QUANT_SIZE), dtype=nl.float32, buffer=nl.sbuf
+                (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.sbuf
             )
             for k_block in range(n_k_blocks):
                 psum = nl.ndarray(
-                    (TILE_SIZE, BLOCK_QUANT_SIZE), dtype=nl.float32, buffer=nl.psum
+                    (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.psum
                 )
                 for k_sub in range(K_TILES_PER_BLOCK):
-                    k0 = k_block * BLOCK_QUANT_SIZE + k_sub * TILE_SIZE
+                    k0 = k_block * SCALE_BLOCK_SIZE + k_sub * TILE_SIZE
                     # [K=TILE_SIZE partitions, M=TILE_SIZE free]
                     x_t = nl.load_transpose2d(
                         x[m0 : m0 + TILE_SIZE, k0 : k0 + TILE_SIZE]
                     )
-                    # [K=TILE_SIZE partitions, N=BLOCK_QUANT_SIZE free], upcast
+                    # [K=TILE_SIZE partitions, N=SCALE_BLOCK_SIZE free], upcast
                     # from fp8 on the DMA.
                     w_tile = nl.load(
-                        weight[k0 : k0 + TILE_SIZE, n0 : n0 + BLOCK_QUANT_SIZE],
+                        weight[k0 : k0 + TILE_SIZE, n0 : n0 + SCALE_BLOCK_SIZE],
                         dtype=nl.bfloat16,
                     )
                     # dst = stationary.T @ moving = [M, N]. Explicit accumulate
                     # flag rather than the compiler's inference, so the
                     # first-write-overwrites contract is visible here.
                     nisa.nc_matmul(
-                        dst=psum[0:TILE_SIZE, 0:BLOCK_QUANT_SIZE],
+                        dst=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
                         stationary=x_t,
                         moving=w_tile,
                         accumulate=(k_sub > 0),
@@ -204,23 +224,23 @@ def blockwise_fp8_mm_kernel(x, weight, weight_scale_t):
                 if k_block == 0:
                     # First block initialises the accumulator, so no zeroing pass.
                     nisa.tensor_scalar(
-                        dst=acc[0:TILE_SIZE, 0:BLOCK_QUANT_SIZE],
-                        data=psum[0:TILE_SIZE, 0:BLOCK_QUANT_SIZE],
+                        dst=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                        data=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
                         op0=nl.multiply,
                         operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
                     )
                 else:
                     nisa.scalar_tensor_tensor(
-                        dst=acc[0:TILE_SIZE, 0:BLOCK_QUANT_SIZE],
-                        data=psum[0:TILE_SIZE, 0:BLOCK_QUANT_SIZE],
+                        dst=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
+                        data=psum[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
                         op0=nl.multiply,
                         operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
                         op1=nl.add,
-                        operand1=acc[0:TILE_SIZE, 0:BLOCK_QUANT_SIZE],
+                        operand1=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
                     )
             nl.store(
-                out[m0 : m0 + TILE_SIZE, n0 : n0 + BLOCK_QUANT_SIZE],
-                value=acc[0:TILE_SIZE, 0:BLOCK_QUANT_SIZE],
+                out[m0 : m0 + TILE_SIZE, n0 : n0 + SCALE_BLOCK_SIZE],
+                value=acc[0:TILE_SIZE, 0:SCALE_BLOCK_SIZE],
             )
     return out
 
@@ -243,23 +263,23 @@ def _require_blocked(rows: int, cols: int, tokens: int) -> None:
             f"Padding tokens to a whole tile is the caller's, exactly as the MoE "
             f"consumer pads to block_size"
         )
-    if rows <= 0 or rows % BLOCK_QUANT_SIZE:
+    if rows <= 0 or rows % SCALE_BLOCK_SIZE:
         problems.append(
             f"K={rows} is not a positive multiple of "
-            f"BLOCK_QUANT_SIZE={BLOCK_QUANT_SIZE}; the remainder has no block "
+            f"SCALE_BLOCK_SIZE={SCALE_BLOCK_SIZE}; the remainder has no block "
             f"scale"
         )
-    if cols <= 0 or cols % BLOCK_QUANT_SIZE:
+    if cols <= 0 or cols % SCALE_BLOCK_SIZE:
         problems.append(
             f"N={cols} is not a positive multiple of "
-            f"BLOCK_QUANT_SIZE={BLOCK_QUANT_SIZE}; the remainder has no block "
+            f"SCALE_BLOCK_SIZE={SCALE_BLOCK_SIZE}; the remainder has no block "
             f"scale"
         )
-    if BLOCK_QUANT_SIZE > MOVING_FMAX:
+    if SCALE_BLOCK_SIZE > MOVING_FMAX:
         # Structural, and asserted rather than assumed: if either constant ever
         # moves, the moving free extent must be re-tiled, not silently exceeded.
         problems.append(
-            f"BLOCK_QUANT_SIZE={BLOCK_QUANT_SIZE} exceeds the Tensor Engine "
+            f"SCALE_BLOCK_SIZE={SCALE_BLOCK_SIZE} exceeds the Tensor Engine "
             f"moving free bound {MOVING_FMAX}"
         )
     if TILE_SIZE > STATIONARY_FMAX:
@@ -274,18 +294,18 @@ def _require_blocked(rows: int, cols: int, tokens: int) -> None:
 
 
 def scale_grid_shape(rows: int, cols: int) -> tuple[int, int]:
-    """``(K // 256, N // 256)`` -- the shape of the PUBLIC scale grid.
+    """``(K // 128, N // 128)`` -- the shape of the PUBLIC scale grid.
 
-    This is the shape a caller supplies: one fp32 scale per ``256 x 256`` block
+    This is the shape a caller supplies: one fp32 scale per ``128 x 128`` block
     of the weight, indexed ``[k_block, n_block]``. The kernel operand is a
     different shape; :func:`to_kernel_scale_layout` is the bridge.
     """
-    if rows <= 0 or rows % BLOCK_QUANT_SIZE or cols <= 0 or cols % BLOCK_QUANT_SIZE:
+    if rows <= 0 or rows % SCALE_BLOCK_SIZE or cols <= 0 or cols % SCALE_BLOCK_SIZE:
         raise BlockwiseFp8MmError(
             f"weight extent [{rows},{cols}] is not a whole number of "
-            f"{BLOCK_QUANT_SIZE}x{BLOCK_QUANT_SIZE} blocks"
+            f"{SCALE_BLOCK_SIZE}x{SCALE_BLOCK_SIZE} blocks"
         )
-    return rows // BLOCK_QUANT_SIZE, cols // BLOCK_QUANT_SIZE
+    return rows // SCALE_BLOCK_SIZE, cols // SCALE_BLOCK_SIZE
 
 
 def flat_scale_index(k_block: int, n_block: int, n_n_blocks: int) -> int:
@@ -307,7 +327,7 @@ def kernel_scale_shape(rows: int, cols: int) -> tuple[int, int]:
 
 
 def to_kernel_scale_layout(weight_scale: Tensor, rows: int, cols: int) -> Tensor:
-    """Bridge the public ``[K//256, N//256]`` grid to the kernel's operand.
+    """Bridge the public ``[K//128, N//128]`` grid to the kernel's operand.
 
     Two things happen here and nowhere else: the grid is flattened by
     :func:`flat_scale_index`, and each scalar is replicated across
@@ -316,7 +336,7 @@ def to_kernel_scale_layout(weight_scale: Tensor, rows: int, cols: int) -> Tensor
     ``(data.shape[0], 1)``.
 
     Returns:
-        ``[TILE_SIZE, (K//256) * (N//256)]`` fp32, contiguous.
+        ``[TILE_SIZE, (K//128) * (N//128)]`` fp32, contiguous.
 
     Raises:
         BlockwiseFp8MmError: if ``weight_scale`` is not the declared grid shape
@@ -445,7 +465,7 @@ def blockwise_fp8_mm(
     Args:
         x: ``[M, K]`` activations, bf16.
         weight: ``[K, N]`` fp8-e4m3, expressed against ``weight_scale``.
-        weight_scale: ``[K//256, N//256]`` fp32, one scale per weight block.
+        weight_scale: ``[K//128, N//128]`` fp32, one scale per weight block.
         prebuilt_scale_t: OPTIONAL, keyword-only. The kernel operand
             :func:`to_kernel_scale_layout` would have built, already built --
             shape :func:`kernel_scale_shape`, fp32. Supply it and the bridge is
@@ -505,7 +525,7 @@ def blockwise_fp8_mm_torch_oracle(
 
     The independent formulation the plan's acceptance names: it dequantises
     **first** and contracts in one fp32 matmul, where the kernel contracts per
-    ``256`` block and scales between blocks. Because the two disagree in
+    ``128`` block and scales between blocks. Because the two disagree in
     arithmetic ORDER while agreeing in value, the comparison is a real check on
     the kernel's block-to-scale assignment rather than a restatement of it --
     and it never consults :func:`flat_scale_index`, so a transposed flattening
@@ -525,8 +545,8 @@ def blockwise_fp8_mm_torch_oracle(
             f"{want} for a [K={rows}, N={cols}] weight"
         )
     dequantised = weight.to(torch.float32) * weight_scale.repeat_interleave(
-        BLOCK_QUANT_SIZE, 0
-    ).repeat_interleave(BLOCK_QUANT_SIZE, 1)
+        SCALE_BLOCK_SIZE, 0
+    ).repeat_interleave(SCALE_BLOCK_SIZE, 1)
     return x.to(torch.float32) @ dequantised
 
 

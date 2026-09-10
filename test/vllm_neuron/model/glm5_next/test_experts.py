@@ -962,12 +962,19 @@ SHARED_DECLARED_SEAM_ENTRIES = 3
 #: (``blockwise_fp8_mm.py::_require_blocked``), read off that source rather than
 #: guessed, and chosen to ADMIT because a geometry the kernel REFUSES raises --
 #: it does not fall back -- and a refused shape would leave the counter at 0.
-#:   T % TILE_SIZE == 0        (``:239`` -- M tiles over the PSUM partition axis)
-#:   H % BLOCK_QUANT_SIZE == 0 (``:246`` -- K needs a whole number of block scales)
-#:   I % BLOCK_QUANT_SIZE == 0 (``:252`` -- N likewise)
-#: H and I are 2 blocks rather than 1 deliberately: a ``[1, 1]`` scale grid cannot
-#: distinguish a transposed flat index, and this fixture's block scales are
-#: distinct and asymmetric so that a mis-mapping is numerically visible.
+#:   T % TILE_SIZE == 0         (``:259`` -- M tiles over the PSUM partition axis)
+#:   H % SCALE_BLOCK_SIZE == 0  (``:266`` -- K needs a whole number of block scales)
+#:   I % SCALE_BLOCK_SIZE == 0  (``:272`` -- N likewise)
+#: THE GATE READS THE DENSE CONSUMER'S CONSTANT, NOT THE ROUTED BANK'S. Those three
+#: lines used to name ``BLOCK_QUANT_SIZE``, which is the MoE retile's 256. The kernel
+#: has always read its own ``SCALE_BLOCK_SIZE``, and ``inc-glm53f-112`` makes that
+#: 128 (``blockwise_fp8_mm.py:109``), so the name and all three line cites are
+#: corrected here. No extent moves: 512 was admissible at 256 and is admissible at
+#: 128, and step 13 of the counted run read 24 of 24 items green either way.
+#: H and I are 4 blocks at that constant -- they were 2 while it was 256 -- and more
+#: than 1 deliberately: a ``[1, 1]`` scale grid cannot distinguish a transposed flat
+#: index, and this fixture's block scales are distinct and asymmetric so that a
+#: mis-mapping is numerically visible.
 SHARED_T = 128
 SHARED_H = 512
 SHARED_I = 512
