@@ -965,16 +965,19 @@ def inter_chunk_constants(
       as a ``[K, 1]`` column, which is the shape the per-key-channel state decay
       needs. One matmul, no transpose: this is why the constant is a column here
       where the intra-chunk entry's row-selector is a full ``[C, C]`` tile.
-    * ``state_init`` -- the ``[K, V]`` zero entering state, built on the host and
+    * ``state_init`` -- the ``[V, K]`` zero entering state, built on the host and
       loaded, rather than zeroed on device. A declared input rather than an
-      assumed device primitive, and it is the seat where a decode block that
-      enters with a non-zero state would pass one.
+      assumed device primitive, and it is the seat a caller that enters with a
+      non-zero state passes one through. It is stated in the orientation
+      :attr:`InterChunkOutputs.final_state` returns, so the entering value and
+      the leaving value are one shape and a caller loops the two with no
+      transpose; the kernel pays the conversion to its own internal orientation.
     """
     idx = torch.arange(chunk, device=device)
     return InterChunkConstants(
         triu_ones=(idx.unsqueeze(1) <= idx.unsqueeze(0)).to(dtype),
         last_col=(idx == (chunk - 1)).to(dtype).unsqueeze(1).contiguous(),
-        state_init=torch.zeros(kdim, vdim, device=device, dtype=dtype),
+        state_init=torch.zeros(vdim, kdim, device=device, dtype=dtype),
     )
 
 
@@ -987,7 +990,7 @@ def kda_inter_chunk_kernel(
 
     Shapes: ``kg``, ``w``, ``gk``, ``q`` are ``[NC, C, K]``; ``u`` is
     ``[NC, C, V]``; ``aqk`` is ``[NC, C, C]``; ``triu`` is ``[C, C]``;
-    ``last_col`` is ``[C, 1]``; ``state_init`` is ``[K, V]``.
+    ``last_col`` is ``[C, 1]``; ``state_init`` is ``[V, K]``.
 
     THERE IS NO RAW ``v`` ARGUMENT. ``v_new`` is derived from ``u`` inside stage
     4, which is the plan's declared input contract and is itself a defence: a
@@ -1006,7 +1009,10 @@ def kda_inter_chunk_kernel(
     decay becomes a ``[K, 1]`` operand broadcast along the free axis, which is
     exactly what ``nisa.tensor_scalar`` does. Carried the other way round, the
     decay would need a partition-axis broadcast, which ``tensor_scalar`` does not
-    do. The single transpose back to ``[V, K]`` is paid once, after the loop.
+    do. The transpose back to ``[V, K]`` is paid once, after the loop, and the
+    entering state is turned the same way once before it -- so the operand and
+    the return are one orientation at this boundary and a caller that carries a
+    state from one call into the next needs no transpose of its own.
     """
     n_chunks, chunk, kdim = kg_hbm.shape
     vdim = u_hbm.shape[2]
@@ -1024,9 +1030,13 @@ def kda_inter_chunk_kernel(
     nisa.tensor_copy(dst=last_col_sb, src=nl.load(last_col_hbm, dtype=nl.float32))
 
     # THE LOOP-CARRIED VALUE. Allocated once, before the loop, because it is the
-    # one tile that must survive an iteration boundary.
+    # one tile that must survive an iteration boundary. The entering state
+    # arrives in the orientation this kernel RETURNS and is turned here, so the
+    # conversion is emitted on this engine rather than by torch on the host.
+    entering_sb = _sbuf(vdim, kdim)
+    nisa.tensor_copy(dst=entering_sb, src=nl.load(state_init_hbm, dtype=nl.float32))
     ht_sb = _sbuf(kdim, vdim)
-    nisa.tensor_copy(dst=ht_sb, src=nl.load(state_init_hbm, dtype=nl.float32))
+    _emit_transpose(ht_sb, entering_sb, vdim, kdim)
 
     for ic in nl.sequential_range(n_chunks):
         kg_sb = _sbuf(chunk, kdim)
@@ -1188,7 +1198,14 @@ def can_run_inter_chunk(
 
 
 def kda_inter_chunk(
-    kg: Tensor, w: Tensor, u: Tensor, gk: Tensor, q: Tensor, aqk: Tensor
+    kg: Tensor,
+    w: Tensor,
+    u: Tensor,
+    gk: Tensor,
+    q: Tensor,
+    aqk: Tensor,
+    *,
+    state: Tensor | None = None,
 ) -> InterChunkOutputs:
     """The seam THIS increment's route predicate counts. Upstream's stages 4-5.
 
@@ -1206,6 +1223,11 @@ def kda_inter_chunk(
             accumulated -- the kernel forms the chunk-local cumulative sum.
         q: ``[NC, C, K]`` fp32, raw. Normalised and scaled inside the kernel.
         aqk: ``[NC, C, C]`` fp32, already carrying the scale and the causal mask.
+        state: ``[V, K]`` entering recurrent state, in ``final_state``'s own
+            orientation, or ``None`` for the zero entry. A caller whose tokens
+            arrive in more than one call passes the state the previous call
+            returned; the recurrence is linear in it, so the chunk-local gate
+            convention below bounds its decay exactly as it bounds a zero entry's.
 
     Returns:
         :class:`InterChunkOutputs`, whose ``final_state`` is ``[V, K]``.
@@ -1249,6 +1271,25 @@ def kda_inter_chunk(
             f"aqk {tuple(aqk.shape)} must be {(n_chunks, chunk, chunk)}"
         )
 
+    # The entering state is refused on the same footing as every other operand,
+    # and BEFORE the route is chosen, so a caller sees one contract whichever
+    # path serves it.
+    if state is not None:
+        if state.dim() != 2:
+            raise ChunkedRecurrenceError(
+                f"state must be 2-D [V, K], got shape {tuple(state.shape)}"
+            )
+        if tuple(state.shape) != (vdim, kdim):
+            raise ChunkedRecurrenceError(
+                f"state {tuple(state.shape)} must be {(vdim, kdim)} -- the "
+                f"orientation final_state is returned in"
+            )
+        if state.dtype != kg.dtype:
+            raise ChunkedRecurrenceError(
+                f"state dtype {state.dtype} must be kg's {kg.dtype}; the entering "
+                f"state is combined with these operands and is not cast here"
+            )
+
     gate_abs_max = float(gk.float().cumsum(dim=1).abs().max().item())
     if not can_run_inter_chunk(q, n_chunks, chunk, kdim, vdim, gate_abs_max):
         _INTER_COUNTERS.torch_fallback += 1
@@ -1256,7 +1297,7 @@ def kda_inter_chunk(
             "kda_inter_chunk: NKI route unavailable, using the torch path "
             "(oracle only, never the shipped path)"
         )
-        return kda_inter_chunk_torch_oracle(kg, w, u, gk, q, aqk)
+        return kda_inter_chunk_torch_oracle(kg, w, u, gk, q, aqk, state=state)
 
     consts = inter_chunk_constants(chunk, kdim, vdim, device=kg.device, dtype=kg.dtype)
     _INTER_COUNTERS.nki_dispatch += 1
@@ -1269,13 +1310,20 @@ def kda_inter_chunk(
         aqk_hbm=aqk,
         triu_hbm=consts.triu_ones,
         last_col_hbm=consts.last_col,
-        state_init_hbm=consts.state_init,
+        state_init_hbm=consts.state_init if state is None else state.contiguous(),
     )
     return InterChunkOutputs(o=o, final_state=final_state, v_new=v_new)
 
 
 def kda_inter_chunk_torch_oracle(
-    kg: Tensor, w: Tensor, u: Tensor, gk: Tensor, q: Tensor, aqk: Tensor
+    kg: Tensor,
+    w: Tensor,
+    u: Tensor,
+    gk: Tensor,
+    q: Tensor,
+    aqk: Tensor,
+    *,
+    state: Tensor | None = None,
 ) -> InterChunkOutputs:
     """Stages 4-5 in torch. THE FALLBACK PATH ONLY, never the shipped path.
 
@@ -1294,7 +1342,13 @@ def kda_inter_chunk_torch_oracle(
     qn = qn * (float(kdim) ** -0.5)
     gc = gk32.cumsum(dim=1)
 
-    ht = torch.zeros(kdim, vdim, device=kg32.device, dtype=kg32.dtype)
+    # ``state`` arrives as the seam's ``[V, K]`` and is turned into the ``[K, V]``
+    # this scan carries, which is the same conversion the kernel emits.
+    ht = (
+        torch.zeros(kdim, vdim, device=kg32.device, dtype=kg32.dtype)
+        if state is None
+        else state.float().t().contiguous()
+    )
     o = torch.empty(n_chunks, chunk, vdim, device=kg32.device, dtype=kg32.dtype)
     v_new = torch.empty_like(o)
     for c in range(n_chunks):

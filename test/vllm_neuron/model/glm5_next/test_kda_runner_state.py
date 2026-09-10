@@ -152,8 +152,15 @@ SEED = layer_half.SEED
 #: The keys a linear layer's carrier holds, in the model's own declared spelling
 #: (``model_fp8.py:4149``). The carrier is splatted straight into the layer, so
 #: this set is asserted rather than assumed: an extra key would be a TypeError and
-#: a missing one would be served as a default.
-DECLARED_CARRIER_KEYS = {"conv_state", "recurrent_state", "is_prefill"}
+#: a missing one would be served as a default. ``start_position`` joined the set
+#: when the layer learned to continue a segmented prompt's recurrence; the
+#: sparse family's carrier has carried the same key from its own beginning.
+DECLARED_CARRIER_KEYS = {
+    "conv_state",
+    "recurrent_state",
+    "is_prefill",
+    "start_position",
+}
 
 
 class VacuousControlError(AssertionError):
