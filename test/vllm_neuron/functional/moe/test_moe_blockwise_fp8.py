@@ -39,12 +39,15 @@ probe whose observable consequence differs between the two candidate orders.
 from __future__ import annotations
 
 import ast
+import math
 import os
 
 import pytest
 import torch
 
 import nki
+import nki.isa as nisa
+import nki.language as nl
 import nki.simulator
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import (
@@ -56,16 +59,26 @@ from vllm_neuron.functional.moe.blockwise_fp8_retile import (
     retile_block_scales,
 )
 from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+    GATE_UP_FUSION,
+    GATE_UP_SCALE_BLOCK,
     NUM_SHARDS,
     MoeBlockwiseFp8Error,
     blockwise_fp8_moe,
     blockwise_fp8_moe_torch_oracle,
     can_run_blockwise_fp8_moe,
+    can_run_moe_gate_up_blockwise_fp8,
     dispatch_counters,
+    gate_up_dispatch_counters,
+    gate_up_flat_scale_index,
+    gate_up_kernel_identity,
+    gate_up_kernel_scale_shape,
     kernel_identity,
     kernel_scale_shape,
+    moe_gate_up_blockwise_fp8,
     reset_dispatch_counters,
+    reset_gate_up_dispatch_counters,
     seam_identity,
+    to_gate_up_kernel_scale_operand,
     to_kernel_scale_layout,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -901,3 +914,944 @@ def test_cte_kernel_scale_shape_matches_the_producer_element_count() -> None:
         print(f"[shape] {projection}: flat={tuple(flat.shape)} logical={logical}")
         assert bridged.numel() == flat.numel()
         assert logical[-1] == TILE_SIZE
+
+
+# ===========================================================================
+# `inc-glm53f-113a` -- the campaign's OWN gate/up kernel, at [128, 128].
+# ===========================================================================
+#
+# WHAT IS COMPARED, AND WHY IT IS AN EQUALITY RATHER THAN A TOLERANCE. The
+# compared tensor is the fp32 PRE-ACTIVATION gate/up matmul output, per expert,
+# against a reference derived from the model's own quantities: the checkpoint's
+# fp8 weights dequantised by the checkpoint's own `128 x 128` scales. On the
+# fixture below every value is exactly representable at every step -- the weights
+# and activations sit on the fp8-e4m3 grid as `k/8`, and each scale is a
+# two-mantissa-bit value times a power of two -- so the reference and the kernel
+# must agree BIT FOR BIT and the expectation is `torch.equal` with
+# `max_abs_diff == 0` printed as a number. That exactness is not assumed: every
+# item that reads an equality prints the fp64-versus-fp32 precondition FIRST, and
+# also prints that the flat and the block-wise reference forms agree, which is
+# what makes the kernel's summation order (per 128-block, scaled, then added)
+# irrelevant to the reading rather than merely convenient.
+#
+# WHY THE FAILING CONTROL COLLAPSES QUADS AND WHY EACH QUAD MUST MIX MANTISSA
+# FAMILIES. The defect this increment removes is a lossy retile of the
+# checkpoint's own grid onto `256` blocks. The control therefore applies that
+# mapping -- each `2 x 2` quad of `128`-blocks takes the quad maximum -- inside
+# this test file, never in the producer, and requires that the equality above
+# CANNOT then be reached. `2.5 == 2 * 1.25` and `3.5 == 2 * 1.75`, so a quad drawn
+# from one mantissa family retiles LOSSLESSLY and a control built from it would
+# read `max_abs_diff == 0` while proving nothing. The grid builder mixes both
+# families in every quad and the control MEASURES that it did before it reads its
+# own result.
+#
+# EVERY ITEM BELOW CARRIES `cte_128` IN ITS NAME, which is what the plan's
+# acceptance command selects (`-k cte_128`), and every reading is emitted on a
+# tagged row (`E113|`) so a transcript reader can anchor on the rows this
+# increment produced.
+
+#: Extents. `B` tokens per expert block, `H` contraction, `I` per fusion half --
+#: the same numbers the `-025` case above uses, so nothing here invents a shape.
+G128_TOKENS = B
+G128_H = H
+G128_I = I_TP
+G128_H_BLOCKS = G128_H // GATE_UP_SCALE_BLOCK
+G128_I_BLOCKS = G128_I // GATE_UP_SCALE_BLOCK
+G128_BLOCKS = G128_H_BLOCKS * GATE_UP_FUSION * G128_I_BLOCKS
+
+#: The four scale values, and the two mantissa families they fall into. Powers of
+#: two multiply them per quad, which keeps every block scale distinct without
+#: moving any value between families.
+_G128_SCALE_VALUES = (1.25, 1.75, 2.5, 3.5)
+_G128_FAMILY = {1.25: "A", 2.5: "A", 1.75: "B", 3.5: "B"}
+
+
+class GateUpExactnessError(AssertionError):
+    """The bit-exactness precondition did not hold on this fixture."""
+
+
+def _emit_128(item: str, body: str) -> None:
+    """One tagged reading per line, so the transcript can be anchored."""
+    print(f"E113|{item}|{body}", flush=True)
+
+
+def _mantissa_family_128(value: float) -> str:
+    """``"A"`` for the ``1.25`` family, ``"B"`` for the ``1.75`` family.
+
+    The significand is recovered by exact halving and doubling rather than by
+    ``log2``, so the classification is a bit-level statement about the value.
+    """
+    scaled = float(value)
+    while scaled >= 2.0:
+        scaled /= 2.0
+    while scaled < 1.0:
+        scaled *= 2.0
+    if scaled not in _G128_FAMILY:
+        raise VacuousControlError(
+            f"{value!r} has significand {scaled!r}, which is not one of "
+            f"{sorted(_G128_FAMILY)}; the family classification is undefined and "
+            f"the control cannot state that its quads mix families"
+        )
+    return _G128_FAMILY[scaled]
+
+
+def _g128_scale_grid() -> torch.Tensor:
+    """``[E, H//128, 2, I//128]`` fp32 -- the checkpoint's own grid, deterministic.
+
+    Two properties are built in and both are measured where they are used: within
+    every ``2 x 2`` quad the four scales come from BOTH mantissa families (so the
+    lossy-``256`` control cannot pass for the wrong reason), and the power-of-two
+    factor varies per quad (so every block scale is distinct and a permuted
+    block-to-scale assignment cannot read as exact).
+    """
+    grid = torch.empty(
+        (E, G128_H_BLOCKS, GATE_UP_FUSION, G128_I_BLOCKS), dtype=torch.float32
+    )
+    for expert in range(E):
+        for h_block in range(G128_H_BLOCKS):
+            for gate_or_up in range(GATE_UP_FUSION):
+                for i_block in range(G128_I_BLOCKS):
+                    value = _G128_SCALE_VALUES[
+                        (h_block % 2) * 2 + (i_block % 2)
+                    ]
+                    quad = (h_block // 2) * (G128_I_BLOCKS // 2) + (i_block // 2)
+                    exponent = ((quad + gate_or_up + expert) % 4) - 2
+                    grid[expert, h_block, gate_or_up, i_block] = value * (
+                        2.0**exponent
+                    )
+    return grid
+
+
+def _g128_fp8_values(seed: int, *shape: int) -> torch.Tensor:
+    """``k/8`` for ``k`` in ``1..7``: on the fp8-e4m3 grid, so every cast is exact.
+
+    Unsigned, for the reason `inc-glm53f-025`'s own fixture records at ``:205``:
+    over a 512-long contraction a signed fixture cancels, and this item reads an
+    EQUALITY rather than a relative tolerance, so cancellation would make the
+    reading fragile for a reason that has nothing to do with the kernel.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    raw = torch.randint(1, 8, shape, generator=generator).to(torch.float32) / 8.0
+    return raw
+
+
+def _build_gate_up_128_case() -> dict:
+    """One token block and one fused gate/up weight per expert, plus the operands."""
+    grid = _g128_scale_grid()
+    hidden = _g128_fp8_values(101, E, G128_TOKENS, G128_H).to(torch.bfloat16)
+    # `[E, H, 2, I]` is the checkpoint's own layout; `[E, H, 2*I]` is its plain
+    # reshape, which is what the kernel consumes -- so no copy stands between the
+    # checkpoint and the operand.
+    weight_fused = _g128_fp8_values(
+        102, E, G128_H, GATE_UP_FUSION * G128_I
+    ).to(_FP8)
+    operands = [
+        to_gate_up_kernel_scale_operand(grid[expert], G128_H, G128_I)
+        for expert in range(E)
+    ]
+    return {
+        "grid": grid,
+        "hidden": hidden,
+        "weight_fused": weight_fused,
+        "operands": operands,
+    }
+
+
+def _g128_expanded_scales(grid: torch.Tensor, expert: int) -> torch.Tensor:
+    """``[H, 2*I]`` -- one scale per element, expanded from the block grid."""
+    per_block = grid[expert]                                    # [nh, 2, ni]
+    expanded = per_block.repeat_interleave(GATE_UP_SCALE_BLOCK, dim=0)
+    expanded = expanded.repeat_interleave(GATE_UP_SCALE_BLOCK, dim=2)
+    return expanded.reshape(G128_H, GATE_UP_FUSION * G128_I)
+
+
+def _g128_reference_flat(case: dict, expert: int) -> torch.Tensor:
+    """The model-derived reference: dequantise every element, then one matmul."""
+    weight = case["weight_fused"][expert].to(torch.float32)
+    dequantised = weight * _g128_expanded_scales(case["grid"], expert)
+    return case["hidden"][expert].to(torch.float32) @ dequantised
+
+
+def _g128_reference_blockwise(case: dict, expert: int) -> torch.Tensor:
+    """The same reference in the kernel's own order: per block, scale, then add.
+
+    Written out so the summation order is a MEASURED non-issue rather than an
+    assumption: the item below prints that this form and the flat form above are
+    bit-equal, which is what lets a single equality certify a kernel that
+    accumulates per block.
+    """
+    hidden = case["hidden"][expert].to(torch.float32)
+    weight = case["weight_fused"][expert].to(torch.float32)
+    accumulator = torch.zeros(
+        (G128_TOKENS, GATE_UP_FUSION * G128_I), dtype=torch.float32
+    )
+    for h_block in range(G128_H_BLOCKS):
+        rows = slice(
+            h_block * GATE_UP_SCALE_BLOCK, (h_block + 1) * GATE_UP_SCALE_BLOCK
+        )
+        partial = hidden[:, rows] @ weight[rows, :]
+        column_scales = (
+            case["grid"][expert, h_block]
+            .reshape(-1)
+            .repeat_interleave(GATE_UP_SCALE_BLOCK)
+        )
+        accumulator += partial * column_scales
+    return accumulator
+
+
+def _g128_precondition(case: dict, expert: int) -> tuple[bool, float, bool]:
+    """``(fp64_agrees, gap, forms_agree)`` -- printed BEFORE any equality is read."""
+    weight64 = case["weight_fused"][expert].to(torch.float64)
+    scales64 = _g128_expanded_scales(case["grid"], expert).to(torch.float64)
+    reference64 = case["hidden"][expert].to(torch.float64) @ (weight64 * scales64)
+    flat32 = _g128_reference_flat(case, expert)
+    block32 = _g128_reference_blockwise(case, expert)
+    gap = float((reference64 - flat32.to(torch.float64)).abs().max())
+    return (
+        bool(torch.equal(reference64, flat32.to(torch.float64))),
+        gap,
+        bool(torch.equal(flat32, block32)),
+    )
+
+
+def _assert_gate_up_route_128(
+    sim: _SimulatorCounter, expected_dispatches: int, label: str
+) -> str:
+    """The three declared route values for THIS limb, each read as a number.
+
+    ``torch_fallback`` can only read ``0`` because the limb has no torch
+    projection route at all -- an inadmissible geometry raises (P13) -- so the
+    zero is stated here rather than assumed, and the control below shows the gate
+    itself flipping so the zero is armed.
+    """
+    nki_dispatch, torch_fallback = gate_up_dispatch_counters()
+    gate = can_run_kernel(torch.zeros(1))
+    reading = (
+        f"gate_up_nki_dispatch={nki_dispatch} "
+        f"gate_up_torch_fallback={torch_fallback} can_run_kernel={gate} "
+        f"simulate_kernel_calls={sim.calls}"
+    )
+    _emit_128(label, reading)
+    if nki_dispatch != expected_dispatches:
+        raise RouteInstrumentError(
+            f"{label}: the gate/up dispatch counter read {nki_dispatch}, declared "
+            f"{expected_dispatches}. {reading}"
+        )
+    if torch_fallback != 0:
+        raise RouteInstrumentError(
+            f"{label}: the gate/up torch-fallback counter read {torch_fallback}, "
+            f"declared exactly 0. {reading}"
+        )
+    if gate is not True:
+        raise RouteInstrumentError(
+            f"{label}: can_run_kernel() read {gate!r}, declared True. {reading}"
+        )
+    if sim.calls != expected_dispatches:
+        raise RouteInstrumentError(
+            f"{label}: nki.simulator.simulate_kernel ran {sim.calls} times, "
+            f"declared {expected_dispatches}. A numeric pass without a simulator "
+            f"call is the F1 false green. {reading}"
+        )
+    return reading
+
+
+# --------------------------------------------------------------------------- #
+# THE DECLARED ACCEPTANCE CASE for `inc-glm53f-113a`.                           #
+# --------------------------------------------------------------------------- #
+def test_cte_128_gate_up_matches_the_model_reference_per_expert_block() -> None:
+    """Pre-activation gate/up output equals the model-derived reference, bit for bit.
+
+    The plan's declared Expected for this increment: ``torch.equal`` on the fp32
+    pre-activation result, ``N/N`` expert blocks, ``max_abs_diff == 0`` printed as
+    a number, and the fp64-versus-fp32 exactness precondition printed first.
+    """
+    case = _build_gate_up_128_case()
+    reset_gate_up_dispatch_counters()
+
+    for expert in range(E):
+        exact, gap, forms_agree = _g128_precondition(case, expert)
+        _emit_128(
+            "precondition",
+            f"expert={expert} fp64_vs_fp32_bit_equal={int(exact)} "
+            f"max_gap={gap:.6e} flat_form_equals_block_form={int(forms_agree)}",
+        )
+        if not exact:
+            raise GateUpExactnessError(
+                f"expert {expert}: the fp64 and fp32 references disagree on this "
+                f"fixture (max gap {gap:.6e}), so an equality taken against the "
+                f"fp32 reference would be a statement about rounding rather than "
+                f"about the kernel"
+            )
+        if not forms_agree:
+            raise GateUpExactnessError(
+                f"expert {expert}: the flat and block-wise reference forms differ, "
+                f"so the kernel's per-block summation order is not neutral on this "
+                f"fixture and the equality below could not attribute a difference"
+            )
+
+    with _SimulatorCounter() as sim:
+        outputs = [
+            moe_gate_up_blockwise_fp8(
+                case["hidden"][expert],
+                case["weight_fused"][expert],
+                case["operands"][expert],
+            )
+            for expert in range(E)
+        ]
+    _assert_gate_up_route_128(sim, E, "acceptance")
+
+    passed = 0
+    worst = -1.0
+    for expert in range(E):
+        got = outputs[expert].to(torch.float32)
+        want = _g128_reference_flat(case, expert)
+        assert tuple(got.shape) == (G128_TOKENS, GATE_UP_FUSION * G128_I), (
+            f"expert {expert}: kernel returned {tuple(got.shape)}, expected "
+            f"{(G128_TOKENS, GATE_UP_FUSION * G128_I)}"
+        )
+        # A reference of all zeros would make an equality vacuous.
+        if float(want.abs().max()) == 0.0:
+            raise VacuousControlError(
+                f"expert {expert}: the reference is all zero, so an equality "
+                f"against it measures nothing"
+            )
+        max_abs_diff = float((got - want).abs().max())
+        worst = max(worst, max_abs_diff)
+        _emit_128(
+            "equality",
+            f"expert={expert} bit_equal={int(bool(torch.equal(got, want)))} "
+            f"max_abs_diff={max_abs_diff} "
+            f"want_absmax={float(want.abs().max()):.6e} "
+            f"got_absmax={float(got.abs().max()):.6e}",
+        )
+        assert torch.equal(got, want), (
+            f"expert {expert}: the kernel and the model-derived reference are not "
+            f"bit-equal; max_abs_diff={max_abs_diff}"
+        )
+        assert max_abs_diff == 0
+        passed += 1
+
+    _emit_128(
+        "verdict",
+        f"expert_blocks_passing={passed}/{E} worst_max_abs_diff={worst}",
+    )
+    assert passed == E, f"{passed}/{E} expert blocks reached bit equality"
+
+
+# --------------------------------------------------------------------------- #
+# THE MUST-FAIL CONTROL: the lossy `256` retile cannot reach exactness.          #
+# --------------------------------------------------------------------------- #
+def _lossy_256_grid(grid: torch.Tensor) -> torch.Tensor:
+    """TEST-LOCAL: every ``2 x 2`` quad of ``128``-blocks takes the quad maximum.
+
+    This is the mapping `inc-glm53f-113` removes, applied here and nowhere near
+    the producer. It is the retile's own rule -- one scale per ``256`` block, the
+    largest of the four it covers, so no rescaled weight overflows.
+    """
+    lossy = grid.clone()
+    for expert in range(grid.shape[0]):
+        for gate_or_up in range(GATE_UP_FUSION):
+            for quad_h in range(G128_H_BLOCKS // 2):
+                for quad_i in range(G128_I_BLOCKS // 2):
+                    rows = slice(2 * quad_h, 2 * quad_h + 2)
+                    cols = slice(2 * quad_i, 2 * quad_i + 2)
+                    quad = grid[expert, rows, gate_or_up, cols]
+                    lossy[expert, rows, gate_or_up, cols] = quad.max()
+    return lossy
+
+
+def test_cte_128_a_lossy_256_retile_must_not_reach_exactness() -> None:
+    """The `256` mapping must NOT reach ``max_abs_diff == 0``, and it must be armed.
+
+    Two readings before the result, because a control that could not have failed
+    proves nothing: every quad is shown to MIX both mantissa families (a
+    single-family quad retiles losslessly, and then a zero here would be correct
+    rather than a false green), and the mapping is shown to have changed the grid.
+    """
+    case = _build_gate_up_128_case()
+    grid = case["grid"]
+
+    quads = 0
+    for expert in range(E):
+        for gate_or_up in range(GATE_UP_FUSION):
+            for quad_h in range(G128_H_BLOCKS // 2):
+                for quad_i in range(G128_I_BLOCKS // 2):
+                    values = grid[
+                        expert,
+                        2 * quad_h : 2 * quad_h + 2,
+                        gate_or_up,
+                        2 * quad_i : 2 * quad_i + 2,
+                    ].reshape(-1)
+                    families = {_mantissa_family_128(float(v)) for v in values}
+                    if families != {"A", "B"}:
+                        raise VacuousControlError(
+                            f"quad (expert={expert}, g={gate_or_up}, "
+                            f"h={quad_h}, i={quad_i}) draws from families "
+                            f"{sorted(families)} only, values "
+                            f"{[float(v) for v in values]}. A single-family quad "
+                            f"retiles losslessly, so this control could read "
+                            f"max_abs_diff=0 for the wrong reason."
+                        )
+                    quads += 1
+    _emit_128("control-arming", f"quads_mixing_both_families={quads}/{quads}")
+    if quads == 0:
+        raise VacuousControlError("no quads were examined, so nothing is armed")
+
+    lossy = _lossy_256_grid(grid)
+    if torch.equal(lossy, grid):
+        raise VacuousControlError(
+            "the lossy 256 mapping changed no scale, so the control cannot "
+            "distinguish the two granularities"
+        )
+    changed = int((lossy != grid).sum())
+    _emit_128(
+        "control-arming",
+        f"scales_changed_by_the_256_mapping={changed} of {grid.numel()}",
+    )
+
+    reset_gate_up_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        got = moe_gate_up_blockwise_fp8(
+            case["hidden"][0],
+            case["weight_fused"][0],
+            to_gate_up_kernel_scale_operand(lossy[0], G128_H, G128_I),
+        ).to(torch.float32)
+    _assert_gate_up_route_128(sim, 1, "control-route")
+
+    want = _g128_reference_flat(case, 0)
+    max_abs_diff = float((got - want).abs().max())
+    _emit_128(
+        "control",
+        f"lossy_256_max_abs_diff={max_abs_diff} "
+        f"reached_zero={int(max_abs_diff == 0)}",
+    )
+    assert max_abs_diff != 0, (
+        "the lossy 256 retile reached bit equality against the 128-granular "
+        "reference, so the declared equality does not discriminate the two "
+        "granularities and this increment's acceptance would pass on the defect "
+        "it exists to remove"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ROUTE CONTROL: the zero above is armed, and there is no torch route to take.   #
+# --------------------------------------------------------------------------- #
+def test_cte_128_route_control_the_gate_up_limb_has_no_torch_route() -> None:
+    """With the simulator off the gate reads False and the call RAISES.
+
+    This is the arm that makes ``gate_up_torch_fallback == 0`` a measurement: the
+    limb is shown to have no torch projection path to fall into, which is P13's
+    requirement for kernel-class work, and the gate is shown to flip through the
+    real environment read rather than through a mock.
+    """
+    case = _build_gate_up_128_case()
+    saved = os.environ.get("NKI_SIMULATOR")
+    os.environ["NKI_SIMULATOR"] = "0"
+    reset_gate_up_dispatch_counters()
+    try:
+        gate = can_run_moe_gate_up_blockwise_fp8(
+            torch.zeros(1), G128_TOKENS, G128_H, G128_I
+        )
+        assert gate is False, (
+            f"the gate read {gate!r} with NKI_SIMULATOR=0, so this control is "
+            f"unarmed"
+        )
+        # The exception TYPE is the substrate's to choose, so it is printed rather
+        # than asserted: what this arm settles is that the call did not return a
+        # tensor computed some other way.
+        with pytest.raises(Exception) as excinfo:  # noqa: B017 - see above
+            moe_gate_up_blockwise_fp8(
+                case["hidden"][0], case["weight_fused"][0], case["operands"][0]
+            )
+    finally:
+        if saved is None:
+            os.environ.pop("NKI_SIMULATOR", None)
+        else:
+            os.environ["NKI_SIMULATOR"] = saved
+
+    message = str(excinfo.value)
+    nki_dispatch, torch_fallback = gate_up_dispatch_counters()
+    _emit_128(
+        "route-control",
+        f"gate_with_simulator_off={gate} "
+        f"raised={type(excinfo.value).__name__}:{message[:80]!r} "
+        f"names_the_simulator={int('simulator' in message.lower())} "
+        f"gate_up_nki_dispatch={nki_dispatch} "
+        f"gate_up_torch_fallback={torch_fallback}",
+    )
+    assert message, "the call raised without a message, so nothing can be read"
+    # The counter counts ENTRIES into the NKI route, so the attempted dispatch is
+    # counted even though it raised -- and the fallback counter stays 0, which is
+    # the reading this arm exists to take: nothing computed torch instead.
+    assert nki_dispatch == 1, nki_dispatch
+    assert torch_fallback == 0, torch_fallback
+
+    # AND THE SOURCE-LEVEL STATEMENT, which no environment can move: the seam
+    # returns the result of exactly one call, and that call is the ``wrap_nki``
+    # dispatch. A torch limb would have to be a second return.
+    import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
+
+    _fn, tree = moe._function_ast(moe_gate_up_blockwise_fp8)
+    returns = [node for node in ast.walk(tree) if isinstance(node, ast.Return)]
+    call_returns = [
+        node for node in returns if isinstance(node.value, ast.Call)
+    ]
+    wrap_returns = [
+        node
+        for node in call_returns
+        if isinstance(node.value.func, ast.Call)
+        and isinstance(node.value.func.func, ast.Name)
+        and node.value.func.func.id == "wrap_nki"
+    ]
+    _emit_128(
+        "route-control",
+        f"seam_returns={len(returns)} call_returns={len(call_returns)} "
+        f"wrap_nki_returns={len(wrap_returns)}",
+    )
+    assert len(returns) == 1, (
+        f"the gate/up seam has {len(returns)} return statements; a second one is "
+        f"where a torch fallback would live, and this limb is declared to have "
+        f"none (P13)"
+    )
+    assert len(wrap_returns) == 1
+
+
+# --------------------------------------------------------------------------- #
+# IDENTITY: the kernel under test is authored in this campaign.                  #
+# --------------------------------------------------------------------------- #
+def _seam_without_wrap_nki():
+    """A probe seam that wraps nothing, so the derivation's guard can be armed."""
+    return 1
+
+
+def _seam_with_two_wrap_nki_calls():
+    """A probe seam that wraps twice, so the ambiguity refusal can be armed."""
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    first = wrap_nki(moe_gate_up_blockwise_fp8_kernel_probe_a)
+    second = wrap_nki(moe_gate_up_blockwise_fp8_kernel_probe_b)
+    return first, second
+
+
+def moe_gate_up_blockwise_fp8_kernel_probe_a() -> None:
+    """Named target for the two-call probe above. Never traced."""
+
+
+def moe_gate_up_blockwise_fp8_kernel_probe_b() -> None:
+    """Named target for the two-call probe above. Never traced."""
+
+
+def test_cte_128_kernel_identity_is_authored_in_this_campaign() -> None:
+    """``gate_up_kernel_identity()`` names THIS module's kernel, derived through the seam.
+
+    The reading is taken through the seam's own ``wrap_nki`` argument rather than
+    off a module-level name, which is `B26-M1`'s finding: a reading taken off an
+    import stays byte-identical when the seam is substituted. Three things are
+    settled here -- the identity, that it is not the vendor member, and that a
+    derivation which cannot be made RAISES instead of answering.
+    """
+    import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
+
+    module, qualname = gate_up_kernel_identity()
+    _emit_128("identity", f"gate_up_kernel={module}.{qualname}")
+    assert module == "vllm_neuron.functional.moe.moe_blockwise_fp8", module
+    assert qualname == "moe_gate_up_blockwise_fp8_kernel", qualname
+
+    # By object identity, not by name: the derivation resolves the live binding.
+    derived = moe._unwrap_nki(
+        moe._wrapped_object_of(moe.moe_gate_up_blockwise_fp8, "the gate/up seam")
+    )
+    assert derived is moe._unwrap_nki(moe.moe_gate_up_blockwise_fp8_kernel)
+
+    # NON-VACUITY: the vendor member is still bound in this module and its
+    # identity DIFFERS, so this reading discriminates the two rather than
+    # restating whatever it finds.
+    vendor = moe._unwrap_nki(moe.blockwise_mm_baseline_shard_intermediate)
+    _emit_128("identity", f"vendor_member={vendor.__module__}.{vendor.__qualname__}")
+    assert (module, qualname) != (vendor.__module__, vendor.__qualname__)
+    assert "nkilib" not in module
+
+    # The guard is armed at both refusals.
+    with pytest.raises(MoeBlockwiseFp8Error) as none_wrapped:
+        moe._wrapped_object_of(_seam_without_wrap_nki, "a probe")
+    assert "makes 0 `wrap_nki(...)` calls" in str(none_wrapped.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as two_wrapped:
+        moe._wrapped_object_of(_seam_with_two_wrap_nki_calls, "a probe")
+    assert "makes 2 `wrap_nki(...)` calls" in str(two_wrapped.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as no_source:
+        moe._wrapped_object_of(object(), "a probe")
+    assert "cannot read the source" in str(no_source.value)
+
+
+# --------------------------------------------------------------------------- #
+# NAMED REFUSALS -- no geometry is coerced and no fallback is shipped.           #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "tokens,rows,cols,needle",
+    [
+        (200, 512, 512, "B=200 is not a positive multiple"),
+        (0, 512, 512, "B=0 is not a positive multiple"),
+        (256, 500, 512, "H=500 is not a positive multiple"),
+        (256, 512, 500, "I=500 is not a positive multiple"),
+    ],
+)
+def test_cte_128_refuses_inadmissible_geometry_by_name(
+    tokens: int, rows: int, cols: int, needle: str
+) -> None:
+    """Every refusal names the offending extent and the loop that needs it."""
+    with pytest.raises(MoeBlockwiseFp8Error) as excinfo:
+        can_run_moe_gate_up_blockwise_fp8(torch.zeros(1), tokens, rows, cols)
+    message = str(excinfo.value)
+    _emit_128("refusal", f"B={tokens} H={rows} I={cols} message={message[:100]!r}")
+    assert needle in message, f"[B={tokens},H={rows},I={cols}] message was: {message}"
+
+
+def test_cte_128_seam_refuses_wrong_operands_by_name() -> None:
+    """Rank, orientation, fusion width and operand shape are each refused by name.
+
+    The orientation arm is the one that matters most: a ``[2*I, H]`` weight is the
+    likely mistake, and reshaping it silently would compute a different function
+    rather than fail.
+    """
+    case = _build_gate_up_128_case()
+    hidden = case["hidden"][0]
+    weight = case["weight_fused"][0]
+    operand = case["operands"][0]
+
+    with pytest.raises(MoeBlockwiseFp8Error) as rank:
+        moe_gate_up_blockwise_fp8(hidden.unsqueeze(0), weight, operand)
+    assert "must be [B, H]" in str(rank.value)
+
+    # Built at the wrong shape rather than transposed or sliced from the fp8
+    # fixture: a transpose-then-contiguous on fp8 would make this arm depend on a
+    # cast path it is not about.
+    transposed = torch.zeros(
+        (GATE_UP_FUSION * G128_I, G128_H), dtype=torch.float32
+    ).to(_FP8)
+    with pytest.raises(MoeBlockwiseFp8Error) as orientation:
+        moe_gate_up_blockwise_fp8(hidden, transposed, operand)
+    assert "contraction-major" in str(orientation.value)
+
+    odd_width = torch.zeros(
+        (G128_H, GATE_UP_FUSION * G128_I - 1), dtype=torch.float32
+    ).to(_FP8)
+    with pytest.raises(MoeBlockwiseFp8Error) as fusion:
+        moe_gate_up_blockwise_fp8(hidden, odd_width, operand)
+    assert "GATE_UP_FUSION" in str(fusion.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as shape:
+        moe_gate_up_blockwise_fp8(hidden, weight, operand[:, :-1].contiguous())
+    assert "to_gate_up_kernel_scale_operand" in str(shape.value)
+
+    with pytest.raises(MoeBlockwiseFp8Error) as grid:
+        to_gate_up_kernel_scale_operand(
+            case["grid"][0][:, :, :-1].contiguous(), G128_H, G128_I
+        )
+    assert "mis-sized" in str(grid.value)
+    _emit_128("refusal", "seam_refusals=5 all_named")
+
+
+# --------------------------------------------------------------------------- #
+# THE SCALE OPERAND -- host-side order, and then the kernel's own reading of it.  #
+# --------------------------------------------------------------------------- #
+def test_cte_128_scale_operand_order_is_the_checkpoint_grid_order() -> None:
+    """Every block's scale sits in the column the flat index names, replicated.
+
+    Oracle-free and kernel-free: this is a statement about the bridge alone, over
+    every block of the declared geometry rather than over a sample.
+    """
+    grid = _g128_scale_grid()
+    operand = to_gate_up_kernel_scale_operand(grid[0], G128_H, G128_I)
+    assert tuple(operand.shape) == gate_up_kernel_scale_shape(G128_H, G128_I)
+    assert tuple(operand.shape) == (TILE_SIZE, G128_BLOCKS)
+
+    checked = 0
+    for h_block in range(G128_H_BLOCKS):
+        for gate_or_up in range(GATE_UP_FUSION):
+            for i_block in range(G128_I_BLOCKS):
+                column = gate_up_flat_scale_index(
+                    h_block, gate_or_up, i_block, G128_I_BLOCKS
+                )
+                want = float(grid[0, h_block, gate_or_up, i_block])
+                got = operand[:, column]
+                assert float(got.min()) == want and float(got.max()) == want, (
+                    f"block (h={h_block}, g={gate_or_up}, i={i_block}) should sit "
+                    f"in column {column} as {want}; that column reads "
+                    f"[{float(got.min())}, {float(got.max())}]"
+                )
+                checked += 1
+    _emit_128(
+        "operand",
+        f"blocks_placed_correctly={checked}/{G128_BLOCKS} "
+        f"shape={tuple(operand.shape)}",
+    )
+    assert checked == G128_BLOCKS
+
+    # The index itself refuses a half selector it cannot place.
+    with pytest.raises(MoeBlockwiseFp8Error):
+        gate_up_flat_scale_index(0, GATE_UP_FUSION, 0, G128_I_BLOCKS)
+
+
+def test_cte_128_a_one_hot_scale_moves_only_its_own_output_columns() -> None:
+    """The kernel reads the column the flat index names, settled without an oracle.
+
+    A single block's scale is doubled and the output delta must be confined to
+    that block's ``128`` output columns. A kernel that read the scale operand in a
+    different order would move a different column range, and the equality item
+    could not say which of the two -- kernel or reference -- had moved.
+    """
+    case = _build_gate_up_128_case()
+    hot_h, hot_g, hot_i = 1, 1, 2
+    ones = torch.ones(
+        (G128_H_BLOCKS, GATE_UP_FUSION, G128_I_BLOCKS), dtype=torch.float32
+    )
+    doubled = ones.clone()
+    doubled[hot_h, hot_g, hot_i] = 2.0
+    if torch.equal(doubled, ones):
+        raise VacuousControlError("the injection changed nothing")
+
+    reset_gate_up_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        baseline = moe_gate_up_blockwise_fp8(
+            case["hidden"][0],
+            case["weight_fused"][0],
+            to_gate_up_kernel_scale_operand(ones, G128_H, G128_I),
+        ).to(torch.float32)
+        probed = moe_gate_up_blockwise_fp8(
+            case["hidden"][0],
+            case["weight_fused"][0],
+            to_gate_up_kernel_scale_operand(doubled, G128_H, G128_I),
+        ).to(torch.float32)
+    _assert_gate_up_route_128(sim, 2, "one-hot-route")
+
+    delta = (probed - baseline).abs()
+    hot_start = hot_g * G128_I + hot_i * GATE_UP_SCALE_BLOCK
+    hot_stop = hot_start + GATE_UP_SCALE_BLOCK
+    inside = float(delta[:, hot_start:hot_stop].max())
+    outside = max(
+        float(delta[:, :hot_start].max()) if hot_start > 0 else 0.0,
+        float(delta[:, hot_stop:].max())
+        if hot_stop < delta.shape[1]
+        else 0.0,
+    )
+    _emit_128(
+        "one-hot",
+        f"hot_block=(h={hot_h},g={hot_g},i={hot_i}) columns={hot_start}:{hot_stop} "
+        f"delta_inside={inside:.6e} delta_outside={outside:.6e}",
+    )
+    if inside == 0.0:
+        raise VacuousControlError(
+            "doubling a block scale moved nothing, so this probe cannot identify "
+            "any column range and the instrument is unarmed"
+        )
+    assert outside == 0.0, (
+        f"the delta escaped the hot block's own columns "
+        f"({hot_start}:{hot_stop}): outside={outside:.6e}. The kernel is reading "
+        f"the scale operand in a different order than "
+        f"gate_up_flat_scale_index declares, which is a design contradiction to "
+        f"route rather than a layout to re-guess here."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# LOAD-BEARING DEFAULTS -- each kept choice is shown to change the answer.        #
+# --------------------------------------------------------------------------- #
+def test_cte_128_the_folded_dequantisation_is_load_bearing() -> None:
+    """Feed the shipped kernel a scale operand of ones: the answer must move.
+
+    The cheapest possible falsifier for the fold, and it needs no second kernel:
+    if the block scales did not reach the arithmetic, an all-ones operand would
+    produce the same numbers as the real one and the equality above would be
+    reading a kernel that ignores the checkpoint's scales entirely.
+    """
+    case = _build_gate_up_128_case()
+    ones = torch.ones(
+        (G128_H_BLOCKS, GATE_UP_FUSION, G128_I_BLOCKS), dtype=torch.float32
+    )
+    if torch.equal(ones, case["grid"][0]):
+        raise VacuousControlError(
+            "the fixture's own scale grid is all ones, so replacing it with ones "
+            "changes nothing and this control is unarmed"
+        )
+
+    reset_gate_up_dispatch_counters()
+    with _SimulatorCounter() as sim:
+        without_scales = moe_gate_up_blockwise_fp8(
+            case["hidden"][0],
+            case["weight_fused"][0],
+            to_gate_up_kernel_scale_operand(ones, G128_H, G128_I),
+        ).to(torch.float32)
+    _assert_gate_up_route_128(sim, 1, "fold-control-route")
+
+    want = _g128_reference_flat(case, 0)
+    max_abs_diff = float((without_scales - want).abs().max())
+    finite = math.isfinite(max_abs_diff)
+    _emit_128(
+        "default",
+        f"disabled='the folded block dequantisation' max_abs_diff={max_abs_diff} "
+        f"finite={int(finite)} reached_zero={int(max_abs_diff == 0)}",
+    )
+    if not finite:
+        raise VacuousControlError(
+            f"the ones-operand run produced {max_abs_diff}, which is not a number, "
+            f"so this arm cannot say whether the fold is load-bearing"
+        )
+    assert max_abs_diff != 0, (
+        "the kernel produced the same numbers with an all-ones scale operand, so "
+        "the checkpoint's block scales do not reach its arithmetic and the "
+        "equality above certifies nothing about the dequantisation"
+    )
+
+
+@nki.jit
+def _variant_128_untransposed_kernel(hidden, fused_weight, scale_operand):
+    """The shipped body with ONE line changed: the activation is not transposed.
+
+    A copy rather than a switch on the shipped kernel, because the shipped body
+    must carry no flag a caller could flip: a control that ran the shipped body
+    could not falsify one of its choices. Only the activation load differs -- with
+    a plain ``nl.load`` the contraction extent lands on the free axis and the
+    engine contracts the token axis instead, which is a different function.
+    """
+    tokens, h_extent = hidden.shape
+    _, fused_cols = fused_weight.shape
+    i_extent = fused_cols // GATE_UP_FUSION
+    n_h_blocks = h_extent // GATE_UP_SCALE_BLOCK
+    n_i_blocks = i_extent // GATE_UP_SCALE_BLOCK
+    n_col_blocks = GATE_UP_FUSION * n_i_blocks
+
+    out = nl.ndarray((tokens, fused_cols), dtype=nl.float32, buffer=nl.shared_hbm)
+    scale_sb = nl.load(scale_operand)
+
+    for m_tile in range(tokens // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        for i_block in range(n_i_blocks):
+            gate_col = i_block * GATE_UP_SCALE_BLOCK
+            up_col = i_extent + i_block * GATE_UP_SCALE_BLOCK
+            gate_acc = nl.ndarray(
+                (TILE_SIZE, GATE_UP_SCALE_BLOCK), dtype=nl.float32, buffer=nl.sbuf
+            )
+            up_acc = nl.ndarray(
+                (TILE_SIZE, GATE_UP_SCALE_BLOCK), dtype=nl.float32, buffer=nl.sbuf
+            )
+            for h_block in range(n_h_blocks):
+                gate_psum = nl.ndarray(
+                    (TILE_SIZE, GATE_UP_SCALE_BLOCK),
+                    dtype=nl.float32,
+                    buffer=nl.psum,
+                )
+                up_psum = nl.ndarray(
+                    (TILE_SIZE, GATE_UP_SCALE_BLOCK),
+                    dtype=nl.float32,
+                    buffer=nl.psum,
+                )
+                h0 = h_block * GATE_UP_SCALE_BLOCK
+                # THE ONE CHANGED LINE: no DMA-side transpose.
+                hidden_t = nl.load(hidden[m0 : m0 + TILE_SIZE, h0 : h0 + TILE_SIZE])
+                gate_w = nl.load(
+                    fused_weight[
+                        h0 : h0 + TILE_SIZE, gate_col : gate_col + GATE_UP_SCALE_BLOCK
+                    ],
+                    dtype=nl.bfloat16,
+                )
+                up_w = nl.load(
+                    fused_weight[
+                        h0 : h0 + TILE_SIZE, up_col : up_col + GATE_UP_SCALE_BLOCK
+                    ],
+                    dtype=nl.bfloat16,
+                )
+                nisa.nc_matmul(
+                    dst=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    stationary=hidden_t,
+                    moving=gate_w,
+                    accumulate=False,
+                )
+                nisa.nc_matmul(
+                    dst=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    stationary=hidden_t,
+                    moving=up_w,
+                    accumulate=False,
+                )
+                gate_flat = h_block * n_col_blocks + i_block
+                up_flat = h_block * n_col_blocks + n_i_blocks + i_block
+                if h_block == 0:
+                    nisa.tensor_scalar(
+                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                    )
+                    nisa.tensor_scalar(
+                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                    )
+                else:
+                    nisa.scalar_tensor_tensor(
+                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                        op1=nl.add,
+                        operand1=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    )
+                    nisa.scalar_tensor_tensor(
+                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                        op1=nl.add,
+                        operand1=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    )
+            nl.store(
+                out[m0 : m0 + TILE_SIZE, gate_col : gate_col + GATE_UP_SCALE_BLOCK],
+                value=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+            )
+            nl.store(
+                out[m0 : m0 + TILE_SIZE, up_col : up_col + GATE_UP_SCALE_BLOCK],
+                value=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+            )
+    return out
+
+
+def test_cte_128_the_activation_transpose_is_load_bearing() -> None:
+    """Without the DMA-side transpose the kernel computes a different function.
+
+    THREE OUTCOMES, NOT TWO, which is `inc-glm53f-112`'s form: a finite non-zero
+    ``max_abs_diff`` falsifies the choice, a zero means it bought nothing, and a
+    ``nan`` means the variant itself is broken -- reported as such rather than
+    counted as a falsification.
+    """
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    case = _build_gate_up_128_case()
+    with _SimulatorCounter() as sim:
+        got = wrap_nki(_variant_128_untransposed_kernel)(
+            case["hidden"][0],
+            case["weight_fused"][0],
+            case["operands"][0],
+        )
+    want = _g128_reference_flat(case, 0)
+    max_abs_diff = float((got.to(torch.float32) - want).abs().max())
+    finite = math.isfinite(max_abs_diff)
+    _emit_128(
+        "default",
+        f"disabled='the DMA-side activation transpose' "
+        f"max_abs_diff={max_abs_diff} finite={int(finite)} "
+        f"reached_zero={int(max_abs_diff == 0)} "
+        f"simulate_kernel_calls={sim.calls}",
+    )
+    if not finite:
+        raise VacuousControlError(
+            f"the untransposed variant produced {max_abs_diff}, which is not a "
+            f"number: the variant is broken, so this arm cannot say whether the "
+            f"transpose is load-bearing"
+        )
+    assert max_abs_diff != 0, (
+        "the untransposed variant reached bit equality, so the engine is not "
+        "contracting the axis this kernel's operand orientation assumes and the "
+        "orientation argument in the module comment is wrong"
+    )
