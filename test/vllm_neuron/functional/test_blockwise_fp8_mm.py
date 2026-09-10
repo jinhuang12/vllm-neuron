@@ -124,6 +124,13 @@ K_BLOCKS = K // SCALE_BLOCK_SIZE    # 4
 N_BLOCKS = N // SCALE_BLOCK_SIZE    # 4
 OUTPUT_TILES = M_TILES * N_BLOCKS   # 8 -- the "per output tile" population
 
+#: `inc-glm53f-112`. 384 was inadmissible at the producer's old 256 granularity
+#: but is a whole number of 128 blocks (384 % 128 == 0), so it stopped raising
+#: when the kernel's own granularity narrowed. DERIVED from SCALE_BLOCK_SIZE
+#: rather than typed: it must stay a non-multiple of SCALE_BLOCK_SIZE or this row
+#: stops testing a refusal.
+INADMISSIBLE_K = SCALE_BLOCK_SIZE * 2 + SCALE_BLOCK_SIZE // 2   # 320
+
 #: The MoE retile producer's block extent, imported from the producer itself.
 PRODUCER_BLOCK_SIZE = _PRODUCER_BLOCK_SIZE
 PRODUCER_K_BLOCKS = K // PRODUCER_BLOCK_SIZE    # 2
@@ -1096,7 +1103,7 @@ def test_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
     "tokens,rows,cols,needle",
     [
         (200, 512, 512, "M=200 is not a positive multiple of TILE_SIZE"),
-        (256, 384, 512, "K=384 is not a positive multiple of"),
+        (256, INADMISSIBLE_K, 512, f"K={INADMISSIBLE_K} is not a positive multiple of"),
         (256, 512, 300, "N=300 is not a positive multiple of"),
         (0, 512, 512, "M=0 is not a positive multiple of TILE_SIZE"),
     ],

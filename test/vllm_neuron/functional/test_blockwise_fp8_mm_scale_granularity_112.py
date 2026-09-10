@@ -189,22 +189,49 @@ def test_the_kernel_indexes_the_checkpoints_own_grid_exactly() -> None:
 # --------------------------------------------------------------------------- #
 # The must-fail control: a lossy 256 retile MUST NOT reach exactness.           #
 # --------------------------------------------------------------------------- #
-def _test_local_lossy_256(scale: torch.Tensor) -> torch.Tensor:
-    """A ``256`` mapping written HERE, never the producer's.
+def _test_local_lossy_256(
+    weight_fp32: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """A REAL ``256`` retile written HERE, never the producer's: bytes move with the scale.
 
-    It retains one ``[128,128]`` scale per quad -- the quad MAXIMUM, so the retile's own fp8 bound
-    cannot raise before a number prints -- and rescales the other three onto it. The producer is
-    not called: after `-114` the producer emits the checkpoint grid unchanged and a control that
-    called it would read 0 for the wrong reason.
+    THE WHOLE POINT IS THAT BOTH HALVES RUN. A retile keeps ONE scale per quad and re-expresses
+    the other three tiles' WEIGHT BYTES against it, ``w * s_tile / s_retained``, then stores them
+    back as fp8. Rewriting only the scale would corrupt the product by whole factors and the
+    control would pass on gross scale damage rather than on retile loss -- which is what it did
+    before this repair, and is the review finding it answers.
+
+    Where the loss lives: the ratio ``s_tile / s_retained`` is not a power of two on this fixture
+    (that is what the mixed mantissa families buy), so ``w * ratio`` leaves the fp8 grid and the
+    cast rounds. That rounding IS the retile's loss, and it is the only difference between this
+    pair and the checkpoint's.
+
+    The quad MAXIMUM is retained, so every ratio is ``<= 1`` and no rescaled byte can overflow
+    e4m3 -- a refusal or an ``inf`` would end the item before a number printed.
+
+    Returns:
+        The rescaled fp8 weight, the coarsened scale grid expressed on the ``128`` grid the
+        kernel indexes, and how many ``128`` tiles the fp8 cast could not express exactly.
     """
-    lossy = scale.clone()
+    retained_grid = scale.clone()
+    rescaled = weight_fp32.clone()
+    inexact_tiles = 0
     for k_quad in range(K_BLOCKS // 2):
         for n_quad in range(N_BLOCKS // 2):
             k0, n0 = k_quad * 2, n_quad * 2
-            quad = scale[k0 : k0 + 2, n0 : n0 + 2]
-            retained = float(quad.max())
-            lossy[k0 : k0 + 2, n0 : n0 + 2] = retained
-    return lossy
+            keep = float(scale[k0 : k0 + 2, n0 : n0 + 2].max())
+            for d_k in range(2):
+                for d_n in range(2):
+                    k_tile, n_tile = k0 + d_k, n0 + d_n
+                    ratio = float(scale[k_tile, n_tile]) / keep
+                    rows = slice(k_tile * TILE_SIZE, (k_tile + 1) * TILE_SIZE)
+                    cols = slice(n_tile * TILE_SIZE, (n_tile + 1) * TILE_SIZE)
+                    exact = weight_fp32[rows, cols] * ratio
+                    as_fp8 = exact.to(_FP8)
+                    if not torch.equal(as_fp8.to(torch.float32), exact):
+                        inexact_tiles += 1
+                    rescaled[rows, cols] = as_fp8.to(torch.float32)
+                    retained_grid[k_tile, n_tile] = keep
+    return rescaled.to(_FP8), retained_grid, inexact_tiles
 
 
 def test_a_lossy_256_retile_must_not_reach_exactness() -> None:
@@ -228,16 +255,26 @@ def test_a_lossy_256_retile_must_not_reach_exactness() -> None:
             "read max_abs_diff=0 for the wrong reason"
         )
 
-    lossy = _test_local_lossy_256(scale)
-    assert not torch.equal(lossy, scale), "the test-local mapping changed nothing"
-    lossy_case = dict(case, scale=lossy)
-    got = blockwise_fp8_mm(lossy_case["x"], lossy_case["weight"], lossy_case["scale"])
+    lossy_weight, lossy_scale, inexact_tiles = _test_local_lossy_256(
+        case["weight_fp32"], scale
+    )
+    assert not torch.equal(lossy_scale, scale), "the test-local mapping changed no scale"
+    assert not torch.equal(
+        lossy_weight.to(torch.float32), case["weight_fp32"]
+    ), "the test-local mapping changed no weight byte, so it is not a retile"
+    if inexact_tiles == 0:
+        raise VacuousReadingError(
+            "every rescaled tile stayed exactly on the fp8 grid, so this mapping is a LOSSLESS "
+            "retile and cannot show that the 128 grid buys anything"
+        )
+
+    got = blockwise_fp8_mm(case["x"], lossy_weight, lossy_scale)
     want = _model_reference(case)
     max_abs_diff = float((got - want).abs().max())
     _emit(
         "I2_CONTROL_LOSSY_256",
-        f"retained_per_quad=max max_abs_diff={max_abs_diff} reached_zero="
-        f"{int(max_abs_diff == 0)}",
+        f"retained_per_quad=max inexact_fp8_tiles={inexact_tiles}/{K_BLOCKS * N_BLOCKS} "
+        f"max_abs_diff={max_abs_diff} reached_zero={int(max_abs_diff == 0)}",
     )
     assert max_abs_diff != 0, (
         "a lossy 256 retile reached exact equality, so the exactness in item 1 is not a "
@@ -250,7 +287,20 @@ def test_a_lossy_256_retile_must_not_reach_exactness() -> None:
 # --------------------------------------------------------------------------- #
 @nki.jit
 def _variant_accumulate_true(x, weight, weight_scale_t):
-    """DEFAULT (a) inverted: ``accumulate=True`` on the single matmul of each block."""
+    """DEFAULT (a) inverted, WITH A REAL DIFFERENT-NUMBER PATH.
+
+    The naive inversion -- ``accumulate=True`` on a PSUM tile allocated fresh for each matmul --
+    computes the shipped kernel's arithmetic exactly, because there is nothing in the tile to
+    accumulate onto. It would read ``max_abs_diff == 0`` and fail this item on correct code. That
+    was the review finding, and this is the repair.
+
+    THE FAITHFUL INVERSION HOISTS THE PSUM TILE out of the ``k_block`` loop, which is what
+    ``accumulate=True`` is FOR: block ``k`` then adds its raw product onto block ``k-1``'s before
+    either is scaled, so every block after the first multiplies a running sum by its own scale.
+    That is exactly the defect ``accumulate=False`` prevents once ``K_TILES_PER_BLOCK`` is 1 and
+    each product carries exactly one scale, and it is a different number by arithmetic rather
+    than by whatever the simulator leaves in a fresh tile.
+    """
     m_extent, k_extent = x.shape
     _, n_extent = weight.shape
     n_n_blocks = n_extent // SCALE_BLOCK_SIZE
@@ -264,10 +314,11 @@ def _variant_accumulate_true(x, weight, weight_scale_t):
             acc = nl.ndarray(
                 (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.sbuf
             )
+            # ONE PSUM TILE FOR EVERY k_block, which is the inversion.
+            psum = nl.ndarray(
+                (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.psum
+            )
             for k_block in range(n_k_blocks):
-                psum = nl.ndarray(
-                    (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.psum
-                )
                 k0 = k_block * SCALE_BLOCK_SIZE
                 x_t = nl.load_transpose2d(x[m0 : m0 + TILE_SIZE, k0 : k0 + TILE_SIZE])
                 w_tile = nl.load(
@@ -306,7 +357,15 @@ def _variant_accumulate_true(x, weight, weight_scale_t):
 
 @nki.jit
 def _variant_no_fp8_upcast(x, weight, weight_scale_t):
-    """DEFAULT (b) inverted: the fp8 weight tile is loaded without the bf16 upcast."""
+    """DEFAULT (b) inverted: the fp8 weight tile is loaded without the bf16 upcast.
+
+    A DTYPE REFUSAL BY NAME COUNTS AS THIS CONTROL FIRING (ruled, LEAD-LOG §1173 item 5b). The
+    upcast is bit-exact by the module's own statement, so on this integer fixture there is no
+    different NUMBER to read: what the default buys is that the Tensor Engine is handed an operand
+    dtype it accepts. So a refusal naming the dtype is the falsification, and it is recorded as
+    ``refused=1`` with the exception text; only "reached exact equality" fails the item, and a
+    silent ``max_abs_diff == 0`` is the red reading.
+    """
     m_extent, k_extent = x.shape
     _, n_extent = weight.shape
     n_n_blocks = n_extent // SCALE_BLOCK_SIZE

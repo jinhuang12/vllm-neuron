@@ -47,7 +47,7 @@ import pytest
 import torch
 
 from vllm_neuron.functional.blockwise_fp8_mm import (
-    BLOCK_QUANT_SIZE,
+    SCALE_BLOCK_SIZE,
     TILE_SIZE,
     BlockwiseFp8MmError,
     blockwise_fp8_mm,
@@ -91,8 +91,11 @@ def _impl():
 # times per case inside the declared 60-second timeout. The production geometry
 # is recorded as a READING instead (the scatter count it implies), so the record
 # carries what the repair is worth without the test paying for it.
-HIDDEN = 2 * BLOCK_QUANT_SIZE  # H = 512
-INTERMEDIATE = 2 * BLOCK_QUANT_SIZE  # I = 512
+# `inc-glm53f-112` narrowed SCALE_BLOCK_SIZE from 256 to 128. The extent is held
+# at 512 on purpose, so this file keeps testing the same geometry it did at 256;
+# `4 * SCALE_BLOCK_SIZE` is derived rather than typed.
+HIDDEN = 4 * SCALE_BLOCK_SIZE  # H = 512, four whole 128 blocks
+INTERMEDIATE = 4 * SCALE_BLOCK_SIZE  # I = 512, four whole 128 blocks
 TOKENS = TILE_SIZE  # T = 128, a whole number of TILE_SIZE rows
 FP8 = torch.float8_e4m3fn
 
