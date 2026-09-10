@@ -1634,8 +1634,9 @@ class DeferredShardGeometry:
     ``num_shards * pad_to_multiple_of``, so every rank's shard is a whole number
     of consumer blocks and the padded tail is zeros (weight) or ones (grid). This
     is what makes a 12288-wide dense intermediate loadable at 64 ranks, where
-    12288 // 64 == 192 is neither a 128-row checkpoint tile nor a 256-row
-    consumer block. Ruled at design entry ``design-20260905-ap``, remedy part 2.
+    12288 // 64 == 192 is a whole number of neither -- and since `inc-glm53f-112`
+    the two are the same 128 rows, so 192 clears neither on the same arithmetic.
+    Ruled at design entry ``design-20260905-ap``, remedy part 2.
     """
 
     shard_dim: int
@@ -1659,7 +1660,8 @@ class DeferredShardGeometry:
     #: no-pad check on the load path is EVEN DIVISION
     #: (``utils/weight_loader.py:330-345``), so a bank at expert-parallel degree 1 on
     #: 4 ranks divided its 512-wide intermediate into 128-row shards -- an even
-    #: division, and not a whole 256-row consumer block -- and the load SUCCEEDED,
+    #: division, and (under the ``256`` consumer grid of the time) not a whole
+    #: consumer block -- and the load SUCCEEDED,
     #: leaving the failure to surface later at ``blockwise_fp8_mm.scale_grid_shape``.
     #: This field is what makes it fail on LOAD instead, which is what design entries
     #: 75 and 77 ruled ("would fail on load, not on the kernel under test").
@@ -1720,19 +1722,25 @@ def consumer_block_quant_size() -> int:
 
     ``inc-glm53f-101``, remedy part 1. IMPORTED rather than re-typed, and that is
     the whole point of the function: ``blockwise_fp8_mm.scale_grid_shape``
-    (``:276-288``) refuses any weight extent that is not a whole number of
-    ``BLOCK_QUANT_SIZE`` blocks, and ``blockwise_fp8_retile`` fixes the same
-    number from the vendor's own kernel (``:91``). A literal here would be a
-    second place for the consumer's granularity to live.
+    refuses any weight extent that is not a whole number of
+    ``SCALE_BLOCK_SIZE`` blocks. A literal here would be a second place for the
+    consumer's granularity to live.
+
+    RE-PINNED by `inc-glm53f-112` (D17.1). The dense consumer now indexes its
+    scales by the ``128``-row blocks the checkpoint itself stores, so this
+    function imports ``SCALE_BLOCK_SIZE`` from that module instead of the MoE
+    retile's ``BLOCK_QUANT_SIZE``. The two numbers are no longer the same and the
+    load path must answer with the DENSE consumer's, which is the one that
+    refuses a shard at the first forward pass.
 
     The import is function-local, which is this file's own precedent (``:2131``):
     the module-level block above imports only what every path needs, and a
     consumer import at module scope would make a load-path module depend on a
     kernel module at import time.
     """
-    from vllm_neuron.functional.blockwise_fp8_mm import BLOCK_QUANT_SIZE
+    from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
 
-    return int(BLOCK_QUANT_SIZE)
+    return int(SCALE_BLOCK_SIZE)
 
 
 def refuse_inadmissible_shard_extent(
@@ -1777,7 +1785,7 @@ def refuse_inadmissible_shard_extent(
     ranks = geometry.num_shards
     # The DOWNWARD neighbour is named only when it exists. Flooring an extent that is
     # already narrower than one block gives 0, and "the nearest admissible extents are
-    # 0 and 256" would offer a rank no rows at all as advice -- found by walking this
+    # 0 and one block" would offer a rank no rows at all as advice -- found by walking this
     # message against the acceptance's own 128-row case rather than by reading it.
     below = (extent // required) * required
     above = below + required
@@ -1835,11 +1843,15 @@ def shard_geometry_for_grid(
     file do hold that property (``:2098-2103``); this one does not, and the
     difference is recorded rather than assumed.
 
-    TWO BOUNDARIES, NOT ONE (``inc-glm53f-101``, remedy part 1). The checkpoint's
-    tile is 128 rows and the CONSUMER's block is 256
-    (:func:`consumer_block_quant_size`), so a shard can clear the tile rule and
-    still be a shard the kernel cannot take -- 12288 // 32 == 384 is three whole
-    tiles and one and a half blocks. Both are checked here, tile first so the
+    TWO BOUNDARIES THAT NOW COINCIDE (``inc-glm53f-101`` remedy part 1, re-pinned
+    by `inc-glm53f-112` under D17.1). The checkpoint's tile is 128 rows, and since
+    `-112` the dense CONSUMER's block (:func:`consumer_block_quant_size`) is the
+    same 128 rows, so any shard that clears the tile rule now clears the block
+    rule as well -- 12288 // 32 == 384 is three whole tiles AND three whole
+    blocks, where under the ``256`` grid it was one and a half blocks and was
+    refused here. The second check is KEPT rather than deleted: it is `-101`'s
+    remedy, not this block's to remove, and it becomes load-bearing again the
+    moment either granularity moves. Both are checked here, tile first so the
     landed refusal keeps its landed message, and the consumer's second with its
     own wording. ``block_size`` is the CHECKPOINT's declared ``weight_block_size``
     threaded in by the caller; the default is the parser's fallback only.

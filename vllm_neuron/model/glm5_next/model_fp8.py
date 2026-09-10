@@ -2900,9 +2900,10 @@ class Glm5NextSharedExperts(nn.Module):
         if block_shape is None or tuple(block_shape) != (TILE_SIZE, TILE_SIZE):
             raise Glm5NextSharedExpertRouteError(
                 f"quant_config declares weight_block_size={block_shape!r}; this "
-                f"route consumes scales retiled from ({TILE_SIZE}, {TILE_SIZE}) "
-                f"checkpoint blocks onto BLOCK_QUANT_SIZE granularity and has no "
-                f"path for any other checkpoint block shape."
+                f"route consumes the checkpoint's own ({TILE_SIZE}, {TILE_SIZE}) "
+                f"blocks directly -- since inc-glm53f-112 the dense kernel "
+                f"indexes at that granularity and nothing is retiled -- and has "
+                f"no path for any other checkpoint block shape."
             )
 
         # ---- Extents, read off the operands rather than off the config. -- #
@@ -3593,8 +3594,9 @@ class Glm5NextDenseMLP(nn.Module):
         if block_shape is None or tuple(block_shape) != (TILE_SIZE, TILE_SIZE):
             raise Glm5NextDenseMLPRouteError(
                 f"quant_config declares weight_block_size={block_shape!r}; this "
-                f"route consumes scales retiled from ({TILE_SIZE}, {TILE_SIZE}) "
-                f"checkpoint blocks onto BLOCK_QUANT_SIZE granularity and has "
+                f"route consumes the checkpoint's own ({TILE_SIZE}, {TILE_SIZE}) "
+                f"blocks directly -- since inc-glm53f-112 the dense kernel "
+                f"indexes at that granularity and nothing is retiled -- and has "
                 f"no path for any other checkpoint block shape."
             )
 
