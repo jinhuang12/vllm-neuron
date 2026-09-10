@@ -1894,8 +1894,11 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 # exists to REFUSE ("so the load must refuse by name", ``:186``), and a routed
 # load that completes runs one thing that configuration was never asked to
 # survive: ``Glm5NextSharedExperts.prepare_scale_operands``, which reaches
-# ``scale_grid_shape`` and demands extents divisible by ``BLOCK_QUANT_SIZE`` =
-# 256. The miniature is 128, so the routed load dies in the SHARED-expert prep
+# ``scale_grid_shape`` and demanded extents divisible by the 256 block it then read
+# (since ``inc-glm53f-112`` the shared prep reads ``SCALE_BLOCK_SIZE`` = 128, so the
+# constraint below is weaker than when these items were written -- they keep their own
+# configuration because the reason above still stands, not because of this number).
+# The miniature is 128, so the routed load died in the SHARED-expert prep
 # -- nothing to do with the bank. That is a pre-existing constraint of the
 # miniature the bank refusal has been masking, and it is measured rather than
 # argued: ``increments/probe-095-collateral-host.out`` reads
@@ -2550,8 +2553,9 @@ def test_the_stacked_bank_refusal_is_gone_for_this_case_only(tmp_path) -> None:
 # WHY THE BANK'S OWN SCALE PREP IS NOT HERE. It was designed here and moved to
 # ``inc-glm53f-054`` at design entry ``design-20260905-x``, on a reading this
 # seat took first: the miniature every load in this file reads is 128 x 128 with
-# (1, 1) grids, ``BLOCK_QUANT_SIZE`` is 256, and both ``retile_block_scales``
-# and ``scale_grid_shape`` refuse an extent that is not a multiple of it. The
+# (1, 1) grids, the bank's ``BLOCK_QUANT_SIZE`` is 256, and ``retile_block_scales``
+# refuses an extent that is not a multiple of it -- as did ``scale_grid_shape``, at
+# the same 256, until ``inc-glm53f-112`` narrowed the DENSE side to 128. The
 # prep loop's gate is a TYPE test, so a prep on the bank would fire inside
 # ``-095``'s own conjunct-1 load -- the one completing load in this file that
 # carries a bank -- and break it. Measured in
@@ -3370,9 +3374,11 @@ def _tiles_per_producer_block() -> int:
     a fixture that hardcoded 2 would keep writing 2 the day either side moved.
 
     RE-AIMED FROM THE CONSUMER TO THE PRODUCER by ``inc-glm53f-112``. It used to read
-    ``consumer_block_quant_size()``, which was 256 and equalled the producer's. That
-    number is now 128 -- the dense kernel indexes the checkpoint's own tiles and the
-    dense load path coarsens nothing -- so a helper aimed at the consumer would
+    the one consumer-block function this package had, back when that number was 256
+    and equalled the producer's. The DENSE consumer's number
+    (``dense_consumer_block_quant_size()``) is now 128 -- the dense kernel indexes the
+    checkpoint's own tiles and the dense load path coarsens nothing -- so a helper
+    aimed at the dense consumer would
     return 1 and every grid built from it would vary nothing. The only coarsening
     left is the MoE routed bank's, inside its own ``prepare_scale_operands``, and the
     two grid builders below now feed that bank alone
@@ -4062,9 +4068,11 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     # A BLOCK-MISALIGNED SHARD REFUSES BY NAME. The aligned case beside it is what
     # makes the refusal a boundary rather than a blanket. The exception class is
     # the one ``_refuse`` raises for every refusal in that section, bank or not.
-    # ``inc-glm53f-101`` (DECISIONS section 80(b)): the aligned case is now one whole
-    # CONSUMER block, which is two checkpoint tiles. One tile alone is what the new
-    # gate refuses, so the old aligned value became the third control below.
+    # ``inc-glm53f-101`` (DECISIONS section 80(b)): the aligned case is 256 rows, which
+    # is two checkpoint tiles -- one whole CONSUMER block while that block was 256, and
+    # TWO of them since `inc-glm53f-112` narrowed it. Either way it is aligned for both
+    # rules, which is all this reading needs; the width is left where it was so this
+    # arm's grid-row count stays the number the item registered.
     aligned = _WL_FP8.shard_geometry_for_grid(
         _WL_FP8.ShardGeometry(
             shard_dim=0,
@@ -4075,7 +4083,7 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     )
     print(f"CONJUNCT3_ALIGNED_GRID_SHARD_SIZE={aligned.shard_size}")
     assert aligned.shard_size == 2, (
-        f"an aligned shard of exactly one consumer block gave "
+        f"an aligned shard of 256 rows gave "
         f"{aligned.shard_size} grid rows, not 2"
     )
     misaligned = DEFAULT_WEIGHT_BLOCK_SIZE[0] + 1
@@ -4096,52 +4104,57 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     )
 
     # THE THIRD CONTROL, and the one the consumer's gate exists for
-    # (``inc-glm53f-101``, DECISIONS section 80(b)). 384 rows is THREE whole
-    # checkpoint tiles, so the tile rule above lets it pass; it is one and a half
-    # consumer blocks, so the kernel cannot index it. Without this reading the new
-    # gate could be deleted and every assertion above would still pass.
-    consumer_block = _WL_FP8.consumer_block_quant_size()
+    # (``inc-glm53f-101``, DECISIONS section 80(b)). The gate refuses a shard that
+    # CLEARS the checkpoint tile and is still not a whole CONSUMER block, so it can
+    # only be read by a width that fails THAT rule and no other.
+    #
+    # WHY THIS CONTROL MOVES THE GRANULARITY (`inc-glm53f-112` round 2, ruling 3).
+    # The dense consumer's block is now the checkpoint tile, so at the production
+    # numbers no width fails one of the two rules alone -- every multiple of 128 is a
+    # multiple of 128. The previous shape of this control fell back to 192, which
+    # fails BOTH rules, and then asserted a number that BOTH refusal messages carry:
+    # it read GREEN off the tile rule while claiming the consumer's. That is the
+    # defect round 2 named. This version moves the CONSUMER's granularity through its
+    # own seam -- the function the product itself calls -- and reads the sharp width
+    # again: 384 is three whole 128-row tiles and one and a half 256-row consumer
+    # blocks, so exactly one rule can refuse it. The tile rule keeps its own control
+    # above, on its own width, with its own message.
+    consumer_block = _WL_FP8.dense_consumer_block_quant_size()
     tile = DEFAULT_WEIGHT_BLOCK_SIZE[0]
-    # THE TWO BOUNDARIES COINCIDE SINCE ``inc-glm53f-112``, and that is why this
-    # control changed shape rather than its width. The sharp form of it needs a width
-    # that CLEARS the checkpoint tile and still FAILS the consumer block -- 384 was
-    # that width while the consumer block was 256. The consumer block is now the tile,
-    # so no such width exists at all: every multiple of the tile is a multiple of the
-    # block. The control therefore states the coincidence as a reading and falls back
-    # to a width that fails BOTH rules, which still exercises the gate `-101` added.
-    # It restores the sharp form automatically the day either granularity moves.
     boundaries_coincide = consumer_block == tile
-    if boundaries_coincide:
-        tile_clearing_block_missing = tile + tile // 2
-    else:
-        tile_clearing_block_missing = 3 * tile
     print(f"CONJUNCT3_CONSUMER_BLOCK={consumer_block}")
     print(f"CONJUNCT3_CHECKPOINT_TILE={tile}")
     print(f"CONJUNCT3_BOUNDARIES_COINCIDE={int(boundaries_coincide)}")
-    print(f"CONJUNCT3_TILE_CLEARING_SHARD={tile_clearing_block_missing}")
-    assert tile_clearing_block_missing % consumer_block != 0, (
-        f"{tile_clearing_block_missing} IS a whole number of {consumer_block}-row "
-        f"consumer blocks, so the refusal below cannot fire and this control means "
-        f"nothing"
+
+    # THE ONE FIELD THIS ARM VARIES, and it is the product's own reader rather than a
+    # stub of the function under test: ``shard_geometry_for_grid`` looks the block up
+    # by module-global name every call, so patching the reader is patching an INPUT.
+    moved_block = 2 * tile
+    monkeypatch.setattr(
+        _WL_FP8, "dense_consumer_block_quant_size", lambda: moved_block
     )
-    if boundaries_coincide:
-        assert consumer_block % tile == 0 and consumer_block // tile == 1, (
-            f"the consumer block {consumer_block} and the checkpoint tile {tile} were "
-            f"read as coinciding but do not: {consumer_block} // {tile} = "
-            f"{consumer_block // tile}. This branch is only correct when they are one "
-            f"number"
-        )
-    else:
-        assert tile_clearing_block_missing % tile == 0, (
-            f"{tile_clearing_block_missing} is not a whole number of {tile}-row tiles, "
-            f"so it would be refused by the tile rule and this control would certify "
-            f"nothing about the consumer's"
-        )
+    assert _WL_FP8.dense_consumer_block_quant_size() == moved_block, (
+        "the patch did not take, so the arm below is still reading the production "
+        "granularity and cannot separate the two rules"
+    )
+    sharp = 3 * tile
+    print(
+        f"CONJUNCT3_MOVED_CONSUMER_BLOCK={moved_block}|SHARP_WIDTH={sharp}"
+        f"|TILE_REMAINDER={sharp % tile}|CONSUMER_REMAINDER={sharp % moved_block}"
+    )
+    assert sharp % tile == 0, (
+        f"{sharp} is not a whole number of {tile}-row tiles, so the tile rule would "
+        f"refuse it first and this arm would be reading the wrong gate"
+    )
+    assert sharp % moved_block != 0, (
+        f"{sharp} IS a whole number of {moved_block}-row consumer blocks, so the "
+        f"refusal below cannot fire and this control means nothing"
+    )
     with pytest.raises(Glm5NextExpertBankNotLoadableError) as consumer_refusal:
         _WL_FP8.shard_geometry_for_grid(
             _WL_FP8.ShardGeometry(
                 shard_dim=0,
-                shard_size=tile_clearing_block_missing,
+                shard_size=sharp,
                 num_shards=SHARD_WORLD,
             ),
             param_name="probe.gate_proj_weight_scale_inv",
@@ -4151,8 +4164,15 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     assert "probe.gate_proj_weight_scale_inv" in consumer_message, (
         f"the consumer refusal does not name the parameter: {consumer_message}"
     )
-    assert str(consumer_block) in consumer_message, (
-        f"the consumer refusal does not name the {consumer_block}-row block it "
+    # WHICH GATE SPOKE, by the wording only that gate has. A number would not do it:
+    # the tile rule's message carries the tile, and at the production granularity the
+    # two numbers are the same one.
+    assert "CONSUMER's" in consumer_message, (
+        f"the refusal that fired is not the CONSUMER's -- its wording belongs to "
+        f"another gate: {consumer_message}"
+    )
+    assert str(moved_block) in consumer_message, (
+        f"the consumer refusal does not name the {moved_block}-row block it "
         f"enforced: {consumer_message}"
     )
 
@@ -4816,7 +4836,7 @@ def _load_at_ep(
     # rather than passing quietly.
     model.load_weights(str(directory), torch.device("cpu"), None)
 
-    block = _WL_FP8.consumer_block_quant_size()
+    block = _WL_FP8.dense_consumer_block_quant_size()
     rows = _padded_shard_extent(SHARED_INTERMEDIATE, world_size, block)
     cols = DEFERRED_NARROW
     tile_grid = (
@@ -4967,7 +4987,7 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     the loader.
     """
     directory, overrides, mappings = _deferred_checkpoint(tmp_path)
-    block = _WL_FP8.consumer_block_quant_size()
+    block = _WL_FP8.dense_consumer_block_quant_size()
     print(f"CONJUNCT1D_CONSUMER_BLOCK={block}")
     print(f"CONJUNCT1D_WORLD={SHARD_EP_WORLD} EP_DEGREE={SHARD_EP_DEGREE}")
     print(f"CONJUNCT1D_TP_PER_EP={SHARD_TP_PER_EP}")
@@ -5328,7 +5348,7 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
     print(f"CONJUNCT2D_RAGGED_REFUSAL={str(ragged.value)[:160]}")
 
     # REFUSAL TWO -- an intermediate shard the CONSUMER cannot take.
-    block = _WL_FP8.consumer_block_quant_size()
+    block = _WL_FP8.dense_consumer_block_quant_size()
     not_a_whole_block = block + DEFAULT_WEIGHT_BLOCK_SIZE[0]
     assert not_a_whole_block % block != 0
     with pytest.raises(Glm5NextExpertBankNotLoadableError) as unusable:
@@ -5398,7 +5418,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     mistaken for each other.
     """
     directory, overrides, mappings = _deferred_checkpoint(tmp_path)
-    block = _WL_FP8.consumer_block_quant_size()
+    block = _WL_FP8.dense_consumer_block_quant_size()
     loads = {
         rank: _load_at_ep(
             directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
@@ -6064,10 +6084,12 @@ def test_sharedshard_the_column_comes_from_the_group_and_refuses_a_disagreement(
 #:
 #: * ``DEFAULT_WEIGHT_BLOCK_SIZE`` is the 128-row CHECKPOINT tile. It fixes how
 #:   many entries a grid holds, so it is what gives a grid anything to divide.
-#: * ``consumer_block_quant_size()`` reads ``SCALE_BLOCK_SIZE``, the block the
-#:   block-FP8 kernel indexes its scales by -- 256 rows until ``inc-glm53f-112``
+#: * ``dense_consumer_block_quant_size()`` reads ``SCALE_BLOCK_SIZE``, the block the
+#:   DENSE block-FP8 kernel indexes its scales by -- 256 rows until ``inc-glm53f-112``
 #:   narrowed it to the checkpoint's own 128, so the two bullets now name ONE
-#:   number and the second refusal can no longer fire alone. ``inc-glm53f-101``
+#:   number and the second refusal can no longer fire alone at the production
+#:   granularity. The ROUTED BANK's block is a third number, still 256, read from its
+#:   own producer and not this rule's subject. ``inc-glm53f-101``
 #:   already refuses a shard that is not a whole number of THOSE, and that
 #:   refusal is upstream of everything this item measures.
 #:
@@ -6530,8 +6552,8 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
        each family is actually sharded on -- dim 0 for the two column-parallel
        projections, dim 1 for the row-parallel one, because a tile is not square in
        principle even though this checkpoint's is;
-    2. and a whole number of the CONSUMER's block, imported from
-       ``consumer_block_quant_size()``. These are TWO SEPARATE REFUSALS in
+    2. and a whole number of the DENSE CONSUMER's block, imported from
+       ``dense_consumer_block_quant_size()``. These are TWO SEPARATE REFUSALS in
        ``shard_geometry_for_grid`` -- one on the tile, one on the consumer's block --
        and while the two granularities differed a width could clear the first and
        still stop the load at the second. Since ``inc-glm53f-112`` the consumer's
@@ -6576,15 +6598,24 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
 
     #: The CONSUMER's block extent, IMPORTED from the consumer and never typed here.
     #: A literal would be a second place for the consumer's granularity to live,
-    #: which is the reason ``consumer_block_quant_size`` exists and says so in its
-    #: own docstring. It is one number rather than a pair because
-    #: ``blockwise_fp8_mm.BLOCK_QUANT_SIZE`` is one number and the consumer applies
-    #: it on either dimension.
-    consumer_block = _WL_FP8.consumer_block_quant_size()
+    #: which is the reason ``dense_consumer_block_quant_size`` exists and says so in
+    #: its own docstring. THE DENSE one is the right one for an MLA projection: its
+    #: weight is dequantised by ``blockwise_fp8_mm``, whose
+    #: ``SCALE_BLOCK_SIZE`` this reads, and not by the routed bank's producer, which
+    #: keeps its own larger block. It is one number rather than a pair because
+    #: ``SCALE_BLOCK_SIZE`` is one number and the consumer applies it on either
+    #: dimension.
+    consumer_block = _WL_FP8.dense_consumer_block_quant_size()
 
-    def part_block(head_width: int) -> int:
-        """The remainder a single head leaves in the CONSUMER's block. 0 is whole."""
-        return head_width % consumer_block
+    def part_block(head_width: int, block: int = 0) -> int:
+        """The remainder a single head leaves in a CONSUMER block. 0 is whole.
+
+        ``block`` defaults to the product's own granularity. The control below passes
+        a MOVED one, so that the predicate can be read on a width that fails this
+        rule and no other -- which is impossible at the production numbers, where the
+        consumer's block and the checkpoint's tile are one number.
+        """
+        return head_width % (block or consumer_block)
 
     print(f"GRIDSHARD_B_BLOCK_SIZE={DEFAULT_WEIGHT_BLOCK_SIZE}")
     print(
@@ -6629,42 +6660,54 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
 
     # READING 4, READING 2'S CONTROL, AND THE REASON THIS ITEM WAS REPAIRED. A q_b
     # split of 256 nope plus 128 rope gives 384 to a head. That CLEARS the checkpoint
-    # tile -- 384 is three whole 128-row tiles -- and still leaves half a consumer
-    # block. Before the repair this item measured the tile alone, so a checkpoint like
-    # that read GREEN here while ``shard_geometry_for_grid`` refused the load at the
-    # consumer boundary: the refused-load-nobody-predicted this gate exists to catch.
-    # ``shard_geometry_for_grid``'s own docstring names this width in those words.
-    # SINCE ``inc-glm53f-112`` THE TWO BOUNDARIES COINCIDE, so a width that clears the
-    # tile while failing the consumer block cannot be constructed: every multiple of
-    # the 128 tile is a multiple of the 128 consumer block. The control states that as
-    # a reading and falls back to a width that fails BOTH, which still shows reading 2
-    # is capable of a non-empty answer. The sharp form returns on its own the day
-    # either granularity moves.
+    # tile -- 384 is three whole 128-row tiles -- and still leaves half a 256-row
+    # consumer block. Before the repair this item measured the tile alone, so a
+    # checkpoint like that read GREEN here while ``shard_geometry_for_grid`` refused
+    # the load at the consumer boundary: the refused-load-nobody-predicted this gate
+    # exists to catch. ``shard_geometry_for_grid``'s own docstring names this width.
+    #
+    # THE CONTROL RUNS AT A MOVED GRANULARITY (`inc-glm53f-112` round 2, ruling 3).
+    # At the production numbers the dense consumer's block IS the checkpoint tile, so
+    # no width fails one rule alone and a control that took a width failing BOTH -- as
+    # this one briefly did, at 192 -- reads a green that belongs to the tile rule. So
+    # the width stays 384 and the BLOCK moves: fed a 256-row block, ``part_block``
+    # must flag 384 while ``part_tile`` clears it. What that certifies is the
+    # predicate, on a width that fails exactly the rule reading 2 is about, and it
+    # certifies it today rather than on the day a granularity moves.
     boundaries_coincide = consumer_block == DEFAULT_WEIGHT_BLOCK_SIZE[0]
-    escaping_width = (
-        DEFAULT_WEIGHT_BLOCK_SIZE[0] + DEFAULT_WEIGHT_BLOCK_SIZE[0] // 2
-        if boundaries_coincide
-        else 256 + 128
-    )
+    moved_block = 2 * DEFAULT_WEIGHT_BLOCK_SIZE[0]
+    escaping_width = 3 * DEFAULT_WEIGHT_BLOCK_SIZE[0]
     escaping_tile = part_tile(0, escaping_width)
-    escaping_block = part_block(escaping_width)
+    escaping_block = part_block(escaping_width, moved_block)
     print(
         f"GRIDSHARD_B_BOUNDARIES_COINCIDE={int(boundaries_coincide)} "
+        f"GRIDSHARD_B_CONTROL_MOVED_BLOCK={moved_block} "
         f"GRIDSHARD_B_CONTROL_ESCAPING_WIDTH={escaping_width} "
         f"TILE_REMAINDER={escaping_tile} CONSUMER_REMAINDER={escaping_block}"
     )
-    assert escaping_block, (
-        f"the {escaping_width}-wide control leaves no consumer-block remainder "
-        f"against block {consumer_block}, so reading 2 could not answer non-empty and "
-        f"its empty result below says nothing"
+    assert escaping_tile == 0, (
+        f"the {escaping_width}-wide control does not clear the "
+        f"{DEFAULT_WEIGHT_BLOCK_SIZE} tile, so the tile rule would answer for it and "
+        f"this control would be reading the wrong rule"
     )
-    if not boundaries_coincide:
-        assert escaping_tile == 0, (
-            f"the {escaping_width}-wide control no longer clears the tile while "
-            f"failing the consumer block: tile remainder {escaping_tile}, consumer "
-            f"remainder {escaping_block}, against tile {DEFAULT_WEIGHT_BLOCK_SIZE} and "
-            f"consumer block {consumer_block}. That discrimination is the whole reason "
-            f"the item reads both boundaries"
+    assert escaping_block, (
+        f"the {escaping_width}-wide control leaves no remainder in a {moved_block}-row "
+        f"consumer block, so reading 2's predicate could not answer non-empty and its "
+        f"empty result below says nothing"
+    )
+    # AND THE PRODUCTION READING, stated rather than implied: at the real granularity
+    # the same width clears BOTH rules, which is why the control had to move the block
+    # instead of the width.
+    print(
+        f"GRIDSHARD_B_AT_PRODUCTION_BLOCK={consumer_block} "
+        f"ESCAPING_WIDTH_REMAINDER={part_block(escaping_width)}"
+    )
+    if boundaries_coincide:
+        assert part_block(escaping_width) == 0, (
+            f"the consumer block {consumer_block} and the tile "
+            f"{DEFAULT_WEIGHT_BLOCK_SIZE[0]} were read as coinciding, but {escaping_width} "
+            f"leaves {part_block(escaping_width)} in the consumer block and 0 in the "
+            f"tile. They do not coincide and this branch is the wrong one"
         )
 
     assert offenders == {}, (
@@ -6683,7 +6726,7 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
     assert block_offenders == {}, (
         f"an MLA head width is not a whole number of the CONSUMER's blocks: "
         f"{block_offenders}, against a consumer block of {consumer_block} imported "
-        f"from ``consumer_block_quant_size()``. Such a width can clear the "
+        f"from ``dense_consumer_block_quant_size()``. Such a width can clear the "
         f"{DEFAULT_WEIGHT_BLOCK_SIZE} checkpoint tile and still be refused, because "
         f"``shard_geometry_for_grid`` makes TWO refusals and this is the second one. "
         f"inc-glm53f-105 declines ``pad_to_consumer_block`` on a head-bearing axis, "
@@ -7273,7 +7316,7 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
     readings of the shared expert rather than of a load that would pass anyway.
     """
     directory, _overrides, _mappings = _deferred_checkpoint(tmp_path)
-    block = _WL_FP8.consumer_block_quant_size()
+    block = _WL_FP8.dense_consumer_block_quant_size()
 
     model = _load_blocked(directory, monkeypatch)
 

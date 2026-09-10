@@ -37,7 +37,7 @@ from vllm_neuron.model.glm5_next.model_fp8 import (
 )
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     FP8_SCALE_SUFFIX,
-    consumer_block_quant_size,
+    dense_consumer_block_quant_size,
 )
 
 _FP8 = torch.float8_e4m3fn
@@ -113,11 +113,13 @@ def test_a_whole_256_checkpoint_publishes_at_128_and_the_prep_accepts_it() -> No
     module's OWN attributes after the publish -- so a wrong grid reaches it exactly as it would on
     a real load.
     """
-    if consumer_block_quant_size() != SCALE_BLOCK_SIZE:
+    if dense_consumer_block_quant_size() != SCALE_BLOCK_SIZE:
         raise AssertionError(
-            f"the load path's consumer granularity is {consumer_block_quant_size()} while the "
-            f"kernel indexes {SCALE_BLOCK_SIZE}; these two must be one number or this whole file "
-            f"is testing a coincidence"
+            f"the load path's DENSE consumer granularity is "
+            f"{dense_consumer_block_quant_size()} while the kernel indexes "
+            f"{SCALE_BLOCK_SIZE}; these two must be one number or this whole file "
+            f"is testing a coincidence. The routed bank's block is a different "
+            f"number and is not this file's subject"
         )
     module = _module()
     published = module.retile_checkpoint_scale_grids()

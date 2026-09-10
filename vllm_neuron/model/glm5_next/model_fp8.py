@@ -88,11 +88,12 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     build_weight_mappings,
     classify_mapped_keys,
     compensate_block_scales,
-    consumer_block_quant_size,
     DeferredShardGeometry,
+    dense_consumer_block_quant_size,
     dequantise_blockwise,
     loader_for_mapped_keys,
     report_floored_blocks,
+    routed_bank_consumer_block_quant_size,
     scale_keys,
     sharded_scale_grid_loader,
     ShardGeometry,
@@ -315,12 +316,15 @@ class _DeclaredShard:
     width source that cannot disagree with the weights.
 
     ``pad_to_consumer_block`` rounds the full width UP to the smallest multiple of
-    ``world_size * consumer_block_quant_size()`` before dividing, so every rank's
-    shard is a whole consumer block. It is a FLAG and not the number, because the
-    number lives in the consumer and is imported at attachment time rather than at
+    ``world_size * dense_consumer_block_quant_size()`` before dividing, so every
+    rank's shard is a whole consumer block. It is a FLAG and not the number, because
+    the number lives in the consumer and is imported at attachment time rather than at
     import time -- which is why narrowing that number to ``128`` in
-    ``inc-glm53f-112`` moved this pad without touching this class -- see
-    :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.consumer_block_quant_size`.
+    ``inc-glm53f-112`` moved this pad without touching this class. The DENSE
+    consumer's is the one this flag reads: the families that declare it are the dense
+    MLP and the shared expert, and ``blockwise_fp8_mm`` is what dequantises both --
+    see
+    :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.dense_consumer_block_quant_size`.
     Ruled at design entry ``design-20260905-ap``, remedy part 2.
     """
 
@@ -434,7 +438,7 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # ``increments/probe-101-grid-host-r6.out``. The three families now declare
 # ``width=None`` with ``pad_to_consumer_block=True``: the width is read off the
 # checkpoint tensor and rounded UP to a multiple of
-# ``world_size * consumer_block_quant_size()``. Ruled at design entry
+# ``world_size * dense_consumer_block_quant_size()``. Ruled at design entry
 # ``design-20260905-ap``, remedy part 2.
 #
 # THE PAD SHRANK IN ``inc-glm53f-112`` and nothing here changed to make it: the
@@ -442,8 +446,10 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # ``world_size * 128``. The padded widths that follow are 16384 at 64 ranks, and
 # 12288 UNCHANGED at 32 or fewer -- where the 256 block had padded 32 ranks up to
 # 16384. Less padding for the same load, and the readings that check it derive the
-# block from ``consumer_block_quant_size()`` rather than typing a number, so they
-# followed on their own.
+# block from ``dense_consumer_block_quant_size()`` rather than typing a number, so
+# they followed on their own. The ROUTED BANK's own rule keeps the 256 it always had
+# and is read from its own producer -- one block constant per consumer, round 2's
+# first finding.
 
 
 # -- inc-glm53f-100 -- the MLA families' three widths. ---------------------- #
@@ -734,19 +740,28 @@ def _shard_geometry_for(
             # path is the right one.
             return None
     if declared.width is None:
-        # Both flags read the SAME number from the consumer and mean opposite things
-        # about an inadmissible width: pad it up, or refuse it. ``inc-glm53f-106`` adds
-        # the second. The number is imported either way, never typed here, for the
-        # reason ``consumer_block_quant_size``'s own docstring gives.
+        # The two flags mean opposite things about an inadmissible width -- pad it up,
+        # or refuse it -- and since `inc-glm53f-112` round 2 they read TWO DIFFERENT
+        # NUMBERS, each from the producer that enforces it. The pad belongs to the
+        # dense MLP and the shared expert, whose weights ``blockwise_fp8_mm``
+        # dequantises at ``SCALE_BLOCK_SIZE``; the requirement belongs to the routed
+        # bank alone (``inc-glm53f-106``), whose scale operands the MoE retile builds
+        # at ``BLOCK_QUANT_SIZE``. Reading one number for both admitted a bank shard
+        # the bank itself refuses later, inside its prep. Both are imported, never
+        # typed here.
         return DeferredShardGeometry(
             shard_dim=declared.shard_dim,
             num_shards=num_shards,
             pad_to_multiple_of=(
-                consumer_block_quant_size() if declared.pad_to_consumer_block else None
+                dense_consumer_block_quant_size()
+                if declared.pad_to_consumer_block
+                else None
             ),
             expert_parallel_degree=ep_degree,
             require_multiple_of=(
-                consumer_block_quant_size() if declared.require_consumer_block else None
+                routed_bank_consumer_block_quant_size()
+                if declared.require_consumer_block
+                else None
             ),
         )
     if declared.shards_within_expert_parallel_group:
@@ -3174,9 +3189,11 @@ class Glm5NextSharedExperts(nn.Module):
                 raise Glm5NextSharedExpertRouteError(
                     f"{grid_name} is not on this module. The block-scale grids "
                     f"are plain attributes the weight loader attaches beside "
-                    f"each declared weight, and this route consumes the PUBLIC "
-                    f"grid at BLOCK_QUANT_SIZE granularity that "
-                    f"retile_checkpoint_scale_grids publishes. Refusing rather "
+                    f"each declared weight, and this route consumes the grid at "
+                    f"blockwise_fp8_mm.SCALE_BLOCK_SIZE granularity that "
+                    f"retile_checkpoint_scale_grids publishes -- the checkpoint's "
+                    f"own, since `inc-glm53f-112`, and NOT the routed bank's "
+                    f"larger block. Refusing rather "
                     f"than running an unscaled matmul, which returns plausible "
                     f"numbers."
                 )
@@ -3511,8 +3528,11 @@ class Glm5NextDenseMLP(nn.Module):
         binds hand-drawn compute-frame weights and their grids straight onto the
         module, which is the loader's job and not the fixture's. Those grids were
         ``256`` until ``inc-glm53f-112`` narrowed the kernel to the checkpoint's own
-        ``128``; the fixture builds them from the product's own declaration, so it
-        followed without an edit.
+        ``128``. THAT FIXTURE DID NOT FOLLOW ON ITS OWN, and the sentence here used to
+        claim it did: it built its grids from the MoE producer's constant, so `-112`
+        round 2 had to re-pin it, and three sibling suites with it, to
+        ``blockwise_fp8_mm.SCALE_BLOCK_SIZE``. Any new fixture for this class reads
+        that name.
 
         The whole body is :func:`_publish_compute_frame_operands`, shared with
         :class:`Glm5NextSharedExperts` -- one definition of the frame rule, not a
