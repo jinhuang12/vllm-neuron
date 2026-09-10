@@ -2390,7 +2390,13 @@ def test_cte_128_down_and_swiglu_refuse_wrong_operands_by_name() -> None:
         moe_down_blockwise_fp8(inter.unsqueeze(0), weight, operand, affinity)
     assert "must have rank 2" in str(rank.value)
 
-    wrong_way = torch.zeros((G128_H, G128_I), dtype=torch.float32).to(_FP8)
+    # THE WRONG-WAY WEIGHT IS BUILT AT A CONTRACTION THIS CASE DOES NOT USE, and
+    # that is forced rather than chosen. `H` and `I_TP` are both 512 here, so the
+    # transpose of this case's own `[I, H]` weight carries the SAME shape as the
+    # weight itself, and a seam that checks axis 0 has nothing to see. Doubling
+    # the contraction separates the two orientations: `[2*H, I]` is the shape a
+    # valid `[I, 2*H]` weight would have if it were handed over transposed.
+    wrong_way = torch.zeros((2 * G128_H, G128_I), dtype=torch.float32).to(_FP8)
     with pytest.raises(MoeBlockwiseFp8Error) as orientation:
         moe_down_blockwise_fp8(inter, wrong_way, operand, affinity)
     assert "contraction-major" in str(orientation.value)
@@ -2402,6 +2408,12 @@ def test_cte_128_down_and_swiglu_refuse_wrong_operands_by_name() -> None:
     with pytest.raises(MoeBlockwiseFp8Error) as columns:
         moe_down_blockwise_fp8(inter, weight, operand, affinity[:-1])
     assert "affinity must be [B, 1]" in str(columns.value)
+    # AND THE ORIENTATION ARM ABOVE IS NOT HOLLOW, which this line is what says.
+    # The call here carries the case's OWN correctly-oriented weight and reached
+    # the affinity guard, so it got PAST the orientation guard -- which makes the
+    # message that arm reads the orientation guard's own, rather than something
+    # every refused call to this seam happens to carry.
+    assert "contraction-major" not in str(columns.value)
 
     with pytest.raises(MoeBlockwiseFp8Error) as grid:
         to_down_kernel_scale_operand(case["grid"][0][:, :-1].contiguous(), G128_I, G128_H)
