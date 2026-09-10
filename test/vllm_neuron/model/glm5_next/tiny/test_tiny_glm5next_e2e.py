@@ -1673,3 +1673,360 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
             "yet by so little that it no longer separates a missing pool member from a rounding. "
             "That is a finding to report, not a bound to widen"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEMS 12-15 (`inc-glm53f-054f`). THE THREE REFUSALS THAT HAD NO TEST ARM, AND THE
+# POSITION CURSOR THAT GIVES THE LIVE RING A SEQUENCE IDENTITY.
+#
+# WHY THESE FOUR ARE HERE AND NOT IN `-054b`. The three refusals were written by `-054b`
+# and nothing measured them, so nothing would have noticed if one stopped firing. The
+# cursor is new: the side caches are keyed by absolute position and carry no sequence
+# identity, so a fresh request admitted at a non-zero cached length -- an automatic
+# prefix-cache hit -- would read the previous request's rows with no error at all.
+#
+# EVERY ARM CARRIES ITS OWN MUST-FAIL CONTROL, and for a refusal the control is the
+# NEGATIVE one: the same call with the offending argument removed must NOT produce that
+# refusal. Without it an arm passes whenever the call fails for any reason, which is the
+# way a refusal test rots. `item.VacuousControlError` fires when a control cannot
+# separate the two cases at all.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+MULTI_TOKEN_DECODE = 3
+STALE_DECODE_GAP = 3
+PLANTED_RING = 9.0
+
+
+def _sparse_indexer(layers):
+    """The first layer's DSA indexer, reached the way this file already reaches it."""
+    for layer in layers:
+        attention = getattr(layer, "self_attn", None)
+        indexer = getattr(attention, "indexer", None)
+        if indexer is not None:
+            return indexer
+    raise item.VacuousControlError(
+        "this fixture exposes no DSA indexer, so the two prefill_tail refusals cannot be "
+        "reached and the arms below would pass without measuring anything"
+    )
+
+
+def _live_rings(runner, banks):
+    return [side for side in runner._glm5next_live_side_caches(banks) if "tail" in side]
+
+
+def test_the_decode_leg_refuses_a_step_carrying_more_than_one_token():
+    """ITEM 12. A decode step with more than one token is refused BY NAME.
+
+    THE REFUSAL EXISTS BECAUSE THE SEAM IS SINGULAR: the decode leg advances the ring one
+    position per call, taking one key row and one position. A multi-token decode is
+    speculative decoding's verify step, which this half does not implement, and threading
+    one would advance the ring once for several tokens.
+
+    THE CONTROL IS THE NEGATIVE ONE. The same call carrying a single token must not raise
+    this refusal. Without that half, the arm would pass on any failure of the builder --
+    a wrong geometry, a bad slot -- and would stop measuring the token count entirely.
+    """
+    _require_cpu_mode()
+    fixture = _fixture()
+    root = fixture["root"]
+    root.bind_kv_cache(_runner_shaped_caches(root))
+    banks = root.glm5next_layer_banks
+    text_config = root.text_config
+    if MULTI_TOKEN_DECODE <= 1:
+        raise item.VacuousControlError(
+            f"this arm needs a decode carrying more than one token; it carries "
+            f"{MULTI_TOKEN_DECODE}, which is what the refusal allows"
+        )
+    side = NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=int(text_config.index_kpool),
+        index_head_dim=int(text_config.index_head_dim),
+        max_seq_len=item.STACK_TOKENS,
+    )
+
+    def build(tokens: int):
+        return NeuronModelRunner._glm5next_layer_carriers(
+            banks,
+            side,
+            geometries=_geometries(banks, block_ids=range(PROMPT_BLOCKS), state_slot=0),
+            is_prefill=False,
+            tokens=tokens,
+            start_position=item.STACK_TOKENS,
+            softmax_scale=item.MLA_SOFTMAX_SCALE,
+            max_seq_len=item.STACK_TOKENS + tokens,
+            index_kpool=int(text_config.index_kpool),
+        )
+
+    with pytest.raises(ValueError) as caught:
+        build(MULTI_TOKEN_DECODE)
+    message = str(caught.value)
+    print(f"TINYE2E|refusal_multi_token_decode|tokens={MULTI_TOKEN_DECODE}|{message}")
+    assert "threading a multi-token decode" in message, (
+        f"a {MULTI_TOKEN_DECODE}-token decode raised, but not the refusal this arm names: "
+        f"{message}"
+    )
+    assert f"{MULTI_TOKEN_DECODE} token(s)" in message, (
+        "the refusal does not report the count it actually saw, so a reader cannot tell "
+        "which step was refused"
+    )
+
+    # ---- THE CONTROL: one token on the same path must not raise THIS refusal.
+    control = None
+    try:
+        build(1)
+    except Exception as exc:  # noqa: BLE001 - the control reports whatever it gets
+        control = f"{type(exc).__name__}: {exc}"
+    print(f"TINYE2E|refusal_multi_token_decode_control|tokens=1|raised={control}")
+    if control is not None and "threading a multi-token decode" in control:
+        raise item.VacuousControlError(
+            "a single-token decode raised the multi-token refusal too, so this arm is not "
+            "measuring the token count and would pass with the guard removed"
+        )
+
+
+def test_the_indexer_refuses_a_prefill_ring_handed_to_a_decode_step():
+    """ITEM 13. ``prefill_tail`` on a decode step is refused BY NAME.
+
+    ONE CALL ADVANCES THE RING OR SEEDS IT, NEVER BOTH. The decode leg's ring is ``tail``
+    and the prefill leg's is ``prefill_tail``; a call carrying both is asking the indexer
+    to do two different things to one buffer.
+
+    THE OPERANDS ARE DELIBERATELY MINIMAL, AND THAT IS SAFE HERE FOR A STATED REASON: the
+    refusal is raised before the hidden states or the query latent are read at all, so
+    passing real ones would add a shape this arm does not measure. The control is what
+    keeps that honest -- with ``prefill_tail`` dropped, this refusal must not appear.
+    """
+    _require_cpu_mode()
+    fixture = _fixture()
+    root, layers = fixture["root"], fixture["layers"]
+    root.bind_kv_cache(_runner_shaped_caches(root))
+    banks = root.glm5next_layer_banks
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+    indexer = _sparse_indexer(layers)
+    rings = _live_rings(runner, banks)
+    if not rings:
+        raise item.VacuousControlError(
+            "the live side caches carry no ring, so there is no prefill_tail to hand a "
+            "decode step and this arm cannot reach its refusal"
+        )
+    ring = rings[0]["tail"]
+    pool_cache = item._mla_pool_cache(pages=item.STACK_PAGES)
+    selection = item._mla_selection_operands(tokens=1, pages=item.STACK_PAGES)
+    minimal = torch.zeros(1, 1, dtype=pool_cache.dtype)
+
+    def call(**extra):
+        return indexer(
+            minimal,
+            minimal,
+            pool_cache,
+            selection["seq_lens"],
+            max_seq_len=item.STACK_TOKENS,
+            page_size=item.MLA_PAGE_SIZE,
+            tail=ring,
+            position=0,
+            **extra,
+        )
+
+    with pytest.raises(Exception) as caught:
+        call(prefill_tail=ring)
+    message = str(caught.value)
+    print(f"TINYE2E|refusal_prefill_ring_on_decode|{type(caught.value).__name__}|{message}")
+    assert "prefill_tail is the PREFILL leg's ring" in message, (
+        f"the decode step carrying a prefill ring raised, but not the refusal this arm "
+        f"names: {message}"
+    )
+
+    # ---- THE CONTROL: the same decode step without the prefill ring.
+    control = None
+    try:
+        call()
+    except Exception as exc:  # noqa: BLE001
+        control = f"{type(exc).__name__}: {exc}"
+    print(f"TINYE2E|refusal_prefill_ring_on_decode_control|raised={control}")
+    if control is not None and "prefill_tail is the PREFILL leg's ring" in control:
+        raise item.VacuousControlError(
+            "the decode step raised the prefill-ring refusal even without a prefill ring, "
+            "so this arm is not measuring the argument it names"
+        )
+
+
+def test_the_indexer_refuses_a_prefill_ring_with_no_end_position():
+    """ITEM 14. ``prefill_tail`` without ``prefill_end_position`` is refused BY NAME.
+
+    SEEDING THE RING NEEDS THE SEQUENCE LENGTH AFTER THIS CHUNK. The remainder positions
+    a prefill seeds are the ones past its last complete pool, so the indexer cannot know
+    WHICH slots to write without the end position. Seeding without it would write the
+    wrong slots and the next completion would pool the wrong keys.
+
+    THE CONTROL SUPPLIES THE END POSITION and requires this refusal to disappear, which is
+    what separates "the end position was missing" from "the call failed".
+    """
+    _require_cpu_mode()
+    fixture = _fixture()
+    root, layers = fixture["root"], fixture["layers"]
+    root.bind_kv_cache(_runner_shaped_caches(root))
+    banks = root.glm5next_layer_banks
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+    indexer = _sparse_indexer(layers)
+    rings = _live_rings(runner, banks)
+    if not rings:
+        raise item.VacuousControlError(
+            "the live side caches carry no ring, so there is no prefill_tail to seed and "
+            "this arm cannot reach its refusal"
+        )
+    ring = rings[0]["tail"]
+    pool_cache = item._mla_pool_cache(pages=item.STACK_PAGES)
+    selection = item._mla_selection_operands(
+        tokens=item.STACK_TOKENS, pages=item.STACK_PAGES
+    )
+    minimal = torch.zeros(1, 1, dtype=pool_cache.dtype)
+
+    def call(**extra):
+        return indexer(
+            minimal,
+            minimal,
+            pool_cache,
+            selection["seq_lens"],
+            max_seq_len=item.STACK_TOKENS,
+            page_size=item.MLA_PAGE_SIZE,
+            slot_mapping=selection["slot_mapping"],
+            prefill_tail=ring,
+            **extra,
+        )
+
+    with pytest.raises(Exception) as caught:
+        call()
+    message = str(caught.value)
+    print(f"TINYE2E|refusal_seed_without_end_position|{type(caught.value).__name__}"
+          f"|{message}")
+    assert "a prefill_tail with no prefill_end_position" in message, (
+        f"the seeding call raised, but not the refusal this arm names: {message}"
+    )
+
+    # ---- THE CONTROL: the same call with the end position supplied.
+    control = None
+    try:
+        call(prefill_end_position=int(item.STACK_TOKENS))
+    except Exception as exc:  # noqa: BLE001
+        control = f"{type(exc).__name__}: {exc}"
+    print(f"TINYE2E|refusal_seed_without_end_position_control|raised={control}")
+    if control is not None and "a prefill_tail with no prefill_end_position" in control:
+        raise item.VacuousControlError(
+            "the seeding call still reported a missing end position after one was supplied, "
+            "so this arm is not measuring that argument"
+        )
+
+
+def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring():
+    """ITEM 15. The live ring carries a POSITION CURSOR, and a fresh sequence resets it.
+
+    THE DEFECT THIS CLOSES. The side caches live for the process and are keyed by absolute
+    position with no sequence identity. A fresh request that enters at a non-zero cached
+    length -- what an automatic prefix-cache hit produces -- would be served from the last
+    request's rows with nothing raised and nothing shaped wrongly. The cursor supplies the
+    identity: it is the position the live ring has been advanced to.
+
+    FOUR THINGS ARE MEASURED, and the last two are the control:
+      1. a fresh prefill sets the cursor to the tokens it consumed, and a decode that
+         continues it advances the cursor by one;
+      2. a decode at a position the cursor does not name is REFUSED, and the refused step
+         leaves the cursor untouched -- a refusal must leave no trace;
+      3. a second fresh prefill resets the cursor and empties the ring, so the second
+         request reads its own rows and not the planted ones;
+      4. THE CONTROL, which is the must-fail direction: after that reset, the FIRST
+         request's next position is refused. If it were still served, the ring would have
+         kept the first sequence's identity and item 3 would be passing on a stale cursor.
+    """
+    _require_cpu_mode()
+    root = _fixture()["root"]
+    root.bind_kv_cache(_runner_shaped_caches(root))
+    banks = root.glm5next_layer_banks
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = root
+    runner.max_model_len = E2E_MAX_SEQ_LEN
+    prompt = int(item.STACK_TOKENS)
+    stale = prompt + STALE_DECODE_GAP
+    if STALE_DECODE_GAP == 0:
+        raise item.VacuousControlError(
+            "the stale decode must sit at a position the cursor does not name; a gap of 0 "
+            "is the position the cursor does name"
+        )
+    if stale + 1 > E2E_MAX_SEQ_LEN:
+        raise item.VacuousControlError(
+            f"the stale decode at {stale} plus its token exceeds the {E2E_MAX_SEQ_LEN} "
+            f"slots this fixture allocates, so it would be refused for length instead"
+        )
+
+    def step(cached: int, tokens: int):
+        return _model_kwargs(
+            runner,
+            input_ids=torch.zeros(tokens, dtype=torch.long),
+            cached=cached,
+            sampling_row=tokens - 1 if tokens > 1 else 0,
+        )
+
+    # ---- 1. the first sequence opens and advances.
+    step(0, prompt)
+    opened = int(runner._glm5next_side_cache_cursor)
+    step(prompt, 1)
+    advanced = int(runner._glm5next_side_cache_cursor)
+    print(f"TINYE2E|cursor_first_sequence|opened={opened}|advanced={advanced}"
+          f"|prompt={prompt}")
+    assert opened == prompt, (
+        f"a fresh prefill of {prompt} tokens left the cursor at {opened}; the cursor must "
+        f"name the position the ring has been advanced to"
+    )
+    assert advanced == prompt + 1, (
+        f"a decode that continued the sequence left the cursor at {advanced} rather than "
+        f"{prompt + 1}, so the ring's recorded position no longer tracks the work done"
+    )
+
+    # ---- 2. a step the cursor does not name is refused, and leaves no trace.
+    with pytest.raises(ValueError) as caught:
+        step(stale, 1)
+    message = str(caught.value)
+    print(f"TINYE2E|cursor_refuses_a_stale_position|at={stale}|{message}")
+    assert "stands at position" in message, (
+        f"a decode at {stale} raised, but not the cursor refusal this arm names: {message}"
+    )
+    assert int(runner._glm5next_side_cache_cursor) == advanced, (
+        "the refused step moved the cursor; a refusal must leave the ring's recorded "
+        "position exactly as it was, or the next legitimate step is refused for a "
+        "mismatch the refused one caused"
+    )
+
+    # ---- 3. a second fresh sequence resets the cursor and empties the ring.
+    for side in _live_rings(runner, banks):
+        side["tail"].fill_(PLANTED_RING)
+    step(0, prompt)
+    reset = int(runner._glm5next_side_cache_cursor)
+    planted = max(float(side["tail"].abs().max()) for side in _live_rings(runner, banks))
+    print(f"TINYE2E|cursor_second_sequence|reset={reset}|ring_max={planted}"
+          f"|planted={PLANTED_RING}")
+    assert reset == prompt, (
+        f"the second fresh prefill left the cursor at {reset}; a prefill at position 0 is "
+        f"a new sequence and must reopen the ring at its own length"
+    )
+    assert planted == 0.0, (
+        "the second sequence started on the first sequence's planted ring, which is the "
+        "silent cross-sequence read this item exists to refuse"
+    )
+
+    # ---- 4. THE CONTROL: the first sequence's next position is now refused.
+    with pytest.raises(ValueError) as after:
+        step(advanced, 1)
+    control = str(after.value)
+    print(f"TINYE2E|cursor_reset_control|first_sequence_next={advanced}|{control}")
+    assert "stands at position" in control, (
+        f"the first sequence's next position {advanced} was still served after a second "
+        f"sequence opened, so the cursor did not reset and item 3 above would pass on a "
+        f"stale identity: {control}"
+    )
+    assert str(reset) in control, (
+        "the refusal does not report the position the ring actually stands at, so a reader "
+        "cannot tell which sequence owns the ring"
+    )
