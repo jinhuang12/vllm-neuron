@@ -338,11 +338,11 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     THE RULE. The slice spans the whole pages the request's own tokens occupy, counted from
     the request's first page: ``ceil((start_position + tokens) / page)`` pages. It therefore
     covers ``start_position + tokens`` slots, which is the bound the layer checks before it
-    writes (``model_fp8.py:6862-6869``), and its rows are the request's own.
+    writes (``model_fp8.py:6862-6867``), and its rows are the request's own.
 
     WHY THE ALIAS MATTERS. The layer writes this step's latents THROUGH the slice
-    (``model_fp8.py:6879``) and reads slot 0 to the last written slot back out of it
-    (``model_fp8.py:6882``). A basic slice is a view, so both land in the bank. A gather
+    (``model_fp8.py:6877``) and reads slot 0 to the last written slot back out of it
+    (``model_fp8.py:6881``). A basic slice is a view, so both land in the bank. A gather
     would return a copy, and the write would be discarded where the next step reads.
     """
     cpu = torch.device("cpu")
