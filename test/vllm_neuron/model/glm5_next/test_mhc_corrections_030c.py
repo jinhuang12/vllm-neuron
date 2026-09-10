@@ -553,6 +553,95 @@ def test_030c_rms_epsilon_site_is_load_bearing_and_the_old_value_moves_it() -> N
         )
 
 
+#: The deliberately WRONG RMS epsilon the control below installs. It is not a
+#: plausible epsilon and is not meant to be: the arm above proved the real swap is
+#: too small for fp32 to carry downstream, so the control needs a change fp32 CAN
+#: carry. At this value the norm's scale moves by about 29 percent.
+WRONG_RMS_EPS = 1.0
+
+#: Sixteen fp32 steps, the same floor the arm above uses. A return that moves less
+#: than this could have moved on rounding.
+RMS_CONTROL_FLOOR_STEPS = 16.0
+
+
+def test_030c_control_a_wrong_rms_epsilon_moves_every_return() -> None:
+    """CONTROL for COUNTED VALUE 2, site 1: ``mhc_pre``'s OWN CODE reads ``rms_eps``.
+
+    WHY THIS ITEM EXISTS. The arm above had to move its assertion off the three
+    returns, because ``1e-05`` against ``1e-06`` is a 4.5e-06 relative change that
+    the gates attenuate below one fp32 step. That left a hole worth closing rather
+    than living with: after the correction, nothing in this file asserted that this
+    layer's own arithmetic reads ``self.rms_eps`` at all.
+    :func:`test_030c_rms_epsilon_reads_the_models_rms_norm_eps` checks the
+    ATTRIBUTE, and would still pass if :meth:`mhc_pre` ignored it;
+    :func:`test_030c_post_gate_matches_the_reference_two_sigmoid` compares against
+    the transcribed reference at the cited relative tolerance of ``1e-02``, where a
+    4.5e-06 difference is invisible. So neither can tell the corrected site from a
+    site that dropped the constant.
+
+    HOW IT CLOSES THE HOLE. Install an epsilon that is deliberately, obviously
+    wrong -- ``1.0`` -- and require every one of the three returns to move by at
+    least sixteen fp32 steps of its own magnitude. That change is one fp32 can
+    carry: the norm's scale moves about 29 percent, ``mixes`` about 4.7e-04, which
+    reaches the returns as hundreds of steps rather than tenths of one. A layer
+    that never read ``self.rms_eps`` would return bit-identical tensors and fail
+    every one of the three.
+
+    This is the arm's own name -- the site is load-bearing -- measured at a
+    magnitude where the reading cannot turn on rounding. It says nothing about
+    ``1e-06``; that comparison stays a printed reading above.
+    """
+    fn, hc_scale, hc_base, residual = _fixture()
+    layer, _cfg = _layer()
+    _load(layer, fn, hc_scale, hc_base)
+
+    eps_real = float(layer.rms_eps)
+    if WRONG_RMS_EPS == eps_real:
+        raise VacuousControlError(
+            f"the control epsilon {WRONG_RMS_EPS} equals the layer's real one, so "
+            f"installing it changes nothing and every reading below would be "
+            f"vacuous"
+        )
+
+    # What the norm's scale does under the swap, from the fixture's own mean
+    # square. Printed so a reader can see the control is large by construction
+    # rather than take the docstring's word for it.
+    flat = residual.flatten(start_dim=1).to(torch.float32)
+    mean_square = flat.square().mean(dim=-1, keepdim=True)
+    real_scale = torch.rsqrt(mean_square + eps_real)
+    wrong_scale = torch.rsqrt(mean_square + WRONG_RMS_EPS)
+    scale_change = float(((real_scale - wrong_scale) / real_scale).abs().max())
+
+    sinkhorn_mod.reset_dispatch_counters()
+    real = layer.mhc_pre(residual)
+    layer.rms_eps = WRONG_RMS_EPS
+    wrong = layer.mhc_pre(residual)
+    _route_reading("value-2-rms-control", calls=2)
+
+    print(
+        f"[value-2-site-rms-control] rms_eps {eps_real} -> {WRONG_RMS_EPS} "
+        f"scale_change_rel={scale_change:.6e} "
+        f"floor_steps={RMS_CONTROL_FLOOR_STEPS:.0f}"
+    )
+    for name, before, after in zip(("post_mix", "comb_mix", "layer_input"), real, wrong):
+        delta = float((before - after).abs().max())
+        # One step at the tensor's LARGEST magnitude, which is the biggest step in
+        # the tensor and therefore the smallest, most conservative step count.
+        step = float(_ulp(before).max())
+        steps = delta / step if step > 0.0 else float("nan")
+        print(
+            f"[value-2-site-rms-control] {name} delta={delta:.6e} "
+            f"one_step={step:.6e} steps={steps:.2f}"
+        )
+        assert steps >= RMS_CONTROL_FLOOR_STEPS, (
+            f"installing the wrong RMS epsilon {WRONG_RMS_EPS} moved {name} by "
+            f"{delta:.6e}, only {steps:.2f} fp32 steps of its own magnitude and "
+            f"under the floor of {RMS_CONTROL_FLOOR_STEPS:.0f}; a change this "
+            f"large at the norm ({scale_change:.6e} relative on its scale) has to "
+            f"arrive, so this layer's arithmetic does not read self.rms_eps"
+        )
+
+
 def test_030c_hc_epsilon_sites_are_the_pre_and_comb_gates_only() -> None:
     """COUNTED VALUE 2, sites 2 and 3, WITH their negative reading.
 
