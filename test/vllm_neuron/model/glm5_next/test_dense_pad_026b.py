@@ -82,12 +82,14 @@ import pytest
 import torch
 
 #: Asked of the one definition rather than retyped: the seam re-exports both.
-from vllm_neuron.functional.blockwise_fp8_mm import BLOCK_QUANT_SIZE, TILE_SIZE
+from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE, TILE_SIZE
 
-#: ``H`` and ``I``: two whole ``BLOCK_QUANT_SIZE`` columns each, the smallest
-#: extents the public scale grid can express for both projection shapes.
-HIDDEN = 2 * BLOCK_QUANT_SIZE
-INTERMEDIATE = 2 * BLOCK_QUANT_SIZE
+#: ``H`` and ``I``: four whole ``SCALE_BLOCK_SIZE`` columns each. `inc-glm53f-112`
+#: narrowed the granularity from 256 to 128, so this is no longer the smallest
+#: legal geometry -- the extent is held at 512 on purpose, so this padding test
+#: keeps the geometry it was written for.
+HIDDEN = 4 * SCALE_BLOCK_SIZE
+INTERMEDIATE = 4 * SCALE_BLOCK_SIZE
 
 #: The count under test, and the count the oracle runs. ``1`` is the decode step
 #: the seam refused; ``TILE_SIZE`` is the smallest count it ever accepted, so the
@@ -194,8 +196,8 @@ def _pow2_grid(exponent: int, rows: int, cols: int) -> torch.Tensor:
 def _operands() -> dict:
     """The three weights, the three public grids, and one row of activations."""
     fp8 = torch.float8_e4m3fn
-    k_parallel = HIDDEN // BLOCK_QUANT_SIZE
-    n_parallel = INTERMEDIATE // BLOCK_QUANT_SIZE
+    k_parallel = HIDDEN // SCALE_BLOCK_SIZE
+    n_parallel = INTERMEDIATE // SCALE_BLOCK_SIZE
     return {
         "row": _fp8_grid_values(SEED_HIDDEN, ONE_TOKEN, HIDDEN).to(torch.bfloat16),
         "gate_proj_weight": (

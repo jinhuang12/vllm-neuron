@@ -1634,8 +1634,9 @@ class DeferredShardGeometry:
     ``num_shards * pad_to_multiple_of``, so every rank's shard is a whole number
     of consumer blocks and the padded tail is zeros (weight) or ones (grid). This
     is what makes a 12288-wide dense intermediate loadable at 64 ranks, where
-    12288 // 64 == 192 is neither a 128-row checkpoint tile nor a 256-row
-    consumer block. Ruled at design entry ``design-20260905-ap``, remedy part 2.
+    12288 // 64 == 192 is a whole number of neither -- and since `inc-glm53f-112`
+    the two are the same 128 rows, so 192 clears neither on the same arithmetic.
+    Ruled at design entry ``design-20260905-ap``, remedy part 2.
     """
 
     shard_dim: int
@@ -1659,7 +1660,8 @@ class DeferredShardGeometry:
     #: no-pad check on the load path is EVEN DIVISION
     #: (``utils/weight_loader.py:330-345``), so a bank at expert-parallel degree 1 on
     #: 4 ranks divided its 512-wide intermediate into 128-row shards -- an even
-    #: division, and not a whole 256-row consumer block -- and the load SUCCEEDED,
+    #: division, and (under the ``256`` consumer grid of the time) not a whole
+    #: consumer block -- and the load SUCCEEDED,
     #: leaving the failure to surface later at ``blockwise_fp8_mm.scale_grid_shape``.
     #: This field is what makes it fail on LOAD instead, which is what design entries
     #: 75 and 77 ruled ("would fail on load, not on the kernel under test").
@@ -1715,24 +1717,70 @@ class DeferredShardGeometry:
 AnyShardGeometry = ShardGeometry | DeferredShardGeometry
 
 
-def consumer_block_quant_size() -> int:
-    """The block extent the block-FP8 consumer will accept, from the consumer.
+def dense_consumer_block_quant_size() -> int:
+    """The block extent the DENSE block-FP8 kernel will accept, from that kernel.
 
-    ``inc-glm53f-101``, remedy part 1. IMPORTED rather than re-typed, and that is
-    the whole point of the function: ``blockwise_fp8_mm.scale_grid_shape``
-    (``:276-288``) refuses any weight extent that is not a whole number of
-    ``BLOCK_QUANT_SIZE`` blocks, and ``blockwise_fp8_retile`` fixes the same
-    number from the vendor's own kernel (``:91``). A literal here would be a
-    second place for the consumer's granularity to live.
+    ``inc-glm53f-101``, remedy part 1, re-aimed by `inc-glm53f-112`. IMPORTED
+    rather than re-typed, and that is the whole point of the function:
+    ``blockwise_fp8_mm.scale_grid_shape`` refuses any weight extent that is not a
+    whole number of ``SCALE_BLOCK_SIZE`` blocks. A literal here would be a second
+    place for the consumer's granularity to live.
+
+    THIS IS THE NUMBER FOR THE DENSE MLP, THE SHARED EXPERT AND EVERY MLA
+    PROJECTION -- every family whose weight is dequantised by ``blockwise_fp8_mm``.
+    Since `-112` that kernel indexes its scales by the ``128``-row blocks the
+    checkpoint itself stores, so this answers 128 where it used to answer 256.
 
     The import is function-local, which is this file's own precedent (``:2131``):
     the module-level block above imports only what every path needs, and a
     consumer import at module scope would make a load-path module depend on a
     kernel module at import time.
     """
-    from vllm_neuron.functional.blockwise_fp8_mm import BLOCK_QUANT_SIZE
+    from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
+
+    return int(SCALE_BLOCK_SIZE)
+
+
+def routed_bank_consumer_block_quant_size() -> int:
+    """The block extent the ROUTED EXPERT BANK will accept, from its own producer.
+
+    ``inc-glm53f-112`` round 2, finding 1. ONE BLOCK CONSTANT PER CONSUMER, each
+    read from the producer that enforces it. The bank does not go through
+    ``blockwise_fp8_mm``: its scale operands are built by the MoE retile, which
+    refuses any extent that is not a whole ``BLOCK_QUANT_SIZE`` block, and that
+    number did not move at `-112`.
+
+    WHY THE TWO CANNOT SHARE ONE FUNCTION ANY MORE. They did share one while both
+    consumers used 256. `-112` moved the dense kernel to 128 and, for one commit
+    range, the bank's own load-time shard rule read the dense number with it --
+    which admitted a 384-row bank shard the bank's producer then refused inside the
+    prep, exactly the "later, on the kernel rather than on the load" failure
+    ``inc-glm53f-106`` exists to prevent. Naming the consumer at every call site is
+    what keeps that from happening again silently.
+    """
+    from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE
 
     return int(BLOCK_QUANT_SIZE)
+
+
+def consumer_block_quant_size() -> int:
+    """The ROUTED BANK's block, under the name the landed callers use.
+
+    KEPT NAME, NARROWED MEANING (`inc-glm53f-112` round 2). This is the name
+    ``inc-glm53f-101`` and ``inc-glm53f-106`` were written against, when there was
+    one consumer granularity in the package and it was 256. Two landed `-106`
+    acceptance items call it by this name and mean the bank's number, so the name
+    keeps answering the bank's number and it forwards rather than holding a second
+    copy of it.
+
+    NEW CODE NAMES ITS CONSUMER. Call
+    :func:`dense_consumer_block_quant_size` or
+    :func:`routed_bank_consumer_block_quant_size` instead; the ambiguity in this
+    name is recorded as debt ``D-112-CONSUMER-BLOCK-NAME`` rather than fixed by a
+    rename, because renaming it would edit two landed items whose bytes this
+    increment is not entitled to move.
+    """
+    return routed_bank_consumer_block_quant_size()
 
 
 def refuse_inadmissible_shard_extent(
@@ -1777,7 +1825,7 @@ def refuse_inadmissible_shard_extent(
     ranks = geometry.num_shards
     # The DOWNWARD neighbour is named only when it exists. Flooring an extent that is
     # already narrower than one block gives 0, and "the nearest admissible extents are
-    # 0 and 256" would offer a rank no rows at all as advice -- found by walking this
+    # 0 and one block" would offer a rank no rows at all as advice -- found by walking this
     # message against the acceptance's own 128-row case rather than by reading it.
     below = (extent // required) * required
     above = below + required
@@ -1835,11 +1883,16 @@ def shard_geometry_for_grid(
     file do hold that property (``:2098-2103``); this one does not, and the
     difference is recorded rather than assumed.
 
-    TWO BOUNDARIES, NOT ONE (``inc-glm53f-101``, remedy part 1). The checkpoint's
-    tile is 128 rows and the CONSUMER's block is 256
-    (:func:`consumer_block_quant_size`), so a shard can clear the tile rule and
-    still be a shard the kernel cannot take -- 12288 // 32 == 384 is three whole
-    tiles and one and a half blocks. Both are checked here, tile first so the
+    TWO BOUNDARIES THAT NOW COINCIDE (``inc-glm53f-101`` remedy part 1, re-pinned
+    by `inc-glm53f-112` under D17.1). The checkpoint's tile is 128 rows, and since
+    `-112` the dense CONSUMER's block
+    (:func:`dense_consumer_block_quant_size`) is the
+    same 128 rows, so any shard that clears the tile rule now clears the block
+    rule as well -- 12288 // 32 == 384 is three whole tiles AND three whole
+    blocks, where under the ``256`` grid it was one and a half blocks and was
+    refused here. The second check is KEPT rather than deleted: it is `-101`'s
+    remedy, not this block's to remove, and it becomes load-bearing again the
+    moment either granularity moves. Both are checked here, tile first so the
     landed refusal keeps its landed message, and the consumer's second with its
     own wording. ``block_size`` is the CHECKPOINT's declared ``weight_block_size``
     threaded in by the caller; the default is the parser's fallback only.
@@ -1916,7 +1969,12 @@ def shard_geometry_for_grid(
             f"sizes are {(geometry.shard_size // extent) * extent} and "
             f"{((geometry.shard_size // extent) + 1) * extent}.",
         )
-    consumer_block = consumer_block_quant_size()
+    # THE DENSE CONSUMER'S, NAMED (`inc-glm53f-112` round 2). Every family that
+    # reaches this branch carries a RESOLVED width -- the MLA projections and KDA --
+    # and every one of them is dequantised by ``blockwise_fp8_mm``. The routed bank
+    # is deferred and never arrives here, so reading the bank's 256 in this place
+    # would enforce a bound no consumer of these weights has.
+    consumer_block = dense_consumer_block_quant_size()
     if geometry.shard_size % consumer_block:
         _refuse(
             param_name,
@@ -1925,8 +1983,9 @@ def shard_geometry_for_grid(
             f"but is NOT a whole number of the CONSUMER's {consumer_block}-row "
             f"blocks. The block-FP8 kernel this weight is dequantised for indexes "
             f"its scales by whole {consumer_block}-row blocks "
-            f"(blockwise_fp8_mm.scale_grid_shape refuses anything else, and "
-            f"blockwise_fp8_retile fixes the same number), so this shard would "
+            f"(blockwise_fp8_mm.SCALE_BLOCK_SIZE fixes that number and "
+            f"scale_grid_shape refuses anything else; the routed expert bank has its "
+            f"OWN, larger block and is not this rule's subject), so this shard would "
             f"load and then be refused at the first forward pass instead of here. "
             f"The nearest consumer-aligned shard sizes are "
             f"{(geometry.shard_size // consumer_block) * consumer_block} and "
@@ -1985,7 +2044,9 @@ def _sharding_loader(
         # this geometry is deferred at all. Wrapping rather than editing
         # ``tensor_width_sharding_loader``: that function lives in a shared utility
         # (``utils/weight_loader.py``) and the block is a block-FP8 fact reached
-        # through ``consumer_block_quant_size()`` in THIS file, so the rule belongs
+        # through ``routed_bank_consumer_block_quant_size()`` in THIS file -- the
+        # BANK's number, because the bank is the only family that declares this
+        # requirement -- so the rule belongs
         # where the families are declared. Precedent for wrapping a transform here:
         # :func:`_weight_slice_only` and :func:`compensating_sharded_scale_grid_loader`.
         def checked(slices: list, rank: int) -> torch.Tensor:
