@@ -8742,14 +8742,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def _update_states_after_model_execute(
         self,
-        scheduler_output: "SchedulerOutput",
         sampled_token_ids: list[list[int]],
+        scheduler_output: "SchedulerOutput",
     ) -> None:
         """Update the cached states after model execution.
 
         On GPU this handles MTP/EAGLE for hybrid models (linear attention
         state shifting). Neuron does not support hybrid models yet, so this
         is a no-op.
+
+        THE PARAMETER ORDER IS THE CALL SITE'S ORDER. This fork's only caller
+        passes ``(sampler_output.sampled_token_ids, scheduler_output)``
+        positionally at ``neuron_model_runner.py:6456-6458`` of this tree, and
+        upstream is self-consistent: it declares ``(output_token_ids,
+        scheduler_output)`` and calls in that same order at
+        ``vllm/v1/worker/gpu_model_runner.py:1497`` and ``:4473``, tag
+        ``v0.24.0``, the version this fork pins. The declaration was the one
+        side that disagreed, so the declaration moved; the name stays this
+        fork's ``sampled_token_ids``. Any body written here before this repair
+        would have read both arguments swapped.
         """
         pass
 
