@@ -453,7 +453,11 @@ def test_initialize_kv_cache_c03_dsa_entries_allocate_the_reported_head_size(
 
     by_name = {layer.name: layer for layer in layers}
     reported = {by_name[name].head_size for name in dsa_names}
-    allocated = {int(caches[name][1].shape[-1]) for name in dsa_names}
+    # A latent layer has ONE bank since its page dropped the second buffer, so
+    # this reads position 0 where it used to read `caches[name][1]` -- the value
+    # half that no longer exists. `k_last` below is now the same reading; both
+    # names are kept so no key disappears from this conjunct's transcript.
+    allocated = {int(caches[name][0].shape[-1]) for name in dsa_names}
     k_last = {int(caches[name][0].shape[-1]) for name in dsa_names}
     config_value = _model_reported_head_size(raw)
     _record(
@@ -472,8 +476,9 @@ def test_initialize_kv_cache_c03_dsa_entries_allocate_the_reported_head_size(
     assert allocated == reported
     assert k_last == reported
     assert reported == {config_value}
-    # The KDA work moved neither half's buffer count.
-    assert all(len(caches[name]) == 2 for name in dsa_names)
+    # The buffer counts, each read against what its own family holds: one latent
+    # bank per attention layer, two state banks per recurrent layer.
+    assert all(len(caches[name]) == 1 for name in dsa_names)
     assert all(len(caches[name]) == 2 for name in kda_names)
 
 

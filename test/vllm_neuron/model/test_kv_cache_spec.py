@@ -362,14 +362,17 @@ def test_kv_cache_spec_c04_state_page_bytes_reconcile_with_zero_discrepancy() ->
 #: neither re-derived nor re-priced here (P9).
 REGISTERED_HYBRID_BLOCK_SIZE = 128
 
-#: The DSA page this checkpoint's geometry produces. MEASURED before this file
-#: was authored (``../../../increments/probe-086-r1-landed-diagnostic.out``),
-#: so the number below is a recorded reading and not a prediction (D1.3).
-MEASURED_DSA_PAGE_BYTES = 262_144
+#: The DSA page this checkpoint's geometry produces. MEASURED at 262,144 B before
+#: this file was authored (``../../../increments/probe-086-r1-landed-diagnostic.out``)
+#: while the latent layers still reported a key/value page of two buffers. The
+#: latent page carries one buffer now, so the page is half that reading.
+MEASURED_DSA_PAGE_BYTES = 131_072
 
-#: The reading that rules out the vendor's re-block branch, MEASURED in the same
-#: transcript: the larger page is not a whole multiple of the smaller one.
-MEASURED_PAGE_REMAINDER = 58_624
+#: The reading that rules out the vendor's re-block branch: the larger page is not
+#: a whole multiple of the smaller one. Stated rather than derived, because the
+#: assertion below computes the same modulo from the same two operands and would
+#: otherwise compare a value against itself: 131,072 - 67,840 = 63,232.
+MEASURED_PAGE_REMAINDER = 63_232
 
 #: The layer split the fixture's own schedule carries.
 DECLARED_TOTAL_LAYERS = 45
