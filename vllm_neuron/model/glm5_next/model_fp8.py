@@ -459,8 +459,8 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # which floors through the same ``_per_rank``, so the width a loader slices to and
 # the width ``projection_widths`` expects are the same expression on the same two
 # inputs. They also read the same world size in production: the root binds
-# ``self.world_size = _resolve_world_size()`` (``:4945``) and passes exactly that
-# to ``_shard_geometry_for`` (``:5154``, ``:5445``), which is what the class's
+# ``self.world_size = _resolve_world_size()`` (``:5022``) and passes exactly that
+# to ``_shard_geometry_for`` (``:5231``, ``:5552``), which is what the class's
 # reader resolves too. If a caller ever made the two disagree the load would stop
 # at ``prepare_projection_weights``'s width check with the site named, rather
 # than compute the wrong function at plausible shapes -- and conjunct (1) of this
@@ -3663,7 +3663,7 @@ class Glm5NextDenseMLP(nn.Module):
     # the call behave exactly as it did before ``inc-glm53f-090``
     # (``blockwise_fp8_mm.py:441``, ``:449-456``). ``-090``'s load-time prep is
     # reached by ``_run_load_time_preps`` through
-    # ``hasattr(type(module), "prepare_scale_operands")`` (``:5999``), which is
+    # ``hasattr(type(module), "prepare_scale_operands")`` (``:6106``), which is
     # a per-class opt-in this class does not take. Adding that prep is a
     # separate decision with its own acceptance, and NOT something to smuggle
     # into a forward: it would change what the load path does.
@@ -3744,7 +3744,7 @@ class Glm5NextDenseMLP(nn.Module):
             )
 
         # ---- THE OPERANDS. The grid name is DERIVED by the rule the landed
-        # prep loop uses (``_sibling_scale_grid_name``, ``:5542``) rather than
+        # prep loop uses (``_sibling_scale_grid_name``, ``:5649``) rather than
         # spelled out here, so the two cannot drift. The grids are plain
         # attributes and not declared parameters, for the reason recorded on
         # ``_load_out_of_band_scales``, which is why this is a ``getattr``.
@@ -4903,11 +4903,13 @@ class Glm5NextDSAIndexer(nn.Module):
         key data the reference calls undefined.
 
         THE SEAM SEES NO PARTIAL POOL, and that is a landed contract rather
-        than a convention: ``dsa_kpool_hadamard`` asserts complete pools, and
-        the plan's rev-169 correction records that the caller masks
-        non-completions and persists the raw remainder to the tail cache. The
-        remainder is the decode ring's, ``dsa_decode_tail_update``, not this
-        method's.
+        than a convention: ``dsa_kpool_hadamard`` asserts complete pools, so
+        this method masks every non-completion and pools nothing partial. The
+        remainder belongs to the DECODE RING, and :meth:`seed_tail` writes it
+        there on this same leg (``inc-glm53f-054b`` commit 6, on the lead's
+        ruling). The plan's rev-169 wording put the remainder on "the caller";
+        that wording is retired, because no caller can do it -- the key and the
+        gate for those positions exist only inside this class's forward.
 
         ONE DISPATCH, on ``dsa_kpool_hadamard``. The sliding window is index
         arithmetic and carries no dispatch of its own.
@@ -5034,6 +5036,81 @@ class Glm5NextDSAIndexer(nn.Module):
         return dsa_decode_tail_update(
             tail, key, gate_score, ape.to(torch.float32), int(position)
         )
+
+    def seed_tail(
+        self,
+        tail: torch.Tensor,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        end_position: int,
+    ) -> int:
+        """Stash this chunk's REMAINDER in the decode ring. Returns the rows written.
+
+        WHAT THE REMAINDER IS. A prefill pools only complete blocks of
+        ``index_kpool`` keys (:meth:`pool_window`); the positions after its last
+        complete pool belong to a pool that has not completed yet. The decode leg
+        pools from the RING and every real token stashes there
+        (``vllm_neuron/functional/dsa/decode_tail_update.py``), so those positions
+        must be in the ring before the first decode step -- otherwise the next
+        completion pools zeros in their place and no check below notices.
+
+        WHERE THEY GO, WHICH IS THE ADDRESS THE DECODE LEG ALREADY USES. The ring
+        slot of an absolute position is ``position % index_kpool``
+        (``decode_tail_update.py``: *"the ring index equals the pool slot"*). With
+        ``end_position`` the sequence length AFTER this chunk, the open pool holds
+        positions ``end_position - r`` through ``end_position - 1`` for
+        ``r = end_position % index_kpool``, and those are slots ``0`` through
+        ``r - 1``. Half 0 is keys and half 1 is gate scores, the halves
+        :meth:`tail_step` declares and refuses on.
+
+        A CHUNKED PREFILL WRITES ONLY ITS OWN SHARE. When the open pool started in
+        an earlier chunk, only its last ``min(r, tokens)`` positions are in this
+        chunk's ``key``, so only the matching HIGH slots are written and the
+        earlier chunk's rows stay. Chunks therefore compose without clobbering
+        each other.
+
+        NOTHING IS WRITTEN WHEN THE SEQUENCE DIVIDES EVENLY, and that is correct
+        rather than a shortcut: there is no open pool, the next decode step starts
+        at slot 0, and the ring it starts from was emptied for the sequence by the
+        runner (``neuron_model_runner.py``'s ``_glm5next_model_kwargs``).
+
+        THE SUBSTRATE (P13). One slice copy of values the kernel-class
+        :meth:`project_stage` already produced. No value is computed here.
+        """
+        pool = self.index_kpool
+        want_tail = (2, pool, self.index_head_dim)
+        if tail.ndim != 3 or tuple(tail.shape) != want_tail:
+            raise Glm5NextDSAIndexerError(
+                f"prefill_tail must be [2, index_kpool, index_head_dim] = "
+                f"{want_tail} -- half 0 keys, half 1 gate scores; got "
+                f"{tuple(tail.shape)}"
+            )
+        if key.ndim != 2 or int(key.shape[1]) != self.index_head_dim:
+            raise Glm5NextDSAIndexerError(
+                f"key must be [tokens, {self.index_head_dim}]; got "
+                f"{tuple(key.shape)}"
+            )
+        if tuple(gate_score.shape) != tuple(key.shape):
+            raise Glm5NextDSAIndexerError(
+                f"gate_score must match key; got {tuple(gate_score.shape)} "
+                f"against {tuple(key.shape)}"
+            )
+        tokens = int(key.shape[0])
+        if int(end_position) < tokens:
+            raise Glm5NextDSAIndexerError(
+                f"end_position is the sequence length AFTER this chunk and "
+                f"{int(end_position)} is shorter than the chunk's own {tokens} "
+                f"token(s)"
+            )
+        rows = int(end_position) % pool
+        take = min(rows, tokens)
+        if take <= 0:
+            return 0
+        # `take` and `rows` are python ints, so these are trace-time addresses --
+        # the same reason `tail_step`'s slot is a python int and not a tensor.
+        tail[0, rows - take:rows, :] = key[tokens - take:].to(tail.dtype)
+        tail[1, rows - take:rows, :] = gate_score[tokens - take:].to(tail.dtype)
+        return take
 
     def score_pools(
         self,
@@ -5566,6 +5643,8 @@ class Glm5NextDSAIndexer(nn.Module):
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
         position: int | None = None,
+        prefill_tail: torch.Tensor | None = None,
+        prefill_end_position: int | None = None,
     ) -> torch.Tensor:
         """The whole indexer chain. Returns ``topk_indices`` and NOTHING ELSE.
 
@@ -5591,6 +5670,14 @@ class Glm5NextDSAIndexer(nn.Module):
             tail: ``[2, index_kpool, index_head_dim]`` bf16 ring, WRITTEN IN
                 PLACE. Passing it selects the decode leg.
             position: the decode token's absolute position, a python int.
+            prefill_tail: the same ring, on the PREFILL leg, WRITTEN IN PLACE for
+                this chunk's remainder by :meth:`seed_tail`. It does NOT select a
+                leg -- ``tail`` alone does that -- and passing it on a decode step
+                refuses.
+            prefill_end_position: the sequence length AFTER this prefill chunk, a
+                python int, required with ``prefill_tail``. It is NOT
+                ``max_seq_len``: that one is the batch's longest sequence, equal to
+                this sequence's end only while the batch is one request.
 
         WHY ``max_seq_len`` IS A PYTHON INT AND NOT READ OFF ``seq_lens``. The
         obvious ``int(seq_lens.max())`` is a host read of tensor DATA inside a
@@ -5608,7 +5695,8 @@ class Glm5NextDSAIndexer(nn.Module):
         slot"* -- and following it is what lets this method return indices alone.
         ``dsa_decode_tail_update`` is functional by design (*"the ring is state,
         and this function does not mutate its argument"*), so its new ring is
-        copied into the caller's buffer here, at one site.
+        copied into the caller's buffer here, at one site. The PREFILL leg writes
+        the same ring at one site too, :meth:`seed_tail`, for its remainder alone.
 
         WHY THE POOL WRITE USES A TRASH ROW INSTEAD OF A BOOLEAN MASK. Indexing
         with a bool mask produces a DATA-DEPENDENT shape, which is the same graph
@@ -5623,7 +5711,8 @@ class Glm5NextDSAIndexer(nn.Module):
         kernel-class DSA seams or the landed ``mla_projection`` seam. What is
         torch here is orchestration and named so a reviewer can check it: shape
         validation, index arithmetic for the gather, one ``index_copy_`` per leg,
-        and one ring copy. No torch path computes an indexer value.
+        one ring copy on the decode leg, and one ring slice copy on the prefill
+        leg (:meth:`seed_tail`). No torch path computes an indexer value.
         """
         self.require_dials()
 
@@ -5641,6 +5730,17 @@ class Glm5NextDSAIndexer(nn.Module):
             raise Glm5NextDSAIndexerError(
                 "the prefill leg needs slot_mapping, the pool-granular slot per "
                 "position; pass tail and position instead for a decode step"
+            )
+        if is_decode and prefill_tail is not None:
+            raise Glm5NextDSAIndexerError(
+                "prefill_tail is the PREFILL leg's ring and this is a decode "
+                "step, whose ring is `tail`; one call advances the ring or seeds "
+                "it, never both"
+            )
+        if prefill_tail is not None and prefill_end_position is None:
+            raise Glm5NextDSAIndexerError(
+                "seeding the ring needs the sequence length after this chunk; got "
+                "a prefill_tail with no prefill_end_position"
             )
         query, key, weights, gate_score = self.project_stage(hidden_states, q_latent)
 
@@ -5665,6 +5765,13 @@ class Glm5NextDSAIndexer(nn.Module):
                 )
             )
             pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+            if prefill_tail is not None:
+                # The remainder is this leg's to persist: the pooled store took
+                # the complete pools above, and the open pool's rows exist only
+                # here. `inc-glm53f-054b` commit 6.
+                self.seed_tail(
+                    prefill_tail, key, gate_score, int(prefill_end_position)
+                )
 
         if not selects:
             # inc-glm53f-099. The write stage above has already landed -- the pool row is
@@ -5976,7 +6083,7 @@ class Glm5NextMLAAttention(nn.Module):
 
         WHERE THE WORLD SIZE COMES FROM. :func:`_resolve_world_size`, the module's
         own reader, which is also what the root binds ``self.world_size`` to
-        (``:4945``) and therefore what the shard table's width callbacks are
+        (``:5022``) and therefore what the shard table's width callbacks are
         handed. One source, so the width a rank's weight is sliced to and the
         width this class expects cannot come from two different answers. It is
         read per call rather than cached because tests inject the world size by
@@ -6725,6 +6832,8 @@ class Glm5NextMLAAttention(nn.Module):
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
         position: int | None = None,
+        prefill_tail: torch.Tensor | None = None,
+        prefill_end_position: int | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -6762,9 +6871,11 @@ class Glm5NextMLAAttention(nn.Module):
         debt is carried forward and declared rather than absorbed in silence.
 
         The two carriers are the caller's and both are written in place:
-        ``latent_cache`` is ``attend()``'s own contract and ``pool_cache`` and
-        ``tail`` are the indexer's. See :meth:`Glm5NextDSAIndexer.forward` for
-        what each means and why ``max_seq_len`` is a python int.
+        ``latent_cache`` is ``attend()``'s own contract and ``pool_cache``,
+        ``tail`` and ``prefill_tail`` are the indexer's -- the last of those is
+        the same ring on the prefill leg, where the indexer seeds this chunk's
+        remainder. See :meth:`Glm5NextDSAIndexer.forward` for what each means and
+        why ``max_seq_len`` is a python int.
         """
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
@@ -6777,6 +6888,8 @@ class Glm5NextMLAAttention(nn.Module):
             slot_mapping=slot_mapping,
             tail=tail,
             position=position,
+            prefill_tail=prefill_tail,
+            prefill_end_position=prefill_end_position,
         )
         return self.attend(
             normed_hidden_states,
@@ -6874,6 +6987,8 @@ class Glm5NextDSALayer(nn.Module):
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
         position: int | None = None,
+        prefill_tail: torch.Tensor | None = None,
+        prefill_end_position: int | None = None,
         streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
@@ -6915,9 +7030,10 @@ class Glm5NextDSALayer(nn.Module):
         the load, by :meth:`bind_hyper_connection_sites`.
 
         THE TWO CARRIERS ARE THE CALLER'S, both written in place: ``latent_cache``
-        is ``attend()``'s own contract and ``pool_cache`` and ``tail`` are the
-        indexer's. See :meth:`Glm5NextDSAIndexer.forward` for what each means and
-        why ``max_seq_len`` is a python int. ``streams`` is ``[T, S, H]`` or
+        is ``attend()``'s own contract and ``pool_cache``, ``tail`` and
+        ``prefill_tail`` are the indexer's. See :meth:`Glm5NextDSAIndexer.forward`
+        for what each means, which leg each belongs to, and why ``max_seq_len`` is
+        a python int. ``streams`` is ``[T, S, H]`` or
         ``None``; the return is ``[T, H]`` in the input dtype on the one-stream
         route and ``[T, S, H]`` in the STREAMS' OWN DTYPE on the streams route.
 
@@ -6944,6 +7060,8 @@ class Glm5NextDSALayer(nn.Module):
                 slot_mapping=slot_mapping,
                 tail=tail,
                 position=position,
+                prefill_tail=prefill_tail,
+                prefill_end_position=prefill_end_position,
             )
 
         site = _mhc_attention_site(self, streams)
@@ -8727,10 +8845,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         looking at. That keeps the one loop family-blind, which is the property
         ``inc-glm53f-013`` built it for, and it is why the runner recognises the
         two halves BY THE FIELDS THEY CARRY (``neuron_model_runner.py``
-        ``:8720-8726``) rather than by a layer name.
+        ``:9193-9199``) rather than by a layer name.
 
         All four move together or not at all. The runner refuses a layer that
-        declares part of the geometry (``neuron_model_runner.py:8727-8733``),
+        declares part of the geometry (``neuron_model_runner.py:8738-8744``),
         because the conv and recurrent carriers are paired positionally, so a
         partial set would shorten the reported page. One ``getattr`` per field
         against one attribute-carrying class satisfies that by construction.
@@ -8761,6 +8879,186 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 )
             )
         return KVSpec(layers=layers)
+
+    def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
+        """Keep the runner's per-layer cache tensors so the runner can name them again.
+
+        THE RUNNER CALLS THIS ON EVERY START-UP AND NOTHING GUARDS THE CALL
+        (``neuron_model_runner.py:9142``, inside ``initialize_kv_cache`` ``:8930``,
+        which the worker runs at ``neuron_worker.py:1101``). Five of the six shipped
+        model families define it; this one did not, so a GLM-5.3-Flash serve raised
+        ``AttributeError`` there before any forward ran. ``inc-glm53f-054b`` adds it
+        at plan revision 276.
+
+        IT IS A MAPPER AND NOTHING ELSE: it allocates no tensor, copies no tensor,
+        runs no math and reads no weight. Every entry it keeps is a VIEW of the
+        runner's own allocation, so a layer that writes its cache writes the
+        runner's paged buffer -- which is what a paged cache requires and the reason
+        the latent view below is taken with ``.view`` and not ``.reshape``: a layout
+        that cannot be viewed raises here instead of silently handing the layers a
+        private copy whose writes are dropped.
+
+        THE KEY IS ``get_kv_spec``'S OWN NAME, asked for rather than rebuilt, so the
+        two cannot drift apart. A layer whose name is absent refuses by name and
+        prints what the dict does hold.
+
+        THE TWO FAMILIES ARE RECOGNISED BY THE FIELDS THE SPEC CARRIES, never by a
+        layer name -- the same test the runner makes at
+        ``neuron_model_runner.py:9193-9199``:
+
+        * a linear-attention (KDA) layer reports the ``kda_*`` geometry, and the
+          runner allocated one ``[state_slots, *shape]`` bank per state, position 0
+          the short convolution and position 1 the recurrent state
+          (``neuron_model_runner.py:9100-9130``);
+        * a sparse-attention (DSA) layer reports none of it, and the runner
+          allocated ``[blocks, num_kv_heads, block_size, head_size]`` for each half
+          of a key/value pair (``:9002-9038``). Only the FIRST half is this
+          attention's latent cache: MLA keeps one latent vector per slot and has no
+          value half to read, which is also why ``num_kv_heads`` is 1
+          (``NUM_LATENT_KV_HEADS``).
+
+        THE LATENT BANK IS ALSO KEPT AS ITS SEQUENCE VIEW, because that is the shape
+        ``Glm5NextDSALayer.forward`` declares: ``[slots, 1, head_size]``, one slot
+        per token in position order. At ONE kv head the paged buffer already has
+        that order -- it is block-major and each block holds ``block_size``
+        consecutive slots, so flattening gives slot ``block * block_size + offset``,
+        exactly the runner's own slot number. At more than one head the flattening
+        would interleave heads, so that case refuses rather than returning a view
+        that looks right and is not.
+
+        THE LAYER MODULES ARE NOT READ, only counted. Every geometry this method
+        needs is already on the spec the model itself produced, so the loop walks
+        the spec and the stack length is checked against it; that keeps this method
+        a mapping of the runner's dict and leaves every per-layer authority where
+        ``inc-glm53f-013`` put it.
+
+        The records land on ``glm5next_layer_banks``, in stack order, one mapping
+        per layer. ``inc-glm53f-054b``'s runner side reads that attribute and builds
+        each layer's carrier from it; nothing else in this tree reads it, and no
+        forward line of this file moves for it. A plain tuple of plain dicts is
+        deliberate: ``nn.Module.__setattr__`` leaves it alone, so ``_apply`` never
+        walks these tensors and the runner stays their only owner.
+
+        Args:
+            kv_caches: the runner's ``layer name -> list of tensors`` mapping,
+                exactly what ``initialize_kv_cache`` returns.
+
+        Raises:
+            ValueError: the spec and the stack disagree on how many layers there
+                are, a layer's spec name is absent from ``kv_caches``, a bank's
+                shape disagrees with the spec that asked for it, a layer reports
+                part of its recurrent geometry, or a latent bank declares more than
+                one KV head.
+        """
+        spec_layers = self.get_kv_spec().layers
+        stack = len(self.model.layers)
+        if len(spec_layers) != stack:
+            raise ValueError(
+                f"get_kv_spec reports {len(spec_layers)} layer(s) and the stack "
+                f"holds {stack}; the carriers are paired positionally, so a "
+                f"disagreement here would hand a layer another layer's cache"
+            )
+        banks: list[dict[str, object]] = []
+        for layer_idx, layer_spec in enumerate(spec_layers):
+            name = layer_spec.name
+            if name not in kv_caches:
+                raise ValueError(
+                    f"kv_caches has no entry for KV layer '{name}', which "
+                    f"get_kv_spec reports at stack position {layer_idx}; the dict "
+                    f"holds {sorted(kv_caches)}"
+                )
+            tensors = list(kv_caches[name])
+            recurrent = (
+                layer_spec.kda_conv_state_shape,
+                layer_spec.kda_recurrent_state_shape,
+            )
+            if all(value is not None for value in recurrent):
+                if len(tensors) != 2:
+                    raise ValueError(
+                        f"KV layer '{name}' reports recurrent geometry, so the "
+                        f"runner allocates exactly two state banks, position 0 the "
+                        f"short convolution and position 1 the recurrent state; "
+                        f"kv_caches holds {len(tensors)} tensor(s)"
+                    )
+                record: dict[str, object] = {
+                    "name": name,
+                    "layer_index": layer_idx,
+                    "family": "linear_attn",
+                }
+                for key, tensor, want in (
+                    ("conv_state", tensors[0], recurrent[0]),
+                    ("recurrent_state", tensors[1], recurrent[1]),
+                ):
+                    if tuple(tensor.shape[1:]) != tuple(want):
+                        raise ValueError(
+                            f"KV layer '{name}' has a {key} bank of "
+                            f"{tuple(tensor.shape)}; the spec asked for one "
+                            f"{tuple(want)} state per slot, so the bank must be "
+                            f"[slots, {', '.join(str(v) for v in want)}]"
+                        )
+                    record[key] = tensor
+                if int(tensors[0].shape[0]) != int(tensors[1].shape[0]):
+                    raise ValueError(
+                        f"KV layer '{name}' has {int(tensors[0].shape[0])} "
+                        f"convolution slot(s) against "
+                        f"{int(tensors[1].shape[0])} recurrent slot(s); the two "
+                        f"states of one request live at one slot number"
+                    )
+                record["state_slots"] = int(tensors[0].shape[0])
+                banks.append(record)
+                continue
+            if any(value is not None for value in recurrent):
+                raise ValueError(
+                    f"KV layer '{name}' reports part of its recurrent geometry "
+                    f"({recurrent}); the two states are paired positionally, so a "
+                    f"missing member would shorten the page the runner allocated"
+                )
+            if not tensors:
+                raise ValueError(
+                    f"KV layer '{name}' has no cache tensor at all; the runner "
+                    f"allocates a key/value pair for a sparse-attention layer "
+                    f"(neuron_model_runner.py:9002-9038)"
+                )
+            bank = tensors[0]
+            if bank.dim() != 4:
+                raise ValueError(
+                    f"KV layer '{name}' has a latent bank of {tuple(bank.shape)}; "
+                    f"the runner allocates [blocks, num_kv_heads, block_size, "
+                    f"head_size] for each half of the pair"
+                )
+            blocks, heads, block_size, width = (int(value) for value in bank.shape)
+            if heads != int(layer_spec.num_kv_heads) or width != int(
+                layer_spec.head_size
+            ):
+                raise ValueError(
+                    f"KV layer '{name}' has a latent bank of {tuple(bank.shape)}, "
+                    f"whose head count and width are ({heads}, {width}); the spec "
+                    f"this model produced asked for "
+                    f"({int(layer_spec.num_kv_heads)}, "
+                    f"{int(layer_spec.head_size)})"
+                )
+            if heads != 1:
+                raise ValueError(
+                    f"KV layer '{name}' declares {heads} KV heads; the sequence "
+                    f"view this method keeps is the paged bank flattened over "
+                    f"blocks and slots, which is that sequence's slot order only "
+                    f"at ONE head -- at more the flattening interleaves heads"
+                )
+            banks.append(
+                {
+                    "name": name,
+                    "layer_index": layer_idx,
+                    "family": "self_attn",
+                    "latent_bank": bank,
+                    "latent_cache": bank.view(blocks * block_size, heads, width),
+                    "blocks": blocks,
+                    "block_size": block_size,
+                    "slots": blocks * block_size,
+                    "head_size": width,
+                }
+            )
+        self.glm5next_layer_banks = tuple(banks)
+
 
     # ── forward ──────────────────────────────────────────────────────────
 
@@ -8860,7 +9158,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ``sampling_positions`` IS REQUIRED, WITH NO DEFAULT, because every dict
         that reaches this method is built by one of the runner's three builders
         and all three set the key unconditionally
-        (``neuron_model_runner.py:4506``, ``:4844``, ``:7035``). A ``None``
+        (``neuron_model_runner.py:4506``, ``:4844``, ``:7046``). A ``None``
         default would therefore never be taken by the runner, and the only
         behaviour it could add is the whole-prefill projection the line above
         exists to prevent.
@@ -8869,7 +9167,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         family precedent is NOT followed. ``llama3/model.py:1622`` carries one as
         its async-speculative-decoding injection point. The runner passes eight
         keys today plus up to four conditional ones
-        (``neuron_model_runner.py:7031-7092``), and three of them --
+        (``neuron_model_runner.py:7042-7103``), and three of them --
         ``sampling_params``, ``logit_mask`` and ``spec_decode_metadata`` -- carry
         ON-DEVICE SAMPLING, which this tree implements nowhere: there is no
         sampler on this class and no ``on_device_sampling_config``. A sink would
