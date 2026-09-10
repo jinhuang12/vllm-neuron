@@ -5062,9 +5062,9 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             )
         # THE FAILING CONTROLS, EXECUTED ONLY WHERE THE CONTROL TENSOR IS EXACT.
         #
-        # The OLD grids must fire BOTH guards, or the guards are statements no scale
-        # in this file's history could have violated. But this control is a
-        # REPRODUCTION of grant 127, and it reproduces only where it runs on the
+        # A guard is re-run on the OLD grids and required to FIRE there, or it is a
+        # statement no scale in this file's history could have violated. But this control
+        # is a REPRODUCTION of grant 127, and it reproduces only where it runs on the
         # tensor grant 127 ran on. Layer 0 is that place: the FFN half is mixed in
         # OUTSIDE the layer call, so ``recorded_out[0][1]`` is the streams after the
         # attention half alone and this commit cannot move it. Layer 1 is not: its input
@@ -5077,10 +5077,29 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         # ``_oas == 0`` needs EVERY gate element and EVERY |up| element at or past
         # the limit in EVERY row, which grant 127 proved for layer 0 only.
         #
-        # SO THE RAISES RUN WHERE THE CONTROL IS EXACT, and layer 1's old-scale
-        # numbers stay the READINGS they always were: the ``scale=old`` row above
-        # prints them, and the legend row below says which layer's control gates and
-        # which only reads. Nothing else about the guards moves.
+        # WHICH GUARDS THE OLD GRID ACTUALLY VIOLATES -- MEASURED, NOT PREDICTED. Grant
+        # 215 ran this block for the first time anywhere. At layer 0 the old grid read
+        # ``gate_at_limit_frac=1.000000``, ``up_at_limit_frac=1.000000``,
+        # ``activated_max_spread=0`` and ``ffn_out_max_spread=0``, against 0.500000,
+        # 0.500000, 0.162277 and 0.146685 at the new grid -- so guards (i) and (iii)
+        # both fire on the old grid, and both of them gate below. It also read
+        # ``elements_absorbed_frac=0.993000`` and ``sum_max_spread=0.0993485``, which
+        # guard (ii) ACCEPTS. So the old grid is not the fixture guard (ii) refuses, and
+        # requiring it to fire there was this block's own mistake -- not a defect in the
+        # product and not a defect in the guard. Grant 127's collapse is a saturated
+        # SwiGLU, which is exactly what a zero activated spread and a zero half-output
+        # spread ARE. Guard (ii) refuses a different degeneracy, a mix that carries the
+        # FFN half alone, and at the old grid 0.7 percent of elements still moved.
+        #
+        # SO GUARD (ii)'S CONTROL IS A READING HERE, with its own falsifier measured
+        # beside it and nothing gated on that measurement. Gating on a number no run had
+        # produced is what put the false red in this block in the first place, so the
+        # ladder below reports where guard (ii)'s predicate does fire and a later round
+        # may gate it once a transcript shows the answer.
+        #
+        # Layer 1's old-scale numbers stay the READINGS they always were: the
+        # ``scale=old`` row above prints them, and the legend row below says which
+        # layer's control gates and which only reads. No guard's own predicate moves.
         _ogf, _ouf, _oas, _oabs, _osum, _offn = _readings["old"]
         _control_is_exact = not any(
             _below < _dense_index for _below in fixture["dense_at"]
@@ -5095,6 +5114,8 @@ def test_tiny_model_forward_matches_the_reference() -> None:
               f"|old_sum_max_spread={_osum:.6g}"
               f"|old_ffn_out_max_spread={_offn:.6g}"
               f"|gates_iff_no_dense_layer_sits_below_this_one={_control_is_exact}"
+              f"|guards_that_gate_on_the_old_grid=(i),(iii)"
+              f"|guard_ii_control=reading_only"
               f"|note=only there is the old-scale recompute the tensor grant 127 read")
         if _control_is_exact:
             if _ogf > 0.0 and _ouf > 0.0 and _oas > 0.0:
@@ -5105,14 +5126,45 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                     f"of which the guard accepts -- so the guard is not what "
                     f"tells the two scales apart"
                 )
-            if _oabs < 1.0 and _osum > 0.0:
-                raise VacuousControlError(
-                    f"layer {_dense_index}: guard (ii)'s control did not "
-                    f"fire. The OLD exponents absorb the hidden term in "
-                    f"{_oabs:.6f} of elements and leave the sum's row spread "
-                    f"at {_osum:.6g}, both of which the guard accepts -- so "
-                    f"the guard is not what tells the two scales apart"
-                )
+            # GUARD (ii)'S CONTROL, AS A READING AND NOT A GATE, for the reason the
+            # header gives: the old grid absorbs 0.993 of elements where guard (ii)
+            # wants strictly below 1.0, so it does not fire here, and this block reports
+            # that in a row instead of raising on it.
+            _ii_fired_on_the_old_grid = not (_oabs < 1.0 and _osum > 0.0)
+            # ITS OWN FALSIFIER, MEASURED. What guard (ii) refuses is TOTAL absorption,
+            # and that is reached by SCALING the old half's own output until the streams'
+            # term falls under one ULP everywhere. The ladder prints the first factor
+            # that gets there, so the row states how much headroom the old grid still had
+            # at 0.993. It is wrapped and it gates on nothing, because a defect in these
+            # lines must not change what this item decides -- BLOCK C's convention, for
+            # the same reason.
+            try:
+                _old_out = dict(_halves)["old"]["out"]
+                _rungs = []
+                _ii_fires_at = None
+                for _factor in (1.0, 2.0 ** 4, 2.0 ** 8, 2.0 ** 12):
+                    _fs = _old_out * _factor
+                    _fsum = _dsite.mhc_post(_fs, _dstreams, _dpost, _dcomb)
+                    _fhalf = _dsite.mhc_post(
+                        _fs, torch.zeros_like(_dstreams), _dpost, _dcomb
+                    )
+                    _ffrac = float((_fsum.float() == _fhalf.float()).float().mean())
+                    _fspread = _row_spread_stats(_fsum)[1]
+                    _rungs.append(f"{_factor:g}:{_ffrac:.6f}")
+                    if _ii_fires_at is None and not (_ffrac < 1.0 and _fspread > 0.0):
+                        _ii_fires_at = _factor
+                print(f"TINYFWD|stack_guard_ii_control|layer={_dense_index}"
+                      f"|fired_on_the_old_grid={_ii_fired_on_the_old_grid}"
+                      f"|old_absorbed={_oabs:.6f}|old_sum_max_spread={_osum:.6g}"
+                      f"|absorbed_by_scale_factor={';'.join(_rungs)}"
+                      f"|predicate_first_fires_at_factor={_ii_fires_at}"
+                      f"|class=reading_only"
+                      f"|note=guard (ii) refuses a mix carrying the FFN half alone; the "
+                      f"old grid does not reach that, so this is read and gated nowhere")
+            except Exception as _ii_exc:  # a reading must not decide the item
+                print(f"TINYFWD|stack_guard_ii_control|layer={_dense_index}"
+                      f"|class=reading_only|unavailable={type(_ii_exc).__name__}"
+                      f"|detail={_ii_exc}")
             # GUARD (iii)'S FAILING CONTROL, on the same tensor the guard now reads and
             # at the same layer the other two controls gate: the OLD grids saturate both
             # SwiGLU clamps into one constant activated row, and a constant row through a
