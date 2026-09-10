@@ -4363,6 +4363,15 @@ class Glm5NextKDAAttention(nn.Module):
         attn_out = shaped.reshape(tokens, width) @ (
             self.o_proj_weight.to(torch.float32).t()
         )
+        # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
+        # Reduce it in fp32, before the cast below: partials add at the width they
+        # were computed in, and reducing after the cast would round each rank's
+        # fraction to the caller's dtype and add the rounded parts instead of
+        # rounding the whole. In place is safe -- ``attn_out`` is a fresh matmul
+        # result, not a view of a cached weight or of the caller's residual.
+        group = _resolve_tp_group()
+        if group is not None:
+            group.all_reduce(attn_out)
         return attn_out.to(hidden_states.dtype)
 
 
