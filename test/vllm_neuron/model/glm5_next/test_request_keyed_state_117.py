@@ -66,6 +66,7 @@ import torch
 
 from vllm_neuron.vllm.worker.neuron_model_runner import (
     NULL_BLOCK_ID,
+    PAD_SLOT_ID,
     NeuronModelRunner,
     _compute_slot_mapping_cpu,
 )
@@ -360,6 +361,36 @@ def _carriers_for(banks, side, *, slot: int, rows, cached: int, is_prefill: bool
         softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
         max_seq_len=int(cached) + 4,
         index_kpool=DECLARED_INDEX_KPOOL,
+    )
+
+
+def _carriers_for_requests(banks, side, *, tokens: int, requests: int, is_prefill: bool):
+    """The carrier builder at a declared request count, for the refusal items.
+
+    The geometry is one entry per bank, which is what the builder still takes at
+    this stage of the increment; the request COUNT is what the sharpened decode
+    refusal reads, and it is passed explicitly rather than inferred from the token
+    count -- inferring it is exactly the conflation the refusal used to make.
+    """
+    geometries = [
+        {
+            "block_ids": [int(value) for value in DECLARED_SPARSE_ROWS[0]],
+            "state_slot": 0,
+            "page_size": DECLARED_PAGE_SIZE,
+        }
+        for _ in banks
+    ]
+    return NeuronModelRunner._glm5next_layer_carriers(
+        banks,
+        side,
+        geometries=geometries,
+        is_prefill=is_prefill,
+        tokens=int(tokens),
+        start_position=int(DECLARED_CACHED_LENGTHS[0]),
+        softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
+        max_seq_len=int(DECLARED_CACHED_LENGTHS[0]) + int(tokens),
+        index_kpool=DECLARED_INDEX_KPOOL,
+        requests=int(requests),
     )
 
 
@@ -701,4 +732,162 @@ def test_a5_the_runners_slot_mapping_addresses_the_banks_own_view() -> None:
         assert not bool((sparse["latent_cache"][neighbour, 0, :] == sentinel).all()), (
             f"request {index}: slot {neighbour} also holds the sentinel, so the "
             f"write landed wider than one slot and the read proves nothing"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A6. A decode carries one token PER REQUEST, and more than that still refuses.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a6_a_decode_carrying_more_tokens_than_requests_refuses_by_name() -> None:
+    """Speculative decoding's verify step is still out of scope, now stated exactly.
+
+    WHAT THE SHARPENING FIXED. The landed refusal read "one token", which conflated
+    one token PER REQUEST -- what a decode step is -- with one token in the batch,
+    which only holds when the batch has one request. So the honest refusal is a step
+    carrying MORE tokens than it has requests.
+
+    TWO READINGS, because a refusal must be told apart from a silent skip. The
+    message is matched on its own text, and the seam dispatch counters are read
+    afterwards and must be exactly zero -- a refused step reaches no kernel. The
+    slot table and the side caches are also compared byte-for-byte across the
+    refused call: a refusal must leave no trace.
+
+    THE ADMITTED CASE IS ASSERTED IN THE SAME ITEM, so this cannot pass by refusing
+    everything: one token per request for two requests is built without raising.
+    """
+    _require_cpu_mode()
+    from vllm_neuron.functional.attention.mla_sparse import (
+        mla_sparse_dispatch_counters,
+        mla_sparse_row_tiled_dispatch_counters,
+        reset_mla_sparse_dispatch_counters,
+        reset_mla_sparse_row_tiled_dispatch_counters,
+    )
+
+    banks = _banks()
+    side = _side_caches(banks)
+    runner = _runner(banks)
+    runner._glm5next_request_slots(banks, list(runner.input_batch.req_ids),
+                                  synthetic=False, side_caches=side)
+    table_before = dict(runner._glm5next_request_slot_table)
+    pools_before = [
+        entry["pool_cache"].clone() for entry in side if entry
+    ]
+
+    reset_mla_sparse_dispatch_counters()
+    reset_mla_sparse_row_tiled_dispatch_counters()
+
+    over_by_one = DECLARED_REQUESTS + 1
+    if over_by_one <= DECLARED_REQUESTS:
+        raise VacuousControlError(
+            "this item needs more tokens than requests to have anything to refuse"
+        )
+    print(f"KEYED|a6|requests={DECLARED_REQUESTS}|tokens={over_by_one}")
+    with pytest.raises(ValueError, match="one token per request"):
+        _carriers_for_requests(
+            banks, side, tokens=over_by_one, requests=DECLARED_REQUESTS,
+            is_prefill=False,
+        )
+
+    base = mla_sparse_dispatch_counters()
+    row_tiled = mla_sparse_row_tiled_dispatch_counters()
+    print(f"KEYED|a6|seam_counters={base}|row_tiled={row_tiled}")
+    assert base == (0, 0), f"a refused step reached the seam: {base}"
+    assert row_tiled == (0, 0), f"a refused step reached the row-tiled seam: {row_tiled}"
+    assert dict(runner._glm5next_request_slot_table) == table_before, (
+        "the refused step changed the slot table; a refusal must leave no trace"
+    )
+    for entry, before in zip([e for e in side if e], pools_before):
+        assert torch.equal(entry["pool_cache"], before), (
+            "the refused step wrote into a pooled store"
+        )
+
+    # ---- THE ADMITTED CASE, so the refusal is not simply refusing everything.
+    admitted = _carriers_for_requests(
+        banks, side, tokens=DECLARED_REQUESTS, requests=DECLARED_REQUESTS,
+        is_prefill=False,
+    )
+    print(f"KEYED|a6|admitted_carriers={len(admitted)}")
+    assert len(admitted) == len(banks)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A7. A padded decode row writes NOWHERE, because zero is a real slot.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a7_padded_decode_rows_carry_a_sentinel_and_never_slot_zero() -> None:
+    """The KV machinery's padding value is an ADDRESS, so it is masked here.
+
+    THE FACT THIS RESTS ON, read off the runner: ``NULL_BLOCK_ID`` is 0 and the
+    decode padder writes it into padded rows. Zero is block 0 offset 0 -- a real,
+    addressable latent slot -- so a write consuming the mapping unmasked lands a
+    padded row's latent in a slot a live request can own.
+
+    THE TRIPWIRE IS DEMONSTRATED, NOT DESCRIBED. This item asserts that the
+    unmasked padding value IS inside the bank's addressable range (which is what
+    makes it dangerous) and that every padded entry of the masked mapping is
+    OUTSIDE it. Dropping the mask therefore fails the second assertion, and an
+    implementation that masked the real rows too fails the first block below.
+
+    THE RUNNER HALF ONLY. Observing the write itself belongs to the half of this
+    increment that owns the writer; what is settled here is the address the writer
+    is handed.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    sparse = next(bank for bank in banks if bank["family"] == "self_attn")
+    addressable = int(sparse["latent_cache"].shape[0])
+    padded_rows = DECLARED_DECODE_BUCKET - DECLARED_REQUESTS
+    if padded_rows <= 0:
+        raise VacuousControlError(
+            f"this item needs a decode bucket wider than the request count to have a "
+            f"padded row at all; bucket {DECLARED_DECODE_BUCKET} against "
+            f"{DECLARED_REQUESTS} request(s)"
+        )
+
+    mapping = NeuronModelRunner._glm5next_latent_slot_mapping(
+        rows=DECLARED_SPARSE_ROWS,
+        starts=DECLARED_CACHED_LENGTHS,
+        tokens=1,
+        block_size=DECLARED_PAGE_SIZE,
+        padded_rows=padded_rows,
+        device=torch.device("cpu"),
+    )
+
+    print(f"KEYED|a7|mapping={mapping.tolist()}|padded_rows={padded_rows}"
+          f"|null_block_id={NULL_BLOCK_ID}|addressable={addressable}")
+    assert int(mapping.shape[0]) == DECLARED_REQUESTS + padded_rows
+
+    # ---- The real rows address their own request's block, inside the bank.
+    for index, (row, start) in enumerate(zip(DECLARED_SPARSE_ROWS, DECLARED_CACHED_LENGTHS)):
+        block = int(row[int(start) // DECLARED_PAGE_SIZE])
+        want = block * DECLARED_PAGE_SIZE + int(start) % DECLARED_PAGE_SIZE
+        assert int(mapping[index]) == want, (
+            f"request {index}'s token was mapped to slot {int(mapping[index])} rather "
+            f"than block {block} offset {int(start) % DECLARED_PAGE_SIZE}"
+        )
+        assert 0 <= int(mapping[index]) < addressable
+
+    # ---- WHY THE PADDING VALUE IS DANGEROUS, asserted rather than asserted about.
+    assert 0 <= NULL_BLOCK_ID < addressable, (
+        f"this item's whole premise is that the padding value {NULL_BLOCK_ID} is a "
+        f"real slot; the bank holds {addressable} slot(s), so it is not, and the "
+        f"mask this item measures would be unnecessary"
+    )
+
+    # ---- Every padded row is outside the bank, so it cannot address anything.
+    for offset in range(padded_rows):
+        value = int(mapping[DECLARED_REQUESTS + offset])
+        assert value == PAD_SLOT_ID, (
+            f"padded row {offset} carries {value}; the mask writes {PAD_SLOT_ID}"
+        )
+        assert not 0 <= value < addressable, (
+            f"padded row {offset} carries {value}, which is a real slot of this bank"
+        )
+        assert value != NULL_BLOCK_ID, (
+            f"padded row {offset} carries the KV machinery's own padding value, so "
+            f"the mask was not applied and a padded latent would land in slot "
+            f"{NULL_BLOCK_ID}"
         )

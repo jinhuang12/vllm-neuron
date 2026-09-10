@@ -4795,6 +4795,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             + 1
         )
 
+    @staticmethod
+    def _glm5next_latent_slot_mapping(
+        *, rows, starts, tokens: int, block_size: int, padded_rows: int = 0, device
+    ) -> torch.Tensor:
+        """``[Σ tokens + padded_rows]`` int64: each token's PHYSICAL latent slot.
+
+        THE FORMULA IS THE RUNNER'S OWN, not a second derivation: at one
+        context-parallel rank a slot is ``block_number * block_size +
+        block_offset`` (``:330-334``), and that number is also the row index of the
+        bank's flattened sequence view (``model_fp8.py:9135``), which is why the
+        latent write can consume it instead of deriving a contiguous run.
+
+        THE PADDED ROWS CARRY ``PAD_SLOT_ID`` AND NOT THE PADDING VALUE THE KV
+        MACHINERY WRITES. That value is ``NULL_BLOCK_ID``, which is ZERO (``:95``),
+        and zero is a REAL slot -- block 0, offset 0 -- not a sentinel. A decode
+        batch padded up to its bucket carries such rows (``:3571-3574``), so a
+        write consuming the mapping unmasked would land a padded row's latent in a
+        slot a live request can own. A negative sentinel cannot be mistaken for an
+        address, so the mask is legible to the consumer rather than trusted.
+        """
+        slots: list[int] = []
+        for row, start in zip(rows, starts):
+            for offset in range(int(tokens)):
+                position = int(start) + offset
+                block = int(row[position // int(block_size)])
+                slots.append(block * int(block_size) + position % int(block_size))
+        slots.extend([PAD_SLOT_ID] * int(padded_rows))
+        return torch.tensor(slots, dtype=torch.int64, device=device)
+
     @classmethod
     def _glm5next_batch_row_seq_lens(cls, requests, *, device) -> torch.Tensor:
         """``[Σ tokens]`` int32: every token's own causal length, in batch order.
@@ -5109,6 +5138,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         softmax_scale: float,
         max_seq_len: int,
         index_kpool: int,
+        requests: int = 1,
     ) -> list[dict]:
         """One mapping per layer, in stack order, each holding THAT layer's own state.
 
@@ -5159,14 +5189,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"entry(ies) and {len(geometries)} geometry(ies); the three come "
                 f"from one walk and must pair"
             )
-        if not is_prefill and int(tokens) != 1:
+        if not is_prefill and int(tokens) != int(requests):
+            # THE REFUSAL IS SHARPENED, NOT LIFTED. It used to read "one token", which
+            # conflated two different things: one token PER REQUEST, which is what a
+            # decode step is, and one token in the batch, which is only true when the
+            # batch holds one request. The ring still advances one position at a time
+            # per sequence -- its seam takes a single [1, index_head_dim] key row and
+            # a single position (model_fp8.py:4741-4744, :5474) -- so what is refused
+            # is a step carrying MORE tokens than it has requests, which is
+            # speculative decoding's verify step and is not this increment's work.
             raise ValueError(
-                f"the decode leg advances the indexer's tail ring one position at a "
-                f"time -- its seam takes a single [1, index_head_dim] key row and a "
-                f"single position (model_fp8.py:4741-4744, :5474) -- and this step "
-                f"carries {int(tokens)} token(s); threading a multi-token decode, "
-                f"which is speculative decoding's verify step, is not "
-                f"inc-glm53f-054b's work"
+                f"the decode leg advances each sequence's tail ring one position at a "
+                f"time, so a decode step carries exactly one token per request; this "
+                f"step carries {int(tokens)} token(s) for {int(requests)} request(s). "
+                f"Threading a multi-token decode, which is speculative decoding's "
+                f"verify step, is not inc-glm53f-054b's work"
             )
 
         carriers: list[dict] = []
