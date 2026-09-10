@@ -27,8 +27,9 @@ THROUGH A SEAM THIS INCREMENT DOES NOT OWN, namely ``-025``'s
 ``functional/moe/moe_blockwise_fp8.py``. Four instruments per declared case,
 each reported as a number:
 
-1. ``-025``'s seam dispatch counter -- ``nki_dispatch == 1``;
-2. the same module's torch-fallback counter -- exactly ``0``;
+1. the three limbs' own dispatch counters -- ``nki_dispatch == 1`` each;
+2. the vendor block seam's counters -- exactly ``(0, 0)``, a negative: the routed
+   composition does not enter that seam;
 3. ``can_run_kernel()`` -- ``True``;
 4. real ``nki.simulator.simulate_kernel`` entries -- ``1``, and ATTRIBUTED: the
    Python frame chain at each entry is walked for ``-025``'s seam module, so the
@@ -115,9 +116,19 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     blockwise_fp8_moe,
     blockwise_fp8_moe_torch_oracle,
     dispatch_counters,
-    kernel_identity,
+    down_dispatch_counters,
+    down_kernel_identity,
+    gate_up_dispatch_counters,
+    gate_up_kernel_identity,
     kernel_scale_shape,
+    reset_down_dispatch_counters,
     reset_dispatch_counters,
+    reset_gate_up_dispatch_counters,
+    reset_swiglu_dispatch_counters,
+    swiglu_dispatch_counters,
+    swiglu_kernel_identity,
+    to_down_kernel_scale_operand,
+    to_gate_up_kernel_scale_operand,
 )
 from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     to_kernel_scale_layout as moe_to_kernel_scale_layout,
@@ -186,17 +197,22 @@ DECLARED_CASES = 1
 
 #: The plan's declared dispatch count for the route arm: ``1/1`` calls.
 #:
-#: WHAT THE PLAN ACTUALLY DECLARES, AND WHAT IT DOES NOT. The plan declares the
-#: SEAM reading and only the seam reading: ``-025``'s ``seam_nki_dispatch == 1``,
-#: ``seam_torch_fallback == 0``, and the attributed ``through_seam == 1``, in
-#: ``1/1`` calls. It declares NO total simulator-entry count and NO mapping
-#: dispatch count anywhere. So the total clause inside :func:`_assert_route` is
-#: THIS FILE's own instrument against the F1 false green, not a plan-declared
-#: value: it requires at least one entry and then ATTRIBUTES every entry to a
-#: measured source. Repair round 2 of ``inc-glm53f-027`` corrected this comment,
-#: which had read the total as plan-backed, and replaced the equality with the
-#: attribution identity.
-DECLARED_DISPATCHES = 1
+#: WHAT THE PLAN DECLARES AND WHAT IT DOES NOT. The plan declares the seam reading
+#: only: one dispatch, no torch fallback, and the attributed share equal to the
+#: dispatch count, in ``1/1`` calls. No total simulator-entry count and no mapping
+#: dispatch count anywhere, so the total clause inside :func:`_assert_route` is THIS
+#: FILE's instrument against the F1 false green: at least one entry, then every entry
+#: attributed to a measured source.
+#:
+#: THE READING IS NOW PER LIMB, one ``(nki_dispatch, torch_fallback)`` pair for the
+#: gate/up, activation and down limbs in launch order: the routed composition runs
+#: three kernels for a whole MoE layer. A TRIPLE RATHER THAN A SUM, deliberately --
+#: a summed ``3`` is also what one limb dispatching three times reads, which is the
+#: false green this file's counter clause exists to exclude.
+DECLARED_LIMB_DISPATCHES = ((1, 0), (1, 0), (1, 0))
+
+#: The same reading when the route was refused before any limb was entered.
+NO_LIMB_DISPATCHES = ((0, 0), (0, 0), (0, 0))
 
 _FP8 = torch.float8_e4m3fn
 
@@ -322,9 +338,26 @@ class _AttributedSimulatorCounter:
         nki.simulator.simulate_kernel = self._real
 
 
+def _reset_limb_counters() -> None:
+    """Zero the three limb counters and the vendor seam's, in the same window."""
+    reset_gate_up_dispatch_counters()
+    reset_swiglu_dispatch_counters()
+    reset_down_dispatch_counters()
+    reset_dispatch_counters()
+
+
+def _limb_counters() -> tuple[tuple[int, int], ...]:
+    """The three limbs' ``(nki_dispatch, torch_fallback)`` pairs, in launch order."""
+    return (
+        gate_up_dispatch_counters(),
+        swiglu_dispatch_counters(),
+        down_dispatch_counters(),
+    )
+
+
 def _assert_route(
     sim: _AttributedSimulatorCounter,
-    expected: int,
+    expected: tuple[tuple[int, int], ...],
     label: str,
     *,
     mapping_count: int,
@@ -332,17 +365,23 @@ def _assert_route(
     """Read all four route instruments and return the reading for the transcript.
 
     The certifying component of each conjunct is named in the message (D1.4):
-    conjuncts 1 and 2 are ``-025``'s module-level counters, conjunct 3 is
+    conjunct 1 is the three limbs' own module-level counters, conjunct 2 is the
+    vendor block seam's, conjunct 3 is
     ``vllm_neuron.utils.neuron_utils.can_run_kernel``, conjuncts 4 and 5 are
     ``nki.simulator.simulate_kernel`` itself, conjunct 6 is the frame walk.
 
-    ``expected`` is the PLAN-DECLARED seam count (``1/1``); it governs conjuncts
-    1 and 6. ``mapping_count`` is a READING, never a literal: the caller measures
-    the token-block mapping alone with :func:`_measure_mapping_count`, under the
-    same instrument and in the same run, and passes what the instrument said.
+    ``expected`` is the declared per-limb reading; it governs conjuncts 1 and 6,
+    the second through the total its dispatch counts add to. ``mapping_count`` is a
+    READING, never a literal: the caller measures the token-block mapping alone
+    with :func:`_measure_mapping_count`, under the same instrument and in the same
+    run, and passes what the instrument said.
+
+    CONJUNCT 2 IS A NEGATIVE, and only ever can be: the routed composition never
+    enters the vendor block seam, so that seam's counters read ``(0, 0)`` whatever
+    else happens and can never prove a route.
 
     Conjuncts 4 and 5 are this file's F1 guard, not a plan-declared count (see
-    :data:`DECLARED_DISPATCHES`). Conjunct 4 refuses a numeric pass with no
+    :data:`DECLARED_LIMB_DISPATCHES`). Conjunct 4 refuses a numeric pass with no
     simulator entry at all. Conjunct 5 then requires every entry to be
     ATTRIBUTED: the total must equal the seam's attributed share plus the
     mapping's measured share, with nothing left over. That identity is what
@@ -350,11 +389,13 @@ def _assert_route(
     is nonzero only when the call site builds the mapping over the real token
     count -- a call site that pads before it maps.
     """
-    nki_dispatch, torch_fallback = dispatch_counters()
+    limbs = _limb_counters()
+    vendor = dispatch_counters()
+    expected_total = sum(dispatches for dispatches, _fallback in expected)
     gate = can_run_kernel(torch.zeros(1))
     reading = (
-        f"[{label}] seam_nki_dispatch={nki_dispatch} "
-        f"seam_torch_fallback={torch_fallback} can_run_kernel={gate} "
+        f"[{label}] limb_counters={limbs} vendor_seam_counters={vendor} "
+        f"declared_limb_counters={expected} can_run_kernel={gate} "
         f"simulate_kernel_total={sim.total} "
         f"simulate_kernel_through_025_seam={sim.through_seam} "
         f"simulate_kernel_elsewhere={sim.elsewhere} "
@@ -362,17 +403,17 @@ def _assert_route(
         f"attribution_sum={sim.through_seam + mapping_count}"
     )
     print(reading)
-    if nki_dispatch != expected:
+    if limbs != expected:
         raise RouteInstrumentError(
-            f"{label}: -025's seam dispatch counter read {nki_dispatch}, "
-            f"declared {expected}. {reading}"
+            f"{label}: the limb counters read {limbs}, declared {expected}. A limb "
+            f"short means the composition reached it some other way; a nonzero "
+            f"fallback means a limb grew a torch path. {reading}"
         )
-    if torch_fallback != 0:
+    if vendor != (0, 0):
         raise RouteInstrumentError(
-            f"{label}: -025's torch-fallback counter read {torch_fallback}, "
-            f"declared exactly 0. A fallback pass compares the vendor's torch "
-            f"reference against a torch reference and measures no kernel. "
-            f"{reading}"
+            f"{label}: the vendor block seam's counters read {vendor}, declared "
+            f"(0, 0). The routed composition does not enter that seam, so any "
+            f"reading here means the call site went back to it. {reading}"
         )
     if gate is not True:
         raise RouteInstrumentError(
@@ -394,10 +435,11 @@ def _assert_route(
             f"whose NKI gates refuse -- which is what padding before mapping "
             f"does, finding B21-027. {reading}"
         )
-    if sim.through_seam != expected:
+    if sim.through_seam != expected_total:
         raise RouteInstrumentError(
             f"{label}: {sim.through_seam} of {sim.total} simulator entries were "
-            f"attributed to -025's seam ({_SEAM_FILE}), declared {expected}. "
+            f"attributed to the limb module ({_SEAM_FILE}), declared "
+            f"{expected_total}. "
             f"An unattributed dispatch means some OTHER component produced it, "
             f"which is not what R-2 counts. {reading}"
         )
@@ -599,6 +641,13 @@ def _build_case() -> dict:
     )
     gup_logical_view = gup_flat.view(*kernel_scale_shape(E, H, I_TP, GATE_UP))
     gup_weight = torch.empty((E, H, 2, I_TP), dtype=torch.float32)
+    # The bytes and the grid the CAMPAIGN limbs consume: the checkpoint's own, never
+    # retiled. The retiled pair beside them is the producer's, and two items in this
+    # file are about the producer.
+    gup_original = torch.empty((E, H, 2, I_TP), dtype=torch.float32)
+    gup_grid = torch.empty(
+        (E, H // TILE_SIZE, 2, I_TP // TILE_SIZE), dtype=torch.float32
+    )
     gup_results = []
     for gate_or_up, (weight_seed, scale_seed) in enumerate(
         ((WEIGHT_SEED_GATE, SCALE_SEED_GATE), (WEIGHT_SEED_UP, SCALE_SEED_UP))
@@ -610,6 +659,8 @@ def _build_case() -> dict:
         )
         gup_results.append(result)
         gup_weight[:, :, gate_or_up, :] = result.retiled_weights.to(torch.float32)
+        gup_original[:, :, gate_or_up, :] = weights
+        gup_grid[:, :, gate_or_up, :] = checkpoint
         bridged = moe_to_kernel_scale_layout(
             result.consumer_scales, E, H, I_TP, projection=GATE_UP
         )
@@ -654,15 +705,29 @@ def _build_case() -> dict:
             expert = (token + slot) % E
             affinities[token, expert] = AFFINITY_VALUES[(token + slot) % len(AFFINITY_VALUES)]
 
+    # --- the campaign limbs' operands, one per expert, from that grid. ------ #
+    down_original = down_weight_hi.transpose(1, 2).contiguous()
+    down_grid = down_checkpoint.transpose(1, 2).contiguous()
+    gup_operands = torch.stack(
+        [to_gate_up_kernel_scale_operand(gup_grid[expert], H, I_TP) for expert in range(E)]
+    )
+    down_operands = torch.stack(
+        [to_down_kernel_scale_operand(down_grid[expert], I_TP, H) for expert in range(E)]
+    )
+
     return {
         "call_site_inputs": dict(
             hidden_states=hidden,
             expert_affinities=affinities,
-            gate_up_proj_weight=gup_weight.to(_FP8),
-            down_proj_weight=down_weight.to(_FP8),
-            gate_up_consumer_scales=gup_flat,
-            down_consumer_scales=down_flat,
+            gate_up_proj_weight=gup_original.to(_FP8),
+            down_proj_weight=down_original.to(_FP8),
+            gate_up_scale_operands=gup_operands,
+            down_scale_operands=down_operands,
         ),
+        "gup_grid": gup_grid,
+        "down_grid": down_grid,
+        "gup_retiled": gup_weight.to(_FP8),
+        "down_retiled": down_weight.to(_FP8),
         "gup_logical": gup_logical_view.clone(),
         "down_logical": moe_to_kernel_scale_layout(
             down_flat, E, H, I_TP, projection=DOWN
@@ -676,7 +741,7 @@ def _build_case() -> dict:
 # The comparator: a pure-torch reference MoE over the SAME weights and scores.
 # ---------------------------------------------------------------------------
 def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Tensor:
-    """``weight[k, n] * scale[k // 256, n // 256]``, expanded, in fp32.
+    """``weight[k, n] * scale[k // g, n // g]``, expanded, in fp32.
 
     The block scale is broadcast by ``repeat_interleave`` on both axes rather
     than by an index computation, so this function repeats none of the
@@ -689,13 +754,27 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
             f"{tuple(weight_fp8.shape)} and {tuple(block_scale.shape)}"
         )
     rows, cols = weight_fp8.shape
-    if tuple(block_scale.shape) != (rows // BLOCK_QUANT_SIZE, cols // BLOCK_QUANT_SIZE):
+    # THE GRANULARITY IS READ OFF THE SCALE, not named here. This reference now serves
+    # the checkpoint's own [128, 128] grid, and naming one number would make the
+    # function silently wrong for the other rather than refuse.
+    block_rows = rows // int(block_scale.shape[0]) if int(block_scale.shape[0]) else 0
+    block_cols = cols // int(block_scale.shape[1]) if int(block_scale.shape[1]) else 0
+    if (block_rows, block_cols) == (0, 0) or tuple(block_scale.shape) != (
+        rows // block_rows,
+        cols // block_cols,
+    ):
         raise ReferenceShapeError(
             f"block scale {tuple(block_scale.shape)} does not tile a "
-            f"{rows}x{cols} weight at granularity {BLOCK_QUANT_SIZE}"
+            f"{rows}x{cols} weight at any whole granularity"
         )
-    expanded = block_scale.repeat_interleave(BLOCK_QUANT_SIZE, dim=0).repeat_interleave(
-        BLOCK_QUANT_SIZE, dim=1
+    if block_rows != block_cols:
+        raise ReferenceShapeError(
+            f"block scale {tuple(block_scale.shape)} tiles {rows}x{cols} only with "
+            f"unequal blocks {block_rows}x{block_cols}; both this checkpoint's grid "
+            f"and the consumer's are square"
+        )
+    expanded = block_scale.repeat_interleave(block_rows, dim=0).repeat_interleave(
+        block_cols, dim=1
     )
     return weight_fp8.to(torch.float32) * expanded
 
@@ -705,8 +784,8 @@ def torch_reference_moe(
     expert_affinities: torch.Tensor,
     gate_up_proj_weight: torch.Tensor,
     down_proj_weight: torch.Tensor,
-    gate_up_logical_scale: torch.Tensor,
-    down_logical_scale: torch.Tensor,
+    gate_up_block_scale: torch.Tensor,
+    down_block_scale: torch.Tensor,
     *,
     swiglu_limit: float,
     post_scale: bool = True,
@@ -746,10 +825,11 @@ def torch_reference_moe(
     ``current.to(final.dtype)`` (``:134``) -- which, under ``POST_SCALE``, is a
     rounding of the SCALED contribution, since the model scales first (``:133``).
 
-    The trailing ``TILE_SIZE`` axis of both logical scale tensors is the
-    partition broadcast -- 128 copies of one scalar -- so index ``0`` is read.
-    That this is a broadcast and not data is ``-025``'s settled finding, not an
-    assumption of this file.
+    Both scale tensors are the CHECKPOINT's own grid, one fp32 scale per
+    ``[128, 128]`` weight block, in the same orientation as the weight they
+    accompany. There is no partition-broadcast axis to index past any more: the
+    kernels read the grid through their own operand builders, and this reference
+    reads it directly.
 
     Returns:
         ``[T, H]`` fp32. No padding row: this reference never had one.
@@ -770,14 +850,14 @@ def torch_reference_moe(
     for expert in range(num_experts):
         gate_weight = _dequantise(
             gate_up_proj_weight[expert, :, 0, :],
-            gate_up_logical_scale[expert, :, 0, :, 0],
+            gate_up_block_scale[expert, :, 0, :],
         )
         up_weight = _dequantise(
             gate_up_proj_weight[expert, :, 1, :],
-            gate_up_logical_scale[expert, :, 1, :, 0],
+            gate_up_block_scale[expert, :, 1, :],
         )
         down_weight = _dequantise(
-            down_proj_weight[expert], down_logical_scale[expert, :, :, 0]
+            down_proj_weight[expert], down_block_scale[expert]
         )
         rows = torch.nonzero(expert_affinities[:, expert], as_tuple=True)[0]
         if rows.numel() == 0:
@@ -802,6 +882,21 @@ def torch_reference_moe(
     return output
 
 
+def _configured_reference(case: dict, bank) -> torch.Tensor:
+    """The comparator on this case's operands, at the call site's two overrides."""
+    return torch_reference_moe(
+        hidden_states=case["call_site_inputs"]["hidden_states"],
+        expert_affinities=case["call_site_inputs"]["expert_affinities"],
+        gate_up_proj_weight=case["call_site_inputs"]["gate_up_proj_weight"],
+        down_proj_weight=case["call_site_inputs"]["down_proj_weight"],
+        gate_up_block_scale=case["gup_grid"],
+        down_block_scale=case["down_grid"],
+        swiglu_limit=bank.swiglu_limit,
+        post_scale=True,
+        clamp=True,
+    )
+
+
 def _max_rel_error(got: torch.Tensor, want: torch.Tensor) -> float:
     """``max |got - want| / (|want| + ATOL)`` -- a number, not a verdict."""
     return float(((got - want).abs() / (want.abs() + ATOL)).max())
@@ -818,6 +913,106 @@ def _nonempty_or_raise(reference: torch.Tensor, label: str) -> int:
     return nonzero_rows
 
 
+class _TorchLimbs:
+    """The three limbs' contracts computed in torch. A SUBSTITUTE, never product code.
+
+    Each method carries its limb's exact positional signature, return shape and block
+    order, so patching the three module attributes makes the call site run this
+    composition instead. Dequantisation and the clamp-then-SiLU pair are the ones
+    :func:`torch_reference_moe` uses, so this and the comparator cannot disagree about
+    the function -- only about the routing, which is what the arm using it measures.
+    The scales come from the CHECKPOINT GRID and not from the ``scale_bank`` operand:
+    recovering the grid from the operand would re-derive the operand builder's own
+    index arithmetic, and a shared off-by-one would then cancel.
+    """
+
+    def __init__(
+        self, gate_up_grid: torch.Tensor, down_grid: torch.Tensor
+    ) -> None:
+        self.gate_up_grid = gate_up_grid
+        self.down_grid = down_grid
+
+    @staticmethod
+    def _rows(row_index: torch.Tensor, pad_row: int) -> torch.Tensor:
+        """Block-order row addresses with the mapping's ``-1`` resolved to the pad row."""
+        rows = row_index.reshape(-1).long()
+        return torch.where(rows < 0, torch.full_like(rows, pad_row), rows)
+
+    def gate_up(
+        self,
+        hidden_states: torch.Tensor,
+        weight_bank: torch.Tensor,
+        scale_bank: torch.Tensor,
+        row_index: torch.Tensor,
+        expert_index: torch.Tensor,
+        block: int,
+    ) -> torch.Tensor:
+        """``[T + 1, H]`` in, ``[P, 2*I]`` fp32 out, block order."""
+        experts, contraction = int(weight_bank.shape[0]), int(weight_bank.shape[1])
+        fused = weight_bank.reshape(experts, contraction, -1).shape[2]
+        half = fused // 2
+        positions = int(row_index.shape[0])
+        rows = self._rows(row_index, int(hidden_states.shape[0]) - 1)
+        out = torch.zeros(positions, fused, dtype=torch.float32)
+        for position in range(positions // block):
+            expert = int(expert_index.reshape(-1)[position])
+            span = slice(position * block, (position + 1) * block)
+            local = hidden_states[rows[span]].to(torch.float32)
+            slab = weight_bank[expert].reshape(contraction, 2, half)
+            for gate_or_up in range(2):
+                weight = _dequantise(
+                    slab[:, gate_or_up, :],
+                    self.gate_up_grid[expert, :, gate_or_up, :],
+                )
+                out[span, gate_or_up * half : (gate_or_up + 1) * half] = (
+                    local @ weight
+                )
+        return out
+
+    @staticmethod
+    def swiglu(
+        gate_up: torch.Tensor,
+        gate_upper: float | None = None,
+        up_upper: float | None = None,
+    ) -> torch.Tensor:
+        """``[B, 2*I]`` in, ``[I, B]`` fp32 out. The transpose is the limb's contract."""
+        half = int(gate_up.shape[1]) // 2
+        gate_act = gate_up[:, :half].to(torch.float32)
+        up_act = gate_up[:, half:].to(torch.float32)
+        if gate_upper is not None:
+            gate_act = gate_act.clamp(min=None, max=float(gate_upper))
+        if up_upper is not None:
+            up_act = up_act.clamp(min=-float(up_upper), max=float(up_upper))
+        intermediate = torch.nn.functional.silu(gate_act) * up_act
+        return intermediate.transpose(0, 1).contiguous()
+
+    def down(
+        self,
+        intermediate_t: torch.Tensor,
+        weight_bank: torch.Tensor,
+        scale_bank: torch.Tensor,
+        affinity_bank: torch.Tensor,
+        row_index: torch.Tensor,
+        expert_index: torch.Tensor,
+        block: int,
+        tokens: int,
+    ) -> torch.Tensor:
+        """``[I, P]`` in, ``[P, H]`` fp32 out, block order, affinity applied here."""
+        experts, cols = int(weight_bank.shape[0]), int(weight_bank.shape[2])
+        positions = int(intermediate_t.shape[1])
+        rows = self._rows(row_index, tokens)
+        affinity = affinity_bank.reshape(-1, experts)
+        out = torch.zeros(positions, cols, dtype=torch.float32)
+        for position in range(positions // block):
+            expert = int(expert_index.reshape(-1)[position])
+            span = slice(position * block, (position + 1) * block)
+            weight = _dequantise(weight_bank[expert], self.down_grid[expert])
+            local = intermediate_t[:, span].transpose(0, 1).to(torch.float32)
+            scale = affinity[rows[span], expert].to(torch.float32).unsqueeze(1)
+            out[span] = (local @ weight) * scale
+        return out
+
+
 # ===========================================================================
 # THE DECLARED ACCEPTANCE CASE. Both conjuncts, one call, 1/1.
 # ===========================================================================
@@ -832,7 +1027,7 @@ def test_moe_path_output_matches_pure_torch_reference() -> None:
     quant_config = _block_quant_config()
     case = _build_case()
 
-    reset_dispatch_counters()
+    _reset_limb_counters()
     with _AttributedSimulatorCounter() as sim:
         got = bank.block_quant_expert_mm(
             quant_config=quant_config, block_size=B, **case["call_site_inputs"]
@@ -844,7 +1039,7 @@ def test_moe_path_output_matches_pure_torch_reference() -> None:
         case["call_site_inputs"]["expert_affinities"], "acceptance"
     )
     reading = _assert_route(
-        sim, DECLARED_DISPATCHES, "acceptance", mapping_count=mapping_count
+        sim, DECLARED_LIMB_DISPATCHES, "acceptance", mapping_count=mapping_count
     )
 
     if tuple(got.shape) != (T, H):
@@ -855,17 +1050,7 @@ def test_moe_path_output_matches_pure_torch_reference() -> None:
 
     # The reference is configured from the BANK the call site used, so the two
     # sides cannot disagree about the bound by construction (R6 item R-T1).
-    want = torch_reference_moe(
-        hidden_states=case["call_site_inputs"]["hidden_states"],
-        expert_affinities=case["call_site_inputs"]["expert_affinities"],
-        gate_up_proj_weight=case["call_site_inputs"]["gate_up_proj_weight"],
-        down_proj_weight=case["call_site_inputs"]["down_proj_weight"],
-        gate_up_logical_scale=case["gup_logical"],
-        down_logical_scale=case["down_logical"],
-        swiglu_limit=bank.swiglu_limit,
-        post_scale=True,
-        clamp=True,
-    )
+    want = _configured_reference(case, bank)
     got_f32 = got.to(torch.float32)
     nonzero_rows = _nonempty_or_raise(want, "acceptance")
 
@@ -942,8 +1127,8 @@ def test_moe_path_reference_agrees_with_vendor_torch_oracle() -> None:
         return blockwise_fp8_moe_torch_oracle(
             hidden_states=padded_hidden,
             expert_affinities_masked=masked.to(hidden.dtype),
-            gate_up_proj_weight=inputs["gate_up_proj_weight"],
-            down_proj_weight=inputs["down_proj_weight"],
+            gate_up_proj_weight=case["gup_retiled"],
+            down_proj_weight=case["down_retiled"],
             block_size=B,
             token_position_to_id=token_position_to_id,
             block_to_expert=block_to_expert.reshape(-1, 1),
@@ -956,10 +1141,10 @@ def test_moe_path_reference_agrees_with_vendor_torch_oracle() -> None:
         return torch_reference_moe(
             hidden_states=hidden,
             expert_affinities=affinities,
-            gate_up_proj_weight=inputs["gate_up_proj_weight"],
-            down_proj_weight=inputs["down_proj_weight"],
-            gate_up_logical_scale=case["gup_logical"],
-            down_logical_scale=case["down_logical"],
+            gate_up_proj_weight=case["gup_retiled"],
+            down_proj_weight=case["down_retiled"],
+            gate_up_block_scale=case["gup_logical"][..., 0],
+            down_block_scale=case["down_logical"][..., 0],
             swiglu_limit=limit,
             **configuration,
         )
@@ -1034,11 +1219,11 @@ def test_moe_path_f1_pre_scale_unclamped_reference_must_fail() -> None:
     case = _build_case()
     limit = float(bank.swiglu_limit)
 
-    reset_dispatch_counters()
+    _reset_limb_counters()
     got = bank.block_quant_expert_mm(
         quant_config=quant_config, block_size=B, **case["call_site_inputs"]
     ).to(torch.float32)
-    nki_dispatch, torch_fallback = dispatch_counters()
+    limbs = _limb_counters()
 
     def _reference(post_scale: bool, clamp: bool) -> torch.Tensor:
         return torch_reference_moe(
@@ -1046,8 +1231,8 @@ def test_moe_path_f1_pre_scale_unclamped_reference_must_fail() -> None:
             expert_affinities=case["call_site_inputs"]["expert_affinities"],
             gate_up_proj_weight=case["call_site_inputs"]["gate_up_proj_weight"],
             down_proj_weight=case["call_site_inputs"]["down_proj_weight"],
-            gate_up_logical_scale=case["gup_logical"],
-            down_logical_scale=case["down_logical"],
+            gate_up_block_scale=case["gup_grid"],
+            down_block_scale=case["down_grid"],
             swiglu_limit=limit,
             post_scale=post_scale,
             clamp=clamp,
@@ -1064,15 +1249,14 @@ def test_moe_path_f1_pre_scale_unclamped_reference_must_fail() -> None:
     }
 
     print(
-        f"[override-pair] seam_nki_dispatch={nki_dispatch} "
-        f"seam_torch_fallback={torch_fallback} swiglu_limit={limit!r} "
+        f"[override-pair] limb_counters={limbs} swiglu_limit={limit!r} "
         f"configured_max_rel_error={_max_rel_error(got, configured):.6e} "
         f"configured_max_abs_error={float((got - configured).abs().max()):.6e} "
         f"rtol={RTOL} atol={ATOL}"
     )
-    assert (nki_dispatch, torch_fallback) == (DECLARED_DISPATCHES, 0), (
-        f"expected the seam reading ({DECLARED_DISPATCHES}, 0), got "
-        f"({nki_dispatch}, {torch_fallback}); this pair is about the route the "
+    assert limbs == DECLARED_LIMB_DISPATCHES, (
+        f"expected the limb reading {DECLARED_LIMB_DISPATCHES}, got "
+        f"{limbs}; this pair is about the route the "
         f"acceptance measures, so it must run on that route"
     )
     for label, other in reverted.items():
@@ -1098,107 +1282,140 @@ def test_moe_path_f1_pre_scale_unclamped_reference_must_fail() -> None:
 
 
 # ===========================================================================
-# F1. The two arms that say why the counter clause is load-bearing.
+# The routing is an operand, so a wrong operand must redden the acceptance.
+# ===========================================================================
+def test_moe_path_planted_routing_operands_must_fail() -> None:
+    """MEASURED: two plantings in the mapping's output each turn the numbers RED.
+
+    The limbs pick their rows, their expert slab and their affinities from operands
+    the mapping produces, so the acceptance is load-bearing only if a wrong operand
+    can fail it: one arm rolls every row index by one position, the other points
+    block ``0`` at the next expert. Each requires the route reading to stay the
+    routed triple, so it fails for the operand and not for a stopped kernel, and
+    each measures that the planting moved the numbers before its failure counts.
+    """
+    from vllm_neuron import functional as functional_hub
+
+    bank, _text_config = _build_bank()
+    quant_config = _block_quant_config()
+    case = _build_case()
+    real_mapping = functional_hub.build_blockwise_mapping
+
+    def _plant(roll_rows: bool, next_expert: bool):
+        def mapping(**kwargs):
+            masked, positions, block_to_expert, conditions = real_mapping(**kwargs)
+            if roll_rows:
+                positions = torch.roll(positions, 1, dims=0)
+            if next_expert:
+                block_to_expert = block_to_expert.clone()
+                flat = block_to_expert.reshape(-1)
+                flat[0] = (int(flat[0]) + 1) % E
+            return masked, positions, block_to_expert, conditions
+
+        return mapping
+
+    want = _configured_reference(case, bank)
+    _nonempty_or_raise(want, "planted-routing")
+
+    for label, planting in (
+        ("row_index_rolled_one_position", dict(roll_rows=True, next_expert=False)),
+        ("block_0_expert_incremented", dict(roll_rows=False, next_expert=True)),
+    ):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                functional_hub, "build_blockwise_mapping", _plant(**planting)
+            )
+            _reset_limb_counters()
+            got = bank.block_quant_expert_mm(
+                quant_config=quant_config, block_size=B, **case["call_site_inputs"]
+            ).to(torch.float32)
+        counters = _limb_counters()
+        separation = float((got - want).abs().max())
+        print(
+            f"[planted-routing] {label} limb_counters={counters} "
+            f"separation_from_reference_absmax={separation:.6e} "
+            f"max_rel_error={_max_rel_error(got, want):.6e} "
+            f"rtol={RTOL} atol={ATOL}"
+        )
+        assert counters == DECLARED_LIMB_DISPATCHES, (
+            f"{label}: the limb counters read {counters}, declared "
+            f"{DECLARED_LIMB_DISPATCHES}; this arm must fail for the planted "
+            f"operand, not because the route stopped running"
+        )
+        if not separation > 0.0:
+            raise VacuousControlError(
+                f"{label}: the planting left the output numerically identical "
+                f"(max abs difference {separation!r}), so this arm cannot fail "
+                f"for the reason it claims"
+            )
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
+# ===========================================================================
+# F1. The arm that says why the counter clause is load-bearing.
 # ===========================================================================
 def test_moe_path_f1_numeric_arm_alone_cannot_discriminate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """MEASURED: the numeric comparison passes on the FALLBACK path too.
+    """MEASURED: a torch composition passes the numbers while no kernel runs.
 
-    ``-025``'s seam falls back to the vendor's own torch reference, which
-    computes the same function, so a silently-unrouted call site produces
-    numbers this file's tolerance accepts. This arm runs that world and shows
-    the numeric arm going green while ZERO kernels ran -- which is exactly why
-    the dispatch count is an acceptance conjunct and not a diagnostic.
+    This is why the limb counters are an acceptance conjunct and not a diagnostic.
+    Substitute the three limbs with :class:`_TorchLimbs` and the call site returns
+    numbers the declared tolerance accepts while all three counters read zero and
+    nothing is attributed to the limb module. So the numeric arm alone cannot tell
+    the shipped route from any other route computing the same function.
 
-    It asserts the numbers PASS and the counters read fallback. It is not a
-    tolerance claim about the kernel and it is not the declared arm.
+    The arm needs no second instrument to prove it is armed: a substitution that
+    did not take effect leaves the counters reading the routed triple, and a
+    substitute computing the wrong function fails the comparison.
     """
     bank, _text_config = _build_bank()
     quant_config = _block_quant_config()
     case = _build_case()
+    limbs = _TorchLimbs(case["gup_grid"], case["down_grid"])
 
-    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
-    if can_run_kernel(torch.zeros(1)) is not False:
-        raise VacuousControlError(
-            "the gate did not flip with NKI_SIMULATOR=0, so this control is "
-            "unarmed and its reading would say nothing"
-        )
+    # The call site imports the three names inside the method, so it resolves them
+    # off this module at call time and patching the module is what reaches it.
+    for name, replacement in (
+        ("moe_gate_up_blockwise_fp8", limbs.gate_up),
+        ("moe_swiglu_transposed", limbs.swiglu),
+        ("moe_down_blockwise_fp8", limbs.down),
+    ):
+        monkeypatch.setattr(_seam_module, name, replacement)
 
-    reset_dispatch_counters()
+    _reset_limb_counters()
     with _AttributedSimulatorCounter() as sim:
         got = bank.block_quant_expert_mm(
             quant_config=quant_config, block_size=B, **case["call_site_inputs"]
         )
-    nki_dispatch, torch_fallback = dispatch_counters()
-    # The CONFIGURED reference, because the fallback route carries the call
-    # site's mode and clamp limits too: the seam forwards ``**kernel_kwargs``
-    # verbatim on both routes (``moe_blockwise_fp8.py:445``, ``:462``). A
-    # default-configured reference here would turn this hazard arm red for a
-    # comparator reason and hide the hazard it exists to show (R6 item R-T1).
-    want = torch_reference_moe(
-        hidden_states=case["call_site_inputs"]["hidden_states"],
-        expert_affinities=case["call_site_inputs"]["expert_affinities"],
-        gate_up_proj_weight=case["call_site_inputs"]["gate_up_proj_weight"],
-        down_proj_weight=case["call_site_inputs"]["down_proj_weight"],
-        gate_up_logical_scale=case["gup_logical"],
-        down_logical_scale=case["down_logical"],
-        swiglu_limit=bank.swiglu_limit,
-        post_scale=True,
-        clamp=True,
-    )
+    counters = _limb_counters()
+    want = _configured_reference(case, bank)
     got_f32 = got.to(torch.float32)
-    error = _max_rel_error(got_f32, want)
+    _nonempty_or_raise(want, "f1-hazard")
     print(
-        f"[f1-hazard] fallback_path seam_nki_dispatch={nki_dispatch} "
-        f"seam_torch_fallback={torch_fallback} simulate_kernel_total={sim.total} "
-        f"max_rel_error={error:.6e} rtol={RTOL} atol={ATOL}"
-    )
-    assert (nki_dispatch, torch_fallback) == (0, 1), (
-        f"expected the fallback reading (0, 1), got "
-        f"({nki_dispatch}, {torch_fallback}); this control cannot demonstrate "
-        f"the hazard if the route did not actually change"
-    )
-    assert sim.total == 0, (
-        f"the simulator ran {sim.total} times on the fallback path, so the "
-        f"instrument is not measuring the route"
-    )
-    # THE POINT: the numbers are fine. Only the counters know the difference.
-    torch.testing.assert_close(got_f32, want, rtol=RTOL, atol=ATOL)
-
-
-def test_moe_path_route_control_fallback_counter_discriminates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The declared ``(1, 0)`` reading is a measurement, not an unwired counter.
-
-    Same instruments, opposite world. ``_assert_route`` must REFUSE the fallback
-    reading, so a passing acceptance cannot be a counter that always reads 1.
-    """
-    bank, _text_config = _build_bank()
-    quant_config = _block_quant_config()
-    case = _build_case()
-
-    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
-    reset_dispatch_counters()
-    with _AttributedSimulatorCounter() as sim:
-        bank.block_quant_expert_mm(
-            quant_config=quant_config, block_size=B, **case["call_site_inputs"]
-        )
-    print(
-        f"[route-control] seam_counters={dispatch_counters()} "
+        f"[f1-hazard] substituted_limbs limb_counters={counters} "
         f"simulate_kernel_total={sim.total} "
-        f"through_025_seam={sim.through_seam}"
+        f"through_limb_file={sim.through_seam} elsewhere={sim.elsewhere} "
+        f"max_rel_error={_max_rel_error(got_f32, want):.6e} "
+        f"max_abs_error={float((got_f32 - want).abs().max()):.6e} "
+        f"rtol={RTOL} atol={ATOL}"
     )
-    # Measured in the SAME monkeypatched world, so the mapping's share is read
-    # off the fallback path too rather than carried over from the real one.
-    mapping_count = _measure_mapping_count(
-        case["call_site_inputs"]["expert_affinities"], "route-control"
+    assert counters == NO_LIMB_DISPATCHES, (
+        f"the limb counters read {counters}, expected {NO_LIMB_DISPATCHES}; the "
+        f"substitution did not take effect, so this arm would be measuring the "
+        f"shipped route and not the hazard"
     )
-    with pytest.raises(RouteInstrumentError):
-        _assert_route(
-            sim, DECLARED_DISPATCHES, "route-control", mapping_count=mapping_count
-        )
+    # NOT ``sim.total == 0``: the token-block mapping dispatches its own NKI
+    # subkernels inside this call, which is the reading
+    # :func:`_run_mapping` requires. What must be zero is the share attributed
+    # to the limb file, because that is the share the acceptance counts.
+    assert sim.through_seam == 0, (
+        f"{sim.through_seam} of {sim.total} simulator entries were attributed to "
+        f"{_SEAM_FILE} while all three limbs were substituted, so the "
+        f"attribution is matching frames it should not"
+    )
+    torch.testing.assert_close(got_f32, want, rtol=RTOL, atol=ATOL)
 
 
 def test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere() -> None:
@@ -1295,7 +1512,7 @@ def test_moe_path_call_site_maps_before_padding_and_dispatches_nki() -> None:
         nested.append(inner)
         return result
 
-    reset_dispatch_counters()
+    _reset_limb_counters()
     NF.build_blockwise_mapping = spy
     try:
         with _AttributedSimulatorCounter() as outer:
@@ -1311,7 +1528,7 @@ def test_moe_path_call_site_maps_before_padding_and_dispatches_nki() -> None:
             f"every reading here assumes exactly one entry"
         )
     handed, inner = seen[0], nested[0]
-    counters = dispatch_counters()
+    counters = _limb_counters()
     print(
         f"[call-site-mapping] handed_shape={tuple(handed.shape)} "
         f"real_tokens={T} padded_tokens={T + 1} "
@@ -1339,9 +1556,11 @@ def test_moe_path_call_site_maps_before_padding_and_dispatches_nki() -> None:
         f"{inner.through_seam} of the mapping's {inner.total} entries were "
         f"attributed to -025's seam, so the attribution sum double-counts"
     )
-    assert outer.through_seam == DECLARED_DISPATCHES, (
-        f"the seam was entered {outer.through_seam} times, declared "
-        f"{DECLARED_DISPATCHES}"
+    assert outer.through_seam == sum(
+        dispatches for dispatches, _fallback in DECLARED_LIMB_DISPATCHES
+    ), (
+        f"the limb module was entered {outer.through_seam} times, declared "
+        f"{DECLARED_LIMB_DISPATCHES}"
     )
     assert outer.total == outer.through_seam + inner.total, (
         f"{outer.total} entries in the whole call do not add up: "
@@ -1349,7 +1568,7 @@ def test_moe_path_call_site_maps_before_padding_and_dispatches_nki() -> None:
         f"mapping is {outer.through_seam + inner.total}. Some component nobody "
         f"measured dispatched."
     )
-    assert counters == (1, 0), (
+    assert counters == DECLARED_LIMB_DISPATCHES, (
         f"seam counters {counters}: the mapping's route must not change how many "
         f"times the block-quant kernel is entered, nor take a fallback"
     )
@@ -1486,14 +1705,14 @@ def test_moe_path_unquantised_config_raises_by_name() -> None:
             "Glm5NextQuantConfig(None) reports is_block_quantized=True, so this "
             "control's input is not the unquantised world it claims to be"
         )
-    reset_dispatch_counters()
+    _reset_limb_counters()
     with pytest.raises(Glm5NextBlockQuantRouteError, match="block-quant route"):
         bank.block_quant_expert_mm(
             quant_config=unquantised, block_size=B, **case["call_site_inputs"]
         )
-    assert dispatch_counters() == (0, 0), (
+    assert _limb_counters() == NO_LIMB_DISPATCHES, (
         f"the refusal must fire BEFORE any dispatch, read "
-        f"{dispatch_counters()}"
+        f"{_limb_counters()}"
     )
 
 
@@ -1524,14 +1743,14 @@ def test_moe_path_foreign_checkpoint_block_shape_raises_by_name() -> None:
         method = _ForeignShapeMethod()
         block_shape = (64, 64)
 
-    reset_dispatch_counters()
+    _reset_limb_counters()
     with pytest.raises(Glm5NextBlockQuantRouteError, match="weight_block_size"):
         bank.block_quant_expert_mm(
             quant_config=_ForeignShapeConfig(),
             block_size=B,
             **case["call_site_inputs"],
         )
-    assert dispatch_counters() == (0, 0)
+    assert _limb_counters() == NO_LIMB_DISPATCHES
 
 
 def _imported_names(source: str, filename: str) -> set[str]:
@@ -1873,24 +2092,34 @@ def test_moe_path_mapping_shape_is_the_one_the_seam_consumes() -> None:
     )
 
 
-def test_moe_path_kernel_identity_is_the_d5b_inner_kernel() -> None:
-    """D5(b), read off the object: the INNER kernel, not the ``moe_cte`` dispatcher.
+def test_moe_path_kernel_identity_is_the_three_limb_kernels() -> None:
+    """Read off the objects: this call site's three kernels are authored here.
 
-    The plan's D5(b) decision is to bypass the public dispatcher because it will
-    not forward block scales. That the seam this call site enters targets the
-    inner member is read from ``kernel_identity()`` rather than argued, so a
-    substitution shows up as a changed reading instead of as silence.
+    The decision is unchanged -- bypass the public ``moe_cte`` dispatcher, which
+    will not forward block scales -- and what moved is where the site lands: three
+    limb kernels in this module, not the vendor's fused member. Each identity is
+    read through its own seam, so a substituted limb changes a reading rather than
+    going silent.
     """
-    module, qualname = kernel_identity()
-    print(f"[kernel-identity] module={module!r} qualname={qualname!r}")
-    assert "bwmm_shard_on_I" in module, (
-        f"the seam's kernel lives in {module!r}, not the D5(b) inner-kernel "
-        f"module"
+    readings = {
+        "gate_up": gate_up_kernel_identity(),
+        "swiglu": swiglu_kernel_identity(),
+        "down": down_kernel_identity(),
+    }
+    print(f"[kernel-identity] {readings}")
+    for limb, (module, qualname) in readings.items():
+        assert module == _seam_module.__name__, (
+            f"the {limb} limb's kernel lives in {module!r}, not the limb module "
+            f"{_seam_module.__name__!r}"
+        )
+        assert "bwmm_shard_on_I" not in module and "moe_cte" not in qualname, (
+            f"the {limb} limb reaches {module!r}.{qualname!r}, a vendor member "
+            f"rather than a kernel authored here"
+        )
+    assert len(set(readings.values())) == 3, (
+        f"two limbs report the same kernel: {readings}; the composition launches "
+        f"three distinct ones"
     )
-    assert qualname == "blockwise_mm_baseline_shard_intermediate", (
-        f"the seam dispatches to {qualname!r}, not the declared inner kernel"
-    )
-    assert "moe_cte_dispatch" not in qualname
 
 
 def test_moe_path_block_size_must_be_block_quant_granular() -> None:
@@ -1900,14 +2129,14 @@ def test_moe_path_block_size_must_be_block_quant_granular() -> None:
     bank, _text_config = _build_bank()
     quant_config = _block_quant_config()
     case = _build_case()
-    reset_dispatch_counters()
+    _reset_limb_counters()
     with pytest.raises(Glm5NextBlockQuantRouteError, match="BLOCK_QUANT_SIZE"):
         bank.block_quant_expert_mm(
             quant_config=quant_config,
             block_size=BLOCK_QUANT_SIZE + 1,
             **case["call_site_inputs"],
         )
-    assert dispatch_counters() == (0, 0)
+    assert _limb_counters() == NO_LIMB_DISPATCHES
 
 
 def test_moe_path_expert_count_disagreement_raises_by_name() -> None:
@@ -1925,12 +2154,12 @@ def test_moe_path_expert_count_disagreement_raises_by_name() -> None:
     case = _build_case()
     inputs = dict(case["call_site_inputs"])
     inputs["gate_up_proj_weight"] = inputs["gate_up_proj_weight"][: E - 1]
-    reset_dispatch_counters()
+    _reset_limb_counters()
     with pytest.raises(Glm5NextBlockQuantRouteError, match="experts"):
         bank.block_quant_expert_mm(
             quant_config=quant_config, block_size=B, **inputs
         )
-    assert dispatch_counters() == (0, 0)
+    assert _limb_counters() == NO_LIMB_DISPATCHES
 
 
 def test_moe_path_landed_sections_are_untouched() -> None:
@@ -2220,7 +2449,7 @@ def test_moe_path_dispatch_maps_global_router_output_at_degree_above_one() -> No
         # what goes in is the GLOBAL width, which is not this rank's extent.
         assert tuple(inputs["expert_affinities"].shape) == (T, global_experts)
         assert global_experts != EP_LOCAL_EXPERTS
-        reset_dispatch_counters()
+        _reset_limb_counters()
         with _MappingAffinitySpy() as spy:
             out = bank.block_quant_expert_mm(
                 quant_config=quant_config,
@@ -2229,7 +2458,7 @@ def test_moe_path_dispatch_maps_global_router_output_at_degree_above_one() -> No
                 **inputs,
             )
         seam_affinities = spy.only
-        counters = dispatch_counters()
+        counters = _limb_counters()
         columns = torch.tensor(
             bank.local_expert_indices(rank), dtype=torch.int64
         )
@@ -2268,7 +2497,7 @@ def test_moe_path_dispatch_maps_global_router_output_at_degree_above_one() -> No
             "the kernel returned an all-zero output, so nothing downstream of "
             "the dispatch actually computed"
         )
-        assert counters == (1, 0), (
+        assert counters == DECLARED_LIMB_DISPATCHES, (
             f"seam counters {counters}: the dispatch must not change how many "
             f"times the block-quant kernel is entered, nor take a fallback"
         )
@@ -2328,7 +2557,7 @@ def test_moe_path_dispatch_refuses_a_caller_sliced_local_form_above_degree_one()
     )
     inputs = dict(case["call_site_inputs"])
     inputs["expert_affinities"] = pre_sliced
-    reset_dispatch_counters()
+    _reset_limb_counters()
     with pytest.raises(Glm5NextBlockQuantRouteError, match="GLOBAL router width"):
         bank.block_quant_expert_mm(
             quant_config=quant_config,
@@ -2336,12 +2565,12 @@ def test_moe_path_dispatch_refuses_a_caller_sliced_local_form_above_degree_one()
             expert_parallel_rank=1,
             **inputs,
         )
-    counters = dispatch_counters()
+    counters = _limb_counters()
     print(
         f"[dispatch-refusal] degree={degree} "
         f"passed_shape={tuple(pre_sliced.shape)} "
         f"global_width={global_experts} seam_counters={counters}"
     )
-    assert counters == (0, 0), (
+    assert counters == NO_LIMB_DISPATCHES, (
         "the refusal must happen before the block-quant kernel is entered"
     )

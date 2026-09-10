@@ -1774,9 +1774,12 @@ class Glm5NextRoutedExperts(nn.Module):
     # router-call-site row, and for the same reason: the routed bank is where
     # the expert weights and the partition live.
     #
-    # D5(b): THE INNER KERNEL IS CALLED DIRECTLY. The public ``moe_cte``
-    # dispatcher will not forward block scales, so this site enters
-    # ``inc-glm53f-025``'s ``blockwise_fp8_moe`` seam instead of the dispatcher.
+    # D5(b): THE INNER KERNELS ARE CALLED DIRECTLY. The public ``moe_cte``
+    # dispatcher will not forward block scales, so this site enters the three
+    # routed limbs -- ``moe_gate_up_blockwise_fp8``, ``moe_swiglu_transposed``,
+    # ``moe_down_blockwise_fp8`` -- instead of the dispatcher. It reaches no
+    # fused block seam: the routing the limbs take is an operand, so one call
+    # per limb per layer covers every block.
     #
     # NO QUANTISATION ENUM MEMBER IS NAMED OR ADDED (plan section 11 constraint
     # B.6, and the ``-023`` section above already declares the same negative).
