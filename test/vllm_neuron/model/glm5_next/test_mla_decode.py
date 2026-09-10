@@ -649,7 +649,12 @@ def test_item_b_iii_the_written_latent_reads_back_bit_identical() -> None:
     """
     module, _, _, gen = build_attention()
     # One SPARE slot past the three the path writes, so control 2 has something untouched
-    # to read. attend() reads [:start + tokens], so a trailing row is never gathered.
+    # to read. RE-PINNED (inc-glm53f-117c): the original reading here was "attend() reads
+    # [:start + tokens], so a trailing row is never gathered". attend() now reads the
+    # WHOLE window, because a length taken from the position pinned the captured graph to
+    # one position. The spare row is still never GATHERED and this item still reads what it
+    # read before, for a different reason: `decode_inputs` selects prior context rows plus
+    # each step's own slot and nothing else, so no selection names the spare row.
     cache = seeded_cache(module, gen, steps=DECODE_STEPS + 1)
     hidden, selection, scale = decode_inputs(module, gen)
     spare = CONTEXT_ROWS + DECODE_STEPS

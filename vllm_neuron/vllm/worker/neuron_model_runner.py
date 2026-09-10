@@ -4799,6 +4799,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
     @staticmethod
+    def _glm5next_start_position(start_position: int, device) -> torch.Tensor:
+        """This step's first slot, as a tensor for the traced boundary.
+
+        The runner keeps the host int for its own arithmetic -- it sizes the window
+        and checks the pages with it -- and hands the layers this tensor, because a
+        python int reaching a traced region is baked into the captured graph and
+        pins it to the position it was captured at.
+        """
+        return torch.tensor(int(start_position), dtype=torch.int32, device=device)
+
+    @staticmethod
     def _glm5next_side_caches(
         banks, *, index_kpool: int, index_head_dim: int, max_seq_len: int
     ) -> list[dict]:
@@ -4995,7 +5006,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "conv_state": bank["conv_state"][int(state_slot)],
                         "recurrent_state": bank["recurrent_state"][int(state_slot)],
                         "is_prefill": bool(is_prefill),
-                        "start_position": int(start_position),
+                        "start_position": cls._glm5next_start_position(
+                            start_position, bank["recurrent_state"].device
+                        ),
                     }
                 )
                 continue
@@ -5021,9 +5034,50 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"{int(geometry['page_size'])}; the slice and the layer's own page "
                     f"are one number or the slice is wrong"
                 )
-            latent = bank["latent_cache"][
-                ids[0] * block_size : (ids[-1] + 1) * block_size
-            ]
+            # THE WINDOW SLICE. Its LENGTH is the bucket's, so one captured graph
+            # serves every position; the request's own pages sit at the front of it
+            # and the position bounds what is written. Two refusals guard the form.
+            if "window_blocks" not in geometry:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed a geometry with no "
+                    f"'window_blocks'; the window this layer reads has a length that is "
+                    f"fixed for the bucket, and a caller that does not state that length "
+                    f"cannot be given a window one captured graph can serve"
+                )
+            window_blocks = int(geometry["window_blocks"])
+            if len(ids) > window_blocks:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {len(ids)} block(s) for one "
+                    f"sequence and the bucket's block table holds {window_blocks} per "
+                    f"sequence; a request longer than its bucket cannot be served by "
+                    f"this window"
+                )
+            base = ids[0] * block_size
+            window = window_blocks * block_size
+            bank_slots = int(bank["latent_cache"].shape[0])
+            if base + window > bank_slots:
+                # THE ALLOCATION IS SHORT, AND CLAMPING THE BASE IS NOT THE REMEDY. A
+                # torch slice past the end does not raise: it returns a SHORTER view,
+                # which is how a bucket-constant length silently becomes a per-request
+                # one where a captured graph cannot see it. Clamping the base instead
+                # would keep the length and move every write onto another sequence's
+                # rows. So the bank owes a spare window of blocks past the last one a
+                # request can be given, and the allocator (inc-glm53f-118) is where
+                # that headroom is added -- not here.
+                raise ValueError(
+                    f"KV layer '{bank['name']}'s bank holds {bank_slots} slot(s) and a "
+                    f"window of {window} slot(s) from block {ids[0]} would end at "
+                    f"{base + window}; the bank needs a spare {window_blocks} block(s) "
+                    f"past the last block a request can be given, and neither a "
+                    f"shortened view nor a clamped base is a substitute"
+                )
+            latent = bank["latent_cache"][base : base + window]
+            if int(latent.shape[0]) != window:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' produced a window of "
+                    f"{int(latent.shape[0])} slot(s) where {window} was asked for; the "
+                    f"window's length is what one captured graph depends on"
+                )
             device = latent.device
             carrier = {
                 "latent_cache": latent,
@@ -5031,7 +5085,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "seq_lens": cls._glm5next_row_seq_lens(
                     tokens=tokens, start_position=start_position, device=device
                 ),
-                "start_position": int(start_position),
+                "start_position": cls._glm5next_start_position(start_position, device),
                 "softmax_scale": float(softmax_scale),
                 "max_seq_len": int(max_seq_len),
                 "page_size": int(geometry["page_size"]),
@@ -5157,11 +5211,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
             row = table[0].reshape(-1)
             blocks_used = -(-(start_position + tokens) // block_size)
+            # THE WINDOW THE LAYER IS HANDED IS THE BUCKET'S, NOT THIS STEP'S. It is
+            # read off the block table's own SHAPE, which is `max_blocks_per_seq` for
+            # this bucket and is real even when the table's VALUES are meta. A length
+            # derived from the cached position instead would change with every decode
+            # step, and a captured graph would fit only the position it was captured
+            # at. The metadata says the same number; both are host ints, so they are
+            # compared rather than one of them trusted.
+            window_blocks = int(table.shape[1])
+            declared_window = int(metadata.get("max_blocks_per_seq", window_blocks))
+            if declared_window != window_blocks:
+                raise ValueError(
+                    f"KV layer '{name}' reports a block table of {window_blocks} "
+                    f"block(s) per sequence and metadata declaring {declared_window}; "
+                    f"the window handed to the layer is one number or the slice is "
+                    f"wrong"
+                )
             geometries.append(
                 {
                     "block_ids": [int(value) for value in row[:blocks_used]],
                     "state_slot": int(row[0]),
                     "page_size": block_size,
+                    "window_blocks": window_blocks,
                 }
             )
             legs.add(

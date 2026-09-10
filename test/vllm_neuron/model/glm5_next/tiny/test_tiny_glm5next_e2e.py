@@ -215,19 +215,29 @@ def _recurrent_spec(root) -> KVSpec:
     )
 
 
-def _geometries(banks, *, block_ids, state_slot: int, page_size: int | None = None):
+def _geometries(banks, *, block_ids, state_slot: int, page_size: int | None = None,
+                window_blocks: int | None = None):
     """One geometry per bank, the shape the carrier builder pairs positionally with its banks.
 
     THE PAGE COMES FROM THE LANDED DIAL, not from the bank, so the builder's cross-check
     between the group's page and the bank's own paging compares two independently sourced
     numbers instead of one number twice.
+
+    RE-PINNED: the builder now also requires the WINDOW's length in blocks, because the
+    slice it hands a layer is the bucket's window and not this request's pages. The
+    original reading of this helper was the three keys above and a slice of exactly the
+    blocks named here; `window_blocks` defaults to `len(block_ids)`, which is that same
+    slice, so every landed item reads what it read before and only a caller that asks
+    for a longer window gets one.
     """
     page = item.MLA_PAGE_SIZE if page_size is None else page_size
+    ids = [int(value) for value in block_ids]
     return [
         {
-            "block_ids": [int(value) for value in block_ids],
+            "block_ids": ids,
             "state_slot": int(state_slot),
             "page_size": int(page),
+            "window_blocks": len(ids) if window_blocks is None else int(window_blocks),
         }
         for _ in banks
     ]
