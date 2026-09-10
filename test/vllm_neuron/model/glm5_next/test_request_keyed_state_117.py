@@ -14,27 +14,32 @@ converter refuses a block table carrying more than one row
 refusal instead of reading a value. An item that passed at base would be
 measuring nothing.
 
-THE FOUR ITEMS HERE, and each names the tripwire it must fail on.
+THE ITEMS HERE, and each names the tripwire it must fail on.
 
-* A1 -- two admitted requests get DIFFERENT recurrent state slots, and each
-  layer's carrier is a VIEW of its own slot row rather than a copy. A copy would
-  send the layer's in-place advance somewhere the next step never reads.
-  Tripwire: a slot table that returns one slot for both requests.
+* A1, SLOT HALF -- two admitted requests get DIFFERENT recurrent state slots, and
+  the assignment is stable within one request's life. Tripwire: a table that
+  returns one slot for both. The carrier-VIEW half of A1 needs the per-request
+  carrier container and arrives with this increment's model-side sliver.
+* A2, THREE ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
+  over-admission refuses by name; a synthetic step takes no claim. Tripwires: a
+  table that never frees cannot seat the later request, one that frees without
+  zeroing fails the zero read, and a synthetic step that seated itself changes the
+  table.
 * A3 -- one request's pooled store and tail ring are byte-unchanged by a step of
-  the other request. Tripwire: the process-wide allocation, which shares one set
-  across every request.
-* A4 -- the per-token operands for a two-request batch equal the two
-  per-request derivations concatenated, exactly. Tripwire: a derivation from a
-  single start position, which is what the base does.
-* A7 -- a padded decode row writes NOWHERE. The padding value is zero
-  (``neuron_model_runner.py:95``) and zero is a real cache slot, not a sentinel,
-  so an unmasked write lands a padded row's latent in a slot a live request can
-  own. Tripwire: dropping the mask. The item also asserts both real writes
-  landed, so a write path disabled altogether fails it too.
+  the other request, on both legs. Tripwire: the process-wide allocation, which
+  made the two carriers one storage.
+* A4 -- the per-token operands for a two-request batch equal the two per-request
+  derivations concatenated, exactly. Tripwire: the batch-wide derivation from a
+  single start position, which is run in the same item and must differ.
+* A5, MAPPING HALF -- the slot number the KV machinery computes and the bank
+  view's row index are ONE element, proved by a sentinel rather than by restating
+  the formula. Tripwire: a wrong block stride or a head-interleaving view makes
+  the read-back miss; the neighbouring-slot control catches a write that landed
+  wider than one slot.
 
-THE THREE REMAINING ITEMS (slot reuse, the physical scattered write, and the
-refusal that still holds for speculative decoding) live in the next commit of
-this increment, not in another file.
+STILL TO COME IN THIS FILE: A6 (the sharpened decode refusal) and A7 (padded rows
+write nowhere). A5's write-and-read-back clause, the interleaved-vs-sequential
+differential and the R-3 seam readings belong to this increment's kernel half.
 
 WHY THE HARNESS IS RE-AUTHORED HERE rather than imported. The two landed files
 with a converter harness -- ``test_kda_runner_state.py`` and
@@ -55,12 +60,14 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from vllm_neuron.vllm.worker.neuron_model_runner import (
     NULL_BLOCK_ID,
     NeuronModelRunner,
+    _compute_slot_mapping_cpu,
 )
 
 # ---------------------------------------------------------------------------
@@ -566,3 +573,132 @@ def test_a2_a_synthetic_step_takes_no_claim() -> None:
         f"a synthetic step changed the slot table from {before} to {after}; warmup "
         f"is not a sequence step and must take no claim"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A4. The batch's per-token operands are the per-request derivations, in order.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a4_the_batch_operands_are_the_per_request_derivations_concatenated() -> None:
+    """Two requests at DIFFERENT cached lengths, and each token gets its own.
+
+    THE TRIPWIRE IS THE LANDED DERIVATION. Before this increment both operands came
+    from ONE start position for the whole batch, so the second request's tokens
+    carried the first request's positions. This item asserts the batch form equals
+    the two per-request derivations concatenated AND that the single-start form
+    differs from it, so a converter that kept the old derivation fails here.
+
+    THE TWO CACHED LENGTHS DIFFER ON PURPOSE. At equal lengths the old and new
+    derivations agree and this item would pass on either.
+    """
+    _require_cpu_mode()
+    first, second = DECLARED_CACHED_LENGTHS
+    if first == second:
+        raise VacuousControlError(
+            f"this item needs two different cached lengths to separate a per-request "
+            f"derivation from a batch-wide one; both are {first}"
+        )
+    requests = [(1, first), (1, second)]
+    device = torch.device("cpu")
+
+    seq_lens = NeuronModelRunner._glm5next_batch_row_seq_lens(requests, device=device)
+    slots = NeuronModelRunner._glm5next_batch_pool_slot_mapping(
+        requests, index_kpool=DECLARED_INDEX_KPOOL, device=device
+    )
+
+    want_seq_lens = torch.cat([
+        NeuronModelRunner._glm5next_row_seq_lens(
+            tokens=tokens, start_position=start, device=device
+        )
+        for tokens, start in requests
+    ])
+    want_slots = torch.cat([
+        NeuronModelRunner._glm5next_pool_slot_mapping(
+            tokens=tokens, start_position=start,
+            index_kpool=DECLARED_INDEX_KPOOL, device=device,
+        )
+        for tokens, start in requests
+    ])
+    print(f"KEYED|a4|requests={requests}|seq_lens={seq_lens.tolist()}"
+          f"|pool_slots={slots.tolist()}")
+    assert torch.equal(seq_lens, want_seq_lens), (
+        f"the batch seq_lens {seq_lens.tolist()} are not the per-request "
+        f"derivations concatenated {want_seq_lens.tolist()}"
+    )
+    assert torch.equal(slots, want_slots), (
+        f"the batch pool slots {slots.tolist()} are not the per-request "
+        f"derivations concatenated {want_slots.tolist()}"
+    )
+
+    # ---- THE OLD DERIVATION, RUN, so the item is proved to separate the two.
+    total = sum(tokens for tokens, _ in requests)
+    stale_seq_lens = NeuronModelRunner._glm5next_row_seq_lens(
+        tokens=total, start_position=first, device=device
+    )
+    print(f"KEYED|a4|stale_batch_wide={stale_seq_lens.tolist()}")
+    assert not torch.equal(seq_lens, stale_seq_lens), (
+        f"a single-start-position derivation produced the same seq_lens "
+        f"{stale_seq_lens.tolist()} as the per-request one, so this item is not "
+        f"measuring the per-request derivation at all"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A5 (mapping half). The runner's slot number and the bank's view are one address.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a5_the_runners_slot_mapping_addresses_the_banks_own_view() -> None:
+    """The physical slot the KV machinery computes IS the bank view's row index.
+
+    WHY THIS IS THE LOAD-BEARING PREMISE. This increment stops deriving the latent
+    write's address from a contiguous block run and consumes the runner's own slot
+    mapping instead. That is only correct if the number the mapping produces
+    addresses the same element the bank's flattened sequence view does. The two are
+    derived independently -- one in the KV machinery, one in the model's mapper --
+    so the equality is measured here rather than assumed.
+
+    THE PROOF IS A SENTINEL, NOT A RESTATED FORMULA. Comparing the two arithmetic
+    expressions would only show that this file can copy a formula. Instead a value
+    is written through the paged bank at ``[block, 0, offset]`` and read back
+    through the flattened view at the mapping's slot; if they are not one element
+    the read misses.
+
+    THE TRIPWIRE: an off-by-one block stride or a view that interleaves heads makes
+    the read-back differ, and the untouched-slot control catches a write that
+    landed everywhere.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    sparse = next(bank for bank in banks if bank["family"] == "self_attn")
+    page = DECLARED_PAGE_SIZE
+    rows = DECLARED_SPARSE_ROWS
+    starts = DECLARED_CACHED_LENGTHS
+
+    # The KV machinery's own derivation, called rather than reproduced.
+    table = np.array([[int(v) for v in row] for row in rows], dtype=np.int32)
+    positions = np.array([int(start) for start in starts], dtype=np.int64)
+    req_indices = np.arange(len(starts), dtype=np.int64)
+    produced = np.zeros(len(starts), dtype=np.int64)
+    _compute_slot_mapping_cpu(table, produced, positions, req_indices, page)
+
+    print(f"KEYED|a5|rows={rows}|starts={starts}|slot_mapping={produced.tolist()}")
+    for index, (row, start) in enumerate(zip(rows, starts)):
+        block = int(row[int(start) // page])
+        offset = int(start) % page
+        slot = int(produced[index])
+
+        sentinel = float(index + 1) * 0.5
+        sparse["latent_bank"][block, 0, offset, :].fill_(sentinel)
+        read_back = sparse["latent_cache"][slot, 0, :]
+        assert bool((read_back == sentinel).all()), (
+            f"request {index}: the KV machinery's slot {slot} and the bank view's "
+            f"row for block {block} offset {offset} are not one element"
+        )
+        # THE CONTROL: the neighbouring slot must NOT have taken the write.
+        neighbour = (slot + 1) % int(sparse["latent_cache"].shape[0])
+        assert not bool((sparse["latent_cache"][neighbour, 0, :] == sentinel).all()), (
+            f"request {index}: slot {neighbour} also holds the sentinel, so the "
+            f"write landed wider than one slot and the read proves nothing"
+        )

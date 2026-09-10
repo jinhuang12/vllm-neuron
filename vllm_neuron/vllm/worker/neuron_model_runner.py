@@ -4795,6 +4795,54 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             + 1
         )
 
+    @classmethod
+    def _glm5next_batch_row_seq_lens(cls, requests, *, device) -> torch.Tensor:
+        """``[Σ tokens]`` int32: every token's own causal length, in batch order.
+
+        ONE DERIVATION PER REQUEST, CONCATENATED, because the causal length of a
+        token is a fact about ITS OWN sequence: row ``i`` of a request that starts
+        at ``start`` sees ``start + i + 1`` tokens. Deriving the whole batch from a
+        single start position -- which is what a one-sequence converter could get
+        away with -- gives the second request the first one's positions and the
+        indexer's causal bound then admits pools that do not exist for it.
+
+        THE ORDER IS THE BATCH'S OWN and is the caller's to supply: it must be the
+        order the block tables are indexed in, or a token's length belongs to
+        another request.
+        """
+        return torch.cat(
+            [
+                cls._glm5next_row_seq_lens(
+                    tokens=int(tokens), start_position=int(start), device=device
+                )
+                for tokens, start in requests
+            ]
+        )
+
+    @classmethod
+    def _glm5next_batch_pool_slot_mapping(
+        cls, requests, *, index_kpool: int, device
+    ) -> torch.Tensor:
+        """``[Σ tokens]`` int32: the pool id where a pool completes, in batch order.
+
+        PER REQUEST FOR THE REASON THE SINGULAR FORM ALREADY RECORDS: a pool
+        completes on the SEQUENCE's own boundaries, not on the batch's, so the id
+        is derived from each request's absolute position and the results are
+        concatenated. A batch-wide derivation would put a second request's rows in
+        the first one's pools and the mask would let the wrong ones through.
+        """
+        return torch.cat(
+            [
+                cls._glm5next_pool_slot_mapping(
+                    tokens=int(tokens),
+                    start_position=int(start),
+                    index_kpool=int(index_kpool),
+                    device=device,
+                )
+                for tokens, start in requests
+            ]
+        )
+
     @staticmethod
     def _glm5next_side_caches(
         banks,
@@ -5183,8 +5231,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # the request table assigned, so two requests in one batch reach
                 # two disjoint views and neither can see the other's pool.
                 "pool_cache": side["pool_cache"][state_slot],
-                "seq_lens": cls._glm5next_row_seq_lens(
-                    tokens=tokens, start_position=start_position, device=device
+                # THE BATCH FORM IS USED EVEN AT ONE REQUEST, so the single-request
+                # path and the concurrent one share one derivation and cannot
+                # drift. At one request it is the singular form's own output.
+                "seq_lens": cls._glm5next_batch_row_seq_lens(
+                    [(tokens, start_position)], device=device
                 ),
                 "start_position": int(start_position),
                 "softmax_scale": float(softmax_scale),
@@ -5192,9 +5243,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "page_size": int(geometry["page_size"]),
             }
             if is_prefill:
-                carrier["slot_mapping"] = cls._glm5next_pool_slot_mapping(
-                    tokens=tokens,
-                    start_position=start_position,
+                carrier["slot_mapping"] = cls._glm5next_batch_pool_slot_mapping(
+                    [(tokens, start_position)],
                     index_kpool=index_kpool,
                     device=device,
                 )
