@@ -74,20 +74,30 @@ tolerance is an artefact of its output dtype and is recorded here, not adopted.
 
 The extents this kernel serves, measured rather than assumed
 ------------------------------------------------------------
-* ``T <= PARTITION_MAX``. Tokens occupy the partition axis in a single tile.
-  Measured at the boundary: ``T = 128`` runs, ``T = 129`` traps inside NKI with
-  ``dma_copy dst partition dimension 129 exceeds maximum 128``. This is the SAME
-  bound `-028` carries on its own token axis, so `inc-glm53f-030`'s tiling
-  question is one question for both WP8 kernels rather than two.
+* ``T`` is **unbounded** (``inc-glm53f-029b``). Tokens occupy the partition axis,
+  which is capped at ``nl.tile_size.pmax``, so the kernel body WALKS that axis in
+  tiles of that size. ``PARTITION_MAX`` is therefore the tile height, not a token
+  ceiling.
+
+  The sentence this replaced said "``T <= PARTITION_MAX``. Tokens occupy the
+  partition axis in a single tile", and it was true of the untiled body: measured
+  at the boundary then, ``T = 128`` ran and ``T = 129`` trapped inside NKI with
+  ``dma_copy dst partition dimension 129 exceeds maximum 128``
+  (``probe-029-shape-ceiling.out``). That reading is kept because
+  `inc-glm53f-029b`'s acceptance REPRODUCES it against an untiled reference copy
+  of the pre-tiling body, in the same test that shows the tiled kernel admitting
+  the same shape. `-028` still carries the single-tile bound on its own token
+  axis; tiling its half is a separate question and is NOT answered here.
 * ``H`` needs **no** tiling at the target's real hidden sizes. Measured:
   ``H = 4096`` and ``H = 7168`` -- the base's own test shapes -- both run in one
   tile, at ``T = 128``, in 0.22 s and 0.27 s of simulator time. Recorded because
   it is the question a reader coming from `-028`'s ``M > 128`` refusal will ask
-  next, and the answer here is the reassuring one.
+  next, and the answer here is the reassuring one. ``H`` lands on the FREE axis,
+  which has no partition cap, so tiling ``T`` did not change this.
 
-Both readings are in ``probe-029-shape-ceiling.out`` beside this increment's
-evidence record; they are cited rather than restated, and the constants below are
-the single place the bound is written.
+Both readings are in ``probe-029-shape-ceiling.out`` beside `-029`'s evidence
+record; they are cited rather than restated, and the constants below are the
+single place the tile height is written.
 
 Route
 -----
@@ -173,7 +183,8 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
 
     Args:
         x: ``[T, H]`` fp32 in HBM -- the sub-block's single-stream output. ``T``
-            occupies the partition axis, so ``T <= PARTITION_MAX``.
+            occupies the partition axis, so it is walked in tiles of
+            ``nl.tile_size.pmax`` and is NOT bounded by it (``inc-glm53f-029b``).
         residual: ``[T, S, H]`` fp32 in HBM -- the ``S`` residual streams.
         post_layer_mix: ``[T, S, 1]`` fp32 -- per token, per OUTPUT stream.
         comb_res_mix: ``[T, S, S]`` fp32 -- per token, ``[i, j]`` weights input
@@ -182,52 +193,76 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
     Returns:
         ``[T, S, H]`` fp32, ``out_j = post_layer_mix_j * x + sum_i comb_ij * res_i``.
 
-    Both python loops are **trace-time** ``range`` over ``S``, so the whole
+    Both python loops over ``S`` are **trace-time** ``range``, so the whole
     ``S x S`` mix unrolls INSIDE this one dispatch. That is a counted property,
     not a stylistic one: the route predicate declares ``1`` dispatch per case, and
     a host-driven loop over output streams would read ``S``.
+
+    THE ROW LOOP IS TRACE-TIME FOR THE SAME REASON (``inc-glm53f-029b``). The
+    token axis is walked in tiles of ``nl.tile_size.pmax`` inside this one
+    dispatch, so a token extent above the partition limit costs more tiles and
+    never a second dispatch. Each row's arithmetic is unchanged and in the same
+    order, which is why the tiled output is BIT-IDENTICAL to the untiled body
+    below the old ceiling rather than merely close to it.
     """
     t_extent, s_extent, h_extent = residual.shape
+    pmax = nl.tile_size.pmax
+    n_tiles = (t_extent + pmax - 1) // pmax
 
+    # `out` is HBM, which has no partition cap, so it is allocated at the FULL
+    # token extent and only the sbuf tiles below are per-tile.
     out = nl.ndarray(
         (t_extent, s_extent, h_extent), dtype=nl.float32, buffer=nl.shared_hbm
     )
 
-    # The single-stream layer output, loaded once: every output stream reads it.
-    x_tile = nl.load(x, dtype=nl.float32)
+    for t in range(n_tiles):
+        # The last tile is short whenever the token count is not a multiple of
+        # `pmax`, and it is narrowed rather than padded: a padded tile would put
+        # values the caller never sent into the arithmetic.
+        rows = min(pmax, t_extent - t * pmax)
+        off = t * pmax
 
-    # All S streams loaded once each, rather than S times each inside the j loop.
-    # S * S loads of the same data would be S * (S - 1) redundant DMAs.
-    streams = [
-        nl.load(residual[0:t_extent, i, 0:h_extent], dtype=nl.float32)
-        for i in range(s_extent)
-    ]
+        # The single-stream layer output, loaded once per tile: every output
+        # stream of this tile reads it.
+        x_tile = nl.load(x[off : off + rows, 0:h_extent], dtype=nl.float32)
 
-    # Two scratch tiles, allocated ONCE and reused across all S output streams.
-    acc = nl.ndarray((t_extent, h_extent), dtype=nl.float32, buffer=nl.sbuf)
-    term = nl.ndarray((t_extent, h_extent), dtype=nl.float32, buffer=nl.sbuf)
+        # All S streams loaded once each, rather than S times each inside the j
+        # loop. S * S loads of the same data would be S * (S - 1) redundant DMAs.
+        streams = [
+            nl.load(residual[off : off + rows, i, 0:h_extent], dtype=nl.float32)
+            for i in range(s_extent)
+        ]
 
-    for j in range(s_extent):
-        # The post term INITIALISES the accumulator, so no separate memset pass:
-        # `tensor_scalar` writes `dst` rather than adding into it. One fewer op,
-        # and it also means the identity case's `post_layer_mix = 0` produces an
-        # exact zero start rather than a zeroed-then-added-to tile.
-        post_j = nl.load(post_layer_mix[0:t_extent, j, 0:1], dtype=nl.float32)
-        nisa.tensor_scalar(dst=acc, data=x_tile, op0=nl.multiply, operand0=post_j)
+        # Two scratch tiles, allocated once per row tile and reused across all S
+        # output streams of that tile.
+        acc = nl.ndarray((rows, h_extent), dtype=nl.float32, buffer=nl.sbuf)
+        term = nl.ndarray((rows, h_extent), dtype=nl.float32, buffer=nl.sbuf)
 
-        for i in range(s_extent):
-            # `comb_res_mix[t, i, j]` -- i is the INPUT stream being summed, j the
-            # OUTPUT stream being written. The [T, 1] slice is a per-token scalar
-            # that `tensor_scalar` broadcasts along the free (hidden) axis.
-            w_ij = nl.load(
-                comb_res_mix[0:t_extent, i, j : j + 1], dtype=nl.float32
+        for j in range(s_extent):
+            # The post term INITIALISES the accumulator, so no separate memset
+            # pass: `tensor_scalar` writes `dst` rather than adding into it. One
+            # fewer op, and it also means the identity case's
+            # `post_layer_mix = 0` produces an exact zero start rather than a
+            # zeroed-then-added-to tile.
+            post_j = nl.load(
+                post_layer_mix[off : off + rows, j, 0:1], dtype=nl.float32
             )
-            nisa.tensor_scalar(
-                dst=term, data=streams[i], op0=nl.multiply, operand0=w_ij
-            )
-            nisa.tensor_tensor(dst=acc, data1=acc, data2=term, op=nl.add)
+            nisa.tensor_scalar(dst=acc, data=x_tile, op0=nl.multiply, operand0=post_j)
 
-        nl.store(out[0:t_extent, j, 0:h_extent], value=acc)
+            for i in range(s_extent):
+                # `comb_res_mix[t, i, j]` -- i is the INPUT stream being summed,
+                # j the OUTPUT stream being written. The [rows, 1] slice is a
+                # per-token scalar that `tensor_scalar` broadcasts along the free
+                # (hidden) axis.
+                w_ij = nl.load(
+                    comb_res_mix[off : off + rows, i, j : j + 1], dtype=nl.float32
+                )
+                nisa.tensor_scalar(
+                    dst=term, data=streams[i], op0=nl.multiply, operand0=w_ij
+                )
+                nisa.tensor_tensor(dst=acc, data1=acc, data2=term, op=nl.add)
+
+            nl.store(out[off : off + rows, j, 0:h_extent], value=acc)
 
     return out
 
@@ -256,18 +291,15 @@ def _require_admissible(
         )
     rows, streams, hidden = (int(v) for v in residual.shape)
 
+    # THERE IS NO UPPER BOUND ON T ANY MORE (`inc-glm53f-029b`). The token axis is
+    # walked in `nl.tile_size.pmax` tiles inside the kernel, so `PARTITION_MAX` is
+    # the TILE HEIGHT rather than the token ceiling. `PARTITION_MAX` is still
+    # imported from `-028`'s module and still 128: it is the same physical bound on
+    # the same axis, and the constant did not move -- only what this kernel does
+    # when the token count exceeds it. What refused before was a real limitation of
+    # the body; the body no longer has it, so the refusal would now be false.
     if rows <= 0:
         problems.append(f"T={rows} must be positive")
-    elif rows > PARTITION_MAX:
-        problems.append(
-            f"T={rows} exceeds PARTITION_MAX={PARTITION_MAX}; the token extent "
-            f"occupies the partition axis in a SINGLE tile and this kernel does "
-            f"not tile T. Multi-tile T is a change to the kernel's shape rather "
-            f"than its parameters, so it is outside `inc-glm53f-029`'s declared "
-            f"scope and routes to the lead, never to a silent pad and never to a "
-            f"torch path. `inc-glm53f-028` carries the same bound on the same "
-            f"axis, so this is one tiling question for WP8, not two"
-        )
     if streams <= 0:
         problems.append(f"S={streams} must be positive")
     if hidden <= 0:
