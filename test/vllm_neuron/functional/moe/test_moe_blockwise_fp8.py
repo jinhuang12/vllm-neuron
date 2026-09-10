@@ -1251,32 +1251,94 @@ def test_cte_128_gate_up_matches_the_model_reference_per_expert_block() -> None:
 # --------------------------------------------------------------------------- #
 # THE MUST-FAIL CONTROL: the lossy `256` retile cannot reach exactness.          #
 # --------------------------------------------------------------------------- #
-def _lossy_256_grid(grid: torch.Tensor) -> torch.Tensor:
-    """TEST-LOCAL: every ``2 x 2`` quad of ``128``-blocks takes the quad maximum.
+def _block_slice(tile: int) -> slice:
+    """The weight rows, or columns, that one ``128`` scale block covers."""
+    return slice(tile * GATE_UP_SCALE_BLOCK, (tile + 1) * GATE_UP_SCALE_BLOCK)
 
-    This is the mapping `inc-glm53f-113` removes, applied here and nowhere near
-    the producer. It is the retile's own rule -- one scale per ``256`` block, the
-    largest of the four it covers, so no rescaled weight overflows.
+
+def _lossy_256_retile(
+    weight_fp32: torch.Tensor, scale2d: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """A REAL ``256`` retile of one weight matrix: its bytes move with its scale.
+
+    BOTH HALVES RUN, and that is the whole point. A retile keeps ONE scale per
+    ``2 x 2`` quad of ``128`` blocks and re-expresses the other three tiles' WEIGHT
+    BYTES against it, ``w * s_tile / s_retained``, cast back to fp8. Rewriting only
+    the scale would corrupt the product by whole factors, and a control built that
+    way passes on gross scale damage rather than on the retile's own loss -- so it
+    would read a difference for every kernel and could never be unarmed.
+
+    Where the loss lives: within a quad the four scales come from both mantissa
+    families, so two of the four ratios are not powers of two, ``w * ratio`` leaves
+    the fp8 grid and the cast rounds. That rounding IS the retile's loss and it is
+    the only difference between this pair and the checkpoint's own.
+
+    The quad MAXIMUM is retained, so every ratio is ``<= 1`` and no rescaled byte
+    can overflow e4m3; an overflow would end the item before a number printed.
+
+    Returns:
+        The rescaled fp8 weight, the coarsened grid expressed on the ``128`` grid
+        the kernel indexes, and how many tiles the fp8 cast could not express
+        exactly.
     """
-    lossy = grid.clone()
-    for expert in range(grid.shape[0]):
-        for gate_or_up in range(GATE_UP_FUSION):
-            for quad_h in range(G128_H_BLOCKS // 2):
-                for quad_i in range(G128_I_BLOCKS // 2):
-                    rows = slice(2 * quad_h, 2 * quad_h + 2)
-                    cols = slice(2 * quad_i, 2 * quad_i + 2)
-                    quad = grid[expert, rows, gate_or_up, cols]
-                    lossy[expert, rows, gate_or_up, cols] = quad.max()
-    return lossy
+    retained = scale2d.clone()
+    rescaled = weight_fp32.clone()
+    inexact_tiles = 0
+    n_row_blocks, n_col_blocks = scale2d.shape
+    for row_quad in range(n_row_blocks // 2):
+        for col_quad in range(n_col_blocks // 2):
+            r0, c0 = row_quad * 2, col_quad * 2
+            keep = float(scale2d[r0 : r0 + 2, c0 : c0 + 2].max())
+            for d_row in range(2):
+                for d_col in range(2):
+                    r_tile, c_tile = r0 + d_row, c0 + d_col
+                    ratio = float(scale2d[r_tile, c_tile]) / keep
+                    rows, cols = _block_slice(r_tile), _block_slice(c_tile)
+                    exact = weight_fp32[rows, cols] * ratio
+                    as_fp8 = exact.to(_FP8)
+                    if not torch.equal(as_fp8.to(torch.float32), exact):
+                        inexact_tiles += 1
+                    rescaled[rows, cols] = as_fp8.to(torch.float32)
+                    retained[r_tile, c_tile] = keep
+    return rescaled.to(_FP8), retained, inexact_tiles
+
+
+def _lossy_256_gate_up(
+    case: dict, expert: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """The retile applied to one expert's fused gate/up weight, a half at a time.
+
+    The checkpoint grid holds a separate ``2 x 2`` neighbourhood per fused half, so
+    the two halves retile independently and the fused weight is reassembled from
+    them. Doing it half by half keeps the quads the grid's own rather than inventing
+    a neighbourhood that straddles the fusion axis.
+    """
+    grid = case["grid"]
+    weight = case["weight_fused"][expert].to(torch.float32)
+    lossy_weight = weight.clone()
+    lossy_grid = grid[expert].clone()
+    inexact_tiles = 0
+    for gate_or_up in range(GATE_UP_FUSION):
+        half = slice(gate_or_up * G128_I, (gate_or_up + 1) * G128_I)
+        bytes_fp8, retained, inexact = _lossy_256_retile(
+            weight[:, half], grid[expert, :, gate_or_up, :]
+        )
+        lossy_weight[:, half] = bytes_fp8.to(torch.float32)
+        lossy_grid[:, gate_or_up, :] = retained
+        inexact_tiles += inexact
+    return lossy_weight.to(_FP8), lossy_grid, inexact_tiles
 
 
 def test_cte_128_a_lossy_256_retile_must_not_reach_exactness() -> None:
     """The `256` mapping must NOT reach ``max_abs_diff == 0``, and it must be armed.
 
-    Two readings before the result, because a control that could not have failed
+    Three readings before the result, because a control that could not have failed
     proves nothing: every quad is shown to MIX both mantissa families (a
     single-family quad retiles losslessly, and then a zero here would be correct
-    rather than a false green), and the mapping is shown to have changed the grid.
+    rather than a false green); the mapping is shown to have moved the grid AND the
+    weight bytes, because a scale swap on unchanged bytes moves the output for any
+    kernel that reads its scales and can never be unarmed; and at least one tile's
+    rescaled bytes are shown to have left the fp8 grid, which is where the loss is.
     """
     case = _build_gate_up_128_case()
     grid = case["grid"]
@@ -1307,24 +1369,37 @@ def test_cte_128_a_lossy_256_retile_must_not_reach_exactness() -> None:
     if quads == 0:
         raise VacuousControlError("no quads were examined, so nothing is armed")
 
-    lossy = _lossy_256_grid(grid)
-    if torch.equal(lossy, grid):
+    lossy_weight, lossy, inexact_tiles = _lossy_256_gate_up(case, 0)
+    if torch.equal(lossy, grid[0]):
         raise VacuousControlError(
             "the lossy 256 mapping changed no scale, so the control cannot "
             "distinguish the two granularities"
         )
-    changed = int((lossy != grid).sum())
+    if torch.equal(
+        lossy_weight.to(torch.float32), case["weight_fused"][0].to(torch.float32)
+    ):
+        raise VacuousControlError(
+            "the lossy 256 mapping changed no weight byte, so it is a scale swap "
+            "and not a retile, and it would move the output for every kernel"
+        )
+    if inexact_tiles == 0:
+        raise VacuousControlError(
+            "every rescaled tile stayed exactly on the fp8 grid, so this mapping is "
+            "a LOSSLESS retile and cannot show that the 128 grid buys anything"
+        )
+    changed = int((lossy != grid[0]).sum())
     _emit_128(
         "control-arming",
-        f"scales_changed_by_the_256_mapping={changed} of {grid.numel()}",
+        f"scales_changed_by_the_256_mapping={changed} of {grid[0].numel()} "
+        f"tiles_the_fp8_cast_rounded={inexact_tiles}",
     )
 
     reset_gate_up_dispatch_counters()
     with _SimulatorCounter() as sim:
         got = moe_gate_up_blockwise_fp8(
             case["hidden"][0],
-            case["weight_fused"][0],
-            to_gate_up_kernel_scale_operand(lossy[0], G128_H, G128_I),
+            lossy_weight,
+            to_gate_up_kernel_scale_operand(lossy, G128_H, G128_I),
         ).to(torch.float32)
     _assert_gate_up_route_128(sim, 1, "control-route")
 
@@ -2082,9 +2157,11 @@ def test_cte_128_down_matches_the_model_reference_per_expert_block() -> None:
 def test_cte_128_down_a_lossy_256_retile_must_not_reach_exactness() -> None:
     """The `256` quad-maximum mapping must not reach exactness on the down grid either.
 
-    Armed the same way as the gate/up control: every quad is shown to mix both
-    mantissa families before the result is read, because a single-family quad
-    retiles losslessly.
+    Armed the same three ways as the gate/up control, and it runs the SAME retile:
+    every quad is shown to mix both mantissa families, the mapping is shown to have
+    moved both the grid and the weight bytes, and at least one tile is shown to have
+    left the fp8 grid. The down grid has no fusion axis, so the retile applies to it
+    whole rather than a half at a time.
     """
     case = _build_down_128_case()
     grid = case["grid"]
@@ -2111,22 +2188,35 @@ def test_cte_128_down_a_lossy_256_retile_must_not_reach_exactness() -> None:
                 quads += 1
     _emit_128("down-control-arming", f"quads_mixing_both_families={quads}/{quads}")
 
-    lossy = grid.clone()
-    for expert in range(E):
-        for quad_i in range(n_i // 2):
-            for quad_h in range(n_h // 2):
-                rows = slice(2 * quad_i, 2 * quad_i + 2)
-                cols = slice(2 * quad_h, 2 * quad_h + 2)
-                lossy[expert, rows, cols] = grid[expert, rows, cols].max()
-    if torch.equal(lossy, grid):
+    lossy_weight, lossy, inexact_tiles = _lossy_256_retile(
+        case["down_weight"][0].to(torch.float32), grid[0]
+    )
+    if torch.equal(lossy, grid[0]):
         raise VacuousControlError("the lossy 256 mapping changed no down scale")
+    if torch.equal(
+        lossy_weight.to(torch.float32), case["down_weight"][0].to(torch.float32)
+    ):
+        raise VacuousControlError(
+            "the lossy 256 mapping changed no down weight byte, so it is a scale "
+            "swap and not a retile, and it would move the output for every kernel"
+        )
+    if inexact_tiles == 0:
+        raise VacuousControlError(
+            "every rescaled down tile stayed exactly on the fp8 grid, so this "
+            "mapping is a LOSSLESS retile and shows nothing about the 128 grid"
+        )
+    _emit_128(
+        "down-control-arming",
+        f"scales_changed_by_the_256_mapping={int((lossy != grid[0]).sum())} "
+        f"of {grid[0].numel()} tiles_the_fp8_cast_rounded={inexact_tiles}",
+    )
 
     reset_down_dispatch_counters()
     with _SimulatorCounter() as sim:
         got = moe_down_blockwise_fp8(
             case["intermediate_t"][0],
-            case["down_weight"][0],
-            to_down_kernel_scale_operand(lossy[0], G128_I, G128_H),
+            lossy_weight,
+            to_down_kernel_scale_operand(lossy, G128_I, G128_H),
             case["ones"][0],
         ).to(torch.float32)
     _assert_limb_route_128(down_dispatch_counters, sim, 1, "down-control-route")
