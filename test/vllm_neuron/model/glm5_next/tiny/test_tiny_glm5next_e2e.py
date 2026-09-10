@@ -45,6 +45,7 @@ HOW TO RUN IT, and both variables must be in the environment rather than set fro
 from __future__ import annotations
 
 import inspect
+import math
 import os
 
 import pytest
@@ -1356,6 +1357,131 @@ REMAINDER_PROMPT = item.STACK_TOKENS - 2
 EVEN_PROMPT = item.STACK_TOKENS
 
 
+def _the_row_scale_bound(reference: torch.Tensor) -> float:
+    """The registered pair read at the row's scale: atol plus rtol times the row's largest value.
+
+    ONE definition. The pass side of the remainder item, its must-fail control and the synthetic
+    proof below all call this, so none of the three can drift from the others. The expression is
+    the one the control already carried before this increment; neither constant changed.
+    """
+    return 1e-5 + 1e-2 * float(reference.abs().max())
+
+
+def _the_bf16_step(scale: float) -> float:
+    """The gap between neighbouring bf16 values at `scale`, derived rather than written down.
+
+    bfloat16 stores seven mantissa bits, so `torch.finfo(torch.bfloat16).eps` IS the gap at 1.0,
+    and the gap at any other magnitude is that eps shifted by the magnitude's exponent. Reading it
+    out of `torch.finfo` keeps the number a property of the dtype: if the ring's dtype ever
+    changes, this follows it instead of asserting a dtype from memory. Writing the power of two by
+    hand here would also have hidden the mistake this increment corrects.
+    """
+    eps = float(torch.finfo(torch.bfloat16).eps)
+    if scale == 0.0:
+        return eps
+    return math.ldexp(eps, math.frexp(scale)[1] - 1)
+
+
+def _an_orthonormal_hadamard(width: int) -> torch.Tensor:
+    """A real Hadamard matrix of `width`, normalised so it is orthonormal.
+
+    Built by the Sylvester doubling, which is the same construction the kernel's butterfly walks.
+    It is here so the synthetic proof can put a planted difference through an ACTUAL rotation
+    instead of reasoning about one.
+    """
+    h = torch.ones(1, 1)
+    while h.shape[0] < width:
+        top = torch.cat([h, h], dim=1)
+        bottom = torch.cat([h, -h], dim=1)
+        h = torch.cat([top, bottom], dim=0)
+    if h.shape[0] != width:
+        raise item.VacuousControlError(
+            f"a Hadamard of width {width} does not exist by doubling; the proof below would "
+            f"rotate by the wrong matrix"
+        )
+    return h / math.sqrt(width)
+
+
+def test_the_row_scale_bound_admits_one_rounding_and_refuses_a_pool_built_short():
+    """The bound the remainder item uses must admit one bf16 rounding and refuse a short pool.
+
+    WHY THIS ITEM EXISTS. The remainder item compares two routes that differ by one extra rounding
+    to bf16, and it therefore reads its allowance at the row's scale rather than cell by cell. A
+    comparison shaped that way is only worth having if it still refuses the thing the item guards
+    against -- a pool completed with zeros where the prefill should have seeded real keys. Both
+    directions are proved here on planted rows, where the answer is known before the run, instead
+    of being argued from the wording of an assertion.
+
+    THE FLOOR IS PROVED HERE TOO, INCLUDING THROUGH A ROTATION. The control applies a floor
+    derived from the share of pool members an emptied ring removes, and that derivation leans on
+    the rotation after the pooling being orthogonal -- it preserves the loss's length but may
+    spread it across the row, and the least a spread-out vector's largest cell can be is its length
+    over the square root of its width. The last block plants a loss, rotates it by a real Hadamard
+    and checks the floor survives, because an argument about a rotation is not a measurement of
+    one.
+
+    NO MODEL RUNS HERE. Planted tensors only, so this item is fast and cannot pass by accident on a
+    stack that is not exercising the seam.
+    """
+    reference = torch.arange(1, 129, dtype=torch.bfloat16).float()
+    width = int(reference.numel())
+    scale = float(reference.abs().max())
+    bound = _the_row_scale_bound(reference)
+    step = _the_bf16_step(scale)
+    print(f"TINYE2E|bound_proof|width={width}|scale={scale:.6g}|bound={bound:.6g}"
+          f"|bf16_step={step:.6g}")
+    if scale == 0.0 or bound == 0.0 or step == 0.0:
+        raise item.VacuousControlError(
+            f"this proof needs a non-zero row, bound and step; it has scale={scale}, "
+            f"bound={bound}, step={step}, so every comparison below would be vacuous"
+        )
+
+    # ONE ROUNDING MUST PASS. Half a step is exactly the worst a round-to-nearest can do, and one
+    # extra bf16 quantisation of the pooled vector is exactly one round-to-nearest.
+    rounded = reference + step / 2
+    delta = float((rounded - reference).abs().max())
+    print(f"TINYE2E|bound_proof|one_rounding|max_abs_delta={delta:.6g}|bound={bound:.6g}"
+          f"|bf16_steps={delta / step:.6g}|under_by={bound / delta:.6g}x")
+    assert delta <= bound, (
+        "the row-scale bound refuses a row that differs from its reference by the worst a single "
+        "bf16 rounding can do, so the remainder item would redden on a faithful kernel"
+    )
+
+    # A POOL BUILT SHORT MUST FAIL, at every share of missing members this fixture could produce.
+    for missing, total in ((1, 4), (2, 4), (3, 4)):
+        share = missing / total
+        delta_vector = reference * share
+        delta = float(delta_vector.abs().max())
+        floor = share * scale / math.sqrt(width) / bound
+        over_by = delta / bound
+        print(f"TINYE2E|bound_proof|missing_{missing}_of_{total}|max_abs_delta={delta:.6g}"
+              f"|bound={bound:.6g}|over_by={over_by:.6g}x|floor={floor:.6g}x"
+              f"|bf16_steps={delta / step:.6g}")
+        assert delta > bound, (
+            "a pool missing a share of its members matched its reference inside the row-scale "
+            "bound, so the remainder item's control would pass with the seeding removed"
+        )
+        assert over_by >= floor, (
+            "a pool missing a share of its members missed the bound by less than that share "
+            "predicts, so the floor the control applies is not derived correctly"
+        )
+
+        # AND IT MUST STILL FAIL AFTER THE ROTATION, which is where the floor's square-root term
+        # comes from. The rotation is orthonormal, so the loss keeps its length and can only
+        # spread; the floor allows for the worst spreading and must hold anyway.
+        rotated = delta_vector @ _an_orthonormal_hadamard(width)
+        rotated_max = float(rotated.abs().max())
+        print(f"TINYE2E|bound_proof|missing_{missing}_of_{total}_rotated"
+              f"|max_abs_delta={rotated_max:.6g}|bound={bound:.6g}"
+              f"|over_by={rotated_max / bound:.6g}x|floor={floor:.6g}x"
+              f"|length_before={float(delta_vector.norm()):.6g}"
+              f"|length_after={float(rotated.norm()):.6g}")
+        assert rotated_max / bound >= floor, (
+            "after an orthonormal rotation the planted loss no longer missed the bound by the "
+            "floor the control applies, so that floor would redden a faithful run"
+        )
+
+
 def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     """The tokens after a prompt's last complete pool must reach the ring the decode leg pools.
 
@@ -1373,6 +1499,22 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     constant is introduced here. The two routes do not use one kernel -- `decode_tail_update`
     records that its completion is not bit-identical to the prefill kernel's on the same pool,
     two bf16 round trips against one -- which is why the registered tolerance and not equality.
+
+    THE PAIR IS READ AT THE ROW'S SCALE, NOT CELL BY CELL. The control below already read it that
+    way and the pass side did not, so the two sides were not measuring one predicate; both now
+    call `_the_bound`. The reason is measured rather than preferred: the extra round trip
+    quantises the pooled vector BEFORE the 128-point Hadamard rotation
+    (`decode_tail_update.py:370`, then `:379`), and that rotation mixes every input cell into
+    every output cell, so one rounding at the pooled vector's own magnitude lands in all 128
+    output cells at the size of the WHOLE ROW. A cell that cancels to near zero therefore cannot
+    meet a per-cell relative tolerance however correct the kernel is. On the granted run the row
+    agreed to HALF a bf16 step at its own magnitude -- 0.0078125 where the step at 2.65625 is
+    0.015625, against an allowance of 0.0265725, so 3.4 times under -- while ten cells sitting 618
+    times below the row's scale missed a per-cell allowance of 5.3e-05
+    (`increments/investigate-054b-red2-item11-r1.md`). Half a step is exactly the worst a single
+    round-to-nearest can do, which is the tightest signature one extra quantisation can leave;
+    bfloat16 stores seven mantissa bits, and both printed rows below derive the step from
+    `torch.finfo` rather than restating a power of two.
 
     THE CONTROL IS A MUST-FAIL. The last block runs route B again and empties the ring after
     the prefill, which is exactly "seeding removed". The completed pool must then MISS the
@@ -1428,6 +1570,18 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
         for row in _rows():
             row.zero_()
 
+    def _the_bound(reference: torch.Tensor) -> float:
+        """The registered pair read at the row's scale, from the module-level definition.
+
+        The control at the bottom of this item was already written this way; the pass side was
+        not, and that gap is what this closes. A control that tests a different predicate from the
+        thing it controls proves nothing, so the two sides now cannot drift apart: the pass side
+        asserts the miss is at most this bound, the control asserts it exceeds the same bound, and
+        the synthetic proof above checks both directions on planted rows -- all three reading one
+        expression, written once, in `_the_row_scale_bound`.
+        """
+        return _the_row_scale_bound(reference)
+
     # ---- Route A: one prefill over the whole block, pooled inside the prefill seam.
     _clear_the_row()
     root(**_model_kwargs(runner, input_ids=ids, cached=0, sampling_row=EVEN_PROMPT - 1))
@@ -1460,11 +1614,21 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
         position = REMAINDER_PROMPT + step
         root(**_model_kwargs(runner, input_ids=ids[position:position + 1], cached=position,
                              sampling_row=0))
+    passing_deltas = []
     for index, (row, reference) in enumerate(zip(_rows(), want)):
-        got = row.float()
-        print(f"TINYE2E|pool_row|{index}|max_abs_delta={float((got - reference).abs().max()):.6g}"
-              f"|rtol=1e-2|atol=1e-5")
-        torch.testing.assert_close(got, reference, rtol=1e-2, atol=1e-5)
+        delta = float((row.float() - reference).abs().max())
+        bound = _the_bound(reference)
+        passing_deltas.append(delta)
+        under_by = (bound / delta) if delta > 0.0 else float("inf")
+        step = _the_bf16_step(float(reference.abs().max()))
+        print(f"TINYE2E|pool_row|{index}|max_abs_delta={delta:.6g}|tolerance_bound={bound:.6g}"
+              f"|under_by={under_by:.6g}x|bf16_step={step:.6g}"
+              f"|bf16_steps={delta / step:.6g}|rtol=1e-2|atol=1e-5")
+        assert delta <= bound, (
+            "the pool the decode leg completed misses the all-prefill reference by more than the "
+            "registered pair allows at this row's scale, which is a wrong pool rather than the "
+            "one extra bf16 round trip the decode kernel faithfully performs"
+        )
 
     # ---- THE CONTROL, must fail: the same route with the seeding taken back out.
     _clear_the_row()
@@ -1478,10 +1642,34 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
                              sampling_row=0))
     for index, (row, reference) in enumerate(zip(_rows(), want)):
         delta = float((row.float() - reference).abs().max())
-        bound = 1e-5 + 1e-2 * float(reference.abs().max())
-        print(f"TINYE2E|control|{index}|max_abs_delta={delta:.6g}|tolerance_bound={bound:.6g}")
+        bound = _the_bound(reference)
+        passing = passing_deltas[index]
+        over_by = (delta / bound) if bound > 0.0 else float("inf")
+        against_the_passing_route = (delta / passing) if passing > 0.0 else float("inf")
+        # THE FLOOR IS DERIVED, NOT CHOSEN, AND THAT IS WHY IT CANNOT BE TUNED. Emptying the ring
+        # turns `remainder` of the pool's `pool` members into zeros, so the pooled vector loses
+        # that share of its mass. The rotation that follows is orthonormal: it keeps the loss's
+        # length and can only spread it across the row, and the least a spread-out vector's
+        # largest cell can be is its length over the square root of the row's width. Dividing by
+        # the bound already in hand turns that into "how many times past the bound". Every term is
+        # a model dial or a quantity already computed here -- no number is written on this line --
+        # so the floor moves when the fixture moves, and there is no knob to turn when a run comes
+        # back red. `test_the_row_scale_bound_admits_one_rounding_and_refuses_a_pool_built_short`
+        # checks the formula at three shares and through a real Hadamard rotation.
+        share = remainder / pool
+        floor = share * float(reference.abs().max()) / math.sqrt(reference.numel()) / bound
+        print(f"TINYE2E|control|{index}|max_abs_delta={delta:.6g}|tolerance_bound={bound:.6g}"
+              f"|over_by={over_by:.6g}x|discrimination_floor={floor:.6g}x"
+              f"|share_of_the_pool_the_emptied_ring_removes={share:.6g}"
+              f"|times_the_passing_route={against_the_passing_route:.6g}x")
         assert delta > bound, (
             "with the ring emptied after the prefill, the completed pool still matched the "
             "all-prefill reference inside the registered tolerance, so this item is not "
             "measuring the seeding at all"
+        )
+        assert over_by >= floor, (
+            "with the ring emptied the completed pool did miss the reference, but by less than "
+            "the share of the pool an emptied ring removes can account for; the control fires, "
+            "yet by so little that it no longer separates a missing pool member from a rounding. "
+            "That is a finding to report, not a bound to widen"
         )
