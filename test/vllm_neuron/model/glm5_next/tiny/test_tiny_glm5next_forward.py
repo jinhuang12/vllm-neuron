@@ -93,6 +93,10 @@ import pytest
 import torch
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE, TILE_SIZE
+from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
+    compensate_block_scales,
+    downscale_fp8_weight_bytes,
+)
 
 #: ``fast`` only. ``forked`` is deliberately absent -- see the paragraph on process
 #: isolation in this module's docstring: the reset-and-difference around each forward
@@ -216,8 +220,12 @@ def _impl():
 #: EVERY ACCESSOR IS NAMED -- READ AND RESET BOTH -- AND NOTHING IS DERIVED, and
 #: that changed on a counterexample rather than on taste (``inc-glm53f-054a``,
 #: repair R; ``probe-054a-counter-population-r1``, 21 modules and 24 families read
-#: from the package's own source). The convention IS ``"reset_" + read`` in twenty
-#: of the twenty-one modules, and ``functional/moe/router.py`` breaks it: its
+#: from the package's own source). ``inc-glm53f-054e`` c6 re-read the same source
+#: with the control's own regex and finds 22 modules and 26 families: the extra two
+#: are ``inc-glm53f-103``'s causal bound and causal sentinel, and grant 181's run
+#: names them itself (``TINYFWD|counter_population|found=26|claimed=24``). The
+#: convention IS ``"reset_" + read`` in twenty-one of the twenty-two modules, and
+#: ``functional/moe/router.py`` breaks it: its
 #: reader is ``noaux_tc_dispatch_counters`` and its reset is
 #: ``reset_noaux_tc_counters``, so a derived name is an ``AttributeError`` on the
 #: first line of every item's route predicate. Naming both costs one string per row
@@ -237,8 +245,12 @@ def _impl():
 #: Naming the reader rather than discovering it stays deliberate:
 #: ``test_dsa_layer.py:380`` discovers the pair by scanning for the
 #: ``_dispatch_counters`` suffix and asserts exactly one pair per module, which is
-#: true of every module below EXCEPT ``mla_sparse`` (three families) and
-#: ``kda/chunked_recurrence`` (two). The two coverage controls below keep the naming
+#: true of every module below EXCEPT ``mla_sparse`` (three families),
+#: ``kda/chunked_recurrence`` (two) and, since ``inc-glm53f-054e`` c6 registered it,
+#: ``dsa/causal_bound`` (two). That file already knows it: its own
+#: ``_causal_bound_apis`` asserts two readers and two resets there and asserts the
+#: single-pair helper REFUSES the module (``test_dsa_layer.py:3665-3692``). The two
+#: coverage controls below keep the naming
 #: honest: one refuses a registered module that grows a family no row claims, the
 #: other refuses a family anywhere in the package that no row claims at all.
 _SEAM_REGISTRY = {
@@ -294,6 +306,18 @@ _SEAM_REGISTRY = {
     "dsa_causal_fill": (
         "vllm_neuron.functional.dsa.causal_fill",
         "causal_fill_dispatch_counters", "reset_causal_fill_dispatch_counters"),
+    # ``inc-glm53f-054e`` c6: the two families ``inc-glm53f-103`` added, which no row
+    # claimed. Grant 181's run read them as the gap itself --
+    # ``TINYFWD|counter_population|found=26|claimed=24`` -- and refused all seven
+    # items before any forward ran. One row per family, because this module holds
+    # two entry points with an instance each (``causal_bound.py:187-208``).
+    "dsa_causal_bound": (
+        "vllm_neuron.functional.dsa.causal_bound",
+        "causal_bound_dispatch_counters", "reset_causal_bound_dispatch_counters"),
+    "dsa_causal_sentinel": (
+        "vllm_neuron.functional.dsa.causal_bound",
+        "causal_sentinel_dispatch_counters",
+        "reset_causal_sentinel_dispatch_counters"),
     "kda_chunked_recurrence": (
         "vllm_neuron.functional.kda.chunked_recurrence",
         "dispatch_counters", "reset_dispatch_counters"),
@@ -402,9 +426,11 @@ def _assert_every_counter_family_is_registered() -> None:
 
     ``dir()`` shows imported names too, so a module that imported another's
     accessor would read as owning a family it does not define. Measured, not
-    assumed: across all twenty-one modules that define a family, no name ending in
+    assumed: across all twenty-two modules that define a family, no name ending in
     the suffix is imported or assigned, only defined
-    (``probe-054a-counter-names-r1``, ``probe-054a-counter-population-r1``).
+    (``probe-054a-counter-names-r1``, ``probe-054a-counter-population-r1``, and for
+    the twenty-second ``inc-glm53f-054e`` c6 re-read ``dsa/causal_bound.py``, which
+    defines four such names at column 0 and imports none).
 
     THIS CONTROL CANNOT SEE A MODULE NO ROW NAMES, which is what let ten families
     sit unregistered until repair R; :func:`_assert_no_unregistered_counter_family`
@@ -452,7 +478,10 @@ def _assert_no_unregistered_counter_family() -> None:
     WHY IT FIRES ON A NEW SEAM RATHER THAN IGNORING IT. A campaign-owned seam that
     nothing reads is the failure mode this control exists for; a seam this campaign
     does NOT own would be an exclusion with a reason, and there is none today --
-    every one of the twenty-one modules is named in this campaign's plan.
+    every one of the twenty-two modules is named in this campaign's plan, the
+    twenty-second being ``inc-glm53f-103``'s ``dsa/causal_bound``. This control did
+    its job once for real: it is what refused grant 181's run rather than letting
+    seven forwards read two of this campaign's own seams as if they did not exist.
 
     Raises:
         VacuousControlError: naming the module and the family that no row claims.
@@ -482,6 +511,37 @@ def _assert_no_unregistered_counter_family() -> None:
             f"Rows the package does not define: {phantom}. An unclaimed family is "
             f"a seam this campaign owns whose torch fallbacks no predicate totals"
         )
+
+
+def _declare_bound_and_sentinel(expected: dict) -> None:
+    """Declare ``-103``'s two causal families at the SELECTOR's count, not at a number.
+
+    ``Glm5NextDSAIndexer.select_bounded_pools`` composes the three seams in one
+    straight-line method with no branch between them (``model_fp8.py:5003-5009``):
+    ``dsa_causal_bound``, then ``dsa_topk_select``, then ``dsa_causal_sentinel``. So
+    whatever an item declares for the selector is arithmetically what these two owe,
+    per item and per layer, and taking it FROM the selector's own entry is what stops
+    a later change to one of the three from leaving the other two stale.
+
+    ``test_dsa_layer.py`` measured this pair through the indexer at THIS file's dials
+    -- ``select_k == TOPK_POOLS == 2`` and ``pool == POOL_SIZE == 4`` there against
+    ``MLA_TOPK_POOLS = 2`` and ``MLA_INDEX_KPOOL = 4`` here -- and read ``(1, 0)``
+    for both entry points (``:3907-3922``, repeated at ``:4251-4259``). The zero half
+    of that reading is the one conjunct 2 already aggregates, and it stays zero
+    because ``can_run_kernel()`` is True in this file's launch mode
+    (``VLLM_NEURON_CPU_MODE=1`` with ``NKI_SIMULATOR=1``, ``neuron_utils.py:16-23``),
+    so both entry points take their NKI branch rather than a torch oracle -- which is
+    P13's requirement, not a preference.
+
+    An item whose forward reaches no indexer declares no selector count, and this
+    helper then declares nothing either: items 1 to 4 are exactly that case, and
+    their zeros stay READ rather than becoming expectations.
+    """
+    selector = expected.get("dsa_topk_select")
+    if selector is None:
+        return
+    expected["dsa_causal_bound"] = selector
+    expected["dsa_causal_sentinel"] = selector
 
 
 def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict) -> None:
@@ -615,6 +675,21 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
     The block scale is broadcast by ``repeat_interleave`` on both axes rather than
     by an index computation, so this repeats none of the bridge's arithmetic and
     cannot share an off-by-one with it (``test_moe_path.py:677-699``'s reason).
+
+    IT APPLIES THE trn2 PAIR ONCE, ASKED RATHER THAN RETYPED. On a 240-clamp
+    platform the store is a matched pair -- the bytes are squeezed and the grid is
+    compensated by the exact inverse -- so a reference that applied neither would
+    disagree with a correct product by that factor, and one that applied only the
+    squeeze would disagree by the same factor the other way. Both halves come from
+    the loader's own functions, never a constant copied into this file, so a change
+    to the factor moves this reference with it: ``inc-glm53f-054e`` moved it from
+    ``240/448`` to an exact ``1/2`` and not a line here changed. On a platform where the
+    clamp is 448 both calls are no-ops and this is the arithmetic it always was.
+
+    WHAT IT DELIBERATELY DOES NOT MEASURE. The squeeze re-quantises through fp8,
+    so this states the CHECKPOINT-to-stored invariant and not the fidelity of the
+    stored weight to the raw HF value. That fidelity is ``inc-glm53f-054e``'s
+    acceptance, not this file's.
     """
     if weight_fp8.dim() != 2 or block_scale.dim() != 2:
         raise ReferenceShapeError(
@@ -628,10 +703,10 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
             f"block scale {tuple(block_scale.shape)} does not tile a "
             f"{rows}x{cols} weight at granularity {BLOCK_QUANT_SIZE}"
         )
-    expanded = block_scale.repeat_interleave(
+    expanded = compensate_block_scales(block_scale).scale_inv.repeat_interleave(
         BLOCK_QUANT_SIZE, dim=0
     ).repeat_interleave(BLOCK_QUANT_SIZE, dim=1)
-    return weight_fp8.to(torch.float32) * expanded
+    return downscale_fp8_weight_bytes(weight_fp8).to(torch.float32) * expanded
 
 
 def _scale_grid_attribute(leaf: str) -> str:
@@ -646,16 +721,77 @@ def _scale_grid_attribute(leaf: str) -> str:
     return _impl().Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
 
 
-def _attach(module, leaf: str, weight: torch.Tensor, grid: torch.Tensor) -> None:
+def _attach(
+    module,
+    leaf: str,
+    weight: torch.Tensor,
+    grid: torch.Tensor,
+    *,
+    prep_will_compensate: bool = False,
+) -> None:
     """Bind one declared weight and the plain-attribute grid beside it.
 
     ``nn.Parameter(..., requires_grad=False)`` because the leaf was declared with
     ``register_parameter(name, None)`` and torch refuses a plain tensor there
     (``test_kda_layer.py:412``'s landed form). The grid is a PLAIN attribute and
     not a parameter, which is the arrangement ``_scale_prep_leaves`` documents.
+
+    IT BINDS WHAT THE LOADER DELIVERS, WHICH IS A PAIR. On a 240-clamp platform a
+    real load squeezes the bytes and compensates the grid by the exact inverse, so
+    binding the checkpoint's own bytes beside the checkpoint's own grid is not a load
+    at all -- it is half of one, and a forward built on it disagrees with a correct
+    product by that factor. The bytes are therefore always squeezed here. The factor
+    itself is never named in this file, which is why ``inc-glm53f-054e`` moving it to
+    an exact ``1/2`` left this argument untouched.
+
+    ``prep_will_compensate`` IS ABOUT WHERE THE OTHER HALF COMES FROM, NOT WHETHER.
+    A module whose test then calls ``retile_checkpoint_scale_grids`` gets its grid
+    compensated by the load-path prep, so this binds that grid RAW and the pair is
+    completed exactly once. Every other module in this file gets no prep at all,
+    so the compensation has to arrive here or it never arrives. Ten binds in this
+    file, and only the two objects the prep runs on pass the keyword.
     """
-    setattr(module, leaf, torch.nn.Parameter(weight.clone(), requires_grad=False))
-    setattr(module, _scale_grid_attribute(leaf), grid.clone())
+    setattr(
+        module,
+        leaf,
+        torch.nn.Parameter(
+            downscale_fp8_weight_bytes(weight).clone(), requires_grad=False
+        ),
+    )
+    delivered = grid if prep_will_compensate else compensate_block_scales(grid).scale_inv
+    setattr(module, _scale_grid_attribute(leaf), delivered.clone())
+
+
+def _prep_operands_from_the_module(module, leaves, fixture: dict) -> tuple:
+    """The six arguments ``prepare_scale_operands`` takes, read off the MODULE.
+
+    THE PREP IS HANDED WHAT THE LOAD BOUND, NOT WHAT THE FIXTURE HELD.
+    ``_run_load_time_preps`` (``model_fp8.py:7887-7895``) passes this module's own
+    attributes, and a bank's forward multiplies only what this call built. A site that
+    hands the fixture's dict straight through therefore builds operands the load never
+    touched: ``_attach``'s squeeze and compensation are skipped, and on a 240-clamp
+    platform the item measures the checkpoint instead of the store. This file's
+    shared-expert item already reads them off the module in exactly this form, so this
+    is that form asked once rather than written at four more sites.
+
+    THE REFUSAL IS BY IDENTITY, NOT EQUALITY. On a platform where the pair is a no-op
+    a copy of the fixture's tensor compares equal to the module's, so equality could
+    not tell the two apart; ``is`` can.
+
+    Raises:
+        VacuousControlError: if a tensor the fixture holds reached the prep, which
+            means the bind between the fixture and the prep stopped transforming.
+    """
+    weights = tuple(getattr(module, leaf) for leaf in leaves)
+    grids = tuple(getattr(module, _scale_grid_attribute(leaf)) for leaf in leaves)
+    for leaf, weight, grid in zip(leaves, weights, grids):
+        if weight is fixture[leaf][0] or grid is fixture[leaf][1]:
+            raise VacuousControlError(
+                f"{leaf} reached the prep as the fixture's own tensor, so the load's "
+                f"squeeze and compensation were skipped and this item would measure "
+                f"the checkpoint rather than what a load stores"
+            )
+    return weights + grids
 
 
 def _dense_operands() -> dict:
@@ -940,6 +1076,7 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
             leaf,
             compute_weight.t().contiguous(),
             checkpoint_grid.t().contiguous(),
+            prep_will_compensate=True,
         )
 
     # ---- CONTROL: the loader's frame ALONE is refused, by name. This is the
@@ -999,6 +1136,61 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     torch.testing.assert_close(
         got_loaded.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
     )
+
+    # ---- CONTROL: THE PAIR, WRONG IN EITHER DIRECTION, IS REFUSED BY NAME.
+    # ``inc-glm53f-054c`` makes the load-path prep compensate the grid, so from here
+    # there are exactly two ways to hold the pair wrong: one compensation too few,
+    # which is un-squeezed bytes under a compensated grid, and one too many, which
+    # is a grid this file compensated and the prep compensated again. The conjunct
+    # above cannot see either, because it would pass unchanged if the reference and
+    # the product moved together -- which is the fault ``-054c`` found in
+    # ``test_load_weights.py``'s own reference. So both are built and refused here.
+    #
+    # THE READINGS ARE ON THE PUBLISHED GRID, NOT THE FORWARD. The SwiGLU clamp
+    # saturates, so an output ratio is compressed below the factor and would be a
+    # misleading number to print; the grid ratio is uniform and exact. The refusal
+    # is what the control asserts, and no tolerance is introduced to state it.
+    for label in ("one_compensation_too_few", "one_compensation_too_many"):
+        wrong = model_fp8.Glm5NextDenseMLP(text_config)
+        for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            compute_weight, public_grid = operands[leaf]
+            checkpoint_grid = public_grid.repeat_interleave(
+                tiles_per_block, dim=0
+            ).repeat_interleave(tiles_per_block, dim=1)
+            loader_weight = compute_weight.t().contiguous()
+            loader_grid = checkpoint_grid.t().contiguous()
+            if label == "one_compensation_too_few":
+                # BY HAND, bypassing the helper on purpose: the control has to state
+                # the defect itself rather than ask the helper that fixes it.
+                setattr(
+                    wrong,
+                    leaf,
+                    torch.nn.Parameter(loader_weight.clone(), requires_grad=False),
+                )
+                setattr(wrong, _scale_grid_attribute(leaf), loader_grid.clone())
+            else:
+                # The keyword is FORGOTTEN -- the one edit that produces the double.
+                _attach(wrong, leaf, loader_weight, loader_grid)
+        if wrong.retile_checkpoint_scale_grids() != 3:
+            raise VacuousControlError(
+                f"the {label} control retiled fewer than 3 projections, so it is "
+                f"not the arrangement this control means to refuse"
+            )
+        for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            attribute = _scale_grid_attribute(leaf)
+            right = getattr(loaded, attribute).to(torch.float32)
+            ratio = (getattr(wrong, attribute).to(torch.float32) / right).unique()
+            print(
+                f"TINYFWD|dense_pair_control|{label}|{leaf}"
+                f"|published_grid_ratio={[round(float(v), 7) for v in ratio]}"
+                f"|bytes_identical_to_the_correct_bind="
+                f"{bool(torch.equal(getattr(wrong, leaf).data, getattr(loaded, leaf).data))}"
+            )
+        got_wrong = wrong.forward(operands["hidden"], quant_config=_quant_config())
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(
+                got_wrong.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1453,12 +1645,7 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
     # per forward step" checkable, so the item runs the prep rather than reaching past
     # it.
     built = module.prepare_scale_operands(
-        gate_proj_weight=operands["gate_proj_weight"][0],
-        up_proj_weight=operands["up_proj_weight"][0],
-        down_proj_weight=operands["down_proj_weight"][0],
-        gate_proj_scale=operands["gate_proj_weight"][1],
-        up_proj_scale=operands["up_proj_weight"][1],
-        down_proj_scale=operands["down_proj_weight"][1],
+        *_prep_operands_from_the_module(module, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), operands)
     )
     health = getattr(module, module.RETILE_HEALTH_ATTR)
     print(
@@ -1767,6 +1954,7 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
             leaf,
             compute_weight.t().contiguous(),
             checkpoint_grid.t().contiguous(),
+            prep_will_compensate=True,
         )
 
     republished = loaded.retile_checkpoint_scale_grids()
@@ -2060,12 +2248,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
         _attach(block.experts, leaf, *routed[leaf])
     bank_built = block.experts.prepare_scale_operands(
-        gate_proj_weight=routed["gate_proj_weight"][0],
-        up_proj_weight=routed["up_proj_weight"][0],
-        down_proj_weight=routed["down_proj_weight"][0],
-        gate_proj_scale=routed["gate_proj_weight"][1],
-        up_proj_scale=routed["up_proj_weight"][1],
-        down_proj_scale=routed["down_proj_weight"][1],
+        *_prep_operands_from_the_module(block.experts, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), routed)
     )
 
     # ---- THE SHARED EXPERT at the bank's hidden size, and its own prep.
@@ -2514,12 +2697,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
         _attach(bare.experts, leaf, *routed[leaf])
     bare.experts.prepare_scale_operands(
-        gate_proj_weight=routed["gate_proj_weight"][0],
-        up_proj_weight=routed["up_proj_weight"][0],
-        down_proj_weight=routed["down_proj_weight"][0],
-        gate_proj_scale=routed["gate_proj_weight"][1],
-        up_proj_scale=routed["up_proj_weight"][1],
-        down_proj_scale=routed["down_proj_weight"][1],
+        *_prep_operands_from_the_module(bare.experts, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), routed)
     )
     bare.experts.router_weight = block.experts.router_weight
     bare.experts.router_bias = block.experts.router_bias
@@ -3147,21 +3325,26 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
     # The two tiled sparse counters are DECLARED ZEROS at this geometry -- the
     # latent is an exact 128 fit and 128 selected rows is inside one moving tile --
     # so they are registered and read rather than left out of the population.
-    _assert_route_predicate(
-        "5 MLA attention",
-        {
-            "mla_projection": 9,
-            "mla_absorb": 2,
-            "mla_sparse": 1,
-            "dsa_kpool_hadamard": 2,
-            "dsa_paged_gather": 1,
-            "dsa_score_gemm": 1,
-            "dsa_topk_select": 1,
-            "dsa_index_expand": 1,
-        },
-        before,
-        after,
-    )
+    #
+    # -054e c6: the causal bound and the causal sentinel are NOT zeros here. This
+    # item's fixture refuses the bypass regime by name (see the candidate-count
+    # guard above), so the indexer selects, and the selecting path dispatches all
+    # three of bound, selector and sentinel once each. Their counts are therefore
+    # taken from the selector's own entry rather than written twice more --
+    # :func:`_declare_bound_and_sentinel` carries the call chain and the landed
+    # reading it rests on.
+    route_expected = {
+        "mla_projection": 9,
+        "mla_absorb": 2,
+        "mla_sparse": 1,
+        "dsa_kpool_hadamard": 2,
+        "dsa_paged_gather": 1,
+        "dsa_score_gemm": 1,
+        "dsa_topk_select": 1,
+        "dsa_index_expand": 1,
+    }
+    _declare_bound_and_sentinel(route_expected)
+    _assert_route_predicate("5 MLA attention", route_expected, before, after)
 
     if tuple(got.shape) != (MLA_TOKENS, MLA_HIDDEN_SIZE):
         raise ReferenceShapeError(
@@ -3748,12 +3931,9 @@ def _stack_fixture(model=None) -> dict:
         for leaf in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
             _attach(layer.mlp.experts, leaf, *operands[leaf])
         built = layer.mlp.experts.prepare_scale_operands(
-            gate_proj_weight=operands["gate_proj_weight"][0],
-            up_proj_weight=operands["up_proj_weight"][0],
-            down_proj_weight=operands["down_proj_weight"][0],
-            gate_proj_scale=operands["gate_proj_weight"][1],
-            up_proj_scale=operands["up_proj_weight"][1],
-            down_proj_scale=operands["down_proj_weight"][1],
+            *_prep_operands_from_the_module(
+                layer.mlp.experts, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), operands
+            )
         )
         if built != 4:
             raise VacuousControlError(
@@ -4256,24 +4436,21 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # per-layer figures are not re-derived here: item 5 reads them off
     # ``test_dsa_layer.py``'s landed closed form, and that table is per layer per
     # PHASE (``DECLARED_PER_LAYER``), so it does not move with the token count.
-    _assert_route_predicate(
-        "6 the decoder stack",
-        {
-            "mla_projection": 9 * STACK_LAYERS,
-            "mla_absorb": 2 * STACK_LAYERS,
-            "mla_sparse": 1 * STACK_LAYERS,
-            "dsa_kpool_hadamard": 2 * STACK_LAYERS,
-            "dsa_paged_gather": 1 * STACK_LAYERS,
-            "dsa_score_gemm": 1 * STACK_LAYERS,
-            "dsa_topk_select": 1 * STACK_LAYERS,
-            "dsa_index_expand": 1 * STACK_LAYERS,
-            "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-            "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
-            "noaux_tc_router": 1 * STACK_MOE_LAYERS,
-        },
-        before,
-        after,
-    )
+    route_expected = {
+        "mla_projection": 9 * STACK_LAYERS,
+        "mla_absorb": 2 * STACK_LAYERS,
+        "mla_sparse": 1 * STACK_LAYERS,
+        "dsa_kpool_hadamard": 2 * STACK_LAYERS,
+        "dsa_paged_gather": 1 * STACK_LAYERS,
+        "dsa_score_gemm": 1 * STACK_LAYERS,
+        "dsa_topk_select": 1 * STACK_LAYERS,
+        "dsa_index_expand": 1 * STACK_LAYERS,
+        "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
+        "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+        "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+    }
+    _declare_bound_and_sentinel(route_expected)
+    _assert_route_predicate("6 the decoder stack", route_expected, before, after)
 
     # ---- THE HOOKS FIRED ONCE PER LAYER, IN STACK ORDER. Read before anything is
     # taken out of them: a loop that skipped a layer, ran one twice or ran them out
@@ -5336,24 +5513,21 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # ---- THE REGISTERED ROUTE PREDICATE. Item 6's figures, declared again here
     # rather than shared, so a root that smuggled in one extra dispatch fails this
     # item on its own declaration.
-    _assert_route_predicate(
-        "7 the root",
-        {
-            "mla_projection": 9 * STACK_LAYERS,
-            "mla_absorb": 2 * STACK_LAYERS,
-            "mla_sparse": 1 * STACK_LAYERS,
-            "dsa_kpool_hadamard": 2 * STACK_LAYERS,
-            "dsa_paged_gather": 1 * STACK_LAYERS,
-            "dsa_score_gemm": 1 * STACK_LAYERS,
-            "dsa_topk_select": 1 * STACK_LAYERS,
-            "dsa_index_expand": 1 * STACK_LAYERS,
-            "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-            "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
-            "noaux_tc_router": 1 * STACK_MOE_LAYERS,
-        },
-        before,
-        after,
-    )
+    route_expected = {
+        "mla_projection": 9 * STACK_LAYERS,
+        "mla_absorb": 2 * STACK_LAYERS,
+        "mla_sparse": 1 * STACK_LAYERS,
+        "dsa_kpool_hadamard": 2 * STACK_LAYERS,
+        "dsa_paged_gather": 1 * STACK_LAYERS,
+        "dsa_score_gemm": 1 * STACK_LAYERS,
+        "dsa_topk_select": 1 * STACK_LAYERS,
+        "dsa_index_expand": 1 * STACK_LAYERS,
+        "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
+        "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+        "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+    }
+    _declare_bound_and_sentinel(route_expected)
+    _assert_route_predicate("7 the root", route_expected, before, after)
 
     # ---- CONJUNCT 1: THE STACK RAN ONCE, ON THE ROOT'S OWN ARGUMENTS. Read before
     # anything is taken out of the recording, and by identity where identity is the

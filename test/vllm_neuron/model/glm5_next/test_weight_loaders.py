@@ -1190,24 +1190,30 @@ def test_skeleton_real_fixtures_are_pinned_by_digest() -> None:
 # reference -- `max|after - before| <= atol + rtol * max|before|` over each
 # block -- rather than a per-element relative comparison.
 #
-# This is not a convenient reading, it is the only one the declared tolerance can
-# carry, and the arithmetic says so: squeezing an fp8 byte by 240/448 and
-# re-quantising costs up to 6.25% of that byte's own magnitude (e4m3 has three
-# mantissa bits, so half the grid spacing is 1/16). A per-element reading is
-# therefore breached by construction -- `byte 256.0 -> 144.0 -> 268.8` is a 5.0%
-# element error that no fixture choice avoids. Block-normalised, the same worst
-# element contributes `12.8 / 448 = 0.0286`, inside `3e-2`. Both numbers are
-# measured and recorded below (`worst_element_relative` is reported on every
-# block and gated on none), so the reading is visible in the evidence instead of
-# being implicit in a pass.
+# It was also the only reading the tolerance could carry while the squeeze was the
+# range ratio, and that is worth keeping on the record because `inc-glm53f-054e`
+# changed it. At 240/448 a squeezed byte cost up to 6.25% of its own magnitude
+# (e4m3 keeps three mantissa bits, so half the grid spacing is 1/16), so a
+# per-element reading was breached by construction: `byte 256.0 -> 144.0 -> 268.8`
+# is a 5.0% element error no fixture choice avoids, and block-normalised the same
+# worst element contributed `12.8 / 448 = 0.0286` against a `3e-2` tolerance.
 #
-# The margin is thin (0.0286 against 0.0300) and it DEPENDS on each block
-# reaching the top of the OCP range: a block whose maximum is 416 instead of 448
-# measures 0.0308 and would fail. That is a property of blockwise quantisation
-# rather than a fixture trick -- a per-block scale is chosen so the block's
-# values use the full fp8 range -- but it is load-bearing, so
-# `test_fp8_downscale_fixture_is_full_range_and_block_shaped` asserts it out loud
-# rather than leaving the pass resting on an accident.
+# AT `x 1/2` THE SAME BYTE READS `256.0 -> 128.0 -> 256.0`, exactly, and the
+# numbers above are history rather than the current arithmetic. 118 of the 126
+# positive magnitudes now survive the round trip bit-exactly; the eight that do
+# not are the odd multiples of `2**-9` and each misses by exactly one minimum
+# subnormal, `2**-9`, which is the ONLY non-zero element error on the whole grid
+# (there were 53 distinct ones at the range ratio). Block-normalised that is
+# `2**-9 / 448 = 0.0000044` for every block, so the margin is no longer thin and
+# no longer depends on a block reaching the top of the OCP range.
+#
+# Both numbers are still measured and recorded below (`worst_element_relative` is
+# reported on every block and gated on none), so the reading stays visible in the
+# evidence instead of being implicit in a pass. The full-range fixture property is
+# still asserted out loud by
+# `test_fp8_downscale_fixture_is_full_range_and_block_shaped`, for the reason
+# given there -- C2's non-vacuity needs pre-squeeze bytes ABOVE 240, which is not
+# the same thing as C1's old margin needing them AT 448.
 #
 # NEITHER TOLERANCE IS THIS FILE'S TO MOVE. `rtol 3e-2` traces to the frozen
 # acceptance pre-registration's single uniform loosening factor of 3
@@ -1250,6 +1256,23 @@ FP8_DECLARED_CLAMP = 240.0
 #: (`dtype_utils.py:19`).
 FP8_OCP_MAX = 448.0
 
+#: `inc-glm53f-054e`'s factor pair: the largest power of two that fits 448 inside
+#: 240, and its exact inverse. PINNED here as literals rather than read from the
+#: module, so this file states the value the load path must hold instead of
+#: restating whatever it happens to hold. `weight_loaders_fp8.py:927,934`.
+FP8_054E_DOWNSCALE = 0.5
+FP8_054E_COMPENSATION = 2.0
+
+#: The pre-`-054e` factor, kept for TWO purposes, both controls: the failing control
+#: that shows the exactness count discriminates between the two factors, and C1's
+#: two-way residual control.
+FP8_054E_RANGE_RATIO = FP8_DECLARED_CLAMP / FP8_OCP_MAX
+
+#: The smallest positive `float8_e4m3fn` magnitude, 2**-9. It is the grid step the
+#: eight inexact magnitudes are the odd multiples of, and it is the EXACT residual
+#: C1's non-vacuity asserts, so it is declared here rather than inside one section.
+FP8_054E_MIN_SUBNORMAL = 2.0**-9
+
 #: The acceptance's synthetic weight shape and block shape (plan L3582).
 FP8_WEIGHT_SHAPE = (256, 256)
 FP8_BLOCK_SIZE = (128, 128)
@@ -1265,7 +1288,8 @@ FP8_ATOL = 1e-5
 FP8_BLOCK_SCALES = ((2.5e-3, 7.5e-4), (1.25e-2, 4.0e-4))
 
 #: The regression case's deliberately tiny scale, four orders below `MINVAL`
-#: even after the 448/240 compensation has multiplied it up.
+#: even after the compensation has multiplied it up (`x 2` since `-054e`, and it
+#: was four orders below at `x 448/240` too -- the case does not depend on which).
 FP8_TINY_SCALE = 1e-9
 
 #: Which tile the regression case makes tiny.
@@ -1316,6 +1340,24 @@ def _fp8_representable_magnitudes() -> torch.Tensor:
     finite = every_byte[torch.isfinite(every_byte)]
     magnitudes = torch.unique(finite.abs())
     return magnitudes[magnitudes > 0]
+
+
+def _054e_squeeze_and_restore(
+    magnitudes: torch.Tensor, down: float, up: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the load path's arithmetic over a tensor of magnitudes at a given factor.
+
+    The four steps are `downscale_fp8_weight_bytes`'s own, in its order -- fp32
+    multiply, clamp at the trn2 bound, cast to the stored dtype -- followed by the
+    compensation the dequant applies to the per-block scale. Returns the stored
+    bytes and the restored fp32 values.
+    """
+    stored = (
+        (magnitudes.to(torch.float32) * down)
+        .clamp(-FP8_DECLARED_CLAMP, FP8_DECLARED_CLAMP)
+        .to(_fp8_module._FP8_DTYPE)
+    )
+    return stored, stored.to(torch.float32) * up
 
 
 def _fp8_full_range_tile(variant: int) -> torch.Tensor:
@@ -1428,6 +1470,12 @@ def test_fp8_downscale_gate_follows_the_resolved_platform_clamp() -> None:
     measured with the gate TRUE rather than measured through a gate nobody
     checked.
 
+    The ruling's words are quoted as issued and are NOT edited here: `inc-glm53f-054e`
+    later moved the factor from 240/448 to an exact `x 1/2`, so read "240/448" above
+    as the factor at the time of the ruling. What the ruling settled -- that the
+    squeeze is conditional on the resolved clamp -- is unchanged by that move, and
+    the gate this test reads is the same gate.
+
     The complementary arm is deliberately absent. The pinned invocation fixes
     `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` before collection
     (`test/conftest.py:23-25`), so this instrument cannot discriminate a gated
@@ -1454,11 +1502,15 @@ def test_fp8_downscale_fixture_is_full_range_and_block_shaped(
 ) -> None:
     """The declared shapes, and the two properties the conjuncts lean on.
 
-    Property 1 (C1's): every tile's absolute maximum is the top of the OCP range.
-    Block-normalised agreement is sensitive to it -- a tile topping out at 416
-    measures 0.0308 against a 0.0300 tolerance -- so it is asserted rather than
-    assumed. Property 2 (C2's): the pre-squeeze bytes are NOT already inside the
-    240 range, or "100% within 240" afterwards would certify nothing.
+    Property 1: every tile's absolute maximum is the top of the OCP range. It used
+    to be C1's -- block-normalised agreement was sensitive to it, a tile topping out
+    at 416 measuring 0.0308 against a 0.0300 tolerance. `inc-glm53f-054e` ended that
+    sensitivity: at an exact `x 1/2` squeeze every block normalises to 0.0000044
+    whatever its maximum. THE ASSERTION STAYS, and it is now Property 2's, one step
+    stronger: 448 is not merely above 240, it is the furthest above, so the
+    pre-squeeze fixture is as far from vacuous as the format allows. Property 2
+    (C2's): the pre-squeeze bytes are NOT already inside the 240 range, or "100%
+    within 240" afterwards would certify nothing.
 
     PROPERTY 3 IS NEW, from finding ``B08-F2``: the fixture's magnitude COVERAGE. The
     old fixture's docstring claimed it held essentially every representable magnitude
@@ -1488,7 +1540,8 @@ def test_fp8_downscale_fixture_is_full_range_and_block_shaped(
         tile_maxima[f"{grid_row},{grid_col}"] = tile_max
         assert tile_max == FP8_OCP_MAX, (
             f"tile {(grid_row, grid_col)} tops out at {tile_max}, not "
-            f"{FP8_OCP_MAX}; C1's block normalisation depends on this"
+            f"{FP8_OCP_MAX}; C2's non-vacuity depends on the pre-squeeze bytes "
+            f"reaching above 240, and 448 is the furthest above the format allows"
         )
 
     fraction_within = float((dense.abs() <= FP8_DECLARED_CLAMP).to(torch.float32).mean())
@@ -1524,7 +1577,10 @@ def test_fp8_downscale_fixture_is_full_range_and_block_shaped(
     )
     assert subnormals_present == subnormals.numel(), (
         f"only {subnormals_present} of {subnormals.numel()} subnormals are present; "
-        f"the smallest subnormal is where the 240/448 squeeze is worst per element"
+        f"the smallest subnormal is where the squeeze is worst per element, and since "
+        f"inc-glm53f-054e it is where the squeeze is TOTAL -- 2**-9 halves onto a tie "
+        f"and round-to-nearest-even sends it to zero, a 100% element error that only "
+        f"a fixture holding that subnormal can ever disclose"
     )
     _record_fp8(
         fixture_tile_maxima=tile_maxima,
@@ -1570,14 +1626,87 @@ def test_fp8_downscale_c1_dequantisation_agrees_per_block(
         for r in failed
     )
 
-    # Non-vacuity: atol alone carries no block, so the rtol term is what passes
-    # them. Without this, a fixture with tiny scales would pass on atol and C1
-    # would certify nothing about the 240/448 squeeze at all.
+    # NON-VACUITY, RE-ARGUED BY `inc-glm53f-054e`. The landed guard asserted
+    # `max_abs_diff > atol` on every block: atol alone must not carry a block, or the
+    # rtol term is not what passes them. That guard was right at 240/448 and it
+    # INVERTS at an exact `x 1/2`, because the squeeze becomes exact and the residual
+    # collapses. It is printed here as the control reading before the claim that
+    # replaces it, so the inversion is in the transcript rather than in a commit
+    # message (LEAD-LOG §1026).
+    old_guard_carried = 0
     for report in reports:
-        assert report.max_abs_diff > FP8_ATOL, (
-            f"block {report.index} passes on atol alone "
-            f"(max_abs_diff={report.max_abs_diff:.3e} <= atol={FP8_ATOL:.3e})"
+        carried = bool(report.max_abs_diff > FP8_ATOL)
+        old_guard_carried += int(carried)
+        print(
+            f"E054|control|old_guard|block={report.index[0]},{report.index[1]}"
+            f"|max_abs_diff={report.max_abs_diff:.9e}|atol={FP8_ATOL:.3e}"
+            f"|old_guard_holds={carried}"
+            f"|predicted_residual_f32={float(FP8_054E_MIN_SUBNORMAL * report.max_abs_before / FP8_OCP_MAX):.9e}"
         )
+    print(
+        f"E054|control|old_guard|blocks_where_atol_alone_now_carries="
+        f"{len(reports) - old_guard_carried}/{len(reports)}"
+    )
+
+    # THE CLAIM THAT REPLACES IT, and it is EXACT with no tolerance at all.
+    #
+    # It is made ONE DOMAIN EARLIER, over the stored bytes before the block scale
+    # multiplies in. That is deliberate and it is the whole reason this reads as an
+    # equality: `max_abs_diff` above is a difference of two fp32 PRODUCTS that round
+    # independently, so it is `2**-9 x scale` plus up to two rounding errors and
+    # misses an exact comparison in the seventh digit
+    # (`054e-c4-f32-rounding-evidence-20260909T222700Z.out`). Before the scale there
+    # is no product to round: every value is an fp8 magnitude times a power of two.
+    #
+    # What it says: the squeeze is EXACT except on the odd multiples of the minimum
+    # subnormal, and there it is off by exactly ONE minimum subnormal. That is
+    # strictly stronger than "atol did not carry this block" -- it names the residual
+    # instead of bounding it -- and it is non-vacuous by its own second clause, which
+    # requires the erring set to be non-empty.
+    restored_bytes = squeeze.weight.to(torch.float32) * FP8_054E_COMPENSATION
+    element_error = (restored_bytes - fp8_downscale_weight.to(torch.float32)).abs()
+    residuals = torch.unique(element_error)
+    nonzero_residuals = residuals[residuals > 0]
+    print(
+        f"E054|squeeze_residual|distinct_nonzero={[float(v) for v in nonzero_residuals]}"
+        f"|count={nonzero_residuals.numel()}|min_subnormal={FP8_054E_MIN_SUBNORMAL}"
+        f"|elements_exact={int((element_error == 0).sum())}/{element_error.numel()}"
+    )
+    assert nonzero_residuals.numel() == 1, (
+        f"the squeeze produced {nonzero_residuals.numel()} distinct non-zero element "
+        f"residuals, not one: {[float(v) for v in nonzero_residuals]}. At an exact "
+        f"x 1/2 every inexact magnitude misses by exactly one minimum subnormal, so "
+        f"more than one value means the factor is not a power of two"
+    )
+    assert float(nonzero_residuals[0]) == FP8_054E_MIN_SUBNORMAL, (
+        f"the single residual is {float(nonzero_residuals[0])}, not the minimum "
+        f"subnormal {FP8_054E_MIN_SUBNORMAL}"
+    )
+
+    # THE CONTROL, TWO-WAY. The same reading at the range ratio must NOT be one
+    # value: 240/448 re-rounds mantissas rather than shifting exponents, so it
+    # produces many distinct residuals. The helper is the one this file already
+    # asserts byte-identical to `downscale_fp8_weight_bytes` at the module's factor,
+    # so the control is not a second implementation of the load path.
+    _, ratio_restored = _054e_squeeze_and_restore(
+        fp8_downscale_weight.to(torch.float32),
+        FP8_054E_RANGE_RATIO,
+        1.0 / FP8_054E_RANGE_RATIO,
+    )
+    ratio_error = (
+        ratio_restored - fp8_downscale_weight.to(torch.float32)
+    ).abs()
+    ratio_residuals = torch.unique(ratio_error)
+    ratio_nonzero = ratio_residuals[ratio_residuals > 0]
+    print(
+        f"E054|control|range_ratio_residuals|distinct_nonzero={ratio_nonzero.numel()}"
+        f"|at_x1_2={nonzero_residuals.numel()}"
+    )
+    assert ratio_nonzero.numel() > 1, (
+        f"at 240/448 the squeeze produced {ratio_nonzero.numel()} distinct non-zero "
+        f"residuals; the reading above cannot tell an exact power of two from a range "
+        f"ratio unless this arm reads many"
+    )
 
     _record_fp8(
         c1_blocks_within=len([r for r in reports if r.within]),
@@ -1636,9 +1765,14 @@ def test_fp8_downscale_c2_every_stored_byte_is_within_240(
     assert squeeze.fraction_within_240 == 1.0
     assert squeeze.max_abs_stored <= FP8_DECLARED_CLAMP
 
-    # The bound is reached, not merely respected: 448 maps to exactly 240, so a
-    # squeeze that quietly over-shrank the bytes would show up here.
-    assert squeeze.max_abs_stored == FP8_DECLARED_CLAMP
+    # The stored maximum is EXACTLY 448 x the factor, so a squeeze that quietly
+    # over-shrank the bytes still shows up here. Until `-054e` that product was 240
+    # and this line read "the bound is reached, not merely respected"; at an exact
+    # `x 1/2` it is 224 and the bound is deliberately NOT reached -- 16 counts of
+    # headroom under the clamp, which `assert ... <= FP8_DECLARED_CLAMP` above
+    # covers and this line no longer claims.
+    assert squeeze.max_abs_stored == FP8_OCP_MAX * FP8_054E_DOWNSCALE
+    assert squeeze.max_abs_stored < FP8_DECLARED_CLAMP
     _record_fp8(
         c2_fraction_within_240=squeeze.fraction_within_240,
         c2_max_abs_stored=squeeze.max_abs_stored,
@@ -1670,8 +1804,10 @@ def test_fp8_downscale_c3_no_scale_falls_below_minval(
     assert squeeze.floored_blocks == ()
 
     # The compensation is the exact inverse of the byte squeeze, and it is
-    # applied to every tile -- not just to the tiles that needed clamping.
-    expected = fp8_downscale_scales * (FP8_OCP_MAX / FP8_DECLARED_CLAMP)
+    # applied to every tile -- not just to the tiles that needed clamping. Since
+    # `-054e` both halves are powers of two, so `x 0.5` then `x 2` is exact in fp32
+    # and this equality needs no tolerance at all.
+    expected = fp8_downscale_scales * FP8_054E_COMPENSATION
     assert torch.equal(squeeze.scale_inv, expected)
     _record_fp8(
         c3_minval=MINVAL,
@@ -1716,12 +1852,14 @@ def test_fp8_downscale_minval_floor_engages_on_a_tiny_block_scale(
     floored_value = float(squeeze.scale_inv[FP8_TINY_BLOCK].item())
     assert torch.equal(squeeze.scale_inv[FP8_TINY_BLOCK], _fp8_as_stored(MINVAL))
     # And the floor is what put it there: the compensated value it replaced was
-    # four orders of magnitude below the floor.
-    assert FP8_TINY_SCALE * (FP8_OCP_MAX / FP8_DECLARED_CLAMP) < MINVAL
+    # four orders of magnitude below the floor. True at either factor -- 1e-9 times
+    # 2 is as far below 1e-5 as 1e-9 times 448/240 was -- but it is asserted at the
+    # factor the load path actually applies.
+    assert FP8_TINY_SCALE * FP8_054E_COMPENSATION < MINVAL
 
     # Leg 2 -- local: every other tile carries the plain compensated scale,
     # compared tile-by-tile against the same grid the transform started from.
-    compensated = tiny_grid * (FP8_OCP_MAX / FP8_DECLARED_CLAMP)
+    compensated = tiny_grid * FP8_054E_COMPENSATION
     for grid_row, grid_col in _fp8_tiles():
         if (grid_row, grid_col) == FP8_TINY_BLOCK:
             continue
@@ -1888,9 +2026,10 @@ def test_fp8_downscale_scale_loader_compensates_through_a_fake_slice(
     assert loaded.dtype is torch.float32
     assert tuple(loaded.shape) == (2, 2)
     assert torch.equal(loaded, compensate_block_scales(fp8_downscale_scales).scale_inv)
-    assert torch.equal(
-        loaded, fp8_downscale_scales * (FP8_OCP_MAX / FP8_DECLARED_CLAMP)
-    )
+    # The second reading is deliberately NOT function-derived -- it names the factor
+    # independently, so a change to the module shows up here as a failure instead of
+    # following along silently. `-054e` moved it from `448/240` to an exact `x 2`.
+    assert torch.equal(loaded, fp8_downscale_scales * FP8_054E_COMPENSATION)
     _record_fp8(loader_scale_grid=loaded.flatten().tolist())
 
 
@@ -1909,7 +2048,12 @@ def test_fp8_downscale_weight_loader_squeezes_through_a_fake_slice(
     assert loaded.dtype is torch.float8_e4m3fn
     assert tuple(loaded.shape) == FP8_WEIGHT_SHAPE
     dense = loaded.to(torch.float32)
-    assert float(dense.abs().max().item()) == FP8_DECLARED_CLAMP
+    # The squeezed maximum is 448 x the factor, which `-054e` moved from exactly 240
+    # to 224. It is asserted against the DERIVED value and separately against the
+    # bound, because "inside 240" and "equal to 240" stopped being the same claim:
+    # the squeeze now leaves 16 counts of headroom under the clamp.
+    assert float(dense.abs().max().item()) == FP8_OCP_MAX * FP8_054E_DOWNSCALE
+    assert float(dense.abs().max().item()) < FP8_DECLARED_CLAMP
     assert torch.equal(
         dense, downscale_fp8_weight_bytes(fp8_downscale_weight).to(torch.float32)
     )
@@ -2415,4 +2559,158 @@ def test_skeleton_no_scale_companion_is_requested_for_a_bf16_tensor(
         c079d_control_fires=len(fires),
         c079d_control_suppressed_requests=len(suppressed),
         c079d_control_token=C079_SYNTHETIC_SKIP_TOKEN,
+    )
+
+
+# =========================================================================== #
+# inc-glm53f-054e -- the squeeze factor is an EXACT POWER OF TWO
+# =========================================================================== #
+#
+# WHAT IT SETTLES. The load path squeezes fp8 bytes by 1/2 and multiplies the
+# per-block dequant scale by 2 rather than using the range ratio 240/448, and one
+# counted number is the reason: `value -> squeeze -> fp8 -> compensate` is
+# BIT-EXACT for 118 of the 126 positive magnitudes at 1/2 and for 14 at the ratio.
+#
+# `-054e` is this file's FIFTH writer and it APPENDS, so it moves no landed line
+# above. Its one item carries `fp8_downscale` and not `skeleton`, joining `-012`'s
+# numerics selection on purpose -- the factor is that partition's own subject, so
+# a `-k fp8_downscale` run that skipped it would read the numerics with the
+# premise missing.
+#
+# WHY THE CONTROLS ARE THE POINT. A test that only asserted "118" would pass for
+# any reason at all, a parallel helper included. Three things are tied together:
+# the counting helper must produce BYTE-IDENTICAL output to
+# `downscale_fp8_weight_bytes` at the module's own factor, so it is not a second
+# implementation; the same helper at the range ratio must read 14, so the count
+# discriminates; and the platform gate is asserted engaged, because disengaged the
+# production function returns its input and every reading here measures nothing.
+#
+# THE COST IS ASSERTED, NOT MENTIONED. All eight inexact magnitudes are odd
+# multiples of 2**-9 -- halving one lands exactly between grid points and
+# round-to-nearest-even resolves away from it -- so the characterisation is
+# asserted rather than the looser "they are all small", and the minimum subnormal
+# is asserted to restore as 0.0.
+
+#: The factor pair and the range ratio are declared with the other traced values
+#: at the head of the numerics partition (`FP8_054E_DOWNSCALE` and its two
+#: companions), because that is where this file keeps the numbers it does not
+#: invent. The counted values below belong to this section alone.
+#:
+#: The counted values. Every one is derived in
+#: `artifacts/.../increments/054e-c1-fp8-exactness-emulation-20260909T220108Z.out`
+#: by exact-fraction emulation of e4m3fn round-to-nearest-even, independently of
+#: torch, and the plan's Tier T expects the first two by name.
+FP8_054E_EXACT_AT_POWER_OF_TWO = 118
+FP8_054E_EXACT_AT_RANGE_RATIO = 14
+FP8_054E_INEXACT_AT_POWER_OF_TWO = 8
+
+#: The magnitude below which every inexact value sits. The grid step whose odd
+#: multiples they are -- `FP8_054E_MIN_SUBNORMAL` -- is declared with the factor pair
+#: at the head of this partition, because C1's non-vacuity reads it too.
+FP8_054E_INEXACT_CEILING = 2.0**-5
+
+
+def test_fp8_downscale_054e_the_squeeze_factor_is_an_exact_power_of_two() -> None:
+    """The factor is a power of two, it is the largest that fits, and 118 round-trip."""
+    assert needs_240_downscale() is True, (
+        "the platform gate is disengaged, so `downscale_fp8_weight_bytes` returns its "
+        "input unchanged and every count below would measure nothing. The clamp maximum "
+        "is resolved at IMPORT time, so no fixture can repair this -- "
+        "NEURON_PLATFORM_TARGET_OVERRIDE=trn2 belongs in the process invocation."
+    )
+
+    down = _fp8_module._FP8_WEIGHT_DOWNSCALE
+    up = _fp8_module._FP8_SCALE_COMPENSATION
+
+    # (a) The module holds the pinned pair, and both halves are exact powers of
+    # two. `.hex()` reads the bits rather than trusting a decimal literal: a power
+    # of two has significand `1.0000000000000` and nothing else.
+    assert (down, up) == (FP8_054E_DOWNSCALE, FP8_054E_COMPENSATION)
+    assert down.hex() == "0x1.0000000000000p-1"
+    assert up.hex() == "0x1.0000000000000p+1"
+    assert down * up == 1.0
+
+    # (b) It is the LARGEST power of two that fits 448 inside 240 -- the next one
+    # up leaves the OCP maximum outside the bound the trn2 kernel reads.
+    assert FP8_OCP_MAX * down <= FP8_DECLARED_CLAMP
+    assert FP8_OCP_MAX * (down * 2.0) > FP8_DECLARED_CLAMP
+
+    magnitudes = _fp8_representable_magnitudes()
+    assert magnitudes.numel() == 126
+
+    # (c) The counting helper IS the production path, byte for byte. Compared as
+    # uint8 because that asks about the stored bytes and nothing else.
+    stored, restored = _054e_squeeze_and_restore(magnitudes, down, up)
+    production = downscale_fp8_weight_bytes(magnitudes)
+    assert torch.equal(production.view(torch.uint8), stored.view(torch.uint8))
+
+    # (d) THE COUNTED VALUE.
+    exact = restored == magnitudes.to(torch.float32)
+    exact_count = int(exact.sum().item())
+    inexact = magnitudes[~exact]
+
+    # (e) The eight that do not survive, characterised by WHY: each is an odd
+    # multiple of the minimum subnormal, so halving it lands exactly between two
+    # grid points and round-to-nearest-even resolves the tie away from it.
+    odd_multiples = [
+        float(value) / FP8_054E_MIN_SUBNORMAL for value in inexact.tolist()
+    ]
+    smallest_restored = float(
+        _054e_squeeze_and_restore(
+            torch.tensor([FP8_054E_MIN_SUBNORMAL]), down, up
+        )[1].item()
+    )
+
+    # (f) THE FAILING CONTROL: the same helper at the range ratio must read 14.
+    ratio_stored, ratio_restored = _054e_squeeze_and_restore(
+        magnitudes, FP8_054E_RANGE_RATIO, 1.0 / FP8_054E_RANGE_RATIO
+    )
+    ratio_exact_count = int((ratio_restored == magnitudes.to(torch.float32)).sum().item())
+
+    zero_restored = float(
+        _054e_squeeze_and_restore(torch.tensor([0.0]), down, up)[1].item()
+    )
+
+    print(
+        f"S054E|exactness|factor={down}|compensation={up}"
+        f"|exact_round_trips={exact_count}/126|want={FP8_054E_EXACT_AT_POWER_OF_TWO}"
+        f"|at_range_ratio={ratio_exact_count}/126|want={FP8_054E_EXACT_AT_RANGE_RATIO}"
+        f"|inexact={inexact.numel()}|worst_inexact={float(inexact.max().item())}"
+        f"|ceiling={FP8_054E_INEXACT_CEILING}"
+        f"|min_subnormal_restores_as={smallest_restored}|zero_restores_as={zero_restored}"
+        f"|stored_max={float(stored.to(torch.float32).max().item())}"
+        f"|bound={FP8_DECLARED_CLAMP}"
+    )
+    print(f"S054E|inexact_as_multiples_of_the_min_subnormal|{odd_multiples}")
+
+    assert exact_count == FP8_054E_EXACT_AT_POWER_OF_TWO
+    assert ratio_exact_count == FP8_054E_EXACT_AT_RANGE_RATIO
+    assert exact_count > ratio_exact_count
+    assert inexact.numel() == FP8_054E_INEXACT_AT_POWER_OF_TWO
+    assert float(inexact.max().item()) < FP8_054E_INEXACT_CEILING
+    assert all(multiple % 2 == 1 for multiple in odd_multiples)
+    assert smallest_restored == 0.0
+    assert zero_restored == 0.0
+
+    # The headroom is real. Two landed readings DID depend on the old factor
+    # reaching exactly 240 -- C2's stored maximum and the weight loader's dense
+    # maximum -- and this increment moved both onto the derived product rather than
+    # deleting them, so the headroom is now asserted rather than merely unused.
+    assert float(stored.to(torch.float32).max().item()) == FP8_OCP_MAX * down
+    assert FP8_OCP_MAX * down < FP8_DECLARED_CLAMP
+
+    _record_fp8(
+        c054e_factor=down,
+        c054e_compensation=up,
+        c054e_exact_round_trips=exact_count,
+        c054e_exact_round_trips_at_range_ratio=ratio_exact_count,
+        c054e_inexact=inexact.numel(),
+        c054e_worst_inexact=float(inexact.max().item()),
+        c054e_inexact_as_multiples_of_min_subnormal=odd_multiples,
+        c054e_min_subnormal_restores_as=smallest_restored,
+        c054e_stored_max=float(stored.to(torch.float32).max().item()),
+        c054e_stored_bytes_agree_with_production=True,
+        c054e_range_ratio_stored_max=float(
+            ratio_stored.to(torch.float32).max().item()
+        ),
     )

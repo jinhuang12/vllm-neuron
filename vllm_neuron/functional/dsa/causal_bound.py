@@ -68,6 +68,28 @@ device kernels that consume them, which is ``inc-glm53f-048``'s precedent exactl
 the host would be a fallback for kernel-class work AND one host round trip per step, on the
 per-forward path.
 
+THE QUERY-TOKEN AXIS IS TILED, AND THAT IS ``inc-glm53f-103b``. Both kernel bodies used to bind the
+query-token count to dim 0 of ONE SBUF tile, and SBUF's partition axis holds at most
+:data:`PARTITION_MAX` rows. A prefill above that did not refuse by name -- nothing in this module
+counts rows, so ``_validate_bound`` and ``can_run_dsa_causal_bound`` both pass it -- it dispatched
+and died inside the vendor's own assert: ``AssertionError: dma_copy dst partition dimension 132
+exceeds maximum 128``, raised at ``nki/isa/_copy.py:152`` by way of ``nki/isa/_validation.py:261``.
+``inc-glm53f-103``'s whole acceptance ran at 5 rows, so the ceiling was never exercised, while the
+registered envelope is 2,048 tokens per request (``acceptance-preregistration.md`` A-5).
+
+Both bodies now walk :func:`row_tiles`, and TILING IS PURE LAYOUT HERE: row ``i``'s output reads
+only ``scores[i, :]``, ``causal_len[i]`` and ``pool_size``, so one query token is one row and no tile
+boundary can split anything. Each tile carries the SAME instruction sequence the untiled body
+carried, which is why a call at :data:`PARTITION_MAX` rows or fewer is exactly one tile and is
+bit-identical to what this module produced before ``103b``. The two partition-invariant tiles in the
+bound -- the column ramp and the fill -- are therefore REBUILT PER TILE rather than built once and
+sliced: hoisting them would save one ``iota`` and one ``memset`` per tile and would cost the
+structural form of that bit-identity claim, and per-tile allocation inside an unrolled token-tile
+loop is this directory's landed form already (``score_gemm.py:254-297``). ``out`` stays a single
+``shared_hbm`` tensor of the caller's shape, so no signature, no seam, no validator and no call site
+moves. The tile arithmetic is `inc-glm53f-028b`'s, adapted: ``mhc/sinkhorn.py`` rounds its tile
+height down to one token's block height, and here there is no block to round to.
+
 CONSTRUCTS, AND THE SCREENING FOR EACH. Since the ``103r5`` repair made the fill finite, EVERY
 construct below has a landed fork call site -- the one exception this list used to carry is retired,
 and its old text is kept as the last bullet because the reason it is gone is worth reading.
@@ -178,6 +200,15 @@ _INDEX_DTYPES = (torch.int32,)
 """Index dtypes that take the NKI route. ``dsa_index_expand`` admits int32, so the sentinel writer
 keeps the selector's output in the dtype its consumer reads."""
 
+PARTITION_MAX = 128
+"""Query rows ONE SBUF tile can hold: the partition-axis bound, ``nl.tile_size.pmax``.
+
+This bounds one ROW TILE and not the call. `inc-glm53f-103b` walks the query-token axis in tiles of
+at most this height, so a prefill with more tokens than this is SERVED rather than trapped in the
+vendor assert the module docstring quotes. Written as a module constant so both kernels, the tile
+arithmetic and the acceptance read one number -- `inc-glm53f-028b`'s form at ``mhc/sinkhorn.py:217``.
+"""
+
 
 class DsaCausalBoundError(ValueError):
     """A malformed call: a ``pool_size`` that is not a power of two, a ``causal_len`` of the wrong
@@ -258,6 +289,79 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------------------------
+# The query-token tiling, written once and read by both kernel bodies and the acceptance
+# ---------------------------------------------------------------------------------------------
+
+
+def _row_tiles_unchecked(rows: int) -> list[tuple[int, int]]:
+    """The ``(start, height)`` query-token tiles, in order, with no refusal in the arithmetic.
+
+    THE FORMS THIS LOOP AVOIDS ARE NOT TASTE, THEY WERE PAID FOR. `inc-glm53f-028b` landed the same
+    tiling in ``mhc/sinkhorn.py``, and commit ``543d793`` had to strip a list comprehension and a
+    ``min`` out of it because the tracer refused them where the kernel bodies reach
+    (``sinkhorn.py:353-386`` records what the compiler said, and that it never settled which of the
+    two was the unsupported expression). This loop therefore uses only ``for`` over ``range``,
+    ``append``, a tuple and the ``if``/``else`` that compiler's own text recommended. The arithmetic
+    is unchanged from ``min(PARTITION_MAX, rows - start)``, and ``score_gemm.py:255`` shows a ``min``
+    IS landed in a kernel body in this directory -- so this form is the conservative one rather than
+    the only one that can compile.
+
+    ``mhc/sinkhorn.py`` takes a ``block`` argument and rounds the tile height DOWN to a multiple of
+    it, because one token's affinity block spans several rows there. Here one query token is exactly
+    one row, so no boundary can split anything and the height is :data:`PARTITION_MAX` itself.
+    """
+    tiles = []
+    for start in range(0, rows, PARTITION_MAX):
+        remaining = rows - start
+        if remaining < PARTITION_MAX:
+            tiles.append((start, remaining))
+        else:
+            tiles.append((start, PARTITION_MAX))
+    return tiles
+
+
+def _row_tile_count_unchecked(rows: int) -> int:
+    """How many tiles :func:`_row_tiles_unchecked` returns, by arithmetic.
+
+    This is a kernel loop BOUND, and it exists for the reason ``sinkhorn.py:388-406`` records: the
+    kernel bodies count with ``for idx in range(bound)`` because a ``for`` whose loop variable is a
+    tuple is what the compiler refused there, and the loop bound is a plain name rather than a call
+    because that is the form the repository's other NKI kernels use. Ceiling division; the acceptance
+    reads this against ``len(row_tiles(rows))`` rather than assuming the two agree.
+    """
+    return (rows + PARTITION_MAX - 1) // PARTITION_MAX
+
+
+def row_tiles(rows: int) -> list[tuple[int, int]]:
+    """The ``(start, height)`` query-token tiles both kernels walk, in order. The CHECKED path.
+
+    For the acceptance, and for any reader that wants to say how a call will be tiled without tracing
+    it. The kernel bodies call :func:`_row_tiles_unchecked` instead, because this function raises and
+    NKI refuses a traced ``raise``; the two return the same list for every admissible input. The last
+    tile is short whenever ``rows`` is not a multiple of :data:`PARTITION_MAX`, which is admitted: a
+    prefill length is not a whole number of tiles either.
+
+    Raises:
+        DsaCausalBoundError: if ``rows`` is not positive. A call with no query rows has no tiles, and
+            a caller asking about one has a bug rather than a shape this module declines to serve.
+    """
+    if rows < 1:
+        raise DsaCausalBoundError(
+            f"rows must be the positive number of query rows to tile; got rows={rows}"
+        )
+    return _row_tiles_unchecked(rows)
+
+
+def row_tile_count(rows: int) -> int:
+    """How many tiles :func:`row_tiles` returns. The CHECKED path, and the same refusal."""
+    if rows < 1:
+        raise DsaCausalBoundError(
+            f"rows must be the positive number of query rows to tile; got rows={rows}"
+        )
+    return _row_tile_count_unchecked(rows)
+
+
+# ---------------------------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------------------------
 
@@ -282,56 +386,83 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
     columns are overwritten in place by one predicated copy, so a kept column carries the loaded
     bits unchanged -- no add of 0.0, no multiply by 1.0, and therefore no ``-0.0`` to ``+0.0``
     rewrite and no ``0 * -inf`` NaN.
+
+    THE QUERY-TOKEN AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS (`inc-glm53f-103b`).
+    Every tile below is the untiled body's own tile at its own height, in the untiled body's own
+    order, and each tile reads only its own rows of both inputs -- so ``rows <= PARTITION_MAX`` is one
+    tile and is the old program exactly, and a taller call is that program run once per tile. The
+    module docstring records the vendor assert this replaces and why nothing is hoisted out of the
+    loop.
     """
     rows = scores_hbm.shape[0]
     width = scores_hbm.shape[1]
 
     out = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.shared_hbm)
 
-    # The scores, loaded once. This tile IS the result: the mask writes into it.
-    scores_sb = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=scores_sb, src=nl.load(scores_hbm))
+    # The UNCHECKED tile arithmetic, because the tracer follows these calls: the checked `row_tiles`
+    # raises, and NKI refuses a traced `raise`. The loop BOUND is a plain name, and the tile list is
+    # read BY INDEX -- both for the reasons `sinkhorn.py:353-406` records against its own compiler
+    # diagnostics.
+    tiles = _row_tiles_unchecked(int(rows))
+    tile_count = _row_tile_count_unchecked(int(rows))
 
-    # The per-row length as a float32 COLUMN operand. float32 because the ISA requires a
-    # `tensor_scalar` operand tile to be float32 and the MLIR verifier refuses int32 there -- the
-    # reading `-099` paid for, recorded at `causal_fill.py:189-196`. Exact: a causal length is a
-    # whole number far below 2**24.
-    clen = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=clen, src=nl.load(causal_len_hbm))
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
 
-    # `-causal_len`, so the only tile-operand call below can be an ADD, which is the screened form
-    # (`causal_fill.py:224`). A `subtract` with a tile operand has no landed call site.
-    nclen = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=nclen, data=clen, op0=nl.multiply, operand0=-1.0)
+        # This tile's scores, loaded once. This tile IS its slice of the result: the mask writes
+        # into it.
+        scores_sb = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=scores_sb, src=nl.load(scores_hbm[start:start + height, 0:width])
+        )
 
-    # The column ramp `p`, the same 0..width-1 on every partition.
-    ramp = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=ramp, pattern=[[1, width]], offset=0, channel_multiplier=0)
+        # This tile's per-row lengths as a float32 COLUMN operand. RE-LOADED PER TILE, never carried
+        # over from the first tile: `causal_len` is per-row, so a walk that hoisted this column would
+        # bound every tile by the first tile's rows and would still read correct at
+        # `rows <= PARTITION_MAX`. float32 because the ISA requires a `tensor_scalar` operand tile to
+        # be float32 and the MLIR verifier refuses int32 there -- the reading `-099` paid for,
+        # recorded at `causal_fill.py:189-196`. Exact: a causal length is a whole number far below
+        # 2**24.
+        clen = nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=clen, src=nl.load(causal_len_hbm[start:start + height, 0:1])
+        )
 
-    # `(p + 1) * pool_size`, the first token index past pool `p`, as one two-scalar chain.
-    end = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=end, data=ramp,
-                       op0=nl.multiply, operand0=float(pool_size),
-                       op1=nl.add, operand1=float(pool_size))
+        # `-causal_len`, so the only tile-operand call below can be an ADD, which is the screened
+        # form (`causal_fill.py:224`). A `subtract` with a tile operand has no landed call site.
+        nclen = nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=nclen, data=clen, op0=nl.multiply, operand0=-1.0)
 
-    # `(p + 1) * pool_size - causal_len[i]`, one tile operand broadcast along the free axis.
-    room = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=room, data=end, op0=nl.add, operand0=nclen)
+        # The column ramp `p`, the same 0..width-1 on every partition of this tile.
+        ramp = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(dst=ramp, pattern=[[1, width]], offset=0, channel_multiplier=0)
 
-    # 1 exactly where the pool is INCOMPLETE for this row, which is where the bound applies.
-    # `greater` into an integer destination is the landed compare (`moe/topk_reduce.py:351-355`).
-    bounded = nl.ndarray((rows, width), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
+        # `(p + 1) * pool_size`, the first token index past pool `p`, as one two-scalar chain.
+        end = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=end, data=ramp,
+                           op0=nl.multiply, operand0=float(pool_size),
+                           op1=nl.add, operand1=float(pool_size))
 
-    # The fill source. FINITE since repair `103r5`, which puts this memset in the same landed
-    # family as the other 37 (every landed value is finite; see the module docstring).
-    fill = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=fill, value=BOUND_FILL)
+        # `(p + 1) * pool_size - causal_len[i]`, one tile operand broadcast along the free axis.
+        room = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=room, data=end, op0=nl.add, operand0=nclen)
 
-    # The mask. `scores_sb` is left alone wherever `bounded` is 0.
-    nisa.tensor_copy_predicated(src=fill, predicate=bounded, dst=scores_sb)
+        # 1 exactly where the pool is INCOMPLETE for this row, which is where the bound applies.
+        # `greater` into an integer destination is the landed compare (`moe/topk_reduce.py:351-355`).
+        bounded = nl.ndarray((height, width), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
 
-    nl.store(out, value=scores_sb)
+        # The fill source. FINITE since repair `103r5`, which puts this memset in the same landed
+        # family as the other 37 (every landed value is finite; see the module docstring).
+        fill = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=fill, value=BOUND_FILL)
+
+        # The mask. `scores_sb` is left alone wherever `bounded` is 0.
+        nisa.tensor_copy_predicated(src=fill, predicate=bounded, dst=scores_sb)
+
+        nl.store(out[start:start + height, 0:width], value=scores_sb)
     return out
 
 
@@ -381,39 +512,61 @@ def _causal_sentinel_nki(values_hbm, indices_hbm, width):
     Every construct here is already landed in this module: ``greater`` into an integer destination
     (``moe/topk_reduce.py:351-355``), ``memset`` with the int32 sentinel (``mla_sparse.py:236``), and
     ``tensor_copy_predicated`` as the select (``moe/topk_reduce.py:309``, ``:360``).
+
+    THE QUERY-TOKEN AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS (`inc-glm53f-103b`),
+    exactly as :func:`_causal_bound_nki` walks it and for the same reason: this kernel is the bound's
+    other half, called back to back with it at one seam, so tiling only one of the two would move the
+    trap from the bound's first load to this kernel's at the same query-token count. Both arms are
+    per-slot and per-row, so a tile boundary changes nothing; each tile is this body's own former
+    program at its own height.
     """
     rows = values_hbm.shape[0]
     k = values_hbm.shape[1]
 
     out = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.shared_hbm)
 
-    # The indices, loaded once. The pad screen writes into this tile.
-    idx_sb = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=idx_sb, src=nl.load(indices_hbm))
+    # The UNCHECKED tile arithmetic, for the tracer reason `_causal_bound_nki` records.
+    tiles = _row_tiles_unchecked(int(rows))
+    tile_count = _row_tile_count_unchecked(int(rows))
 
-    vals = nl.ndarray((rows, k), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=vals, src=nl.load(values_hbm))
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
 
-    # The sentinel source, and the result that starts out entirely sentinel.
-    fill = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.memset(dst=fill, value=SENTINEL)
-    marked = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.memset(dst=marked, value=SENTINEL)
+        # This tile's indices, loaded once. The pad screen writes into this tile.
+        idx_sb = nl.ndarray((height, k), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=idx_sb, src=nl.load(indices_hbm[start:start + height, 0:k])
+        )
 
-    # THE INDEX ARM. `index >= width` written as `index > width - 1`, which needs only `greater`.
-    idxf = nl.ndarray((rows, k), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=idxf, src=idx_sb)
-    pad = nl.ndarray((rows, k), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=pad, data=idxf, op0=nl.greater, operand0=float(width) - 1.0)
-    nisa.tensor_copy_predicated(src=fill, predicate=pad, dst=idx_sb)
+        vals = nl.ndarray((height, k), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=vals, src=nl.load(values_hbm[start:start + height, 0:k])
+        )
 
-    # THE VALUE ARM, as a KEEP mask: 1 where the value is a real score. A fill, a `-inf` and a NaN
-    # all fail this compare, so all three are left at the sentinel the result already holds.
-    keep = nl.ndarray((rows, k), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=keep, data=vals, op0=nl.greater, operand0=BOUND_FILL_MARK)
-    nisa.tensor_copy_predicated(src=idx_sb, predicate=keep, dst=marked)
+        # The sentinel source, and the result that starts out entirely sentinel.
+        fill = nl.ndarray((height, k), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=fill, value=SENTINEL)
+        marked = nl.ndarray((height, k), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=marked, value=SENTINEL)
 
-    nl.store(out, value=marked)
+        # THE INDEX ARM. `index >= width` written as `index > width - 1`, which needs only `greater`.
+        idxf = nl.ndarray((height, k), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=idxf, src=idx_sb)
+        pad = nl.ndarray((height, k), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=pad, data=idxf, op0=nl.greater, operand0=float(width) - 1.0
+        )
+        nisa.tensor_copy_predicated(src=fill, predicate=pad, dst=idx_sb)
+
+        # THE VALUE ARM, as a KEEP mask: 1 where the value is a real score. A fill, a `-inf` and a
+        # NaN all fail this compare, so all three are left at the sentinel the result already holds.
+        keep = nl.ndarray((height, k), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=keep, data=vals, op0=nl.greater, operand0=BOUND_FILL_MARK)
+        nisa.tensor_copy_predicated(src=idx_sb, predicate=keep, dst=marked)
+
+        nl.store(out[start:start + height, 0:k], value=marked)
     return out
 
 

@@ -3317,8 +3317,10 @@ def _shard_pattern(
     distinct finite value per index with no rounding at all.
 
     THE BYTE RANGE IS 8 TO 126, AND BOTH ENDS ARE CHOSEN. Bytes 1 to 7 are
-    subnormal, where the 240/448 squeeze rounds several distinct bytes onto one
-    value and weakens what conjunct (2) can detect; bytes 127 and 255 are ``NaN``
+    subnormal, where the squeeze rounds distinct bytes onto one value and weakens
+    what conjunct (2) can detect -- at 240/448 that was several of them, and at the
+    exact ``x 1/2`` of ``inc-glm53f-054e`` it is worse for the smallest, which
+    halves onto a tie and lands on zero; bytes 127 and 255 are ``NaN``
     in ``e4m3fn``, which no equality comparison survives. That leaves 119 values,
     so index ``i`` and ``i + 119`` share one -- the single aliasing this pattern
     has, stated rather than left to be discovered. Rank 0's first row (byte 8) and
@@ -3416,6 +3418,69 @@ def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
     line = torch.ldexp(
         torch.ones(extent, dtype=torch.float32), exponents[block % exponents.numel()]
     )
+    view = [1] * len(shape)
+    view[dim] = extent
+    return line.reshape(view).expand(shape).contiguous()
+
+
+def _squeezed_byte_ceiling() -> float:
+    """The largest magnitude a squeezed load can store, MEASURED through the loader.
+
+    ``inc-glm53f-054e`` added this because the number moved. It pushes the OCP
+    maximum through the production squeeze rather than reading the loader's private
+    factor, so what comes back is what a load would really store: 224.0 at this
+    increment's exact half, 240.0 at the older 240/448, and 448.0 on a platform where
+    the squeeze does not engage at all. A measurement rather than a constant is what
+    keeps the item below armed at whatever the factor becomes.
+    """
+    ocp_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    probe = torch.tensor([ocp_max], dtype=torch.float32).to(torch.float8_e4m3fn)
+    squeezed = downscale_fp8_weight_bytes(probe).to(torch.float32)
+    return float(squeezed.abs().max())
+
+
+def _ratio_the_retile_must_refuse() -> int:
+    """The smallest whole rescale the retile cannot hold, DERIVED not chosen.
+
+    The retile refuses when a rescaled byte passes fp8's own bound
+    (``blockwise_fp8_retile.py:461-463``, the bound being
+    ``torch.finfo(torch.float8_e4m3fn).max``). The largest byte a squeezed load
+    stores is :func:`_squeezed_byte_ceiling`, so the smallest whole ratio that MUST
+    overflow is ``floor(bound / ceiling) + 1``.
+
+    That is 3 at ``inc-glm53f-054e``'s exact half (224 x 3 = 672) and was 2 at the
+    older 240/448 (240 x 2 = 480). It is the whole reason the plain ramp armed the
+    refusal before this increment and no longer does: the ramp's worst 256-block
+    ratio is exactly 2, and 224 x 2 = 448 is exactly the bound, which the strict
+    comparison holds rather than refuses.
+    """
+    bound = float(torch.finfo(torch.float8_e4m3fn).max)
+    return int(bound // _squeezed_byte_ceiling()) + 1
+
+
+def _steep_block_grid_pattern(
+    shape: tuple[int, ...], dim: int, ratio: int
+) -> torch.Tensor:
+    """A ``128``-tile grid whose EVERY ``256`` block asks for a rescale of ``ratio``.
+
+    Alternating 1 and ``ratio`` per tile, so each block retains 1 -- the coarsening
+    keeps its ``(h_tile 0, i_tile 0)`` scale (``blockwise_fp8_retile.py:400-401``) --
+    and every other tile in it rescales by exactly ``ratio``.
+
+    ALTERNATING RATHER THAN A GROWING RAMP, and that is the point of the fixture.
+    ``ratio ** 255`` is ``inf`` in fp32 and a non-finite scale is refused by a
+    DIFFERENT branch (``:405-414``), which would make this item pass for the wrong
+    reason. Alternating keeps every scale small and finite, so the only thing that
+    can refuse the load is the one thing this fixture varies.
+    """
+    per_block = _tiles_per_consumer_block()
+    assert per_block >= 2, (
+        f"a 256 block holds {per_block} tiles of the consumer's granularity, so no "
+        f"block has a second tile to rescale and this fixture varies nothing"
+    )
+    extent = shape[dim]
+    line = torch.ones(extent, dtype=torch.float32)
+    line[1::per_block] = float(ratio)
     view = [1] * len(shape)
     view[dim] = extent
     return line.reshape(view).expand(shape).contiguous()
@@ -4482,6 +4547,7 @@ def _deferred_key_overrides(
     mappings: dict[str, str | list[str]],
     *,
     ramp_grids: bool = False,
+    steep_ratio: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
 
@@ -4495,6 +4561,14 @@ def _deferred_key_overrides(
 
     ``ramp_grids=True`` writes the ramp for EVERY family, which is the fixture the
     refusal item needs and the only caller that asks for it.
+
+    ``steep_ratio`` is ``inc-glm53f-054e``'s addition, and it varies ONE field
+    against the pow2 fixture: the retiled families' grids become
+    :func:`_steep_block_grid_pattern` at that ratio and every other family keeps its
+    ramp. It exists because the plain ramp no longer overflows the fp8 bound once the
+    squeeze leaves 224 rather than 240, so the refusal it was written to arm needs a
+    steeper grid to stay reachable. :func:`_ratio_the_retile_must_refuse` derives the
+    ratio from the loader rather than choosing one.
 
     A bank entry is E weight keys and E scale keys interleaved, so its arm writes
     one tensor per expert at that expert's own full width -- the loader's job is to
@@ -4544,28 +4618,41 @@ def _deferred_key_overrides(
                 )
             coarsened = not ramp_grids and family in _RETILED_AT_LOAD_CLASSES
             for key in scales:
-                overrides[key] = (
-                    _pow2_block_grid_pattern(grid_shape, shard_dim)
-                    if coarsened
-                    else _shard_pattern(grid_shape, shard_dim, torch.float32)
-                )
+                if coarsened and steep_ratio is not None:
+                    overrides[key] = _steep_block_grid_pattern(
+                        grid_shape, shard_dim, steep_ratio
+                    )
+                elif coarsened:
+                    overrides[key] = _pow2_block_grid_pattern(grid_shape, shard_dim)
+                else:
+                    overrides[key] = _shard_pattern(
+                        grid_shape, shard_dim, torch.float32
+                    )
     return overrides
 
 
 def _deferred_checkpoint(
-    tmp_path: Path, *, ramp_grids: bool = False, name: str = "deferred"
+    tmp_path: Path,
+    *,
+    ramp_grids: bool = False,
+    steep_ratio: int | None = None,
+    name: str = "deferred",
 ) -> tuple[Path, dict, dict]:
     """One checkpoint holding every full tensor these five items read.
 
     ``ramp_grids`` and ``name`` exist for R6 item R-T2's refusal item alone: it
     needs the SAME checkpoint with the ramp scale grid restored, written beside this
     one rather than over it, so the two loads in that item differ in exactly the one
-    field it varies.
+    field it varies. ``steep_ratio`` is the third grid family the same item needs
+    since ``inc-glm53f-054e``, and it is written beside the other two for the same
+    reason.
     """
     config = _deferred_config()
     mappings = _mappings_for(config)
     reference = Glm5NextForConditionalGeneration(config)
-    overrides = _deferred_key_overrides(reference, mappings, ramp_grids=ramp_grids)
+    overrides = _deferred_key_overrides(
+        reference, mappings, ramp_grids=ramp_grids, steep_ratio=steep_ratio
+    )
     directory = tmp_path / name
     _write_miniature_checkpoint(
         directory, mappings, reference, extra_overrides=overrides
@@ -5214,8 +5301,18 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
 def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
-    """Conjunct (3). The padded ranks hold fp8 zero and grid 1.0, and the pad
-    changes no number the model would compute.
+    """Conjunct (3). The padded ranks hold fp8 zero and the stored pad grid, and
+    the pad changes no number the model would compute.
+
+    "ONES" IN THE NAME IS THE CHECKPOINT'S PAD VALUE, NOT THE STORED ONE. The pad
+    grid is written as 1.0 and ``inc-glm53f-054c`` makes the load path compensate
+    every block by the compensation factor -- ``448/240`` then, an exact ``2.0`` since
+    ``inc-glm53f-054e`` -- so the stored reading is that factor and 1.0 is now the
+    control. The name is kept because filed records cite it. TWICE the factor (3.4844
+    then, 4.0 now) would mean the sharded route compensated a grid that a loader had
+    already compensated, so this line is also that double's only reader. Neither number
+    is written here: the assertion reads the factor from
+    ``compensate_block_scales`` itself, so it follows the constant with no edit.
 
     WHY THE DENSE THREE ARE THE SUBJECT. At world 4 the dense intermediate 512 pads
     to 1024, so ranks 2 and 3 hold no real row at all -- the strongest form of the
@@ -5304,10 +5401,34 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
                     f"{SHARD_INTERMEDIATE} rows, so every element must be fp8 zero; "
                     f"max abs is {as_float.abs().max().item()}"
                 )
-                assert bool((grid.to(torch.float32) == 1.0).all()), (
-                    f"{path}.{leaf}'s grid at rank {rank} must be all 1.0 past the "
-                    f"real rows; it holds values from "
-                    f"{grid.min().item()} to {grid.max().item()}"
+                # THE PAD GRID IS THE STORED ONE, NOT THE CHECKPOINT'S. The pad is
+                # written as 1.0 and the load path then compensates every block, so
+                # what a reader finds here is 1.0 carried through the pair. The
+                # expected value is ASKED of the loader's own function on a grid of
+                # ones rather than typed, so a change to the factor moves this
+                # reading with it, and no tolerance is needed because a uniform
+                # multiply of 1.0 is exact and sits far above the MINVAL floor.
+                pad = compensate_block_scales(torch.ones_like(grid))
+                assert bool(torch.equal(grid.to(torch.float32), pad.scale_inv)), (
+                    f"{path}.{leaf}'s grid at rank {rank} must be the stored pad "
+                    f"value {pad.scale_inv.flatten()[0].item()} past the real rows; "
+                    f"it holds values from {grid.min().item()} to "
+                    f"{grid.max().item()}. Twice that value means the grid was "
+                    f"compensated twice"
+                )
+                # PRE-``-054c`` CONTROL. Raw 1.0 is exactly what this line asserted
+                # while the load path was missing its half of the pair, so where the
+                # compensation applies the old reading has to be refused now.
+                if pad.applied:
+                    assert not bool((grid.to(torch.float32) == 1.0).all()), (
+                        f"{path}.{leaf}'s grid at rank {rank} still reads all 1.0 "
+                        f"with the 240 clamp engaged, so the load path did not "
+                        f"compensate it"
+                    )
+                print(
+                    f"CONJUNCT3D_PAD_GRID|{path}.{leaf}|rank={rank}"
+                    f"|stored={grid.to(torch.float32).flatten()[0].item():.7f}"
+                    f"|compensation_applied={pad.applied}"
                 )
                 zero_ranks += 1
     print(f"CONJUNCT3D_PADDED_RANK_READINGS={zero_ranks}")
@@ -5444,36 +5565,49 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     h_padded = (gate_padded @ x) * (up_padded @ x)
     y_padded = down_padded @ h_padded
 
-    def _reference(leaf: str, *, compensated: bool = False) -> torch.Tensor:
-        """The same three tensors whole, at the SAME scale convention.
+    def _reference(leaf: str, *, uncompensated: bool = False) -> torch.Tensor:
+        """The same three tensors whole, with BOTH halves of the trn2 pair applied.
 
-        ``compensated=True`` is the CONTROL ARM and never the reference: it builds
-        the same tensor at the other convention, so a reading that cannot tell the
-        two apart fails instead of passing quietly (DECISIONS §706-§707). The
-        reference itself is the checkpoint's own tensors at the checkpoint's own raw
-        grid and the checkpoint's own 128 granularity -- the model's semantics -- and
-        it re-implements no part of the republish.
+        CORRECTED BY ``inc-glm53f-054c``, and the correction is one word: the grid is
+        now compensated on the reference side, because the load path compensates it.
+        The trn2 encoding is a matched pair -- the weight bytes are squeezed into the
+        240 range and the per-block grid is multiplied by the inverse factor -- and
+        ``_publish_compute_frame_operands`` applies the second half at
+        ``model_fp8.py:7118``. Before ``-054c`` NOTHING applied it for these two
+        classes, so a reference carrying only the squeeze agreed with the product, and
+        this reading passed while the effective matrix stood at ``240/448`` of the
+        checkpoint's magnitude.
 
-        THE GRID IS NOT COMPENSATED HERE, and that is read off the loader rather
-        than chosen. A sharded weight's grid travels the non-compensating loader,
-        whose own words are "IT DOES NOT COMPENSATE, AND THAT IS THE WHOLE REASON
-        IT EXISTS SEPARATELY ... leaves ``compensate_block_scales`` to the
-        load-time prep that consumes it" (``weight_loaders_fp8.py:1840-1848``). So
-        the grid on the module above is the checkpoint's own, and a reference that
-        compensated would compare two different conventions.
+        ``uncompensated=True`` IS NOW THE CONTROL ARM: it is the pre-``-054c`` value,
+        the one that half-applied pair produced. It must NOT match, and if it does then
+        the compensation is not reaching the grid and this reading cannot tell the fixed
+        load path from the broken one (DECISIONS §706-§707).
 
-        The first version of this reference DID compensate. The instrument caught
-        it: both sides came out uniform and their ratio was exactly
-        ``(448/240) ** 3``, one factor per leaf
-        (``probe-101-r11c-pad-repair.out``). It is the same defect this seat keeps
-        making -- the reference named "the checkpoint's own tensors" and then
-        applied a transformation the load path does not apply at that point.
+        WHY THE REFERENCE STILL CARRIES THE SQUEEZE, rather than being the raw
+        checkpoint numbers. ``downscale_fp8_weight_bytes`` casts BACK to fp8, so it can
+        re-quantise. At 240/448 it re-quantised nearly every byte, so the squeezed bytes
+        were not ``w * 240/448`` exactly and a raw-checkpoint reference was unreachable
+        at the EXACT equality this reading asserts.
+        ``inc-glm53f-054e`` NARROWED THAT TO FOUR BYTES AND DID NOT REMOVE IT: an exact
+        ``x 1/2`` is a pure exponent shift, so of the 119 bytes this fixture uses only
+        bytes 9, 11, 13 and 15 -- the odd multiples of ``2**-9`` above the subnormals --
+        still re-quantise. Four is enough: a raw-checkpoint reference would break on
+        them, and loosening this equality to a tolerance would give up the
+        bit-exactness that makes the pad readings worth having. The un-squeezed comparison belongs where a tolerance is honest and is
+        made there instead, over the real loader and the real prep, in
+        ``test_scale_compensation_054c.py``.
+
+        The history is kept because it is the same defect twice, in opposite
+        directions. The FIRST version of this reference compensated, the instrument
+        caught a ratio of exactly the compensation cubed -- one factor per leaf --
+        (``probe-101-r11c-pad-repair.out``) and the reference was changed to match the
+        product. The product was the thing that was wrong.
         """
         keys = _keys_of(mappings, f"{path}.{leaf}")
         scales = scale_keys(keys)
         weight_key = next(key for key in keys if key not in scales)
         grid = overrides[scales[0]]
-        if compensated:
+        if not uncompensated:
             grid = compensate_block_scales(grid).scale_inv
         return dequantise_blockwise(
             downscale_fp8_weight_bytes(overrides[weight_key]),
@@ -5486,9 +5620,11 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
 
     # WHICH CONVENTION THE MODULE CARRIES, read at the NUMBERS, per projection
     # (DECISIONS §706-§707). Each padded stack's real rows -- real columns, for the
-    # down projection -- are compared against the checkpoint's own tensor at the raw
-    # convention, which must agree exactly, and against the compensated form, which
-    # must NOT: if both agreed, neither reading could tell the conventions apart.
+    # down projection -- are compared against the checkpoint's own tensor with BOTH
+    # halves of the trn2 pair applied, which must agree exactly, and against the
+    # pre-``-054c`` half-applied form, which must NOT: if both agreed, neither reading
+    # could tell the conventions apart. The two arms SWAPPED at ``-054c`` because the
+    # load path changed, not because the reading did -- the grid is compensated now.
     # This is per projection so that a red run names which one moved.
     stacks = {
         "gate_proj_weight": gate_padded,
@@ -5498,22 +5634,22 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     conventions: dict[str, tuple[float, float]] = {}
     for leaf, stack in stacks.items():
         whole = _reference(leaf)
-        other = _reference(leaf, compensated=True)
+        other = _reference(leaf, uncompensated=True)
         real = (
             stack[:, : whole.shape[1]]
             if leaf == "down_proj_weight"
             else stack[: whole.shape[0]]
         )
         raw_diff = _max_abs_diff(real, whole)
-        compensated_diff = _max_abs_diff(real, other)
-        conventions[leaf] = (raw_diff, compensated_diff)
-        print(f"CONJUNCT3D_{leaf.upper()}_VS_CHECKPOINT_RAW={raw_diff}")
-        print(f"CONJUNCT3D_{leaf.upper()}_VS_COMPENSATED={compensated_diff}")
-    for leaf, (raw_diff, compensated_diff) in conventions.items():
-        assert compensated_diff != 0.0, (
-            f"{leaf} matches the compensated form as well as the raw one, so this "
-            f"item cannot tell the two conventions apart and its reference is "
-            f"unguarded"
+        uncompensated_diff = _max_abs_diff(real, other)
+        conventions[leaf] = (raw_diff, uncompensated_diff)
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_CHECKPOINT_PAIRED={raw_diff}")
+        print(f"CONJUNCT3D_{leaf.upper()}_VS_UNCOMPENSATED={uncompensated_diff}")
+    for leaf, (raw_diff, uncompensated_diff) in conventions.items():
+        assert uncompensated_diff != 0.0, (
+            f"{leaf} matches the UNCOMPENSATED form as well as the paired one, so the "
+            f"compensation is not reaching this grid and this item cannot tell "
+            f"the fixed load path from the pre-inc-glm53f-054c one"
         )
         assert raw_diff == 0.0, (
             f"{leaf}'s real rows differ from the checkpoint's own tensor by "
@@ -7127,24 +7263,42 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_retile_ran(
 def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
-    """R6 item R-T2's pair: the grid the coarsening cannot reproduce is REFUSED.
+    """R6 item R-T2's pair: a grid the coarsening cannot reproduce is REFUSED, and
+    the ramp is no longer one of them.
 
-    This is the reading the ramp grid used to carry and the pow2 grid above gives
-    up, kept here where it belongs. The SAME checkpoint is written twice, differing
-    in one field -- the scale grid's family -- and the two loads are compared:
+    ``inc-glm53f-054e`` c7 re-argued this item on a measurement rather than on a
+    preference. Grant 181 ran it at the exact ``x 1/2`` squeeze and it read
+    ``DID NOT RAISE``, and the arithmetic says it should: the squeeze stores at most
+    ``448 x 1/2 = 224`` where the old ``240/448`` stored 240, the plain ramp's worst
+    256-block ratio is exactly 2, and ``224 x 2 = 448`` is exactly fp8's bound, which
+    the retile's strict comparison HOLDS rather than refuses
+    (``blockwise_fp8_retile.py:461-463``). At 240 the same ramp reached 480 and was
+    refused. Nothing in the production path regressed: a checkpoint the old factor
+    could not load now loads, exactly, with no NaN.
+
+    So the item keeps both halves of what it was protecting, on THREE grid families
+    written from one checkpoint and differing in one field each:
 
     * the pow2 grid loads and completes, which is the arming half. Without it a
       refusal below could be any load failure wearing the right words.
-    * the ramp grid, 1, 2, 3, ... per 128 tile, makes the first 256 block's ratio
-      exactly 2, and an fp8 byte at the maximum doubled leaves what fp8-e4m3 holds.
-      The landed cast is not saturating, so until R6 item R-P1 that produced a
-      SILENT NaN which every shape reading passed straight over; now the retile
-      refuses and names the expert, the 256 block, the 128 tile, the ratio, the
-      retained scale, the bound and both health counters
-      (``blockwise_fp8_retile.py:461-476``).
+    * the RAMP grid is now a positive claim: the load completes, every published
+      tensor is finite -- which is what "instead of emitting NaN" means, measured
+      rather than implied -- and the retile's own ``inexact_rescales`` per leaf are
+      PRINTED as readings. They are not zero and are not asserted: the first block
+      rescales by exactly 2 and stays bit-exact, while later blocks rescale by
+      fractions like 4/3 that fp8 cannot hold exactly. The old factor never reached
+      them, because it refused on the first block.
+    * the STEEP grid keeps the refusal armed, at a ratio DERIVED from the loader
+      rather than chosen: :func:`_ratio_the_retile_must_refuse` reads the squeezed
+      byte ceiling through the production squeeze and returns the smallest whole
+      ratio that must overflow -- 3 here, 2 at the old factor. The refusal must fire
+      and must still name the expert, the 256 block, the 128 tile, the ratio, the
+      retained scale, the bound and both health counters.
 
     A clamp is deliberately not the alternative: it would ship numbers the
-    checkpoint does not contain (lead ruling ``LEAD-LOG.md`` §901).
+    checkpoint does not contain (lead ruling ``LEAD-LOG.md`` §901). Lowering the
+    bound is not one either -- it is ``torch.finfo(torch.float8_e4m3fn).max``, and
+    448 is a value the format holds exactly.
 
     The refusal is read off the exception CHAIN rather than the outermost type,
     because the load path is entitled to wrap it; what this item claims is that a
@@ -7197,8 +7351,123 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
         "be attributed to the grid the retile read"
     )
 
+    # ---- ARM 1: THE RAMP COMPLETES AT THIS FACTOR, AND EMITS NO NaN.
+    # The ceiling and the ratio are read, not typed, so the two rows below say what
+    # this run's own loader does rather than what an earlier one did.
+    ceiling = _squeezed_byte_ceiling()
+    steep_ratio = _ratio_the_retile_must_refuse()
+    bound = float(torch.finfo(torch.float8_e4m3fn).max)
+    print(
+        f"RAMPREFUSAL_CEILING={ceiling!r}|bound={bound!r}"
+        f"|ramp_worst_ratio_is_2_reaches={ceiling * 2!r}"
+        f"|refused_only_if_above={bound!r}"
+    )
+    print(f"RAMPREFUSAL_DERIVED_STEEP_RATIO={steep_ratio}|reaches={ceiling * steep_ratio!r}")
+    ramp_loaded = _load_blocked(ramp_directory, monkeypatch)
+    assert _modules_named(ramp_loaded, "Glm5NextSharedExperts"), (
+        "the ramp load built no shared-expert module, so it did not complete the "
+        "way the readings below assume"
+    )
+    published = list(ramp_loaded.named_parameters()) + list(ramp_loaded.named_buffers())
+    nonfinite = [
+        name
+        for name, tensor in published
+        if not bool(torch.isfinite(tensor.detach().to(torch.float32)).all())
+    ]
+    print(f"RAMPREFUSAL_TENSORS_CHECKED={len(published)}|nonfinite={nonfinite[:6]}")
+    assert published, (
+        "the completed ramp load published no parameter or buffer at all, so the "
+        "finiteness reading below is over nothing"
+    )
+    assert not nonfinite, (
+        f"the ramp load completed but published non-finite values in {nonfinite[:6]}. "
+        f"That is the silent NaN this item is named for: at this factor the retile "
+        f"does not refuse the ramp, so finiteness is the claim that replaces the "
+        f"refusal and it just failed"
+    )
+    # The health counters, PRINTED as readings and gated on nothing: the first 256
+    # block rescales by exactly 2 and stays bit-exact, later blocks rescale by
+    # fractions fp8 cannot hold, and the old factor never reached them.
+    #
+    # THE TWO DICT-SHAPED RECORDS, EACH NAMED. A suffix scan over
+    # ``dir(type(module))`` also matches the ROUTED bank's own
+    # ``RETILE_HEALTH_ATTR`` (``model_fp8.py:2143``), and that one publishes a dict
+    # of TUPLES -- ``(emitted_unsupplied, input_scales_dropped, inexact_rescales)``
+    # per projection (``:2334-2352``) -- so ``record.get`` reached a tuple and a
+    # CORRECT load raised ``AttributeError``. The deferred fixture has four routed
+    # experts and the load path prepares every module that offers a prep
+    # (``model_fp8.py:7899``), so it was reached every time.
+    #
+    # NAMING BOTH IS A POSITIVE SELECTION, not a filter. "Skip anything that is not
+    # a dict" would also pass on the day the shared or dense record changed shape:
+    # the loop would collect nothing and only the emptiness assert below would be
+    # left to speak, and it speaks only if BOTH banks vanish. With the names, a
+    # missing attribute makes ``getattr`` return ``None`` and that assert names it.
+    # Both landed readers of these two records name them the same way: ``:7191``
+    # for the shared bank, ``:4861`` for the dense MLP.
+    #
+    # THE ROUTED BANK'S COUNTS ARE THEREFORE NOT IN THIS TOTAL, and the row says so.
+    # Reading them needs an index convention for a nameless tuple, which is a
+    # different change from this repair; the shared and dense records carry
+    # ``inexact_rescales`` by name (``model_fp8.py:7191-7199``).
+    health_records: dict[tuple[str, str], dict] = {}
+    for path, module in ramp_loaded.named_modules():
+        for attribute_name in (
+            "SHARED_RETILE_HEALTH_ATTR",
+            "DENSE_RETILE_HEALTH_ATTR",
+        ):
+            attribute = getattr(type(module), attribute_name, None)
+            if attribute is None:
+                continue
+            health = getattr(module, attribute, None)
+            if not health:
+                continue
+            for leaf, record in health.items():
+                health_records[(path, leaf)] = record
+    assert health_records, (
+        "the completed ramp load published no shared-expert or dense-MLP retile "
+        "health record, so that retile either did not run or does not report -- "
+        "and this item's readings about rescales would be about nothing"
+    )
+    total_inexact = 0
+    for (path, leaf), record in sorted(health_records.items()):
+        count = int(record.get("inexact_rescales", 0))
+        total_inexact += count
+        print(
+            f"RAMPREFUSAL_HEALTH|{path}.{leaf}|retiled={record.get('retiled')}"
+            f"|inexact_rescales={count}|gated_on_none"
+        )
+    print(
+        f"RAMPREFUSAL_INEXACT_TOTAL={total_inexact}|records={len(health_records)}"
+        f"|banks=shared+dense|gated_on_none|a fraction fp8 cannot hold is a "
+        f"rescale, not a refusal"
+    )
+
+    # ---- ARM 2: THE REFUSAL IS STILL REACHABLE, at the derived ratio.
+    steep_directory, steep_overrides, _steep_mappings = _deferred_checkpoint(
+        tmp_path, steep_ratio=steep_ratio, name="deferred-steep"
+    )
+    assert sorted(steep_overrides) == sorted(pow2_overrides), (
+        "the steep fixture and the pow2 fixture do not hold the same keys, so they "
+        "differ in more than the grid family this arm varies"
+    )
+    steep_differing = sorted(
+        key
+        for key, tensor in steep_overrides.items()
+        if not _same(tensor, pow2_overrides[key])
+    )
+    print(f"RAMPREFUSAL_STEEP_KEYS_THAT_DIFFER={len(steep_differing)}")
+    assert steep_differing and all(
+        key.endswith(FP8_SCALE_SUFFIX) for key in steep_differing
+    ), (
+        f"the steep fixture varies "
+        f"{[key for key in steep_differing if not key.endswith(FP8_SCALE_SUFFIX)][:6]}"
+        f" besides scale grids, or varies nothing at all ({len(steep_differing)} "
+        f"keys differ). This arm varies the grid family and must vary nothing else"
+    )
+
     with pytest.raises(Exception) as raised:  # noqa: B017 -- the chain is the claim
-        _load_blocked(ramp_directory, monkeypatch)
+        _load_blocked(steep_directory, monkeypatch)
 
     chain: list[BaseException] = []
     error: BaseException | None = raised.value
@@ -7211,10 +7480,12 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
     for item in refusals:
         print(f"RAMPREFUSAL_MESSAGE={str(item)[:400]}")
     assert refusals, (
-        f"the ramp grid raised {types}, with no BlockwiseFp8RetileError anywhere in "
-        f"the chain. Either the retile no longer refuses an unrepresentable rescale "
-        f"-- in which case it is emitting NaN again -- or the load failed for some "
-        f"other reason and this item is measuring that instead"
+        f"the steep grid at ratio {steep_ratio} raised {types}, with no "
+        f"BlockwiseFp8RetileError anywhere in the chain. That ratio takes a stored "
+        f"byte to {ceiling * steep_ratio!r} against a bound of {bound!r}, so either "
+        f"the retile no longer refuses an unrepresentable rescale -- in which case "
+        f"it is emitting NaN again -- or the load failed for some other reason and "
+        f"this item is measuring that instead"
     )
     message = str(refusals[0])
     for phrase in (
