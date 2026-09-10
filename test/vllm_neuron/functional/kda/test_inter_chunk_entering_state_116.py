@@ -60,8 +60,10 @@ CHUNKS_PER_HALF = 2
 HALF_TOKENS = CHUNK * CHUNKS_PER_HALF
 TOKENS = HALF_TOKENS * 2
 
-#: One NKI dispatch per seam call and no torch fallback.
+#: One NKI dispatch per seam call and no torch fallback, so a two-call run reads
+#: twice that and a one-shot run reads it once.
 DECLARED_DISPATCH_PER_CALL = 1
+DECLARED_TWO_HALF_DISPATCHES = 2 * DECLARED_DISPATCH_PER_CALL
 DECLARED_FALLBACKS = 0
 
 
@@ -70,11 +72,12 @@ def _flat(start: int, stop: int):
     return tuple(x[start:stop].contiguous() for x in chunk_half._flat_inputs())
 
 
-def _pipeline(tokens, state):
+def _pipeline(tokens, state, *, reset: bool = True):
     """One half through the real intra-chunk and inter-chunk kernels.
 
-    Returns ``(o_flat, final_state, counters)``. The counter reading is taken
-    around the inter-chunk call alone, so it belongs to that call and no other.
+    Returns ``(o_flat, final_state, counters)``, the counters read straight after
+    this call's own dispatch. ``reset`` is off when a caller wants ONE reading
+    across several calls, which is what the two-call route figure is.
     """
     q, k, v, beta, gk = tokens
     n_chunks = q.shape[0] // CHUNK
@@ -84,7 +87,8 @@ def _pipeline(tokens, state):
     beta_c = beta.reshape(n_chunks, CHUNK).contiguous()
     gk_c = gk.reshape(n_chunks, CHUNK, KDIM).contiguous()
     intra = kda_intra_chunk(q_c, k_c, v_c, beta_c, gk_c)
-    reset_inter_dispatch_counters()
+    if reset:
+        reset_inter_dispatch_counters()
     out = kda_inter_chunk(
         intra.kg, intra.w, intra.u, gk_c, q_c, intra.aqk, state=state
     )
@@ -93,11 +97,11 @@ def _pipeline(tokens, state):
     return o_flat, chunk_half._t(out.final_state), counters
 
 
-def _two_halves(carry: bool):
+def _two_halves(carry: bool, *, reset: bool = True):
     """Both halves in order; the second entered with the first's state or not."""
-    first = _pipeline(_flat(0, HALF_TOKENS), None)
+    first = _pipeline(_flat(0, HALF_TOKENS), None, reset=reset)
     entering = first[1] if carry else None
-    second = _pipeline(_flat(HALF_TOKENS, TOKENS), entering)
+    second = _pipeline(_flat(HALF_TOKENS, TOKENS), entering, reset=reset)
     return first, second
 
 
@@ -161,9 +165,10 @@ def test_inter_chunk_entering_state_carries_a_split_sequence():
 def test_inter_chunk_entering_state_reads_one_dispatch_per_call():
     """Item 2. Certifying component: the seam this file drives, form R-1.
 
-    One NKI dispatch per seam call and no torch fallback, on the carried route
-    and on the whole-sequence control. The pair read before either call is
-    asserted at zero, so a stale counter cannot satisfy the equality.
+    One NKI dispatch per seam call and no torch fallback: the two-call run reads
+    two over ONE window that spans both calls, the one-shot control reads one.
+    The pair read before either window is asserted at zero, so a stale counter
+    cannot satisfy the equality.
     """
     _report("item2_route_predicate", "the inter-chunk seam's dispatch counters")
     reset_inter_dispatch_counters()
@@ -171,24 +176,30 @@ def test_inter_chunk_entering_state_reads_one_dispatch_per_call():
     print(f"ENTERSTATE|item2|before={before}", flush=True)
     assert before == (0, 0), f"the counters read {before} before any call"
 
-    (_, _, first_counters), (_, _, second_counters) = _two_halves(carry=True)
-    _, _, whole_counters = _pipeline(_flat(0, TOKENS), None)
+    # One window across both halves: nothing resets in between, so the reading
+    # after the second call is the run's own total.
+    (_, _, after_first), (_, _, two_call) = _two_halves(carry=True, reset=False)
+
+    reset_inter_dispatch_counters()
+    assert inter_dispatch_counters() == (0, 0)
+    _, _, one_shot = _pipeline(_flat(0, TOKENS), None, reset=False)
     print(
-        f"ENTERSTATE|item2|first_half={first_counters}|second_half={second_counters}|"
-        f"whole={whole_counters}|declared_dispatch_per_call="
-        f"{DECLARED_DISPATCH_PER_CALL}|declared_fallbacks={DECLARED_FALLBACKS}",
+        f"ENTERSTATE|item2|after_first_call={after_first}|two_call_run={two_call}|"
+        f"one_shot={one_shot}|declared_two_call="
+        f"{(DECLARED_TWO_HALF_DISPATCHES, DECLARED_FALLBACKS)}|declared_one_shot="
+        f"{(DECLARED_DISPATCH_PER_CALL, DECLARED_FALLBACKS)}",
         flush=True,
     )
-    declared = (DECLARED_DISPATCH_PER_CALL, DECLARED_FALLBACKS)
-    for label, counters in (
-        ("first half", first_counters),
-        ("second half, entered with a state", second_counters),
-        ("the whole sequence", whole_counters),
-    ):
-        assert counters == declared, (
-            f"{label} read {counters}; the declared reading is {declared}, one NKI "
-            f"dispatch per seam call with no torch fallback"
-        )
+    assert two_call == (DECLARED_TWO_HALF_DISPATCHES, DECLARED_FALLBACKS), (
+        f"the two-call run read {two_call}; the declared reading is "
+        f"{(DECLARED_TWO_HALF_DISPATCHES, DECLARED_FALLBACKS)} -- one NKI dispatch "
+        f"per seam call, no torch fallback"
+    )
+    assert one_shot == (DECLARED_DISPATCH_PER_CALL, DECLARED_FALLBACKS), (
+        f"the one-shot control read {one_shot}; the declared reading is "
+        f"{(DECLARED_DISPATCH_PER_CALL, DECLARED_FALLBACKS)}, which is what tells a "
+        f"per-chunk dispatcher from this one"
+    )
 
 
 def test_inter_chunk_refuses_an_entering_state_it_cannot_serve():
