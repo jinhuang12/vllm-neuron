@@ -5859,7 +5859,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         raise VacuousControlError(
             "control B did not put root.lm_head_weight back, so every control after "
             "it runs against a root whose head the product refuses by name "
-            "(model_fp8.py:7795)"
+            "(model_fp8.py:8633-8634)"
         )
     if root._head_weight() is not root.lm_head_weight:
         raise VacuousControlError(
@@ -5946,7 +5946,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
             "root.lm_head_weight is None before control E plants anything: control B "
             "unsets it to make the product refuse and must put it back in its "
             "finally. The product would refuse by name here, because "
-            "model_fp8.py:7907 resolves the head before the stack runs, instead of "
+            "model_fp8.py:8746 resolves the head before the stack runs, instead of "
             "selecting the rows this control asks about"
         )
     if root._head_weight() is not root.lm_head_weight:
