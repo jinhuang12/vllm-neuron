@@ -611,9 +611,13 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
 # this file would move every line below it.
 # ===========================================================================
 
-#: The unified page every KDA entry now reports. MEASURED at round 1, read from
-#: `probe-086-r1-landed-diagnostic.out` (`KDA_page_size_padded_DISTINCT`).
-MEASURED_PADDED_PAGE_BYTES = 262_144
+#: The unified page every KDA entry now reports, which is the attention page it
+#: is padded up to. Round 1 MEASURED that page at 262,144 B
+#: (`probe-086-r1-landed-diagnostic.out`, `KDA_page_size_padded_DISTINCT`), while
+#: the latent layers still reported a key/value page of two buffers. They report
+#: a one-buffer page now, so the value this file asserts is half of what that
+#: probe read, and the acceptance transcript records it.
+MEASURED_PADDED_PAGE_BYTES = 131_072
 
 
 def _addressable_page_bytes(spec) -> int:
