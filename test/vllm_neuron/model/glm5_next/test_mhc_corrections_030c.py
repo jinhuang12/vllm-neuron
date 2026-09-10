@@ -422,24 +422,112 @@ def test_030c_rms_epsilon_reads_the_models_rms_norm_eps() -> None:
         )
 
 
-def test_030c_rms_epsilon_site_is_load_bearing_and_the_old_value_moves_it() -> None:
-    """COUNTED VALUE 2, site 1: swapping the RMS epsilon MOVES the output.
+def _ulp(x: torch.Tensor) -> torch.Tensor:
+    """The exact fp32 step at each entry of ``x``, from ``nextafter``.
 
-    The reading is a printed delta rather than a must-fail comparison, and that
-    is deliberate (the parent block's own words): ``1e-05`` against ``1e-06``
-    inside an RMS denominator can sit under the cited pair, so a must-fail arm
-    there could be vacuous while a printed nonzero delta cannot. A **ZERO**
-    delta means this site does not read the constant the design says it reads,
-    and that is a finding for the lead, never a pass.
+    ``finfo.eps * |x|`` is the step at 1.0 scaled by the magnitude, which
+    overstates the true step by up to 2x depending on where the value sits inside
+    its binade. This arm's floor is stated in ulps, so it uses the real step
+    rather than a bound that could be twice the truth in either direction.
+    """
+    magnitude = x.abs()
+    return torch.nextafter(magnitude, torch.full_like(magnitude, float("inf"))) - magnitude
+
+
+def test_030c_rms_epsilon_site_is_load_bearing_and_the_old_value_moves_it() -> None:
+    """COUNTED VALUE 2, site 1: the RMS epsilon moves the NORM OUTPUT by the predicted amount.
+
+    WHAT THIS ARM ASSERTS, AND WHY IT IS NOT THE THREE RETURNS. The first cut
+    asserted that swapping ``1e-05`` for ``1e-06`` moved all three of
+    :meth:`mhc_pre`'s returns. Grant 177 read ``post_mix`` and ``layer_input``
+    as exactly zero, and grant 179's transcript settled why: the epsilon enters
+    as one scalar per token, ``rsqrt(mean_square + eps)``, so the swap is a
+    **4.5e-06 relative** change; the pre and post gates then multiply it by
+    ``hc_scale`` of about ``0.1`` and add ``hc_base`` of about ``0.1``, which
+    lands the signal at about **a tenth of one fp32 step** of the value it must
+    move. Two of the three returns therefore cannot move at all, and the third
+    moved by two steps. A reading that can go either way on correct bytes is not
+    a control, so this arm now measures the epsilon where the epsilon is read.
+
+    THE MEASURABLE IS THE NORM OUTPUT (``reference:278`` applies
+    ``reference:216``'s norm to the folded streams before the projection). One
+    honest limitation, stated rather than buried: this tree folds that norm's
+    scale onto the projection's OUTPUT instead (``model_fp8.py:1220-1221``, which
+    is the same number because the projection carries no bias), so the normalised
+    tensor is never materialised and cannot be read out of the three returns.
+    The norm here is therefore the transcribed one, evaluated on this layer's own
+    two constants read off the layer. What binds it to this tree is
+    :func:`test_030c_rms_epsilon_reads_the_models_rms_norm_eps` on the constants
+    and :func:`test_030c_post_gate_matches_the_reference_two_sigmoid` on the
+    arithmetic.
+
+    THE PREDICTION IS FIRST-ORDER AND THAT IS EXACT ENOUGH. For
+    ``r(eps) = (ms + eps) ** -0.5`` the relative change is
+    ``|d eps| / (2 * (ms + eps))``; the next term is
+    ``(3/8) * (d eps / (ms + eps)) ** 2``, about ``1e-11`` relative here, which
+    is five orders below one fp32 step. So a measurement outside ``[0.5x, 2x]``
+    of the prediction is a finding about the norm, not about the algebra.
     """
     fn, hc_scale, hc_base, residual = _fixture()
     layer, cfg = _layer()
     _load(layer, fn, hc_scale, hc_base)
 
+    eps_new = float(layer.rms_eps)  # the corrected constant, `config.rms_norm_eps`
+    eps_old = float(layer.hc_eps)  # what `-030` wrongly read at this site
+    if eps_new == eps_old:
+        raise VacuousControlError(
+            f"rms_eps and hc_eps are both {eps_new}, so swapping one for the "
+            f"other changes nothing and this arm would measure zero on correct "
+            f"bytes"
+        )
+
+    # ---- 1. THE ASSERTED READING: the norm output, against its prediction. --- #
+    flat = residual.flatten(start_dim=1).to(torch.float32)
+    mean_square = flat.square().mean(dim=-1, keepdim=True)
+    normed_new = flat * torch.rsqrt(mean_square + eps_new)
+    normed_old = flat * torch.rsqrt(mean_square + eps_old)
+
+    # Per token, because `mean_square` is per token; the max of each side is
+    # compared against the max of the other, and the relative change is uniform
+    # across a token's entries because the scale is one scalar.
+    predicted_rel = float(
+        (abs(eps_new - eps_old) / (2.0 * (mean_square + eps_new))).max()
+    )
+    delta = (normed_new - normed_old).abs()
+    live = normed_old.abs() > 0.0
+    measured_rel = float((delta[live] / normed_old.abs()[live]).max())
+    measured_ulps = float((delta[live] / _ulp(normed_old)[live]).max())
+    ratio = measured_rel / predicted_rel if predicted_rel > 0.0 else float("nan")
+    print(
+        f"[value-2-site-rms-norm] eps {eps_new} -> {eps_old} "
+        f"predicted_rel={predicted_rel:.6e} measured_rel={measured_rel:.6e} "
+        f"ratio={ratio:.4f} band=[0.5,2.0] measured_ulps={measured_ulps:.2f} "
+        f"ulp_floor=16 mean_square_min={float(mean_square.min()):.6f} "
+        f"entries={int(live.sum())}"
+    )
+    assert 0.5 * predicted_rel <= measured_rel <= 2.0 * predicted_rel, (
+        f"the norm output moved by {measured_rel:.6e} relative when swapping "
+        f"eps {eps_new} for {eps_old}, and first-order theory predicts "
+        f"{predicted_rel:.6e} (ratio {ratio:.4f}); outside the [0.5x, 2.0x] band "
+        f"the denominator is not `mean_square + eps`"
+    )
+    assert measured_ulps >= 16.0, (
+        f"the norm output moved by only {measured_ulps:.2f} fp32 steps, under "
+        f"the floor of 16, so this reading is at the resolution limit and could "
+        f"pass or fail on rounding rather than on the constant -- the defect "
+        f"that took the three-return form out of service"
+    )
+
+    # ---- 2. THE THREE RETURNS: PRINTED, NOT ASSERTED. ----------------------- #
+    # Kept because they are the evidence for the paragraph above and because the
+    # r2 transcript carries the same row, so the two runs stay comparable. The
+    # design bullet that asserted them is corrected, not the site: grant 179 read
+    # `post 0 / comb 2.98e-08 / input 0`, and `2.98e-08` is two fp32 steps at
+    # `comb_mix`'s own magnitude.
     sinkhorn_mod.reset_dispatch_counters()
     post_a, comb_a, input_a = layer.mhc_pre(residual)
     # Put the OLD, wrong constant back at this one site and nothing else.
-    layer.rms_eps = layer.hc_eps
+    layer.rms_eps = eps_old
     post_b, comb_b, input_b = layer.mhc_pre(residual)
     _route_reading("value-2-rms-site", calls=2)
 
@@ -448,21 +536,20 @@ def test_030c_rms_epsilon_site_is_load_bearing_and_the_old_value_moves_it() -> N
     d_input = float((input_a - input_b).abs().max())
     print(
         f"[value-2-site-rms] swapped rms_eps {float(cfg.rms_norm_eps)} -> "
-        f"{layer.hc_eps} delta_post_mix={d_post:.6e} "
-        f"delta_comb_mix={d_comb:.6e} delta_layer_input={d_input:.6e}"
+        f"{eps_old} delta_post_mix={d_post:.6e} "
+        f"delta_comb_mix={d_comb:.6e} delta_layer_input={d_input:.6e} asserted=no"
     )
-    # The RMS scale multiplies `mixes`, which feeds all three heads, so all
-    # three returns must move. Any zero here means the denominator did not read
-    # `rms_eps` at all.
-    for name, delta in (
-        ("post_mix", d_post),
-        ("comb_mix", d_comb),
-        ("layer_input", d_input),
+    for name, moved, reference in (
+        ("post_mix", d_post, post_a),
+        ("comb_mix", d_comb, comb_a),
+        ("layer_input", d_input, input_a),
     ):
-        assert delta > 0.0, (
-            f"swapping rms_eps left {name} bit-identical (delta {delta}); the "
-            f"RMS denominator does not read rms_eps, which is a finding for the "
-            f"lead rather than a pass"
+        floor = float(_ulp(reference).max())
+        print(
+            f"[value-2-site-rms-arrived] {name} delta={moved:.6e} "
+            f"one_step_at_its_own_magnitude={floor:.6e} "
+            f"steps={(moved / floor) if floor > 0.0 else float('nan'):.3f} "
+            f"asserted=no"
         )
 
 
