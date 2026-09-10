@@ -966,13 +966,13 @@ class Glm5NextQuantConfig:
 # route, and the checkpoint-leaf question stays a lead-owned open question for a
 # later design revision. ``weight_loaders_fp8.py`` is untouched.
 #
-# NO TOKEN TILING IS AUTHORED HERE, also a lead ruling. ``-028``'s kernel
-# refuses its ``M`` above ``PARTITION_MAX`` by raising ``SinkhornError`` and has
-# no torch path (``sinkhorn.py:321-330``); the refusal is allowed to propagate
-# unchanged. A host-side tiling loop and a large-``M`` torch fallback are both
-# out of scope, the second by P13 outright. The measured consequence -- see the
-# token-ceiling note on :meth:`mhc_pre` -- is recorded for the design revision
-# that settles the policy.
+# NO TOKEN TILING IS AUTHORED HERE, also a lead ruling, and after commit 5 none is
+# needed: the merged kernels tile the token axis themselves. ``-028``'s SQUARE kernel
+# refused its ``M`` above ``PARTITION_MAX``; that path is not the one taken here,
+# ``sinkhorn.py:321-330`` is now the tile-height helper, and the only ``PARTITION_MAX``
+# refusal left is on ``block`` (``sinkhorn.py:344-349``). A host-side tiling loop and a
+# large-``M`` torch fallback stay out of scope, the second by P13 outright. The
+# token-ceiling note on :meth:`mhc_pre` carries what this tree actually bounds.
 # ---------------------------------------------------------------------------
 
 
@@ -1255,25 +1255,25 @@ class Glm5NextHyperConnection(nn.Module):
         on ``[T, S, S]`` blocks, where ``N`` per block is ``S`` and
         :func:`_require_blocks_admissible` carries **no token bound**.
 
-        So the ceiling is now ``-029``'s combine kernel alone: ``T <=
-        PARTITION_MAX`` -- **128**, refused with ``HyperConnectionError`` from
-        :meth:`mhc_post`. The NUMBER did not move (the old square ceiling was
-        ``MOVING_FMAX // S``, also 128); the axis, the seam and the exception
-        class did.
+        SO NO TOKEN CEILING IS LEFT ON THIS BRANCH. ``inc-glm53f-029b`` lifted
+        the last one and commit 5 of this increment merged it in, so the combine
+        kernel bounds no token extent: tokens ride the PARTITION axis and the
+        body walks that axis in tiles of ``nl.tile_size.pmax``, which makes
+        ``PARTITION_MAX`` the tile height rather than a limit
+        (``functional/mhc/hyper_connection.py:209-223``). The paragraph this
+        replaces said the ceiling was ``T <= PARTITION_MAX`` -- **128**, refused
+        with ``HyperConnectionError`` from :meth:`mhc_post`; that was true of the
+        untiled body and stopped being true at that merge. The bounds that remain
+        are ``block <= PARTITION_MAX`` (``sinkhorn.py:344-349``) and the
+        Sinkhorn's ``cols <= MOVING_FMAX``, 512 (``sinkhorn.py:772-777``), and
+        both are on ``S``, which is 4 here and reaches neither. Every line number
+        in this paragraph is measured on THIS tree, the commit-5 merge.
 
-        LIFTING 128 IS ``inc-glm53f-029b``'S WORK AND THAT WORK HAS LANDED --
-        on the campaign tip, not yet on this branch. So the refusal described
-        above is still exactly what this branch's kernel does
-        (``functional/mhc/hyper_connection.py:261`` refuses
-        ``T > PARTITION_MAX``), and it stops being true the moment the tip
-        merges in: after ``-029b`` the combine bounds no token extent at all,
-        ``PARTITION_MAX`` is the tile height rather than a ceiling, and the
-        only bounds left are ``block <= PARTITION_MAX`` and the Sinkhorn's
-        ``cols <= MOVING_FMAX`` (512) -- both on ``S``, which is 4 here and
-        never reaches either. This paragraph is therefore rewritten in the
-        wake of that merge, and is left standing now because it is true now.
-        Either way the answer is never a pad and never a torch path here
-        (P13).
+        THE ACCEPTANCE STILL MEASURES ``T = 128`` EXACTLY, and that value is
+        REGISTERED and is not moved here (P9). What no longer holds is the
+        combine-ceiling half of the reason recorded for it; amending the plan's
+        premise sentence is the lead's, not this docstring's. Either way the
+        answer is never a pad and never a torch path here (P13).
 
         Raises:
             Glm5NextHyperConnectionError: on a non-3-D ``residual`` or a stream
@@ -9157,8 +9157,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         ``sampling_positions`` IS REQUIRED, WITH NO DEFAULT, because every dict
         that reaches this method is built by one of the runner's three builders
-        and all three set the key unconditionally
-        (``neuron_model_runner.py:4506``, ``:4844``, ``:7046``). A ``None``
+        and all three set the key unconditionally (``neuron_model_runner.py:4506``,
+        ``:5404``, ``:7595``, measured at the campaign tip ``0a1888a9``). A ``None``
         default would therefore never be taken by the runner, and the only
         behaviour it could add is the whole-prefill projection the line above
         exists to prevent.
@@ -9167,7 +9167,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         family precedent is NOT followed. ``llama3/model.py:1622`` carries one as
         its async-speculative-decoding injection point. The runner passes eight
         keys today plus up to four conditional ones
-        (``neuron_model_runner.py:7042-7103``), and three of them --
+        (``neuron_model_runner.py:7591-7656`` at ``0a1888a9``), and three of them --
         ``sampling_params``, ``logit_mask`` and ``spec_decode_metadata`` -- carry
         ON-DEVICE SAMPLING, which this tree implements nowhere: there is no
         sampler on this class and no ``on_device_sampling_config``. A sink would
