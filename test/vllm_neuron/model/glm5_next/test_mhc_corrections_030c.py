@@ -51,6 +51,7 @@ collected module before running any test.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 
@@ -563,6 +564,20 @@ WRONG_RMS_EPS = 1.0
 #: than this could have moved on rounding.
 RMS_CONTROL_FLOOR_STEPS = 16.0
 
+#: What a SUBSTITUTED carrier entry must predict: twice the floor. The search below
+#: picks a carrier from an analytic prediction, and the armed refusal then re-checks
+#: it against the seam's real numbers, so the margin is what keeps a carrier that
+#: was chosen at 16.4 steps from arriving at 15.
+RMS_CARRIER_TARGET_STEPS = 32.0
+
+#: The magnitudes the carrier search may choose from: powers of two, scanned by
+#: INCREASING magnitude. Powers of two are exact in fp32, so the substituted value
+#: is the value the reader sees printed, and scanning upward takes the smallest one
+#: that works rather than the largest -- which matters because the gate derivative
+#: `sigma * (1 - sigma)` FALLS again once the sigmoid saturates, so a bigger scale is
+#: not reliably a stronger signal.
+RMS_CARRIER_EXPONENTS = tuple(range(-24, 25))
+
 
 def _predicted_control_deltas(
     layer,
@@ -639,6 +654,115 @@ def _predicted_control_deltas(
     }
 
 
+def _analytic_returns(layer, fn, hc_scale, hc_base, residual) -> dict:
+    """``mhc_pre``'s three returns, recomputed in torch with NO seam call.
+
+    The carrier search below needs a step SIZE per return for dozens of candidate
+    scales, and the real denominator comes from :meth:`mhc_pre`, whose Sinkhorn runs
+    on the NKI simulator. Calling it per candidate would put a hundred simulator
+    dispatches inside one test for numbers that only choose a candidate. So the two
+    returns that need no seam -- ``post_mix`` and ``layer_input`` -- are reproduced
+    exactly here, and ``comb_mix`` is represented by ``comb_start``, the softmax the
+    seam is handed. That last one is a PROXY: Sinkhorn changes the magnitude, so its
+    step size is close rather than equal.
+
+    Nothing here is trusted. The search is a heuristic and the armed refusal after
+    it is the guarantee: the control still recomputes prediction AND denominator from
+    the real returns of the substituted carrier, and still refuses by name if the
+    signal does not reach. A wrong number here costs a re-pick, never a wrong pass.
+    """
+    tokens = residual.shape[0]
+    flat = residual.flatten(start_dim=1).to(torch.float32)
+    mean_square = flat.square().mean(dim=-1, keepdim=True)
+    mixes = (flat @ fn.to(torch.float32).t()) * torch.rsqrt(
+        mean_square + float(layer.rms_eps)
+    )
+    scale = hc_scale.to(torch.float32)
+    base = hc_base.to(torch.float32)
+    hc_eps = float(layer.hc_eps)
+
+    pre_mix = torch.sigmoid(mixes[:, :S] * scale[0] + base[:S]) + hc_eps
+    post_mix = float(layer.post_mult_value) * torch.sigmoid(
+        mixes[:, S : 2 * S] * scale[1] + base[S : 2 * S]
+    )
+    comb_block = mixes[:, 2 * S :].reshape(tokens, S, S)
+    comb_start = torch.softmax(
+        comb_block * scale[2] + base[2 * S :].reshape(1, S, S), dim=-1
+    ) + hc_eps
+    layer_input = (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1)
+    return {"post_mix": post_mix, "comb_mix": comb_start, "layer_input": layer_input}
+
+
+#: Which ``hc_scale`` entry drives which return. ``mhc_pre`` slices ``mixes`` into
+#: three blocks and multiplies each by its own scale, so the three are independent:
+#: entry 0 is the PRE gate and reaches ``layer_input``, entry 1 is the POST gate and
+#: reaches ``post_mix``, entry 2 is the comb logits and reaches ``comb_mix``.
+RMS_CARRIER_DRIVES = ((0, "layer_input"), (1, "post_mix"), (2, "comb_mix"))
+
+
+def _predicted_steps_analytic(layer, fn, hc_scale, hc_base, residual, name) -> float:
+    """Predicted fp32 steps at ``name`` for this candidate scale, seam-free."""
+    predicted = _predicted_control_deltas(
+        layer, fn, hc_scale, hc_base, residual, WRONG_RMS_EPS
+    )
+    one_step = float(
+        _ulp(_analytic_returns(layer, fn, hc_scale, hc_base, residual)[name]).max()
+    )
+    return predicted[name] / one_step if one_step > 0.0 else float("nan")
+
+
+def _control_carrier(layer, fn, hc_scale, hc_base, residual):
+    """``(carrier, rows)`` -- the fixture's ``hc_scale`` with the weak entries replaced.
+
+    WHY A CARRIER AT ALL, and why only here. Grant 199 measured this control red on
+    correct code: the fixture drew ``hc_scale[0] = -0.0001``, which attenuates the
+    epsilon swap to ``0.54`` predicted steps at ``layer_input`` -- under the floor of
+    sixteen -- while the other two returns cleared it by hundreds. The reading the
+    control exists for is "``mhc_pre``'s arithmetic reads ``self.rms_eps``", and that
+    reading does not depend on the fixture's draw. So this ONE item substitutes a
+    carrier scale strong enough to resolve the signal, and every other item in this
+    file keeps the fixture's own draw, because the other items measure agreement with
+    the reference at the magnitudes the target actually runs.
+
+    THE RULE, so a reader can predict the output: an entry whose return already
+    predicts at least ``RMS_CONTROL_FLOOR_STEPS`` is KEPT untouched. An entry under
+    the floor is replaced, SIGN KEPT, by the smallest power of two that predicts at
+    least ``RMS_CARRIER_TARGET_STEPS``. Both the real value and its substitute are
+    printed, so the substitution is visible in the transcript rather than implied.
+    """
+    carrier = hc_scale.detach().clone().to(torch.float32)
+    rows = []
+    for index, name in RMS_CARRIER_DRIVES:
+        real_value = float(carrier[index])
+        before = _predicted_steps_analytic(layer, fn, carrier, hc_base, residual, name)
+        if before >= RMS_CONTROL_FLOOR_STEPS:
+            rows.append((name, index, real_value, real_value, before, before, "kept"))
+            continue
+        chosen = None
+        for exponent in RMS_CARRIER_EXPONENTS:
+            candidate = carrier.clone()
+            candidate[index] = math.copysign(2.0**exponent, real_value or 1.0)
+            after = _predicted_steps_analytic(
+                layer, fn, candidate, hc_base, residual, name
+            )
+            if after >= RMS_CARRIER_TARGET_STEPS:
+                chosen = (float(candidate[index]), after)
+                break
+        if chosen is None:
+            raise VacuousControlError(
+                f"no power of two in 2**{RMS_CARRIER_EXPONENTS[0]}..2**"
+                f"{RMS_CARRIER_EXPONENTS[-1]} carries the epsilon swap to {name}: "
+                f"the strongest candidate still predicts under "
+                f"{RMS_CARRIER_TARGET_STEPS:.0f} fp32 steps. The gate derivative "
+                f"sigma*(1-sigma) falls once the sigmoid saturates, so this is a "
+                f"reachability failure of the CONTROL, not a layer that ignores "
+                f"self.rms_eps"
+            )
+        carrier[index] = chosen[0]
+        rows.append((name, index, real_value, chosen[0], before, chosen[1], "substituted"))
+    return carrier, rows
+
+
 def test_030c_control_a_wrong_rms_epsilon_moves_every_return() -> None:
     """CONTROL for COUNTED VALUE 2, site 1: ``mhc_pre``'s OWN CODE reads ``rms_eps``.
 
@@ -666,8 +790,25 @@ def test_030c_control_a_wrong_rms_epsilon_moves_every_return() -> None:
     magnitude where the reading cannot turn on rounding. It says nothing about
     ``1e-06``; that comparison stays a printed reading above.
     """
-    fn, hc_scale, hc_base, residual = _fixture()
+    fn, hc_scale_fixture, hc_base, residual = _fixture()
     layer, _cfg = _layer()
+    _load(layer, fn, hc_scale_fixture, hc_base)
+
+    # THE CONTROL-ONLY CARRIER (LEAD-LOG section 1219(1)). Chosen before anything is
+    # measured, printed beside the fixture's own value, and re-checked below against
+    # the seam's real numbers by the same by-name refusal that caught the weak draw.
+    hc_scale, carrier_rows = _control_carrier(
+        layer, fn, hc_scale_fixture, hc_base, residual
+    )
+    for name, index, real_value, used, before, after, verdict in carrier_rows:
+        print(
+            f"[value-2-site-rms-carrier] {name} hc_scale[{index}] "
+            f"fixture={real_value:.6e} control={used:.6e} "
+            f"predicted_steps_on_fixture={before:.2f} "
+            f"predicted_steps_on_control={after:.2f} "
+            f"floor={RMS_CONTROL_FLOOR_STEPS:.0f} "
+            f"target={RMS_CARRIER_TARGET_STEPS:.0f} {verdict}"
+        )
     _load(layer, fn, hc_scale, hc_base)
 
     eps_real = float(layer.rms_eps)
@@ -694,7 +835,8 @@ def test_030c_control_a_wrong_rms_epsilon_moves_every_return() -> None:
         f"[value-2-site-rms-control] rms_eps {eps_real} -> {WRONG_RMS_EPS} "
         f"scale_change_rel={scale_change:.6e} "
         f"floor_steps={RMS_CONTROL_FLOOR_STEPS:.0f} "
-        f"hc_scale={[round(float(v), 6) for v in hc_scale]}"
+        f"hc_scale_control={[round(float(v), 6) for v in hc_scale]} "
+        f"hc_scale_fixture={[round(float(v), 6) for v in hc_scale_fixture]}"
     )
     # ---- IS THIS CONTROL REACHABLE ON THIS DRAW? Asked BEFORE the second call, and
     # against the SAME denominator the measurement uses, so prediction and
@@ -720,7 +862,8 @@ def test_030c_control_a_wrong_rms_epsilon_moves_every_return() -> None:
                 f"this fixture's draw cannot carry the control to {name}: the "
                 f"epsilon swap predicts {predicted_steps:.2f} fp32 steps there, "
                 f"under the floor of {RMS_CONTROL_FLOOR_STEPS:.0f}. The gates "
-                f"multiply by hc_scale={[round(float(v), 6) for v in hc_scale]} "
+                f"multiply by the CONTROL carrier "
+                f"hc_scale={[round(float(v), 6) for v in hc_scale]} "
                 f"before the sigmoid, so a small draw attenuates the signal below "
                 f"the resolution the assertion needs. This is an UNREACHABLE "
                 f"control on this draw, not a layer that ignores self.rms_eps"

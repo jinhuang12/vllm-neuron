@@ -145,7 +145,10 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # The declared tiny case.                                                     #
 # --------------------------------------------------------------------------- #
 #: Tokens. RE-GROUNDED BY `inc-glm53f-030c`: the ceiling used to be the square
-#: embedding's, ``T * S <= MOVING_FMAX``. ``mhc_pre`` now enters the batched
+#: embedding's, ``T * S <= MOVING_FMAX``. Since LANDED ``inc-glm53f-029b`` NO
+#: upper extent bound is left on this path at all; see
+#: :func:`test_mhc_layer_serves_above_the_combines_old_ceiling`. ``mhc_pre`` enters
+#: the batched
 #: entry, which carries NO token bound, so the only ceiling left is the combine
 #: kernel's ``T <= PARTITION_MAX`` = ``128``. ``8`` sits far inside it, so the
 #: declared case is not also a boundary case. The boundary is a separate arm.
@@ -1199,59 +1202,78 @@ def test_mhc_layer_serves_above_the_old_ceiling(tokens: int) -> None:
 
 
 @pytest.mark.parametrize("tokens", [PARTITION_MAX + 1, 200])
-def test_mhc_layer_refusal_names_the_offending_extent(tokens: int) -> None:
-    """The refusal that still binds names its extent, and which seam charges.
+def test_mhc_layer_serves_above_the_combines_old_ceiling(tokens: int) -> None:
+    """129 and 200 tokens are SERVED and match the oracle. No bound is left to cross.
 
-    RE-GROUNDED BY `inc-glm53f-030c`, for the second time, and the history is the
-    point of the note. This item first asserted `-028`'s row-axis refusal on
-    ``M``; `inc-glm53f-028b` tiled that axis away and it was re-grounded onto the
-    square matrix's ``N``, on the Tensor Engine's moving free bound. `-030c` now
-    stops building a square matrix at all: :meth:`mhc_pre` calls
-    ``sinkhorn_normalise_blocks`` on ``[T, S, S]``, where ``N`` per block is
-    ``S`` and the batched seam carries **no token bound**.
+    RE-GROUNDED BY `inc-glm53f-030c` commit 10, and this is the THIRD time these two
+    cases have changed subject, so the history is the note. They first asserted
+    `-028`'s row-axis refusal on ``M``; `inc-glm53f-028b` tiled that axis away and
+    they moved onto the square matrix's ``N``; `-030c` stopped building a square
+    matrix at all and they moved onto `-029`'s combine kernel, ``T <= PARTITION_MAX``.
+    Commit 9 then merged the campaign tip, which carries LANDED `inc-glm53f-029b`,
+    and that increment TILES the combine's token axis and deletes the refusal --
+    ``hyper_connection.py`` now says ``T`` is unbounded and ``PARTITION_MAX`` is the
+    tile height. Grant 199 measured the consequence directly: both cases raised
+    ``Failed: DID NOT RAISE HyperConnectionError`` because the layer served them.
 
-    So the ceiling is `-029`'s combine kernel alone -- ``T <= PARTITION_MAX``,
-    refused with ``HyperConnectionError`` from :meth:`mhc_post`. **The NUMBER
-    did not move:** the previous ceiling was ``MOVING_FMAX // S``, which is also
-    128 at ``hc_mult 4``, so both parametrised cases are the same two token
-    counts they always were. What moved is the axis, the seam and the exception
-    class, and asserting the class is not the same one is part of the reading.
+    So they re-ground the way `-028b`'s
+    :func:`test_mhc_layer_serves_above_the_old_ceiling` did, onto the same reading at
+    the same registered tolerances: the extent is SERVED and the output matches the
+    torch reference. ``129`` is one token past the old ceiling and needs a ragged
+    second tile; ``200`` needs two tiles with the second more than half full.
 
-    THE COUNTERS MOVE TOO, and that is a real behavioural change rather than
-    bookkeeping. This call used to charge NEITHER seam, because the Sinkhorn
-    refused before dispatching. Now the Sinkhorn genuinely RUNS -- one real
-    dispatch over ``T`` blocks -- and the combine refuses afterwards, before its
-    own dispatch, because ``can_run_hyper_connection`` calls
-    ``_require_admissible`` before it asks whether a route exists
-    (``hyper_connection.py:363-364``). That ordering is also why an inadmissible
-    ``T`` can never reach the combine's torch oracle: refusal comes first, so no
-    torch path serves kernel-class work here (P13, D6).
+    NO NAMED-REFUSAL ITEM REPLACES THEM, and that is a measurement rather than an
+    omission. On the path this layer takes, nothing upstream carries an upper extent
+    bound any more:
 
-    A refusal a caller cannot act on is barely better than a trap, so the message
-    content is asserted rather than only the exception type.
+    * the combine's :func:`_require_admissible` checks positivity and shape
+      agreement only -- no ``T``, ``S`` or ``H`` ceiling
+      (``functional/mhc/hyper_connection.py:301-334``);
+    * ``mhc_pre`` calls the BATCHED seam, whose
+      :func:`_require_blocks_admissible` bounds nothing from above either: ``T``
+      positive, ``S`` positive, blocks square
+      (``functional/mhc/sinkhorn.py:802-813``), and its own docstring says ``T`` has
+      no upper bound and the block rides two free axes;
+    * ``PARTITION_MAX`` and ``MOVING_FMAX`` still gate
+      :func:`_require_admissible` in ``sinkhorn.py``, but that is the SQUARE
+      kernel's entry, which `-030c` no longer calls.
+
+    The named-refusal readings this file still owes are therefore the agreements
+    rather than the ceilings, and they are already covered:
+    :func:`test_mhc_layer_refuses_a_stream_count_that_contradicts_its_config`,
+    :func:`test_mhc_layer_refuses_a_hidden_extent_that_contradicts_its_config`,
+    :func:`test_mhc_layer_refuses_a_non_3d_residual` and
+    :func:`test_mhc_layer_combine_seam_refusals_reach_the_caller`. Item count is
+    unchanged at 28 collected: same function count, same two parameters.
+
+    THE COUNTERS MOVE, and it is the reading that shows the tiling is inside the
+    kernel. Under the refusal this call charged the Sinkhorn one dispatch and the
+    combine none, because the combine refused before dispatching. Now both seams
+    dispatch ONCE at 129 tokens and ONCE at 200 -- one per layer call however many
+    tiles the extent needs.
     """
     fn, hc_scale, hc_base, residual = _fixture(tokens=tokens)
     layer = _layer()
     _load(layer, fn, hc_scale, hc_base)
 
     _reset_both()
-    with pytest.raises(HyperConnectionError) as excinfo:
-        layer.forward(residual, _sublayer)
+    with _AttributedSimulatorCounter() as sim:
+        got = layer.forward(residual, _sublayer)
+    _assert_route(sim, calls=1, label=f"above-combine-ceiling-T{tokens}")
     after = _read_both()
-    message = str(excinfo.value)
+
+    want, _, _, _, _ = _reference_layer(fn, hc_scale, hc_base, residual, "torch")
+    max_abs, max_rel = _errors(got, want)
     print(
-        f"[refusal] T={tokens} blocks_normalised={tokens} block_side={S} "
-        f"serving_ceiling_T={PARTITION_MAX} "
-        f"old_square_ceiling_T={MOVING_FMAX // S} message={message!r}"
+        f"[above-combine-ceiling] T={tokens} served=yes "
+        f"tile_height={PARTITION_MAX} token_tiles={-(-tokens // PARTITION_MAX)} "
+        f"old_combine_ceiling_T={PARTITION_MAX} "
+        f"old_square_ceiling_T={MOVING_FMAX // S} "
+        f"max_abs_error={max_abs:.6e} max_rel_error={max_rel:.6e}"
     )
-    print(f"[refusal] counters_after_refusal={after}")
-    assert f"T={tokens} exceeds PARTITION_MAX={PARTITION_MAX}" in message, message
-    # The class changed with the axis. A `SinkhornError` here would mean the
-    # layer is still embedding the blocks in a square matrix.
-    assert not isinstance(excinfo.value, SinkhornError), type(excinfo.value).__name__
-    # The Sinkhorn ran (1 dispatch, 0 fallback); the combine refused before its
-    # own dispatch and before any route question, so it charges nothing at all.
-    assert after == ((1, 0), (0, 0)), after
+    print(f"[above-combine-ceiling] T={tokens} counters_after_serving={after}")
+    assert tuple(got.shape) == (tokens, S, H)
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
 
 
 # --------------------------------------------------------------------------- #
