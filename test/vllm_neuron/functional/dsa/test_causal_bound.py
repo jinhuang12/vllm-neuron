@@ -52,13 +52,31 @@ to write ``-inf`` and the marker used to key on it exactly. It now writes the FI
 index at or past the real ``width``, which is how a pad column the selector invented is caught. The
 reason is recorded with its bytes in
 ``increments/contradiction-103-selector-pad-6874a0f5.md``.
+
+``inc-glm53f-103b`` ADDS SIX ITEMS AT THE BOTTOM OF THIS FILE AND CHANGES NOTHING ABOVE THEM.
+``-103``'s four items keep their ids, their dials and their readings; the six new ones all carry
+``tiled`` in their names, so ``pytest -k tiled`` selects exactly them and the declared count is
+derivable from the file rather than typed into a runner. They exist because every reading above runs
+at 5 query rows: the two kernels used to bind the query-token count to one on-chip tile, which holds
+128 rows at most, so the registered 2,048-token envelope trapped in the vendor's own check and no item
+here could see it. That section carries its own dials, its own emit prefix (``B103|``), a re-spelling
+of the PARENT kernel bodies so the pre-``103b`` result is still measurable, and the two failing
+controls the block declares. No tolerance is authored there either: tiling moves rows between tiles
+and computes no new number, and ``-103b`` is registered at exact bit equality.
 """
 
 import os
+import re
 from pathlib import Path
 
 import pytest
 import torch
+
+import nki
+import nki.isa as nisa
+import nki.language as nl
+
+from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention.mla_sparse import (
     can_run_mla_sparse_attention,
@@ -68,6 +86,7 @@ from vllm_neuron.functional.dsa import causal_bound as mod
 from vllm_neuron.functional.dsa.causal_bound import (
     BOUND_FILL,
     BOUND_FILL_MARK,
+    PARTITION_MAX,
     SENTINEL,
     DsaCausalBoundError,
     can_run_dsa_causal_bound,
@@ -82,6 +101,16 @@ from vllm_neuron.functional.dsa.causal_bound import (
     dsa_causal_sentinel_torch_oracle,
     reset_causal_bound_dispatch_counters,
     reset_causal_sentinel_dispatch_counters,
+    row_tile_count,
+    row_tiles,
+)
+
+# `inc-glm53f-103b`'s two UNCHECKED tiling helpers. Imported for the WRONG-WALK control kernel only,
+# so that the control differs from the candidate in exactly one thing -- the hoist -- and not in its
+# tile arithmetic. The checked `row_tiles`/`row_tile_count` above are what the items read.
+from vllm_neuron.functional.dsa.causal_bound import (
+    _row_tile_count_unchecked,
+    _row_tiles_unchecked,
 )
 from vllm_neuron.functional.dsa.index_expand import (
     can_run_dsa_index_expand,
@@ -1141,3 +1170,800 @@ def test_three_malformed_bound_calls_are_refused_by_name_and_the_fallback_can_fi
     assert can_run_dsa_causal_bound(scores, causal_len, POOL_SIZE) is True
     assert can_run_dsa_causal_sentinel(values, idx32, POOL_COLUMNS) is True
     _emit("C4_GATES_RESTORED", bound=1, sentinel=1)
+
+
+# =========================================================================== #
+# inc-glm53f-103b -- THE QUERY-TOKEN TILING                                    #
+# SIX COUNTED ITEMS, no `parametrize`, every name carries `tiled`.             #
+# Run: VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 pytest <this file> -k tiled -s -rA
+# =========================================================================== #
+
+TILED_ROWS = 2048
+"""The registered envelope in query tokens: 2,048 per request
+(``acceptance-preregistration.md`` A-5). This is the extent the parent trapped on and the extent
+items 1, 4, 5 and 6 take their readings at."""
+
+TRAP_ROWS = 132
+"""The query-token count the OBSERVED trap was reported at, so the control reproduces the number in
+the transcript rather than a number of this file's choosing."""
+
+TILED_LADDER = [
+    PARTITION_MAX,
+    PARTITION_MAX + 1,
+    TRAP_ROWS,
+    2 * PARTITION_MAX,
+    2000,
+    TILED_ROWS,
+]
+"""The boundary ladder, because one large extent proves less than the edges do.
+
+``PARTITION_MAX`` is the last single tile and the widest call the parent could serve;
+``PARTITION_MAX + 1`` is the first two-tile call, where a short second tile of ONE row runs;
+``TRAP_ROWS`` is the observed trap; ``2 * PARTITION_MAX`` is a whole number of tiles with no
+remainder; ``2000`` is a non-multiple, so the remainder tile is 80 rows; ``TILED_ROWS`` is the
+registered envelope. Read off :data:`PARTITION_MAX` rather than typed, so the ladder follows the
+constant if the constant ever moves."""
+
+VENDOR_PARTITION_ASSERT = "dma_copy dst partition dimension {rows} exceeds maximum {pmax}"
+"""What the PARENT died of above the ceiling in the run that found it -- kept for the READER, not for
+the assertion.
+
+This module has no row-count check anywhere -- ``_validate_bound`` reads shapes and dtypes,
+``can_run_dsa_causal_bound`` reads only whether NKI is available -- so the parent does not refuse by
+name. It dispatches, and the vendor's own assert fires in ``nki/isa/_copy.py:152`` by way of
+``nki/isa/_validation.py:261``."""
+
+VENDOR_PARTITION_NUMBERS = r"partition dimension (\d+) exceeds maximum (\d+)"
+"""WHAT THE CONTROL ACTUALLY ASSERTS ON, and why it is a pattern and not the sentence above.
+
+The control's claim is "the parent trapped BECAUSE 132 rows exceeded the 128-row partition axis", and
+that claim lives in the two NUMBERS. The surrounding words are the vendor's to change: a wording drift
+between the run that produced :data:`VENDOR_PARTITION_ASSERT` and the image this acceptance runs on
+would redden a correct candidate on prose. So the control EXTRACTS the pair and compares it with
+:data:`TRAP_ROWS` and :data:`PARTITION_MAX`, and it still prints the raw text and the exception type
+verbatim -- a drift then shows up in the transcript as a fact rather than as a red."""
+
+TILED_LENGTH_PERIOD = POOL_COLUMNS + 1
+"""Row ``i``'s causal length completes ``i % TILED_LENGTH_PERIOD`` pools, and this period is chosen so
+the pattern cannot line up with a tile.
+
+Every count from 0 to :data:`POOL_COLUMNS` appears: 0 is a wholly-bounded row, ``POOL_COLUMNS`` is a
+saturated row where nothing is bounded, and everything between is interior. The period is 17 at the
+declared dials and the tile height is 128, and 17 does not divide 128 -- so every tile past the first
+holds a DIFFERENT set of lengths than the first tile does. That is what makes the wrong-walk control
+below able to fail: a walk that hoists the length column reuses the first tile's lengths, and there is
+no tile where reusing them is accidentally right."""
+
+TILED_PAD_STRIDE = PARTITION_MAX - 1
+"""Which rows item 5 plants a selector-invented PAD index on: every ``TILED_PAD_STRIDE``-th row.
+
+127 at the declared dials, which is coprime with the 128-row tile height, so the planted rows land at
+a different offset inside every tile and the item's own reading asserts they span more than one."""
+
+
+def _emit_tiled(item: str, **values: object) -> None:
+    """Print one machine-readable reading line for the ``-103b`` items.
+
+    A DIFFERENT PREFIX from :func:`_emit`'s ``S103|``, on purpose: a launcher counting this
+    increment's readings must not have to tell them apart from ``-103``'s by tag spelling. Same
+    warning as :func:`_emit` about pytest's progress marker -- match with ``grep -o``, never with a
+    ``^`` anchor.
+    """
+    body = " ".join(f"{k}={v}" for k, v in values.items())
+    print(f"B103|{item}|{body}", flush=True)
+
+
+def _tiled_scores(rows: int, seed: int) -> torch.Tensor:
+    """``[rows, POOL_COLUMNS]`` float32 scores at ``-103``'s declared width. Same scale as
+    :func:`_scores`, seeded from the caller so a failure reproduces from its own item."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(rows, POOL_COLUMNS, generator=gen, dtype=torch.float32) * 0.05
+
+
+def _tiled_causal_len(rows: int) -> torch.Tensor:
+    """``[rows, 1]`` int32 lengths, row ``i`` completing ``i % TILED_LENGTH_PERIOD`` pools."""
+    lens = []
+    for i in range(rows):
+        lens.append((i % TILED_LENGTH_PERIOD) * POOL_SIZE)
+    return torch.tensor(lens, dtype=torch.int32).reshape(rows, 1)
+
+
+def _tiled_complete_pools(rows: int) -> torch.Tensor:
+    """Complete pools per row, DERIVED from this file's dials the way :func:`_complete_pools` is."""
+    counts = []
+    for i in range(rows):
+        counts.append(i % TILED_LENGTH_PERIOD)
+    return torch.tensor(counts, dtype=torch.int64)
+
+
+def _max_abs_diff(got: torch.Tensor, want: torch.Tensor) -> float:
+    """The largest absolute elementwise gap, as a number to print. NOT a tolerance: every reading
+    below asserts BIT equality and prints this beside it, so ``0.0`` is a measured value rather than
+    a threshold that was met."""
+    return float((got.to(torch.float64) - want.to(torch.float64)).abs().max())
+
+
+def _selection_of(bounded: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A ``(values, indices)`` pair over a bounded score matrix, taken on the HOST with
+    ``torch.topk``.
+
+    WHY THE HOST AND NOT ``dsa_topk_select``. This increment's claim is about the query-token axis of
+    two kernels, and the landed chain reading through the real selector is already taken by conjunct 2
+    and conjunct 3 above at ``-103``'s own extents. Driving the vendored selector at 2,048 rows would
+    put someone else's kernel inside this increment's readings, where a finding about it would arrive
+    as a red on ``-103b``. The sweep that minted this increment already adjudicated that selector as
+    tiling its own row axis
+    (``increments/scope-lap-token-axis-partition-ceiling-lane-dsa2-s2.md`` section (a)), so the gap
+    this pair leaves is recorded rather than covered here.
+
+    ``torch.topk`` is a fine SOURCE of a selection for the sentinel writer: what the writer reads is
+    only "is this value a fill" and "is this index past the real width", and both are properties of
+    the pair, not of who produced it.
+    """
+    values, indices = torch.topk(bounded, k, dim=1)
+    return values.contiguous(), indices.to(torch.int32).contiguous()
+
+
+# --------------------------------------------------------------------------------------------- #
+# The PARENT bodies, re-spelled so the pre-`103b` result is still measurable, and the WRONG WALK  #
+# --------------------------------------------------------------------------------------------- #
+# Both replicas below are the kernel bodies at `b7b3d80e` -- `causal_bound.py:286-335` for the bound
+# and `:385-417` for the sentinel -- with the explanatory comments dropped and not one call changed.
+# They are here because commit 1 replaced those bodies, and item 2's "bit-identical to the landed
+# kernel" reading needs the landed kernel to still exist somewhere. A MIS-COPIED replica cannot pass
+# quietly: item 2 measures each replica against the torch oracle as well, so a replica that drifted
+# from the parent reddens on the oracle rather than agreeing with a wrong candidate.
+
+
+@nki.jit
+def _parent_bound_untiled(scores_hbm, causal_len_hbm, pool_size):
+    """The bound kernel as it stood at ``b7b3d80e``: one tile, so 129 rows or more trap."""
+    rows = scores_hbm.shape[0]
+    width = scores_hbm.shape[1]
+
+    out = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    scores_sb = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=scores_sb, src=nl.load(scores_hbm))
+
+    clen = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=clen, src=nl.load(causal_len_hbm))
+
+    nclen = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=nclen, data=clen, op0=nl.multiply, operand0=-1.0)
+
+    ramp = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=ramp, pattern=[[1, width]], offset=0, channel_multiplier=0)
+
+    end = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=end, data=ramp,
+                       op0=nl.multiply, operand0=float(pool_size),
+                       op1=nl.add, operand1=float(pool_size))
+
+    room = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=room, data=end, op0=nl.add, operand0=nclen)
+
+    bounded = nl.ndarray((rows, width), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
+
+    fill = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=fill, value=BOUND_FILL)
+
+    nisa.tensor_copy_predicated(src=fill, predicate=bounded, dst=scores_sb)
+
+    nl.store(out, value=scores_sb)
+    return out
+
+
+@nki.jit
+def _parent_sentinel_untiled(values_hbm, indices_hbm, width):
+    """The sentinel writer as it stood at ``b7b3d80e``: one tile, so 129 rows or more trap."""
+    rows = values_hbm.shape[0]
+    k = values_hbm.shape[1]
+
+    out = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.shared_hbm)
+
+    idx_sb = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=idx_sb, src=nl.load(indices_hbm))
+
+    vals = nl.ndarray((rows, k), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=vals, src=nl.load(values_hbm))
+
+    fill = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.memset(dst=fill, value=SENTINEL)
+    marked = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.memset(dst=marked, value=SENTINEL)
+
+    idxf = nl.ndarray((rows, k), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=idxf, src=idx_sb)
+    pad = nl.ndarray((rows, k), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=pad, data=idxf, op0=nl.greater, operand0=float(width) - 1.0)
+    nisa.tensor_copy_predicated(src=fill, predicate=pad, dst=idx_sb)
+
+    keep = nl.ndarray((rows, k), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=keep, data=vals, op0=nl.greater, operand0=BOUND_FILL_MARK)
+    nisa.tensor_copy_predicated(src=idx_sb, predicate=keep, dst=marked)
+
+    nl.store(out, value=marked)
+    return out
+
+
+@nki.jit
+def _hoisted_clen_bound(scores_hbm, causal_len_hbm, pool_size):
+    """THE WRONG WALK, and the only thing wrong with it is the hoist.
+
+    It tiles the query-token axis with the candidate's OWN tile arithmetic and then lifts the per-row
+    length column out of the loop, so every tile is bounded by the FIRST tile's lengths. This is the
+    specific plausible bug: the length column is the one per-row operand in the body, hoisting it
+    looks like a loop-invariant optimisation, and at :data:`PARTITION_MAX` rows or fewer there is only
+    one tile, so the wrong walk and the right one produce identical bits. Item 2 reads both facts.
+
+    DEFINED ONLY FOR A WHOLE NUMBER OF TILES, which :func:`_run_hoisted_bound` asserts. Every tile
+    then has the first tile's height, so the hoisted column is used with no reslicing and this control
+    introduces NO construct the candidate does not already use -- a control that failed to compile
+    would say nothing about the candidate.
+    """
+    rows = scores_hbm.shape[0]
+    width = scores_hbm.shape[1]
+
+    out = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    tiles = _row_tiles_unchecked(int(rows))
+    tile_count = _row_tile_count_unchecked(int(rows))
+
+    first_geom = tiles[0]
+    first_height = first_geom[1]
+
+    # THE BUG: read once, off the first tile's rows, and reused for every tile below.
+    clen = nl.ndarray((first_height, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=clen, src=nl.load(causal_len_hbm[0:first_height, 0:1]))
+    nclen = nl.ndarray((first_height, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=nclen, data=clen, op0=nl.multiply, operand0=-1.0)
+
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
+
+        scores_sb = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=scores_sb, src=nl.load(scores_hbm[start:start + height, 0:width])
+        )
+
+        ramp = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(dst=ramp, pattern=[[1, width]], offset=0, channel_multiplier=0)
+
+        end = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=end, data=ramp,
+                           op0=nl.multiply, operand0=float(pool_size),
+                           op1=nl.add, operand1=float(pool_size))
+
+        room = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=room, data=end, op0=nl.add, operand0=nclen)
+
+        bounded = nl.ndarray((height, width), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
+
+        fill = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=fill, value=BOUND_FILL)
+
+        nisa.tensor_copy_predicated(src=fill, predicate=bounded, dst=scores_sb)
+
+        nl.store(out[start:start + height, 0:width], value=scores_sb)
+    return out
+
+
+def _run_parent_bound(scores: torch.Tensor, causal_len: torch.Tensor, pool_size: int):
+    """Dispatch the parent bound replica the way the seam dispatches the real one."""
+    rows = int(scores.shape[0])
+    clen_col = causal_len.reshape(rows, 1).contiguous()
+    return wrap_nki(_parent_bound_untiled)(scores.contiguous(), clen_col, pool_size)
+
+
+def _run_parent_sentinel(values: torch.Tensor, indices: torch.Tensor, width: int):
+    """Dispatch the parent sentinel replica the way the seam dispatches the real one."""
+    return wrap_nki(_parent_sentinel_untiled)(values.contiguous(), indices.contiguous(), width)
+
+
+def _run_hoisted_bound(scores: torch.Tensor, causal_len: torch.Tensor, pool_size: int):
+    """Dispatch the wrong-walk control, which is defined only for a whole number of tiles."""
+    rows = int(scores.shape[0])
+    assert rows % PARTITION_MAX == 0, (
+        f"the wrong-walk control takes only a whole number of tiles; got rows={rows}"
+    )
+    clen_col = causal_len.reshape(rows, 1).contiguous()
+    return wrap_nki(_hoisted_clen_bound)(scores.contiguous(), clen_col, pool_size)
+
+
+def _trap_of(call) -> tuple[str, str]:
+    """Run ``call`` expecting it to trap, and return ``(exception type name, text)``.
+
+    ``BaseException`` rather than ``AssertionError``: the assert this catches is the VENDOR's, and
+    whether the dispatch wrapper re-raises it as itself is not something this file gets to declare.
+    The control asserts on the MESSAGE, which is what the block declares verbatim, and prints the type
+    it saw so a change in wrapping is visible in the transcript instead of silent.
+    """
+    try:
+        call()
+    except BaseException as exc:  # noqa: BLE001 - the vendor's own trap is the reading
+        return (type(exc).__name__, f"{exc}")
+    raise AssertionError("the call was expected to trap above the partition ceiling and did not")
+
+
+def _partition_numbers(text: str) -> tuple[int, int]:
+    """The ``(rows, maximum)`` pair out of a vendor partition-ceiling trap, or a failure saying so.
+
+    :data:`VENDOR_PARTITION_NUMBERS` is searched ANYWHERE in the text rather than anchored, because
+    the trap arrives wrapped in whatever frames the dispatch path adds. Two numbers is the whole
+    reading: they are what says the trap was the partition ceiling and not some other assert that
+    happened to fire at the same call.
+    """
+    found = re.search(VENDOR_PARTITION_NUMBERS, text)
+    assert found is not None, (
+        f"the trap did not report a partition dimension against a maximum, so it is not the ceiling "
+        f"this control is about; the raw text was: {' '.join(text.split())[:400]}"
+    )
+    return (int(found.group(1)), int(found.group(2)))
+
+
+# =========================================================================== #
+# TILED ITEM 1 -- ADMISSION WHERE THERE IS A TRAP TODAY                        #
+# =========================================================================== #
+
+
+def test_tiled_admits_the_registered_envelope_where_the_parent_trapped() -> None:
+    """Item 1. Both entry points serve 2,048 query rows in ONE dispatch each, and the parent does not.
+
+    THE CONTROL IS IN THIS ITEM because it is what makes the admission mean something: without it, a
+    candidate that tiles nothing could pass item 1 by the extent simply never having been tried. The
+    control runs the PARENT replica at the observed :data:`TRAP_ROWS`, EXTRACTS the two numbers out of
+    the vendor's trap and asserts them against this file's dials, and then the candidate serves that
+    same call. The vendor's wording is printed verbatim beside the numbers and is not asserted on --
+    :data:`VENDOR_PARTITION_NUMBERS` says why.
+
+    Certifying component (D1.4): ``causal_bound._causal_bound_nki`` and
+    ``causal_bound._causal_sentinel_nki`` through their two seams.
+    """
+    _assert_module_under_test_is_the_candidate()
+    rows = TILED_ROWS
+    scores = _tiled_scores(rows, 1031)
+    clen = _tiled_causal_len(rows)
+
+    tiles = row_tiles(rows)
+    assert row_tile_count(rows) == len(tiles), (row_tile_count(rows), len(tiles))
+    assert len(tiles) > 1, "the envelope must be a MULTI-tile call or this item reads nothing"
+    _emit_tiled("I1_TILING", rows=rows, tiles=len(tiles), height=tiles[0][1],
+                last_height=tiles[-1][1], partition_max=PARTITION_MAX)
+
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    assert can_run_dsa_causal_bound(scores, clen, POOL_SIZE) is True
+    bounded = dsa_causal_bound(scores, clen, POOL_SIZE)
+    assert tuple(bounded.shape) == (rows, POOL_COLUMNS), tuple(bounded.shape)
+    assert bounded.dtype is torch.float32, bounded.dtype
+    _emit_tiled("I1_BOUND_SERVED", rows=rows, shape=tuple(bounded.shape), dtype=bounded.dtype)
+
+    values, idx32 = _selection_of(bounded, SELECT_K)
+    assert can_run_dsa_causal_sentinel(values, idx32, POOL_COLUMNS) is True
+    marked = dsa_causal_sentinel(values, idx32, POOL_COLUMNS)
+    assert tuple(marked.shape) == (rows, SELECT_K), tuple(marked.shape)
+    assert marked.dtype is torch.int32, marked.dtype
+    _emit_tiled("I1_SENTINEL_SERVED", rows=rows, shape=tuple(marked.shape), dtype=marked.dtype)
+
+    # ONE dispatch per entry point for the whole multi-tile call: the tile loop is INSIDE the kernel,
+    # so a host-side loop over 128-row slices would read `len(tiles)` here instead of 1.
+    route = (causal_bound_dispatch_counters(), causal_sentinel_dispatch_counters())
+    assert route == ((1, 0), (1, 0)), (route, len(tiles))
+    _emit_tiled("I1_ONE_DISPATCH_PER_ENTRY_POINT", bound=route[0], sentinel=route[1],
+                tiles_covered=len(tiles))
+
+    # ---- CONTROL: the parent traps at the observed extent, in the vendor's own words ----
+    trap_scores = _tiled_scores(TRAP_ROWS, 1032)
+    trap_clen = _tiled_causal_len(TRAP_ROWS)
+    # THE ASSERTION IS ON THE TWO NUMBERS, NOT ON THE SENTENCE. See VENDOR_PARTITION_NUMBERS: the
+    # claim is that 132 rows exceeded the 128-row partition axis, and a wording change in the vendor's
+    # message must not redden a correct candidate. The wording is still printed, verbatim.
+    quoted = VENDOR_PARTITION_ASSERT.format(rows=TRAP_ROWS, pmax=PARTITION_MAX)
+    kind, text = _trap_of(lambda: _run_parent_bound(trap_scores, trap_clen, POOL_SIZE))
+    numbers = _partition_numbers(text)
+    assert numbers == (TRAP_ROWS, PARTITION_MAX), (numbers, kind, text)
+    _emit_tiled("I1_CONTROL_PARENT_BOUND_TRAPS", rows=TRAP_ROWS, exception=kind,
+                extracted_rows=numbers[0], extracted_maximum=numbers[1],
+                wording_matches_the_recorded_run=int(quoted in text),
+                raw=" ".join(text.split())[:240])
+
+    # The sentinel half traps too, at the same extent -- which is why the block put BOTH entry points
+    # in one increment: fixing one alone moves the trap rather than removing it.
+    trap_values = torch.zeros(TRAP_ROWS, SELECT_K, dtype=torch.float32)
+    trap_idx = torch.zeros(TRAP_ROWS, SELECT_K, dtype=torch.int32)
+    s_kind, s_text = _trap_of(
+        lambda: _run_parent_sentinel(trap_values, trap_idx, POOL_COLUMNS)
+    )
+    s_numbers = _partition_numbers(s_text)
+    assert s_numbers == (TRAP_ROWS, PARTITION_MAX), (s_numbers, s_kind, s_text)
+    _emit_tiled("I1_CONTROL_PARENT_SENTINEL_TRAPS", rows=TRAP_ROWS, exception=s_kind,
+                extracted_rows=s_numbers[0], extracted_maximum=s_numbers[1],
+                wording_matches_the_recorded_run=int(quoted in s_text),
+                raw=" ".join(s_text.split())[:240])
+
+    # ---- and the candidate serves exactly that call, bit-exactly ----
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    served = dsa_causal_bound(trap_scores, trap_clen, POOL_SIZE)
+    want = dsa_causal_bound_torch_oracle(trap_scores, trap_clen, POOL_SIZE)
+    assert torch.equal(served.view(torch.int32), want.view(torch.int32)), (
+        f"the candidate served {TRAP_ROWS} rows but not the oracle's bits"
+    )
+    served_values, served_idx = _selection_of(served, SELECT_K)
+    served_marked = dsa_causal_sentinel(served_values, served_idx, POOL_COLUMNS)
+    want_marked = dsa_causal_sentinel_torch_oracle(served_values, served_idx, POOL_COLUMNS)
+    assert torch.equal(served_marked, want_marked)
+    trap_route = (causal_bound_dispatch_counters(), causal_sentinel_dispatch_counters())
+    assert trap_route == ((1, 0), (1, 0)), trap_route
+    _emit_tiled("I1_CANDIDATE_SERVES_THE_TRAP_EXTENT", rows=TRAP_ROWS,
+                max_abs_diff=_max_abs_diff(served, want),
+                sentinel_differing=int((served_marked != want_marked).sum()),
+                route=trap_route)
+
+
+# =========================================================================== #
+# TILED ITEM 2 -- BIT EQUALITY ON EVERY EXTENT `-103` ALREADY SERVES           #
+# =========================================================================== #
+
+
+def test_tiled_is_bit_identical_to_the_parent_kernel_and_the_oracles_below_the_ceiling() -> None:
+    """Item 2. At 128 rows or fewer the tiled kernels are the parent kernels, bit for bit.
+
+    Tiling is layout and not arithmetic, so this is the reading that says so: at every extent the
+    parent could serve, the tiled result equals the PARENT's result AND the torch oracle's, on the raw
+    int32 view rather than on ``==`` -- the same reason conjunct 1 gives, that ``==`` on floats cannot
+    tell ``-0.0`` from ``+0.0``.
+
+    ``-103``'s own declared shape is one of the cases, with ``-103``'s own dials and seed, so this
+    item also says the landed increment's readings still hold on the new bodies.
+
+    THE CONTROL IS IN THIS ITEM, and it points the opposite way from item 1's: a walk that HOISTS the
+    per-row length column out of the tile loop must AGREE here (one tile, so the hoist is invisible)
+    and DISAGREE above the ceiling. A control that only disagreed would not show that the bug is
+    invisible exactly where every landed reading lives.
+
+    Certifying component (D1.4): both kernels through both seams, against
+    ``_parent_bound_untiled`` / ``_parent_sentinel_untiled`` and the two torch oracles.
+    """
+    _assert_module_under_test_is_the_candidate()
+
+    # `-103`'s own case first, with its own dials, then the ladder up to the ceiling.
+    cases = [(ROWS, _scores(103), _causal_len())]
+    for rows in (1, PARTITION_MAX - 1, PARTITION_MAX):
+        cases.append((rows, _tiled_scores(rows, 2000 + rows), _tiled_causal_len(rows)))
+
+    agreed = 0
+    for rows, scores, clen in cases:
+        assert row_tile_count(rows) == 1, (rows, row_tile_count(rows))
+
+        reset_causal_bound_dispatch_counters()
+        tiled = dsa_causal_bound(scores, clen, POOL_SIZE)
+        parent = _run_parent_bound(scores, clen, POOL_SIZE)
+        oracle = dsa_causal_bound_torch_oracle(scores, clen, POOL_SIZE)
+        assert torch.equal(tiled.view(torch.int32), parent.view(torch.int32)), (
+            f"rows={rows}: the tiled bound differs from the parent kernel's own bits"
+        )
+        assert torch.equal(tiled.view(torch.int32), oracle.view(torch.int32)), (
+            f"rows={rows}: the tiled bound differs from the oracle -- if the parent agreed with the "
+            f"candidate here, the replica has drifted from the parent too"
+        )
+        assert causal_bound_dispatch_counters() == (1, 0), causal_bound_dispatch_counters()
+
+        values, idx32 = _selection_of(tiled, SELECT_K)
+        reset_causal_sentinel_dispatch_counters()
+        tiled_marked = dsa_causal_sentinel(values, idx32, POOL_COLUMNS)
+        parent_marked = _run_parent_sentinel(values, idx32, POOL_COLUMNS)
+        oracle_marked = dsa_causal_sentinel_torch_oracle(values, idx32, POOL_COLUMNS)
+        assert torch.equal(tiled_marked, parent_marked), f"rows={rows}: sentinel vs parent"
+        assert torch.equal(tiled_marked, oracle_marked), f"rows={rows}: sentinel vs oracle"
+        assert causal_sentinel_dispatch_counters() == (1, 0)
+
+        agreed += 1
+        _emit_tiled("I2_BIT_IDENTICAL", rows=rows, tiles=row_tile_count(rows),
+                    entries=tiled.numel(),
+                    bound_max_abs_diff=_max_abs_diff(tiled, parent),
+                    bound_differing_bits=int((tiled.view(torch.int32)
+                                              != parent.view(torch.int32)).sum()),
+                    sentinel_differing=int((tiled_marked != parent_marked).sum()))
+
+    assert agreed == len(cases), (agreed, len(cases))
+    _emit_tiled("I2_CASES", agreed=agreed, of=len(cases),
+                extents=[c[0] for c in cases])
+
+    # ---- CONTROL, part 1: at one tile the hoisted walk is INVISIBLE ----
+    rows = PARTITION_MAX
+    h_scores = _tiled_scores(rows, 1041)
+    h_clen = _tiled_causal_len(rows)
+    tiled_one = dsa_causal_bound(h_scores, h_clen, POOL_SIZE)
+    hoisted_one = _run_hoisted_bound(h_scores, h_clen, POOL_SIZE)
+    assert torch.equal(hoisted_one.view(torch.int32), tiled_one.view(torch.int32)), (
+        "the wrong walk must be INDISTINGUISHABLE at one tile, or it is not the bug this control "
+        "is about"
+    )
+    _emit_tiled("I2_CONTROL_HOIST_INVISIBLE_AT_ONE_TILE", rows=rows,
+                max_abs_diff=_max_abs_diff(hoisted_one, tiled_one))
+
+    # ---- CONTROL, part 2: above the ceiling it must differ, by a number ----
+    big = TILED_ROWS
+    b_scores = _tiled_scores(big, 1042)
+    b_clen = _tiled_causal_len(big)
+    tiled_big = dsa_causal_bound(b_scores, b_clen, POOL_SIZE)
+    hoisted_big = _run_hoisted_bound(b_scores, b_clen, POOL_SIZE)
+    diff = _max_abs_diff(hoisted_big, tiled_big)
+    differing_rows = int((hoisted_big != tiled_big).any(dim=1).sum())
+    assert diff > 0.0, "the wrong walk agreed above the ceiling; this control cannot fail"
+    assert differing_rows > 0, differing_rows
+    # It goes wrong in EVERY tile past the first, which is what the length period buys.
+    first_tile_rows = int((hoisted_big[:PARTITION_MAX] != tiled_big[:PARTITION_MAX]).any(dim=1).sum())
+    assert first_tile_rows == 0, "the hoist must be harmless in the tile it reads from"
+    _emit_tiled("I2_CONTROL_HOIST_DIFFERS_ABOVE_THE_CEILING", rows=big,
+                tiles=row_tile_count(big), max_abs_diff=diff, differing_rows=differing_rows,
+                differing_rows_in_first_tile=first_tile_rows)
+
+
+# =========================================================================== #
+# TILED ITEM 3 -- THE BOUNDARY LADDER                                          #
+# =========================================================================== #
+
+
+def test_tiled_boundary_ladder_matches_the_oracles_bit_for_bit() -> None:
+    """Item 3. Both entry points agree with their oracles at every edge of the tiling, not just at one
+    large extent.
+
+    The edges are where a tiling goes wrong: the last single tile, the first two-tile call whose second
+    tile holds ONE row, the observed trap, a whole number of tiles with no remainder, a non-multiple
+    whose remainder tile is short, and the registered envelope. :data:`TILED_LADDER` derives all six
+    from :data:`PARTITION_MAX`, and this item reads the tile geometry back out of the module for each
+    one rather than assuming it.
+
+    Certifying component (D1.4): both kernels through both seams against the two torch oracles.
+    """
+    _assert_module_under_test_is_the_candidate()
+
+    agreed = 0
+    for rows in TILED_LADDER:
+        scores = _tiled_scores(rows, 3000 + rows)
+        clen = _tiled_causal_len(rows)
+
+        reset_causal_bound_dispatch_counters()
+        reset_causal_sentinel_dispatch_counters()
+        got = dsa_causal_bound(scores, clen, POOL_SIZE)
+        want = dsa_causal_bound_torch_oracle(scores, clen, POOL_SIZE)
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), (
+            f"rows={rows}: the bound's bits differ from the oracle's"
+        )
+
+        values, idx32 = _selection_of(got, SELECT_K)
+        got_marked = dsa_causal_sentinel(values, idx32, POOL_COLUMNS)
+        want_marked = dsa_causal_sentinel_torch_oracle(values, idx32, POOL_COLUMNS)
+        assert torch.equal(got_marked, want_marked), f"rows={rows}: the sentinel differs"
+
+        route = (causal_bound_dispatch_counters(), causal_sentinel_dispatch_counters())
+        assert route == ((1, 0), (1, 0)), (rows, route)
+
+        # The bound count is read from this file's dials too, so an off-by-one in the inequality
+        # cannot hide behind the oracle agreeing with the kernel about the wrong thing.
+        complete = _tiled_complete_pools(rows)
+        expected_bounded = (POOL_COLUMNS - complete).clamp(min=0).to(torch.int64)
+        per_row = (got == BOUND_FILL).sum(dim=1).to(torch.int64)
+        assert torch.equal(per_row, expected_bounded), (
+            f"rows={rows}: filled-column counts disagree with this file's own dials"
+        )
+
+        tiles = row_tiles(rows)
+        agreed += 1
+        _emit_tiled("I3_LADDER", rows=rows, tiles=len(tiles), last_height=tiles[-1][1],
+                    entries=got.numel(), bound_max_abs_diff=_max_abs_diff(got, want),
+                    sentinel_differing=int((got_marked != want_marked).sum()),
+                    filled_total=int(per_row.sum()), route=route)
+
+    assert agreed == len(TILED_LADDER), (agreed, len(TILED_LADDER))
+    _emit_tiled("I3_CASES", agreed=agreed, of=len(TILED_LADDER), ladder=TILED_LADDER)
+
+
+# =========================================================================== #
+# TILED ITEM 4 -- TOKEN INDEPENDENCE ACROSS A TILE BOUNDARY                    #
+# =========================================================================== #
+
+
+def test_tiled_rows_stay_independent_across_a_tile_boundary() -> None:
+    """Item 4. Perturbing one query row moves that row's output block and NOTHING else.
+
+    This is the reading that says the tiling did not make one row's answer depend on which tile it
+    landed in. Two probes: the FIRST ROW OF THE SECOND TILE, which is the row a boundary bug would
+    reach first, and a row inside the SHORT LAST TILE, which is the one a remainder bug would reach.
+    Both the score and the length are perturbed, because they enter the kernel by different routes --
+    the score as the tile itself, the length as the per-row column operand.
+
+    Each probe row is asserted to complete strictly between zero and every pool, so the item cannot
+    pass vacuously: a wholly-bounded row would not move when its scores changed, and a saturated row
+    would not move when its length changed.
+
+    Certifying component (D1.4): ``causal_bound._causal_bound_nki`` through its seam.
+    """
+    _assert_module_under_test_is_the_candidate()
+    rows = TILED_ROWS
+    scores = _tiled_scores(rows, 1051)
+    clen = _tiled_causal_len(rows)
+    base = dsa_causal_bound(scores, clen, POOL_SIZE)
+    complete = _tiled_complete_pools(rows)
+
+    probes = (PARTITION_MAX, rows - 3)
+    for probe in probes:
+        assert 0 < int(complete[probe]) < POOL_COLUMNS, (
+            f"probe row {probe} completes {int(complete[probe])} pools; a probe must be interior"
+        )
+        moved_scores = scores.clone()
+        moved_scores[probe] = moved_scores[probe] + 1.0
+        moved_clen = clen.clone()
+        new_complete = (int(complete[probe]) + 1) % TILED_LENGTH_PERIOD
+        moved_clen[probe, 0] = new_complete * POOL_SIZE
+
+        got = dsa_causal_bound(moved_scores, moved_clen, POOL_SIZE)
+        assert not torch.equal(got[probe], base[probe]), (
+            f"probe row {probe} did not move when its own score and length did"
+        )
+
+        keep = torch.ones(rows, dtype=torch.bool)
+        keep[probe] = False
+        assert torch.equal(got[keep].view(torch.int32), base[keep].view(torch.int32)), (
+            f"perturbing row {probe} moved another row's bits"
+        )
+        # and the moved row is still exactly what the oracle says it is
+        want = dsa_causal_bound_torch_oracle(moved_scores, moved_clen, POOL_SIZE)
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+        _emit_tiled("I4_ROW_INDEPENDENCE", probe=probe, tile=probe // PARTITION_MAX,
+                    complete_pools_before=int(complete[probe]), complete_pools_after=new_complete,
+                    moved_rows=int((got != base).any(dim=1).sum()),
+                    other_rows_bit_identical=int(keep.sum()),
+                    max_abs_diff_vs_oracle=_max_abs_diff(got, want))
+
+    _emit_tiled("I4_PROBES", probes=list(probes), rows=rows, tiles=row_tile_count(rows))
+
+
+# =========================================================================== #
+# TILED ITEM 5 -- THE SENTINEL ARM AT THE SAME EXTENT, BOTH ARMS LIVE          #
+# =========================================================================== #
+
+
+def test_tiled_sentinel_marks_exactly_the_bounded_slots_with_both_arms_live() -> None:
+    """Item 5. At 2,048 rows the ``-1`` count per row is ``max(0, k - complete pools)``, on every row.
+
+    TWO READINGS, ONE CONJUNCT. The first has no pad in it, so the VALUE arm is the only thing that can
+    mark: the count is the closed form computed from this file's dials, on N/N rows, and the whole
+    tensor is bit-equal to the oracle. The second plants a selector-invented index PAST the real width
+    on rows whose slots are all real scores, so the INDEX arm is the only thing that can mark those
+    slots -- the item asserts their values are real scores first, which is what makes "no value test
+    can see them" a reading rather than a remark.
+
+    The planted rows are asserted to span more than one tile, because a pad screen that only worked in
+    the tile the kernel happens to start with is exactly the defect this increment could have
+    introduced.
+
+    Certifying component (D1.4): ``causal_bound._causal_sentinel_nki`` through its seam.
+    """
+    _assert_module_under_test_is_the_candidate()
+    rows = TILED_ROWS
+    scores = _tiled_scores(rows, 1061)
+    clen = _tiled_causal_len(rows)
+    bounded = dsa_causal_bound(scores, clen, POOL_SIZE)
+    values, idx32 = _selection_of(bounded, SELECT_K)
+
+    complete = _tiled_complete_pools(rows)
+    want_counts = (SELECT_K - complete).clamp(min=0).to(torch.int64)
+
+    reset_causal_sentinel_dispatch_counters()
+    marked = dsa_causal_sentinel(values, idx32, POOL_COLUMNS)
+    assert causal_sentinel_dispatch_counters() == (1, 0)
+    per_row = (marked == SENTINEL).sum(dim=1).to(torch.int64)
+    assert torch.equal(per_row, want_counts), (
+        "the per-row sentinel count disagrees with max(0, k - complete pools) computed from this "
+        "file's dials"
+    )
+    oracle = dsa_causal_sentinel_torch_oracle(values, idx32, POOL_COLUMNS)
+    assert torch.equal(marked, oracle), "the sentinel differs from the oracle at the envelope"
+    value_arm_rows = int((want_counts > 0).sum())
+    assert value_arm_rows > 0, "no row was bounded enough to exercise the value arm"
+    _emit_tiled("I5_VALUE_ARM", rows=rows, of=rows, sentinels=int(per_row.sum()),
+                rows_with_sentinels=value_arm_rows, differing_from_oracle=0,
+                formula="max(0, k - clen//pool_size)")
+
+    # ---- the INDEX arm, on rows whose every slot is a real score ----
+    stride_rows = torch.arange(0, rows, TILED_PAD_STRIDE)
+    planted = stride_rows[want_counts[stride_rows] == 0]
+    assert int(planted.numel()) > 0, "no fully-kept row to plant a pad on"
+    tiles_touched = sorted({int(r) // PARTITION_MAX for r in planted.tolist()})
+    assert len(tiles_touched) > 1, (
+        f"the planted pads must span more than one tile; they touched {tiles_touched}"
+    )
+    assert bool((values[planted, 0] > BOUND_FILL_MARK).all()), (
+        "a planted slot held a fill, so the value arm could mark it and the index arm would not be "
+        "the thing under test"
+    )
+
+    padded_idx = idx32.clone()
+    padded_idx[planted, 0] = POOL_COLUMNS  # one past the last REAL pool, which is what a pad is
+    reset_causal_sentinel_dispatch_counters()
+    marked_pad = dsa_causal_sentinel(values, padded_idx, POOL_COLUMNS)
+    assert causal_sentinel_dispatch_counters() == (1, 0)
+    assert bool((marked_pad[planted, 0] == SENTINEL).all()), "a planted pad was kept"
+
+    # NOTHING ELSE MOVED: the expected tensor is the no-pad result with exactly those slots marked.
+    expected = marked.clone()
+    expected[planted, 0] = SENTINEL
+    assert torch.equal(marked_pad, expected), (
+        "planting a pad changed a slot it was not planted on"
+    )
+    pad_oracle = dsa_causal_sentinel_torch_oracle(values, padded_idx, POOL_COLUMNS)
+    assert torch.equal(marked_pad, pad_oracle)
+    _emit_tiled("I5_INDEX_ARM", planted_rows=int(planted.numel()),
+                first=int(planted[0]), last=int(planted[-1]), tiles_touched=len(tiles_touched),
+                sentinels=int((marked_pad == SENTINEL).sum()),
+                sentinels_without_pads=int(per_row.sum()),
+                differing_from_oracle=int((marked_pad != pad_oracle).sum()))
+
+
+# =========================================================================== #
+# TILED ITEM 6 -- THE ROUTE AT THE REGISTERED ENVELOPE                         #
+# =========================================================================== #
+
+
+def test_tiled_route_is_one_nki_dispatch_per_entry_point_at_the_envelope() -> None:
+    """Item 6. Route predicate form R-1 at 2,048 rows: 1 NKI dispatch per entry point, 0 fallbacks.
+
+    ``-103``'s landed route reading is re-satisfied by construction -- the counters, the resets, the
+    accessors and the identity helpers did not move -- and this item takes it at the extent ``-103``
+    could not reach. The reading that matters here is the PAIR: many tiles, one dispatch. A host-side
+    loop over 128-row slices would serve the same shapes and read ``len(tiles)`` dispatches, which is
+    the design P13 excludes and the number that tells the two apart.
+
+    THE FALLBACK ZERO'S FIRING CONTROL IS NOT REPEATED HERE. Conjunct 4 above already moves both
+    ``torch_fallback`` counters off 0 by forcing ``can_run_kernel`` False, and a second spelling of
+    that control would be a second place for it to drift.
+
+    Certifying component (D1.4): both seams' counters and both kernel-identity accessors.
+    """
+    _assert_module_under_test_is_the_candidate()
+    rows = TILED_ROWS
+    scores = _tiled_scores(rows, 1071)
+    clen = _tiled_causal_len(rows)
+    tiles = row_tile_count(rows)
+    assert tiles > 1, tiles
+
+    reset_causal_bound_dispatch_counters()
+    reset_causal_sentinel_dispatch_counters()
+    assert causal_bound_kernel_identity() is None
+    assert causal_sentinel_kernel_identity() is None
+
+    assert can_run_dsa_causal_bound(scores, clen, POOL_SIZE) is True
+    bounded = dsa_causal_bound(scores, clen, POOL_SIZE)
+    values, idx32 = _selection_of(bounded, SELECT_K)
+    assert can_run_dsa_causal_sentinel(values, idx32, POOL_COLUMNS) is True
+    dsa_causal_sentinel(values, idx32, POOL_COLUMNS)
+
+    bound_route = causal_bound_dispatch_counters()
+    sentinel_route = causal_sentinel_dispatch_counters()
+    assert bound_route == (1, 0), (bound_route, tiles)
+    assert sentinel_route == (1, 0), (sentinel_route, tiles)
+
+    bound_id = causal_bound_kernel_identity()
+    sentinel_id = causal_sentinel_kernel_identity()
+    assert bound_id is not None and sentinel_id is not None
+    assert bound_id[1] == "_causal_bound_nki", bound_id
+    assert sentinel_id[1] == "_causal_sentinel_nki", sentinel_id
+    assert bound_id[0].endswith("dsa.causal_bound"), bound_id
+    assert sentinel_id[0].endswith("dsa.causal_bound"), sentinel_id
+    _emit_tiled("I6_ROUTE", rows=rows, tiles=tiles, nki_dispatch_bound=bound_route[0],
+                torch_fallback_bound=bound_route[1], nki_dispatch_sentinel=sentinel_route[0],
+                torch_fallback_sentinel=sentinel_route[1],
+                bound_kernel="/".join(bound_id), sentinel_kernel="/".join(sentinel_id))
+
+    # A SECOND CALL DISPATCHES A SECOND TIME, so "1" is a per-call reading and not a saturated flag.
+    dsa_causal_bound(scores, clen, POOL_SIZE)
+    assert causal_bound_dispatch_counters() == (2, 0), causal_bound_dispatch_counters()
+    _emit_tiled("I6_PER_CALL", second_call=causal_bound_dispatch_counters()[0], tiles=tiles)

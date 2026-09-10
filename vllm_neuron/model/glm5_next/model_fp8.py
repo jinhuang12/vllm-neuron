@@ -88,10 +88,12 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MHC_LEAVES,
     build_weight_mappings,
     classify_mapped_keys,
+    compensate_block_scales,
     consumer_block_quant_size,
     DeferredShardGeometry,
     dequantise_blockwise,
     loader_for_mapped_keys,
+    report_floored_blocks,
     scale_keys,
     sharded_scale_grid_loader,
     ShardGeometry,
@@ -350,6 +352,58 @@ class _DeclaredShard:
     #: unquantised deferred family. Mutually exclusive with the pad, enforced in
     #: ``DeferredShardGeometry.__post_init__`` rather than trusted here.
     require_consumer_block: bool = False
+
+
+#: The value a pad row carries, and no activation on either dense path does.
+#:
+#: `inc-glm53f-026b`. The seam tiles ``M`` over the PSUM partition axis and does
+#: not pad, so it refuses any token count that is not a whole number of
+#: ``TILE_SIZE`` rows and says in its own message that padding is the caller's
+#: (``functional/blockwise_fp8_mm.py:239-245``). A one-token decode step is
+#: exactly that case, so both dense paths pad here and slice the result back
+#: inside the same call. **The refusal itself is not touched**: weakening it
+#: would ship a torch path for kernel-class work, which is what its own
+#: docstring refuses (``blockwise_fp8_mm.py:386-397``, P13 and D6).
+#:
+#: ``-2 ** 15`` is exact in ``bfloat16`` and orders of magnitude outside the
+#: widest pre-activation this path has produced -- ``[67.94, 184.89]`` at
+#: `-033`'s fixture (``increments/probe-R7-clamp-and-config-lift.out``) -- so a
+#: pad row is identifiable by EQUALITY rather than by a tolerance. The value
+#: never reaches a caller: the slice removes every pad row at the single return,
+#: and the acceptance counts that.
+_TOKEN_PAD_SENTINEL = -32768.0
+
+
+def _pad_tokens_to_tile(
+    hidden_states: torch.Tensor, tile: int
+) -> tuple[torch.Tensor, int]:
+    """Grow ``[T, H]`` up to a whole tile of rows. Returns it with the caller's T.
+
+    A token count that is already a whole tile is returned UNCHANGED and pays no
+    copy, so the prefill shape this model has always run keeps its exact bytes.
+
+    A count of zero or less is also returned unchanged, deliberately: the seam
+    refuses it by name and inventing rows for an empty call would replace a clear
+    refusal with a silently different function.
+    """
+    tokens = int(hidden_states.shape[0])
+    if tokens <= 0 or tokens % tile == 0:
+        return hidden_states, tokens
+    pad = hidden_states.new_full(
+        (tile - tokens % tile, int(hidden_states.shape[1])), _TOKEN_PAD_SENTINEL
+    )
+    return torch.cat((hidden_states, pad), dim=0), tokens
+
+
+def _unpad_rows(out: torch.Tensor, tokens: int) -> torch.Tensor:
+    """Give the caller back its own rows. The pad never leaves the call.
+
+    Written as its own function rather than inline so the acceptance can remove
+    exactly this step and nothing else, which is the control the design names.
+    """
+    if int(out.shape[0]) == tokens:
+        return out
+    return out[:tokens]
 
 
 def _kda_head_width(module: nn.Module, world_size: int) -> int:
@@ -2901,10 +2955,12 @@ class Glm5NextSharedExperts(nn.Module):
         says what the omission cost.
 
         Args:
-            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
-                whole number of ``TILE_SIZE`` rows -- the seam tiles ``M`` over
-                the PSUM partition axis and does not pad
-                (``blockwise_fp8_mm.py:239-245``), so padding is the caller's.
+            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` may be any
+                positive count: the seam tiles ``M`` over the PSUM partition axis
+                and does not pad (``blockwise_fp8_mm.py:239-245``), so THIS
+                METHOD pads to a whole ``TILE_SIZE`` and slices the result back
+                before returning (`inc-glm53f-026b`). A ``T`` that is already a
+                whole tile is not copied.
             gate_proj_weight: ``[H, I]`` fp8-e4m3, expressed against
                 ``gate_proj_scale``.
             up_proj_weight: ``[H, I]`` fp8-e4m3.
@@ -3010,6 +3066,14 @@ class Glm5NextSharedExperts(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
+        # ---- PAD TO A WHOLE TILE. `inc-glm53f-026b`. ---------------------- #
+        # The pad is created here, consumed by the three dispatches below and
+        # removed at the single return, so it never leaves this call: nothing
+        # outside can observe it and no state can be advanced by it. The extent
+        # checks above ran on the caller's own tensor, so a mis-shaped operand
+        # still fails on what the caller passed.
+        hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
+
         # ---- The three projection sites. The counted seam entries. ------- #
         # Each passes the operand ``prepare_scale_operands`` built at load time,
         # by keyword (`inc-glm53f-090`). The public grid is still passed too: the
@@ -3083,12 +3147,17 @@ class Glm5NextSharedExperts(nn.Module):
         # cast back to the activation dtype. The cast is named rather than
         # implicit because it is a real precision step and the acceptance's torch
         # reference mirrors it at the same point.
-        # ENTRY 3 of 3 -- down.
-        return blockwise_fp8_mm(
-            activated.to(hidden_states.dtype),
-            down_proj_weight,
-            down_proj_scale,
-            prebuilt_scale_t=self._prepared_scale_operand("down_proj"),
+        # ENTRY 3 of 3 -- down. The slice back is `-026b`'s, and it is the last
+        # thing that happens: the caller receives its own row count, never the
+        # padded one.
+        return _unpad_rows(
+            blockwise_fp8_mm(
+                activated.to(hidden_states.dtype),
+                down_proj_weight,
+                down_proj_scale,
+                prebuilt_scale_t=self._prepared_scale_operand("down_proj"),
+            ),
+            tokens,
         )
 
     # ── the shared expert's forward -- ``inc-glm53f-054a`` item 3 of 7 ────
@@ -3589,11 +3658,12 @@ class Glm5NextDenseMLP(nn.Module):
         and the shared expert alike (DECISIONS §77).
 
         Args:
-            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` must be a
-                whole number of ``TILE_SIZE`` rows -- the seam tiles ``M`` over
-                the PSUM partition axis and does not pad
-                (``blockwise_fp8_mm.py:239-245``), so padding is the caller's,
-                exactly as it is for the shared expert.
+            hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` may be any
+                positive count: the seam tiles ``M`` over the PSUM partition axis
+                and does not pad (``blockwise_fp8_mm.py:239-245``), so THIS
+                METHOD pads to a whole ``TILE_SIZE`` and slices the result back
+                before returning, exactly as the shared expert does
+                (`inc-glm53f-026b`).
             quant_config: the resolved per-model quantisation policy, and the
                 route selector. An ARGUMENT rather than a field, because that is
                 what all three landed methods of this family do (``:1539``,
@@ -3696,6 +3766,12 @@ class Glm5NextDenseMLP(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
+        # ---- PAD TO A WHOLE TILE. `inc-glm53f-026b`, the same two lines as the
+        # shared expert's and for the same reason: the seam refuses a token count
+        # that is not a whole tile and does not pad, so a one-token decode step
+        # pads here and is sliced back at the single return below.
+        hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
+
         # ---- THE TWO PARALLEL PROJECTIONS. Two entries, two dispatches.
         gate = blockwise_fp8_mm(
             hidden_states, gate_proj_weight, scale_grid("gate_proj_weight")
@@ -3722,11 +3798,15 @@ class Glm5NextDenseMLP(nn.Module):
 
         # ---- THE DOWN PROJECTION re-enters the seam, whose declared input
         # dtype is ``bfloat16`` (``blockwise_fp8_mm.py:446``), so the fp32
-        # intermediate is cast back to the caller's activation dtype here.
-        return blockwise_fp8_mm(
-            activated.to(hidden_states.dtype),
-            down_proj_weight,
-            scale_grid("down_proj_weight"),
+        # intermediate is cast back to the caller's activation dtype here. The
+        # slice back is `-026b`'s and it is the last thing that happens.
+        return _unpad_rows(
+            blockwise_fp8_mm(
+                activated.to(hidden_states.dtype),
+                down_proj_weight,
+                scale_grid("down_proj_weight"),
+            ),
+            tokens,
         )
 
 
@@ -7288,15 +7368,31 @@ def _publish_compute_frame_operands(
     this step already count. The transpose count and both frames go into the health
     record on ``health_attr``.
 
-    TWO STEPS, INDEPENDENT, IN THIS ORDER.
+    THREE STEPS, INDEPENDENT, IN THIS ORDER.
 
-    1. Coarsen the checkpoint's ``128``-tile scale grid onto the ``256`` public
+    1. Compensate the checkpoint's scale grid by the compensation factor, once
+       (``inc-glm53f-054c``). The loader squeezed the weight BYTES into the 240
+       range and attached these grids RAW, so without this step the product
+       reaching the kernel is the SQUEEZE FACTOR times the checkpoint's -- ``240/448``
+       when this step was written, an exact ``1/2`` since ``inc-glm53f-054e``. The
+       factor is read from ``compensate_block_scales``, never written here. NEVER
+       skipped and
+       never conditional on extents -- the compensator's own platform gate decides
+       whether the multiply happens, and on a platform that needs no squeeze it is
+       a no-op that still reports.
+    2. Coarsen the checkpoint's ``128``-tile scale grid onto the ``256`` public
        grid, which also requantises the weight. This runs only for extents that
        are whole ``256`` blocks; a miniature with no public grid to build is
        RECORDED and skipped, because a silent skip looks exactly like a working
        retile.
-    2. Transpose the weight and its grid into the compute frame. This is NEVER
+    3. Transpose the weight and its grid into the compute frame. This is NEVER
        skipped: a skipped transpose leaves the forward refusing at layer 0.
+
+    STEP 1 RUNS BEFORE STEP 2 AND THE ORDER IS LOAD-BEARING. Step 2's refusal
+    predicate reads ``scales[tile] / retained``, and a uniform multiply of the whole
+    grid cancels in that ratio, so compensating first leaves which blocks step 2
+    refuses unchanged -- EXCEPT where the ``MINVAL`` floor engages on a block and
+    breaks the uniformity, which is why the floored count is recorded per leaf.
 
     WHY THE TRANSPOSE IS HERE AND NOT IN THE FORWARD. The loader delivers the
     checkpoint's own layout -- ``[I, H]`` for gate and up, ``[H, I]`` for down (the
@@ -7360,6 +7456,51 @@ def _publish_compute_frame_operands(
             raise error_cls(f"{grid_name} must be 2-D, got shape {tuple(grid.shape)}")
         rows, cols = int(weight.shape[0]), int(weight.shape[1])
         record: dict[str, object] = {"loader_frame": (rows, cols)}
+
+        # ---- THE SCALE COMPENSATION, EXACTLY ONCE PER GRID (``inc-glm53f-054c``).
+        # The weight BYTES arrive already squeezed into the 240 range by the loader
+        # (``weight_loaders_fp8.py:2250`` -> ``:1346`` -> ``:1174``), while this file
+        # attached their scale GRIDS raw (``:7734``/``:7743``). Only half a matched pair
+        # ran, so the product the kernel multiplied was the squeeze factor times the
+        # checkpoint's -- 240/448 = 53.5714% when this was written, an exact 50% since
+        # ``inc-glm53f-054e``. The loader's own module header states the pair -- squeeze the
+        # bytes AND compensate the per-block scale by the inverse factor -- and
+        # ``sharded_scale_grid_loader``'s docstring names THIS prep as the consumer that
+        # owes the second half. Nothing did it: the file held zero calls to it.
+        #
+        # HERE, AND NOT BESIDE THE RETILE, for three reasons. Both grid routes have
+        # converged by this line, so the unsharded ``_get_slice`` grid is covered as well
+        # as the sharded one. It runs once per projection per LOAD rather than once per
+        # token. And it sits AHEAD of the extent branch below: that branch skips the
+        # retile but still transposes whatever grid is attached, so a compensation placed
+        # in the retile arm would miss exactly the extents no retile covers.
+        #
+        # THE FUNCTION IS REUSED, NEVER REWRITTEN. It carries the platform gate
+        # (``needs_240_downscale``), the ``MINVAL`` floor and the floored-block census,
+        # and the routed bank already calls that same function in its own loader
+        # (``weight_loaders_fp8.py:2623``). The bank never reaches this prep -- it retiles
+        # inside ``Glm5NextRoutedExperts.prepare_scale_operands`` -- so this call cannot
+        # double-compensate it, and no second copy of the arithmetic exists to drift.
+        compensation = compensate_block_scales(grid)
+        report_floored_blocks(compensation, grid_name)
+        grid = compensation.scale_inv
+        # WRITTEN BACK BEFORE THE BRANCH, not after it. The retile arm rebinds this
+        # attribute to the public grid further down, but the skip arm never rebinds it and
+        # STEP 2 transposes whatever is attached. Without this ``setattr`` a skipped
+        # projection would carry the RAW grid into the compute frame and the defect would
+        # survive at the one granularity the retile does not touch.
+        setattr(module, grid_name, grid)
+        # A COUNTER, NOT A LITERAL. ``record`` is fresh per leaf, so this reads 1 for a
+        # grid compensated once and would read 2 if a second call were ever added to this
+        # loop body -- which is the reading the acceptance asks for ("neither 0 nor 2").
+        # ``scale_compensated`` is the PLATFORM answer and is False where the squeeze is a
+        # no-op, so a test cannot mistake a no-op platform for a working compensation.
+        record["scale_compensations_applied"] = (
+            int(record.get("scale_compensations_applied", 0)) + 1
+        )
+        record["scale_compensated"] = compensation.applied
+        record["scale_blocks_floored"] = len(compensation.floored_blocks)
+
         if rows % BLOCK_QUANT_SIZE or cols % BLOCK_QUANT_SIZE:
             # No public grid exists for these extents. Recorded, not silent. The
             # transpose below still runs: the frame is wrong for the kernel
