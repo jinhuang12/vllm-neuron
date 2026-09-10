@@ -4923,8 +4923,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         and the ring it seeds -- ``prefill_tail`` with ``prefill_end_position`` --
         on the prefill leg, or ``tail`` and ``position`` on the decode leg
         (``model_fp8.py:6696-6713``); a linear (KDA) layer takes ``conv_state``,
-        ``recurrent_state`` and ``is_prefill`` (``:4149``). Which leg is running is
-        the caller's reading of the batch, passed in rather than guessed here.
+        ``recurrent_state``, ``is_prefill`` and ``start_position`` (``:4149``).
+        Which leg is running is the caller's reading of the batch, passed in
+        rather than guessed here.
+
+        BOTH FAMILIES READ THE POSITION FROM ONE VARIABLE. The linear family
+        needs it for the same reason the sparse one does: a prompt longer than one
+        batch of tokens arrives in segments, and a later segment continues state
+        the earlier one wrote, which the receiving layer can only know from how
+        many tokens are already computed.
 
         ONE SEQUENCE PER CALL, REFUSED RATHER THAN MIS-SLICED. The latent cache a
         DSA layer takes is one sequence's slots in position order, and
@@ -4985,6 +4992,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "conv_state": bank["conv_state"][int(state_slot)],
                         "recurrent_state": bank["recurrent_state"][int(state_slot)],
                         "is_prefill": bool(is_prefill),
+                        "start_position": int(start_position),
                     }
                 )
                 continue
