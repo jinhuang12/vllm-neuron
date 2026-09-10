@@ -7388,20 +7388,46 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
     # The health counters, PRINTED as readings and gated on nothing: the first 256
     # block rescales by exactly 2 and stays bit-exact, later blocks rescale by
     # fractions fp8 cannot hold, and the old factor never reached them.
+    #
+    # THE TWO DICT-SHAPED RECORDS, EACH NAMED. A suffix scan over
+    # ``dir(type(module))`` also matches the ROUTED bank's own
+    # ``RETILE_HEALTH_ATTR`` (``model_fp8.py:2143``), and that one publishes a dict
+    # of TUPLES -- ``(emitted_unsupplied, input_scales_dropped, inexact_rescales)``
+    # per projection (``:2334-2352``) -- so ``record.get`` reached a tuple and a
+    # CORRECT load raised ``AttributeError``. The deferred fixture has four routed
+    # experts and the load path prepares every module that offers a prep
+    # (``model_fp8.py:7899``), so it was reached every time.
+    #
+    # NAMING BOTH IS A POSITIVE SELECTION, not a filter. "Skip anything that is not
+    # a dict" would also pass on the day the shared or dense record changed shape:
+    # the loop would collect nothing and only the emptiness assert below would be
+    # left to speak, and it speaks only if BOTH banks vanish. With the names, a
+    # missing attribute makes ``getattr`` return ``None`` and that assert names it.
+    # Both landed readers of these two records name them the same way: ``:7191``
+    # for the shared bank, ``:4861`` for the dense MLP.
+    #
+    # THE ROUTED BANK'S COUNTS ARE THEREFORE NOT IN THIS TOTAL, and the row says so.
+    # Reading them needs an index convention for a nameless tuple, which is a
+    # different change from this repair; the shared and dense records carry
+    # ``inexact_rescales`` by name (``model_fp8.py:7191-7199``).
     health_records: dict[tuple[str, str], dict] = {}
     for path, module in ramp_loaded.named_modules():
-        for attribute_name in dir(type(module)):
-            if not attribute_name.endswith("RETILE_HEALTH_ATTR"):
+        for attribute_name in (
+            "SHARED_RETILE_HEALTH_ATTR",
+            "DENSE_RETILE_HEALTH_ATTR",
+        ):
+            attribute = getattr(type(module), attribute_name, None)
+            if attribute is None:
                 continue
-            health = getattr(module, getattr(type(module), attribute_name), None)
+            health = getattr(module, attribute, None)
             if not health:
                 continue
             for leaf, record in health.items():
                 health_records[(path, leaf)] = record
     assert health_records, (
-        "the completed ramp load published no retile health record, so the retile "
-        "either did not run or does not report -- and this item's readings about "
-        "rescales would be about nothing"
+        "the completed ramp load published no shared-expert or dense-MLP retile "
+        "health record, so that retile either did not run or does not report -- "
+        "and this item's readings about rescales would be about nothing"
     )
     total_inexact = 0
     for (path, leaf), record in sorted(health_records.items()):
@@ -7413,7 +7439,8 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
         )
     print(
         f"RAMPREFUSAL_INEXACT_TOTAL={total_inexact}|records={len(health_records)}"
-        f"|gated_on_none|a fraction fp8 cannot hold is a rescale, not a refusal"
+        f"|banks=shared+dense|gated_on_none|a fraction fp8 cannot hold is a "
+        f"rescale, not a refusal"
     )
 
     # ---- ARM 2: THE REFUSAL IS STILL REACHABLE, at the derived ratio.
