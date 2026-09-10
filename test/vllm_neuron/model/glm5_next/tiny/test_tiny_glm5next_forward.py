@@ -220,8 +220,12 @@ def _impl():
 #: EVERY ACCESSOR IS NAMED -- READ AND RESET BOTH -- AND NOTHING IS DERIVED, and
 #: that changed on a counterexample rather than on taste (``inc-glm53f-054a``,
 #: repair R; ``probe-054a-counter-population-r1``, 21 modules and 24 families read
-#: from the package's own source). The convention IS ``"reset_" + read`` in twenty
-#: of the twenty-one modules, and ``functional/moe/router.py`` breaks it: its
+#: from the package's own source). ``inc-glm53f-054e`` c6 re-read the same source
+#: with the control's own regex and finds 22 modules and 26 families: the extra two
+#: are ``inc-glm53f-103``'s causal bound and causal sentinel, and grant 181's run
+#: names them itself (``TINYFWD|counter_population|found=26|claimed=24``). The
+#: convention IS ``"reset_" + read`` in twenty-one of the twenty-two modules, and
+#: ``functional/moe/router.py`` breaks it: its
 #: reader is ``noaux_tc_dispatch_counters`` and its reset is
 #: ``reset_noaux_tc_counters``, so a derived name is an ``AttributeError`` on the
 #: first line of every item's route predicate. Naming both costs one string per row
@@ -241,8 +245,12 @@ def _impl():
 #: Naming the reader rather than discovering it stays deliberate:
 #: ``test_dsa_layer.py:380`` discovers the pair by scanning for the
 #: ``_dispatch_counters`` suffix and asserts exactly one pair per module, which is
-#: true of every module below EXCEPT ``mla_sparse`` (three families) and
-#: ``kda/chunked_recurrence`` (two). The two coverage controls below keep the naming
+#: true of every module below EXCEPT ``mla_sparse`` (three families),
+#: ``kda/chunked_recurrence`` (two) and, since ``inc-glm53f-054e`` c6 registered it,
+#: ``dsa/causal_bound`` (two). That file already knows it: its own
+#: ``_causal_bound_apis`` asserts two readers and two resets there and asserts the
+#: single-pair helper REFUSES the module (``test_dsa_layer.py:3665-3692``). The two
+#: coverage controls below keep the naming
 #: honest: one refuses a registered module that grows a family no row claims, the
 #: other refuses a family anywhere in the package that no row claims at all.
 _SEAM_REGISTRY = {
@@ -298,6 +306,18 @@ _SEAM_REGISTRY = {
     "dsa_causal_fill": (
         "vllm_neuron.functional.dsa.causal_fill",
         "causal_fill_dispatch_counters", "reset_causal_fill_dispatch_counters"),
+    # ``inc-glm53f-054e`` c6: the two families ``inc-glm53f-103`` added, which no row
+    # claimed. Grant 181's run read them as the gap itself --
+    # ``TINYFWD|counter_population|found=26|claimed=24`` -- and refused all seven
+    # items before any forward ran. One row per family, because this module holds
+    # two entry points with an instance each (``causal_bound.py:187-208``).
+    "dsa_causal_bound": (
+        "vllm_neuron.functional.dsa.causal_bound",
+        "causal_bound_dispatch_counters", "reset_causal_bound_dispatch_counters"),
+    "dsa_causal_sentinel": (
+        "vllm_neuron.functional.dsa.causal_bound",
+        "causal_sentinel_dispatch_counters",
+        "reset_causal_sentinel_dispatch_counters"),
     "kda_chunked_recurrence": (
         "vllm_neuron.functional.kda.chunked_recurrence",
         "dispatch_counters", "reset_dispatch_counters"),
@@ -406,9 +426,11 @@ def _assert_every_counter_family_is_registered() -> None:
 
     ``dir()`` shows imported names too, so a module that imported another's
     accessor would read as owning a family it does not define. Measured, not
-    assumed: across all twenty-one modules that define a family, no name ending in
+    assumed: across all twenty-two modules that define a family, no name ending in
     the suffix is imported or assigned, only defined
-    (``probe-054a-counter-names-r1``, ``probe-054a-counter-population-r1``).
+    (``probe-054a-counter-names-r1``, ``probe-054a-counter-population-r1``, and for
+    the twenty-second ``inc-glm53f-054e`` c6 re-read ``dsa/causal_bound.py``, which
+    defines four such names at column 0 and imports none).
 
     THIS CONTROL CANNOT SEE A MODULE NO ROW NAMES, which is what let ten families
     sit unregistered until repair R; :func:`_assert_no_unregistered_counter_family`
@@ -456,7 +478,10 @@ def _assert_no_unregistered_counter_family() -> None:
     WHY IT FIRES ON A NEW SEAM RATHER THAN IGNORING IT. A campaign-owned seam that
     nothing reads is the failure mode this control exists for; a seam this campaign
     does NOT own would be an exclusion with a reason, and there is none today --
-    every one of the twenty-one modules is named in this campaign's plan.
+    every one of the twenty-two modules is named in this campaign's plan, the
+    twenty-second being ``inc-glm53f-103``'s ``dsa/causal_bound``. This control did
+    its job once for real: it is what refused grant 181's run rather than letting
+    seven forwards read two of this campaign's own seams as if they did not exist.
 
     Raises:
         VacuousControlError: naming the module and the family that no row claims.
@@ -486,6 +511,37 @@ def _assert_no_unregistered_counter_family() -> None:
             f"Rows the package does not define: {phantom}. An unclaimed family is "
             f"a seam this campaign owns whose torch fallbacks no predicate totals"
         )
+
+
+def _declare_bound_and_sentinel(expected: dict) -> None:
+    """Declare ``-103``'s two causal families at the SELECTOR's count, not at a number.
+
+    ``Glm5NextDSAIndexer.select_bounded_pools`` composes the three seams in one
+    straight-line method with no branch between them (``model_fp8.py:5003-5009``):
+    ``dsa_causal_bound``, then ``dsa_topk_select``, then ``dsa_causal_sentinel``. So
+    whatever an item declares for the selector is arithmetically what these two owe,
+    per item and per layer, and taking it FROM the selector's own entry is what stops
+    a later change to one of the three from leaving the other two stale.
+
+    ``test_dsa_layer.py`` measured this pair through the indexer at THIS file's dials
+    -- ``select_k == TOPK_POOLS == 2`` and ``pool == POOL_SIZE == 4`` there against
+    ``MLA_TOPK_POOLS = 2`` and ``MLA_INDEX_KPOOL = 4`` here -- and read ``(1, 0)``
+    for both entry points (``:3907-3922``, repeated at ``:4251-4259``). The zero half
+    of that reading is the one conjunct 2 already aggregates, and it stays zero
+    because ``can_run_kernel()`` is True in this file's launch mode
+    (``VLLM_NEURON_CPU_MODE=1`` with ``NKI_SIMULATOR=1``, ``neuron_utils.py:16-23``),
+    so both entry points take their NKI branch rather than a torch oracle -- which is
+    P13's requirement, not a preference.
+
+    An item whose forward reaches no indexer declares no selector count, and this
+    helper then declares nothing either: items 1 to 4 are exactly that case, and
+    their zeros stay READ rather than becoming expectations.
+    """
+    selector = expected.get("dsa_topk_select")
+    if selector is None:
+        return
+    expected["dsa_causal_bound"] = selector
+    expected["dsa_causal_sentinel"] = selector
 
 
 def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict) -> None:
@@ -3269,21 +3325,26 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
     # The two tiled sparse counters are DECLARED ZEROS at this geometry -- the
     # latent is an exact 128 fit and 128 selected rows is inside one moving tile --
     # so they are registered and read rather than left out of the population.
-    _assert_route_predicate(
-        "5 MLA attention",
-        {
-            "mla_projection": 9,
-            "mla_absorb": 2,
-            "mla_sparse": 1,
-            "dsa_kpool_hadamard": 2,
-            "dsa_paged_gather": 1,
-            "dsa_score_gemm": 1,
-            "dsa_topk_select": 1,
-            "dsa_index_expand": 1,
-        },
-        before,
-        after,
-    )
+    #
+    # -054e c6: the causal bound and the causal sentinel are NOT zeros here. This
+    # item's fixture refuses the bypass regime by name (see the candidate-count
+    # guard above), so the indexer selects, and the selecting path dispatches all
+    # three of bound, selector and sentinel once each. Their counts are therefore
+    # taken from the selector's own entry rather than written twice more --
+    # :func:`_declare_bound_and_sentinel` carries the call chain and the landed
+    # reading it rests on.
+    route_expected = {
+        "mla_projection": 9,
+        "mla_absorb": 2,
+        "mla_sparse": 1,
+        "dsa_kpool_hadamard": 2,
+        "dsa_paged_gather": 1,
+        "dsa_score_gemm": 1,
+        "dsa_topk_select": 1,
+        "dsa_index_expand": 1,
+    }
+    _declare_bound_and_sentinel(route_expected)
+    _assert_route_predicate("5 MLA attention", route_expected, before, after)
 
     if tuple(got.shape) != (MLA_TOKENS, MLA_HIDDEN_SIZE):
         raise ReferenceShapeError(
@@ -4375,24 +4436,21 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # per-layer figures are not re-derived here: item 5 reads them off
     # ``test_dsa_layer.py``'s landed closed form, and that table is per layer per
     # PHASE (``DECLARED_PER_LAYER``), so it does not move with the token count.
-    _assert_route_predicate(
-        "6 the decoder stack",
-        {
-            "mla_projection": 9 * STACK_LAYERS,
-            "mla_absorb": 2 * STACK_LAYERS,
-            "mla_sparse": 1 * STACK_LAYERS,
-            "dsa_kpool_hadamard": 2 * STACK_LAYERS,
-            "dsa_paged_gather": 1 * STACK_LAYERS,
-            "dsa_score_gemm": 1 * STACK_LAYERS,
-            "dsa_topk_select": 1 * STACK_LAYERS,
-            "dsa_index_expand": 1 * STACK_LAYERS,
-            "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-            "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
-            "noaux_tc_router": 1 * STACK_MOE_LAYERS,
-        },
-        before,
-        after,
-    )
+    route_expected = {
+        "mla_projection": 9 * STACK_LAYERS,
+        "mla_absorb": 2 * STACK_LAYERS,
+        "mla_sparse": 1 * STACK_LAYERS,
+        "dsa_kpool_hadamard": 2 * STACK_LAYERS,
+        "dsa_paged_gather": 1 * STACK_LAYERS,
+        "dsa_score_gemm": 1 * STACK_LAYERS,
+        "dsa_topk_select": 1 * STACK_LAYERS,
+        "dsa_index_expand": 1 * STACK_LAYERS,
+        "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
+        "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+        "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+    }
+    _declare_bound_and_sentinel(route_expected)
+    _assert_route_predicate("6 the decoder stack", route_expected, before, after)
 
     # ---- THE HOOKS FIRED ONCE PER LAYER, IN STACK ORDER. Read before anything is
     # taken out of them: a loop that skipped a layer, ran one twice or ran them out
@@ -5455,24 +5513,21 @@ def test_tiny_root_forward_matches_the_reference() -> None:
     # ---- THE REGISTERED ROUTE PREDICATE. Item 6's figures, declared again here
     # rather than shared, so a root that smuggled in one extra dispatch fails this
     # item on its own declaration.
-    _assert_route_predicate(
-        "7 the root",
-        {
-            "mla_projection": 9 * STACK_LAYERS,
-            "mla_absorb": 2 * STACK_LAYERS,
-            "mla_sparse": 1 * STACK_LAYERS,
-            "dsa_kpool_hadamard": 2 * STACK_LAYERS,
-            "dsa_paged_gather": 1 * STACK_LAYERS,
-            "dsa_score_gemm": 1 * STACK_LAYERS,
-            "dsa_topk_select": 1 * STACK_LAYERS,
-            "dsa_index_expand": 1 * STACK_LAYERS,
-            "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-            "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
-            "noaux_tc_router": 1 * STACK_MOE_LAYERS,
-        },
-        before,
-        after,
-    )
+    route_expected = {
+        "mla_projection": 9 * STACK_LAYERS,
+        "mla_absorb": 2 * STACK_LAYERS,
+        "mla_sparse": 1 * STACK_LAYERS,
+        "dsa_kpool_hadamard": 2 * STACK_LAYERS,
+        "dsa_paged_gather": 1 * STACK_LAYERS,
+        "dsa_score_gemm": 1 * STACK_LAYERS,
+        "dsa_topk_select": 1 * STACK_LAYERS,
+        "dsa_index_expand": 1 * STACK_LAYERS,
+        "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
+        "blockwise_fp8_moe": 1 * STACK_MOE_LAYERS,
+        "noaux_tc_router": 1 * STACK_MOE_LAYERS,
+    }
+    _declare_bound_and_sentinel(route_expected)
+    _assert_route_predicate("7 the root", route_expected, before, after)
 
     # ---- CONJUNCT 1: THE STACK RAN ONCE, ON THE ROOT'S OWN ARGUMENTS. Read before
     # anything is taken out of the recording, and by identity where identity is the
