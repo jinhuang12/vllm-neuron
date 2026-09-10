@@ -1360,7 +1360,7 @@ def test_moe_path_planted_routing_operands_must_fail() -> None:
 
 
 # ===========================================================================
-# The routing is device-side, so the routed call traces whole.
+# The three limbs trace whole, over routing operands built before the trace.
 # ===========================================================================
 _DYNAMO_REFUSAL_NAMES = ("Unsupported", "GraphBreakError", "FullGraphError")
 
@@ -1382,8 +1382,23 @@ def _dynamo_refusal_classes() -> tuple[type, ...]:
     return found
 
 
-def _compiled_route(bank, quant_config):
-    """The bank's routed call, compiled with the runner's own fullgraph setting."""
+#: The three limbs in launch order, under the names the call site resolves off
+#: this module at call time.
+_LIMB_LAUNCH_ORDER = (
+    "moe_gate_up_blockwise_fp8",
+    "moe_swiglu_transposed",
+    "moe_down_blockwise_fp8",
+)
+
+#: Where the mapping's row index sits in two limbs' argument lists. The capture
+#: below asserts the two positions hold the same object before anything reads it.
+_ROW_INDEX_IN_GATE_UP = 3
+_ROW_INDEX_IN_DOWN = 4
+
+
+def _fullgraph(traced):
+    """``traced``, compiled the way the runner compiles, or a refusal to measure."""
+    from torch import _dynamo
     from vllm_neuron import envs as neuron_envs
 
     if neuron_envs.VLLM_NEURON_DEBUG_MODE:
@@ -1391,88 +1406,212 @@ def _compiled_route(bank, quant_config):
             "VLLM_NEURON_DEBUG_MODE is set, so the runner would compile with "
             "fullgraph=False and this reading would measure nothing"
         )
+    # Two items compile the same closure body; a cache hit would answer one of them
+    # with the other one's trace.
+    _dynamo.reset()
+    return torch.compile(traced, fullgraph=True)
 
-    def routed(**inputs):
-        return bank.block_quant_expert_mm(
-            quant_config=quant_config, block_size=B, **inputs
+
+def _capture_limb_calls(bank, quant_config, case):
+    """Run the call site once and record the limb operands and the last answer.
+
+    THE ROUTING RUNS HERE, in the eager call site, and never inside a traced
+    region: the mapping dispatches a vendor subkernel that carries no fake-tensor
+    rule, so tracing it puts a question to the vendor that this increment cannot
+    answer. What comes back is the three limbs' own arguments in launch order --
+    each limb's leading operand dropped where the previous limb supplies it -- and
+    the down limb's answer, which is the comparison for anything re-running them.
+    """
+    real = {name: getattr(_seam_module, name) for name in _LIMB_LAUNCH_ORDER}
+    recorded: dict[str, tuple] = {}
+    answers: dict[str, torch.Tensor] = {}
+
+    def recorder(name):
+        def record(*args):
+            answers[name] = real[name](*args)
+            recorded[name] = args
+            return answers[name]
+
+        return record
+
+    with pytest.MonkeyPatch.context() as patch:
+        for name in _LIMB_LAUNCH_ORDER:
+            patch.setattr(_seam_module, name, recorder(name))
+        bank.block_quant_expert_mm(
+            quant_config=quant_config, block_size=B, **case["call_site_inputs"]
         )
+    missing = [name for name in _LIMB_LAUNCH_ORDER if name not in recorded]
+    if missing:
+        raise RouteInstrumentError(
+            f"the call site never reached {missing}, so there are no recorded "
+            f"operands for the limbs to run over"
+        )
+    gate_up, swiglu, down = (recorded[name] for name in _LIMB_LAUNCH_ORDER)
+    if gate_up[_ROW_INDEX_IN_GATE_UP] is not down[_ROW_INDEX_IN_DOWN]:
+        raise RouteInstrumentError(
+            f"argument {_ROW_INDEX_IN_GATE_UP} of the gate/up limb is not the row "
+            f"index object the down limb was handed, so a plant reading it would "
+            f"be reading something else"
+        )
+    return (gate_up, swiglu[1:], down[1:]), answers[_LIMB_LAUNCH_ORDER[2]]
 
-    return torch.compile(routed, fullgraph=True)
+
+def _limbs_over(gate_up):
+    """The three limbs composed over recorded operands, gate/up handed in."""
+    swiglu = getattr(_seam_module, _LIMB_LAUNCH_ORDER[1])
+    down = getattr(_seam_module, _LIMB_LAUNCH_ORDER[2])
+
+    def limbs(gate_up_args, swiglu_tail, down_tail):
+        return down(swiglu(gate_up(*gate_up_args), *swiglu_tail), *down_tail)
+
+    return limbs
 
 
-def test_moe_path_routed_call_traces_under_fullgraph() -> None:
-    """MEASURED: the routed call traces whole under ``fullgraph=True`` and returns.
+def test_moe_path_routed_limbs_trace_under_fullgraph() -> None:
+    """MEASURED: the three limbs trace whole under ``fullgraph=True`` and return.
 
     The runner compiles the model with ``fullgraph`` on unless the debug door is open
-    (``neuron_model_runner.py:1457-1462``), so a host read anywhere in the routing is
-    fatal in service, and this item passes only if the compiled call RETURNS, with the
-    routed triple read and the configured reference's numbers. The backend is dynamo's
-    own: the runner's remaining options are ``neuronx-cc`` arguments that reach the
-    compiler and never the tracer, so they cannot change whether the trace breaks, and
-    what the neuron backend then makes of this graph is the host run's COMPILE step.
+    (``neuron_model_runner.py:1457-1462``), so a host read inside the limbs is fatal in
+    service. The traced region is this increment's three limbs and nothing else: the
+    routing runs first, in the eager call site, and the compiled region re-runs the
+    limbs over the operands that call recorded. The comparison is that same call's own
+    limb answer, so a trace returning other numbers reds; the counters must read the
+    declared triple, because a trace that returns without dispatching proves nothing.
+    The backend is dynamo's own: the runner's remaining options are ``neuronx-cc``
+    arguments that reach the compiler and never the tracer.
     """
     bank, _text_config = _build_bank()
     quant_config = _block_quant_config()
     case = _build_case()
-    want = _configured_reference(case, bank)
+    operands, answer = _capture_limb_calls(bank, quant_config, case)
+    want = answer.to(torch.float32)
     _nonempty_or_raise(want, "fullgraph")
 
     _reset_limb_counters()
-    got = _compiled_route(bank, quant_config)(**case["call_site_inputs"]).to(
-        torch.float32
-    )
+    intact = getattr(_seam_module, _LIMB_LAUNCH_ORDER[0])
+    got = _fullgraph(_limbs_over(intact))(*operands).to(torch.float32)
     counters = _limb_counters()
     print(
         f"[fullgraph] limb_counters={counters} returned_shape={tuple(got.shape)} "
         f"max_rel_error={_max_rel_error(got, want):.6e} rtol={RTOL} atol={ATOL}"
     )
     assert counters == DECLARED_LIMB_DISPATCHES, (
-        f"the compiled call read {counters}, declared {DECLARED_LIMB_DISPATCHES}; "
+        f"the compiled limbs read {counters}, declared {DECLARED_LIMB_DISPATCHES}; "
         f"a trace that returns without running the limbs proves nothing"
     )
     torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
 
 
-def test_moe_path_planted_host_read_breaks_the_fullgraph_trace() -> None:
-    """MEASURED: one ``.item()`` in the routing turns the item above RED, by name.
+def test_moe_path_planted_host_read_breaks_the_limb_trace() -> None:
+    """MEASURED: one ``.item()`` inside the traced limbs turns the item above RED.
 
-    The plant reads one element of the mapping's own row index to the host and hands
-    back every operand unchanged, so the arithmetic is untouched -- asserted first,
-    uncompiled -- and the read is all the compiled arm has left to fail on. The
-    refusal must be a class :data:`_DYNAMO_REFUSAL_NAMES` names, and the resolver
-    refuses when this torch carries none of them.
+    The plant reads one element of the mapping's row index to the host and hands every
+    operand on unchanged, so the arithmetic is untouched -- asserted first, uncompiled,
+    against the same answer the item above compares to -- and the read is all the
+    compiled arm has left to fail on. The refusal must be a class
+    :data:`_DYNAMO_REFUSAL_NAMES` names, and the resolver refuses to answer when this
+    torch carries none of them.
     """
-    from vllm_neuron import functional as functional_hub
-
     bank, _text_config = _build_bank()
     quant_config = _block_quant_config()
     case = _build_case()
-    real_mapping = functional_hub.build_blockwise_mapping
-    want = _configured_reference(case, bank)
+    operands, answer = _capture_limb_calls(bank, quant_config, case)
+    want = answer.to(torch.float32)
     _nonempty_or_raise(want, "planted-host-read")
+    intact = getattr(_seam_module, _LIMB_LAUNCH_ORDER[0])
     read: list[int] = []
 
-    def mapping(**kwargs):
-        masked, positions, block_to_expert, conditions = real_mapping(**kwargs)
-        read.append(int(positions.reshape(-1)[0].item()))
-        return masked, positions, block_to_expert, conditions
+    def planted(*args):
+        read.append(int(args[_ROW_INDEX_IN_GATE_UP].reshape(-1)[0].item()))
+        return intact(*args)
 
     refusals = _dynamo_refusal_classes()
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(functional_hub, "build_blockwise_mapping", mapping)
-        _reset_limb_counters()
-        eager = bank.block_quant_expert_mm(
-            quant_config=quant_config, block_size=B, **case["call_site_inputs"]
-        ).to(torch.float32)
-        torch.testing.assert_close(eager, want, rtol=RTOL, atol=ATOL)
-        with pytest.raises(refusals) as refused:
-            _compiled_route(bank, quant_config)(**case["call_site_inputs"])
+    eager = _limbs_over(planted)(*operands).to(torch.float32)
+    torch.testing.assert_close(eager, want, rtol=RTOL, atol=ATOL)
+    with pytest.raises(refusals) as refused:
+        _fullgraph(_limbs_over(planted))(*operands)
     print(
         f"[planted-host-read] host_reads={read[:1]} "
         f"refusal={type(refused.value).__name__} "
         f"declared={[cls.__name__ for cls in refusals]} "
         f"message_head={str(refused.value).splitlines()[:1]}"
     )
+
+
+# ===========================================================================
+# DIAGNOSTIC, never gating: what the mapping alone does under a fullgraph trace.
+# ===========================================================================
+#: The two serving shapes read beside the tests' own: the pinned prefill bucket,
+#: and the one-token decode step at ``max-num-seqs 1``.
+_DIAG_PREFILL_TOKENS = 2048
+_DIAG_DECODE_TOKENS = 1
+
+
+def _diag_mapping_row(tokens: int, experts: int, top_k: int) -> str:
+    """Trace the mapping alone, run nothing, and report the attempt as one row."""
+    from torch import _dynamo
+    from vllm_neuron import functional as functional_hub
+
+    affinities = torch.zeros(tokens, experts, dtype=torch.float32)
+    for token in range(tokens):
+        for slot in range(top_k):
+            affinities[token, (token + slot) % experts] = 1.0 / top_k
+    graphs: list = []
+
+    def keep_graph(graph, _example_inputs):
+        """Take the traced graph and hand back something that executes none of it."""
+        graphs.append(graph)
+        return lambda *args, **kwargs: None
+
+    def mapping(scores):
+        return functional_hub.build_blockwise_mapping(
+            expert_affinities=scores,
+            num_local_experts=experts,
+            num_experts_per_token=top_k,
+            block_size=B,
+            moe_group=None,
+            tp_degree=1,
+        )
+
+    _dynamo.reset()
+    try:
+        torch.compile(mapping, fullgraph=True, backend=keep_graph)(affinities)
+    except Exception as refused:  # noqa: BLE001 -- the row IS the reading
+        head = str(refused).splitlines() or [type(refused).__name__]
+        return f"traced=no|error={head[0]}"
+    if not graphs:
+        return "traced=no|error=the tracer produced no graph and raised nothing"
+    return "traced=yes|error="
+
+
+@pytest.mark.parametrize(
+    "tokens,from_the_pinned_config",
+    [
+        pytest.param(T, False, id="tests_own_mask"),
+        pytest.param(_DIAG_PREFILL_TOKENS, True, id="prefill_bucket"),
+        pytest.param(_DIAG_DECODE_TOKENS, True, id="decode_step"),
+    ],
+)
+def test_moe_path_diagnostic_mapping_trace(
+    tokens: int, from_the_pinned_config: bool
+) -> None:
+    """DIAGNOSTIC: one row per shape saying whether the mapping traces. Never reds.
+
+    The items above trace the three limbs and leave the mapping outside the compiled
+    region, because the first host run reddened inside a vendor subkernel the mapping
+    dispatches. This says what the mapping does on its own: at the shape these tests
+    use, and at the two serving shapes with the routed-expert count and top-k read from
+    the pinned checkpoint config. The reading is about TRACING only -- the backend
+    keeps the graph and executes nothing -- and a ``traced=no`` row at a serving shape
+    is a finding for the campaign to route, so no reading here can fail the item.
+    """
+    experts, top_k = E, K
+    if from_the_pinned_config:
+        text_config = _pinned_raw_config()["text_config"]
+        experts = int(text_config["n_routed_experts"])
+        top_k = int(text_config["num_experts_per_tok"])
+    row = _diag_mapping_row(tokens=tokens, experts=experts, top_k=top_k)
+    print(f"DIAG|build_blockwise_mapping|tokens={tokens}|experts={experts}|{row}")
 
 
 # ===========================================================================
