@@ -4571,7 +4571,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size, kv_segment_size, device=device
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            # ``kwargs`` stays bound to the generic mapping: the drafter branch
+            # below reads its attention metadata after this call returns.
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
@@ -4923,8 +4925,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         and the ring it seeds -- ``prefill_tail`` with ``prefill_end_position`` --
         on the prefill leg, or ``tail`` and ``position`` on the decode leg
         (``model_fp8.py:6696-6713``); a linear (KDA) layer takes ``conv_state``,
-        ``recurrent_state`` and ``is_prefill`` (``:4149``). Which leg is running is
-        the caller's reading of the batch, passed in rather than guessed here.
+        ``recurrent_state``, ``is_prefill`` and ``start_position`` (``:4149``).
+        Which leg is running is the caller's reading of the batch, passed in
+        rather than guessed here.
+
+        BOTH FAMILIES READ THE POSITION FROM ONE VARIABLE. The linear family
+        needs it for the same reason the sparse one does: a prompt longer than one
+        batch of tokens arrives in segments, and a later segment continues state
+        the earlier one wrote, which the receiving layer can only know from how
+        many tokens are already computed.
 
         ONE SEQUENCE PER CALL, REFUSED RATHER THAN MIS-SLICED. The latent cache a
         DSA layer takes is one sequence's slots in position order, and
@@ -4985,6 +4994,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "conv_state": bank["conv_state"][int(state_slot)],
                         "recurrent_state": bank["recurrent_state"][int(state_slot)],
                         "is_prefill": bool(is_prefill),
+                        "start_position": int(start_position),
                     }
                 )
                 continue
@@ -5053,9 +5063,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         RETURNS ITS ARGUMENT UNCHANGED unless the loaded model kept cache banks,
         which only ``Glm5NextForConditionalGeneration.bind_kv_cache`` does. That is
-        what lets all five call sites go through one function: for llama3, qwen3,
-        gpt_oss, qwen3_vl and synthetic this is one ``getattr`` and a return of the
-        same object.
+        what lets all eight call sites -- three warmup calls, the execute path, the
+        idle dummy step and the three graph-capture calls -- go through one
+        function: for llama3, qwen3, gpt_oss, qwen3_vl and synthetic this is one
+        ``getattr`` and a return of the same object.
 
         WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
         ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
@@ -5477,7 +5488,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             compiled_graph_input=True,
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for decode completed: batch size=%s", batch_size
@@ -5499,7 +5510,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 compiled_graph_input=True,
             )
             try:
-                _ = self.capture_backend_model(**kwargs)
+                _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
             except CaptureComplete:
                 logger.debug(
                     "Graph capture for target model decode completed: batch size=%s",
