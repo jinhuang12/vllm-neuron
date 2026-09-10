@@ -43,6 +43,16 @@ class LayerSpec:
     kda_conv_state_dtype: torch.dtype | None = None
     kda_recurrent_state_dtype: torch.dtype | None = None
 
+    # ---- Latent (MLA) key/value cache ------------------------------------
+    # A latent-attention layer caches ONE compressed vector per token and has no
+    # value half to store, so its page holds one buffer where a key/value layer's
+    # holds two. vLLM's own vocabulary for this is MLAAttentionSpec, whose page
+    # carries no second term; the flag is what tells the allocator to ask for
+    # that class. APPENDED last, defaulting to False, so the positional form
+    # above stays unbroken and a model wired for a key/value cache keeps its
+    # resolved spec byte-for-byte.
+    latent_kv: bool = False
+
 
 @dataclass
 class KVSpec:

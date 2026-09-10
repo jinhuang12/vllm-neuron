@@ -6066,6 +6066,10 @@ class Glm5NextMLAAttention(nn.Module):
     #: across tensor-parallel ranks, so this is 1 at every world size.
     NUM_LATENT_KV_HEADS = 1
 
+    #: One latent vector per token, and no value half to cache. The runner reads
+    #: this to size the page for one buffer instead of a key/value pair.
+    LATENT_KV_CACHE = True
+
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
         self.num_attention_heads = int(text_config.num_attention_heads)
@@ -8958,6 +8962,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     kda_recurrent_state_dtype=getattr(
                         attention, "kda_recurrent_state_dtype", None
                     ),
+                    latent_kv=getattr(attention, "LATENT_KV_CACHE", False),
                 )
             )
         return KVSpec(layers=layers)
@@ -8993,11 +8998,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
           the short convolution and position 1 the recurrent state
           (``neuron_model_runner.py:9100-9130``);
         * a sparse-attention (DSA) layer reports none of it, and the runner
-          allocated ``[blocks, num_kv_heads, block_size, head_size]`` for each half
-          of a key/value pair (``:9002-9038``). Only the FIRST half is this
-          attention's latent cache: MLA keeps one latent vector per slot and has no
-          value half to read, which is also why ``num_kv_heads`` is 1
-          (``NUM_LATENT_KV_HEADS``).
+          allocated ONE ``[blocks, num_kv_heads, block_size, head_size]`` bank for
+          it. MLA keeps one latent vector per slot and has no value half, so the
+          layer declares a latent cache and the runner sizes a page for one buffer
+          rather than for a key/value pair -- which is also why ``num_kv_heads``
+          is 1 (``NUM_LATENT_KV_HEADS``). The bank is read at position 0 and
+          there is no second position.
 
         THE LATENT BANK IS ALSO KEPT AS ITS SEQUENCE VIEW, because that is the shape
         ``Glm5NextDSALayer.forward`` declares: ``[slots, 1, head_size]``, one slot
@@ -9098,15 +9104,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if not tensors:
                 raise ValueError(
                     f"KV layer '{name}' has no cache tensor at all; the runner "
-                    f"allocates a key/value pair for a sparse-attention layer "
-                    f"(neuron_model_runner.py:9002-9038)"
+                    f"allocates one latent bank for a sparse-attention layer"
                 )
             bank = tensors[0]
             if bank.dim() != 4:
                 raise ValueError(
                     f"KV layer '{name}' has a latent bank of {tuple(bank.shape)}; "
                     f"the runner allocates [blocks, num_kv_heads, block_size, "
-                    f"head_size] for each half of the pair"
+                    f"head_size] for a latent cache"
                 )
             blocks, heads, block_size, width = (int(value) for value in bank.shape)
             if heads != int(layer_spec.num_kv_heads) or width != int(
