@@ -3131,7 +3131,13 @@ SHARD_LINEAR_ATTN = {
 #: that is not a whole number of them. At 256 the per-rank shard was 128, half a
 #: consumer block, so the padded loader rounded the width to 512 and both conjunct
 #: (1) and conjunct (2) read a shape no rank was meant to hold. At 512 the pad is a
-#: no-op at world size 2 and a REAL pad at world size 4, which item (3) reads.
+#: no-op at world size 2, which is what every item using this width needs.
+#:
+#: IT STOPPED PADDING AT WORLD 4 WHEN ``inc-glm53f-112`` NARROWED THE DENSE
+#: CONSUMER'S BLOCK to 128: 512 divides evenly over four ranks at 128, so the pad
+#: this width used to construct is gone. The item whose subject IS that pad now
+#: carries its own width, :data:`PAD_DENSE_INTERMEDIATE`, and this sentence is the
+#: correction of the one that promised the pad here.
 SHARD_INTERMEDIATE = 512
 
 SHARD_WORLD = 2
@@ -4550,6 +4556,50 @@ DEFERRED_EP_GROUP_CLASSES = ("Glm5NextRoutedExperts",)
 DEFERRED_NARROW = 256
 
 
+#: THE PAD ITEM'S OWN DENSE WIDTH, and why it is not :data:`SHARD_INTERMEDIATE`.
+#: Conjunct (3) reads a rank that holds NO real row, so its fixture has to be a
+#: width the loader must pad at the shipped block. At world 4 the loader rounds a
+#: dense width up to a multiple of ``4 x block``; ``inc-glm53f-112`` narrows the
+#: dense consumer's block from 256 to 128, so 512 -- which needed rounding to 1024
+#: at block 256 -- now divides evenly over four ranks and pads nothing. The counted
+#: grant-205 run read that as ``assert 4 < 4``: the item's own vacuity guard, doing
+#: its job.
+#:
+#: 256 restores the subject at the SHIPPED block: ``4 x 128 = 512``, so 256 rounds
+#: up to 512, each rank takes 128 rows and ranks 2 and 3 hold no real row at all --
+#: the same strongest form the item was written for, two padded ranks of four.
+#:
+#: A NEW NAME, NOT A REBINDING, for the reason :data:`DEFERRED_NARROW` gives.
+#: :data:`SHARD_INTERMEDIATE` stays 512 and every other item keeps it: only the item
+#: whose subject is the pad passes this width, and it passes it to the checkpoint AND
+#: to every load so both sides describe one model. ``intermediate_size`` reaches
+#: exactly one module in the package, ``Glm5NextDenseMLP``
+#: (``model_fp8.py:3484``), so this width moves the dense three and nothing else --
+#: the shared expert takes ``moe_intermediate_size`` (``config.py:223``) and the bank
+#: its own width.
+PAD_DENSE_INTERMEDIATE = 256
+
+
+def _deferred_families_at(
+    dense_intermediate: int,
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """Every family this fixture writes, with the dense three restated at ONE width.
+
+    At the default width the returned table is EQUAL to the plain merge this
+    function replaced, which is the property that keeps every other item's bytes
+    where they were.
+    """
+    merged: dict[tuple[str, str], tuple[int, int]] = {
+        **SHARD_FAMILIES,
+        **DEFERRED_FAMILIES,
+    }
+    for leaf in SHARD_DENSE_LEAVES:
+        key = ("Glm5NextDenseMLP", leaf)
+        shard_dim, _full = merged[key]
+        merged[key] = (shard_dim, dense_intermediate)
+    return merged
+
+
 def _deferred_full_shape(
     family: str, leaf: str, shard_dim: int, full: int
 ) -> tuple[int, ...]:
@@ -4578,7 +4628,10 @@ def _padded_shard_extent(full: int, num_shards: int, block: int) -> int:
     return (math.ceil(full / step) * step) // num_shards
 
 
-def _deferred_config(shared_experts: int = MINI_SHARED_EXPERTS) -> Glm5NextConfig:
+def _deferred_config(
+    shared_experts: int = MINI_SHARED_EXPERTS,
+    dense_intermediate: int = SHARD_INTERMEDIATE,
+) -> Glm5NextConfig:
     """:func:`_shard_config`'s fixture with the shared expert switched ON.
 
     ``n_shared_experts`` is 1 here where :func:`_shard_config` sets 0, and that is
@@ -4590,6 +4643,10 @@ def _deferred_config(shared_experts: int = MINI_SHARED_EXPERTS) -> Glm5NextConfi
     completes and records no refusal, which is what makes the recorded gap below a
     reading of the shared expert's prep rather than of the fixture at large
     (DECISIONS §84 ruling (ii)).
+
+    ``dense_intermediate`` IS THE DENSE THREE'S WIDTH AND NOTHING ELSE'S, which is
+    why one item can move it. See :data:`PAD_DENSE_INTERMEDIATE`, the only caller
+    that passes anything but the default.
     """
     return Glm5NextConfig(
         text_config=Glm5NextTextConfig(
@@ -4599,7 +4656,7 @@ def _deferred_config(shared_experts: int = MINI_SHARED_EXPERTS) -> Glm5NextConfi
             first_k_dense_replace=MINI_FIRST_K_DENSE,
             tie_word_embeddings=False,
             linear_attn_config=SHARD_LINEAR_ATTN,
-            intermediate_size=SHARD_INTERMEDIATE,
+            intermediate_size=dense_intermediate,
             **MINI_MLA_WIDTHS,
         )
     )
@@ -4611,6 +4668,7 @@ def _deferred_key_overrides(
     *,
     ramp_grids: bool = False,
     steep_ratio: int | None = None,
+    dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> dict[str, torch.Tensor]:
     """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
 
@@ -4656,7 +4714,9 @@ def _deferred_key_overrides(
     :data:`SHARD_FAMILIES` states them -- only the extent no family shards changes.
     """
     overrides: dict[str, torch.Tensor] = {}
-    every_family = {**SHARD_FAMILIES, **DEFERRED_FAMILIES}
+    # The dense three are written at the width the CONFIG gave the model, so a
+    # checkpoint tensor and the module it loads into cannot describe two widths.
+    every_family = _deferred_families_at(dense_intermediate)
     for path, module in model.named_modules():
         cls = type(module).__name__
         for (family, leaf), (shard_dim, full) in every_family.items():
@@ -4700,6 +4760,7 @@ def _deferred_checkpoint(
     ramp_grids: bool = False,
     steep_ratio: int | None = None,
     name: str = "deferred",
+    dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> tuple[Path, dict, dict]:
     """One checkpoint holding every full tensor these five items read.
 
@@ -4709,12 +4770,20 @@ def _deferred_checkpoint(
     field it varies. ``steep_ratio`` is the third grid family the same item needs
     since ``inc-glm53f-054e``, and it is written beside the other two for the same
     reason.
+
+    ``dense_intermediate`` exists for conjunct (3) alone, whose subject is a padded
+    rank: see :data:`PAD_DENSE_INTERMEDIATE`. It reaches the config AND the written
+    tensors from this one place, so the two cannot describe different widths.
     """
-    config = _deferred_config()
+    config = _deferred_config(dense_intermediate=dense_intermediate)
     mappings = _mappings_for(config)
     reference = Glm5NextForConditionalGeneration(config)
     overrides = _deferred_key_overrides(
-        reference, mappings, ramp_grids=ramp_grids, steep_ratio=steep_ratio
+        reference,
+        mappings,
+        ramp_grids=ramp_grids,
+        steep_ratio=steep_ratio,
+        dense_intermediate=dense_intermediate,
     )
     directory = tmp_path / name
     _write_miniature_checkpoint(
@@ -4783,6 +4852,7 @@ def _load_at_ep(
     ep_degree: int,
     monkeypatch,
     shared_experts: int = MINI_SHARED_EXPERTS,
+    dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> _DeferredLoad:
     """Load at a synthetic world size, rank AND expert-parallel degree.
 
@@ -4794,6 +4864,11 @@ def _load_at_ep(
     THE MODEL COMES BACK EVEN WHEN THE PREP REFUSES, and that is the point: the
     shards are attached before the prep runs, so every shape and byte these items
     read is on the module the real ``load_weights`` populated.
+
+    ``dense_intermediate`` MUST MATCH THE CHECKPOINT'S, and the caller passes the
+    same value to both (:data:`PAD_DENSE_INTERMEDIATE`, conjunct (3) only). A model
+    built at one dense width loading a checkpoint written at another would refuse on
+    shape, which is a real reading but not the one that item is for.
     """
     ep_rank, column = _mesh_answers(world_size, ep_degree, rank)
     monkeypatch.setattr(_MODEL_FP8, "_resolve_world_size", lambda: world_size)
@@ -4805,7 +4880,9 @@ def _load_at_ep(
         "get_neuron_ep_tp_group",
         lambda: _FixtureGroup(column, world_size // ep_degree),
     )
-    model = Glm5NextForConditionalGeneration(_deferred_config(shared_experts))
+    model = Glm5NextForConditionalGeneration(
+        _deferred_config(shared_experts, dense_intermediate=dense_intermediate)
+    )
     assert model.world_size == world_size, (
         f"the model resolved world size {model.world_size}, not the patched "
         f"{world_size}"
@@ -5348,9 +5425,33 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
     print(f"CONJUNCT2D_RAGGED_REFUSAL={str(ragged.value)[:160]}")
 
     # REFUSAL TWO -- an intermediate shard the CONSUMER cannot take.
-    block = _WL_FP8.dense_consumer_block_quant_size()
-    not_a_whole_block = block + DEFAULT_WEIGHT_BLOCK_SIZE[0]
-    assert not_a_whole_block % block != 0
+    #
+    # THE GRANULARITY MOVES, NOT THE WIDTH, and it moves through the product's own
+    # reader for this arm alone. This is the form the two ``inc-glm53f-101`` controls
+    # use. The arm used to build its width as "one consumer block plus one checkpoint
+    # tile", which was only "not a whole block" while those two numbers differed;
+    # ``inc-glm53f-112`` makes both of them 128, so that sum IS a whole block and the
+    # arm's own guard fired before the product was ever called (the counted grant-205
+    # run read ``assert (256 % 128) != 0``). Moving the CONSUMER's number instead
+    # keeps the subject: the tile rule stays cleared, and the only rule that can
+    # refuse this width is the consumer's.
+    #
+    # The patch lands AFTER every load in this item, so no reading above it moves.
+    tile = DEFAULT_WEIGHT_BLOCK_SIZE[0]
+    moved_block = 2 * tile
+    monkeypatch.setattr(
+        _WL_FP8, "dense_consumer_block_quant_size", lambda: moved_block
+    )
+    not_a_whole_block = 3 * tile
+    assert not_a_whole_block % tile == 0, (
+        f"{not_a_whole_block} rows is not a whole number of {tile}-row checkpoint "
+        f"tiles, so a refusal here could be the tile rule's rather than the "
+        f"consumer's and this arm would not read what it names"
+    )
+    assert not_a_whole_block % moved_block != 0, (
+        f"{not_a_whole_block} rows IS a whole number of the moved consumer block "
+        f"{moved_block}, so this arm would read no refusal at all"
+    )
     with pytest.raises(Glm5NextExpertBankNotLoadableError) as unusable:
         _WL_FP8.shard_geometry_for_grid(
             _WL_FP8.ShardGeometry(
@@ -5363,7 +5464,18 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
     message = str(unusable.value)
     print(f"CONJUNCT2D_CONSUMER_REFUSAL={message[:200]}")
     assert "probe.experts.gate_proj_weight_scale_inv" in message
-    assert str(block) in message
+    assert f"{not_a_whole_block} rows along dim 0" in message, (
+        f"the refusal does not name the width this arm fed it: {message[:200]}"
+    )
+    # THE MOVED NUMBER IS READ IN THE CONSUMER'S OWN SLOT, phrase and all, so this
+    # cannot pass on some other number that happens to appear in the text -- the
+    # message also mentions the routed bank's block, and reading a bare "256"
+    # anywhere in the string would not tell the two apart.
+    assert f"CONSUMER's {moved_block}-row blocks" in message, (
+        f"the refusal does not name the moved consumer block {moved_block} in the "
+        f"CONSUMER's own slot, so the reader is not reading the consumer's rule: "
+        f"{message[:200]}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -5387,11 +5499,17 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     is written here: the assertion reads the factor from
     ``compensate_block_scales`` itself, so it follows the constant with no edit.
 
-    WHY THE DENSE THREE ARE THE SUBJECT. At world 4 the dense intermediate 512 pads
-    to 1024, so ranks 2 and 3 hold no real row at all -- the strongest form of the
-    padded case. The shared three at 2048 need no pad at this world, and that
-    absence is read here too, so "the pad happened" and "the pad did not happen"
-    are both measurements rather than one assumption.
+    WHY THE DENSE THREE ARE THE SUBJECT. At world 4 this item's dense intermediate
+    256 pads to 512, so each rank takes 128 rows and ranks 2 and 3 hold no real row
+    at all -- the strongest form of the padded case. The shared three at 2048 need no
+    pad at this world, and that absence is read here too, so "the pad happened" and
+    "the pad did not happen" are both measurements rather than one assumption.
+
+    THE WIDTH IS THIS ITEM'S OWN SINCE ``inc-glm53f-112``, and the narrowing is why:
+    :data:`PAD_DENSE_INTERMEDIATE` carries the arithmetic. The shared 512 stopped
+    padding when the dense consumer's block became 128, and the counted grant-205 run
+    read that as ``assert 4 < 4`` -- this item's own vacuity guard refusing to report
+    a pad it no longer constructs. No other item's width moved.
 
     THE EXACTNESS CLAIM IS AN EQUALITY, NOT A TOLERANCE. A padded weight row is fp8
     zero and its grid entry is 1.0, so the row dequantises to exactly 0.0; a zero
@@ -5417,11 +5535,18 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     the padded ranks left out, so a republish finding and a pad defect cannot be
     mistaken for each other.
     """
-    directory, overrides, mappings = _deferred_checkpoint(tmp_path)
+    directory, overrides, mappings = _deferred_checkpoint(
+        tmp_path, name="deferred-pad", dense_intermediate=PAD_DENSE_INTERMEDIATE
+    )
     block = _WL_FP8.dense_consumer_block_quant_size()
     loads = {
         rank: _load_at_ep(
-            directory, SHARD_EP_WORLD, rank, SHARD_EP_DEGREE, monkeypatch
+            directory,
+            SHARD_EP_WORLD,
+            rank,
+            SHARD_EP_DEGREE,
+            monkeypatch,
+            dense_intermediate=PAD_DENSE_INTERMEDIATE,
         )
         for rank in range(SHARD_EP_WORLD)
     }
@@ -5449,12 +5574,17 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     print(f"CONJUNCT3D_DENSE_MODULES={dense_paths}")
     assert dense_paths, "the fixture built no dense MLP, so this item reads nothing"
 
-    per_rank = _padded_shard_extent(SHARD_INTERMEDIATE, SHARD_EP_WORLD, block)
-    real_ranks = SHARD_INTERMEDIATE // per_rank
-    print(f"CONJUNCT3D_PER_RANK={per_rank} REAL_RANKS={real_ranks}")
+    per_rank = _padded_shard_extent(PAD_DENSE_INTERMEDIATE, SHARD_EP_WORLD, block)
+    real_ranks = PAD_DENSE_INTERMEDIATE // per_rank
+    print(
+        f"CONJUNCT3D_DENSE_WIDTH={PAD_DENSE_INTERMEDIATE} BLOCK={block} "
+        f"PER_RANK={per_rank} REAL_RANKS={real_ranks}"
+    )
     assert real_ranks < SHARD_EP_WORLD, (
-        f"every one of the {SHARD_EP_WORLD} ranks holds a real row, so this fixture "
-        f"constructs no padded rank and the readings below would be vacuous"
+        f"every one of the {SHARD_EP_WORLD} ranks holds a real row of the "
+        f"{PAD_DENSE_INTERMEDIATE}-row dense width at the consumer's {block}-row "
+        f"block, so this fixture constructs no padded rank and the readings below "
+        f"would be vacuous"
     )
 
     zero_ranks = 0
@@ -5465,7 +5595,9 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
             # leading underscore rather than deleted -- the deletion this line
             # replaced sat inside the rank loop below, so the second padded rank
             # re-deleted an already-deleted name.
-            _shard_dim, _full = SHARD_FAMILIES[("Glm5NextDenseMLP", leaf)]
+            _shard_dim, _full = _deferred_families_at(PAD_DENSE_INTERMEDIATE)[
+                ("Glm5NextDenseMLP", leaf)
+            ]
             attribute = SHARD_GRID_ATTRIBUTES[SHARD_DENSE_LEAVES.index(leaf)]
             for rank in range(real_ranks, SHARD_EP_WORLD):
                 weight = _loaded(models[rank], f"{path}.{leaf}")
@@ -5473,7 +5605,8 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
                 as_float = weight.to(torch.float32)
                 assert bool((as_float == 0.0).all()), (
                     f"{path}.{leaf} at rank {rank} sits wholly past the real "
-                    f"{SHARD_INTERMEDIATE} rows, so every element must be fp8 zero; "
+                    f"{PAD_DENSE_INTERMEDIATE} rows, so every element must be fp8 "
+                    f"zero; "
                     f"max abs is {as_float.abs().max().item()}"
                 )
                 # THE PAD GRID IS THE STORED ONE, NOT THE CHECKPOINT'S. The pad is
