@@ -4571,7 +4571,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size, kv_segment_size, device=device
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            # ``kwargs`` stays bound to the generic mapping: the drafter branch
+            # below reads its attention metadata after this call returns.
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
@@ -5053,9 +5055,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         RETURNS ITS ARGUMENT UNCHANGED unless the loaded model kept cache banks,
         which only ``Glm5NextForConditionalGeneration.bind_kv_cache`` does. That is
-        what lets all five call sites go through one function: for llama3, qwen3,
-        gpt_oss, qwen3_vl and synthetic this is one ``getattr`` and a return of the
-        same object.
+        what lets all eight call sites -- three warmup calls, the execute path, the
+        idle dummy step and the three graph-capture calls -- go through one
+        function: for llama3, qwen3, gpt_oss, qwen3_vl and synthetic this is one
+        ``getattr`` and a return of the same object.
 
         WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
         ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
@@ -5477,7 +5480,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             compiled_graph_input=True,
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for decode completed: batch size=%s", batch_size
@@ -5499,7 +5502,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 compiled_graph_input=True,
             )
             try:
-                _ = self.capture_backend_model(**kwargs)
+                _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
             except CaptureComplete:
                 logger.debug(
                     "Graph capture for target model decode completed: batch size=%s",
