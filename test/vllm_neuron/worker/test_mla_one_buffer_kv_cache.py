@@ -226,12 +226,21 @@ def _drive_real(raw: dict, monkeypatch: pytest.MonkeyPatch, *, latent: bool):
 
     Spec and mapper come from one ``get_kv_spec`` call chain, so no arm compares
     a buffer built from one geometry against a reader expecting another.
+
+    THE RECURRENT GEOMETRY COMES FROM THE SHARED FIXTURE, NOT FROM THE MODEL BUILT
+    HERE. This process has no tensor-parallel world, so a model built in it reports
+    the UNSHARDED recurrent state -- 64 times the per-rank shard a serve carries --
+    and page unification refuses a recurrent page larger than the attention page,
+    which is a geometry no serve has. ``_fake_layers`` rebuilds each REAL layer with
+    ``replace``, so the layer's own latent declaration survives while the four
+    recurrent fields become the shard at the registered world size.
     """
     model = _real_model(raw)
-    layers = list(model.get_kv_spec().layers)
+    layers = _fake_layers(raw)
     if not latent:
         layers = _without_latent(layers)
-        model.get_kv_spec = lambda: SimpleNamespace(layers=layers)
+    # ONE geometry for the allocation and for the mapper that reads it.
+    model.get_kv_spec = lambda: SimpleNamespace(layers=layers)
     specs = _call(layers)
     _, attention_names = _split(specs)
     one_buffer, two_buffer = _vendor_pages(raw)
