@@ -1315,10 +1315,14 @@ def moe_down_blockwise_fp8_kernel(intermediate_t, down_weight, scale_operand, af
 
     out = nl.ndarray((tokens, h_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     scale_sb = nl.load(scale_operand)
-    affinity_sb = nl.load(affinity, dtype=nl.float32)
 
     for m_tile in range(tokens // TILE_SIZE):
         m0 = m_tile * TILE_SIZE
+        # LOADED PER TOKEN TILE, never hoisted out of this loop: a token is a
+        # PARTITION, the partition axis serves 128 of them, and a whole-column load
+        # would bound this kernel to one tile. The causal-bound kernel re-loads its
+        # per-row length column inside its own row loop for the same reason.
+        affinity_sb = nl.load(affinity[m0 : m0 + TILE_SIZE, 0:1], dtype=nl.float32)
         for h_block in range(n_h_blocks):
             h0 = h_block * GATE_UP_SCALE_BLOCK
             acc = _gate_up_sbuf()
@@ -1363,7 +1367,7 @@ def moe_down_blockwise_fp8_kernel(intermediate_t, down_weight, scale_operand, af
                 dst=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 data=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 op0=nl.multiply,
-                operand0=affinity_sb[m0 : m0 + TILE_SIZE, 0:1],
+                operand0=affinity_sb[0:TILE_SIZE, 0:1],
             )
             nl.store(
                 out[m0 : m0 + TILE_SIZE, h0 : h0 + GATE_UP_SCALE_BLOCK],
