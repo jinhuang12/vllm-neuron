@@ -1595,6 +1595,7 @@ def moe_down_blockwise_fp8_kernel(
     h_extent,
     block,
     n_experts,
+    pad_row,
 ):
     """``out[P, H] = (intermediate[P, I] @ dequantise(bank[expert])) * affinity``.
 
@@ -1614,6 +1615,10 @@ def moe_down_blockwise_fp8_kernel(
         h_extent: ``H``, a trace-time int.
         block: tokens per block, a trace-time int and a multiple of ``TILE_SIZE``.
         n_experts: ``E_local``, a trace-time int -- the affinity row stride.
+        pad_row: the row of the affinity bank the mapping's ``-1`` addresses, a
+            trace-time int. GIVEN rather than derived from the bank's length: a bank
+            one row short would otherwise move the padding row silently, and every
+            padded position would then read a real token's affinity.
 
     Returns:
         ``[P, H]`` fp32 in BLOCK order. The scatter back to token order is the
@@ -1633,7 +1638,6 @@ def moe_down_blockwise_fp8_kernel(
     n_i_blocks = i_extent // GATE_UP_SCALE_BLOCK
     n_h_blocks = h_extent // GATE_UP_SCALE_BLOCK
     tiles_per_block = block // TILE_SIZE
-    pad_row = affinity_bank.shape[0] // n_experts - 1
 
     out = nl.ndarray((positions, h_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
@@ -1752,6 +1756,7 @@ def moe_down_blockwise_fp8(
     row_index: Tensor,
     expert_index: Tensor,
     block: int,
+    tokens: int,
 ) -> Tensor:
     """The counted down seam, routed. ``[I, P]`` in, ``[P, H]`` fp32 out, block order.
 
@@ -1788,11 +1793,14 @@ def moe_down_blockwise_fp8(
             f"experts. Build each expert's operand with "
             f"to_down_kernel_scale_operand rather than by hand."
         )
-    if int(affinity_bank.shape[0]) % experts or int(affinity_bank.shape[1]) != 1:
+    if tuple(affinity_bank.shape) != ((tokens + 1) * experts, 1):
         raise MoeBlockwiseFp8Error(
-            f"affinity_bank must be [(T + 1) * E_local, 1] with E_local={experts}; "
-            f"got {tuple(affinity_bank.shape)}. It is the mapping's own flat "
-            f"token-major emission, not a per-block slice."
+            f"affinity_bank must be [(T + 1) * E_local, 1] = "
+            f"{((tokens + 1) * experts, 1)} at T={tokens} and E_local={experts}; got "
+            f"{tuple(affinity_bank.shape)}. It is the mapping's own flat token-major "
+            f"emission with the padding token's zeros appended, not a per-block "
+            f"slice, and its length is checked because the padding row is counted "
+            f"from T rather than from this tensor."
         )
 
     _DOWN_COUNTERS.nki_dispatch += 1
@@ -1807,6 +1815,7 @@ def moe_down_blockwise_fp8(
         cols,
         int(block),
         experts,
+        int(tokens),
     )
 
 

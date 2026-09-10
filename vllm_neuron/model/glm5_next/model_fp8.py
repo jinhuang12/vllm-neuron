@@ -2096,6 +2096,7 @@ class Glm5NextRoutedExperts(nn.Module):
             token_position_to_id,
             block_to_expert,
             block,
+            tokens,
         )
 
         # ---- BACK TO TOKEN ORDER: one scatter-add over the whole emission. ---- #

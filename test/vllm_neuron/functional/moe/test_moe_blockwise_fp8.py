@@ -75,7 +75,6 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     gate_up_flat_scale_index,
     gate_up_kernel_identity,
     gate_up_kernel_scale_shape,
-    kernel_identity,
     kernel_scale_shape,
     moe_down_blockwise_fp8,
     moe_gate_up_blockwise_fp8,
@@ -84,7 +83,6 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     reset_down_dispatch_counters,
     reset_gate_up_dispatch_counters,
     reset_swiglu_dispatch_counters,
-    seam_identity,
     swiglu_dispatch_counters,
     swiglu_kernel_identity,
     to_down_kernel_scale_operand,
@@ -759,125 +757,113 @@ def test_cte_route_control_simulator_is_load_bearing() -> None:
 # --------------------------------------------------------------------------- #
 # Seam identity and named refusals.                                            #
 # --------------------------------------------------------------------------- #
-def test_cte_seam_dispatches_to_the_adapted_nkilib_member() -> None:
-    """The seam adapts the vendor member, read off the object rather than assumed."""
-    module, qualname = kernel_identity()
-    print(f"[identity] kernel={module}.{qualname} num_shards={NUM_SHARDS}")
-    assert module == "nkilib.core.moe.moe_cte.bwmm_shard_on_I", module
-    assert qualname == "blockwise_mm_baseline_shard_intermediate", qualname
-    assert NUM_SHARDS == 2
+def test_cte_128_no_limb_seam_reaches_the_vendor_member() -> None:
+    """Every limb this campaign runs dispatches into THIS module, and none into nkilib.
 
-
-def test_cte_identity_readings_are_derived_through_the_seam() -> None:
-    """`B26-M1`, `inc-glm53f-077`: both readings follow the real call chain.
-
-    The seam wraps a shim and the shim forwards to the vendor kernel, so there
-    are TWO substitutable hops. The reading this repair replaced looked at
-    neither: it read this module's own import of the kernel, so a substitution at
-    either hop left it byte-identical and the silence read as reassurance.
-
-    What this arm settles, and what it does NOT. It settles that each reading
-    resolves to the object at its own hop, that the two hops are different
-    objects, and that a chain which cannot be derived RAISES rather than falling
-    back to the import. It does NOT discriminate the repair from the reading it
-    replaced -- that needs the call site itself edited, which the acceptance
-    harness does as its graded mutation arms (``accept-077-r1-host.out``).
+    The positive half -- that each identity names the kernel authored here -- is
+    settled by the two items further down this file. This one settles the NEGATIVE
+    half, which those cannot: that no limb on the product path resolves into
+    ``nkilib`` at all. Before the switch the block seam did, and its own docstring
+    said so; an item that only checks the new names would pass just as well on a tree
+    where one limb had slipped back.
     """
-    import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
-
-    seam_module, seam_qualname = seam_identity()
-    kernel_module, kernel_qualname = kernel_identity()
-    print(f"[identity] seam={seam_module}.{seam_qualname}")
-    print(f"[identity] kernel={kernel_module}.{kernel_qualname}")
-
-    # Hop 1: what ``wrap_nki`` wraps is THIS module's shim, not the vendor member.
-    assert seam_module == "vllm_neuron.functional.moe.moe_blockwise_fp8", seam_module
-    assert seam_qualname == (
-        "_torch_compatible_blockwise_mm_baseline_shard_intermediate"
-    ), seam_qualname
-
-    # Hop 2: the kernel reading is unchanged by this repair, to the byte.
-    assert kernel_module == "nkilib.core.moe.moe_cte.bwmm_shard_on_I", kernel_module
-    assert kernel_qualname == "blockwise_mm_baseline_shard_intermediate", (
-        kernel_qualname
+    readings = {
+        "gate_up": gate_up_kernel_identity(),
+        "swiglu": swiglu_kernel_identity(),
+        "down": down_kernel_identity(),
+    }
+    for limb, (module, qualname) in readings.items():
+        print(f"[identity] {limb}={module}.{qualname}")
+    mine = "vllm_neuron.functional.moe.moe_blockwise_fp8"
+    foreign = {
+        limb: module for limb, (module, _) in readings.items() if module != mine
+    }
+    assert foreign == {}, (
+        f"these limbs resolve outside this module: {foreign}. Every kernel the "
+        f"routed MoE path runs is authored here"
+    )
+    assert len({qualname for _, qualname in readings.values()}) == len(readings), (
+        f"two limbs resolved to the same kernel: {readings}. Three distinct limbs "
+        f"must be three distinct objects, or one of these readings is not deriving "
+        f"anything"
     )
 
-    # The pair is not vacuous: two hops, two different objects, two readings.
-    wrapped = moe._seam_wrapped_object()
-    forwarded = moe._shim_forward_target()
-    if wrapped is forwarded:
-        raise RouteInstrumentError(
-            "the seam's wrapped object and the shim's forward target are the "
-            "same object, so the two readings cannot separate the two hops and "
-            "this arm asserts a property of nothing"
-        )
-    assert (seam_module, seam_qualname) != (kernel_module, kernel_qualname)
 
-    # Each reading is the object at its own hop, by identity rather than by name.
-    assert wrapped is moe._torch_compatible_blockwise_mm_baseline_shard_intermediate
-    assert forwarded is moe.blockwise_mm_baseline_shard_intermediate
+def test_cte_128_limb_identities_are_derived_through_their_own_seams() -> None:
+    """`B26-M1`'s property, on the limbs: each reading follows its own call chain.
 
-    # A chain that cannot be derived RAISES. No fall back to the import: that
-    # fall back is the silence `B26-M1` found.
-    with pytest.raises(MoeBlockwiseFp8Error) as no_source:
-        moe._function_ast(object())
-    assert "cannot read the source" in str(no_source.value)
-
-    with pytest.raises(MoeBlockwiseFp8Error) as not_a_name:
-        moe._resolved(seam_identity, ast.Constant(value=1), "a test probe")
-    assert "not a plain name" in str(not_a_name.value)
-
-    with pytest.raises(MoeBlockwiseFp8Error) as unbound:
-        moe._resolved(seam_identity, ast.Name(id="not_bound_anywhere"), "a probe")
-    assert "not bound in" in str(unbound.value)
-
-
-def test_cte_kernel_identity_has_no_fall_back_to_the_import(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`B46 N1`, `inc-glm53f-077`: the reading is BOUND to the derivation.
-
-    The arm above binds both helpers to their objects, but checks
-    ``kernel_identity()`` itself only against two name strings -- and in a healthy
-    tree the derivation and this module's own import of the kernel name the SAME
-    object, so a ``kernel_identity()`` that went back to reading the import would
-    satisfy those strings unchanged. That is the silence `B26-M1` found, and the
-    arm above cannot see it.
-
-    What a unit test CAN settle is that no such fall back exists: break the
-    derivation and the reading must RAISE rather than answer. An implementation
-    that read the import would return the real identity here, and this arm would
-    then fail on the missing exception. Discriminating the repair from its
-    predecessor on an INTACT tree still needs the call site itself edited, which
-    stays the acceptance harness's graded mutation arms.
+    A reading that looked at this module's import of a kernel instead of at the seam
+    that calls it is byte-identical on a healthy tree and blind to a substitution at
+    the seam. So the property is checked the only way a unit test can: break ONE
+    limb's derivation and that limb's reading must RAISE, while the other two are
+    unmoved. An implementation reading the import would answer for all three.
     """
     import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
 
-    # POPULATION BEFORE PROPERTY: the reading works before the break, so the
-    # exception below belongs to the break and not to a tree that was already red.
-    intact_module, intact_qualname = kernel_identity()
-    assert intact_module == "nkilib.core.moe.moe_cte.bwmm_shard_on_I", intact_module
-
+    # POPULATION BEFORE PROPERTY: all three answer before the break, so the
+    # exception below belongs to the break and not to an already-red tree.
+    intact = {
+        "gate_up": gate_up_kernel_identity(),
+        "swiglu": swiglu_kernel_identity(),
+        "down": down_kernel_identity(),
+    }
     sentinel = "the derivation was broken by this arm, on purpose"
 
-    def _refuse() -> None:
+    def _refuse(seam, what):
         raise MoeBlockwiseFp8Error(sentinel)
 
-    monkeypatch.setattr(moe, "_shim_forward_target", _refuse)
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(moe, "_wrapped_object_of", _refuse)
+        for limb, reader in (
+            ("gate_up", moe.gate_up_kernel_identity),
+            ("swiglu", moe.swiglu_kernel_identity),
+            ("down", moe.down_kernel_identity),
+        ):
+            with pytest.raises(MoeBlockwiseFp8Error) as broken:
+                reader()
+            assert sentinel in str(broken.value), f"[{limb}] {broken.value}"
+    finally:
+        monkeypatch.undo()
 
-    with pytest.raises(MoeBlockwiseFp8Error) as broken:
-        moe.kernel_identity()
-    assert sentinel in str(broken.value), str(broken.value)
+    # NON-VACUITY: there really was something to fall back TO. The module-level
+    # kernel names are still bound and unwrapping them yields the same identities,
+    # so the refusals above are a choice rather than an absence.
+    for limb, kernel in (
+        ("gate_up", moe.moe_gate_up_blockwise_fp8_kernel),
+        ("swiglu", moe.moe_swiglu_transposed_kernel),
+        ("down", moe.moe_down_blockwise_fp8_kernel),
+    ):
+        fallback = moe._unwrap_nki(kernel)
+        assert (fallback.__module__, fallback.__qualname__) == intact[limb], limb
 
-    # NON-VACUITY CONTROL, and the reason this arm is not a test of an absent
-    # name. The module-level import is still bound, and unwrapping it yields the
-    # very identity the intact reading returned -- so there really was something
-    # to fall back TO, and the refusal above is a choice rather than an accident.
-    fallback = moe._unwrap_nki(moe.blockwise_mm_baseline_shard_intermediate)
-    assert (fallback.__module__, fallback.__qualname__) == (
-        intact_module,
-        intact_qualname,
+
+def test_cte_128_a_substituted_import_does_not_move_a_limb_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reading is bound to the SEAM's call, not to this module's name for it.
+
+    The arm above shows a broken derivation raises. This one shows the other
+    direction on an intact tree: rebind the module-level NAME of a limb kernel to a
+    different object and the reading must not follow, because the seam still calls
+    the kernel it always called. A reading that resolved the module attribute would
+    answer with the substitute and this arm would catch it.
+    """
+    import vllm_neuron.functional.moe.moe_blockwise_fp8 as moe
+
+    before = gate_up_kernel_identity()
+
+    def _decoy():
+        raise AssertionError("the decoy must never be called by anything")
+
+    monkeypatch.setattr(moe, "moe_gate_up_blockwise_fp8_kernel", _decoy)
+    after = moe.gate_up_kernel_identity()
+    print(f"[identity] before={before} after_substitution={after}")
+    assert after == before, (
+        f"the gate/up reading followed a substituted module attribute: {before} -> "
+        f"{after}. It must resolve the object the seam calls"
     )
+    assert after[1] != "_decoy", after
 
 
 @pytest.mark.parametrize(
@@ -968,6 +954,59 @@ G128_I = I_TP
 G128_H_BLOCKS = G128_H // GATE_UP_SCALE_BLOCK
 G128_I_BLOCKS = G128_I // GATE_UP_SCALE_BLOCK
 G128_BLOCKS = G128_H_BLOCKS * GATE_UP_FUSION * G128_I_BLOCKS
+
+
+def _one_block_routing(tokens: int) -> tuple:
+    """``(row_index, expert_index, block)`` for one block of one expert.
+
+    The identity row index and a single zero expert, which is the mapping a
+    single-expert comparison implies. ``block`` is the whole token count, so the
+    routed kernels see exactly one block and their block arithmetic reduces to the
+    single-expert form these items were written against.
+    """
+    return (
+        torch.arange(tokens, dtype=torch.int32).reshape(-1, 1),
+        torch.zeros((1, 1), dtype=torch.int32),
+        tokens,
+    )
+
+
+def _gate_up_one_block(hidden, fused_weight, scale_operand):
+    """The routed gate/up seam at the single-expert, single-block shape."""
+    tokens = int(hidden.shape[0])
+    padded = torch.cat(
+        [hidden, torch.zeros((1, int(hidden.shape[1])), dtype=hidden.dtype)]
+    )
+    return moe_gate_up_blockwise_fp8(
+        padded,
+        fused_weight.unsqueeze(0),
+        scale_operand.unsqueeze(0),
+        *_one_block_routing(tokens),
+    )
+
+
+def _affinity_bank(affinity):
+    """One expert's ``[B, 1]`` affinities as the seam's ``[(T + 1) * E, 1]`` bank."""
+    return torch.cat([affinity, torch.zeros((1, 1), dtype=affinity.dtype)])
+
+
+def _down_one_block(intermediate_t, down_weight, scale_operand, affinity):
+    """The routed down seam at the single-expert, single-block shape.
+
+    The affinity arrives as ``[B, 1]`` for one expert and the bank the seam takes is
+    ``[(T + 1) * E, 1]``; at ``E = 1`` that is this column with the padding token's
+    zero appended, which is what the mapping itself would hand over.
+    """
+    tokens = int(intermediate_t.shape[1])
+    bank = torch.cat([affinity, torch.zeros((1, 1), dtype=affinity.dtype)])
+    return moe_down_blockwise_fp8(
+        intermediate_t,
+        down_weight.unsqueeze(0),
+        scale_operand.unsqueeze(0),
+        bank,
+        *_one_block_routing(tokens),
+        tokens,
+    )
 
 #: The four scale values, and the two mantissa families they fall into. Powers of
 #: two multiply them per quad, which keeps every block scale distinct without
@@ -1201,7 +1240,7 @@ def test_cte_128_gate_up_matches_the_model_reference_per_expert_block() -> None:
 
     with _SimulatorCounter() as sim:
         outputs = [
-            moe_gate_up_blockwise_fp8(
+            _gate_up_one_block(
                 case["hidden"][expert],
                 case["weight_fused"][expert],
                 case["operands"][expert],
@@ -1396,7 +1435,7 @@ def test_cte_128_a_lossy_256_retile_must_not_reach_exactness() -> None:
 
     reset_gate_up_dispatch_counters()
     with _SimulatorCounter() as sim:
-        got = moe_gate_up_blockwise_fp8(
+        got = _gate_up_one_block(
             case["hidden"][0],
             lossy_weight,
             to_gate_up_kernel_scale_operand(lossy, G128_H, G128_I),
@@ -1445,7 +1484,7 @@ def test_cte_128_route_control_the_gate_up_limb_has_no_torch_route() -> None:
         # than asserted: what this arm settles is that the call did not return a
         # tensor computed some other way.
         with pytest.raises(Exception) as excinfo:  # noqa: B017 - see above
-            moe_gate_up_blockwise_fp8(
+            _gate_up_one_block(
                 case["hidden"][0], case["weight_fused"][0], case["operands"][0]
             )
     finally:
@@ -1606,8 +1645,13 @@ def test_cte_128_seam_refuses_wrong_operands_by_name() -> None:
     operand = case["operands"][0]
 
     with pytest.raises(MoeBlockwiseFp8Error) as rank:
-        moe_gate_up_blockwise_fp8(hidden.unsqueeze(0), weight, operand)
-    assert "must be [B, H]" in str(rank.value)
+        moe_gate_up_blockwise_fp8(
+            hidden.unsqueeze(0),
+            weight.unsqueeze(0),
+            operand.unsqueeze(0),
+            *_one_block_routing(G128_TOKENS),
+        )
+    assert "must be [T + 1, H]" in str(rank.value)
 
     # Built at the wrong shape rather than transposed or sliced from the fp8
     # fixture: a transpose-then-contiguous on fp8 would make this arm depend on a
@@ -1616,18 +1660,33 @@ def test_cte_128_seam_refuses_wrong_operands_by_name() -> None:
         (GATE_UP_FUSION * G128_I, G128_H), dtype=torch.float32
     ).to(_FP8)
     with pytest.raises(MoeBlockwiseFp8Error) as orientation:
-        moe_gate_up_blockwise_fp8(hidden, transposed, operand)
+        moe_gate_up_blockwise_fp8(
+            hidden,
+            transposed.unsqueeze(0),
+            operand.unsqueeze(0),
+            *_one_block_routing(G128_TOKENS),
+        )
     assert "contraction-major" in str(orientation.value)
 
     odd_width = torch.zeros(
         (G128_H, GATE_UP_FUSION * G128_I - 1), dtype=torch.float32
     ).to(_FP8)
     with pytest.raises(MoeBlockwiseFp8Error) as fusion:
-        moe_gate_up_blockwise_fp8(hidden, odd_width, operand)
+        moe_gate_up_blockwise_fp8(
+            hidden,
+            odd_width.unsqueeze(0),
+            operand.unsqueeze(0),
+            *_one_block_routing(G128_TOKENS),
+        )
     assert "GATE_UP_FUSION" in str(fusion.value)
 
     with pytest.raises(MoeBlockwiseFp8Error) as shape:
-        moe_gate_up_blockwise_fp8(hidden, weight, operand[:, :-1].contiguous())
+        moe_gate_up_blockwise_fp8(
+            hidden,
+            weight.unsqueeze(0),
+            operand[:, :-1].contiguous().unsqueeze(0),
+            *_one_block_routing(G128_TOKENS),
+        )
     assert "to_gate_up_kernel_scale_operand" in str(shape.value)
 
     with pytest.raises(MoeBlockwiseFp8Error) as grid:
@@ -2111,7 +2170,7 @@ def test_cte_128_down_matches_the_model_reference_per_expert_block() -> None:
 
     with _SimulatorCounter() as sim:
         outputs = {
-            (expert, key): moe_down_blockwise_fp8(
+            (expert, key): _down_one_block(
                 case["intermediate_t"][expert],
                 case["down_weight"][expert],
                 case["operands"][expert],
@@ -2213,7 +2272,7 @@ def test_cte_128_down_a_lossy_256_retile_must_not_reach_exactness() -> None:
 
     reset_down_dispatch_counters()
     with _SimulatorCounter() as sim:
-        got = moe_down_blockwise_fp8(
+        got = _down_one_block(
             case["intermediate_t"][0],
             lossy_weight,
             to_down_kernel_scale_operand(lossy, G128_I, G128_H),
@@ -2243,13 +2302,13 @@ def test_cte_128_the_affinity_scaling_is_load_bearing() -> None:
     case = _build_down_128_case()
     reset_down_dispatch_counters()
     with _SimulatorCounter() as sim:
-        plain = moe_down_blockwise_fp8(
+        plain = _down_one_block(
             case["intermediate_t"][0],
             case["down_weight"][0],
             case["operands"][0],
             case["ones"][0],
         ).to(torch.float32)
-        scaled = moe_down_blockwise_fp8(
+        scaled = _down_one_block(
             case["intermediate_t"][0],
             case["down_weight"][0],
             case["operands"][0],
@@ -2387,7 +2446,14 @@ def test_cte_128_down_and_swiglu_refuse_wrong_operands_by_name() -> None:
     operand, affinity = case["operands"][0], case["ones"][0]
 
     with pytest.raises(MoeBlockwiseFp8Error) as rank:
-        moe_down_blockwise_fp8(inter.unsqueeze(0), weight, operand, affinity)
+        moe_down_blockwise_fp8(
+            inter.unsqueeze(0),
+            weight.unsqueeze(0),
+            operand.unsqueeze(0),
+            _affinity_bank(affinity),
+            *_one_block_routing(G128_TOKENS),
+            G128_TOKENS,
+        )
     assert "must have rank 2" in str(rank.value)
 
     # THE WRONG-WAY WEIGHT IS BUILT AT A CONTRACTION THIS CASE DOES NOT USE, and
@@ -2398,16 +2464,37 @@ def test_cte_128_down_and_swiglu_refuse_wrong_operands_by_name() -> None:
     # valid `[I, 2*H]` weight would have if it were handed over transposed.
     wrong_way = torch.zeros((2 * G128_H, G128_I), dtype=torch.float32).to(_FP8)
     with pytest.raises(MoeBlockwiseFp8Error) as orientation:
-        moe_down_blockwise_fp8(inter, wrong_way, operand, affinity)
+        moe_down_blockwise_fp8(
+            inter,
+            wrong_way.unsqueeze(0),
+            operand.unsqueeze(0),
+            _affinity_bank(affinity),
+            *_one_block_routing(G128_TOKENS),
+            G128_TOKENS,
+        )
     assert "contraction-major" in str(orientation.value)
 
     with pytest.raises(MoeBlockwiseFp8Error) as shape:
-        moe_down_blockwise_fp8(inter, weight, operand[:, :-1].contiguous(), affinity)
+        moe_down_blockwise_fp8(
+            inter,
+            weight.unsqueeze(0),
+            operand[:, :-1].contiguous().unsqueeze(0),
+            _affinity_bank(affinity),
+            *_one_block_routing(G128_TOKENS),
+            G128_TOKENS,
+        )
     assert "to_down_kernel_scale_operand" in str(shape.value)
 
     with pytest.raises(MoeBlockwiseFp8Error) as columns:
-        moe_down_blockwise_fp8(inter, weight, operand, affinity[:-1])
-    assert "affinity must be [B, 1]" in str(columns.value)
+        moe_down_blockwise_fp8(
+            inter,
+            weight.unsqueeze(0),
+            operand.unsqueeze(0),
+            _affinity_bank(affinity)[:-1],
+            *_one_block_routing(G128_TOKENS),
+            G128_TOKENS,
+        )
+    assert "affinity_bank must be [(T + 1) * E_local, 1]" in str(columns.value)
     # AND THE ORIENTATION ARM ABOVE IS NOT HOLLOW, which this line is what says.
     # The call here carries the case's OWN correctly-oriented weight and reached
     # the affinity guard, so it got PAST the orientation guard -- which makes the
