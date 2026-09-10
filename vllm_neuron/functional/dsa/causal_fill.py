@@ -177,76 +177,124 @@ def _causal_fill_nki(positions_hbm, width):
         ``[rows, width]`` int32, holding ``c`` in column ``c`` of every row whose position is at
         least ``c`` and ``-1`` in every other column.
 
-    THE WHOLE TILE IS WRITTEN BY ONE EXPRESSION, so no region can be left undefined and none can be
+    EVERY TILE IS WRITTEN BY ONE EXPRESSION, so no region can be left undefined and none can be
     written twice -- the failure mode ``index_expand.py:297-303`` had to partition three regions to
-    avoid. There is no loop here at all: the column ramp is one iota and the rule is one closed
-    form over it.
+    avoid. The column ramp is one iota and the rule is one closed form over it.
+
+    THE ROW AXIS IS TILED AT ``nl.tile_size.pmax`` (``inc-glm53f-103d``). It used to say "there is
+    no loop here at all", and that sentence was the defect: a row is a PARTITION, the partition axis
+    serves 128, and this kernel bound every one of its nine tiles to the full row count. Any prefill
+    above 128 tokens therefore died inside the vendor's own check --
+    ``AssertionError: dma_copy dst partition dimension 132 exceeds maximum 128``
+    (``nki/isa/_copy.py:152`` calling ``nki/isa/_validation.py:261``) -- and this kernel is the ONLY
+    one the short-sequence bypass regime reaches, so no request above 128 tokens ran at all.
+
+    THE TILING IS LAYOUT AND NOT ARITHMETIC, which is why the acceptance may ask for bit equality
+    rather than a tolerance. Row ``i``'s output depends on ``positions[i]`` and the column index and
+    on nothing else: ``ramp`` is an iota with ``channel_multiplier=0``, identical on every
+    partition, every step is an elementwise ``tensor_scalar``/``tensor_tensor``, and there is no
+    reduction across rows anywhere. A tile boundary may therefore fall at any row.
+
+    THE LOOP FORM IS THE ONE LANDED IN THIS PACKAGE, not one invented here: ``paged_gather.py``
+    tiles its token axis the same way (``:212-219`` for the bound and the short last tile,
+    ``:243-244`` for the strided store), including the ``min`` for the ragged tile and the
+    ``.ap(pattern=..., offset=...)`` access patterns. ``pos`` is loaded INSIDE the loop, once per
+    tile, because it is the one PER-ROW operand -- hoisting it would bound every tile by the first
+    tile's rows and would read identically to this kernel at any row count of 128 or fewer.
     """
-    rows = positions_hbm.shape[0]
+    rows_total = positions_hbm.shape[0]
+    pmax = nl.tile_size.pmax
+    n_tiles = (rows_total + pmax - 1) // pmax
 
-    out = nl.ndarray((rows, width), dtype=nl.int32, buffer=nl.shared_hbm)
+    out = nl.ndarray((rows_total, width), dtype=nl.int32, buffer=nl.shared_hbm)
 
-    # WHY float32 AND NOT int32, WHICH IS WHAT THIS TILE HELD UNTIL THE COMPILER REFUSED IT.
-    # `pos` is the only TILE this kernel passes as a `tensor_scalar` operand, and the ISA requires a
-    # tile operand to be float32: "arithmetic operators impose no restriction on the data types of
-    # input tensor ``data`` and output tensor ``dst``, but the operand0 and operand1 (if used) must
-    # be float32" (`nki/isa/_tensor_ops.py:279`, with the conversion at `:227`). An int32 tile here
-    # is refused by the MLIR verifier with `'nisa.tensor_scalar_arith' op 'operand0' must be
-    # float32, got 'i32'` -- read at every width in `capture-099-r1.out`. The NKI SIMULATOR does not
-    # run that stage, which is why four green items never saw it.
-    #
-    # THE VALUE IS UNCHANGED, not merely close. The engine already casts `data` to float32 and does
-    # the arithmetic in float32 math regardless, casting back to `dst.dtype` at no cost, so this
-    # makes an existing float32 computation explicit for one operand rather than introducing one.
-    # Every quantity involved is a whole number below 2**24 -- a position is at most
-    # `select_k * pool + pool - 2` and a column at most `width - 1` -- so float32 holds each one
-    # exactly. `test_causal_fill.py`'s exactness items are the reading, not this comment.
-    pos = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=pos, src=nl.load(positions_hbm))
+    for t in range(n_tiles):
+        # The last tile is short whenever the row count is not a multiple of `pmax`. It is narrowed
+        # rather than padded, so no lane that holds no row can contribute one -- the same choice
+        # `paged_gather.py:216-219` records, and the reason a non-multiple row count is one of the
+        # acceptance's declared extents rather than an afterthought.
+        rows = min(pmax, rows_total - t * pmax)
+        off = t * pmax
 
-    # THE COLUMN RAMP. `channel_multiplier=0` gives every row the same 0..width-1, which is the
-    # broadcast `causal_range[None, :]` upstream builds with a torch arange. It stays float32 and is
-    # used as the ramp directly: the int32 `cols` copy this used to make is gone, because the whole
-    # closed form below is float32 now and that copy was the cast the chain no longer needs.
-    ramp = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=ramp, pattern=[[1, width]], offset=0, channel_multiplier=0)
+        # WHY float32 AND NOT int32, WHICH IS WHAT THIS TILE HELD UNTIL THE COMPILER REFUSED IT.
+        # `pos` is the only TILE this kernel passes as a `tensor_scalar` operand, and the ISA
+        # requires a tile operand to be float32: "arithmetic operators impose no restriction on the
+        # data types of input tensor ``data`` and output tensor ``dst``, but the operand0 and
+        # operand1 (if used) must be float32" (`nki/isa/_tensor_ops.py:279`, with the conversion at
+        # `:227`). An int32 tile here is refused by the MLIR verifier with
+        # `'nisa.tensor_scalar_arith' op 'operand0' must be float32, got 'i32'` -- read at every
+        # width in `capture-099-r1.out`. The NKI SIMULATOR does not run that stage, which is why
+        # four green items never saw it.
+        #
+        # THE VALUE IS UNCHANGED, not merely close. The engine already casts `data` to float32 and
+        # does the arithmetic in float32 math regardless, casting back to `dst.dtype` at no cost, so
+        # this makes an existing float32 computation explicit for one operand rather than
+        # introducing one. Every quantity involved is a whole number below 2**24 -- a position is at
+        # most `select_k * pool + pool - 2` and a column at most `width - 1` -- so float32 holds
+        # each one exactly. `test_causal_fill.py`'s exactness items are the reading, not this
+        # comment.
+        #
+        # LOADED PER TILE, DELIBERATELY. `pos` is this kernel's only per-row operand, so a load
+        # hoisted out of this loop would bound every tile by the FIRST tile's rows. That reads
+        # identically to this kernel at any row count of 128 or fewer, which is why the acceptance
+        # carries a control that hoists it and drives a row count above 128.
+        pos = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=pos, src=nl.load(positions_hbm.ap(pattern=[[1, rows], [1, 1]], offset=off))
+        )
 
-    # `1 - c`, as one two-scalar chain. Building it this way rather than as `-(c - 1)` keeps the tile
-    # operand and the scalar operands in separate calls, which is the screening constraint.
-    one_minus = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=one_minus, data=ramp,
-                       op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
+        # THE COLUMN RAMP. `channel_multiplier=0` gives every row the same 0..width-1, which is the
+        # broadcast `causal_range[None, :]` upstream builds with a torch arange. It stays float32
+        # and is used as the ramp directly: the int32 `cols` copy this used to make is gone, because
+        # the whole closed form below is float32 now and that copy was the cast the chain no longer
+        # needs. It is rebuilt per tile and is identical in every tile -- it carries no row state,
+        # so a tile boundary cannot change it.
+        ramp = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(dst=ramp, pattern=[[1, width]], offset=0, channel_multiplier=0)
 
-    # `room = positions[i] - c + 1`, at least 1 exactly while `c <= positions[i]` and at most 0
-    # after it. One call, one tile operand, broadcast along the free axis. THIS is the call the MLIR
-    # verifier refused while `pos` was int32; see the dtype note above `pos`.
-    room = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=room, data=one_minus, op0=nl.add, operand0=pos)
+        # `1 - c`, as one two-scalar chain. Building it this way rather than as `-(c - 1)` keeps the
+        # tile operand and the scalar operands in separate calls, which is the screening constraint.
+        one_minus = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=one_minus, data=ramp,
+                           op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
 
-    # `keep = clamp(room, 0, 1)`. The landed clamp shape, `index_expand.py:361`.
-    keep = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=keep, data=room,
-                       op0=nl.maximum, operand0=0.0, op1=nl.minimum, operand1=1.0)
+        # `room = positions[i] - c + 1`, at least 1 exactly while `c <= positions[i]` and at most 0
+        # after it. One call, one tile operand, broadcast along the free axis. THIS is the call the
+        # MLIR verifier refused while `pos` was int32; see the dtype note above `pos`.
+        room = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=room, data=one_minus, op0=nl.add, operand0=pos)
 
-    # `out = (c + 1) * keep - 1`: `c` where the column is causal, `-1` where it is not. The `+1`/`-1`
-    # pair is what lets column 0 survive -- a bare `c * keep` would write 0 for a masked column 0
-    # and 0 is a real token index.
-    cols1 = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=cols1, data=ramp, op0=nl.add, operand0=1.0)
-    prod = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=prod, data1=cols1, data2=keep, op=nl.multiply)
-    acc = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=acc, data=prod, op0=nl.subtract, operand0=1.0)
+        # `keep = clamp(room, 0, 1)`. The landed clamp shape, `index_expand.py:361`.
+        keep = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=keep, data=room,
+                           op0=nl.maximum, operand0=0.0, op1=nl.minimum, operand1=1.0)
 
-    # THE ONE CAST AT THE STORE. Every tile above is float32, so the closed form runs in one dtype
-    # from the ramp to here and no intermediate is converted. The result is an index tensor, so it
-    # is cast to int32 exactly once, by `nisa.tensor_copy`, which is this repository's landed
-    # cross-dtype copy. Casting here rather than inside `nl.store` keeps the conversion a named
-    # instruction a reader can see, instead of an implicit property of the store.
-    result = nl.ndarray((rows, width), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=result, src=acc)
+        # `out = (c + 1) * keep - 1`: `c` where the column is causal, `-1` where it is not. The
+        # `+1`/`-1` pair is what lets column 0 survive -- a bare `c * keep` would write 0 for a
+        # masked column 0 and 0 is a real token index.
+        cols1 = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=cols1, data=ramp, op0=nl.add, operand0=1.0)
+        prod = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=prod, data1=cols1, data2=keep, op=nl.multiply)
+        acc = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=acc, data=prod, op0=nl.subtract, operand0=1.0)
 
-    nl.store(out, value=result)
+        # THE ONE CAST AT THE STORE. Every tile above is float32, so the closed form runs in one
+        # dtype from the ramp to here and no intermediate is converted. The result is an index
+        # tensor, so it is cast to int32 exactly once, by `nisa.tensor_copy`, which is this
+        # repository's landed cross-dtype copy. Casting here rather than inside `nl.store` keeps the
+        # conversion a named instruction a reader can see, instead of an implicit property of the
+        # store.
+        result = nl.ndarray((rows, width), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=result, src=acc)
+
+        # The strided store puts this tile's rows at their own offset in the full output. The
+        # pattern is `paged_gather.py:243-244`'s, which is the landed form for writing a row slice
+        # of a `[rows, width]` HBM tensor.
+        nl.store(
+            out.ap(pattern=[[width, rows], [1, width]], offset=off * width), value=result
+        )
+
     return out
 
 

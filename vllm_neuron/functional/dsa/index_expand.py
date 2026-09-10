@@ -252,6 +252,80 @@ def index_expand_raw_width(n_groups: int, pool_size: int) -> int:
     return n_groups * pool_size + pool_size - 1
 
 
+PARTITION_MAX = 128
+"""Query rows ONE SBUF tile can hold: the partition-axis bound, ``nl.tile_size.pmax``.
+
+This bounds one ROW TILE and not the call. `inc-glm53f-103c` walks the query-token axis in tiles of at
+most this height, so a prefill with more selected rows than this is SERVED rather than trapped in the
+vendor's own ``dma_copy`` assert. Written as a module constant so the kernel, the tile arithmetic and
+the acceptance read one number -- `inc-glm53f-028b`'s form at ``mhc/sinkhorn.py:217``, as
+`inc-glm53f-103b` adapted it at ``dsa/causal_bound.py``.
+"""
+
+
+def _row_tiles_unchecked(rows: int) -> list[tuple[int, int]]:
+    """The ``(start, height)`` query-row tiles, in order, with no refusal in the arithmetic.
+
+    THE FORMS THIS LOOP AVOIDS ARE NOT TASTE, THEY WERE PAID FOR. `inc-glm53f-028b` landed the same
+    tiling in ``mhc/sinkhorn.py`` and commit ``543d793`` had to strip a list comprehension and a ``min``
+    out of it because the tracer refused them where the kernel bodies reach (``sinkhorn.py:353-386``
+    records what the compiler said). This loop therefore uses only ``for`` over ``range``, ``append``, a
+    tuple and an ``if``/``else``. The arithmetic is unchanged from ``min(PARTITION_MAX, rows - start)``.
+
+    ``mhc/sinkhorn.py`` rounds its tile height DOWN to a multiple of one token's block, because a block
+    spans several rows there. Here one query row is one token, so nothing can be split and the height is
+    :data:`PARTITION_MAX` itself. This is byte-for-byte the helper `inc-glm53f-103b` landed in
+    ``dsa/causal_bound.py``; the two are separate because each block's declared surface is its own file,
+    and putting one copy in a shared module is a design decision rather than an implementer's.
+    """
+    tiles = []
+    for start in range(0, rows, PARTITION_MAX):
+        remaining = rows - start
+        if remaining < PARTITION_MAX:
+            tiles.append((start, remaining))
+        else:
+            tiles.append((start, PARTITION_MAX))
+    return tiles
+
+
+def _row_tile_count_unchecked(rows: int) -> int:
+    """How many tiles :func:`_row_tiles_unchecked` returns, by arithmetic.
+
+    A kernel loop BOUND, for the reason ``sinkhorn.py:388-406`` records: the body counts with
+    ``for idx in range(bound)`` because a ``for`` whose loop variable is a tuple is what the compiler
+    refused there, and the bound is a plain name rather than a call because that is the form the
+    repository's other NKI kernels use. Ceiling division; the acceptance reads this against
+    ``len(row_tiles(rows))`` rather than assuming the two agree.
+    """
+    return (rows + PARTITION_MAX - 1) // PARTITION_MAX
+
+
+def row_tiles(rows: int) -> list[tuple[int, int]]:
+    """The ``(start, height)`` query-row tiles the kernel walks, in order. The CHECKED path.
+
+    For the acceptance, and for any reader that wants to say how a call will be tiled without tracing
+    it. The kernel body calls :func:`_row_tiles_unchecked` instead, because this function raises and NKI
+    refuses a traced ``raise``; the two return the same list for every admissible input.
+
+    Raises:
+        IndexExpandError: if ``rows`` is not positive. A call with no selected rows has no tiles.
+    """
+    if rows < 1:
+        raise IndexExpandError(
+            f"rows must be the positive number of query rows to tile; got rows={rows}"
+        )
+    return _row_tiles_unchecked(rows)
+
+
+def row_tile_count(rows: int) -> int:
+    """How many tiles :func:`row_tiles` returns. The CHECKED path, and the same refusal."""
+    if rows < 1:
+        raise IndexExpandError(
+            f"rows must be the positive number of query rows to tile; got rows={rows}"
+        )
+    return _row_tile_count_unchecked(rows)
+
+
 def index_expand_width(n_groups: int, pool_size: int) -> int:
     """How many columns are EMITTED: the raw width rounded up to a whole number of ``KEY_CHUNK``.
 
@@ -304,6 +378,18 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
     The padding memset is the whole of this increment's device-side change. It is written HERE, in the
     kernel body, and not as a torch concatenation after the call: the width is kernel-class work under
     P13 and a torch pad would be a fallback for it.
+
+    THE QUERY-ROW AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS (`inc-glm53f-103c`).
+    Every tile below is this body's own former tile at its own height, in its own order, and each tile
+    reads only its own rows of both inputs -- so ``rows <= PARTITION_MAX`` is one tile and is the old
+    program exactly, and a taller call is that program run once per tile. THE TWO LOOPS THAT WERE
+    ALREADY HERE ARE NOT THIS: they are ``pool_size`` long and walk COLUMNS, and they still do. What
+    they write -- the padding slice, the strided history columns, one tail column each -- stays the same
+    COLUMN geometry of the tile whose partition extent is the tile height. Before this increment nothing
+    in this module bounded ``rows``: ``_validate`` reads shapes, dtypes and ``pool_size``, and
+    :func:`can_run_dsa_index_expand` reads only whether NKI is available, so a taller call dispatched
+    and died inside the vendor's own assert at ``nki/isa/_copy.py:152`` by way of
+    ``nki/isa/_validation.py:261``.
     """
     rows = pool_ids_hbm.shape[0]
     n_groups = pool_ids_hbm.shape[1]
@@ -317,56 +403,75 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
 
     out = nl.ndarray((rows, out_cols), dtype=nl.int32, buffer=nl.shared_hbm)
 
-    pid = nl.ndarray((rows, n_groups), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=pid, src=nl.load(pool_ids_hbm))
-    seq = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=seq, src=nl.load(seq_lens_hbm))
+    # The UNCHECKED tile arithmetic, because the tracer follows these calls: the checked `row_tiles`
+    # raises, and NKI refuses a traced `raise`. The loop BOUND is a plain name and the tile list is read
+    # BY INDEX -- both for the reasons `sinkhorn.py:353-406` records against its own diagnostics.
+    tiles = _row_tiles_unchecked(int(rows))
+    tile_count = _row_tile_count_unchecked(int(rows))
 
-    acc = nl.ndarray((rows, out_cols), dtype=nl.int32, buffer=nl.sbuf)
+    for idx in range(tile_count):
+        tile_geom = tiles[idx]
+        start = tile_geom[0]
+        height = tile_geom[1]
 
-    # THE PADDING REGION, FIRST, so the tile's whole extent is accounted for before any real value is
-    # written and a later edit to the tail loop cannot silently leave a gap. `nisa.memset` on a column
-    # slice with a sentinel is the landed form at `argsort_unstable.py:197-199`, which pads to a
-    # multiple of its own pass width for the same reason. The guard matters: an admissible raw width
-    # would make this an empty slice, and `pool_size == 1` is exactly that case.
-    if out_cols > raw_cols:
-        nisa.memset(acc[:, raw_cols:out_cols], -1)
+        pid = nl.ndarray((height, n_groups), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=pid, src=nl.load(pool_ids_hbm[start:start + height, 0:n_groups])
+        )
+        # RE-LOADED PER TILE, never carried over from the first tile: `seq_lens` is per-row, so a walk
+        # that hoisted this column would give every tile the first tile's lengths and would still read
+        # correct at `rows <= PARTITION_MAX`, where there is only one tile.
+        seq = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=seq, src=nl.load(seq_lens_hbm[start:start + height, 0:1]))
 
-    # THE HISTORY REGION. `max(pid * pool_size + o, -1)` is upstream's `where(pid >= 0, ...)` with no
-    # compare and no select: the largest value any negative pool id can reach is exactly -1.
-    for o in range(pool_size):
-        vals = nl.ndarray((rows, n_groups), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=vals, data=pid,
-                           op0=nl.multiply, operand0=pool_size, op1=nl.add, operand1=o)
-        nisa.tensor_scalar(dst=vals, data=vals, op0=nl.maximum, operand0=-1)
-        nisa.tensor_copy(dst=acc[:, o:topk:pool_size], src=vals)
+        acc = nl.ndarray((height, out_cols), dtype=nl.int32, buffer=nl.sbuf)
 
-    # `tail_start = seq_len - (seq_len & (pool_size - 1))`, exact for a power-of-two pool_size and the
-    # reason the gate refuses any other. `nl.mod` would say this directly and does not compile.
-    rem = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=rem, data=seq, op0=nl.bitwise_and, operand0=pool_mask)
-    tail_start = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=tail_start, data1=seq, data2=rem, op=nl.subtract)
+        # THE PADDING REGION, FIRST, so the tile's whole extent is accounted for before any real value
+        # is written and a later edit to the tail loop cannot silently leave a gap. `nisa.memset` on a
+        # column slice with a sentinel is the landed form at `argsort_unstable.py:197-199`, which pads
+        # to a multiple of its own pass width for the same reason. The guard matters: an admissible raw
+        # width would make this an empty slice, and `pool_size == 1` is exactly that case.
+        if out_cols > raw_cols:
+            nisa.memset(acc[:, raw_cols:out_cols], -1)
 
-    # THE TAIL REGION, one column per possible tail token. `mask` is 1 exactly while
-    # `tail_start + t < seq_len`, so the value is `tail_start + t` there and -1 elsewhere.
-    for t in range(pool_size - 1):
-        pos = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=pos, data=tail_start, op0=nl.add, operand0=t)
-        clipped = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=clipped, data1=pos, data2=seq, op=nl.minimum)
-        room = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=room, data1=seq, data2=clipped, op=nl.subtract)
-        mask = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=mask, data=room, op0=nl.maximum, operand0=0, op1=nl.minimum, operand1=1)
-        pos1 = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=pos1, data=pos, op0=nl.add, operand0=1)
-        prod = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=prod, data1=pos1, data2=mask, op=nl.multiply)
-        col = topk + t
-        nisa.tensor_scalar(dst=acc[:, col:col + 1], data=prod, op0=nl.subtract, operand0=1)
+        # THE HISTORY REGION. `max(pid * pool_size + o, -1)` is upstream's `where(pid >= 0, ...)` with
+        # no compare and no select: the largest value any negative pool id can reach is exactly -1.
+        # This loop walks COLUMNS and is `pool_size` long; it is not the row tiling.
+        for o in range(pool_size):
+            vals = nl.ndarray((height, n_groups), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=vals, data=pid,
+                               op0=nl.multiply, operand0=pool_size, op1=nl.add, operand1=o)
+            nisa.tensor_scalar(dst=vals, data=vals, op0=nl.maximum, operand0=-1)
+            nisa.tensor_copy(dst=acc[:, o:topk:pool_size], src=vals)
 
-    nl.store(out, value=acc)
+        # `tail_start = seq_len - (seq_len & (pool_size - 1))`, exact for a power-of-two pool_size and
+        # the reason the gate refuses any other. `nl.mod` would say this directly and does not compile.
+        rem = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=rem, data=seq, op0=nl.bitwise_and, operand0=pool_mask)
+        tail_start = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=tail_start, data1=seq, data2=rem, op=nl.subtract)
+
+        # THE TAIL REGION, one column per possible tail token. `mask` is 1 exactly while
+        # `tail_start + t < seq_len`, so the value is `tail_start + t` there and -1 elsewhere. This
+        # loop walks COLUMNS too.
+        for t in range(pool_size - 1):
+            pos = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=pos, data=tail_start, op0=nl.add, operand0=t)
+            clipped = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=clipped, data1=pos, data2=seq, op=nl.minimum)
+            room = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=room, data1=seq, data2=clipped, op=nl.subtract)
+            mask = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=mask, data=room, op0=nl.maximum, operand0=0,
+                               op1=nl.minimum, operand1=1)
+            pos1 = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=pos1, data=pos, op0=nl.add, operand0=1)
+            prod = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=prod, data1=pos1, data2=mask, op=nl.multiply)
+            col = topk + t
+            nisa.tensor_scalar(dst=acc[:, col:col + 1], data=prod, op0=nl.subtract, operand0=1)
+
+        nl.store(out[start:start + height, 0:out_cols], value=acc)
     return out
 
 
