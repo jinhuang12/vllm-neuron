@@ -1544,41 +1544,6 @@ class Glm5NextHyperConnection(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _one_expert(bank: torch.Tensor, expert: torch.Tensor) -> torch.Tensor:
-    """One expert's slab of a bank, selected by a DEVICE index rather than a Python int.
-
-    The fp8 path selects on a byte view because ``index_select`` is defined for
-    ``uint8`` on every backend this fork runs and is not for ``float8_e4m3fn``; the
-    view is free and the result is viewed back, so no cast and no copy of the bank
-    happens either way.
-    """
-    if bank.dtype == torch.float8_e4m3fn:
-        return bank.view(torch.uint8).index_select(0, expert)[0].view(bank.dtype)
-    return bank.index_select(0, expert)[0]
-
-
-def _clamped_gate_up(
-    pre_activation: torch.Tensor, half_width: int, limit: float | None
-) -> torch.Tensor:
-    """The reference's ASYMMETRIC SwiGLU bounds, applied before the activation limb.
-
-    ``gate`` is bounded from above only and ``up`` from both sides
-    (``modeling_glm5_next.py:139`` passes ``min=None`` for the first and a negated
-    limit for the second). The bounds sit on the pre-activation columns, so applying
-    them here is the same function as applying them inside the activation, which is
-    what the vendor kernel took its four clamp arguments to do.
-    """
-    if limit is None:
-        return pre_activation
-    return torch.cat(
-        (
-            pre_activation[:, :half_width].clamp(max=limit),
-            pre_activation[:, half_width:].clamp(min=-limit, max=limit),
-        ),
-        dim=1,
-    )
-
-
 class Glm5NextRoutedExperts(nn.Module):
     """The routed-expert bank at ``mlp.experts``.
 
@@ -1936,7 +1901,6 @@ class Glm5NextRoutedExperts(nn.Module):
             TILE_SIZE,
         )
         from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
-            GATE_UP_FUSION,
             moe_down_blockwise_fp8,
             moe_gate_up_blockwise_fp8,
             moe_swiglu_transposed,
@@ -2101,74 +2065,68 @@ class Glm5NextRoutedExperts(nn.Module):
             [expert_affinities_masked, pad_masked], dim=0
         )
 
-        # ---- THE PER-BLOCK COMPOSITION, on this campaign's own limbs. ---- #
-        # `-113` landed the three NKI limbs and this is where the model reaches
-        # them. One token block at a time: gather the block's rows, run gate/up
-        # against that block's expert slab, clamp, activate, project down with the
-        # affinity, scatter the rows back.
-        #
-        # WHY THE ROUTING IS TORCH WHILE THE ARITHMETIC IS NOT. The three matmuls
-        # and the activation are the kernel-class work and they stay NKI. What is
-        # torch here is the gather, the slab selection and the scatter -- the
-        # orchestration the vendor kernel used to do inside itself. The device can
-        # hold that too: the six-arm indirect-DMA probe read MATCH on all six arms
-        # under lease event 229, gather source, scatter destination, a device-
-        # computed index vector and a ``[1, 1]`` int32 expert index among them.
-        # Moving it there is a later increment and does not change this result.
-        #
-        # NO HOST TENSOR IS READ IN THIS REGION, deliberately: a block's expert
-        # stays a one-element tensor slice used through ``index_select``, never an
-        # ``int``. The runner compiles this path with ``fullgraph=True``
-        # (``neuron_model_runner.py:1457-1462``), where a host read is a graph
-        # break rather than a slow line.
-        blocks = int(token_position_to_id.shape[0]) // block
-        pad_row = torch.full(
-            (1,), tokens, dtype=torch.long, device=hidden_states.device
+        # ---- THE COMPOSITION: three kernels for the whole layer. ---------- #
+        # The routing is INSIDE the limbs -- each one takes the mapping and picks its
+        # own rows, its own expert weight slab and its own affinities on device. So
+        # this site launches three kernels for a whole MoE layer rather than three per
+        # token block, and no expert weight is ever copied to make an operand
+        # contiguous. The mechanisms are the three the `-113` probe read MATCH on
+        # under lease event 229: the indirect row gather, the index vector computed on
+        # device, and the ``(1, 1)`` int32 expert index offsetting a weight buffer.
+        pre_activation = moe_gate_up_blockwise_fp8(
+            padded_hidden,
+            gate_up_proj_weight,
+            gate_up_scale_operands,
+            token_position_to_id,
+            block_to_expert,
+            block,
         )
-        affinity_by_token = expert_affinities_masked.reshape(-1, num_experts)
+        # THE BOUNDS GO INTO THE ACTIVATION KERNEL, both of them, and the asymmetry is
+        # the checkpoint's: ``gate`` is bounded above only and ``up`` on both sides
+        # (``modeling_glm5_next.py:139``). The vendor seam took four clamp arguments
+        # for this same work; the activation limb now takes the two numbers that
+        # describe it.
+        contribution = moe_down_blockwise_fp8(
+            moe_swiglu_transposed(
+                pre_activation, self.swiglu_limit, self.swiglu_limit
+            ),
+            down_proj_weight,
+            down_scale_operands,
+            expert_affinities_masked,
+            token_position_to_id,
+            block_to_expert,
+            block,
+        )
+
+        # ---- BACK TO TOKEN ORDER: one scatter-add over the whole emission. ---- #
+        # WHERE THE ROUTER WEIGHT MULTIPLIED: after the down projection, inside the
+        # kernel above, never into the hidden states. The checkpoint projects the
+        # unscaled token and then scales (``modeling_glm5_next.py:132-133``), and the
+        # two are different functions rather than rearrangements of one -- this
+        # repository says so in its own words at
+        # ``vllm_neuron/functional/moe/moe_cte.py:490-492``: "this is NOT
+        # mathematically equivalent to POST_SCALE because the nonlinear activation
+        # breaks the linearity". Measured at up to 76.9% per-token error against a 1%
+        # tolerance in ``increments/probe-054a-affinity-scaling-mode-r1.out``.
+        #
+        # THIS SCATTER IS DELIBERATELY NOT ON THE DEVICE, and it is the one piece of
+        # routing that is not. A token selected by top-k experts appears in top-k
+        # blocks, so a device scatter has to ACCUMULATE, and the probe's arm 2
+        # certified an indirect scatter that WRITES. An accumulating read-modify-write
+        # through the same access pattern is a mechanism this campaign has not
+        # measured, and getting it wrong loses contributions silently. One
+        # ``index_add`` over the whole emission is not the rejected per-block unroll:
+        # it moves no weight and it runs once for the layer.
+        wanted = torch.where(
+            token_position_to_id < 0,
+            torch.full_like(token_position_to_id, tokens),
+            token_position_to_id,
+        ).long()
         accumulated = torch.zeros(
             tokens + 1, hidden, dtype=torch.float32, device=hidden_states.device
-        )
-        for position in range(blocks):
-            rows = token_position_to_id[position * block : (position + 1) * block]
-            # A ``-1`` position is the padding token, which the mapping emits and
-            # the vendor kernel resolved to the last row of the hidden states
-            # (``bwmm_shard_on_I.py:157``). The same row is appended above, so the
-            # substitution here is that same rule written where it is used.
-            rows = torch.where(rows < 0, pad_row, rows.long())
-            expert = block_to_expert[position : position + 1].long()
-            pre_activation = moe_gate_up_blockwise_fp8(
-                padded_hidden.index_select(0, rows),
-                _one_expert(gate_up_proj_weight, expert).reshape(
-                    hidden, GATE_UP_FUSION * intermediate
-                ),
-                gate_up_scale_operands.index_select(0, expert)[0],
-            )
-            # WHERE THE ROUTER WEIGHT MULTIPLIES: after the down projection, never
-            # into the hidden states. The checkpoint projects the unscaled token
-            # and then scales (``modeling_glm5_next.py:132-133``), and the two are
-            # different functions rather than rearrangements of one -- this
-            # repository says so in its own words at
-            # ``vllm_neuron/functional/moe/moe_cte.py:490-492``: "this is NOT
-            # mathematically equivalent to POST_SCALE because the nonlinear
-            # activation breaks the linearity". Measured at up to 76.9% per-token
-            # error against a 1% tolerance in
-            # ``increments/probe-054a-affinity-scaling-mode-r1.out``. The vendor
-            # seam took an enum for this choice; the down limb applies the
-            # affinity itself, so the choice is now the call graph.
-            contribution = moe_down_blockwise_fp8(
-                moe_swiglu_transposed(
-                    _clamped_gate_up(pre_activation, intermediate, self.swiglu_limit)
-                ),
-                _one_expert(down_proj_weight, expert),
-                down_scale_operands.index_select(0, expert)[0],
-                affinity_by_token.index_select(0, rows)
-                .index_select(1, expert)
-                .to(torch.float32),
-            )
-            accumulated = accumulated.index_add(0, rows, contribution)
-        # The padding row is dropped rather than masked: it accumulated whatever
-        # the padded blocks computed, and no real token indexes it.
+        ).index_add(0, wanted, contribution)
+        # The padding row is dropped rather than masked: it accumulated whatever the
+        # padded positions computed, and no real token indexes it.
         return accumulated[:tokens].to(hidden_states.dtype)
 
     # ── load-time operand prep -- hand-off item (i) of ``inc-glm53f-054a`` ──
