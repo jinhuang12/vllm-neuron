@@ -98,7 +98,7 @@ def _aligned_blocks(slots: int) -> int:
 
 #: The window one captured graph reads: the block table's width on the warmup path, because
 #: the shell states no ``kv_segment_size`` bucket, so the converter's prefill span falls back
-#: to that width (``neuron_model_runner.py:5214-5245``). It is WIDER than the sequence, which
+#: to that width (``neuron_model_runner.py:5239-5259``). It is WIDER than the sequence, which
 #: is the whole point -- a window whose length moved with the position pinned the graph.
 E2E_WINDOW_BLOCKS = _aligned_blocks(E2E_MAX_SEQ_LEN)
 

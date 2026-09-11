@@ -30,12 +30,19 @@ headroom refusal to raise; item 4 because the base hands a python int; items 5 a
 because the base's source carries the two host reads this block removed; item 7
 because the base sizes the window from the request's own blocks and c1 sized it from the
 block table's width, and the item names both wrong answers; item 8 because the base's
-decode window is this step's blocks and not the bucket's.
+decode window is this step's own two blocks where the bucket is ten.
 
 WHAT ITEM 8 DOES NOT SEPARATE. On the decode leg the bucket's span and the table's width
 are the SAME number by the ruling, so item 8 fails at the base and passes at c1 as well
 as here. Item 7 is the one that separates c1 from c2, and it is on the prefill leg
 because that is the leg where the two answers differ.
+
+WHY ITEM 8 OPENS A SEQUENCE FIRST. The converter refuses any step that does not continue
+the live indexer ring, so a decode dropped onto a fresh shell raises on the cursor before
+a window is built. Round 2 of the review found this file doing that: item 8 was failing
+everywhere -- base and HEAD alike -- for the cursor and not for the window. It now runs a
+prefill at 0 through the same converter, reads the cursor that prefill left, and carries
+the position it names.
 """
 
 from __future__ import annotations
@@ -96,6 +103,13 @@ DECLARED_TABLE_WIDTH = 10
 DECLARED_SEGMENT = 16
 DECLARED_PREFILL_TOKENS = 8
 DECLARED_DECODE_THRESHOLD = 1
+
+#: The position a prefill of ``DECLARED_PREFILL_TOKENS`` tokens leaves the live indexer ring
+#: standing at, which is the only position a following decode step may carry: the converter
+#: advances its cursor to ``start_position + tokens`` and refuses a step that does not
+#: continue it (``neuron_model_runner.py:5366-5373``, ``:5402``). Derived, so the two cannot
+#: drift apart.
+DECLARED_CONTINUED_POSITION = DECLARED_PREFILL_TOKENS
 
 
 def say(name: str, *values) -> None:
@@ -401,8 +415,15 @@ def _prefill_metadata(banks) -> dict:
     return {bank["name"]: dict(entry) for bank in banks}
 
 
+def _blocks_for_decode() -> int:
+    """The blocks this item's decode step occupies, which is what the base sliced."""
+    return -(
+        -(DECLARED_CONTINUED_POSITION + DECLARED_TOKENS) // DECLARED_PAGE_SIZE
+    )
+
+
 def _decode_metadata(banks) -> dict:
-    """The same entry set on the DECODE leg, one token at a position inside the table.
+    """The same entry set on the DECODE leg, one token at the position the ring stands at.
 
     ``kv_segment_size`` is present and non-zero here on purpose: it is what a prefill
     chunk's span is built from, and a decode step that reached for it would be handed a
@@ -411,7 +432,7 @@ def _decode_metadata(banks) -> dict:
     entry = dict(next(iter(_prefill_metadata(banks).values())))
     entry["max_query_len"] = DECLARED_TOKENS
     entry["cached_seq_len"] = torch.tensor(
-        [[DECLARED_HIGH_POSITION]], dtype=torch.int32
+        [[DECLARED_CONTINUED_POSITION]], dtype=torch.int32
     )
     entry["slot_mapping"] = torch.arange(DECLARED_TOKENS, dtype=torch.int32)
     return {bank["name"]: dict(entry) for bank in banks}
@@ -468,22 +489,51 @@ def test_the_converter_sizes_the_window_from_the_legs_bucket() -> None:
 
 
 def test_the_decode_legs_window_is_its_context_bucket() -> None:
-    """The other leg the block declares, and the segment span is the wrong answer here.
+    """The other leg the block declares, on a sequence this item opens the production way.
 
     A decode group's block table IS its context bucket -- the bucket was chosen so its
-    longest sequence fits -- so the table's width is the span on this leg and the
-    prefill formula is not. The bank is exactly the base block plus one whole window,
-    which is the spare the allocator owes; a slot less and the refusal fires.
+    longest sequence fits -- so the table's width is the span on this leg and the prefill
+    formula is not. THE SEQUENCE IS OPENED BY A PREFILL AT 0 through the same converter,
+    because the live indexer ring refuses a step that continues no sequence, and a decode
+    dropped onto a fresh shell would fail on THAT refusal and never reach a window at all
+    (``neuron_model_runner.py:5343-5365``). Round 2 of the review found this file doing
+    exactly that, so the opening step is part of the item now and its premise is read
+    rather than assumed.
     """
     _require_cpu_mode()
     text_config, bank = _world()
     runner = _runner(text_config, [bank])
     segment_span = -(-(DECLARED_SEGMENT + DECLARED_TOKENS) // DECLARED_PAGE_SIZE)
 
+    opened = runner._glm5next_model_kwargs(
+        {
+            "input_ids": torch.zeros(DECLARED_PREFILL_TOKENS, dtype=torch.long),
+            "positions": torch.arange(DECLARED_PREFILL_TOKENS, dtype=torch.long),
+            "attn_metadata": _prefill_metadata([bank]),
+            "sampling_positions": torch.tensor(
+                [DECLARED_PREFILL_TOKENS - 1], dtype=torch.long
+            ),
+            "sampling_params": None,
+            "spec_decode_metadata": None,
+            "rank": None,
+            "logit_mask": None,
+        }
+    )
+    cursor = getattr(runner, "_glm5next_side_cache_cursor", None)
+    say("I8_OPENED", f"carriers={len(opened['layer_carriers'])}", f"cursor={cursor}")
+    assert cursor == DECLARED_CONTINUED_POSITION, (
+        f"the opening prefill left the ring at {cursor} and this item's decode step "
+        f"carries position {DECLARED_CONTINUED_POSITION}; without a ring that continues "
+        f"this sequence the step below would be refused before any window is built, and "
+        f"the reading would be about the cursor and not about the window"
+    )
+
     converted = runner._glm5next_model_kwargs(
         {
             "input_ids": torch.zeros(DECLARED_TOKENS, dtype=torch.long),
-            "positions": torch.tensor([DECLARED_HIGH_POSITION], dtype=torch.long),
+            "positions": torch.tensor(
+                [DECLARED_CONTINUED_POSITION], dtype=torch.long
+            ),
             "attn_metadata": _decode_metadata([bank]),
             "sampling_positions": torch.zeros(1, dtype=torch.long),
             "sampling_params": None,
@@ -496,9 +546,14 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
 
     say("I8_WINDOW_SLOTS", slots,
         f"bucket={DECLARED_TABLE_WIDTH * DECLARED_PAGE_SIZE}",
-        f"segment_span={segment_span * DECLARED_PAGE_SIZE}")
+        f"segment_span={segment_span * DECLARED_PAGE_SIZE}",
+        f"own_blocks={_blocks_for_decode() * DECLARED_PAGE_SIZE}")
     assert slots == DECLARED_TABLE_WIDTH * DECLARED_PAGE_SIZE
     assert slots != segment_span * DECLARED_PAGE_SIZE, (
         "the decode window came from the prefill leg's segment span, which is shorter "
         "than this sequence's own context"
+    )
+    assert slots != _blocks_for_decode() * DECLARED_PAGE_SIZE, (
+        "the decode window is this step's own blocks again, so its length still grows "
+        "with every decode step"
     )
