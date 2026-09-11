@@ -149,6 +149,18 @@ def _is_on_device(where: torch.device, target: torch.device) -> bool:
     return where.index == target.index
 
 
+def _values_are_readable(tensor: torch.Tensor) -> bool:
+    """Can a host-side value be read off this tensor at all?
+
+    A shape-only load carries meta tensors: they have the right shape and dtype
+    and no data, so any check that reads a NUMBER out of one raises rather than
+    answering. Checks that read numbers ask this first and record the skip; every
+    check that reads only a shape needs no guard, because a meta tensor's shape is
+    as real as any other tensor's.
+    """
+    return tensor.device.type != "meta"
+
+
 def _declare_parameters(module: nn.Module, *names: str) -> None:
     """Reserve parameter attribute paths on ``module`` without allocating.
 
@@ -2337,14 +2349,25 @@ class Glm5NextRoutedExperts(nn.Module):
         gate_up_scales = torch.where(
             torch.isnan(gate.consumer_scales), up.consumer_scales, gate.consumer_scales
         )
-        unwritten = int(torch.isnan(gate_up_scales).sum())
-        if unwritten:
-            raise Glm5NextBlockQuantRouteError(
-                f"the fused gate/up consumer scales have {unwritten} slots that "
-                f"neither half wrote. The producer writes one half per call and "
-                f"leaves the other NaN, so every slot must come from exactly one "
-                f"of the two calls above; a survivor means the two emissions do "
-                f"not tile the same space"
+        # THIS CHECK COUNTS NaNs, so it needs values and a shape-only load has
+        # none. It runs exactly as it always did whenever values are there; on a
+        # shape-only pass the skip is RECORDED rather than passed over silently,
+        # because a completeness check that quietly stops checking is worse than
+        # one that says it did not run.
+        if _values_are_readable(gate_up_scales):
+            unwritten = int(torch.isnan(gate_up_scales).sum())
+            if unwritten:
+                raise Glm5NextBlockQuantRouteError(
+                    f"the fused gate/up consumer scales have {unwritten} slots "
+                    f"that neither half wrote. The producer writes one half per "
+                    f"call and leaves the other NaN, so every slot must come from "
+                    f"exactly one of the two calls above; a survivor means the two "
+                    f"emissions do not tile the same space"
+                )
+        else:
+            self._value_checks_skipped = (
+                *getattr(self, "_value_checks_skipped", ()),
+                "gate_up_fusion_completeness",
             )
 
         # ---- THE CAMPAIGN LIMBS' OPERANDS, from the checkpoint's own bytes.
