@@ -1547,15 +1547,35 @@ _DIAG_PREFILL_TOKENS = 2048
 _DIAG_DECODE_TOKENS = 1
 
 
+def _mapping_affinities(tokens: int, experts: int, top_k: int) -> torch.Tensor:
+    """``[tokens, experts]`` router scores: ``top_k`` slots per token, walked."""
+    affinities = torch.zeros(tokens, experts, dtype=torch.float32)
+    for token in range(tokens):
+        for slot in range(top_k):
+            affinities[token, (token + slot) % experts] = 1.0 / top_k
+    return affinities
+
+
+def _routing_by_expert(mapping: tuple, experts: int, block: int) -> dict:
+    """Which token ids each expert is handed, read off one mapping's own outputs."""
+    _, token_position_to_id, block_to_expert, _ = mapping
+    blocks = token_position_to_id.reshape(-1, block)
+    return {
+        expert: sorted(
+            int(token)
+            for token in blocks[block_to_expert == expert].reshape(-1).tolist()
+            if int(token) != -1
+        )
+        for expert in range(experts)
+    }
+
+
 def _diag_mapping_row(tokens: int, experts: int, top_k: int) -> str:
     """Trace the mapping alone and report the attempt as one row, never raising."""
     from torch import _dynamo
     from vllm_neuron import functional as functional_hub
 
-    affinities = torch.zeros(tokens, experts, dtype=torch.float32)
-    for token in range(tokens):
-        for slot in range(top_k):
-            affinities[token, (token + slot) % experts] = 1.0 / top_k
+    affinities = _mapping_affinities(tokens, experts, top_k)
     graphs: list = []
 
     def keep_graph(graph, _example_inputs):
@@ -1595,18 +1615,18 @@ def _diag_mapping_row(tokens: int, experts: int, top_k: int) -> str:
         pytest.param(_DIAG_DECODE_TOKENS, True, id="decode_step"),
     ],
 )
-def test_moe_path_diagnostic_mapping_trace(
+def test_moe_path_mapping_traces_at_every_declared_shape(
     tokens: int, from_the_pinned_config: bool
 ) -> None:
-    """DIAGNOSTIC: one row per shape saying whether the mapping traces. Never reds.
+    """MEASURED: the mapping traces whole at this file's shape and both serving shapes.
 
-    The items above trace the three limbs and leave the mapping outside the compiled
-    region, because the first host run reddened inside a vendor subkernel the mapping
-    dispatches. This says what the mapping does on its own: at the shape these tests
-    use, and at the two serving shapes with the routed-expert count and top-k read from
-    the pinned checkpoint config. TRACING is what it reads: the graph handed to the
-    backend says the trace completed, and a ``traced=no`` row at a serving shape is a
-    finding for the campaign to route, so no reading here can fail the item.
+    These rows read ``traced=no`` at 256 and at the prefill bucket while the mapping's
+    flow reached two vendor subkernels through the wrapper, and ``traced=yes`` only at
+    one token -- the single shape whose flow gates refuse those subkernels. A captured
+    graph gets the static-shape construction now, so every row must read
+    ``traced=yes``: the routed-expert count and top-k of the two serving shapes come
+    from the pinned checkpoint config, and the row is printed before it is judged,
+    because the row is the reading.
     """
     experts, top_k = E, K
     if from_the_pinned_config:
@@ -1615,6 +1635,69 @@ def test_moe_path_diagnostic_mapping_trace(
         top_k = int(text_config["num_experts_per_tok"])
     row = _diag_mapping_row(tokens=tokens, experts=experts, top_k=top_k)
     print(f"DIAG|build_blockwise_mapping|tokens={tokens}|experts={experts}|{row}")
+    assert row.startswith("traced=yes"), row
+
+
+# ===========================================================================
+# The construction a captured graph gets must route what the vendor's routes.
+# ===========================================================================
+@pytest.mark.parametrize(
+    "tokens,from_the_pinned_config",
+    [
+        pytest.param(T, False, id="tests_own_mask"),
+        pytest.param(_DIAG_PREFILL_TOKENS, True, id="prefill_bucket"),
+    ],
+)
+def test_moe_path_capture_safe_mapping_routes_what_the_vendor_routes(
+    monkeypatch: pytest.MonkeyPatch, tokens: int, from_the_pinned_config: bool
+) -> None:
+    """MEASURED: the construction capture gets hands every expert the vendor's tokens.
+
+    The reference is the vendor construction and it stays the eager one, subkernels and
+    all. The candidate is the same call with those kernels refused, which is what
+    capture does to them. The reading is per expert and sorted, because two
+    constructions can lay their blocks out differently while routing the same tokens;
+    the affinity operand, which the flow split does not touch, is compared whole.
+    """
+    from vllm_neuron import functional as functional_hub
+    from vllm_neuron.functional.moe import moe_blockwise
+
+    experts, top_k = E, K
+    if from_the_pinned_config:
+        text_config = _pinned_raw_config()["text_config"]
+        experts = int(text_config["n_routed_experts"])
+        top_k = int(text_config["num_experts_per_tok"])
+    affinities = _mapping_affinities(tokens, experts, top_k)
+
+    def build() -> tuple:
+        return functional_hub.build_blockwise_mapping(
+            expert_affinities=affinities,
+            num_local_experts=experts,
+            num_experts_per_token=top_k,
+            block_size=B,
+            moe_group=None,
+            tp_degree=1,
+        )
+
+    reference = build()
+    monkeypatch.setattr(moe_blockwise, "can_run_kernel", lambda *_a, **_k: False)
+    candidate = build()
+    reference_routing = _routing_by_expert(reference, experts, B)
+    candidate_routing = _routing_by_expert(candidate, experts, B)
+    routed = sum(len(rows) for rows in reference_routing.values())
+    print(
+        f"[mapping-equality] tokens={tokens} experts={experts} top_k={top_k} "
+        f"routed_positions={routed} reference_blocks={int(reference[2].numel())} "
+        f"candidate_blocks={int(candidate[2].numel())}"
+    )
+    if routed != tokens * top_k:
+        raise VacuousControlError(
+            f"the reference routed {routed} positions at {tokens} tokens and top-k "
+            f"{top_k}, so the comparison below would pass on a mapping that routes "
+            f"almost none of them"
+        )
+    assert torch.equal(candidate[0], reference[0])
+    assert candidate_routing == reference_routing
 
 
 # ===========================================================================

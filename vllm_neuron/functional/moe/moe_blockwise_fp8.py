@@ -943,7 +943,7 @@ def gate_up_dispatch_counters() -> tuple[int, int]:
 
 @nki.jit
 def moe_gate_up_blockwise_fp8_kernel(
-    hidden, weight_bank, scale_bank, row_index, expert_index, iota, i_extent, block
+    hidden, weight_bank, scale_bank, row_index, expert_index, iota
 ):
     """``out[P, 2*I] = routed_rows(hidden) @ dequantise(weight_bank[expert])``, fp32.
 
@@ -962,13 +962,19 @@ def moe_gate_up_blockwise_fp8_kernel(
         expert_index: ``[n_blocks_total, 1]`` int32, the mapping's ``block_to_expert``.
         iota: ``[TILE_SIZE, 1]`` int32 holding ``0..TILE_SIZE-1``; see :func:`_row_iota`
             for why a ramp arrives as an operand on this image.
-        i_extent: ``I``, one fusion half's width, a trace-time int.
-        block: tokens per block, a trace-time int and a multiple of ``TILE_SIZE``.
 
     Returns:
         ``[P, 2*I]`` fp32, PRE-ACTIVATION, in BLOCK order -- position ``p`` of the
         mapping, not token ``p``. The activation is the next limb's and the scatter
         back to token order is the caller's one ``index_add``.
+
+    ONLY TENSORS CROSS THE WRAPPER, so every extent is read from an operand's
+    shape: one fusion half's width from the scale operand's column count against
+    ``H``, and the block length from the two routing operands. A non-tensor argument
+    is recorded in the traced node and the kernel is handed ``None`` for it at
+    lowering time, which is a wrong answer rather than a refusal. The seam has
+    already refused an operand whose shape disagrees, so reading one here reads a
+    pinned relationship and does not guess.
 
     THE ROUTING IS HERE AND NOT IN TORCH. Each ``128``-row tile belongs to exactly
     one block, because ``block`` is a multiple of ``TILE_SIZE``, so the block index
@@ -984,10 +990,16 @@ def moe_gate_up_blockwise_fp8_kernel(
     """
     positions = row_index.shape[0]
     h_extent = hidden.shape[1]
-    fused_cols = GATE_UP_FUSION * i_extent
     n_h_blocks = h_extent // GATE_UP_SCALE_BLOCK
+    # ONE SCALE COLUMN PER (H BLOCK, FUSED COLUMN BLOCK), which the seam pins against
+    # :func:`gate_up_kernel_scale_shape`, so the width over the H blocks IS the fused
+    # column count in blocks -- and the fusion is even, which the seam also refuses.
+    n_col_blocks = scale_bank.shape[1] // n_h_blocks
+    fused_cols = n_col_blocks * GATE_UP_SCALE_BLOCK
+    i_extent = fused_cols // GATE_UP_FUSION
     n_i_blocks = i_extent // GATE_UP_SCALE_BLOCK
-    n_col_blocks = GATE_UP_FUSION * n_i_blocks
+    # One expert per block: the routing operands' own lengths give the block length.
+    block = positions // expert_index.shape[0]
     tiles_per_block = block // TILE_SIZE
     pad_row = hidden.shape[0] - 1
 
@@ -1208,6 +1220,29 @@ def _partition_iota(device: torch.device) -> Tensor:
     )
 
 
+_SWIGLU_BOUND_COLUMNS = 3
+
+
+def _swiglu_bound_operand(
+    gate_upper: float | None, up_upper: float | None, device: torch.device
+) -> Tensor:
+    """The activation limb's bounds as one column operand: gate, ``-up``, ``up``.
+
+    Neither limit set is the one-column shape the kernel elides on, so an unbounded
+    configuration still emits no bound instruction. A limit that IS set arrives as a
+    value, and a value cannot be read off a shape: it travels as a column because a
+    non-tensor argument is replaced with ``None`` when the graph is captured. An
+    unset limit beside a set one is the neutral infinity, which bounds nothing.
+    """
+    if gate_upper is None and up_upper is None:
+        return torch.zeros((TILE_SIZE, 1), dtype=torch.float32, device=device)
+    unbounded = float("inf")
+    gate = unbounded if gate_upper is None else float(gate_upper)
+    up = unbounded if up_upper is None else float(up_upper)
+    row = torch.tensor([[gate, -up, up]], dtype=torch.float32, device=device)
+    return row.expand(TILE_SIZE, _SWIGLU_BOUND_COLUMNS).contiguous()
+
+
 def _require_routing(
     positions: int, block: int, experts: int, row_index: Tensor, expert_index: Tensor
 ) -> None:
@@ -1316,8 +1351,6 @@ def moe_gate_up_blockwise_fp8(
         row_index.to(torch.int32).reshape(-1, 1),
         expert_index.to(torch.int32).reshape(-1, 1),
         _partition_iota(row_index.device),
-        cols,
-        int(block),
     )
 
 
@@ -1434,15 +1467,18 @@ def down_dispatch_counters() -> tuple[int, int]:
 
 
 @nki.jit
-def moe_swiglu_transposed_kernel(gate_up, gate_upper, up_upper):
+def moe_swiglu_transposed_kernel(gate_up, bounds):
     """``SiLU(clamp(gate)) * clamp(up)`` for one token block, as ``[I, B]`` fp32.
 
     Args:
         gate_up: ``[B, 2*I]`` -- the pre-activation output, gate columns then up
             columns.
-        gate_upper: the reference's upper bound on ``gate``, or ``None`` for no
-            bound. A trace-time scalar, never a tensor.
-        up_upper: the reference's SYMMETRIC bound on ``up``, or ``None``.
+        bounds: ``[TILE_SIZE, _SWIGLU_BOUND_COLUMNS]`` fp32 -- the gate upper
+            bound, the up bound negated, then the up bound -- or ``[TILE_SIZE, 1]``
+            when the configuration bounds neither half. A bound is a VALUE and no
+            shape can carry it, so it arrives as a column rather than as a scalar
+            that capture replaces with ``None``. :func:`_swiglu_bound_operand` builds
+            it, and one column is the shape this kernel elides the bound on.
 
     Returns:
         ``[I, B]`` fp32, transposed so the down projection can contract ``I`` on the
@@ -1457,7 +1493,13 @@ def moe_swiglu_transposed_kernel(gate_up, gate_upper, up_upper):
     """
     tokens, fused_cols = gate_up.shape
     i_extent = fused_cols // GATE_UP_FUSION
+    # A ONE-COLUMN OPERAND IS AN UNBOUNDED CONFIGURATION, and then no bound
+    # instruction is emitted at all -- the trace-time elision the landed form had
+    # when the two limits arrived as ``None``.
+    bounded_config = bounds.shape[1] == _SWIGLU_BOUND_COLUMNS
     out = nl.ndarray((i_extent, tokens), dtype=nl.float32, buffer=nl.shared_hbm)
+    if bounded_config:
+        bounds_sb = nl.load(bounds[0:TILE_SIZE, 0:_SWIGLU_BOUND_COLUMNS])
 
     for m_tile in range(tokens // TILE_SIZE):
         m0 = m_tile * TILE_SIZE
@@ -1479,22 +1521,25 @@ def moe_swiglu_transposed_kernel(gate_up, gate_upper, up_upper):
             # (``dsa/causal_fill.py``), and the two-scalar chain is the landed shape
             # of that call. A ``None`` limit removes its own line at trace time, so
             # an unbounded configuration emits no instruction rather than a bound at
-            # infinity.
-            if gate_upper is not None:
+            # infinity. A configured limit is a per-partition column for the reason
+            # :func:`_swiglu_bound_operand` records.
+            if bounded_config:
                 bounded = _gate_up_sbuf()
                 nisa.tensor_scalar(
-                    dst=bounded, data=gate, op0=nl.minimum, operand0=gate_upper
+                    dst=bounded,
+                    data=gate,
+                    op0=nl.minimum,
+                    operand0=bounds_sb[0:TILE_SIZE, 0:1],
                 )
                 gate = bounded
-            if up_upper is not None:
                 bounded_up = _gate_up_sbuf()
                 nisa.tensor_scalar(
                     dst=bounded_up,
                     data=up,
                     op0=nl.maximum,
-                    operand0=-up_upper,
+                    operand0=bounds_sb[0:TILE_SIZE, 1:2],
                     op1=nl.minimum,
-                    operand1=up_upper,
+                    operand1=bounds_sb[0:TILE_SIZE, 2:3],
                 )
                 up = bounded_up
             # sigmoid is one activation-engine op on this image, not a composition.
@@ -1573,7 +1618,8 @@ def moe_swiglu_transposed(
 
     _SWIGLU_COUNTERS.nki_dispatch += 1
     return wrap_nki(moe_swiglu_transposed_kernel)(
-        gate_up.to(torch.float32), gate_upper, up_upper
+        gate_up.to(torch.float32),
+        _swiglu_bound_operand(gate_upper, up_upper, gate_up.device),
     )
 
 
@@ -1586,10 +1632,6 @@ def moe_down_blockwise_fp8_kernel(
     row_index,
     expert_index,
     iota,
-    h_extent,
-    block,
-    n_experts,
-    pad_row,
 ):
     """``out[P, H] = (intermediate[P, I] @ dequantise(bank[expert])) * affinity``.
 
@@ -1606,13 +1648,6 @@ def moe_down_blockwise_fp8_kernel(
         row_index: ``[P, 1]`` int32, ``token_position_to_id``, ``-1`` for padding.
         expert_index: ``[n_blocks_total, 1]`` int32, ``block_to_expert``.
         iota: ``[TILE_SIZE, 1]`` int32 ramp; see :func:`_row_iota`.
-        h_extent: ``H``, a trace-time int.
-        block: tokens per block, a trace-time int and a multiple of ``TILE_SIZE``.
-        n_experts: ``E_local``, a trace-time int -- the affinity row stride.
-        pad_row: the row of the affinity bank the mapping's ``-1`` addresses, a
-            trace-time int. GIVEN rather than derived from the bank's length: a bank
-            one row short would otherwise move the padding row silently, and every
-            padded position would then read a real token's affinity.
 
     Returns:
         ``[P, H]`` fp32 in BLOCK order. The scatter back to token order is the
@@ -1628,10 +1663,21 @@ def moe_down_blockwise_fp8_kernel(
     it belongs to. The seam refuses the geometry if that quotient ever stops being
     one.
     """
+    # ONLY TENSORS CROSS THE WRAPPER; the gate/up kernel above records why, and each
+    # shape read here is a relationship the seam has already refused to break.
     i_extent, positions = intermediate_t.shape
     n_i_blocks = i_extent // GATE_UP_SCALE_BLOCK
-    n_h_blocks = h_extent // GATE_UP_SCALE_BLOCK
+    # One scale column per (I block, H block), so the width over the I blocks is H.
+    n_h_blocks = scale_bank.shape[1] // n_i_blocks
+    h_extent = n_h_blocks * GATE_UP_SCALE_BLOCK
+    # The scale operand stacks one ``TILE_SIZE``-tall operand per expert, so its
+    # height IS the affinity row stride.
+    n_experts = scale_bank.shape[0] // TILE_SIZE
+    block = positions // expert_index.shape[0]
     tiles_per_block = block // TILE_SIZE
+    # The padding row is the appended one. The seam checks the affinity bank's length
+    # against ``T`` for exactly this reason, so the quotient cannot move it silently.
+    pad_row = affinity_bank.shape[0] // n_experts - 1
 
     out = nl.ndarray((positions, h_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
@@ -1806,10 +1852,6 @@ def moe_down_blockwise_fp8(
         row_index.to(torch.int32).reshape(-1, 1),
         expert_index.to(torch.int32).reshape(-1, 1),
         _partition_iota(row_index.device),
-        cols,
-        int(block),
-        experts,
-        int(tokens),
     )
 
 

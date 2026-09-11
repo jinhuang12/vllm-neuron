@@ -3,6 +3,7 @@ import math
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch._subclasses.fake_tensor import FakeTensor
 from typing import TYPE_CHECKING, Optional
 import logging
 
@@ -124,7 +125,20 @@ def build_blockwise_mapping(
         tensor=expert_mask,
         f_len=f_len,
     )
-    use_kernel_flow = can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel
+    # UNDER CAPTURE THE VENDOR SUBKERNELS ARE NOT ELIGIBLE. Both reach the device
+    # through the HOP wrapper, whose non-tensor arguments are replaced with ``None``
+    # once the graph is captured, so a traced prefill dies inside a subkernel instead
+    # of serving. The torch construction below is static-shape -- every extent is a
+    # trace-time int and every write is a fixed-shape index_put -- so it is what a
+    # captured graph gets, and it is the flow that already traced at one token. The
+    # reading is FakeTensor rather than ``torch.compiler.is_compiling()``, which
+    # ``attention_decode.py:597`` records as unreliable on this backend: Dynamo
+    # traces with fake inputs. Eager keeps the subkernels, so they stay the reference
+    # the equality item measures this construction against.
+    capturing = isinstance(expert_mask, FakeTensor)
+    use_kernel_flow = (
+        can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel and not capturing
+    )
 
     if use_kernel_flow:
         token_position_to_id, block_to_expert, num_blocks = (
