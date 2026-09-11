@@ -15,7 +15,7 @@ WHAT THIS FILE IS ABOUT. Graph extraction builds the whole batch on ``meta``
 (``neuron_worker.py:500-501``) and calls the model. A precondition that reads a VALUE off a
 tensor cannot run there, and two of them were on the path: the converter's geometry reads,
 which ``test_host_geometry_119.py`` covers, and the attention seam's selected-row range
-refusal (``mla_sparse.py:1400``), which every MLA layer of every step reaches
+refusal (``mla_sparse.py:1411``), which every MLA layer of every step reaches
 (``model_fp8.py:6895``, unconditionally).
 
 THE TWO ITEMS
@@ -123,7 +123,7 @@ def test_a07_a_captured_forward_reads_no_value_off_a_tensor(monkeypatch) -> None
     dispatched: list[tuple] = []
 
     def stand_in(entry):
-        """The seam's declared return, ``[S, H, L]`` float32 (``mla_sparse.py:1345``)."""
+        """The seam's declared return, ``[S, H, L]`` float32 (``mla_sparse.py:1331``)."""
 
         def call(q_lift, *rest):
             dispatched.append(tuple(int(d) for d in q_lift.shape))

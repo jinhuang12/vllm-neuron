@@ -387,7 +387,7 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     """A precondition that reads values cannot run where values do not exist.
 
     ``mla_sparse_attention`` refused an out-of-range selected row by reading the row range
-    with ``int(...)`` (``mla_sparse.py:1400``), which is the same call the converter used to
+    with ``int(...)`` (``mla_sparse.py:1411``), which is the same call the converter used to
     make and which a ``meta`` tensor cannot answer. Every MLA layer of every step goes
     through that seam (``model_fp8.py:6895``, unconditionally), so a captured prefill reached
     it and stopped there.
@@ -401,7 +401,7 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     the way the layer slices it (``model_fp8.py:6877``, ``:6881``), and the scale is the
     carrier's own. The selected-row width is the seam's declared tile, ``KEY_CHUNK``,
     imported rather than typed: the admissibility clause requires a positive multiple of it
-    (``mla_sparse.py:1379-1383``).
+    (``mla_sparse.py:1293-1299``).
     """
     from vllm_neuron.functional.attention import mla_sparse as seam
 
