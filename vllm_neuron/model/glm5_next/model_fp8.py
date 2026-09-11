@@ -149,6 +149,18 @@ def _is_on_device(where: torch.device, target: torch.device) -> bool:
     return where.index == target.index
 
 
+def _values_are_readable(tensor: torch.Tensor) -> bool:
+    """Can a host-side value be read off this tensor at all?
+
+    A shape-only load carries meta tensors: they have the right shape and dtype
+    and no data, so any check that reads a NUMBER out of one raises rather than
+    answering. Checks that read numbers ask this first and record the skip; every
+    check that reads only a shape needs no guard, because a meta tensor's shape is
+    as real as any other tensor's.
+    """
+    return tensor.device.type != "meta"
+
+
 def _declare_parameters(module: nn.Module, *names: str) -> None:
     """Reserve parameter attribute paths on ``module`` without allocating.
 
@@ -2337,14 +2349,25 @@ class Glm5NextRoutedExperts(nn.Module):
         gate_up_scales = torch.where(
             torch.isnan(gate.consumer_scales), up.consumer_scales, gate.consumer_scales
         )
-        unwritten = int(torch.isnan(gate_up_scales).sum())
-        if unwritten:
-            raise Glm5NextBlockQuantRouteError(
-                f"the fused gate/up consumer scales have {unwritten} slots that "
-                f"neither half wrote. The producer writes one half per call and "
-                f"leaves the other NaN, so every slot must come from exactly one "
-                f"of the two calls above; a survivor means the two emissions do "
-                f"not tile the same space"
+        # THIS CHECK COUNTS NaNs, so it needs values and a shape-only load has
+        # none. It runs exactly as it always did whenever values are there; on a
+        # shape-only pass the skip is RECORDED rather than passed over silently,
+        # because a completeness check that quietly stops checking is worse than
+        # one that says it did not run.
+        if _values_are_readable(gate_up_scales):
+            unwritten = int(torch.isnan(gate_up_scales).sum())
+            if unwritten:
+                raise Glm5NextBlockQuantRouteError(
+                    f"the fused gate/up consumer scales have {unwritten} slots "
+                    f"that neither half wrote. The producer writes one half per "
+                    f"call and leaves the other NaN, so every slot must come from "
+                    f"exactly one of the two calls above; a survivor means the two "
+                    f"emissions do not tile the same space"
+                )
+        else:
+            self._value_checks_skipped = (
+                *getattr(self, "_value_checks_skipped", ()),
+                "gate_up_fusion_completeness",
             )
 
         # ---- THE CAMPAIGN LIMBS' OPERANDS, from the checkpoint's own bytes.
@@ -8094,6 +8117,12 @@ def _bind_hyper_connection_sites(
         instance = Glm5NextHyperConnection(
             text_config, neuron_config=text_config.neuron_config
         )
+        # The instance allocates its three parameters with no device, so it is
+        # built where the default device is whatever this load targets. Assigning
+        # an operand's data onto a parameter of another type raises, so the
+        # instance is moved onto the load's device first. A load on the default
+        # device moves nothing and hands over the same storage as before.
+        instance.to(device)
         site_record: dict[str, object] = {}
         for role, leaf in sorted(sites[site].items()):
             operand = loaded[leaf]
@@ -8104,7 +8133,10 @@ def _bind_hyper_connection_sites(
                 "shape": tuple(operand.shape),
                 "dtype": str(operand.dtype),
                 "device": str(operand.device),
-                "data_ptr": int(operand.data_ptr()),
+                # An operand with no storage has no address to record.
+                "data_ptr": (
+                    0 if operand.device.type == "meta" else int(operand.data_ptr())
+                ),
             }
         bound[site] = instance
         record[site] = site_record
@@ -8141,6 +8173,88 @@ class Glm5NextWeightLoadError(ValueError):
     argument is passed straight through from the runner and a refusal that did
     not name it would send a reader to the wrong place.
     """
+
+
+class _MetaSlice:
+    """One checkpoint tensor's header, answering data reads with meta tensors.
+
+    The loaders read a slice by indexing it, and every index they use is a plain
+    torch index. So the shape arithmetic of a shard or a fusion is done by
+    indexing a meta tensor of the stored shape, which is torch's own answer to
+    the question rather than a second implementation of it here.
+    """
+
+    def __init__(self, source: object) -> None:
+        self._source = source
+        self._empty: torch.Tensor | None = None
+
+    def get_shape(self) -> list[int]:
+        """The stored shape, as the header gives it."""
+        return self._source.get_shape()
+
+    def get_dtype(self) -> str:
+        """The stored dtype, as the header gives it."""
+        return self._source.get_dtype()
+
+    def _meta(self) -> torch.Tensor:
+        if self._empty is None:
+            shape = tuple(int(extent) for extent in self._source.get_shape())
+            # THE DTYPE COMES OFF ONE ROW, not off a name table. safetensors names
+            # its dtypes in its own spelling and torch has no reader for that
+            # spelling, so a table here would be a second place every dtype in the
+            # checkpoint is written down -- including the fp8 ones this model
+            # depends on. What one row costs is the trailing dimensions times the
+            # item size, not a few bytes: about 4 KB for a [1536, 4096] fp8
+            # weight, and one row per tensor over the whole checkpoint. A 0-D
+            # tensor has no row, so it is taken whole.
+            probe = self._source[0:1] if shape and shape[0] else self._source[:]
+            self._empty = torch.empty(shape, dtype=probe.dtype, device="meta")
+        return self._empty
+
+    def __getitem__(self, index: object) -> torch.Tensor:
+        return self._meta()[index]
+
+
+class _MetaShapeCheckpoint(SafetensorsCheckpoint):
+    """The checkpoint reader that answers with shapes and reads no weight data.
+
+    Only the two places that touch bytes are replaced. File discovery, the key
+    index and the load pipeline stay the shared reader's own, so a fusion or a
+    shard that the real load performs is performed here too.
+    """
+
+    def _get_slice(self, name: str) -> _MetaSlice:
+        """One tensor's slice, wrapped so its data reads as meta."""
+        return _MetaSlice(super()._get_slice(name))
+
+    def _load_to_page_cache(
+        self,
+        rank: int,
+        world_size: int,
+        cached_files_store: "torch.distributed.Store",
+        shutdown_event: "threading.Event",
+    ) -> None:
+        """Announce this rank's files without reading their bytes.
+
+        THE ANNOUNCEMENT IS NOT OPTIONAL. The pipelined load's main loop waits
+        for exactly the keys this method writes: it turns on a file only when
+        ``cached_files_store.check([file_name])`` answers, and nothing else ever
+        calls ``add`` (``utils/checkpoints.py:385-395``, the store write at
+        ``:533``). A method that returned without adding them would leave that
+        loop spinning on its 1 ms sleep until the process was killed, so the
+        shape-only pass keeps the round-robin and the store write and drops only
+        the read-through that pulls the whole checkpoint into RAM.
+
+        The file is still made local first, because the loop opens it for its
+        headers two lines after the key appears.
+        """
+        for index, file_name in enumerate(self._source.get_file_names()):
+            if shutdown_event.is_set():
+                return
+            if index % world_size != rank:
+                continue
+            self._source.download_file(file_name)
+            cached_files_store.add(file_name, 1)
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
@@ -8413,13 +8527,58 @@ class Glm5NextForConditionalGeneration(nn.Module):
             module.register_parameter(leaf, placeholder)
         return len(planned)
 
-    def load_weights(
+    def load_weights_lite(
         self,
         checkpoint_path: str,
         device: torch.device,
         cache_dir: str | None = None,
     ) -> None:
+        """Shape the tree from the checkpoint's headers, reading no weight data.
+
+        The runner calls this on a CPU-compile start, where no weights are wanted
+        and the whole module is moved to meta afterwards
+        (``neuron_model_runner.py:1358-1367``). Before this method the arm loaded
+        nothing at all: every parameter stayed a ``register_parameter(name, None)``
+        declaration, so the root forward refused at its embedding table and the
+        mHC sites were never bound.
+
+        IT RUNS THE REAL LOAD, and that is the whole design. The shapes a
+        parameter ends up with are decided by the loaders -- which checkpoint keys
+        fuse into one tensor, how the shard geometry narrows it -- and those rules
+        live in one place. So this method changes WHERE the numbers come from and
+        nothing else: :class:`_MetaShapeCheckpoint` answers with meta tensors of
+        the checkpoint's own shapes, and every loader, prep and bind then executes
+        the code the real load executes.
+
+        ``device`` IS IGNORED AND META IS USED INSTEAD. The runner passes the CPU
+        because that is where it wants compile-time constants read from, but a CPU
+        tensor of these shapes would allocate the whole model; meta allocates
+        nothing and is where the runner moves the module two lines later anyway.
+        """
+        meta = torch.device("meta")
+        self.to(meta)
+        self.load_weights(
+            checkpoint_path,
+            meta,
+            cache_dir,
+            reader=_MetaShapeCheckpoint(checkpoint_path, cache_dir),
+        )
+
+    def load_weights(
+        self,
+        checkpoint_path: str,
+        device: torch.device,
+        cache_dir: str | None = None,
+        *,
+        reader: object | None = None,
+    ) -> None:
         """Read the checkpoint's weights onto ``device``.
+
+        ``reader`` is the seam :meth:`load_weights_lite` replaces, and it is
+        keyword-only with a default so the three-argument call the runner makes
+        (``neuron_model_runner.py:1299``) is the call it always was. Passed
+        ``None``, this method opens the real checkpoint on the line it always
+        opened it.
 
         ``inc-glm53f-091``. This method is what the runner already calls:
         ``neuron_model_runner.py:1299`` invokes ``self.model.load_weights(...)``
@@ -8477,7 +8636,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         acceptance over it -- is recorded on the raising function.
         """
         try:
-            checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
+            checkpoint = reader or SafetensorsCheckpoint(checkpoint_path, cache_dir)
             num_files = checkpoint.get_num_files()
         except Exception as exc:
             raise Glm5NextWeightLoadError(

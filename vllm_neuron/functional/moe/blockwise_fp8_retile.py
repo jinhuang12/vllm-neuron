@@ -263,6 +263,13 @@ def _require_blocked(rows: int, cols: int) -> None:
 # --------------------------------------------------------------------------- #
 # Results.                                                                     #
 # --------------------------------------------------------------------------- #
+#: Value censuses skipped because the tensor they would measure carried no values.
+#: A shape-only pass appends one name; a pass with values never appends. It is a
+#: record and not a control: nothing in this module reads it, and a test clears it,
+#: runs a pass and reads which censuses that pass reached.
+SKIPPED_VALUE_CENSUSES: list[str] = []
+
+
 @dataclass(frozen=True)
 class BlockLosslessnessRecord:
     """Both losslessness conjuncts for one ``256 x 256`` block, as measured."""
@@ -381,6 +388,38 @@ def retile_block_scales(
             h_tile, i_tile, h_256, i_256, projection, gate_or_up
         )
     )
+
+    if weights.device.type == "meta":
+        # SHAPE ONLY, and the loop is not entered at all. Every line below reads
+        # values -- the retained scale, its power-of-two exponent, the round trip
+        # that decides losslessness -- and the four results are allocated without
+        # a device, so a shape-only pass would fill real memory from numbers that
+        # do not exist. What a caller can still have is the geometry, so each
+        # result is empty on the operand's own device at the shape the emitting
+        # path gives it, every counter is zero and no block is recorded.
+        SKIPPED_VALUE_CENSUSES.append("retile_block_scales")
+        return RetiledBlockScales(
+            consumer_scales=torch.empty(
+                consumer_scale_shape(experts, rows, cols, projection),
+                dtype=_FP32,
+                device=weights.device,
+            ),
+            block_scales=torch.empty(
+                (experts, i_256, h_256), dtype=_FP32, device=weights.device
+            ),
+            retiled_weights=torch.empty(
+                weights.shape, dtype=_FP8, device=weights.device
+            ),
+            tile_exponent_shifts=torch.empty(
+                (experts, h_tiles, i_tiles), dtype=torch.int32, device=weights.device
+            ),
+            projection=projection,
+            gate_or_up=gate_or_up,
+            emitted_unsupplied=0,
+            input_scales_dropped=0,
+            inexact_rescales=0,
+            records=(),
+        )
 
     weights_fp32 = weights.to(_FP32)
     shape = consumer_scale_shape(experts, rows, cols, projection)
