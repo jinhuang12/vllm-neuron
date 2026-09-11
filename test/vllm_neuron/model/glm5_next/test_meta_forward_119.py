@@ -163,9 +163,48 @@ def _meta_root_and_runner():
             if hasattr(type(module), "bind_hyper_connection_sites"):
                 module.bind_hyper_connection_sites(root.text_config, torch.device("meta"))
     root.bind_kv_cache(caches)
+    print(f"META|stash_to_meta|moved={len(_every_stash_to_meta(root))}")
     runner = sites._runner(root)
     runner.device = torch.device("meta")
     return root, runner
+
+
+def _on_meta(value):
+    """``value`` with every tensor leaf on ``meta``, or ``value`` itself if none was elsewhere."""
+    if isinstance(value, torch.Tensor):
+        return value if value.device.type == "meta" else value.to("meta")
+    if isinstance(value, dict):
+        moved = {key: _on_meta(item) for key, item in value.items()}
+        return moved if any(moved[key] is not value[key] for key in value) else value
+    if isinstance(value, (list, tuple)):
+        moved = [_on_meta(item) for item in value]
+        if all(new is old for new, old in zip(moved, value)):
+            return value
+        return moved if isinstance(value, list) else tuple(moved)
+    return value
+
+
+def _every_stash_to_meta(root) -> list[str]:
+    """Move what a module keeps OUTSIDE its parameters and buffers, and name what moved.
+
+    ``.to(device)`` visits parameters, buffers and submodules and nothing else. A module that
+    stashes a tensor as a plain attribute keeps it where the load put it: the kernel scale
+    operands are built once at load time and stashed exactly so
+    (``model_fp8.py:2832-2846``), and the mHC sites above are the same shape of thing. A stash
+    left on the host is INVISIBLE inside a held dispatch, which makes its own operands at the
+    shapes it is handed, and fatal in a torch route, which requires one device -- which is how
+    a load-time scale operand ends a forward inside a fallback oracle rather than at a kernel.
+    """
+    moved = []
+    for name, module in root.named_modules():
+        for field, value in list(vars(module).items()):
+            if field in ("_parameters", "_buffers", "_modules"):
+                continue
+            replaced = _on_meta(value)
+            if replaced is not value:
+                setattr(module, field, replaced)
+                moved.append(f"{name}.{field}")
+    return moved
 
 
 def _extract(runner, leg: str):
@@ -258,15 +297,17 @@ class _HeldBoundary:
 
     def __call__(self, *args, **kwargs):
         name = getattr(self.kernel, "__name__", type(self.kernel).__name__)
-        self.crossed.append(f"{self.module}.{name}")
         real = REAL_WRAP_NKI(self.kernel)
         returned = (real if self.grid is None else real[self.grid])(
             *(_on_the_host(value) for value in args),
             **{key: _on_the_host(value) for key, value in kwargs.items()},
         )
-        if isinstance(returned, tuple):
-            return tuple(_back_on_meta(value) for value in returned)
-        return _back_on_meta(returned)
+        # EVERY TENSOR LEAF GOES BACK, whatever shape the return has: a bare tensor, a tuple, a
+        # list or a dict of them. The row records what was handed back, leaf by leaf, so a leak
+        # here is named by the row rather than found in a traceback two modules later.
+        handed = _on_meta(returned)
+        self.crossed.append(f"{self.module}.{name}->{_leaves_of(handed)}")
+        return handed
 
 
 def _on_the_host(value):
@@ -277,9 +318,15 @@ def _on_the_host(value):
     return make(tuple(value.shape), dtype=value.dtype)
 
 
-def _back_on_meta(value):
-    """One returned operand back where the forward is running."""
-    return value.to("meta") if isinstance(value, torch.Tensor) else value
+def _leaves_of(value) -> str:
+    """A returned value as ``dtype:device`` per tensor leaf, for a row that must name a leak."""
+    if isinstance(value, torch.Tensor):
+        return f"{value.dtype}:{value.device.type}".replace("torch.", "")
+    if isinstance(value, dict):
+        return "{" + ",".join(_leaves_of(item) for item in value.values()) + "}"
+    if isinstance(value, (list, tuple)):
+        return "(" + ",".join(_leaves_of(item) for item in value) + ")"
+    return type(value).__name__
 
 
 def _hold_every_dispatch_but_the_seam(monkeypatch, crossed: list[str]) -> list[str]:
@@ -388,6 +435,13 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
                 f"|stood_down={len(stood_down)}|held={len(held)}|crossed={len(crossed)}"
                 f"|error={'none' if error is None else str(error).splitlines()[0]}"
             )
+            # A DEVICE MISMATCH IS ATTRIBUTED WHERE IT HAPPENED, not left to a traceback: the
+            # row names the site and the last dispatch this arm handed back, with its leaves.
+            if error is not None and "expected device" in str(error):
+                print(
+                    f"A07|{leg}|device_mismatch|site={_site_of(error)}"
+                    f"|last_held={crossed[-1] if crossed else 'none'}"
+                )
             if error is not None:
                 assert not _reads_a_value(error), (
                     f"the {leg} forward read a value off a tensor at "
@@ -396,7 +450,7 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
             # THE ITEM'S OWN PREMISE, CHECKED BEFORE ITS OUTCOME IS JUDGED, AND READ PER SITE.
             # Every declared dispatch was entered, so nothing on this path decided the leg's
             # outcome by running a kernel on meta. A total would pass with one site missing.
-            entered = [held.rsplit(".", 1)[-1] for held in crossed]
+            entered = [held.split("->", 1)[0].rsplit(".", 1)[-1] for held in crossed]
             for site, kernel in DECLARED_SITES.items():
                 assert kernel in entered, (
                     f"the {leg} forward never entered the declared dispatch at {site}, so "
