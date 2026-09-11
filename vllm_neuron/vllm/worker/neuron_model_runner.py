@@ -5241,12 +5241,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # layer keeps one sequence's state in one slot however many tokens the step
             # covers. Asking every row to address the step demanded pages of a table
             # that has none.
-            if bank["family"] == "self_attn" and blocks_used > len(row):
+            if bank["family"] == "self_attn":
+                if blocks_used > len(row):
+                    raise ValueError(
+                        f"KV layer '{name}' holds {start_position + tokens} slot(s) of "
+                        f"sequence, which occupy {blocks_used} page(s), and its "
+                        f"block-table row is {len(row)} entry(ies) wide; a row that "
+                        f"cannot address the step would slice another sequence's pages"
+                    )
+            elif len(row) != 1:
                 raise ValueError(
-                    f"KV layer '{name}' holds {start_position + tokens} slot(s) of "
-                    f"sequence, which occupy {blocks_used} page(s), and its "
-                    f"block-table row is {len(row)} entry(ies) wide; a row that "
-                    f"cannot address the step would slice another sequence's pages"
+                    f"KV layer '{name}' keeps one sequence's state in ONE slot, so its "
+                    f"block-table row names one slot; this row is {len(row)} entry(ies) "
+                    f"wide, and only the first would ever be read, so the rest name "
+                    f"slots this layer would silently leave behind"
                 )
             geometries.append(
                 {
