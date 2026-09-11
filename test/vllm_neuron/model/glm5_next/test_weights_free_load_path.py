@@ -291,12 +291,14 @@ def test_the_hook_clears_both_refusals_the_forward_hits(
 ) -> None:
     """The table carries what the real load leaves, and every mHC layer has its sites.
 
-    THE REFERENCE IS THE CPU LOAD, not a shape written here. The root forward reads
-    the embedding table before any layer runs, so an unset table refuses there; but
-    the shape it should carry is the checkpoint's own, and this checkpoint writes
-    every plain-family key at a 1-D miniature placeholder. A number typed here would
-    measure the fixture, so the same loader is run on the CPU and its table is the
-    reference: an unset table and a reshaped one both fail against it.
+    TWO READINGS, AND NEITHER TYPES A RANK. The refusal this item is about is the
+    root's own: it reads the table before any layer runs and raises when the table is
+    ``None`` (``model_fp8.py:7448``), which is the condition asked here in the same
+    form. What shape that table should carry is a different question, and the answer
+    is the checkpoint's -- this fixture writes every plain-family key at a 1-D
+    miniature placeholder, so a rank written here would measure the fixture. The
+    reference is therefore the same loader run on the CPU, compared on shape AND
+    dtype: an unset table, a reshaped one and a retyped one all fail against it.
     """
     impl = _impl()
     model = _lite_loaded(tmp_path)
@@ -308,10 +310,13 @@ def test_the_hook_clears_both_refusals_the_forward_hits(
     )
     reference.load_weights(str(reference_directory), torch.device("cpu"), None)
     reference_table = reference.model.embed_tokens_weight
-    want = None if reference_table is None else tuple(reference_table.shape)
+    want = None if reference_table is None else (
+        tuple(reference_table.shape),
+        str(reference_table.dtype),
+    )
 
     table = model.model.embed_tokens_weight
-    got = None if table is None else tuple(table.shape)
+    got = None if table is None else (tuple(table.shape), str(table.dtype))
     layers = [
         layer
         for layer in model.model.modules()
@@ -327,10 +332,15 @@ def test_the_hook_clears_both_refusals_the_forward_hits(
         f"table={got}|cpu_reference={want}",
         f"mhc_layers={len(counts)}|site_counts={sorted(set(counts))}",
     )
-    assert got is not None and got == want, (
-        f"the hook left the embedding table {got} where the same loader on the CPU "
-        f"leaves {want}; the root forward reads that table before any layer runs, so "
-        f"an unset table refuses there and a reshaped one feeds it wrong widths"
+    assert table is not None, (
+        "the embedding table is None after the hook, which is the exact condition the "
+        "root forward raises on: it reads the table before any layer runs and refuses "
+        "when nothing was loaded onto it"
+    )
+    assert got == want, (
+        f"the hook left the embedding table at {got} where the same loader on the CPU "
+        f"leaves {want} on the same checkpoint; a shape-only pass has to reproduce the "
+        f"checkpoint's own header, in shape and in dtype"
     )
     assert counts and set(counts) == {2}, (
         f"the layers carrying mHC weights hold site counts {sorted(set(counts))}, "
