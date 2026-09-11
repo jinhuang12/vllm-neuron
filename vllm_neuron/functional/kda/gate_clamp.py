@@ -289,7 +289,7 @@ def kda_gate_clamp(
             f"{a_log.numel()} in shape {tuple(a_log.shape)}"
         )
     if bias is None:
-        bias_col = torch.zeros((kdim, 1), dtype=torch.float32)
+        bias_col = torch.zeros((kdim, 1), dtype=torch.float32, device=g.device)
     else:
         if bias.numel() != kdim:
             raise GateClampError(

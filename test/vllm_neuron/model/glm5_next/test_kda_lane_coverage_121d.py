@@ -4,34 +4,38 @@
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 python -m pytest -s -rA \\
       test/vllm_neuron/model/glm5_next/test_kda_lane_coverage_121d.py
 
-A01 censuses every allocation in ``vllm_neuron/functional/kda/`` and names the ONE that
-decides a device for itself, keyed by module, function and factory rather than by a line
-that moves. A01B reads why that one is inert: the single shipped call site always passes
-``bias``, so the branch holding it is never taken. Neither item repairs it -- the
-allocation is on record and its repair is a product change -- and A01 fails the moment a
-SECOND such allocation appears in that package.
+A01 censuses every module of ``vllm_neuron/functional/kda/`` with a factory set the package
+itself supplies: every ``torch.<name>(`` its modules call, kept when that name accepts a
+``device=``. Which place answered that question for which name is a row of its own, and a set
+that keeps nothing fails the item, because a census with an empty set reads every module as
+empty and reports a hollow zero offenders on any tree at all. Nothing is exempt for the name
+of the function around it, because no class here
+is an ``nn.Module`` and so nothing carries a later ``to(device)``. The walk is armed twice: once
+off the derived set, and once off a set this file spells out, because an arming that reads only
+what the predicate kept says nothing when the predicate keeps the wrong names. A01 reports the driven
+model file as well, through the LANDED census, whose narrower scope is named on its own row
+and whose call total is a reading rather than a pin. A01B is the reading the product repair
+answers: no allocation in that package decides a device for itself.
 
-A02 reads the tiny stack's layer schedule as a dial. The schedule was a fixed argument
-beside ``**overrides``, so a caller asking for another shape got a duplicate keyword and a
-``TypeError``, and a stack with a recurrent layer in it could not be asked for at all. The
-default is unchanged, and that is the reading: every landed item still gets the
-sparse-attention stack it got before.
+A02 reads the tiny stack's layer schedule as a dial. The schedule was a fixed argument beside
+``**overrides``, so a caller asking for another shape got a duplicate keyword and a
+``TypeError``. The default is unchanged, and that is the reading: every landed item still gets
+the sparse-attention stack it got before.
 
-A03 reads the meta-forward's device-mismatch reporter. It keyed on one wording,
-``expected device``, while the fake-tensor propagation says ``two different devices`` and
-the eager check says ``at least two devices`` -- so a mismatch in either of those arrived
-unlabelled. All three read as one now, each is armed, and the old needle's own miss is a
-reading beside them.
+A03 reads the meta-forward's device-mismatch reporter. It keyed on one wording, while the
+fake-tensor propagation and the eager check say two others, so a mismatch in either arrived
+unlabelled. All three read as one, each armed, with the old needle's own miss beside them.
 
-With ``GLM53F_121D_EXPECT_BASE=1`` A02 and A03 assert the PRE-REPAIR reading of the tree
-they are copied into: the schedule refuses an override and the reporter carries no shared
-predicate. A01 and A01B read the same on both trees, because what they name is recorded
-rather than repaired.
+With ``GLM53F_121D_EXPECT_BASE=1`` A01B asserts the PRE-REPAIR reading of the tree it is
+copied into: the one allocation that names no device, keyed by module, function and factory.
+A01, A02 and A03 read the same on both trees, because this lap changes one product line and
+neither the dial nor the reporter.
 """
 
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import pathlib
 
@@ -51,20 +55,31 @@ EXPECT_BASE_VAR = "GLM53F_121D_EXPECT_BASE"
 #: The package this file censuses, resolved off the imported module rather than typed.
 KDA_PACKAGE = pathlib.Path(kda_package.__file__).parent
 
-#: The allocation on record, keyed by module, enclosing function and factory. NOT by line:
-#: a line moves whenever anything above it does, and this one already drifted nine lines
-#: between the tree that recorded it and the tree that carries it.
+#: The allocation the pre-repair tree carries, keyed by module, enclosing function and factory.
+#: NOT by line: a line moves whenever anything above it does, and this one already drifted nine
+#: lines between the tree that recorded it and the tree that repaired it.
 RECORDED_ALLOCATION = ("gate_clamp.py", "kda_gate_clamp", "zeros")
 
-#: The seam that holds it, and the argument whose absence would reach it.
-RECORDED_SEAM = "kda_gate_clamp"
-RECORDED_BRANCH_ARGUMENT = "bias"
+#: What the landed census reads, said where its numbers are printed rather than left implied.
+MODEL_SCOPE = "landed_walk:six_typed_factories,init_exempt,this_file_only"
 
-#: The repaired model file's own census, which must not slip back.
-MODEL_CALLS, MODEL_OFFENDERS = 19, 0
+#: One device-less call per derived factory, so every name in the set is shown live.
+PLANTED = "import torch\n\n\ndef f(rows):\n{calls}\n"
 
-#: A device-less factory, planted so the census walk is shown finding one.
-PLANTED = "import torch\n\n\ndef f(rows):\n    return torch.zeros((rows, 1))\n"
+#: A SECOND ARMING, OFF A SET SPELLED HERE RATHER THAN DERIVED. The arming above shows the walk
+#: working on whatever the predicate kept, so a predicate that keeps the wrong names arms a wrong
+#: walk and says nothing. These five calls and their three expected offenders do not move with the
+#: predicate, the installed torch or the package: three name no device, one copies the device of
+#: what it reads, and one names a device and so is not an offender.
+FIXED_SET = ("arange", "empty", "empty_like", "zeros")
+FIXED_CALLS = (
+    "    torch.zeros(rows)",
+    "    torch.empty(rows)",
+    "    torch.arange(rows)",
+    "    torch.empty_like(rows)",
+    "    torch.zeros(rows, device=rows.device)",
+)
+FIXED_OFFENDERS = ["zeros", "empty", "arange"]
 
 #: The wordings a device mismatch arrives in on this path.
 FAKE_TENSOR_WORDING = (
@@ -115,55 +130,215 @@ def _model_file() -> pathlib.Path:
     return pathlib.Path(os.environ.get(census.MODEL_FILE_VAR) or model_fp8.__file__)
 
 
-def test_a01_every_kda_allocation_names_its_device_but_the_one_on_record(tmp_path) -> None:
-    """The package census, the recorded allocation by shape, and the walk shown working."""
+def _package_modules() -> list[pathlib.Path]:
+    """Every module of the package, any sub-directory included."""
+    return sorted(KDA_PACKAGE.rglob("*.py"))
+
+
+def _torch_calls(tree: ast.AST):
+    """Each ``torch.<name>(...)`` call as ``(name, enclosing def, keyword names)``."""
+
+    def walk(node: ast.AST, where: str):
+        for child in ast.iter_child_nodes(node):
+            func = getattr(child, "func", None)
+            if isinstance(func, ast.Attribute) and getattr(func.value, "id", None) == "torch":
+                yield func.attr, where, {keyword.arg for keyword in child.keywords}
+            inner = isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            yield from walk(child, child.name if inner else where)
+
+    yield from walk(tree, "<module>")
+
+
+def _device_sources(name: str) -> list[str]:
+    """Which places say ``torch.<name>`` accepts a ``device=``, so a call omitting it picks one.
+
+    THREE PLACES, AND NO ONE OF THEM ANSWERS FOR EVERY NAME. A Python-level function has a
+    signature the inspect module can read. A C-level one may answer that call with a bare
+    ``(*args, **kwargs)`` instead of refusing it, and then carries its real signature in
+    ``__text_signature__`` or on the first NON-BLANK line of its docstring -- torch writes
+    that docstring with a leading newline, so the first line itself is empty.
+    """
+    function = getattr(torch, name, None)
+    if function is None:
+        return []
+    reads = []
+    try:
+        if "device" in inspect.signature(function).parameters:
+            reads.append("signature")
+    except (TypeError, ValueError):
+        pass
+    if "device=" in (getattr(function, "__text_signature__", None) or ""):
+        reads.append("text_signature")
+    doc = getattr(function, "__doc__", None) or ""
+    if "device=" in next((line for line in doc.splitlines() if line.strip()), ""):
+        reads.append("docstring")
+    return reads
+
+
+def _factory_set(modules: list[pathlib.Path]) -> tuple[list[str], list[str]]:
+    """``(the names the package calls, those that take a device)``, off its own parse trees."""
+    called = sorted(
+        {
+            name
+            for path in modules
+            for name, _where, _keywords in _torch_calls(ast.parse(path.read_text()))
+        }
+    )
+    return called, [name for name in called if _device_sources(name)]
+
+
+def _census(
+    path: pathlib.Path, factories: frozenset[str]
+) -> tuple[int, list[tuple[str, str, str]]]:
+    """``(calls read, offenders)``; an offender is ``(module, enclosing def, factory)``.
+
+    A ``*_like`` factory takes the device of the tensor it copies, so a call that omits
+    ``device=`` there has named one after all. Every other factory falls back to the default
+    device, which under graph capture is not where the activations live.
+    """
+    calls, offenders = 0, []
+    for factory, where, keywords in _torch_calls(ast.parse(path.read_text())):
+        if factory not in factories:
+            continue
+        calls += 1
+        if not factory.endswith("_like") and "device" not in keywords:
+            offenders.append((path.name, where, factory))
+    return calls, offenders
+
+
+def test_a01_the_package_census_reads_every_factory_its_modules_call(tmp_path) -> None:
+    """The derived set, one row per module, the walk shown finding one call per kept name."""
     _require_cpu_lane()
-    modules = sorted(KDA_PACKAGE.glob("*.py"))
+    modules = _package_modules()
+    called, factories = _factory_set(modules)
+    _emit(
+        "factories",
+        called=",".join(called),
+        kept=",".join(factories),
+        exempt=",".join(name for name in factories if name.endswith("_like")),
+    )
+    reads = {name: _device_sources(name) for name in called}
+    _emit(
+        "predicate",
+        **{
+            place: ",".join(name for name, places in reads.items() if place in places) or "none"
+            for place in ("signature", "text_signature", "docstring")
+        },
+    )
+    assert factories, (
+        f"the device predicate kept NONE of the {len(called)} names this package calls: {called}. "
+        f"Every census below would then read zero calls and every offender count would be a "
+        f"hollow zero. The predicate row above says which place answered for which name"
+    )
+    kept = frozenset(factories)
     calls, found = 0, []
     for path in modules:
-        module_calls, offenders = census._census(path)
+        module_calls, offenders = _census(path, kept)
         calls += module_calls
-        found += [(path.name, where, factory) for _line, factory, where in offenders]
+        found += offenders
         _emit("census", module=path.name, calls=module_calls, offenders=len(offenders))
-
-    model_file = _model_file()
-    model_calls, model_offenders = census._census(model_file)
     _emit(
         "census_totals",
         files=len(modules),
         calls=calls,
         offenders=len(found),
         keyed=";".join(":".join(entry) for entry in sorted(found)) or "none",
-        model_calls=model_calls,
-        model_offenders=len(model_offenders),
+    )
+    assert calls, (
+        f"the census read no call at all over {len(modules)} modules with the kept set "
+        f"{factories}, so its zero offenders say nothing about this package"
     )
 
     planted_file = tmp_path / "planted.py"
-    planted_file.write_text(PLANTED)
-    planted_calls, planted = census._census(planted_file)
-    _emit("armed", planted_calls=planted_calls, planted_offenders=len(planted))
-    assert planted_calls == 1
-    assert [(factory, where) for _line, factory, where in planted] == [("zeros", "f")]
+    planted_file.write_text(
+        PLANTED.format(calls="\n".join(f"    torch.{name}(rows)" for name in factories))
+    )
+    planted_calls, planted = _census(planted_file, kept)
+    _emit(
+        "armed",
+        planted_calls=planted_calls,
+        planted_offenders=len(planted),
+        planted=",".join(factory for _module, _where, factory in planted) or "none",
+    )
+    assert planted_calls == len(factories), (planted_calls, factories)
+    assert [factory for _module, _where, factory in planted] == [
+        name for name in factories if not name.endswith("_like")
+    ], planted
 
-    assert sorted(found) == [RECORDED_ALLOCATION], sorted(found)
-    assert (model_calls, len(model_offenders)) == (MODEL_CALLS, MODEL_OFFENDERS)
+    # AND THE SAME WALK OVER A SET THIS FILE SPELLS, so the arming above cannot be the only one.
+    # It reads whatever the predicate kept, and a predicate that keeps the wrong names arms a
+    # wrong walk. These five calls and their three offenders are fixed here.
+    fixed_file = tmp_path / "fixed.py"
+    fixed_file.write_text(PLANTED.format(calls="\n".join(FIXED_CALLS)))
+    fixed_calls, fixed_found = _census(fixed_file, frozenset(FIXED_SET))
+    _emit(
+        "armed_fixed",
+        factories=",".join(FIXED_SET),
+        planted_calls=fixed_calls,
+        planted_offenders=len(fixed_found),
+        planted=",".join(factory for _module, _where, factory in fixed_found) or "none",
+    )
+    assert fixed_calls == len(FIXED_CALLS), (
+        f"the walk read {fixed_calls} of the {len(FIXED_CALLS)} calls planted from a set spelled "
+        f"in this file, so it is not reading every call form it is given"
+    )
+    assert [factory for _module, _where, factory in fixed_found] == FIXED_OFFENDERS, (
+        f"over the fixed arming the walk read {fixed_found} and this file declares "
+        f"{FIXED_OFFENDERS}: the copying factory and the call that names a device are not "
+        f"offenders, and the other three are"
+    )
+
+    model_file = _model_file()
+    model_calls, model_offenders = census._census(model_file)
+    _emit(
+        "model_census",
+        calls=model_calls,
+        offenders=len(model_offenders),
+        keyed=";".join(f"{where}:{factory}" for _line, factory, where in sorted(model_offenders))
+        or "none",
+        scope=MODEL_SCOPE,
+    )
+    assert not model_offenders, (
+        f"{len(model_offenders)} allocation(s) outside __init__ in {model_file.name} name no "
+        f"device=: {model_offenders}. The call count beside them is a reading, not a pin, so a "
+        f"new allocation that names its device is not a failure here"
+    )
 
 
-def test_a01b_the_recorded_allocation_sits_on_a_branch_the_product_never_takes() -> None:
-    """Every shipped call of that seam passes ``bias``, so the branch holding it is dead."""
+def test_a01b_no_allocation_in_the_kda_package_decides_a_device_for_itself() -> None:
+    """Zero offenders on the repaired tree; exactly one, by shape, on the tree without it."""
     _require_cpu_lane()
-    calls = [
-        node
-        for node in ast.walk(ast.parse(_model_file().read_text()))
-        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == RECORDED_SEAM
-    ]
-    passes = [
-        any(keyword.arg == RECORDED_BRANCH_ARGUMENT for keyword in node.keywords)
-        for node in calls
-    ]
-    _emit("call_sites", seam=RECORDED_SEAM, sites=len(calls), pass_the_argument=sum(passes))
-    assert len(calls) == 1, f"{len(calls)} call sites of {RECORDED_SEAM}"
-    assert all(passes), f"a call site of {RECORDED_SEAM} passes no {RECORDED_BRANCH_ARGUMENT}"
+    modules = _package_modules()
+    called, factories = _factory_set(modules)
+    kept = frozenset(factories)
+    read = [_census(path, kept) for path in modules]
+    calls = sum(count for count, _offenders in read)
+    found = sorted(entry for _count, offenders in read for entry in offenders)
+    _emit(
+        "offenders",
+        count=len(found),
+        keyed=";".join(":".join(entry) for entry in found) or "none",
+        calls_read=calls,
+    )
+    # THE FLOOR UNDER THE READING BELOW. A predicate that keeps no name, or a walk that finds no
+    # call, gives zero offenders on any tree at all, and a zero of that kind is not the reading
+    # this item is for.
+    assert factories, (
+        f"the device predicate kept NONE of the {len(called)} names this package calls: {called}"
+    )
+    assert calls, f"no call was read over the {len(modules)} modules with the kept set {factories}"
+    if _expect_base():
+        assert found == [RECORDED_ALLOCATION], (
+            f"this arm reads the tree that still builds its zero bias column without a device, so "
+            f"the walk must find exactly that one allocation, keyed by module, function and "
+            f"factory: declared [{RECORDED_ALLOCATION}], read {found} over {calls} calls in "
+            f"{len(modules)} modules"
+        )
+        return
+    assert not found, (
+        f"{len(found)} allocation(s) in {KDA_PACKAGE.name}/ name no device= and take the "
+        f"default device, which under capture is not where the activations are: {found}"
+    )
 
 
 def test_a02_the_tiny_stacks_layer_schedule_is_a_dial_with_its_landed_default() -> None:
@@ -183,13 +358,6 @@ def test_a02_the_tiny_stacks_layer_schedule_is_a_dial_with_its_landed_default() 
     assert default.num_hidden_layers == tiny.STACK_LAYERS
 
     asked = [KDA_LAYER_TYPE] * (tiny.STACK_LAYERS - 1) + [DSA_LAYER_TYPE]
-    if _expect_base():
-        with pytest.raises(TypeError) as refused:
-            tiny._stack_text_config(layer_types=asked)
-        _emit("schedule_refused", error=" ".join(str(refused.value).split()))
-        assert "layer_types" in str(refused.value)
-        return
-
     mixed = tiny._stack_text_config(layer_types=asked)
     moved = [
         name
@@ -223,12 +391,6 @@ def test_a03_the_meta_forwards_device_mismatch_reader_reads_every_wording() -> N
     )
     assert OLD_NEEDLE not in FAKE_TENSOR_WORDING
     assert OLD_NEEDLE not in EAGER_WORDING
-
-    if _expect_base():
-        _emit("reader_absent", has_predicate=int(hasattr(meta, "_names_a_device_mismatch")))
-        assert not hasattr(meta, "_names_a_device_mismatch")
-        assert f'"{OLD_NEEDLE}" in str(error)' in pathlib.Path(meta.__file__).read_text()
-        return
 
     read = {
         name: int(meta._names_a_device_mismatch(RuntimeError(text)))
