@@ -798,13 +798,13 @@ def torch_reference_moe(
     from the vendor KERNEL's torch reference
     (``nkilib/core/moe/moe_cte/moe_cte_torch.py:193``) and therefore computed the
     kernel's DEFAULTS, while the product call site deliberately overrides both of
-    them (``model_fp8.py:1968`` and ``:2009-2012``) to match the checkpoint's own
+    them (``model_fp8.py:1973`` and ``:2014-2017``) to match the checkpoint's own
     model. A reference built on the wrong authority is a comparator defect, not a
     tolerance question, so the two overridden points now read from the model:
 
     * ``POST_SCALE`` -- the expert affinity multiplies the expert's output AFTER
       the down matmul (``design/reference/modeling_glm5_next.py:133``), which is
-      what the call site selects (``model_fp8.py:1968``). The pre-scaling
+      what the call site selects (``model_fp8.py:1973``). The pre-scaling
       alternative is a DIFFERENT function, not a refactor, because SiLU is
       nonlinear; ``post_scale=False`` computes that other function and exists
       only for the must-fail control
@@ -812,11 +812,11 @@ def torch_reference_moe(
     * THE SwiGLU CLAMP -- ``gate`` is bounded from above only and ``up`` on both
       sides (``modeling_glm5_next.py:139-140``), at the checkpoint's own
       ``swiglu_limit``, which the call site sends as the kernel's four limit
-      keywords (``model_fp8.py:2009-2012``). The asymmetry is the model's.
+      keywords (``model_fp8.py:2014-2017``). The asymmetry is the model's.
       ``clamp=False`` drops it, again only for that control.
 
     ``swiglu_limit`` is keyword-ONLY and has NO default: every caller names the
-    value it read off the bank (``model_fp8.py:1433``), so no arm can silently
+    value it read off the bank (``model_fp8.py:1438``), so no arm can silently
     inherit a bound the checkpoint did not declare.
 
     The affinity is applied IN THE ACTIVATION DTYPE (bf16), matching the call
@@ -1072,7 +1072,7 @@ def test_moe_path_reference_agrees_with_vendor_torch_oracle() -> None:
     at the vendor's own defaults would certify arithmetic the acceptance no longer
     uses. This arm therefore runs the vendor oracle TWICE -- once at those
     defaults, and once carrying the same scaling mode and the same four clamp
-    limits the call site sends (``model_fp8.py:1968``, ``:2009-2012``), which the
+    limits the call site sends (``model_fp8.py:1973``, ``:2014-2017``), which the
     seam forwards VERBATIM into the vendor's torch reference
     (``moe_blockwise_fp8.py:445`` then ``:519``) -- and compares each against the
     matching configuration of this file's reference.
@@ -1184,7 +1184,7 @@ def test_moe_path_f1_pre_scale_unclamped_reference_must_fail() -> None:
     Batch R6 moved this file's reference off the vendor kernel's defaults and onto
     the model the checkpoint ships (``design/reference/modeling_glm5_next.py:133``
     and ``:139-140``), because the call site overrides both
-    (``model_fp8.py:1968``, ``:2009-2012``). This item is the pair that makes that
+    (``model_fp8.py:1973``, ``:2014-2017``). This item is the pair that makes that
     move a measurement rather than an assertion: the CONFIGURED reference passes
     at the declared tolerances, and each override reverted -- the scaling point
     alone, the clamp alone, and both together, which is exactly the reference this
@@ -1538,7 +1538,7 @@ def test_moe_path_routed_limbs_trace_under_fullgraph() -> None:
     """MEASURED: the three limbs trace whole under ``fullgraph=True`` and return.
 
     The runner compiles the model with ``fullgraph`` on unless the debug door is open
-    (``neuron_model_runner.py:1457-1462``), so a host read inside the limbs is fatal in
+    (``neuron_model_runner.py:1458-1463``), so a host read inside the limbs is fatal in
     service. The traced region is this increment's three limbs and nothing else: the
     routing runs first, in the eager call site, and the compiled region re-runs the
     limbs over the operands that call recorded. The comparison is that same call's own
@@ -2821,7 +2821,7 @@ class _MappingAffinitySpy:
     """Captures the affinity tensor ``build_blockwise_mapping`` is handed.
 
     The call site imports the mapping FUNCTION-LOCALLY from
-    ``vllm_neuron.functional`` (``model_fp8.py:1094``, re-anchored by
+    ``vllm_neuron.functional`` (``model_fp8.py:1099``, re-anchored by
     ``inc-glm53f-091b`` from ``:1078``, same bytes), so replacing the
     attribute on that module is what a call actually resolves. The real mapping
     still runs and its result is still used, so the kernel below is measured on

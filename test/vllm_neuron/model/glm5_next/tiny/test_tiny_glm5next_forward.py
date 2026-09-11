@@ -2177,7 +2177,7 @@ SEED_MOE_ROUTER = 5425
 MOE_GAMMA_VALUES = (1.0, 1.25, 1.5, 1.75)
 
 #: The router's own scale, following the landed fixture this item copies
-#: (``test_moe_path.py:1899-1905``): a small normal draw for the weight and a
+#: (``test_moe_path.py:2017-2023``): a small normal draw for the weight and a
 #: smaller one for the correction bias.
 MOE_ROUTER_WEIGHT_SCALE = 0.1
 MOE_ROUTER_BIAS_SCALE = 0.05
@@ -2289,7 +2289,7 @@ def _ffn_norm(hidden: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Te
 # The clamp discrimination belongs to items 1, 2 and 3, which own those paths.  #
 #                                                                              #
 # THE ROUTER IS EXECUTED RATHER THAN IMITATED, which is the landed convention   #
-# for this path (``test_moe_path.py:1890-1895``: "the router is executed rather #
+# for this path (``test_moe_path.py:2008-2013``: "the router is executed rather #
 # than imitated, so the form the call site consumes is the form the producer    #
 # actually emits"). Its affinities are an INPUT to the reference. Re-deriving   #
 # them here would put this item in the business of certifying the router, which #
@@ -2371,7 +2371,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # ---- THE ROUTER's two parameters, in the orientation the seam consumes:
     # ``[H, E]`` for the weight, which ``noaux_tc_rmsnorm_router_topk`` reads its
     # expert count off (``router.py:1615``), and one bias per expert. The landed
-    # fixture this copies is ``test_moe_path.py:1899-1905``.
+    # fixture this copies is ``test_moe_path.py:2017-2023``.
     generator = torch.Generator().manual_seed(SEED_MOE_ROUTER)
     block.experts.router_weight = torch.nn.Parameter(
         (
@@ -5854,7 +5854,7 @@ SEED_ROOT_HEAD = 5481
 #: shape; and it is SHORTER than the token count, so a forward that projected
 #: every row would fail on shape. The repeat is not contrived: the runner pads
 #: its own ``logits_indices`` by repeating the last real index
-#: (``neuron_model_runner.py:3896-3900``), and builds them ``dtype=torch.long``
+#: (``neuron_model_runner.py:3897-3901``), and builds them ``dtype=torch.long``
 #: (``:2941``), which is the dtype this item passes.
 ROOT_SAMPLING_POSITIONS = (STACK_TOKENS - 1, 0, 7, 7)
 
@@ -6419,7 +6419,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         root.forward(input_ids, layer_carriers=carriers)
 
     # ---- CONTROL D: THERE IS NO ``**kwargs`` SINK. ``sampling_params`` is a real
-    # runner key (``neuron_model_runner.py:7036``) that this tree implements nowhere;
+    # runner key (``neuron_model_runner.py:7048``) that this tree implements nowhere;
     # it must be refused at the call, not accepted and dropped.
     with pytest.raises(TypeError, match="sampling_params"):
         root.forward(
