@@ -91,6 +91,13 @@ def _meta_root_and_runner():
     at the device the rest of the model now holds, through the same method the load calls
     (``model_fp8.py:8830``), or the first mHC layer meets a CPU weight with ``meta``
     activations.
+
+    THE BIND RUNS UNDER A DEFAULT-DEVICE CONTEXT, and that is not decoration. The method
+    builds a fresh site object and assigns each loaded weight onto that object's own
+    parameter (``model_fp8.py:8101``); the object is allocated wherever the default device
+    points, so a bind that targets any other device assigns across two tensor types and
+    ``set_data`` refuses. The context makes the site the method builds land on the device
+    the bind was asked for.
     """
     landed._require_cpu_mode()
     root = landed._fixture()["root"]
@@ -99,9 +106,10 @@ def _meta_root_and_runner():
         for name, tensors in landed._runner_shaped_caches(root).items()
     }
     root.to("meta")
-    for module in root.modules():
-        if hasattr(type(module), "bind_hyper_connection_sites"):
-            module.bind_hyper_connection_sites(root.text_config, torch.device("meta"))
+    with torch.device("meta"):
+        for module in root.modules():
+            if hasattr(type(module), "bind_hyper_connection_sites"):
+                module.bind_hyper_connection_sites(root.text_config, torch.device("meta"))
     root.bind_kv_cache(caches)
     runner = sites._runner(root)
     runner.device = torch.device("meta")
