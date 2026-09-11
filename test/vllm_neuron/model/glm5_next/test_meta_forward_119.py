@@ -16,7 +16,7 @@ WHAT THIS FILE IS ABOUT. Graph extraction builds the whole batch on ``meta``
 tensor cannot run there, and two of them were on the path: the converter's geometry reads,
 which ``test_host_geometry_119.py`` covers, and the attention seam's selected-row range
 refusal (``mla_sparse.py:1411``), which every MLA layer of every step reaches
-(``model_fp8.py:6895``, unconditionally).
+(``model_fp8.py:7008``, unconditionally).
 
 THE TWO ITEMS
 

@@ -230,7 +230,7 @@ def _metadata(banks, *, tokens: int, cached: int) -> dict:
     """The runner's attention-metadata mapping: one entry per layer name.
 
     THE KEYING AND THE KEYS ARE THE RUNNER'S OWN (``neuron_model_runner.py``
-    ``:4417-4441`` for the entry, ``:4256-4257`` for the keying). The converter
+    ``:4418-4442`` for the entry, ``:4257-4258`` for the keying). The converter
     reads five of them and derives each bank's geometry from the HOST-SIDE block
     table and cached length, and the page; the device copies of those two numbers
     are present, unread, because the runner's own mapping carries both.

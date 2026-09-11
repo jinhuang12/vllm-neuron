@@ -37,7 +37,7 @@ THE SIX ITEMS
   the bank rather than a copy. This item reads the same at the base, because it is about the
   rule the converter has always implemented rather than about the source it reads.
 * A06 -- the second host read on the same path. Every MLA layer of every step calls
-  ``mla_sparse_attention`` (``model_fp8.py:6895``), whose range refusal read the selected-row
+  ``mla_sparse_attention`` (``model_fp8.py:7008``), whose range refusal read the selected-row
   range with ``int(...)``. The seam now reaches its dispatch on a captured step's own
   carrier; at the base it raises the same meta read, one seam further along than A01.
 
@@ -77,7 +77,7 @@ STATE_SLOTS = 8
 DECODE_THRESHOLD = 1
 
 #: The longest sequence the harness admits, which is what the side-cache allocator bounds
-#: its pooled store by (``neuron_model_runner.py:4916-4920``).
+#: its pooled store by (``neuron_model_runner.py:4917-4921``).
 MAX_MODEL_LEN = BANK_PAGES * PAGE
 
 
@@ -95,7 +95,7 @@ def _sparse_bank(device: torch.device) -> dict:
     """One sparse-attention bank, in the shape ``bind_kv_cache`` leaves on the model.
 
     The four keys are the ones the carrier builder reads for this family
-    (``neuron_model_runner.py:5015-5025``): the name it is looked up by, the family that
+    (``neuron_model_runner.py:5016-5026``): the name it is looked up by, the family that
     selects the branch, the page its bank is cut into, and the bank flattened over pages and
     slots, which is the sequence view the layers take.
     """
@@ -151,7 +151,7 @@ def _entry(
     """One KV-cache group's metadata entry, with its host and device halves set apart.
 
     THE KEYS ARE THE RUNNER'S OWN, read off the mapping it builds at
-    ``neuron_model_runner.py:4417-4441``. The two halves are given separately here because
+    ``neuron_model_runner.py:4418-4442``. The two halves are given separately here because
     that is the whole measurement: in the runner they carry the same numbers, and an item
     that sets them apart shows which half the converter read.
     """
@@ -191,7 +191,7 @@ def _open_ring_at(runner, banks, position: int) -> None:
 
     A prefill at position 0 opens the ring inside the converter. A step that continues a
     sequence is refused unless the ring already stands at its position
-    (``neuron_model_runner.py:5338-5345``), so an item at a non-zero position hands the
+    (``neuron_model_runner.py:5339-5346``), so an item at a non-zero position hands the
     runner the same two attributes the previous step would have left.
     """
     runner._glm5next_side_cache_set = NeuronModelRunner._glm5next_side_caches(
@@ -210,7 +210,7 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     """The graph-extraction world, which is where the hardware run stopped.
 
     Warmup declares a cached length of 0, one row, and this bucket's own pages
-    (``neuron_model_runner.py:4372-4379``, ``:4430-4441``). The device half is on ``meta``,
+    (``neuron_model_runner.py:4373-4380``, ``:4431-4442``). The device half is on ``meta``,
     where reading a value is impossible; the host half is the array the runner already holds.
     """
     meta = torch.device("meta")
@@ -279,7 +279,7 @@ def test_a03_a_padded_device_table_does_not_decide_the_request_count() -> None:
     """One request, in a device table padded to four rows.
 
     ``_build_attention_metadata`` sizes its device tensors by ``padded_num_reqs`` and its host
-    arrays by ``num_reqs`` (``neuron_model_runner.py:4236-4243``). A padding row names no
+    arrays by ``num_reqs`` (``neuron_model_runner.py:4237-4244``). A padding row names no
     request, so reading the padded height as the batch refuses a step that is single.
     """
     cpu = torch.device("cpu")
@@ -342,11 +342,11 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     THE RULE. The slice spans the whole pages the request's own tokens occupy, counted from
     the request's first page: ``ceil((start_position + tokens) / page)`` pages. It therefore
     covers ``start_position + tokens`` slots, which is the bound the layer checks before it
-    writes (``model_fp8.py:6862-6867``), and its rows are the request's own.
+    writes (``model_fp8.py:6975-6980``), and its rows are the request's own.
 
     WHY THE ALIAS MATTERS. The layer writes this step's latents THROUGH the slice
-    (``model_fp8.py:6877``) and reads slot 0 to the last written slot back out of it
-    (``model_fp8.py:6881``). A basic slice is a view, so both land in the bank. A gather
+    (``model_fp8.py:6990``) and reads slot 0 to the last written slot back out of it
+    (``model_fp8.py:6994``). A basic slice is a view, so both land in the bank. A gather
     would return a copy, and the write would be discarded where the next step reads.
     """
     cpu = torch.device("cpu")
@@ -389,7 +389,7 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     ``mla_sparse_attention`` refused an out-of-range selected row by reading the row range
     with ``int(...)`` (``mla_sparse.py:1411``), which is the same call the converter used to
     make and which a ``meta`` tensor cannot answer. Every MLA layer of every step goes
-    through that seam (``model_fp8.py:6895``, unconditionally), so a captured prefill reached
+    through that seam (``model_fp8.py:7008``, unconditionally), so a captured prefill reached
     it and stopped there.
 
     WHAT THIS ITEM MEASURES AND WHAT IT DOES NOT. It measures that the call gets PAST the
@@ -398,7 +398,7 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     a vendor question and ``D01`` in ``test_meta_forward_119.py`` reports it.
 
     THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, sliced
-    the way the layer slices it (``model_fp8.py:6877``, ``:6881``), and the scale is the
+    the way the layer slices it (``model_fp8.py:6990``, ``:6994``), and the scale is the
     carrier's own. The selected-row width is the seam's declared tile, ``KEY_CHUNK``,
     imported rather than typed: the admissibility clause requires a positive multiple of it
     (``mla_sparse.py:1293-1299``).

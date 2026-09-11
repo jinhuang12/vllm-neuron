@@ -725,7 +725,7 @@ def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) ->
     """ONE KV-cache group's attention-metadata entry, at this step's geometry.
 
     THE KEYS AND THEIR SHAPES ARE THE RUNNER'S OWN, read off the mapping it builds at
-    `neuron_model_runner.py:4417-4441`; the converter under test reads five of them --
+    `neuron_model_runner.py:4418-4442`; the converter under test reads five of them --
     `host_block_table`, `host_num_computed_tokens`, `block_size`, `max_query_len` and
     `decode_token_threshold` -- and the rest are present so that this is the runner's mapping
     and not a five-key stand-in. The device copies of the first two are among the rest: the
