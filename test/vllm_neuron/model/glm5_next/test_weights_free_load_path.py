@@ -9,6 +9,7 @@ today must bind exactly as it did.
 """
 
 import dataclasses
+import threading
 
 import pytest
 import torch
@@ -189,6 +190,32 @@ def test_a_loaded_but_unbound_layer_refuses_a_streams_call() -> None:
     )
 
 
+class _RecordingStore:
+    """The two methods the pipelined load uses on its distributed store."""
+
+    def __init__(self) -> None:
+        self.added: list[str] = []
+
+    def add(self, key: str, value: int) -> None:
+        self.added.append(key)
+
+    def check(self, keys) -> bool:
+        return all(key in self.added for key in keys)
+
+
+def _meta_load(tmp_path, name: str):
+    """Run the real loader on meta through the reader, and hand both back."""
+    impl = _impl()
+    directory = tmp_path / name
+    model = _dense_model()
+    written = _write_miniature_checkpoint(directory, _mappings_for(_dense_config()), model)
+    reader = impl._MetaShapeCheckpoint(str(directory), None)
+    model.to(torch.device("meta"))
+    model.load_weights(str(directory), torch.device("meta"), None, reader=reader)
+    say("meta-load", f"tensors_written={written}|files={reader.get_num_files()}")
+    return model, reader
+
+
 def _lite_loaded(tmp_path):
     """A dense miniature tree after the weights-free hook, with its checkpoint."""
     directory = tmp_path / "weights-free"
@@ -273,4 +300,55 @@ def test_the_hook_clears_both_refusals_the_forward_hits(
     assert counts and set(counts) == {2}, (
         f"the layers carrying mHC weights hold site counts {sorted(set(counts))}, "
         f"so a streams call on one of them has nothing to run"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (7) The pipelined load completes: every file is announced and processed.      #
+# --------------------------------------------------------------------------- #
+def test_the_pipelined_load_completes_on_the_shape_only_reader(
+    tmp_path, single_rank_process_group
+) -> None:
+    """The load's own loop waits on store keys, so the reader must still write them."""
+    impl = _impl()
+    directory = tmp_path / "announced"
+    model = _dense_model()
+    _write_miniature_checkpoint(directory, _mappings_for(_dense_config()), model)
+    reader = impl._MetaShapeCheckpoint(str(directory), None)
+    store = _RecordingStore()
+    reader._load_to_page_cache(0, 1, store, threading.Event())
+    files = list(reader._source.get_file_names())
+    say("announced", f"added={store.added}|files={files}")
+    assert store.added == files and store.check(files), (
+        f"the reader announced {store.added} of {files}; the load's loop turns a "
+        f"file on only when its key is in the store, so a file left out leaves "
+        f"that loop spinning until the step's time bound cuts it off"
+    )
+
+    _model, loaded_reader = _meta_load(tmp_path, "pipelined")
+    processed = len(loaded_reader._open_safetensor_files)
+    say("pipelined", f"processed_files={processed}|files={loaded_reader.get_num_files()}")
+    assert processed == loaded_reader.get_num_files() >= 1, (
+        f"the load opened {processed} of {loaded_reader.get_num_files()} checkpoint "
+        f"files, so it returned without processing them all"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (8) The census that reads values is reached on the meta pass, and skips.      #
+# --------------------------------------------------------------------------- #
+def test_the_meta_pass_reaches_the_block_scale_census_and_skips_it(
+    tmp_path, single_rank_process_group
+) -> None:
+    """Reached, not merely guarded: the load walks into it and it records the skip."""
+    from vllm_neuron.model.glm5_next import weight_loaders_fp8
+
+    weight_loaders_fp8.SKIPPED_VALUE_CENSUSES.clear()
+    _meta_load(tmp_path, "census")
+    skips = list(weight_loaders_fp8.SKIPPED_VALUE_CENSUSES)
+    say("census-skips", f"count={len(skips)}|names={sorted(set(skips))}")
+    assert skips.count("compensate_block_scales") >= 1, (
+        f"the shape-only load recorded {sorted(set(skips))}; the block-scale census "
+        f"reads three numbers before the platform gate, so a pass that never "
+        f"reaches it proves nothing about a load that will"
     )
