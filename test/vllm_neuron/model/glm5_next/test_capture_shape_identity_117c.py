@@ -7,7 +7,7 @@ THE DECLARED ACCEPTANCE, Tier N, CPU mode:
       test/vllm_neuron/model/glm5_next/test_capture_shape_identity_117c.py \\
       -s -rA -p no:randomly -p no:cacheprovider
 
-Eight items, one test each, no ``parametrize`` and no skip.
+Eleven items, one test each, no ``parametrize`` and no skip.
 
 WHAT THE BLOCK IS ABOUT. A graph is captured once and replayed at every position, so
 anything whose SHAPE or whose CONTROL FLOW comes from a position value pins the graph
@@ -15,8 +15,14 @@ to the position it was captured at. Two such things existed: the MLA layer read 
 cache as ``[: start + tokens]``, whose length grows with every decode step, and the KDA
 layer chose its entering state with a python branch on the same value.
 
-WHAT THESE ITEMS OBSERVE, AND WHAT THEY DO NOT. Items 1 to 4, 7 and 8 are
-BEHAVIOURAL: they drive the runner's own carrier builder -- items 7 and 8 through the
+ITEMS 9 TO 11 ARE THE SECOND LAP'S, on the three things the first lap left to the
+runner: the ALLOCATION that makes item 3's refusal unreachable in a serve, the write
+bound that moved out of the layer once the window grew longer than a request's pages,
+and the indexer's sequence bound, which stays a python int and therefore had to stop
+moving.
+
+WHAT THESE ITEMS OBSERVE, AND WHAT THEY DO NOT. Items 1 to 4, 7 to 11 are
+BEHAVIOURAL: they drive the runner's own carrier builder -- items 7, 8 and 11 through the
 converter that sizes the window, one per leg -- and read what it hands a layer. Items 5 and 6 are
 STRUCTURAL, in the form this campaign already uses for the state hook
 (``test_kda_runner_state.py`` B01 and B02): they read the source of the two methods and
@@ -30,7 +36,11 @@ headroom refusal to raise; item 4 because the base hands a python int; items 5 a
 because the base's source carries the two host reads this block removed; item 7
 because the base sizes the window from the request's own blocks and c1 sized it from the
 block table's width, and the item names both wrong answers; item 8 because the base's
-decode window is this step's own two blocks where the bucket is ten.
+decode window is this step's own two blocks where the bucket is ten; item 9 because the
+base's allocator adds no spare window and has no method to ask for one; item 10 because
+the base builds the carrier without a word and leaves the write to a layer whose own
+bound is now the whole window; item 11 because the base's bound is this step's end
+position, which is a different number at each of the two steps.
 
 WHAT ITEM 8 DOES NOT SEPARATE. On the decode leg the bucket's span and the table's width
 are the SAME number by the ruling, so item 8 fails at the base and passes at c1 as well
@@ -387,6 +397,9 @@ def _runner(text_config, banks) -> NeuronModelRunner:
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.model = SimpleNamespace(text_config=text_config, glm5next_layer_banks=banks)
     runner.max_model_len = DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE
+    # The context-parallel width the block-table arithmetic divides by. One is the
+    # single-rank case, which is what a shell with no parallel world can honestly say.
+    runner._dcp_size = 1
     return runner
 
 
@@ -423,6 +436,24 @@ def _prefill_metadata(banks) -> dict:
         "kv_segment_size": DECLARED_SEGMENT,
     }
     return {bank["name"]: dict(entry) for bank in banks}
+
+
+def _converter_kwargs(banks, metadata: dict, tokens: int) -> dict:
+    """The generic mapping a call site hands the converter, at this step's token count.
+
+    The keys the converter drops are present because a real call site carries them, so
+    an item reads the same translation a serve does.
+    """
+    return {
+        "input_ids": torch.zeros(tokens, dtype=torch.long),
+        "positions": torch.arange(tokens, dtype=torch.long),
+        "attn_metadata": metadata,
+        "sampling_positions": torch.tensor([tokens - 1], dtype=torch.long),
+        "sampling_params": None,
+        "spec_decode_metadata": None,
+        "rank": None,
+        "logit_mask": None,
+    }
 
 
 def _blocks_for_decode() -> int:
@@ -467,20 +498,9 @@ def test_the_converter_sizes_the_window_from_the_legs_bucket() -> None:
         -(DECLARED_SEGMENT + DECLARED_PREFILL_TOKENS) // DECLARED_PAGE_SIZE
     )
 
-    converted = runner._glm5next_model_kwargs(
-        {
-            "input_ids": torch.zeros(DECLARED_PREFILL_TOKENS, dtype=torch.long),
-            "positions": torch.arange(DECLARED_PREFILL_TOKENS, dtype=torch.long),
-            "attn_metadata": _prefill_metadata([bank]),
-            "sampling_positions": torch.tensor(
-                [DECLARED_PREFILL_TOKENS - 1], dtype=torch.long
-            ),
-            "sampling_params": None,
-            "spec_decode_metadata": None,
-            "rank": None,
-            "logit_mask": None,
-        }
-    )
+    converted = runner._glm5next_model_kwargs(_converter_kwargs(
+        [bank], _prefill_metadata([bank]), DECLARED_PREFILL_TOKENS
+    ))
     carriers = converted["layer_carriers"]
     assert len(carriers) == 1, f"one bank was handed {len(carriers)} carrier(s)"
     slots = int(carriers[0]["latent_cache"].shape[0])
@@ -518,20 +538,9 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
     runner = _runner(text_config, [bank])
     segment_span = -(-(DECLARED_SEGMENT + DECLARED_TOKENS) // DECLARED_PAGE_SIZE)
 
-    opened = runner._glm5next_model_kwargs(
-        {
-            "input_ids": torch.zeros(DECLARED_PREFILL_TOKENS, dtype=torch.long),
-            "positions": torch.arange(DECLARED_PREFILL_TOKENS, dtype=torch.long),
-            "attn_metadata": _prefill_metadata([bank]),
-            "sampling_positions": torch.tensor(
-                [DECLARED_PREFILL_TOKENS - 1], dtype=torch.long
-            ),
-            "sampling_params": None,
-            "spec_decode_metadata": None,
-            "rank": None,
-            "logit_mask": None,
-        }
-    )
+    opened = runner._glm5next_model_kwargs(_converter_kwargs(
+        [bank], _prefill_metadata([bank]), DECLARED_PREFILL_TOKENS
+    ))
     cursor = getattr(runner, "_glm5next_side_cache_cursor", None)
     say("I8_OPENED", f"carriers={len(opened['layer_carriers'])}", f"cursor={cursor}")
     assert cursor == DECLARED_CONTINUED_POSITION, (
@@ -541,20 +550,9 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
         f"the reading would be about the cursor and not about the window"
     )
 
-    converted = runner._glm5next_model_kwargs(
-        {
-            "input_ids": torch.zeros(DECLARED_TOKENS, dtype=torch.long),
-            "positions": torch.tensor(
-                [DECLARED_CONTINUED_POSITION], dtype=torch.long
-            ),
-            "attn_metadata": _decode_metadata([bank]),
-            "sampling_positions": torch.zeros(1, dtype=torch.long),
-            "sampling_params": None,
-            "spec_decode_metadata": None,
-            "rank": None,
-            "logit_mask": None,
-        }
-    )
+    converted = runner._glm5next_model_kwargs(_converter_kwargs(
+        [bank], _decode_metadata([bank]), DECLARED_TOKENS
+    ))
     slots = int(converted["layer_carriers"][0]["latent_cache"].shape[0])
 
     say("I8_WINDOW_SLOTS", slots,
@@ -570,3 +568,174 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
         "the decode window is this step's own blocks again, so its length still grows "
         "with every decode step"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ITEM 9. The ALLOCATOR gives every latent bank the spare window item 3 refuses
+# a bank for lacking, and the two numbers are the same number.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_the_allocator_sizes_the_spare_window_the_carrier_builder_requires() -> None:
+    """Item 3's production counterpart: what makes that refusal unreachable in a serve.
+
+    ITEM 3 READS A BANK SIZED BY HAND. This one asks the allocator how much spare it
+    gives a latent bank, and then drives the REAL carrier builder against a bank of
+    exactly that size at the LAST block a request can be given -- the one placement
+    where a window running off the end is reachable. The pair is the reading: a spare
+    that were too small would pass the first assertion and be refused by the second.
+
+    THE SPARE IS THE ALIGNED BLOCK-TABLE WIDTH, which is the widest window the
+    converter can hand a layer of this group, and the item asks the runner for that
+    number too rather than restating the arithmetic.
+    """
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        MLAAttentionSpec,
+    )
+
+    _require_cpu_mode()
+    text_config, _ = _world()
+    runner = _runner(text_config, [])
+    name = "model.layers.0.self_attn"
+    spec = MLAAttentionSpec(
+        block_size=DECLARED_PAGE_SIZE,
+        num_kv_heads=1,
+        head_size=DECLARED_HEAD_SIZE,
+        dtype=torch.bfloat16,
+    )
+    schedulable_blocks = DECLARED_TABLE_WIDTH
+    config = KVCacheConfig(
+        num_blocks=schedulable_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=spec.page_size_bytes * schedulable_blocks, shared_by=[name]
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)],
+    )
+
+    spare_bytes = runner._latent_spare_bytes(config)
+    spare_blocks = spare_bytes[name] // spec.page_size_bytes
+    declared_width = runner._aligned_table_width(
+        context_length=runner.max_model_len, block_size=DECLARED_PAGE_SIZE
+    )
+    say("I9_SPARE", f"blocks={spare_blocks}", f"aligned_width={declared_width}",
+        f"schedulable={schedulable_blocks}")
+    assert spare_blocks == declared_width
+    assert spare_blocks > 0
+
+    # THE PLACEMENT THE SPARE EXISTS FOR: the last block the scheduler can give, with
+    # a window as wide as the spare. Sized as the allocator sizes it, this must serve.
+    last_block = schedulable_blocks - 1
+    bank = _bank(DECLARED_HEAD_SIZE, blocks=schedulable_blocks + spare_blocks)
+    geometry = {
+        "block_ids": [last_block],
+        "state_slot": last_block,
+        "page_size": DECLARED_PAGE_SIZE,
+        "window_blocks": spare_blocks,
+    }
+    carrier = _carrier(bank, text_config, position=0, geometry=geometry)
+    slots = int(carrier["latent_cache"].shape[0])
+    say("I9_WINDOW_AT_THE_LAST_BLOCK", slots,
+        f"want={spare_blocks * DECLARED_PAGE_SIZE}")
+    assert slots == spare_blocks * DECLARED_PAGE_SIZE
+
+    # MUST-FAIL ARM: the same placement on a bank sized WITHOUT the spare is refused,
+    # so the first arm is reading the spare and not a bank that was large anyway.
+    with pytest.raises(ValueError) as caught:
+        _carrier(
+            _bank(DECLARED_HEAD_SIZE, blocks=schedulable_blocks),
+            text_config,
+            position=0,
+            geometry=geometry,
+        )
+    message = " ".join(str(caught.value).split())
+    say("I9_WITHOUT_THE_SPARE", message[:190])
+    assert "spare" in message
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ITEM 10. A write outside the request's own pages is refused RUNNER-SIDE.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a_write_outside_the_requests_own_pages_is_refused_runner_side() -> None:
+    """The guard the layer can no longer make, at the last place the value is a number.
+
+    THE LAYER USED TO MAKE IT. It refused a write past the end of the cache slice it
+    was handed, and that slice WAS the request's pages. The window is longer than
+    those pages by design, so the same check inside the layer now passes and the write
+    lands on a neighbour's rows inside the window, silently. The control below reads
+    that silence directly on the layer's own bound.
+    """
+    _require_cpu_mode()
+    text_config, bank = _world()
+    tokens = DECLARED_TOKENS
+    position = DECLARED_PAGE_SIZE + 1
+    own_blocks = 1
+    geometry = {
+        "block_ids": [DECLARED_FIRST_BLOCK],
+        "state_slot": DECLARED_FIRST_BLOCK,
+        "page_size": DECLARED_PAGE_SIZE,
+        "window_blocks": DECLARED_WINDOW_BLOCKS,
+    }
+
+    # THE CONTROL: the layer's own bound is the WINDOW's length, which this write is
+    # well inside, so nothing downstream of the runner can catch it.
+    own_slots = own_blocks * DECLARED_PAGE_SIZE
+    window_slots = DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE
+    say("I10_CONTROL", f"position={position}", f"tokens={tokens}",
+        f"own_slots={own_slots}", f"window_slots={window_slots}")
+    assert position + tokens > own_slots
+    assert position + tokens <= window_slots
+
+    with pytest.raises(ValueError) as caught:
+        _carrier(bank, text_config, position=position, geometry=geometry)
+    message = " ".join(str(caught.value).split())
+    say("I10_MESSAGE", message[:190])
+    assert "own pages" in message
+    assert str(own_slots) in message
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ITEM 11. The indexer's sequence bound is ONE number at two consecutive steps.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_the_indexer_bound_is_one_number_at_two_consecutive_steps() -> None:
+    """A python int that changes per step is a graph per step, which is the defect.
+
+    The bound stays an int on purpose -- reading it off a tensor is a host read inside
+    a traced region, which the indexer's own docstring records -- so the fix is that
+    the int does not move. Two CONSECUTIVE decode steps are driven through the
+    converter, because the live indexer ring admits only a step that continues it, and
+    the two are compared against each other and against the engine's own length.
+    """
+    _require_cpu_mode()
+    text_config, bank = _world()
+    runner = _runner(text_config, [bank])
+
+    runner._glm5next_model_kwargs(_converter_kwargs(
+        [bank], _prefill_metadata([bank]), DECLARED_PREFILL_TOKENS
+    ))
+    bounds = []
+    for step in range(2):
+        position = DECLARED_CONTINUED_POSITION + step
+        metadata = _decode_metadata([bank])
+        for entry in metadata.values():
+            entry["cached_seq_len"] = torch.tensor([[position]], dtype=torch.int32)
+            entry["host_num_computed_tokens"] = torch.full(
+                (1,), position, dtype=torch.int32
+            )
+        converted = runner._glm5next_model_kwargs(
+            _converter_kwargs([bank], metadata, DECLARED_TOKENS)
+        )
+        carrier = converted["layer_carriers"][0]
+        bounds.append((position, int(carrier["max_seq_len"])))
+
+    say("I11_BOUNDS", *[f"position={p}|bound={b}" for p, b in bounds])
+    assert bounds[0][1] == bounds[1][1]
+    assert bounds[0][1] == int(runner.max_model_len)
+    # The two steps really are at different positions, so the equality above is the
+    # bound standing still and not the same step read twice.
+    assert bounds[0][0] != bounds[1][0]
+    # And the base's answer is a different number at each of them, which is what the
+    # candidate count used to be sized from.
+    assert {position + DECLARED_TOKENS for position, _ in bounds} != {bounds[0][1]}
