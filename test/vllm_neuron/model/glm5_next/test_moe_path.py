@@ -1548,7 +1548,7 @@ _DIAG_DECODE_TOKENS = 1
 
 
 def _diag_mapping_row(tokens: int, experts: int, top_k: int) -> str:
-    """Trace the mapping alone, run nothing, and report the attempt as one row."""
+    """Trace the mapping alone and report the attempt as one row, never raising."""
     from torch import _dynamo
     from vllm_neuron import functional as functional_hub
 
@@ -1559,9 +1559,9 @@ def _diag_mapping_row(tokens: int, experts: int, top_k: int) -> str:
     graphs: list = []
 
     def keep_graph(graph, _example_inputs):
-        """Take the traced graph and hand back something that executes none of it."""
+        """Take the traced graph and hand back the callable dynamo will run."""
         graphs.append(graph)
-        return lambda *args, **kwargs: None
+        return graph.forward
 
     def mapping(scores):
         return functional_hub.build_blockwise_mapping(
@@ -1574,14 +1574,17 @@ def _diag_mapping_row(tokens: int, experts: int, top_k: int) -> str:
         )
 
     _dynamo.reset()
+    error = ""
     try:
         torch.compile(mapping, fullgraph=True, backend=keep_graph)(affinities)
     except Exception as refused:  # noqa: BLE001 -- the row IS the reading
         head = str(refused).splitlines() or [type(refused).__name__]
-        return f"traced=no|error={head[0]}"
+        error = head[0]
+    # A GRAPH IN HAND IS WHAT SAYS THE TRACE COMPLETED: the backend is reached only
+    # after one, so reading the exception would call a failed RUN a failed trace.
     if not graphs:
-        return "traced=no|error=the tracer produced no graph and raised nothing"
-    return "traced=yes|error="
+        return f"traced=no|error={error or 'no graph reached the backend'}"
+    return f"traced=yes|error={error}"
 
 
 @pytest.mark.parametrize(
@@ -1601,9 +1604,9 @@ def test_moe_path_diagnostic_mapping_trace(
     region, because the first host run reddened inside a vendor subkernel the mapping
     dispatches. This says what the mapping does on its own: at the shape these tests
     use, and at the two serving shapes with the routed-expert count and top-k read from
-    the pinned checkpoint config. The reading is about TRACING only -- the backend
-    keeps the graph and executes nothing -- and a ``traced=no`` row at a serving shape
-    is a finding for the campaign to route, so no reading here can fail the item.
+    the pinned checkpoint config. TRACING is what it reads: the graph handed to the
+    backend says the trace completed, and a ``traced=no`` row at a serving shape is a
+    finding for the campaign to route, so no reading here can fail the item.
     """
     experts, top_k = E, K
     if from_the_pinned_config:
