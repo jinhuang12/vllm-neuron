@@ -8,7 +8,7 @@ THE DECLARED ACCEPTANCE:
       test/vllm_neuron/model/glm5_next/test_host_geometry_119.py -s -rA \\
       -p no:randomly -p no:cacheprovider
 
-Five items, one test each, no ``parametrize``.
+Six items, one test each, no ``parametrize``.
 
 WHAT THIS FILE IS ABOUT. ``NeuronModelRunner._glm5next_model_kwargs`` decides which cache
 pages a step occupies before the traced call runs. It used to read those numbers off
@@ -18,7 +18,7 @@ pages a step occupies before the traced call runs. It used to read those numbers
 extraction raised. The numbers now come from the entry's ``host_num_computed_tokens`` and
 ``host_block_table``, which both metadata builders fill from the runner's own host arrays.
 
-THE FIVE ITEMS
+THE SIX ITEMS
 
 * A01 -- a captured step. The metadata is built the way ``_build_warmup_attention_metadata``
   builds it, with every device tensor and every bank on ``meta``, and the converter must
@@ -36,8 +36,12 @@ THE FIVE ITEMS
   pages from the request's first page, covers ``start_position + tokens``, and is an ALIAS of
   the bank rather than a copy. This item reads the same at the base, because it is about the
   rule the converter has always implemented rather than about the source it reads.
+* A06 -- the second host read on the same path. Every MLA layer of every step calls
+  ``mla_sparse_attention`` (``model_fp8.py:6895``), whose range refusal read the selected-row
+  range with ``int(...)``. The seam now reaches its dispatch on a captured step's own
+  carrier; at the base it raises the same meta read, one seam further along than A01.
 
-THE BASE ARM, DECLARED: A01, A02, A03 and A04 FAIL and A05 PASSES.
+THE BASE ARM, DECLARED: A01, A02, A03, A04 and A06 FAIL and A05 PASSES.
 
 CONVENTIONS. The runner is stood up with ``__new__`` and given only the attributes the
 converter reads, which is this campaign's landed harness shape
@@ -374,3 +378,72 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     view[cached : cached + tokens, 0, :] = 1.0
     assert bool(bank[4 * PAGE + cached].eq(1.0).all())
     assert bool(bank[4 * PAGE + cached - 1].eq(0.0).all())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A06. The attention seam reaches its dispatch on a captured step's carrier.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
+    """A precondition that reads values cannot run where values do not exist.
+
+    ``mla_sparse_attention`` refused an out-of-range selected row by reading the row range
+    with ``int(...)`` (``mla_sparse.py:1400``), which is the same call the converter used to
+    make and which a ``meta`` tensor cannot answer. Every MLA layer of every step goes
+    through that seam (``model_fp8.py:6895``, unconditionally), so a captured prefill reached
+    it and stopped there.
+
+    WHAT THIS ITEM MEASURES AND WHAT IT DOES NOT. It measures that the call gets PAST the
+    precondition: the seam's own dispatch counter, one line beyond it, moves. Whatever the
+    kernel boundary does with ``meta`` inputs after that is NOT measured here -- that is
+    a vendor question and ``D01`` in ``test_meta_forward_119.py`` reports it.
+
+    THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, sliced
+    the way the layer slices it (``model_fp8.py:6877``, ``:6881``), and the scale is the
+    carrier's own. The selected-row width is the seam's declared tile, ``KEY_CHUNK``,
+    imported rather than typed: the admissibility clause requires a positive multiple of it
+    (``mla_sparse.py:1379-1383``).
+    """
+    from vllm_neuron.functional.attention import mla_sparse as seam
+
+    meta = torch.device("meta")
+    banks = [_sparse_bank(meta)]
+    runner = _runner(banks)
+    tokens = 2 * PAGE
+    entry = _entry(
+        host_row=[[0, 1]],
+        host_cached=[0],
+        device_row=[[0, 1]],
+        device_cached=0,
+        tokens=tokens,
+        device=meta,
+    )
+
+    carrier = runner._glm5next_model_kwargs(
+        _kwargs(banks, entry, tokens=tokens, device=meta)
+    )["layer_carriers"][0]
+    start = int(carrier["start_position"])
+    c_kv = carrier["latent_cache"][: start + tokens, 0, :]
+    q_lift = torch.zeros((1, 1, LATENT_WIDTH), dtype=torch.float32, device=meta)
+    selected = torch.zeros((1, seam.KEY_CHUNK), dtype=torch.int32, device=meta)
+
+    seam.reset_mla_sparse_dispatch_counters()
+    before = seam.mla_sparse_dispatch_counters()
+    raised: Exception | None = None
+    try:
+        seam.mla_sparse_attention(
+            q_lift, c_kv, selected, float(carrier["softmax_scale"])
+        )
+    except Exception as caught:  # noqa: BLE001 -- the kernel boundary is not measured here
+        raised = caught
+    after = seam.mla_sparse_dispatch_counters()
+
+    assert after[0] == before[0] + 1, (
+        f"the seam's dispatch counter did not move: {before} -> {after}. The call did not "
+        f"get past the range refusal, which is the line this increment repairs"
+        + (f"; it raised {type(raised).__name__}: {raised}" if raised else "")
+    )
+    if raised is not None:
+        message = str(raised)
+        assert "cannot be called on meta tensors" not in message, (
+            f"the seam still read a value off a meta tensor: {message}"
+        )
