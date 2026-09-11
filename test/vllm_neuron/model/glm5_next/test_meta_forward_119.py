@@ -190,7 +190,10 @@ def _every_stash_to_meta(root) -> list[str]:
     ``.to(device)`` visits parameters, buffers and submodules and nothing else. A module that
     stashes a tensor as a plain attribute keeps it where the load put it: the kernel scale
     operands are built once at load time and stashed exactly so
-    (``model_fp8.py:2832-2846``), and the mHC sites above are the same shape of thing. A stash
+    (``PREPARED_SCALE_OPERANDS_ATTR``, read back by ``_prepared_scale_operand``, which refuses
+    rather than building one per step), and the mHC sites above are the same shape of thing. The
+    reference is by NAME and not by line: a stash is found by the attribute it is kept under, and
+    that name survives a fold that moves every line around it. A stash
     left on the host is INVISIBLE inside a held dispatch, which makes its own operands at the
     shapes it is handed, and fatal in a torch route, which requires one device -- which is how
     a load-time scale operand ends a forward inside a fallback oracle rather than at a kernel.
