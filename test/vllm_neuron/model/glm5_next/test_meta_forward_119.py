@@ -21,32 +21,40 @@ refusal (``mla_sparse.py:1411``), which every MLA layer of every step reaches
 THE TWO ITEMS
 
 * A07 -- the whole tiny root forward on ``meta``, at the prefill bucket and at decode,
-  through the runner's own capture entry points and its own kwargs builder. It requires that
-  NO host read of a tensor value happens anywhere on that path, and that the forward reached
-  the attention seam's dispatch. ONE STAND-IN IS DECLARED: the NKI dispatch inside the seam
-  returns the seam's declared output shape on ``meta`` instead of entering the vendor
-  kernel. That is the landed capture-sites pattern for a backend boundary
-  (``tiny/test_tiny_glm5next_capture_sites.py:120-139``).
+  through the runner's own capture entry points and its own kwargs builder. It requires
+  that the forward COMPLETES, that NO host read of a tensor value happens anywhere on that
+  path, and that it reached the attention seam's dispatch. ONE STAND-IN IS DECLARED: the
+  NKI dispatch inside the seam returns the seam's declared output shape on ``meta``
+  instead of entering the vendor kernel. That is the landed capture-sites pattern for a
+  backend boundary (``tiny/test_tiny_glm5next_capture_sites.py:120-139``). AND EVERY OTHER
+  NKI ROUTE IS STOOD DOWN: the same layer enters the real vendor boundary in
+  ``mla_projections`` and in ``mla_absorb`` before it ever reaches this seam, so without
+  that stand-down the item's outcome would be the vendor's answer to ``meta`` inputs
+  rather than the candidate's.
 * D01 -- THE DIAGNOSTIC, and it is not a criterion. The same two legs with the REAL vendor
   boundary, reported and never asserted: one row per leg saying whether the forward
   completed and, if it did not, the first line of the failure and the site. It passes
   whatever the answer is, because what a vendor entry point does with ``meta`` inputs is a
   campaign finding for the lead and not this increment's acceptance.
 
-WHAT A07 DOES NOT MEASURE. The kernel's own behaviour on ``meta``: the stand-in replaces
-exactly that. D01 is where that question is answered, without a verdict attached.
+WHAT A07 DOES NOT MEASURE. Any kernel's own behaviour on ``meta``: the stand-in replaces
+that for the seam and the stand-down replaces it everywhere else, so what A07 drives outside
+the seam is each module's torch route, which is device-independent and readable in this
+repository. D01 is where the vendor's answer is reported, without a verdict attached.
 
 THE BASE ARM, DECLARED: A07 FAILS and D01 PASSES.
 """
 
 from __future__ import annotations
 
+import sys
 import traceback
 
 import pytest
 import torch
 
 from vllm_neuron.functional.attention import mla_sparse as seam
+from vllm_neuron.utils import neuron_utils
 
 # The landed tiny files and the landed capture-sites file, imported rather than
 # re-implemented: the fixture and its dials, the runner-shaped cache dict, the CPU-lane gate
@@ -58,6 +66,14 @@ pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
 #: The two legs a captured step is extracted for, with the entry point each one drives.
 LEGS = ("prefill", "decode")
+
+#: The functional package whose kernel routes A07 stands down, and the two modules the
+#: layer reaches before the seam, which the stand-down is checked on afterwards.
+FUNCTIONAL = "vllm_neuron.functional"
+BEFORE_THE_SEAM = (
+    f"{FUNCTIONAL}.attention.mla_projections",
+    f"{FUNCTIONAL}.attention.mla_absorb",
+)
 
 
 def _meta_root_and_runner():
@@ -115,10 +131,39 @@ def _site_of(error: BaseException) -> str:
     return f"{last.filename.split('/vllm_neuron/')[-1]}:{last.lineno}"
 
 
+def _refuses_every_route(*_args, **_kwargs) -> bool:
+    """The stood-down kernel route: this module has no NKI route for this call."""
+    return False
+
+
+def _stand_down_every_route_but_the_seam(monkeypatch) -> list[str]:
+    """Refuse the NKI route in every functional module but the seam, and name those patched.
+
+    ``can_run_kernel`` is true in CPU mode with the simulator on ANY device
+    (``neuron_utils.py:17-24``), so a route it guards is taken on ``meta`` too. Two limbs
+    reach every module: each module binds the name at its own import, so a module already
+    imported is patched by name here; a module imported later inside a method
+    (``model_fp8.py:4906`` is one) reads the source, which is patched too. The seam under
+    test keeps the real route, so the forward still reaches the dispatch the stand-in holds.
+    """
+    patched = []
+    for name, module in sorted(sys.modules.items()):
+        if not name.startswith(FUNCTIONAL) or module is seam:
+            continue
+        if not hasattr(module, "can_run_kernel"):
+            continue
+        monkeypatch.setattr(module, "can_run_kernel", _refuses_every_route)
+        patched.append(name)
+    monkeypatch.setattr(neuron_utils, "can_run_kernel", _refuses_every_route)
+    return patched
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# A07. The forward reads no value, and it reaches the attention dispatch.
+# A07. The forward completes, reads no value, and reaches the attention dispatch.
 # ══════════════════════════════════════════════════════════════════════════════
-def test_a07_a_captured_forward_reads_no_value_off_a_tensor(monkeypatch) -> None:
+def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
+    monkeypatch,
+) -> None:
     """Both legs, on ``meta``, with the one declared stand-in at the NKI dispatch."""
     dispatched: list[tuple] = []
 
@@ -134,6 +179,7 @@ def test_a07_a_captured_forward_reads_no_value_off_a_tensor(monkeypatch) -> None
         return call
 
     monkeypatch.setattr(seam, "wrap_nki", stand_in)
+    stood_down = _stand_down_every_route_but_the_seam(monkeypatch)
 
     for leg in LEGS:
         _, runner = _meta_root_and_runner()
@@ -147,12 +193,31 @@ def test_a07_a_captured_forward_reads_no_value_off_a_tensor(monkeypatch) -> None
         print(
             f"A07|{leg}|completed={'yes' if completed else 'no'}"
             f"|seam_dispatch={counters[0]}|stand_in_calls={len(dispatched)}"
+            f"|stood_down={len(stood_down)}"
             f"|error={'none' if error is None else str(error).splitlines()[0]}"
         )
         if error is not None:
             assert not _reads_a_value(error), (
                 f"the {leg} forward read a value off a tensor at {_site_of(error)}: {error}"
             )
+        # THE ITEM'S OWN PREMISE, CHECKED BEFORE ITS OUTCOME IS JUDGED. Both limbs of the
+        # stand-down are visible here: a module imported before the patch was patched by
+        # name, and one imported during the forward read the patched source.
+        for module_name in BEFORE_THE_SEAM:
+            reached = sys.modules.get(module_name)
+            assert reached is not None, (
+                f"the {leg} forward never imported {module_name}, so nothing was measured "
+                f"against the layer that runs before the seam; it stopped at "
+                f"{_site_of(error) if error else 'no failure'}: {error}"
+            )
+            assert reached.can_run_kernel is _refuses_every_route, (
+                f"{module_name} kept its own kernel route, so the {leg} outcome is the "
+                f"vendor's answer to meta inputs and not this candidate's"
+            )
+        assert completed, (
+            f"the {leg} forward did not complete on meta; it stopped at "
+            f"{_site_of(error)}: {error}"
+        )
         assert counters[0] >= 1, (
             f"the {leg} forward never reached the attention seam's dispatch"
             + (f"; it stopped at {_site_of(error)}: {error}" if error else "")
