@@ -5228,7 +5228,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             row = [int(value) for value in rows[0]]
             start_position = int(positions[0])
             blocks_used = -(-(start_position + tokens) // block_size)
-            if blocks_used > len(row):
+            if not row:
+                raise ValueError(
+                    f"KV layer '{name}' was handed an empty block-table row; a row "
+                    f"names either the pages a paged bank steps through or the one "
+                    f"slot a recurrent bank keeps its state in, and an empty row "
+                    f"names neither"
+                )
+            # A PAGED ROW ADDRESSES PAGES; A RECURRENT ROW NAMES ONE SLOT. The two
+            # families land in different KV-cache groups with different tables, so the
+            # width a paged row needs says nothing about a recurrent one: a recurrent
+            # layer keeps one sequence's state in one slot however many tokens the step
+            # covers. Asking every row to address the step demanded pages of a table
+            # that has none.
+            if bank["family"] == "self_attn" and blocks_used > len(row):
                 raise ValueError(
                     f"KV layer '{name}' holds {start_position + tokens} slot(s) of "
                     f"sequence, which occupy {blocks_used} page(s), and its "
