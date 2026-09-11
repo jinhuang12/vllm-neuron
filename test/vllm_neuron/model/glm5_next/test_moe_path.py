@@ -1382,6 +1382,48 @@ def _dynamo_refusal_classes() -> tuple[type, ...]:
     return found
 
 
+#: Where a data-dependent guard refusal is named: module path, then class name. A
+#: branch on a value read to the host raises one of these, wrapped or bare, and a
+#: name this torch does not carry is skipped rather than assumed.
+_DATA_DEPENDENT_REFUSALS = (
+    ("torch._dynamo.exc", "UserError"),
+    ("torch.fx.experimental.symbolic_shapes", "GuardOnDataDependentSymNode"),
+)
+
+
+def _steering_refusal_classes() -> tuple[type, ...]:
+    """The classes a Python branch on a host-read value raises, dynamo's own included."""
+    import importlib
+
+    found = list(_dynamo_refusal_classes())
+    for module_path, name in _DATA_DEPENDENT_REFUSALS:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        candidate = getattr(module, name, None)
+        if isinstance(candidate, type):
+            found.append(candidate)
+    return tuple(found)
+
+
+def _refusal_in_chain(raised, classes: tuple[type, ...]):
+    """The first exception in ``raised``'s chain that is one of ``classes``, or ``None``.
+
+    THE CHAIN AND NOT THE OUTERMOST CLASS: torch wraps a tracing refusal in whatever
+    its compile entry point raises, so reading only the raised class would pin this
+    reading to one torch's wrapper.
+    """
+    seen: set[int] = set()
+    current = raised
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, classes):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
 #: The three limbs in launch order, under the names the call site resolves off
 #: this module at call time.
 _LIMB_LAUNCH_ORDER = (
@@ -1542,14 +1584,19 @@ def test_moe_path_routed_limbs_trace_under_fullgraph() -> None:
 
 
 def test_moe_path_planted_host_read_breaks_the_limb_trace() -> None:
-    """MEASURED: one ``.item()`` inside the traced limbs turns the item above RED.
+    """MEASURED: a host read that steers a Python branch turns the item above RED.
 
-    The plant reads one element of the mapping's row index to the host and hands every
-    operand on unchanged, so the arithmetic is untouched -- asserted first, uncompiled,
-    against the same answer the item above compares to -- and the read is all the
-    compiled arm has left to fail on. The refusal must be a class
-    :data:`_DYNAMO_REFUSAL_NAMES` names, and the resolver refuses to answer when this
-    torch carries none of them.
+    The plant reads one element of the mapping's row index to the host and STEERS A
+    PYTHON BRANCH on what it says, handing every operand on unchanged either way, so
+    the arithmetic is untouched -- asserted first, uncompiled, against the same answer
+    the item above compares to -- and the steering is all the traced arm has left to
+    fail on. A bare read is not enough: this torch captures a scalar read as an
+    unbacked value and traces on, which is why the branch is the plant.
+
+    The reading is INVERTED LIVENESS and pins no message text: the item above passes
+    only on a whole graph holding the declared kernel calls, so this arm must leave no
+    such graph behind, and the attempt must have raised with a refusal somewhere in
+    its chain.
     """
     bank, _text_config = _build_bank()
     quant_config = _block_quant_config()
@@ -1558,23 +1605,54 @@ def test_moe_path_planted_host_read_breaks_the_limb_trace() -> None:
     want = answer.to(torch.float32)
     _nonempty_or_raise(want, "planted-host-read")
     intact = getattr(_seam_module, _LIMB_LAUNCH_ORDER[0])
-    read: list[int] = []
+    read: list[tuple] = []
 
     def planted(*args):
-        read.append(int(args[_ROW_INDEX_IN_GATE_UP].reshape(-1)[0].item()))
+        steered = args[_ROW_INDEX_IN_GATE_UP].reshape(-1)[0].item()
+        # THE PLANT: a Python branch on the value just read to the host. Both arms
+        # hand the same operands to the same limb, so nothing numeric moves and the
+        # steering alone is what a whole-graph trace has to answer for.
+        if steered >= 0:
+            arm = "nonnegative"
+        else:
+            arm = "negative"
+        read.append((steered, arm))
         return intact(*args)
 
-    refusals = _dynamo_refusal_classes()
+    refusals = _steering_refusal_classes()
     eager = _limbs_over(planted)(*operands).to(torch.float32)
     torch.testing.assert_close(eager, want, rtol=RTOL, atol=ATOL)
+
     graphs: list = []
-    with pytest.raises(refusals) as refused:
+    declared_calls = sum(nki for nki, _fallback in DECLARED_LIMB_DISPATCHES)
+    raised = None
+    try:
         _fullgraph(_limbs_over(planted), graphs)(*operands)
+    except Exception as refused:  # noqa: BLE001 -- the chain IS the reading
+        raised = refused
+    whole = [
+        graph for graph in graphs if len(_kernel_calls_in(graph)) == declared_calls
+    ]
+    refusal = _refusal_in_chain(raised, refusals)
+    from torch._dynamo import config as dynamo_config
+
     print(
         f"[planted-host-read] host_reads={read[:1]} captured_graphs={len(graphs)} "
-        f"refusal={type(refused.value).__name__} "
+        f"whole_graphs={len(whole)} raised_class={type(raised).__name__} "
+        f"planted_refusal_class="
+        f"{type(refusal).__name__ if refusal is not None else None} "
         f"declared={[cls.__name__ for cls in refusals]} "
-        f"message_head={str(refused.value).splitlines()[:1]}"
+        f"capture_scalar_outputs="
+        f"{getattr(dynamo_config, 'capture_scalar_outputs', 'absent')}"
+    )
+    assert not whole, (
+        f"the steered arm still left {len(whole)} whole graph(s) holding "
+        f"{declared_calls} kernel calls, which is what the item above passes on"
+    )
+    assert refusal is not None, (
+        f"the steered arm raised {type(raised).__name__} with no class among "
+        f"{[cls.__name__ for cls in refusals]} anywhere in its chain, so nothing "
+        f"says the trace was refused for the steering"
     )
 
 
