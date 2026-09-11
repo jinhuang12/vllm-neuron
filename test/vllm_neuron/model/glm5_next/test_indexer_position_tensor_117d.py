@@ -28,10 +28,14 @@ WHAT THE ITEMS OBSERVE.
        are read the same way.
   A03  The decode leg's own source: no host read of the position is spelled there.
 
-EVERY ITEM FAILS AT THE BASE. A01 because the base's seams reach ``int(position)`` and
-``int(end_position)``, which raise on a shape-only tensor; A02 because the base has no
-tensor route to compare (the same ``int()`` raises); A03 because the base's decode leg
-spells two such reads.
+TWO OF THE THREE FAIL AT THE BASE, AND THE THIRD IS A REGRESSION EQUALITY. A01 fails
+because the base's seams reach ``int(position)`` on a shape-only tensor, which has no
+value to give; A03 fails because the base's decode leg spells two such reads. A02 PASSES
+at the base, and that is not a gap: it hands the seams CPU 0-d tensors, and ``int()`` on
+one RETURNS the number rather than raising, so the base coerces the tensor operand into
+its own int route and A02's two sides become the same run. What A02 measures at the base
+is therefore that the base agrees with itself; what it measures HERE is that the new
+route agrees with the landed one. The block's must-fail arm names items (1) and (3) only.
 
 WHAT THIS FILE DOES NOT DO. Nothing here captures a real graph or serves a real
 request. The reading that one captured graph replays across positions is a host-side
@@ -100,12 +104,18 @@ def _shape_only_indexer():
     """An indexer with NO weight but its per-slot bias, on the shape-only device.
 
     ``tail_step`` and ``seed_tail`` read the bias and nothing else off the module, so
-    materialising the four projections would be furniture. The bias is assigned as a
-    plain tensor because both methods read only its rank and its shape.
+    materialising the four projections would be furniture.
+
+    THE BIAS MUST BE A PARAMETER AND NOT A PLAIN TENSOR. Its name is reserved on the
+    module by ``register_parameter(name, None)``, so it lives in the parameter registry
+    from construction; ``nn.Module.__setattr__`` refuses a plain tensor on such a name
+    and raises before this fixture returns. The landed sibling assigns the same bias the
+    same way for the same reason.
     """
     indexer = layer_half._bare_indexer()
-    indexer.index_kpool_compress_ape = torch.zeros(
-        POOL, int(indexer.index_head_dim), dtype=torch.bfloat16, device="meta"
+    indexer.index_kpool_compress_ape = torch.nn.Parameter(
+        torch.zeros(POOL, int(indexer.index_head_dim), dtype=torch.bfloat16, device="meta"),
+        requires_grad=False,
     )
     return indexer
 
