@@ -231,6 +231,23 @@ def _reads_a_value(error: BaseException) -> bool:
     )
 
 
+#: The wordings a device mismatch arrives in on this path. The fake-tensor propagation
+#: says "two different devices", the eager same-device check says "at least two devices",
+#: and an op that carries its own expectation says "expected device". Keying on one of
+#: them alone reads a mismatch in the other two as an unlabelled failure.
+_DEVICE_MISMATCH_WORDINGS = (
+    "two different devices",
+    "at least two devices",
+    "expected device",
+)
+
+
+def _names_a_device_mismatch(error: BaseException) -> bool:
+    """True when this failure says two devices met, in any wording this path produces."""
+    text = str(error).lower()
+    return any(wording in text for wording in _DEVICE_MISMATCH_WORDINGS)
+
+
 def _site_of(error: BaseException) -> str:
     """The last frame inside the plugin, as ``file:line``, or the word ``unknown``."""
     frames = [
@@ -440,7 +457,7 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
             )
             # A DEVICE MISMATCH IS ATTRIBUTED WHERE IT HAPPENED, not left to a traceback: the
             # row names the site and the last dispatch this arm handed back, with its leaves.
-            if error is not None and "expected device" in str(error):
+            if error is not None and _names_a_device_mismatch(error):
                 print(
                     f"A07|{leg}|device_mismatch|site={_site_of(error)}"
                     f"|last_held={crossed[-1] if crossed else 'none'}"
