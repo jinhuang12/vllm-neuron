@@ -8094,6 +8094,12 @@ def _bind_hyper_connection_sites(
         instance = Glm5NextHyperConnection(
             text_config, neuron_config=text_config.neuron_config
         )
+        # The instance allocates its three parameters with no device, so it is
+        # built where the default device is whatever this load targets. Assigning
+        # an operand's data onto a parameter of another type raises, so the
+        # instance is moved onto the load's device first. A load on the default
+        # device moves nothing and hands over the same storage as before.
+        instance.to(device)
         site_record: dict[str, object] = {}
         for role, leaf in sorted(sites[site].items()):
             operand = loaded[leaf]
@@ -8104,7 +8110,10 @@ def _bind_hyper_connection_sites(
                 "shape": tuple(operand.shape),
                 "dtype": str(operand.dtype),
                 "device": str(operand.device),
-                "data_ptr": int(operand.data_ptr()),
+                # An operand with no storage has no address to record.
+                "data_ptr": (
+                    0 if operand.device.type == "meta" else int(operand.data_ptr())
+                ),
             }
         bound[site] = instance
         record[site] = site_record
