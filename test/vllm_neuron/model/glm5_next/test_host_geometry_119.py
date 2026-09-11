@@ -218,8 +218,9 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     """The graph-extraction world, which is where the hardware run stopped.
 
     Warmup declares a cached length of 0, one row, and this bucket's own pages
-    (``neuron_model_runner.py:4373-4380``, ``:4431-4442``). The device half is on ``meta``,
-    where reading a value is impossible; the host half is the array the runner already holds.
+    (``neuron_model_runner.py:4373-4380``, ``neuron_model_runner.py:4431-4442``). The device
+    half is on ``meta``, where reading a value is impossible; the host half is the array the
+    runner already holds.
     """
     meta = torch.device("meta")
     banks = [_sparse_bank(meta), _linear_bank(meta)]
@@ -405,8 +406,8 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     kernel boundary does with ``meta`` inputs after that is NOT measured here -- that is
     a vendor question and ``D01`` in ``test_meta_forward_119.py`` reports it.
 
-    THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, sliced
-    the way the layer slices it (``model_fp8.py:6832``, ``:6994``), and the scale is the
+    THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, sliced the
+    way the layer slices it (``model_fp8.py:6832``, ``model_fp8.py:6836``), and the scale is the
     carrier's own. The selected-row width is the seam's declared tile, ``KEY_CHUNK``,
     imported rather than typed: the admissibility clause requires a positive multiple of it
     (``mla_sparse.py:1293-1299``).
@@ -463,13 +464,13 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
 def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
     """A recurrent bank is handed its KV group's full padded row, and must be served.
 
-    NEITHER BUILDER NARROWS A ROW TO THE ONE SLOT A RECURRENT BANK USES. The warmup
-    builder writes ``torch.arange(max_num_blocks_per_req)``
-    (``neuron_model_runner.py:4437-4442``) and the serving builder slices the group's own
-    table (``:4246``), whose width is ``max_model_len`` over the page size. The slot the
-    scheduler allocated is the row's first entry and the rest is the table's padding, so a
-    converter that asked a recurrent row to be one entry wide would refuse every hybrid
-    step. Both shapes are driven here, each named in its own failure message.
+    NEITHER BUILDER NARROWS A ROW TO THE ONE SLOT A RECURRENT BANK USES. The warmup builder
+    writes ``torch.arange(max_num_blocks_per_req)`` (``neuron_model_runner.py:4437-4442``) and
+    the serving builder slices the group's own table (``neuron_model_runner.py:4246``), whose
+    width is ``max_model_len`` over the page size. The slot the scheduler allocated is the row's
+    first entry and the rest is the table's padding, so a converter that asked a recurrent row
+    to be one entry wide would refuse every hybrid step. Both shapes are driven here, each named
+    in its own failure message.
     """
     cpu = torch.device("cpu")
     banks = [_linear_bank(cpu)]

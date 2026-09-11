@@ -5235,12 +5235,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"slot a recurrent bank keeps its state in, and an empty row "
                     f"names neither"
                 )
-            # A PAGED ROW ADDRESSES PAGES; A RECURRENT ROW NAMES ONE SLOT. The two
-            # families land in different KV-cache groups with different tables, so the
-            # width a paged row needs says nothing about a recurrent one: a recurrent
-            # layer keeps one sequence's state in one slot however many tokens the step
-            # covers. Asking every row to address the step demanded pages of a table
-            # that has none.
+            # A PAGED ROW ADDRESSES PAGES; A RECURRENT ROW NAMES ONE SLOT. The difference is
+            # not the table: a recurrent group's spec carries the ATTENTION block size
+            # (:9458-9459), so its table is as wide as the paged one. What differs is what the
+            # layer reads out of the row -- a paged layer walks the pages its step covers,
+            # and a recurrent layer keeps one sequence's state in the one slot at the row's
+            # head however many tokens the step covers. So the width a paged row needs says
+            # nothing about a recurrent one.
             if bank["family"] == "self_attn":
                 if blocks_used > len(row):
                     raise ValueError(
