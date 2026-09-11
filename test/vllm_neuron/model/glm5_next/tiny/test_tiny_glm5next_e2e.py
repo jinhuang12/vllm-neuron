@@ -107,7 +107,7 @@ E2E_WINDOW_BLOCKS = _aligned_blocks(E2E_MAX_SEQ_LEN)
 #: end of a bank sized to the sequence alone would need a window that runs off the end --
 #: which the carrier builder refuses rather than shortening the view. The spare is the
 #: ALIGNED width, not the sequence's block count, since that is the length actually handed
-#: over. ``inc-glm53f-118``'s allocator owes the same spare in production.
+#: over. The runner's own allocator owes the same spare in production.
 E2E_BANK_BLOCKS = E2E_BLOCKS + E2E_WINDOW_BLOCKS
 
 #: The recurrent-state geometry the substituted spec reports. Small and arbitrary: the mapper
@@ -163,7 +163,7 @@ def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
     It described the runner before the latent cache became one buffer; the branch below now
     keys on the layer's own declaration, so both classes are still mirrored here.
 
-    RE-PINNED (``inc-glm53f-117c``): the block dim is ``E2E_BANK_BLOCKS`` and was
+    RE-PINNED: the block dim is ``E2E_BANK_BLOCKS`` and was
     ``E2E_BLOCKS``, the sequence's own blocks. The reading this replaces, kept verbatim: "a
     layer that declares a latent cache gets ONE bank of ``[blocks, num_kv_heads, block_size,
     head_size]``" -- the shape is that same shape and only ``blocks`` moved. A carrier is now
@@ -356,7 +356,7 @@ def test_bind_kv_cache_maps_every_sparse_layer_onto_its_own_slots():
         view = bank["latent_cache"]
         print(f"TINYE2E|bank|{bank['name']}|bank={tuple(allocated.shape)}"
               f"|view={tuple(view.shape)}|slots={bank['slots']}")
-        # RE-PINNED (inc-glm53f-117c): both numbers were `E2E_BLOCKS * page`. The reading
+        # RE-PINNED: both numbers were `E2E_BLOCKS * page`. The reading
         # this replaces, verbatim: "the flattened view covers the whole bank, one row per
         # slot, and `slots` reports that same count". It still does; the BANK grew by one
         # spare window, so the count the view and `slots` agree on is the bank's.
@@ -456,7 +456,7 @@ def test_bind_kv_cache_refuses_a_bank_whose_geometry_is_not_the_specs():
     # The wrong head count goes in bank zero and every other bank is kept as allocated. The
     # reading this replaces, verbatim: the list ended `caches[layer_spec.name][1],` — it
     # named bank one, which a latent layer no longer has.
-    # RE-PINNED (inc-glm53f-117c): the block dim is `E2E_BANK_BLOCKS`, as allocated. It was
+    # RE-PINNED: the block dim is `E2E_BANK_BLOCKS`, as allocated. It was
     # `E2E_BLOCKS`; with the bank grown, leaving it there would have made this bank wrong in
     # TWO ways and the item could then pass on the one it does not name.
     caches[layer_spec.name] = [

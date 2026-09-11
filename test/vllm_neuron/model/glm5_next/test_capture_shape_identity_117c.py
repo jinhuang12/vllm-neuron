@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-117c`` acceptance -- one captured graph serves every position.
+"""One captured graph serves every position, whatever position it was captured at.
 
 THE DECLARED ACCEPTANCE, Tier N, CPU mode:
 
@@ -9,22 +9,22 @@ THE DECLARED ACCEPTANCE, Tier N, CPU mode:
 
 Eleven items, one test each, no ``parametrize`` and no skip.
 
-WHAT THE BLOCK IS ABOUT. A graph is captured once and replayed at every position, so
+WHAT THIS FILE IS ABOUT. A graph is captured once and replayed at every position, so
 anything whose SHAPE or whose CONTROL FLOW comes from a position value pins the graph
 to the position it was captured at. Two such things existed: the MLA layer read its
 cache as ``[: start + tokens]``, whose length grows with every decode step, and the KDA
 layer chose its entering state with a python branch on the same value.
 
-ITEMS 9 TO 11 ARE THE SECOND LAP'S, on the three things the first lap left to the
-runner: the ALLOCATION that makes item 3's refusal unreachable in a serve, the write
-bound that moved out of the layer once the window grew longer than a request's pages,
-and the indexer's sequence bound, which stays a python int and therefore had to stop
-moving.
+ITEMS 9 TO 11 ARE THE RUNNER'S SIDE OF THE SAME RULE, on the three things a layer can
+no longer do for itself: the ALLOCATION that makes item 3's refusal unreachable in a
+serve, the write bound that moved out of the layer once the window grew longer than a
+request's pages, and the indexer's sequence bound, which stays a python int and
+therefore had to stop moving.
 
 WHAT THESE ITEMS OBSERVE, AND WHAT THEY DO NOT. Items 1 to 4, 7 to 11 are
 BEHAVIOURAL: they drive the runner's own carrier builder -- items 7, 8 and 11 through the
 converter that sizes the window, one per leg -- and read what it hands a layer. Items 5 and 6 are
-STRUCTURAL, in the form this campaign already uses for the state hook
+STRUCTURAL, in the form this test suite already uses for the state hook
 (``test_kda_runner_state.py`` B01 and B02): they read the source of the two methods and
 assert the position no longer reaches a python int there. Nothing here captures a real
 dynamo graph -- that reading is a host-side end-to-end one on the serving run, and this
@@ -33,24 +33,24 @@ file must not be read as making it.
 EVERY ITEM FAILS AT THE BASE. Items 1 and 2 because the base's window is the request's
 own blocks, so its length moves with the position; item 3 because the base has no
 headroom refusal to raise; item 4 because the base hands a python int; items 5 and 6
-because the base's source carries the two host reads this block removed; item 7
-because the base sizes the window from the request's own blocks and c1 sized it from the
-block table's width, and the item names both wrong answers; item 8 because the base's
-decode window is this step's own two blocks where the bucket is ten; item 9 because the
-base's allocator adds no spare window and has no method to ask for one; item 10 because
-the base builds the carrier without a word and leaves the write to a layer whose own
-bound is now the whole window; item 11 because the base's bound is this step's end
-position, which is a different number at each of the two steps.
+because the base's source carries the two host reads this change removed; item 7
+because the base sizes the window from the request's own blocks and an earlier draft
+sized it from the block table's width, and the item names both wrong answers; item 8
+because the base's decode window is this step's own two blocks where the bucket is ten;
+item 9 because the base's allocator adds no spare window and has no method to ask for
+one; item 10 because the base builds the carrier without a word and leaves the write to
+a layer whose own bound is now the whole window; item 11 because the base's bound is
+this step's end position, which is a different number at each of the two steps.
 
 WHAT ITEM 8 DOES NOT SEPARATE. On the decode leg the bucket's span and the table's width
-are the SAME number by the ruling, so item 8 fails at the base and passes at c1 as well
-as here. Item 7 is the one that separates c1 from c2, and it is on the prefill leg
-because that is the leg where the two answers differ.
+are the SAME number, so item 8 fails at the base and passes for either way of sizing the
+window. Item 7 is the one that separates the two, and it is on the prefill leg because
+that is the leg where the two answers differ.
 
 WHY ITEM 8 OPENS A SEQUENCE FIRST. The converter refuses any step that does not continue
 the live indexer ring, so a decode dropped onto a fresh shell raises on the cursor before
-a window is built. Round 2 of the review found this file doing that: item 8 was failing
-everywhere -- base and HEAD alike -- for the cursor and not for the window. It now runs a
+a window is built. An earlier draft of this file did exactly that: item 8 failed on every
+tree, base and candidate alike, for the cursor and not for the window. It now runs a
 prefill at 0 through the same converter, reads the cursor that prefill left, and carries
 the position it names.
 """
@@ -334,8 +334,8 @@ def test_the_position_reaches_the_layer_as_a_tensor() -> None:
 def test_the_mla_read_no_longer_depends_on_the_position() -> None:
     """``attend()``'s own source: the read is the whole window and no host read remains.
 
-    A structural reading, in the form this campaign uses for the state hook. It observes
-    the three lines the block changed; it does not observe an attention output.
+    A structural reading, in the form this suite uses for the state hook. It observes
+    the three lines that changed; it does not observe an attention output.
     """
     _require_cpu_mode()
     source = inspect.getsource(model_fp8.Glm5NextMLAAttention.attend)
@@ -529,9 +529,9 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
     formula is not. THE SEQUENCE IS OPENED BY A PREFILL AT 0 through the same converter,
     because the live indexer ring refuses a step that continues no sequence, and a decode
     dropped onto a fresh shell would fail on THAT refusal and never reach a window at all
-    (``neuron_model_runner.py:5343-5365``). Round 2 of the review found this file doing
-    exactly that, so the opening step is part of the item now and its premise is read
-    rather than assumed.
+    (``neuron_model_runner.py:5343-5365``). An earlier draft of this item did exactly
+    that, so the opening step is part of the item now and its premise is read rather
+    than assumed.
     """
     _require_cpu_mode()
     text_config, bank = _world()

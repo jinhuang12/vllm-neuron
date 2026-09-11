@@ -649,7 +649,7 @@ def test_item_b_iii_the_written_latent_reads_back_bit_identical() -> None:
     """
     module, _, _, gen = build_attention()
     # One SPARE slot past the three the path writes, so control 2 has something untouched
-    # to read. RE-PINNED (inc-glm53f-117c): the original reading here was "attend() reads
+    # to read. RE-PINNED: the original reading here was "attend() reads
     # [:start + tokens], so a trailing row is never gathered". attend() now reads the
     # WHOLE window, because a length taken from the position pinned the captured graph to
     # one position. The spare row is still never GATHERED and this item still reads what it

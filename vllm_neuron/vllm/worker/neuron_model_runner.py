@@ -5159,7 +5159,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # one where a captured graph cannot see it. Clamping the base instead
                 # would keep the length and move every write onto another sequence's
                 # rows. So the bank owes a spare window of blocks past the last one a
-                # request can be given, and the allocator (inc-glm53f-118) is where
+                # request can be given, and the runner's allocator is where
                 # that headroom is added -- not here.
                 raise ValueError(
                     f"KV layer '{bank['name']}'s bank holds {bank_slots} slot(s) and a "
