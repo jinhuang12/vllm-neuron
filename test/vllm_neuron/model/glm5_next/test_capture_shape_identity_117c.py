@@ -7,7 +7,7 @@ THE DECLARED ACCEPTANCE, Tier N, CPU mode:
       test/vllm_neuron/model/glm5_next/test_capture_shape_identity_117c.py \\
       -s -rA -p no:randomly -p no:cacheprovider
 
-Eleven items, one test each, no ``parametrize`` and no skip.
+Twelve items, one test each, no ``parametrize`` and no skip.
 
 WHAT THIS FILE IS ABOUT. A graph is captured once and replayed at every position, so
 anything whose SHAPE or whose CONTROL FLOW comes from a position value pins the graph
@@ -15,11 +15,12 @@ to the position it was captured at. Two such things existed: the MLA layer read 
 cache as ``[: start + tokens]``, whose length grows with every decode step, and the KDA
 layer chose its entering state with a python branch on the same value.
 
-ITEMS 9 TO 11 ARE THE RUNNER'S SIDE OF THE SAME RULE, on the three things a layer can
+ITEMS 9 TO 12 ARE THE RUNNER'S SIDE OF THE SAME RULE, on the four things a layer can
 no longer do for itself: the ALLOCATION that makes item 3's refusal unreachable in a
 serve, the write bound that moved out of the layer once the window grew longer than a
-request's pages, and the indexer's sequence bound, which stays a python int and
-therefore had to stop moving.
+request's pages, the indexer's sequence bound, which stays a python int and
+therefore had to stop moving, and the two ring positions, which stopped being python
+ints and are now built here.
 
 WHAT THESE ITEMS OBSERVE, AND WHAT THEY DO NOT. Items 1 to 4, 7 to 11 are
 BEHAVIOURAL: they drive the runner's own carrier builder -- items 7, 8 and 11 through the
@@ -40,7 +41,10 @@ because the base's decode window is this step's own two blocks where the bucket 
 item 9 because the base's allocator adds no spare window and has no method to ask for
 one; item 10 because the base builds the carrier without a word and leaves the write to
 a layer whose own bound is now the whole window; item 11 because the base's bound is
-this step's end position, which is a different number at each of the two steps.
+this step's end position, which is a different number at each of the two steps; item 12
+because the base builds both ring positions from a python int, so neither reaches a ring
+seam as a tensor and the builder's own source spells an int cast and a sum where the
+tensor helper is required.
 
 WHAT ITEM 8 DOES NOT SEPARATE. On the decode leg the bucket's span and the table's width
 are the SAME number, so item 8 fails at the base and passes for either way of sizing the
@@ -57,8 +61,10 @@ the position it names.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -135,7 +141,7 @@ def _require_cpu_mode() -> None:
     )
 
 
-def _bank(head_size: int, *, blocks: int = DECLARED_BANK_BLOCKS) -> dict:
+def _bank(head_size: int, *, blocks: int = DECLARED_BANK_BLOCKS, device="cpu") -> dict:
     """One sparse bank, carrying only the four keys the carrier builder reads.
 
     Built by hand for the reason ``test_kda_runner_state.py`` gives for its own banks: a
@@ -147,19 +153,22 @@ def _bank(head_size: int, *, blocks: int = DECLARED_BANK_BLOCKS) -> dict:
         "family": "self_attn",
         "block_size": DECLARED_PAGE_SIZE,
         "latent_cache": torch.zeros(
-            (blocks * DECLARED_PAGE_SIZE, 1, head_size), dtype=torch.bfloat16
+            (blocks * DECLARED_PAGE_SIZE, 1, head_size),
+            dtype=torch.bfloat16,
+            device=device,
         ),
     }
 
 
-def _geometry(*, position: int, window_blocks: int = DECLARED_WINDOW_BLOCKS) -> dict:
+def _geometry(*, position: int, window_blocks: int = DECLARED_WINDOW_BLOCKS,
+              tokens: int = DECLARED_TOKENS) -> dict:
     """This request's pages at ``position``, plus the window's length in blocks.
 
     The block run is the ascending run the builder requires, and it is exactly as long
     as the request needs at this position -- which is the number the base's window used
     and the number this block's window no longer uses.
     """
-    used = max(1, -(-(position + DECLARED_TOKENS) // DECLARED_PAGE_SIZE))
+    used = max(1, -(-(position + tokens) // DECLARED_PAGE_SIZE))
     return {
         "block_ids": [DECLARED_FIRST_BLOCK + offset for offset in range(used)],
         "state_slot": DECLARED_FIRST_BLOCK,
@@ -168,8 +177,15 @@ def _geometry(*, position: int, window_blocks: int = DECLARED_WINDOW_BLOCKS) -> 
     }
 
 
-def _carrier(bank: dict, text_config, *, position: int, geometry: dict) -> dict:
-    """The one carrier the builder hands this bank's layer at ``position``."""
+def _carrier(bank: dict, text_config, *, position: int, geometry: dict,
+             tokens: int = DECLARED_TOKENS, is_prefill: bool = False,
+             max_seq_len: int | None = None) -> dict:
+    """The one carrier the builder hands this bank's layer at ``position``.
+
+    The leg, the token count and the bound are keywords because item 12 drives BOTH legs
+    and needs the bound to stand still across two positions. Every other item drives one
+    decode token at the bound the base derived, which is this signature's default.
+    """
     side = NeuronModelRunner._glm5next_side_caches(
         [bank],
         index_kpool=int(text_config.index_kpool),
@@ -180,11 +196,11 @@ def _carrier(bank: dict, text_config, *, position: int, geometry: dict) -> dict:
         [bank],
         side,
         geometries=[geometry],
-        is_prefill=False,
-        tokens=DECLARED_TOKENS,
+        is_prefill=is_prefill,
+        tokens=tokens,
         start_position=position,
         softmax_scale=1.0,
-        max_seq_len=position + DECLARED_TOKENS,
+        max_seq_len=position + tokens if max_seq_len is None else int(max_seq_len),
         index_kpool=int(text_config.index_kpool),
     )
     assert len(carriers) == 1, f"one bank was handed {len(carriers)} carrier(s)"
@@ -739,3 +755,100 @@ def test_the_indexer_bound_is_one_number_at_two_consecutive_steps() -> None:
     # And the base's answer is a different number at each of them, which is what the
     # candidate count used to be sized from.
     assert {position + DECLARED_TOKENS for position, _ in bounds} != {bounds[0][1]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ITEM 12. The runner hands BOTH ring positions down as tensors.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_the_runner_hands_both_ring_positions_down_as_tensors() -> None:
+    """The two keys the ring seams are fed by: a tensor on both legs, at two positions.
+
+    THE TWO KEYS ARE THE LAST PYTHON NUMBERS TO CROSS THE BOUNDARY. The decode leg's
+    ``position`` chooses the ring slot this token's key is written to and the prefill
+    leg's ``prefill_end_position`` chooses which slots the chunk's remainder occupies.
+    An int there is a constant in the captured graph, exactly as it was for the cache
+    write item 4 reads.
+
+    THE INSTRUMENT IS THE DEVICE, in the form the landed seam acceptance
+    (``test_indexer_position_tensor_117d.py`` A01) uses: a shape-only tensor carries no
+    data, so a builder that reached for a VALUE on this bank would raise rather than
+    answer. Reaching the end of both builds is the reading that it did not, and the
+    shapes that come back are the reading that nothing sized itself from the position.
+
+    WHAT THIS ITEM DOES NOT REPEAT. That the tensor route and the int route write the
+    same bytes is measured by that same landed file, A02, on the seams themselves. This
+    item is the RUNNER's half: that the runner is what hands the tensor down.
+    """
+    _require_cpu_mode()
+    meta = torch.device("meta")
+    text_config = Glm5NextTextConfig()
+    bank = _bank(DECLARED_HEAD_SIZE, device=meta)
+    legs = (
+        ("prefill", True, DECLARED_PREFILL_TOKENS, "prefill_end_position"),
+        ("decode", False, DECLARED_TOKENS, "position"),
+    )
+
+    forms: dict[str, list[dict[str, tuple[int, ...]]]] = {}
+    for position in (0, DECLARED_SEGMENT):
+        for name, is_prefill, tokens, key in legs:
+            carrier = _carrier(
+                bank, text_config, position=position, tokens=tokens,
+                is_prefill=is_prefill,
+                geometry=_geometry(position=position, tokens=tokens),
+                max_seq_len=DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE,
+            )
+            value = carrier[key]
+            say(f"I12_{name.upper()}_{key.upper()}", f"position={position}",
+                type(value).__name__, getattr(value, "dtype", None),
+                tuple(getattr(value, "shape", ())))
+            assert torch.is_tensor(value), (
+                f"the {name} leg hands the ring a python int at position {position}, "
+                f"which a captured graph turns into the constant it was captured with"
+            )
+            assert value.dtype == torch.int32
+            assert value.device.type == "meta"
+            forms.setdefault(name, []).append({
+                held: tuple(item.shape) for held, item in carrier.items()
+                if torch.is_tensor(item)
+            })
+
+    for name, pair in forms.items():
+        say(f"I12_SHAPES_{name.upper()}", pair[0] == pair[1], sorted(pair[0]))
+        assert pair[0] == pair[1], (
+            f"the {name} leg's carrier changes shape between position 0 and position "
+            f"{DECLARED_SEGMENT}, so one captured graph cannot serve both"
+        )
+    # The two positions occupy a different number of the request's own blocks, so the
+    # equality above is the window standing still and not one position read twice.
+    assert (len(_geometry(position=0, tokens=DECLARED_TOKENS)["block_ids"])
+            != len(_geometry(position=DECLARED_SEGMENT,
+                            tokens=DECLARED_TOKENS)["block_ids"]))
+
+    # AND THE SOURCE SIDE OF THE SAME SENTENCE, by ``ast`` over the builder: each key is
+    # assigned ONCE, and from the helper that makes a tensor -- not from an ``int()``.
+    # The builder's own host arithmetic stays an int on purpose; what this counts is the
+    # value that leaves for the traced region.
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(NeuronModelRunner._glm5next_layer_carriers)
+    ))
+    made: dict[str, list[str]] = {"position": [], "prefill_end_position": []}
+    for node in ast.walk(tree):
+        target = node.targets[0] if isinstance(node, ast.Assign) else None
+        if not isinstance(target, ast.Subscript):
+            continue
+        held = getattr(target.slice, "value", None)
+        if getattr(target.value, "id", None) == "carrier" and held in made:
+            value = node.value
+            made[held].append(
+                getattr(value.func, "attr", None) or getattr(value.func, "id", "?")
+                if isinstance(value, ast.Call) else type(value).__name__
+            )
+
+    for held, spelled in made.items():
+        say(f"I12_ASSIGNED_{held.upper()}", len(spelled), *spelled)
+        # One equality carries both halves: assigned once, and from the tensor helper.
+        assert spelled == ["_glm5next_start_position"], (
+            f"'{held}' is assigned {len(spelled)} time(s) in the builder and the last is "
+            f"{spelled[-1] if spelled else 'nothing'}; the one value that leaves for the "
+            f"traced region has to be the tensor the helper makes"
+        )

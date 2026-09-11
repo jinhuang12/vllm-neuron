@@ -4843,15 +4843,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
     @staticmethod
-    def _glm5next_start_position(start_position: int, device) -> torch.Tensor:
-        """This step's first slot, as a tensor for the traced boundary.
+    def _glm5next_start_position(position: int, device) -> torch.Tensor:
+        """A host position number, as a tensor for the traced boundary.
 
         The runner keeps the host int for its own arithmetic -- it sizes the window
         and checks the pages with it -- and hands the layers this tensor, because a
         python int reaching a traced region is baked into the captured graph and
-        pins it to the position it was captured at.
+        pins it to the position it was captured at. Three numbers go through here:
+        this step's first slot, this decode step's own position, and the sequence
+        length after a prefill chunk. All three are host numbers when this runs.
         """
-        return torch.tensor(int(start_position), dtype=torch.int32, device=device)
+        return torch.tensor(int(position), dtype=torch.int32, device=device)
 
     @staticmethod
     def _glm5next_host_geometry(metadata: dict, key: str, name: str) -> list:
@@ -5202,11 +5204,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # sequence, equal to this sequence's end only while the batch is
                 # one request -- which this half refuses to exceed, but the model
                 # must not depend on that.
+                # THE END POSITION RIDES AS A TENSOR, built here from two host ints.
+                # It decides which ring slots this chunk's remainder occupies, so an
+                # int would bake those slots into the captured graph and pin it to
+                # the length this chunk happened to end at. The seam's int route
+                # refuses an end position shorter than the chunk, and that refusal
+                # cannot run on a tensor -- it is made above instead, where the
+                # position is still a number and a negative one is rejected.
                 carrier["prefill_tail"] = side["tail"]
-                carrier["prefill_end_position"] = int(start_position) + int(tokens)
+                carrier["prefill_end_position"] = cls._glm5next_start_position(
+                    int(start_position) + int(tokens), device
+                )
             else:
+                # AND SO DOES THE DECODE POSITION, for the same reason: it chooses
+                # the ring slot this token's key is written to.
                 carrier["tail"] = side["tail"]
-                carrier["position"] = int(start_position)
+                carrier["position"] = cls._glm5next_start_position(
+                    start_position, device
+                )
             carriers.append(carrier)
         return carriers
 
