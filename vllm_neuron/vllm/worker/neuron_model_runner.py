@@ -4275,6 +4275,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         return attn_metadata
 
+    def _aligned_table_width(self, *, context_length: int, block_size: int) -> int:
+        """The block-table width a group of ``block_size`` reports for a context length.
+
+        It is the whole blocks the context needs, divided across the context-parallel
+        ranks, and then rounded up again to a multiple of ``128 // block_size`` to match
+        upstream's InputBatch width. This is the width the warmup builder hands over and
+        the width a prefill graph is captured with, since a prefill never trims it back.
+
+        ONE ARITHMETIC, TWO READERS. The KV allocator sizes each latent bank's spare
+        window from this same number, and a spare that disagreed with the width actually
+        handed over would be the wrong size in exactly the case it exists for.
+        """
+        dcp_block_size = int(block_size) * max(self._dcp_size, 1)
+        blocks = -(-int(context_length) // dcp_block_size)
+        alignment = 128 // int(block_size) if int(block_size) <= 128 else 1
+        return -(-blocks // alignment) * alignment
+
     def _build_warmup_attention_metadata(
         self,
         num_tokens: int,
@@ -4331,16 +4348,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ctx_bucket if ctx_bucket is not None else self.max_model_len
             )
             dcp_block_size = block_size * max(self._dcp_size, 1)
-            max_num_blocks_per_req = (
-                ctx_for_blocks + dcp_block_size - 1
-            ) // dcp_block_size
             # Match upstream's TRTLLM alignment (vLLM PR #39324): InputBatch
             # block_table width is rounded up to a multiple of 128/block_size.
             # Prefill doesn't trim at runtime so warmup must use the aligned
             # width. Decode with ctx-length buckets trims back below.
-            alignment = 128 // block_size if block_size <= 128 else 1
-            max_num_blocks_per_req = (
-                (max_num_blocks_per_req + alignment - 1) // alignment * alignment
+            max_num_blocks_per_req = self._aligned_table_width(
+                context_length=ctx_for_blocks, block_size=block_size
             )
             # Untrimmed block-table seq dim — used by the on-device
             # ``correct_spec_decode_positions_and_slot_mapping`` correction
@@ -9243,6 +9256,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return (num_blocks, num_kv_heads, block_size // 2, head_size, 2)
         return (num_blocks, num_kv_heads, block_size, head_size)
 
+    def _latent_spare_bytes(self, kv_cache_config: KVCacheConfig) -> dict[str, int]:
+        """Extra bytes each latent layer's bank needs, keyed by layer name.
+
+        The names come from the KV-cache GROUPS rather than from a model attribute,
+        because the groups are what carry each layer's spec and the spec class is what
+        says a bank is latent. A stack with two families therefore grows its latent group
+        and leaves its recurrent group at the size the engine budgeted.
+
+        The spare is ONE WINDOW: the aligned block-table width, which is the widest window
+        the converter can hand a layer of this group, times that group's page in bytes.
+        """
+        spare: dict[str, int] = {}
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not isinstance(spec, MLAAttentionSpec):
+                continue
+            blocks = self._aligned_table_width(
+                context_length=self.max_model_len, block_size=spec.block_size
+            )
+            for layer_name in group.layer_names:
+                spare[layer_name] = blocks * spec.page_size_bytes
+        return spare
+
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -9289,10 +9325,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             is_pooling_model=self.is_pooling_model,
         )
 
+        # A LATENT BANK IS ALLOCATED WITH A SPARE WINDOW PAST THE SCHEDULER'S BLOCKS.
+        # A layer of this family is handed a WINDOW of its bank whose length is fixed
+        # for the bucket, not the pages this step happens to occupy, so one captured
+        # graph serves every position. A request placed at the last block the scheduler
+        # can give it then needs slots past that block, and a torch slice past the end
+        # of a bank does not raise -- it returns a SHORTER view, which turns the
+        # bucket-constant length back into a per-request one where a captured graph
+        # cannot see it. The remedy is space, and it belongs here: the carrier builder
+        # refuses the short bank by name rather than shortening the view or clamping the
+        # window's base onto a neighbour's rows.
+        #
+        # THE SCHEDULER'S BLOCK COUNT IS UNTOUCHED. ``kv_cache_config.num_blocks`` is
+        # what hands out blocks and it is not read here; only the bytes behind each
+        # latent tensor grow, so the spare blocks exist and are never allocated to a
+        # request. The whole cost is HBM: one window per latent layer.
+        spare_bytes = self._latent_spare_bytes(kv_cache_config)
+
         # Initialize the KV Cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for tensor in kv_cache_config.kv_cache_tensors:
-            raw_tensor = torch.zeros(tensor.size, dtype=torch.int8, device=self.device)
+            spare = max(
+                (spare_bytes.get(layer_name, 0) for layer_name in tensor.shared_by),
+                default=0,
+            )
+            raw_tensor = torch.zeros(
+                tensor.size + spare, dtype=torch.int8, device=self.device
+            )
             # Case where the KV cache is shared across layers
             for layer_name in tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = raw_tensor

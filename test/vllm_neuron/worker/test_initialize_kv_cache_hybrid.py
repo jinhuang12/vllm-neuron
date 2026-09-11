@@ -97,6 +97,10 @@ NUM_BLOCKS_FULL = 2
 TINY_LAYER_COUNT = 8
 NUM_BLOCKS_TINY = 3
 
+#: The longest sequence the fake runner admits. The allocator reads it to size each
+#: latent bank's spare window, so it is a named constant rather than an inline number.
+DECLARED_MAX_MODEL_LEN = 256
+
 #: PARENT readings, measured by ``probe-017-parent-readings.py`` at ``069863ee``.
 PARENT_KDA_BUFFERS_ALLOCATED = 0
 PARENT_RAISE_MESSAGE_FRAGMENT = "Unsupported Attention spec type"
@@ -147,7 +151,7 @@ def _drive(kv_cache_config, layers, monkeypatch: pytest.MonkeyPatch) -> dict:
         drafter=None,
         device=torch.device("cpu"),
         max_num_reqs=4,
-        max_model_len=256,
+        max_model_len=DECLARED_MAX_MODEL_LEN,
         max_num_batched_tokens=256,
         vocab_size=128,
         is_pooling_model=False,
@@ -157,6 +161,12 @@ def _drive(kv_cache_config, layers, monkeypatch: pytest.MonkeyPatch) -> dict:
     fake.model.bind_kv_cache = bound.append
     fake._kv_cache_is_fp8_packed = MethodType(runner._kv_cache_is_fp8_packed, fake)
     fake._k_cache_alloc_shape = runner._k_cache_alloc_shape
+    # RE-PINNED: the allocator now also asks itself how much spare window each latent
+    # bank owes, so the two methods that answer are bound onto the fake self the same
+    # way the two above are. Stubbing them would leave the spare untested here.
+    fake._dcp_size = 1
+    fake._aligned_table_width = MethodType(runner._aligned_table_width, fake)
+    fake._latent_spare_bytes = MethodType(runner._latent_spare_bytes, fake)
 
     caches = runner.initialize_kv_cache(fake, kv_cache_config)
     # The dict handed to the model is the dict returned, so nothing below reads
@@ -516,16 +526,29 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
         c04_counting_mock_calls=len(requested),
     )
     assert len(caches) == DECLARED_TOTAL_ENTRIES
-    assert allocated - _addressable_bytes(specs, NUM_BLOCKS_FULL) == 0
+    # RE-PINNED: a latent bank is allocated with one spare window past the blocks the
+    # scheduler can hand out, so the referent carries that term. The reading this
+    # replaces, verbatim:
+    # `assert allocated - _addressable_bytes(specs, NUM_BLOCKS_FULL) == 0`. It is still a
+    # ZERO, which is this item's whole subject; what moved is what the total is owed.
+    assert (
+        allocated
+        - _addressable_bytes(specs, NUM_BLOCKS_FULL)
+        - _spare_bytes(specs)
+        == 0
+    )
 
     # The KDA page's own referent stays DECISIONS section 6's recorded page (P9).
     # -086 pads page_size_bytes, so the state's own geometry answers this now.
     assert _kda_natural_pages(specs, kda_names) == [RECORDED_KDA_STATE_PAGE_BYTES]
 
     # Per entry too, so a compensating pair of errors cannot net to zero.
+    # RE-PINNED with the same term per entry, so the spare cannot land on the wrong
+    # family and net out against a shortfall somewhere else.
     per_entry = {
         name: sum(b.numel() * b.element_size() for b in buffers)
         - _addressable_page_bytes(specs[name]) * NUM_BLOCKS_FULL
+        - _spare_page_bytes(specs[name])
         for name, buffers in caches.items()
     }
     _record(
@@ -539,7 +562,10 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
     # each raw tensor from that page, and the counting mock records what was
     # asked for, so padding raises the two together. The buffers the allocator
     # RETURNED span less, which is why the addressable zero above re-pinned.
-    assert sum(requested) == expected_bytes
+    # RE-PINNED: what was ASKED for grows by the same spare, since the allocator adds
+    # it to each latent tensor's size before the buffer is made. The reading this
+    # replaces, verbatim: `assert sum(requested) == expected_bytes`.
+    assert sum(requested) == expected_bytes + _spare_bytes(specs)
 
     # READINGS inherited from inc-glm53f-016's construction, RECORDED here and
     # adding no criterion: (a) which entries now carry page_size_padded, (b) both
@@ -603,7 +629,10 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
         c04_control_doubled_minus_expected=sum(doubled) - expected_bytes,
         c04_control_expected_delta=control_delta,
     )
-    assert sum(doubled) - expected_bytes == control_delta
+    # RE-PINNED: the control re-drives the same allocator, so its total carries the
+    # latent spare too. The reading this replaces, verbatim:
+    # `assert sum(doubled) - expected_bytes == control_delta`.
+    assert sum(doubled) - expected_bytes == control_delta + _spare_bytes(specs)
 
 
 # ===========================================================================
@@ -650,6 +679,31 @@ def _addressable_page_bytes(spec) -> int:
 def _addressable_bytes(specs: dict, num_blocks: int) -> int:
     """Every entry's addressable page, times the blocks per entry."""
     return sum(_addressable_page_bytes(spec) * num_blocks for spec in specs.values())
+
+
+def _spare_page_bytes(spec) -> int:
+    """One entry's spare window in bytes, and zero for an entry that owes none.
+
+    A latent bank is handed to its layer as a WINDOW whose length is fixed for the
+    bucket, so it needs one whole window past the last block a request can be given.
+    The width comes from the runner's OWN method rather than from arithmetic repeated
+    here: a spare this file computed for itself could agree with a wrong allocator.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    if not isinstance(spec, MLAAttentionSpec):
+        return 0
+    runner = _runner_module().NeuronModelRunner
+    shell = SimpleNamespace(_dcp_size=1)
+    blocks = MethodType(runner._aligned_table_width, shell)(
+        context_length=DECLARED_MAX_MODEL_LEN, block_size=spec.block_size
+    )
+    return blocks * spec.page_size_bytes
+
+
+def _spare_bytes(specs: dict) -> int:
+    """The spare window every entry of this config owes, summed."""
+    return sum(_spare_page_bytes(spec) for spec in specs.values())
 
 
 def _kda_natural_pages(specs: dict, kda_names: list) -> list:
