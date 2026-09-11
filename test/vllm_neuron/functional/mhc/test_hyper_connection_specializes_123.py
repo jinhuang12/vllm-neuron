@@ -214,23 +214,31 @@ def test_the_kernel_specialises_under_the_capture_regime() -> None:
     it: the wrapper answers such a call from the simulator, which interprets the
     body instead of compiling it, and reports nothing.
 
+    THE SEAM MUST BE REACHED, on both arms. The module's own dispatch counter is
+    zeroed before the forward and read after it, so a leg that never dispatched
+    fails instead of passing on an absence. The counter rises before the wrapped
+    call, so a refused specialisation still counts as reached.
+
     Under ``GLM53F_123_EXPECT_BASE=1`` the refusal is the expected reading and is
-    required, with the vendor's own two fragments and the seam as the site. On the
-    candidate the requirement is that no specialisation refusal appears. Anything
-    else the forward says is PRINTED WHOLE and not judged: a second refused
-    construct behind the first would be a result, and this item's job is to show
-    it rather than to hide it behind a green.
+    required AT THE SEAM, with the vendor's second fragment as well. On the
+    candidate the requirement is that no refusal names the seam. A refusal
+    anywhere else is PRINTED WHOLE and reported rather than judged: a second
+    refused construct elsewhere in the forward is a result, and this item's job is
+    to show it, not to hide it behind a green nor to fail on it.
     """
     for leg in LEGS:
         standing = meta119._standing_arm()
         _, runner = meta119._meta_root_and_runner()
+        reset_dispatch_counters()
         completed, error = True, None
         try:
             meta119._extract(runner, leg)
         except Exception as caught:  # noqa: BLE001 - the vendor's own failure is the reading
             completed, error = False, caught
+        seam_dispatch, _ = dispatch_counters()
         message = "" if error is None else " ".join(str(error).split())
         site = "none" if error is None else meta119._site_of(error)
+        refused_at_seam = int(WANT_REFUSAL in message and site.startswith(SEAM_MODULE))
         print(f"HC123|I1_META_VERBATIM|{leg}|{message}", flush=True)
         _emit(
             "I1_META_FORWARD",
@@ -239,19 +247,20 @@ def test_the_kernel_specialises_under_the_capture_regime() -> None:
             route="real" if not standing else "arm:" + ",".join(standing),
             venue="nki_simulator" if os.environ.get("NKI_SIMULATOR") == "1" else "device",
             site=site,
+            seam_dispatch=seam_dispatch,
+            refused_at_seam=refused_at_seam,
             names_the_refusal=int(WANT_REFUSAL in message),
             names_the_diagnostic=int(WANT_DIAGNOSTIC in message),
             error_type="none" if error is None else type(error).__name__,
         )
         assert not standing, f"leg={leg}: another item's stand-in is still bound: {standing}"
+        assert seam_dispatch >= 1, f"leg={leg}: the forward never dispatched this seam"
         if EXPECT_BASE:
             assert not completed, f"leg={leg}: the pre-change body completed the forward"
-            assert WANT_REFUSAL in message, message
+            assert refused_at_seam, f"leg={leg}: site={site}: {message}"
             assert WANT_DIAGNOSTIC in message, message
-            assert site.startswith(SEAM_MODULE), site
         else:
-            assert WANT_REFUSAL not in message, message
-            assert WANT_DIAGNOSTIC not in message, message
+            assert not refused_at_seam, f"leg={leg}: site={site}: {message}"
 
 
 # --------------------------------------------------------------------------- #
