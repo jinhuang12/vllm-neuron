@@ -289,11 +289,29 @@ def test_the_hook_materialises_every_declared_leaf_on_meta(
 def test_the_hook_clears_both_refusals_the_forward_hits(
     tmp_path, single_rank_process_group
 ) -> None:
-    """The embedding table is set, and every mHC layer has its two sites."""
+    """The table carries what the real load leaves, and every mHC layer has its sites.
+
+    THE REFERENCE IS THE CPU LOAD, not a shape written here. The root forward reads
+    the embedding table before any layer runs, so an unset table refuses there; but
+    the shape it should carry is the checkpoint's own, and this checkpoint writes
+    every plain-family key at a 1-D miniature placeholder. A number typed here would
+    measure the fixture, so the same loader is run on the CPU and its table is the
+    reference: an unset table and a reshaped one both fail against it.
+    """
     impl = _impl()
     model = _lite_loaded(tmp_path)
 
+    reference_directory = tmp_path / "cpu-reference"
+    reference = _dense_model()
+    _write_miniature_checkpoint(
+        reference_directory, _mappings_for(_dense_config()), reference
+    )
+    reference.load_weights(str(reference_directory), torch.device("cpu"), None)
+    reference_table = reference.model.embed_tokens_weight
+    want = None if reference_table is None else tuple(reference_table.shape)
+
     table = model.model.embed_tokens_weight
+    got = None if table is None else tuple(table.shape)
     layers = [
         layer
         for layer in model.model.modules()
@@ -306,12 +324,13 @@ def test_the_hook_clears_both_refusals_the_forward_hits(
     )
     say(
         "forward-preconditions",
-        f"table={None if table is None else tuple(table.shape)}",
+        f"table={got}|cpu_reference={want}",
         f"mhc_layers={len(counts)}|site_counts={sorted(set(counts))}",
     )
-    assert table is not None and table.dim() == 2, (
-        "the embedding table is still unset after the hook, so the root forward "
-        "refuses before any layer runs"
+    assert got is not None and got == want, (
+        f"the hook left the embedding table {got} where the same loader on the CPU "
+        f"leaves {want}; the root forward reads that table before any layer runs, so "
+        f"an unset table refuses there and a reshaped one feeds it wrong widths"
     )
     assert counts and set(counts) == {2}, (
         f"the layers carrying mHC weights hold site counts {sorted(set(counts))}, "
