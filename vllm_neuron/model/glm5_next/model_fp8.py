@@ -4187,7 +4187,13 @@ class Glm5NextKDAAttention(nn.Module):
         chunk = self._resolve_chunk_size(chunk_size)
         n_chunks = tokens // chunk if is_prefill else 0
         chunked = n_chunks * chunk
-        core = torch.empty(tokens, width, dtype=torch.float32)
+        # AN ALLOCATION ON THE TRACED PATH FOLLOWS THE ACTIVATION IT IS COMBINED
+        # WITH. A bare factory call takes the default device, so under a capture
+        # that holds this module and its inputs on ``meta`` this buffer would land
+        # on the host and the first arithmetic against a parameter would meet two
+        # devices. ``q_conv`` is the convolution's own output, which every value
+        # written into this buffer is derived from.
+        core = torch.empty(tokens, width, dtype=torch.float32, device=q_conv.device)
         for h in range(heads):
             span = slice(h * kdim, (h + 1) * kdim)
             q_h = q_conv[:, span].contiguous()
