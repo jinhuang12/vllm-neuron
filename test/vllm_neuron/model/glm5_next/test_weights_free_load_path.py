@@ -3,9 +3,10 @@
 
 A CPU-compile start never loads weights: the runner calls no loader and moves the
 whole module to meta (``neuron_model_runner.py:1358-1367``). A bind for that route
-therefore receives meta operands, and the four items here read what it does with
-them. The CPU arm is measured beside the meta one, because the load path that ships
-today must bind exactly as it did.
+therefore receives meta operands, and the items here read what it does with them:
+the bind, the whole shape-only load through the real loader, and the two value
+censuses that load walks into. The CPU arm is measured beside the meta one, because
+the load path that ships today must bind exactly as it did.
 """
 
 import dataclasses
@@ -19,6 +20,9 @@ from .test_load_weights import (  # noqa: F401 -- the fixture is used by name
     _dense_config,
     _dense_model,
     _mappings_for,
+    _stacked_checkpoint,
+    _stacked_config,
+    _stacked_model,
     _write_miniature_checkpoint,
     single_rank_process_group,
 )
@@ -203,16 +207,28 @@ class _RecordingStore:
         return all(key in self.added for key in keys)
 
 
-def _meta_load(tmp_path, name: str):
-    """Run the real loader on meta through the reader, and hand both back."""
+def _meta_load(tmp_path, name: str, *, with_bank: bool = False):
+    """Run the real loader on meta through the reader, and hand both back.
+
+    ``with_bank`` picks the landed routed fixture whose load COMPLETES rather than
+    the all-dense one: one dense MLP at layer 0 and three expert banks written at
+    256-blocked extents. It is not extended here, because the suite that owns it
+    already carries both halves this file needs.
+    """
     impl = _impl()
     directory = tmp_path / name
-    model = _dense_model()
-    written = _write_miniature_checkpoint(directory, _mappings_for(_dense_config()), model)
+    model = _stacked_model() if with_bank else _dense_model()
+    config = _stacked_config() if with_bank else _dense_config()
+    mappings = _mappings_for(config)
+    written = (
+        _stacked_checkpoint(directory, mappings, model)
+        if with_bank
+        else _write_miniature_checkpoint(directory, mappings, model)
+    )
     reader = impl._MetaShapeCheckpoint(str(directory), None)
     model.to(torch.device("meta"))
     model.load_weights(str(directory), torch.device("meta"), None, reader=reader)
-    say("meta-load", f"tensors_written={written}|files={reader.get_num_files()}")
+    say("meta-load", f"tree={name}|written={written}|files={reader.get_num_files()}")
     return model, reader
 
 
@@ -335,20 +351,34 @@ def test_the_pipelined_load_completes_on_the_shape_only_reader(
 
 
 # --------------------------------------------------------------------------- #
-# (8) The census that reads values is reached on the meta pass, and skips.      #
+# (8) Both censuses that read values are reached on the meta pass, and skip.     #
 # --------------------------------------------------------------------------- #
-def test_the_meta_pass_reaches_the_block_scale_census_and_skips_it(
+def test_the_meta_pass_reaches_both_value_censuses_and_skips_them(
     tmp_path, single_rank_process_group
 ) -> None:
-    """Reached, not merely guarded: the load walks into it and it records the skip."""
+    """Reached, not merely guarded: the load walks into both and both record it.
+
+    One tree carries both halves: the dense MLP at layer 0 reaches the block-scale
+    compensation through its own scale-grid prep, and the three expert banks reach
+    the retile through theirs. A pass on a tree that reaches neither would read
+    green off code no load had entered.
+    """
+    from vllm_neuron.functional.moe import blockwise_fp8_retile
     from vllm_neuron.model.glm5_next import weight_loaders_fp8
 
     weight_loaders_fp8.SKIPPED_VALUE_CENSUSES.clear()
-    _meta_load(tmp_path, "census")
-    skips = list(weight_loaders_fp8.SKIPPED_VALUE_CENSUSES)
-    say("census-skips", f"count={len(skips)}|names={sorted(set(skips))}")
-    assert skips.count("compensate_block_scales") >= 1, (
-        f"the shape-only load recorded {sorted(set(skips))}; the block-scale census "
-        f"reads three numbers before the platform gate, so a pass that never "
-        f"reaches it proves nothing about a load that will"
+    blockwise_fp8_retile.SKIPPED_VALUE_CENSUSES.clear()
+    _meta_load(tmp_path, "census", with_bank=True)
+    compensated = list(weight_loaders_fp8.SKIPPED_VALUE_CENSUSES)
+    retiled = list(blockwise_fp8_retile.SKIPPED_VALUE_CENSUSES)
+    say("census-skips", f"compensate={len(compensated)}|retile={len(retiled)}")
+    assert compensated.count("compensate_block_scales") >= 1, (
+        f"the shape-only load recorded {sorted(set(compensated))} in the loader "
+        f"module; the block-scale census reads three numbers before the platform "
+        f"gate, so a pass that never reaches it proves nothing"
+    )
+    assert retiled.count("retile_block_scales") >= 1, (
+        f"the shape-only load recorded {sorted(set(retiled))} in the retile "
+        f"module; the retile allocates from values it reads, so a pass that never "
+        f"reaches it leaves that branch unread"
     )
