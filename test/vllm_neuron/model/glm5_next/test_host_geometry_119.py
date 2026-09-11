@@ -51,6 +51,14 @@ THE WIDTH ITEM, ON THE SAME CONVERTER
 
 THE BASE ARM, DECLARED: A01, A02, A03, A04 and A06 FAIL; A05 and B01 PASS.
 
+RE-PINNED AFTER THE PAGED-WINDOW WORK. The converter hands a layer a window whose length is
+the leg's bucket span, so the view is WIDER than the step's own pages and the position
+arrives as a tensor rather than an int. Five readings moved: the three view lengths in A01,
+A02 and A03, and the position reads in A01 and A06, which asked a ``meta`` tensor for a value
+it does not hold. Each original is quoted verbatim where it was replaced. A05 keeps its
+base-passing arm on purpose -- it pins whole pages and coverage rather than the exact length,
+which the window's own acceptance file measures.
+
 CONVENTIONS. The runner is stood up with ``__new__`` and given only the attributes the
 converter reads, which is this campaign's landed harness shape
 (``test_kda_runner_state.py:209-228``). No layer is driven here: every carrier under
@@ -87,6 +95,19 @@ DECODE_THRESHOLD = 1
 #: The longest sequence the harness admits, which is what the side-cache allocator bounds
 #: its pooled store by (``neuron_model_runner.py:4917-4921``).
 MAX_MODEL_LEN = BANK_PAGES * PAGE
+
+
+def _window_slots(row) -> int:
+    """The carrier view's length for an entry ``_entry`` built from ``row``.
+
+    The converter hands a layer a window whose length is the LEG's bucket span capped by
+    the declared blocks per sequence, and no longer this step's own pages. Every entry in
+    this file declares both numbers off the same row -- the blocks per sequence is the row's
+    width and the segment is that width in slots -- so the span always reaches the cap and
+    the window is the row's whole width. That is one number per item and it does not move
+    with the position, which is the property the window exists to give.
+    """
+    return len(row) * PAGE
 
 
 def _text_config() -> SimpleNamespace:
@@ -226,8 +247,9 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     banks = [_sparse_bank(meta), _linear_bank(meta)]
     runner = _runner(banks)
     tokens = 8
+    host_row = [0, 1, 2, 3]
     entry = _entry(
-        host_row=[[0, 1, 2, 3]],
+        host_row=[host_row],
         host_cached=[0],
         device_row=[[0, 1, 2, 3]],
         device_cached=0,
@@ -240,13 +262,28 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     carriers = translated["layer_carriers"]
     assert len(carriers) == 2
     sparse, linear = carriers
-    # Eight tokens at position 0 occupy two pages of four.
-    assert int(sparse["latent_cache"].shape[0]) == 2 * PAGE
-    assert int(sparse["start_position"]) == 0
+    # RE-PINNED: the view's length is the window's, not this step's pages. The reading this
+    # replaces, verbatim: "Eight tokens at position 0 occupy two pages of four" —
+    # `assert int(sparse["latent_cache"].shape[0]) == 2 * PAGE`. Those two pages are still
+    # the ones this step writes, and they are the front of the window, so the second line
+    # keeps the original claim.
+    assert int(sparse["latent_cache"].shape[0]) == _window_slots(host_row)
+    assert int(sparse["latent_cache"].shape[0]) >= 2 * PAGE
+    # RE-PINNED: the position arrives as a tensor, and this item's carrier is on `meta`,
+    # where a value does not exist to be read. The reading this replaces, verbatim:
+    # `assert int(sparse["start_position"]) == 0`. What `meta` does answer is the operand's
+    # form, which is what a captured graph depends on; the VALUE is read where it is
+    # readable, on the continuing CPU step in A05.
+    assert tuple(sparse["start_position"].shape) == ()
+    assert sparse["start_position"].dtype == torch.int32
+    assert sparse["start_position"].device.type == "meta"
     assert sparse["latent_cache"].device.type == "meta"
     # The linear layer's carrier is the bank's slot, which the row's first id names.
     assert tuple(linear["conv_state"].shape) == (4, 6)
-    assert int(linear["start_position"]) == 0
+    # RE-PINNED for the same reason, replacing
+    # `assert int(linear["start_position"]) == 0`.
+    assert tuple(linear["start_position"].shape) == ()
+    assert linear["start_position"].device.type == "meta"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -263,8 +300,9 @@ def test_a02_the_host_row_is_the_one_the_slice_follows() -> None:
     banks = [_sparse_bank(cpu)]
     runner = _runner(banks)
     tokens = 6
+    host_row = [4, 5, 6, 7]
     entry = _entry(
-        host_row=[[4, 5, 6, 7]],
+        host_row=[host_row],
         host_cached=[0],
         device_row=[[500, 501, 502, 503]],
         device_cached=0,
@@ -275,8 +313,11 @@ def test_a02_the_host_row_is_the_one_the_slice_follows() -> None:
     translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
 
     carrier = translated["layer_carriers"][0]
-    # Six tokens at position 0 occupy two pages, and they are the host row's first two.
-    assert int(carrier["latent_cache"].shape[0]) == 2 * PAGE
+    # RE-PINNED: the length is the window's. The reading this replaces, verbatim: "Six
+    # tokens at position 0 occupy two pages, and they are the host row's first two" —
+    # `assert int(carrier["latent_cache"].shape[0]) == 2 * PAGE`. Which row the view follows
+    # is what this item measures, and the pointer line below is what measures it.
+    assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)
     bank = banks[0]["latent_cache"]
     assert carrier["latent_cache"].data_ptr() == bank[4 * PAGE].data_ptr()
 
@@ -295,8 +336,9 @@ def test_a03_a_padded_device_table_does_not_decide_the_request_count() -> None:
     banks = [_sparse_bank(cpu)]
     runner = _runner(banks)
     tokens = 4
+    host_row = [0, 1]
     entry = _entry(
-        host_row=[[0, 1]],
+        host_row=[host_row],
         host_cached=[0],
         device_row=[[0, 1], [0, 0], [0, 0], [0, 0]],
         device_cached=0,
@@ -306,7 +348,13 @@ def test_a03_a_padded_device_table_does_not_decide_the_request_count() -> None:
 
     translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
 
-    assert int(translated["layer_carriers"][0]["latent_cache"].shape[0]) == PAGE
+    # RE-PINNED: the length is the window's, which for this two-entry row is two pages. The
+    # reading this replaces, verbatim:
+    # `assert int(translated["layer_carriers"][0]["latent_cache"].shape[0]) == PAGE`. What
+    # this item measures is that the step was NOT refused as a four-request batch, and a
+    # carrier that exists at all is that reading.
+    carrier = translated["layer_carriers"][0]
+    assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -357,6 +405,15 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     (``model_fp8.py:6855``) and reads slot 0 to the last written slot back out of it
     (``model_fp8.py:6859``). A basic slice is a view, so both land in the bank. A gather
     would return a copy, and the write would be discarded where the next step reads.
+
+    RE-PINNED. The length is now the bucket's window and the read is the whole of it. The
+    rule this replaces, verbatim: "The slice spans the whole pages the request's own tokens
+    occupy, counted from the request's first page: ``ceil((start_position + tokens) / page)``
+    pages. It therefore covers ``start_position + tokens`` slots, which is the bound the
+    layer checks before it writes". Every clause of it that this item can still read is
+    still read below: the view starts at the request's first page, it COVERS the step's own
+    slots, and it aliases the bank. What changed is that covering is no longer exactness --
+    a length that tracked the position is what pinned a captured graph to one position.
     """
     cpu = torch.device("cpu")
     banks = [_sparse_bank(cpu)]
@@ -378,9 +435,18 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     view = carrier["latent_cache"]
     pages = -(-(cached + tokens) // PAGE)
     assert pages == 3
-    assert int(view.shape[0]) == pages * PAGE
+    # RE-PINNED: `assert int(view.shape[0]) == pages * PAGE` became the two clauses of that
+    # reading which survive the window -- whole pages, and enough of them for this step.
+    # The EXACT length is the window's now and belongs to the item that measures the window;
+    # pinning it here would also cost this item its base-passing arm, which is the whole
+    # reason it is in the file.
+    assert int(view.shape[0]) % PAGE == 0
+    assert int(view.shape[0]) >= pages * PAGE
     # The layer's own bound: the step's last slot is inside the slice it was handed.
     assert int(view.shape[0]) >= cached + tokens
+    # The position's VALUE, read here because this item's carrier is on CPU: A01's is on
+    # `meta`, where the tensor has a form but no value.
+    assert int(carrier["start_position"]) == cached
     # The slice starts at the request's first page, and it is the bank's own storage.
     bank = banks[0]["latent_cache"]
     assert view.data_ptr() == bank[4 * PAGE].data_ptr()
@@ -430,8 +496,12 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     carrier = runner._glm5next_model_kwargs(
         _kwargs(banks, entry, tokens=tokens, device=meta)
     )["layer_carriers"][0]
-    start = int(carrier["start_position"])
-    c_kv = carrier["latent_cache"][: start + tokens, 0, :]
+    # RE-PINNED: the cache side is sliced the way the layer slices it, and the layer now
+    # reads the window WHOLE. The reading this replaces, verbatim:
+    # `start = int(carrier["start_position"])` then
+    # `c_kv = carrier["latent_cache"][: start + tokens, 0, :]`. That `int()` cannot answer on
+    # a `meta` carrier, and reading a length off the position is what the window removed.
+    c_kv = carrier["latent_cache"][:, 0, :]
     q_lift = torch.zeros((1, 1, LATENT_WIDTH), dtype=torch.float32, device=meta)
     selected = torch.zeros((1, seam.KEY_CHUNK), dtype=torch.int32, device=meta)
 
