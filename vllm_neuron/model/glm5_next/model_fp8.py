@@ -4179,7 +4179,13 @@ class Glm5NextKDAAttention(nn.Module):
         chunk = self._resolve_chunk_size(chunk_size)
         n_chunks = tokens // chunk if is_prefill else 0
         chunked = n_chunks * chunk
-        core = torch.empty(tokens, width, dtype=torch.float32)
+        # AN ALLOCATION ON THE TRACED PATH FOLLOWS THE ACTIVATION IT IS COMBINED
+        # WITH. A bare factory call takes the default device, so under a capture
+        # that holds this module and its inputs on ``meta`` this buffer would land
+        # on the host and the first arithmetic against a parameter would meet two
+        # devices. ``q_conv`` is the convolution's own output, which every value
+        # written into this buffer is derived from.
+        core = torch.empty(tokens, width, dtype=torch.float32, device=q_conv.device)
         for h in range(heads):
             span = slice(h * kdim, (h + 1) * kdim)
             q_h = q_conv[:, span].contiguous()
@@ -4189,7 +4195,12 @@ class Glm5NextKDAAttention(nn.Module):
             beta_h = beta[:, h].contiguous()
 
             if is_prefill and int(start_position) == 0:
-                state = torch.zeros(kdim, kdim, dtype=torch.float32)
+                # The fresh state enters the recurrence beside these same head
+                # slices, so it takes their device for the reason given at
+                # ``core`` above.
+                state = torch.zeros(
+                    kdim, kdim, dtype=torch.float32, device=q_conv.device
+                )
             else:
                 state = recurrent_state[h].to(torch.float32)
 
