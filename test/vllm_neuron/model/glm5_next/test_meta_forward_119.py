@@ -83,6 +83,14 @@ def _meta_root_and_runner():
     they are bound: ``bind_kv_cache`` keeps them as plain entries rather than buffers, so
     moving the module afterwards would leave the banks behind on CPU and the forward would
     mix two devices.
+
+    THE HYPER-CONNECTION SITES NEED THE SAME TREATMENT, AND ``.to()`` CANNOT GIVE IT. Each
+    layer holds its two mHC sites in a plain dict rather than as submodules, so no
+    ``.to(device)`` visits them and their weights stay wherever the load put them -- the
+    load's own refusal says exactly that (``model_fp8.py:8242-8247``). They are re-bound here
+    at the device the rest of the model now holds, through the same method the load calls
+    (``model_fp8.py:8988``), or the first mHC layer meets a CPU weight with ``meta``
+    activations.
     """
     landed._require_cpu_mode()
     root = landed._fixture()["root"]
@@ -91,6 +99,9 @@ def _meta_root_and_runner():
         for name, tensors in landed._runner_shaped_caches(root).items()
     }
     root.to("meta")
+    for module in root.modules():
+        if hasattr(type(module), "bind_hyper_connection_sites"):
+            module.bind_hyper_connection_sites(root.text_config, torch.device("meta"))
     root.bind_kv_cache(caches)
     runner = sites._runner(root)
     runner.device = torch.device("meta")
