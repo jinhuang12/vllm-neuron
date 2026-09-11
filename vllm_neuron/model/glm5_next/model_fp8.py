@@ -1256,11 +1256,22 @@ class Glm5NextHyperConnection(nn.Module):
         # submodules, and the tensors arrive here by ``.data`` assignment. So the
         # three ``nn.Parameter`` names below are unchanged, and so is every name
         # ``named_parameters()`` reports.
+        # GRAD-FREE, LIKE EVERY OTHER WEIGHT THIS MODEL HOLDS. Serving never
+        # differentiates, and the six leaves these three are handed are allocated
+        # ``requires_grad=False`` where they are declared. ``.data`` assignment does
+        # not carry the flag over, so a default ``nn.Parameter`` would leave ONE
+        # storage reachable as a grad-free leaf and as a grad-requiring parameter at
+        # the same time -- which graph extraction refuses.
         self.fn = nn.Parameter(
-            torch.zeros(self.hc_mult3, hc_mult * hidden, dtype=torch.float32)
+            torch.zeros(self.hc_mult3, hc_mult * hidden, dtype=torch.float32),
+            requires_grad=False,
         )
-        self.hc_scale = nn.Parameter(torch.zeros(3, dtype=torch.float32))
-        self.hc_base = nn.Parameter(torch.zeros(self.hc_mult3, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(
+            torch.zeros(3, dtype=torch.float32), requires_grad=False
+        )
+        self.hc_base = nn.Parameter(
+            torch.zeros(self.hc_mult3, dtype=torch.float32), requires_grad=False
+        )
 
     # ── mHC pre -- the folded input, and ONE Sinkhorn dispatch ────────────
     def mhc_pre(
