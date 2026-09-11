@@ -83,12 +83,14 @@ proved live by allocating one parameter inside the same patched window.
 
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 import inspect
 import json
 import os
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -639,6 +641,51 @@ def test_kv_spec_declared_parameters_are_reserved_and_unmaterialised(model) -> N
 STUB_SENTENCE = "is a stub created by"
 
 
+def _stub_markers(source: str) -> tuple[list[int], list[int]]:
+    """The lines of ``source`` that raise ``NotImplementedError`` or carry the sentence as code."""
+    # BOTH READINGS COME OFF THE PARSE TREE, so prose can neither satisfy nor defeat
+    # them. A text scan for either marker fails a file for EXPLAINING itself: a
+    # docstring that says what a stub used to raise is not a stub raising it, and this
+    # campaign has already spent a counted run on that exact false failure.
+    #
+    # BLANKING PROSE IS NOT THE REPAIR HERE, though it is the repair for text scans in
+    # this tree. A real stub's sentence lives in the MESSAGE of its raise, so blanking
+    # every string would leave the sentence reading unable to see a real stub at all --
+    # trading a reading that can fail wrongly for one that cannot fail at all. The
+    # docstring is excluded by identity instead, which is the narrowest exclusion that
+    # removes prose and keeps the stub form.
+    tree = ast.parse(textwrap.dedent(source))
+    raises = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or node.exc is None:
+            continue
+        raised = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+        if isinstance(raised, ast.Name) and raised.id == "NotImplementedError":
+            raises.append(node.lineno)
+    docstrings = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstrings.add(id(first.value))
+    sentences = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+        and STUB_SENTENCE in node.value
+    ]
+    return sorted(raises), sorted(sentences)
+
+
 def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     """Every compute site COMPUTES -- the census this node id names has inverted.
 
@@ -647,7 +694,8 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     measure. The reading is inverted rather than deleted: the same eleven forwards
     are still walked, in ``inc-glm53f-051``'s source-reading form, and each must now
     carry NO stub sentence and raise no ``NotImplementedError``; the module-wide
-    sentence count must be 0.
+    sentence count must be 0. All three readings are taken off the parse tree, so a
+    comment or a docstring that NAMES either marker cannot fail them (:func:`_stub_markers`).
 
     THE NODE ID IS KEPT ON PURPOSE, though the name now reads backwards. 108 files
     in this campaign's records join on this node id -- the increment plan, ``-013``'s
@@ -728,13 +776,15 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
             f"{cls.forward.__qualname__}, so this census would read another "
             f"class's source"
         )
-        source = inspect.getsource(cls.forward)
-        assert STUB_SENTENCE not in source, (
-            f"{name} still carries the stub sentence, so a compute site this "
-            f"campaign has declared landed is still a stub"
+        raises, sentences = _stub_markers(inspect.getsource(cls.forward))
+        assert not sentences, (
+            f"{name} still carries the stub sentence as code, at line(s) "
+            f"{sentences} of its own source, so a compute site this campaign has "
+            f"declared landed is still a stub"
         )
-        assert "NotImplementedError" not in source, (
-            f"{name} still raises NotImplementedError"
+        assert not raises, (
+            f"{name} still raises NotImplementedError, at line(s) {raises} of its "
+            f"own source"
         )
         read.append(name)
 
@@ -742,7 +792,12 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     # another rather than each on its own. While stubs existed this count had to
     # equal the number of arms; now it has to be ZERO, and a sentence left anywhere
     # in the module is a stub no arm above reaches.
-    sentences = inspect.getsource(impl).count(STUB_SENTENCE)
+    # Read as code, by the same predicate the per-forward readings use, and for the
+    # same reason: over a whole module the chance of prose naming the sentence is
+    # larger, not smaller, and this count is the one that speaks for every line the
+    # walk above does not reach.
+    _, module_sentence_lines = _stub_markers(inspect.getsource(impl))
+    sentences = len(module_sentence_lines)
     _record(stub_sentences_in_module=sentences)
     # The two keys ``inc-glm53f-013``'s acceptance script reads out of this item's
     # JSON sink (``accept-013-r1-host.sh:84``) are still written, so that record's
@@ -751,9 +806,10 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     _record(retired_forwards_still_stubbed=[])
     _record(forwards_read_as_implemented=read)
     assert sentences == 0, (
-        f"model_fp8.py carries {sentences} stub sentences while this census "
-        f"asserts every compute site is implemented; every sentence owes an arm, "
-        f"so a leftover is a stub nothing above guards"
+        f"model_fp8.py carries {sentences} stub sentences as code, at line(s) "
+        f"{module_sentence_lines}, while this census asserts every compute site is "
+        f"implemented; every sentence owes an arm, so a leftover is a stub nothing "
+        f"above guards"
     )
 
     # ---- THE POSITIVE CONTROL, RE-GROUNDED ON A REAL FORWARD. An absence is not a
@@ -769,14 +825,34 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
         f"{len(probe_source.splitlines())} lines; a near-empty read would make "
         f"every absence above vacuous"
     )
-    planted = probe_source + f"\n    # {STUB_SENTENCE} a control\n"
-    assert STUB_SENTENCE in planted, (
-        "the stub-sentence scan cannot find the sentence in a source that "
-        "carries it, so every absence read above says nothing"
+    # THE PLANTED MARKER IS THE FORM A STUB REALLY HAD, not the sentence in a comment.
+    # A comment was what this control used to plant, and the readings above no longer
+    # see one -- so the old control would now arm nothing. What every stub in this
+    # module actually was is a raise whose message carries the sentence, so that is
+    # what a copy of a real forward gets, and BOTH readings have to fire on it.
+    assert _stub_markers(probe_source) == ([], []), (
+        "the control's own forward already reads as a stub, so a planted marker "
+        "would prove nothing"
     )
-    assert STUB_SENTENCE not in probe_source, (
-        "the control's own source already carries the sentence, so the planted "
-        "marker proves nothing"
+    planted = textwrap.dedent(probe_source) + (
+        "    raise NotImplementedError(\n"
+        f'        "{type(probe).__name__}.forward {STUB_SENTENCE} "\n'
+        '        "a control, to arm the two readings above"\n'
+        "    )\n"
+    )
+    planted_raises, planted_sentences = _stub_markers(planted)
+    assert planted_raises and planted_sentences, (
+        f"a forward carrying a real stub raise reads as raises={planted_raises} "
+        f"sentences={planted_sentences}; a reading that cannot find the thing when "
+        f"it IS there makes every absence above vacuous"
+    )
+    # AND THE PROSE FORM IS SHOWN NOT TO FIRE, which is the whole defect this repays.
+    # The same sentence in a comment is not a stub, and the reading that failed on one
+    # cost this campaign a counted run.
+    commented = textwrap.dedent(probe_source) + f"    # {STUB_SENTENCE} in a comment\n"
+    assert _stub_markers(commented) == ([], []), (
+        "a comment naming the stub sentence still reads as a stub, so the readings "
+        "above can be failed by a file that explains itself"
     )
 
 
