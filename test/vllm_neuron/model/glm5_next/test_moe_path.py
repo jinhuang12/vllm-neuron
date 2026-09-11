@@ -1396,8 +1396,28 @@ _ROW_INDEX_IN_GATE_UP = 3
 _ROW_INDEX_IN_DOWN = 4
 
 
-def _fullgraph(traced):
-    """``traced``, compiled the way the runner compiles, or a refusal to measure."""
+#: The spelling torch itself prints for a captured kernel-wrapper call target.
+_KERNEL_CALL_NAME = "nki_kernel_wrapper"
+
+
+def _kernel_calls_in(graph) -> list[str]:
+    """The kernel call targets one captured graph holds, in graph order."""
+    return [
+        str(node.target)
+        for node in graph.graph.nodes
+        if node.op == "call_function" and _KERNEL_CALL_NAME in str(node.target)
+    ]
+
+
+def _fullgraph(traced, graphs: list):
+    """``traced`` traced whole, every captured graph kept in ``graphs``.
+
+    The backend keeps the traced graph and hands back that graph's own callable --
+    the form this file's mapping diagnostic already reads. Dynamo's DEFAULT backend
+    lowers the captured graph through inductor, which cannot lower a kernel wrapper
+    at all, so leaving it in place answers a question about tracing with a lowering
+    failure; the serving path lowers nothing through inductor.
+    """
     from torch import _dynamo
     from vllm_neuron import envs as neuron_envs
 
@@ -1406,10 +1426,15 @@ def _fullgraph(traced):
             "VLLM_NEURON_DEBUG_MODE is set, so the runner would compile with "
             "fullgraph=False and this reading would measure nothing"
         )
+
+    def keep_graph(graph, _example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
     # Two items compile the same closure body; a cache hit would answer one of them
     # with the other one's trace.
     _dynamo.reset()
-    return torch.compile(traced, fullgraph=True)
+    return torch.compile(traced, fullgraph=True, backend=keep_graph)
 
 
 def _capture_limb_calls(bank, quant_config, case):
@@ -1477,8 +1502,9 @@ def test_moe_path_routed_limbs_trace_under_fullgraph() -> None:
     limbs over the operands that call recorded. The comparison is that same call's own
     limb answer, so a trace returning other numbers reds; the counters must read the
     declared triple, because a trace that returns without dispatching proves nothing.
-    The backend is dynamo's own: the runner's remaining options are ``neuronx-cc``
-    arguments that reach the compiler and never the tracer.
+    THE READING IS THE TRACE, so the backend keeps the captured graph and runs it:
+    the three kernel calls must stand in that graph, and dynamo's default backend
+    would instead lower it through inductor, which can never lower a kernel wrapper.
     """
     bank, _text_config = _build_bank()
     quant_config = _block_quant_config()
@@ -1489,11 +1515,24 @@ def test_moe_path_routed_limbs_trace_under_fullgraph() -> None:
 
     _reset_limb_counters()
     intact = getattr(_seam_module, _LIMB_LAUNCH_ORDER[0])
-    got = _fullgraph(_limbs_over(intact))(*operands).to(torch.float32)
+    graphs: list = []
+    got = _fullgraph(_limbs_over(intact), graphs)(*operands).to(torch.float32)
     counters = _limb_counters()
+    kernel_calls = [call for graph in graphs for call in _kernel_calls_in(graph)]
+    declared_calls = sum(nki for nki, _fallback in DECLARED_LIMB_DISPATCHES)
     print(
-        f"[fullgraph] limb_counters={counters} returned_shape={tuple(got.shape)} "
+        f"[fullgraph] captured_graphs={len(graphs)} kernel_calls={kernel_calls} "
+        f"limb_counters={counters} returned_shape={tuple(got.shape)} "
         f"max_rel_error={_max_rel_error(got, want):.6e} rtol={RTOL} atol={ATOL}"
+    )
+    assert len(graphs) == 1, (
+        f"{len(graphs)} graphs reached the backend, want the one whole trace; "
+        f"under fullgraph a second graph cannot happen and none means no trace"
+    )
+    assert len(kernel_calls) == declared_calls, (
+        f"the captured graph holds {kernel_calls}, want {declared_calls} kernel "
+        f"calls; every call target it holds is "
+        f"{[str(node.target) for node in graphs[0].graph.nodes]}"
     )
     assert counters == DECLARED_LIMB_DISPATCHES, (
         f"the compiled limbs read {counters}, declared {DECLARED_LIMB_DISPATCHES}; "
@@ -1528,10 +1567,11 @@ def test_moe_path_planted_host_read_breaks_the_limb_trace() -> None:
     refusals = _dynamo_refusal_classes()
     eager = _limbs_over(planted)(*operands).to(torch.float32)
     torch.testing.assert_close(eager, want, rtol=RTOL, atol=ATOL)
+    graphs: list = []
     with pytest.raises(refusals) as refused:
-        _fullgraph(_limbs_over(planted))(*operands)
+        _fullgraph(_limbs_over(planted), graphs)(*operands)
     print(
-        f"[planted-host-read] host_reads={read[:1]} "
+        f"[planted-host-read] host_reads={read[:1]} captured_graphs={len(graphs)} "
         f"refusal={type(refused.value).__name__} "
         f"declared={[cls.__name__ for cls in refusals]} "
         f"message_head={str(refused.value).splitlines()[:1]}"
