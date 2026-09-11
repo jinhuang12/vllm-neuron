@@ -262,15 +262,18 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     carriers = translated["layer_carriers"]
     assert len(carriers) == 2
     sparse, linear = carriers
-    # RE-PINNED: the view's length is the window's, not this step's pages. The reading this
+    # RE-PINNED: the view's length is the window's, not this step's pages, because a length
+    # that follows the position is a new graph at every step. The reading this
     # replaces, verbatim: "Eight tokens at position 0 occupy two pages of four" —
     # `assert int(sparse["latent_cache"].shape[0]) == 2 * PAGE`. Those two pages are still
     # the ones this step writes, and they are the front of the window, so the second line
     # keeps the original claim.
     assert int(sparse["latent_cache"].shape[0]) == _window_slots(host_row)
     assert int(sparse["latent_cache"].shape[0]) >= 2 * PAGE
-    # RE-PINNED: the position arrives as a tensor, and this item's carrier is on `meta`,
-    # where a value does not exist to be read. The reading this replaces, verbatim:
+    # RE-PINNED: the position arrives as a tensor -- for the window's own reason, that a
+    # host number here is baked into the graph it was captured with -- and this item's
+    # carrier is on `meta`, where a value does not exist to be read. The reading this
+    # replaces, verbatim:
     # `assert int(sparse["start_position"]) == 0`. What `meta` does answer is the operand's
     # form, which is what a captured graph depends on; the VALUE is read where it is
     # readable, on the continuing CPU step in A05.
@@ -280,8 +283,8 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     assert sparse["latent_cache"].device.type == "meta"
     # The linear layer's carrier is the bank's slot, which the row's first id names.
     assert tuple(linear["conv_state"].shape) == (4, 6)
-    # RE-PINNED for the same reason, replacing
-    # `assert int(linear["start_position"]) == 0`.
+    # RE-PINNED for the same reason -- a host number at this boundary is a captured
+    # constant -- replacing `assert int(linear["start_position"]) == 0`.
     assert tuple(linear["start_position"].shape) == ()
     assert linear["start_position"].device.type == "meta"
 
@@ -313,7 +316,9 @@ def test_a02_the_host_row_is_the_one_the_slice_follows() -> None:
     translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
 
     carrier = translated["layer_carriers"][0]
-    # RE-PINNED: the length is the window's. The reading this replaces, verbatim: "Six
+    # RE-PINNED: the length is the window's, which is one number for every position in the
+    # bucket where the step's own pages were a different number each step. The reading
+    # this replaces, verbatim: "Six
     # tokens at position 0 occupy two pages, and they are the host row's first two" —
     # `assert int(carrier["latent_cache"].shape[0]) == 2 * PAGE`. Which row the view follows
     # is what this item measures, and the pointer line below is what measures it.
@@ -348,7 +353,8 @@ def test_a03_a_padded_device_table_does_not_decide_the_request_count() -> None:
 
     translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
 
-    # RE-PINNED: the length is the window's, which for this two-entry row is two pages. The
+    # RE-PINNED: the length is the window's, which for this two-entry row is two pages, and
+    # it is that length at every position rather than at this one. The
     # reading this replaces, verbatim:
     # `assert int(translated["layer_carriers"][0]["latent_cache"].shape[0]) == PAGE`. What
     # this item measures is that the step was NOT refused as a four-request batch, and a
@@ -406,7 +412,9 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     (``model_fp8.py:6859``). A basic slice is a view, so both land in the bank. A gather
     would return a copy, and the write would be discarded where the next step reads.
 
-    RE-PINNED. The length is now the bucket's window and the read is the whole of it. The
+    RE-PINNED. The length is now the bucket's window and the read is the whole of it,
+    because the old length was derived from the position and therefore held only for the
+    step it was captured at. The
     rule this replaces, verbatim: "The slice spans the whole pages the request's own tokens
     occupy, counted from the request's first page: ``ceil((start_position + tokens) / page)``
     pages. It therefore covers ``start_position + tokens`` slots, which is the bound the
@@ -437,6 +445,7 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     assert pages == 3
     # RE-PINNED: `assert int(view.shape[0]) == pages * PAGE` became the two clauses of that
     # reading which survive the window -- whole pages, and enough of them for this step.
+    # `pages` counts THIS step's, and a length counted that way moves as the step does.
     # The EXACT length is the window's now and belongs to the item that measures the window;
     # pinning it here would also cost this item its base-passing arm, which is the whole
     # reason it is in the file.
@@ -497,7 +506,8 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
         _kwargs(banks, entry, tokens=tokens, device=meta)
     )["layer_carriers"][0]
     # RE-PINNED: the cache side is sliced the way the layer slices it, and the layer now
-    # reads the window WHOLE. The reading this replaces, verbatim:
+    # reads the window WHOLE, so the extent it reads is the bucket's and not this step's.
+    # The reading this replaces, verbatim:
     # `start = int(carrier["start_position"])` then
     # `c_kv = carrier["latent_cache"][: start + tokens, 0, :]`. That `int()` cannot answer on
     # a `meta` carrier, and reading a length off the position is what the window removed.
