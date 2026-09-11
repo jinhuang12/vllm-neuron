@@ -14,6 +14,14 @@ import pytest
 import torch
 import torch.nn as nn
 
+from .test_load_weights import (  # noqa: F401 -- the fixture is used by name
+    _dense_config,
+    _dense_model,
+    _mappings_for,
+    _write_miniature_checkpoint,
+    single_rank_process_group,
+)
+
 SENT = "WFLOAD"
 
 
@@ -178,4 +186,91 @@ def test_a_loaded_but_unbound_layer_refuses_a_streams_call() -> None:
     assert site is not None, (
         "the same call returns no site after a bind, so the refusal above says "
         "nothing about the bind being what is missing"
+    )
+
+
+def _lite_loaded(tmp_path):
+    """A dense miniature tree after the weights-free hook, with its checkpoint."""
+    directory = tmp_path / "weights-free"
+    model = _dense_model()
+    written = _write_miniature_checkpoint(directory, _mappings_for(_dense_config()), model)
+    say("fixture", f"tensors_written={written}|declared={len(model.declared_parameter_names())}")
+    model.load_weights_lite(str(directory), torch.device("cpu"), None)
+    return model
+
+
+# --------------------------------------------------------------------------- #
+# (5) The hook leaves every declared leaf a meta tensor of its own shape.       #
+# --------------------------------------------------------------------------- #
+def test_the_hook_materialises_every_declared_leaf_on_meta(
+    tmp_path, single_rank_process_group
+) -> None:
+    """No leaf is left None or shape-free, and every one of them is on meta."""
+    model = _lite_loaded(tmp_path)
+
+    declared = model.declared_parameter_names()
+    by_name = dict(model.named_parameters())
+    none_count = sum(1 for name in declared if by_name.get(name) is None)
+    lazy_count = sum(
+        1
+        for parameter in by_name.values()
+        if torch.nn.parameter.is_lazy(parameter)
+    )
+    off_meta = sorted(
+        name for name, parameter in by_name.items() if parameter.device.type != "meta"
+    )
+    shapeless = sorted(
+        name
+        for name, parameter in by_name.items()
+        if not torch.nn.parameter.is_lazy(parameter) and parameter.dim() == 0
+    )
+    say(
+        "materialised",
+        f"declared={len(declared)}|named={len(by_name)}|none={none_count}",
+        f"lazy={lazy_count}|off_meta={len(off_meta)}|shapeless={len(shapeless)}",
+    )
+    assert (none_count, lazy_count, off_meta, shapeless) == (0, 0, [], []), (
+        f"the hook left {none_count} leaves unset, {lazy_count} shape-free, "
+        f"{len(off_meta)} off meta and {len(shapeless)} without a shape; a load "
+        f"that leaves any of those cannot reach a forward"
+    )
+    assert len(by_name) == len(declared), (
+        f"the hook materialised {len(by_name)} of {len(declared)} declared "
+        f"parameters, so the walk visited a different set than the declaration"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (6) Both refusals that stop a weights-free forward are cleared.               #
+# --------------------------------------------------------------------------- #
+def test_the_hook_clears_both_refusals_the_forward_hits(
+    tmp_path, single_rank_process_group
+) -> None:
+    """The embedding table is set, and every mHC layer has its two sites."""
+    impl = _impl()
+    model = _lite_loaded(tmp_path)
+
+    table = model.model.embed_tokens_weight
+    layers = [
+        layer
+        for layer in model.model.modules()
+        if hasattr(type(layer), "bind_hyper_connection_sites")
+    ]
+    counts = sorted(
+        len(getattr(layer, impl.MHC_SITES_ATTR, {}))
+        for layer in layers
+        if any(getattr(layer, leaf, None) is not None for leaf in impl.MHC_LEAVES)
+    )
+    say(
+        "forward-preconditions",
+        f"table={None if table is None else tuple(table.shape)}",
+        f"mhc_layers={len(counts)}|site_counts={sorted(set(counts))}",
+    )
+    assert table is not None and table.dim() == 2, (
+        "the embedding table is still unset after the hook, so the root forward "
+        "refuses before any layer runs"
+    )
+    assert counts and set(counts) == {2}, (
+        f"the layers carrying mHC weights hold site counts {sorted(set(counts))}, "
+        f"so a streams call on one of them has nothing to run"
     )
