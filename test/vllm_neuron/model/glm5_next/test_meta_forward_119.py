@@ -16,7 +16,7 @@ WHAT THIS FILE IS ABOUT. Graph extraction builds the whole batch on ``meta``
 tensor cannot run there, and two of them were on the path: the converter's geometry reads,
 which ``test_host_geometry_119.py`` covers, and the attention seam's selected-row range
 refusal (``mla_sparse.py:1411``), which every MLA layer of every step reaches
-(``model_fp8.py:6850``, unconditionally).
+(``model_fp8.py:6873``, unconditionally).
 
 THE TWO ITEMS
 
@@ -139,14 +139,14 @@ def _meta_root_and_runner():
     THE HYPER-CONNECTION SITES NEED THE SAME TREATMENT, AND ``.to()`` CANNOT GIVE IT. Each
     layer holds its two mHC sites in a plain dict rather than as submodules, so no
     ``.to(device)`` visits them and their weights stay wherever the load put them -- the
-    load's own refusal says exactly that (``model_fp8.py:8084-8089``). They are re-bound here
+    load's own refusal says exactly that (``model_fp8.py:8107-8112``). They are re-bound here
     at the device the rest of the model now holds, through the same method the load calls
-    (``model_fp8.py:8830``), or the first mHC layer meets a CPU weight with ``meta``
+    (``model_fp8.py:8989``), or the first mHC layer meets a CPU weight with ``meta``
     activations.
 
     THE BIND RUNS UNDER A DEFAULT-DEVICE CONTEXT, and that is not decoration. The method
     builds a fresh site object and assigns each loaded weight onto that object's own
-    parameter (``model_fp8.py:8101``); the object is allocated wherever the default device
+    parameter (``model_fp8.py:8130``); the object is allocated wherever the default device
     points, so a bind that targets any other device assigns across two tensor types and
     ``set_data`` refuses. The context makes the site the method builds land on the device
     the bind was asked for.
@@ -256,7 +256,7 @@ def _stand_down_every_route_but_the_seam(monkeypatch) -> list[str]:
     (``neuron_utils.py:17-24``), so a route it guards is taken on ``meta`` too. Two limbs
     reach every module: each module binds the name at its own import, so a module already
     imported is patched by name here; a module imported later inside a method
-    (``model_fp8.py:4748`` is one) reads the source, which is patched too. The seam under
+    (``model_fp8.py:4771`` is one) reads the source, which is patched too. The seam under
     test keeps the real route, so the forward still reaches the dispatch the stand-in holds.
 
     AND ONE MODULE IS SPARED, because standing its route down stops the forward instead of

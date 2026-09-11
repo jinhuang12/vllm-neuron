@@ -37,7 +37,7 @@ THE SIX HOST-GEOMETRY ITEMS
   the bank rather than a copy. This item reads the same at the base, because it is about the
   rule the converter has always implemented rather than about the source it reads.
 * A06 -- the second host read on the same path. Every MLA layer of every step calls
-  ``mla_sparse_attention`` (``model_fp8.py:6850``), whose range refusal read the selected-row
+  ``mla_sparse_attention`` (``model_fp8.py:6873``), whose range refusal read the selected-row
   range with ``int(...)``. The seam now reaches its dispatch on a captured step's own
   carrier; at the base it raises the same meta read, one seam further along than A01.
 
@@ -351,11 +351,11 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     THE RULE. The slice spans the whole pages the request's own tokens occupy, counted from
     the request's first page: ``ceil((start_position + tokens) / page)`` pages. It therefore
     covers ``start_position + tokens`` slots, which is the bound the layer checks before it
-    writes (``model_fp8.py:6817-6822``), and its rows are the request's own.
+    writes (``model_fp8.py:6840-6845``), and its rows are the request's own.
 
     WHY THE ALIAS MATTERS. The layer writes this step's latents THROUGH the slice
-    (``model_fp8.py:6832``) and reads slot 0 to the last written slot back out of it
-    (``model_fp8.py:6836``). A basic slice is a view, so both land in the bank. A gather
+    (``model_fp8.py:6855``) and reads slot 0 to the last written slot back out of it
+    (``model_fp8.py:6859``). A basic slice is a view, so both land in the bank. A gather
     would return a copy, and the write would be discarded where the next step reads.
     """
     cpu = torch.device("cpu")
@@ -398,7 +398,7 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     ``mla_sparse_attention`` refused an out-of-range selected row by reading the row range
     with ``int(...)`` (``mla_sparse.py:1411``), which is the same call the converter used to
     make and which a ``meta`` tensor cannot answer. Every MLA layer of every step goes
-    through that seam (``model_fp8.py:6850``, unconditionally), so a captured prefill reached
+    through that seam (``model_fp8.py:6873``, unconditionally), so a captured prefill reached
     it and stopped there.
 
     WHAT THIS ITEM MEASURES AND WHAT IT DOES NOT. It measures that the call gets PAST the
@@ -407,7 +407,7 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     a vendor question and ``D01`` in ``test_meta_forward_119.py`` reports it.
 
     THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, sliced the
-    way the layer slices it (``model_fp8.py:6832``, ``model_fp8.py:6836``), and the scale is the
+    way the layer slices it (``model_fp8.py:6855``, ``model_fp8.py:6859``), and the scale is the
     carrier's own. The selected-row width is the seam's declared tile, ``KEY_CHUNK``,
     imported rather than typed: the admissibility clause requires a positive multiple of it
     (``mla_sparse.py:1293-1299``).
