@@ -1162,8 +1162,13 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
         )
 
     # ---- THE CONTROL: one table for the whole stack lands the sparse slice elsewhere.
+    # THE SHARED ROW STILL HAS TO ADDRESS THE STEP: what this control varies is WHOSE table the
+    # lookup goes through, not how wide the row is, and a real shared table hands every group
+    # the same full-width row. The measurement is unchanged -- this run of pages starts away
+    # from `sparse_row`, and the recurrent banks read the first entry, the slot, as before.
+    shared_row = [state_slot + offset for offset in range(_blocks_for(tokens))]
     single = {
-        bank["name"]: _entry(row=[state_slot], tokens=tokens, cached=0, threshold=1,
+        bank["name"]: _entry(row=shared_row, tokens=tokens, cached=0, threshold=1,
                              block_size=item.MLA_PAGE_SIZE)
         for bank in banks
     }
