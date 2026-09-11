@@ -51,12 +51,17 @@ THE TWO ITEMS
   whether anything of the arm was still standing when it ran, because that is the one way
   its rows could report the arm instead of the vendor.
 
-WHAT A07 DOES NOT MEASURE. Any kernel's own answer to ``meta`` inputs: the stand-in replaces
-that for the seam, the stand-down replaces it wherever a torch path exists, and the held
-dispatch supplies the operands everywhere else. What A07 drives is the candidate's own host
-code -- the runner's kwargs builder, the converter's geometry reads and each module's torch
-route -- all of which is device-independent and readable in this repository. D01 is where the
-vendor's answer is reported, without a verdict attached.
+SO EVERY KERNEL-CLASS DISPATCH ON THE PATH IS EITHER STOOD IN -- the seven declared sites
+below -- OR STOOD DOWN onto its own torch oracle, and each of the seven is read per site
+rather than as a total, because a module that never consults the predicate does not care what
+the predicate was rebound to.
+
+WHAT A07 DOES NOT MEASURE, AND WHOSE QUESTION THAT IS. Any kernel's own answer to ``meta``
+inputs is D01's question, not this item's. What A07 measures is the torch orchestration
+BETWEEN the kernels, on ``meta``, for host reads of a value: the runner's kwargs builder, the
+converter's geometry reads, the carriers, the mHC affinity and combine oracle, the norms and
+residuals, the DSA oracles, the MoE mapping flow and the seam's own dispatch. That is the
+defect class this file exists for, and it is a criterion.
 
 THE BASE ARM, DECLARED: A07 FAILS and D01 PASSES.
 """
@@ -64,6 +69,7 @@ THE BASE ARM, DECLARED: A07 FAILS and D01 PASSES.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import traceback
 
@@ -95,6 +101,25 @@ BEFORE_THE_SEAM = (
 #: The one module whose seam RAISES on an unavailable route instead of taking a torch path
 #: (``mhc/sinkhorn.py:996-1002``), so its predicate is the one the stand-down leaves alone.
 RAISES_RATHER_THAN_FALLING_BACK = f"{FUNCTIONAL}.mhc.sinkhorn"
+
+#: One module on this path that IS gated and DOES carry a torch oracle
+#: (``mhc/hyper_connection.py:423``), where standing the predicate down is what routes around
+#: the vendor. The premise reads the stand-down there, and nowhere else: at a site that never
+#: consults the predicate, the rebound name says nothing about what ran.
+STOOD_DOWN_ON_THE_PATH = f"{FUNCTIONAL}.mhc.hyper_connection"
+
+#: The six dispatch sites on this path that no stand-down can reach -- five that never consult
+#: their own predicate and one that refuses instead of falling back -- and the kernel each one
+#: enters. The seam's own declared stand-in is the seventh site, counted by its own list. Both
+#: legs reach all seven, so the premise reads them site by site.
+DECLARED_SITES = {
+    "mhc/sinkhorn.py:1005": "sinkhorn_blocks_kernel",
+    "attention/mla_projections.py:272": "mla_projection_kernel",
+    "attention/mla_absorb.py:322": "mla_absorb_kernel",
+    "moe/moe_blockwise_fp8.py:1354": "moe_gate_up_blockwise_fp8_kernel",
+    "moe/moe_blockwise_fp8.py:1638": "moe_swiglu_transposed_kernel",
+    "moe/moe_blockwise_fp8.py:1865": "moe_down_blockwise_fp8_kernel",
+}
 
 #: The vendor's dispatch wrapper and the route predicate as they are BEFORE anything here
 #: patches them: what a held dispatch calls, and what the teardown hands back.
@@ -368,21 +393,33 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
                     f"the {leg} forward read a value off a tensor at "
                     f"{_site_of(error)}: {error}"
                 )
-            # THE ITEM'S OWN PREMISE, CHECKED BEFORE ITS OUTCOME IS JUDGED. Both limbs of
-            # the stand-down are visible here: a module imported before the patch was
-            # patched by name, and one imported during the forward read the patched source.
-            # THE PREDICATE IS NOT WHAT HOLDS THESE TWO, though -- neither seam consults it
-            # (``mla_projections.py:271-272``) -- so each one's dispatch is read as well.
+            # THE ITEM'S OWN PREMISE, CHECKED BEFORE ITS OUTCOME IS JUDGED, AND READ PER SITE.
+            # Every declared dispatch was entered, so nothing on this path decided the leg's
+            # outcome by running a kernel on meta. A total would pass with one site missing.
+            entered = [held.rsplit(".", 1)[-1] for held in crossed]
+            for site, kernel in DECLARED_SITES.items():
+                assert kernel in entered, (
+                    f"the {leg} forward never entered the declared dispatch at {site}, so "
+                    f"nothing stood in for {kernel} and its own answer to meta inputs "
+                    f"decided this leg; entered: {sorted(set(entered))}"
+                    + (f". It stopped at {_site_of(error)}: {error}" if error else "")
+                )
+            # AND THE STAND-DOWN IS READ WHERE THE PREDICATE IS ACTUALLY CONSULTED. At a site
+            # that never reads it, the rebound name would say nothing about what ran.
+            gated = sys.modules.get(STOOD_DOWN_ON_THE_PATH)
+            assert gated is not None and gated.can_run_kernel is _refuses_every_route, (
+                f"{STOOD_DOWN_ON_THE_PATH} kept its own kernel route, so the {leg} outcome "
+                f"at every gated site is the vendor's answer to meta inputs"
+            )
+            # The two modules the layer reaches before the seam are read as well: they must
+            # have been imported, and their dispatch -- which they enter whatever the
+            # predicate says (``mla_projections.py:271-272``) -- must be held.
             for module_name in BEFORE_THE_SEAM:
                 reached = sys.modules.get(module_name)
                 assert reached is not None, (
                     f"the {leg} forward never imported {module_name}, so nothing was "
                     f"measured against the layer that runs before the seam; it stopped at "
                     f"{_site_of(error) if error else 'no failure'}: {error}"
-                )
-                assert reached.can_run_kernel is _refuses_every_route, (
-                    f"{module_name} kept its own kernel route, so the {leg} outcome is the "
-                    f"vendor's answer to meta inputs and not this candidate's"
                 )
                 assert reached.wrap_nki is not REAL_WRAP_NKI, (
                     f"{module_name} kept the vendor dispatch, which it enters whatever the "
@@ -398,7 +435,6 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
                 + (f"; it stopped at {_site_of(error)}: {error}" if error else "")
             )
             assert dispatched, f"the {leg} forward never entered the declared stand-in"
-            assert crossed, f"the {leg} forward crossed no held dispatch"
             dispatched.clear()
             crossed.clear()
     finally:
@@ -418,6 +454,11 @@ def test_d01_reports_whether_a_meta_forward_completes_at_the_real_boundary() -> 
     repository -- the package is installed on the host and nowhere else -- so it is reported
     from the venue that can see it and left to the lead. A ``completed=no`` here is a
     finding, not a failure: A07 above already carries the criterion this increment declares.
+
+    AND THE ROW NAMES THE VENUE IT ASKED. On this lane the dispatch goes to the simulator
+    rather than to a device (``neuron_utils.py:17-24``), so what a ``completed=no`` row reports
+    is the SIMULATOR's answer to ``meta`` inputs. A device may answer differently, and nothing
+    here claims otherwise.
 
     AND THE ROW SAYS WHOSE ROUTE IT READ. ``monkeypatch`` restores what it set, so A07's
     treatments come off the modules that existed when it ran -- but a module A07 imported
@@ -439,6 +480,7 @@ def test_d01_reports_whether_a_meta_forward_completes_at_the_real_boundary() -> 
         print(
             f"DIAG|meta_forward|leg={leg}|completed={'yes' if completed else 'no'}"
             f"|route={'real' if not standing else 'arm:' + ','.join(standing)}"
+            f"|venue={'nki_simulator' if os.environ.get('NKI_SIMULATOR') == '1' else 'device'}"
             f"|seam_dispatch={counters[0]}"
             f"|error={'none' if error is None else str(error).splitlines()[0]}"
             f"|site={'none' if error is None else _site_of(error)}"
