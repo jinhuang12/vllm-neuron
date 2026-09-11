@@ -23,30 +23,47 @@ THE TWO ITEMS
 * A07 -- the whole tiny root forward on ``meta``, at the prefill bucket and at decode,
   through the runner's own capture entry points and its own kwargs builder. It requires
   that the forward COMPLETES, that NO host read of a tensor value happens anywhere on that
-  path, and that it reached the attention seam's dispatch. ONE STAND-IN IS DECLARED: the
-  NKI dispatch inside the seam returns the seam's declared output shape on ``meta``
-  instead of entering the vendor kernel. That is the landed capture-sites pattern for a
-  backend boundary (``tiny/test_tiny_glm5next_capture_sites.py:120-139``). AND EVERY OTHER
-  NKI ROUTE IS STOOD DOWN: the same layer enters the real vendor boundary in
-  ``mla_projections`` and in ``mla_absorb`` before it ever reaches this seam, so without
-  that stand-down the item's outcome would be the vendor's answer to ``meta`` inputs
-  rather than the candidate's.
+  path, and that it reached the attention seam's dispatch. THE ARM HOLDS EVERY KERNEL ROUTE
+  IT DOES NOT MEASURE, and those routes differ in three ways that need three treatments:
+
+  - the seam under test keeps its real route, and ONE STAND-IN IS DECLARED at its NKI
+    dispatch, which returns the seam's declared output shape on ``meta``
+    (``mla_sparse.py:1331``) instead of entering the vendor kernel. That is the landed
+    capture-sites pattern for a backend boundary
+    (``tiny/test_tiny_glm5next_capture_sites.py:120-139``);
+  - EVERY OTHER ROUTE PREDICATE IS STOOD DOWN, so each module takes its own torch path --
+    every module but one. The batched sinkhorn RAISES when the route is unavailable instead
+    of falling back (``mhc/sinkhorn.py:996-1002``), because kernel-class work ships no torch
+    path, so standing that one down stops the forward at the first mHC layer;
+  - AND EVERY OTHER VENDOR DISPATCH IS HELD BY THE ARM, because a seam that never consults
+    the predicate cannot be stood down at all: the MLA projections, the absorb and the three
+    MoE limbs dispatch unconditionally (``mla_projections.py:271-272``,
+    ``mla_absorb.py:321-322``, ``moe_blockwise_fp8.py:1353-1354``). A held dispatch crosses
+    the REAL boundary on operands the arm makes at the shapes it was handed -- a ``meta``
+    tensor carries no value to hand over -- and returns the result on ``meta`` for the
+    forward to carry on with. The kernel still decides the output's shape, so this file
+    declares no kernel's output shape but the seam's own.
 * D01 -- THE DIAGNOSTIC, and it is not a criterion. The same two legs with the REAL vendor
   boundary, reported and never asserted: one row per leg saying whether the forward
   completed and, if it did not, the first line of the failure and the site. It passes
   whatever the answer is, because what a vendor entry point does with ``meta`` inputs is a
-  campaign finding for the lead and not this increment's acceptance.
+  campaign finding for the lead and not this increment's acceptance. Its row also names
+  whether anything of the arm was still standing when it ran, because that is the one way
+  its rows could report the arm instead of the vendor.
 
-WHAT A07 DOES NOT MEASURE. Any kernel's own behaviour on ``meta``: the stand-in replaces
-that for the seam and the stand-down replaces it everywhere else, so what A07 drives outside
-the seam is each module's torch route, which is device-independent and readable in this
-repository. D01 is where the vendor's answer is reported, without a verdict attached.
+WHAT A07 DOES NOT MEASURE. Any kernel's own answer to ``meta`` inputs: the stand-in replaces
+that for the seam, the stand-down replaces it wherever a torch path exists, and the held
+dispatch supplies the operands everywhere else. What A07 drives is the candidate's own host
+code -- the runner's kwargs builder, the converter's geometry reads and each module's torch
+route -- all of which is device-independent and readable in this repository. D01 is where the
+vendor's answer is reported, without a verdict attached.
 
 THE BASE ARM, DECLARED: A07 FAILS and D01 PASSES.
 """
 
 from __future__ import annotations
 
+import importlib
 import sys
 import traceback
 
@@ -67,13 +84,23 @@ pytestmark = [pytest.mark.fast, pytest.mark.forked]
 #: The two legs a captured step is extracted for, with the entry point each one drives.
 LEGS = ("prefill", "decode")
 
-#: The functional package whose kernel routes A07 stands down, and the two modules the
-#: layer reaches before the seam, which the stand-down is checked on afterwards.
+#: The functional package whose kernel routes A07 holds, and the two modules the layer
+#: reaches before the seam, which both treatments are checked on afterwards.
 FUNCTIONAL = "vllm_neuron.functional"
 BEFORE_THE_SEAM = (
     f"{FUNCTIONAL}.attention.mla_projections",
     f"{FUNCTIONAL}.attention.mla_absorb",
 )
+
+#: The one module whose seam RAISES on an unavailable route instead of taking a torch path
+#: (``mhc/sinkhorn.py:996-1002``), so its predicate is the one the stand-down leaves alone.
+RAISES_RATHER_THAN_FALLING_BACK = f"{FUNCTIONAL}.mhc.sinkhorn"
+
+#: The vendor's dispatch wrapper and the route predicate as they are BEFORE anything here
+#: patches them: what a held dispatch calls, and what the teardown hands back.
+NKI_HOP = "libtorch_neuronx_lite.nki.nki_hop"
+REAL_WRAP_NKI = importlib.import_module(NKI_HOP).wrap_nki
+REAL_CAN_RUN_KERNEL = neuron_utils.can_run_kernel
 
 
 def _meta_root_and_runner():
@@ -164,10 +191,17 @@ def _stand_down_every_route_but_the_seam(monkeypatch) -> list[str]:
     imported is patched by name here; a module imported later inside a method
     (``model_fp8.py:4748`` is one) reads the source, which is patched too. The seam under
     test keeps the real route, so the forward still reaches the dispatch the stand-in holds.
+
+    AND ONE MODULE IS SPARED, because standing its route down stops the forward instead of
+    routing around it: the batched sinkhorn raises when the route is unavailable rather than
+    taking a torch path. It is imported here so that it holds the real predicate BEFORE the
+    source is patched -- the second limb would otherwise reach it at the mHC layer's own
+    import and put back what this exemption exists to avoid.
     """
+    spared = importlib.import_module(RAISES_RATHER_THAN_FALLING_BACK)
     patched = []
     for name, module in sorted(sys.modules.items()):
-        if not name.startswith(FUNCTIONAL) or module is seam:
+        if not name.startswith(FUNCTIONAL) or module is seam or module is spared:
             continue
         if not hasattr(module, "can_run_kernel"):
             continue
@@ -175,6 +209,117 @@ def _stand_down_every_route_but_the_seam(monkeypatch) -> list[str]:
         patched.append(name)
     monkeypatch.setattr(neuron_utils, "can_run_kernel", _refuses_every_route)
     return patched
+
+
+class _HeldBoundary:
+    """One module's NKI dispatch, crossed on host operands and handed back on ``meta``.
+
+    A ``meta`` tensor carries no value, so the vendor kernel cannot be given the operands the
+    forward built. This makes them at the shapes it was handed -- ones where the operand is
+    floating point, because a seam of this family requires its affinities to be positive
+    (``mhc/sinkhorn.py:967-968``), and zeros where it is an index, which every table this
+    forward addresses holds -- crosses the REAL boundary, and returns the result on ``meta``.
+    The kernel decides the output's shape, so no shape is declared here.
+    """
+
+    def __init__(self, kernel, module: str, crossed: list[str]) -> None:
+        self.kernel, self.module, self.crossed = kernel, module, crossed
+        self.grid = None
+
+    def __getitem__(self, grid) -> _HeldBoundary:
+        """``wrap_nki(k)[n]`` is an SPMD launch grid, not an output arity: it is kept."""
+        self.grid = grid
+        return self
+
+    def __call__(self, *args, **kwargs):
+        name = getattr(self.kernel, "__name__", type(self.kernel).__name__)
+        self.crossed.append(f"{self.module}.{name}")
+        real = REAL_WRAP_NKI(self.kernel)
+        returned = (real if self.grid is None else real[self.grid])(
+            *(_on_the_host(value) for value in args),
+            **{key: _on_the_host(value) for key, value in kwargs.items()},
+        )
+        if isinstance(returned, tuple):
+            return tuple(_back_on_meta(value) for value in returned)
+        return _back_on_meta(returned)
+
+
+def _on_the_host(value):
+    """One operand as host data of its own shape, or unchanged if it is not a meta tensor."""
+    if not isinstance(value, torch.Tensor) or value.device.type != "meta":
+        return value
+    make = torch.ones if value.dtype.is_floating_point else torch.zeros
+    return make(tuple(value.shape), dtype=value.dtype)
+
+
+def _back_on_meta(value):
+    """One returned operand back where the forward is running."""
+    return value.to("meta") if isinstance(value, torch.Tensor) else value
+
+
+def _hold_every_dispatch_but_the_seam(monkeypatch, crossed: list[str]) -> list[str]:
+    """Hold the vendor dispatch in every functional module but the seam, and name them.
+
+    A SEAM THAT NEVER CONSULTS THE ROUTE PREDICATE CANNOT BE STOOD DOWN, and several on this
+    path do not: the MLA projections, the absorb and the MoE limbs call ``wrap_nki``
+    unconditionally, so the stand-down above decides nothing for them. Holding the dispatch
+    is what covers those, and it covers them without this file naming a single kernel: the
+    same two limbs as the stand-down reach every module, by name where the module is already
+    imported and through the source where it is imported later.
+    """
+    held = []
+    for name, module in sorted(sys.modules.items()):
+        if not name.startswith(FUNCTIONAL) or module is seam:
+            continue
+        if not hasattr(module, "wrap_nki"):
+            continue
+        monkeypatch.setattr(module, "wrap_nki", _make_holder(name, crossed))
+        held.append(name)
+    monkeypatch.setattr(importlib.import_module(NKI_HOP), "wrap_nki",
+                        _make_holder(NKI_HOP, crossed))
+    return held
+
+
+def _make_holder(module: str, crossed: list[str]):
+    """The ``wrap_nki`` one module binds while its dispatch is held."""
+
+    def hold(kernel) -> _HeldBoundary:
+        return _HeldBoundary(kernel, module, crossed)
+
+    return hold
+
+
+def _where_the_arm_still_stands() -> list[tuple]:
+    """``(module, field, what it should hold, module name)`` for each of this arm's objects."""
+    standing = []
+    for name, module in sorted(sys.modules.items()):
+        if not name.startswith(FUNCTIONAL):
+            continue
+        if getattr(module, "can_run_kernel", None) is _refuses_every_route:
+            standing.append((module, "can_run_kernel", REAL_CAN_RUN_KERNEL, name))
+        dispatch = getattr(module, "wrap_nki", None)
+        if dispatch is not None and dispatch is not REAL_WRAP_NKI:
+            standing.append((module, "wrap_nki", REAL_WRAP_NKI, name))
+    return standing
+
+
+def _standing_arm() -> list[str]:
+    """The same, as ``module.field`` names a row can carry."""
+    return [f"{name}.{field}" for _m, field, _real, name in _where_the_arm_still_stands()]
+
+
+def _hand_back_what_a_late_import_took() -> list[str]:
+    """Undo this arm in the modules ``monkeypatch`` cannot reach, and name what was undone.
+
+    ``monkeypatch`` restores what it SET. A module first imported DURING the forward was never
+    set: it read the patched source at its own import and kept the arm's objects for the life
+    of the process, so the next item in this file would report the arm and not the vendor.
+    """
+    handed_back = []
+    for module, field, real, name in _where_the_arm_still_stands():
+        setattr(module, field, real)
+        handed_back.append(f"{name}.{field}")
+    return handed_back
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -185,6 +330,7 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
 ) -> None:
     """Both legs, on ``meta``, with the one declared stand-in at the NKI dispatch."""
     dispatched: list[tuple] = []
+    crossed: list[str] = []
 
     def stand_in(entry):
         """The seam's declared return, ``[S, H, L]`` float32 (``mla_sparse.py:1331``)."""
@@ -199,50 +345,67 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
 
     monkeypatch.setattr(seam, "wrap_nki", stand_in)
     stood_down = _stand_down_every_route_but_the_seam(monkeypatch)
+    held = _hold_every_dispatch_but_the_seam(monkeypatch, crossed)
 
-    for leg in LEGS:
-        _, runner = _meta_root_and_runner()
-        seam.reset_mla_sparse_dispatch_counters()
-        completed, error = True, None
-        try:
-            _extract(runner, leg)
-        except Exception as caught:  # noqa: BLE001 -- classified below, not swallowed
-            completed, error = False, caught
-        counters = seam.mla_sparse_dispatch_counters()
-        print(
-            f"A07|{leg}|completed={'yes' if completed else 'no'}"
-            f"|seam_dispatch={counters[0]}|stand_in_calls={len(dispatched)}"
-            f"|stood_down={len(stood_down)}"
-            f"|error={'none' if error is None else str(error).splitlines()[0]}"
-        )
-        if error is not None:
-            assert not _reads_a_value(error), (
-                f"the {leg} forward read a value off a tensor at {_site_of(error)}: {error}"
+    try:
+        for leg in LEGS:
+            _, runner = _meta_root_and_runner()
+            seam.reset_mla_sparse_dispatch_counters()
+            completed, error = True, None
+            try:
+                _extract(runner, leg)
+            except Exception as caught:  # noqa: BLE001 -- classified below, not swallowed
+                completed, error = False, caught
+            counters = seam.mla_sparse_dispatch_counters()
+            print(
+                f"A07|{leg}|completed={'yes' if completed else 'no'}"
+                f"|seam_dispatch={counters[0]}|stand_in_calls={len(dispatched)}"
+                f"|stood_down={len(stood_down)}|held={len(held)}|crossed={len(crossed)}"
+                f"|error={'none' if error is None else str(error).splitlines()[0]}"
             )
-        # THE ITEM'S OWN PREMISE, CHECKED BEFORE ITS OUTCOME IS JUDGED. Both limbs of the
-        # stand-down are visible here: a module imported before the patch was patched by
-        # name, and one imported during the forward read the patched source.
-        for module_name in BEFORE_THE_SEAM:
-            reached = sys.modules.get(module_name)
-            assert reached is not None, (
-                f"the {leg} forward never imported {module_name}, so nothing was measured "
-                f"against the layer that runs before the seam; it stopped at "
-                f"{_site_of(error) if error else 'no failure'}: {error}"
+            if error is not None:
+                assert not _reads_a_value(error), (
+                    f"the {leg} forward read a value off a tensor at "
+                    f"{_site_of(error)}: {error}"
+                )
+            # THE ITEM'S OWN PREMISE, CHECKED BEFORE ITS OUTCOME IS JUDGED. Both limbs of
+            # the stand-down are visible here: a module imported before the patch was
+            # patched by name, and one imported during the forward read the patched source.
+            # THE PREDICATE IS NOT WHAT HOLDS THESE TWO, though -- neither seam consults it
+            # (``mla_projections.py:271-272``) -- so each one's dispatch is read as well.
+            for module_name in BEFORE_THE_SEAM:
+                reached = sys.modules.get(module_name)
+                assert reached is not None, (
+                    f"the {leg} forward never imported {module_name}, so nothing was "
+                    f"measured against the layer that runs before the seam; it stopped at "
+                    f"{_site_of(error) if error else 'no failure'}: {error}"
+                )
+                assert reached.can_run_kernel is _refuses_every_route, (
+                    f"{module_name} kept its own kernel route, so the {leg} outcome is the "
+                    f"vendor's answer to meta inputs and not this candidate's"
+                )
+                assert reached.wrap_nki is not REAL_WRAP_NKI, (
+                    f"{module_name} kept the vendor dispatch, which it enters whatever the "
+                    f"route predicate says, so the {leg} outcome is the vendor's and not "
+                    f"this candidate's"
+                )
+            assert completed, (
+                f"the {leg} forward did not complete on meta; it stopped at "
+                f"{_site_of(error)}: {error}"
             )
-            assert reached.can_run_kernel is _refuses_every_route, (
-                f"{module_name} kept its own kernel route, so the {leg} outcome is the "
-                f"vendor's answer to meta inputs and not this candidate's"
+            assert counters[0] >= 1, (
+                f"the {leg} forward never reached the attention seam's dispatch"
+                + (f"; it stopped at {_site_of(error)}: {error}" if error else "")
             )
-        assert completed, (
-            f"the {leg} forward did not complete on meta; it stopped at "
-            f"{_site_of(error)}: {error}"
-        )
-        assert counters[0] >= 1, (
-            f"the {leg} forward never reached the attention seam's dispatch"
-            + (f"; it stopped at {_site_of(error)}: {error}" if error else "")
-        )
-        assert dispatched, f"the {leg} forward never entered the declared stand-in"
-        dispatched.clear()
+            assert dispatched, f"the {leg} forward never entered the declared stand-in"
+            assert crossed, f"the {leg} forward crossed no held dispatch"
+            dispatched.clear()
+            crossed.clear()
+    finally:
+        # WHAT MONKEYPATCH CANNOT GIVE BACK, THIS ITEM GIVES BACK ITSELF, pass or fail: the
+        # modules the forward imported while the source was patched outlive this item, and
+        # the diagnostic below would report this arm instead of the vendor.
+        print(f"A07|handed_back|{len(_hand_back_what_a_late_import_took())}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -255,8 +418,16 @@ def test_d01_reports_whether_a_meta_forward_completes_at_the_real_boundary() -> 
     repository -- the package is installed on the host and nowhere else -- so it is reported
     from the venue that can see it and left to the lead. A ``completed=no`` here is a
     finding, not a failure: A07 above already carries the criterion this increment declares.
+
+    AND THE ROW SAYS WHOSE ROUTE IT READ. ``monkeypatch`` restores what it set, so A07's
+    treatments come off the modules that existed when it ran -- but a module A07 imported
+    DURING its own forward read the patched source and kept those objects, and no teardown
+    reaches that. A07 hands them back itself; this row names whatever is still standing,
+    because a row reporting the arm's own refusal as the vendor's answer is a finding about
+    nothing.
     """
     for leg in LEGS:
+        standing = _standing_arm()
         _, runner = _meta_root_and_runner()
         seam.reset_mla_sparse_dispatch_counters()
         completed, error = True, None
@@ -267,6 +438,7 @@ def test_d01_reports_whether_a_meta_forward_completes_at_the_real_boundary() -> 
         counters = seam.mla_sparse_dispatch_counters()
         print(
             f"DIAG|meta_forward|leg={leg}|completed={'yes' if completed else 'no'}"
+            f"|route={'real' if not standing else 'arm:' + ','.join(standing)}"
             f"|seam_dispatch={counters[0]}"
             f"|error={'none' if error is None else str(error).splitlines()[0]}"
             f"|site={'none' if error is None else _site_of(error)}"
