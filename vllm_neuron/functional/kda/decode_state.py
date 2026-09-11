@@ -77,7 +77,7 @@ from vllm_neuron.functional.kda.chunked_recurrence import (
     _psum,
     _sbuf,
 )
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +324,13 @@ def kda_decode_step(
                 f"{(vdim, kdim)}"
             )
 
-    gate_abs_max = float(gk.float().abs().max().item())
+    # An eager call reads the gate range; a traced or meta-built one has no values to
+    # read and passes 0.0, which is inside the limit and refuses nothing. The route is
+    # `can_run_kernel`'s alone and nothing else reads this number, so a graph build
+    # gives up the message and no result.
+    gate_abs_max = (
+        float(gk.float().abs().max().item()) if values_are_readable(gk) else 0.0
+    )
     if not can_run_decode_step(state, kdim, vdim, gate_abs_max):
         _DECODE_COUNTERS.torch_fallback += 1
         logger.debug(

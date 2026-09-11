@@ -230,10 +230,10 @@ def _metadata(banks, *, tokens: int, cached: int) -> dict:
     """The runner's attention-metadata mapping: one entry per layer name.
 
     THE KEYING AND THE KEYS ARE THE RUNNER'S OWN (``neuron_model_runner.py``
-    ``:4417-4429`` for the entry, ``:4256-4257`` for the keying). The converter
-    reads five of them and derives each bank's geometry from the block table, the
-    cached length and the page; the rest are present so that this is the runner's
-    mapping rather than a five-key stand-in.
+    ``:4418-4442`` for the entry, ``:4257-4258`` for the keying). The converter
+    reads five of them and derives each bank's geometry from the HOST-SIDE block
+    table and cached length, and the page; the device copies of those two numbers
+    are present, unread, because the runner's own mapping carries both.
     """
     span = cached + tokens
     blocks = max(1, -(-span // DECLARED_PAGE_SIZE))
@@ -250,6 +250,8 @@ def _metadata(banks, *, tokens: int, cached: int) -> dict:
         "max_blocks_per_seq": int(table.shape[1]),
         "decode_token_threshold": DECLARED_DECODE_THRESHOLD,
         "cached_seq_len": torch.tensor([cached], dtype=torch.int32),
+        "host_block_table": table,
+        "host_num_computed_tokens": [int(cached)],
         "kv_segment_size": int(table.shape[1]) * int(DECLARED_PAGE_SIZE),
     }
     return {str(bank["name"]): entry for bank in banks}

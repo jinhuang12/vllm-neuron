@@ -725,10 +725,11 @@ def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) ->
     """ONE KV-cache group's attention-metadata entry, at this step's geometry.
 
     THE KEYS AND THEIR SHAPES ARE THE RUNNER'S OWN, read off the mapping it builds at
-    `neuron_model_runner.py:4417-4429`; the converter under test reads five of them --
-    `block_table_tensor`, `block_size`, `max_query_len`, `decode_token_threshold` and
-    `cached_seq_len` -- and the rest are present so that this is the runner's mapping and not
-    a five-key stand-in.
+    `neuron_model_runner.py:4418-4442`; the converter under test reads five of them --
+    `host_block_table`, `host_num_computed_tokens`, `block_size`, `max_query_len` and
+    `decode_token_threshold` -- and the rest are present so that this is the runner's mapping
+    and not a five-key stand-in. The device copies of the first two are among the rest: the
+    converter is measured NOT reading them.
     """
     table = torch.tensor([[int(value) for value in row]], dtype=torch.int32)
     return {
@@ -740,6 +741,8 @@ def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) ->
         "max_blocks_per_seq": int(table.shape[1]),
         "decode_token_threshold": int(threshold),
         "cached_seq_len": torch.tensor([cached], dtype=torch.int32),
+        "host_block_table": table,
+        "host_num_computed_tokens": [int(cached)],
         "kv_segment_size": int(table.shape[1]) * int(block_size),
     }
 
@@ -1159,8 +1162,13 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
         )
 
     # ---- THE CONTROL: one table for the whole stack lands the sparse slice elsewhere.
+    # THE SHARED ROW STILL HAS TO ADDRESS THE STEP: what this control varies is WHOSE table the
+    # lookup goes through, not how wide the row is, and a real shared table hands every group
+    # the same full-width row. The measurement is unchanged -- this run of pages starts away
+    # from `sparse_row`, and the recurrent banks read the first entry, the slot, as before.
+    shared_row = [state_slot + offset for offset in range(_blocks_for(tokens))]
     single = {
-        bank["name"]: _entry(row=[state_slot], tokens=tokens, cached=0, threshold=1,
+        bank["name"]: _entry(row=shared_row, tokens=tokens, cached=0, threshold=1,
                              block_size=item.MLA_PAGE_SIZE)
         for bank in banks
     }
