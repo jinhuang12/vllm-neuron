@@ -557,7 +557,12 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
         # One value per head, not per channel.
         "b_proj_weight": _DeclaredShard(0, _kda_head_count, "one row per head"),
         "A_log": _DeclaredShard(0, _kda_head_count, "one decay per head"),
-        "dt_bias": _DeclaredShard(0, _kda_head_count, "one bias per head"),
+        # One value per CHANNEL, not per head: the forward reshapes this bias flat
+        # (``:4280``) and takes ``[h * head_dim : (h + 1) * head_dim]`` from it per
+        # head (``:4285``), so the extent it reads is the head WIDTH.
+        "dt_bias": _DeclaredShard(
+            0, _kda_head_width, "one bias per channel -- the forward slices it per head width"
+        ),
     },
     # -- inc-glm53f-100 -- the MLA families the ratified table defers to it
     #    (``increments/shard-table-094.md`` Part 5, Group B). THREE leaves, one per
@@ -3967,6 +3972,7 @@ class Glm5NextKDAAttention(nn.Module):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         is_prefill: bool,
+        start_position: int = 0,
         chunk_size: int | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
@@ -3993,20 +3999,29 @@ class Glm5NextKDAAttention(nn.Module):
                 than implied. Written in place.
             is_prefill: whether this call is a prefill. It selects the
                 recurrence route and nothing else.
+            start_position: how many tokens of this sequence are already
+                computed. Zero means this call opens the sequence; above zero on
+                a prefill means this call CONTINUES one, which is what decides
+                whether the recurrence enters with the carrier's state.
             chunk_size: overrides the resolved chunk width, for a test that
                 needs to name it.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
 
-        THE PREFILL ARM ENTERS THE CHUNKED SEAMS WITH A ZERO STATE, BY
-        CONSTRUCTION. Neither chunked seam accepts an entering state, so a
-        prefill starts the recurrence at zero and ``recurrent_state`` is
-        OVERWRITTEN by this call rather than read by it. That is this block's
-        declared NON-GOAL held as code, not an oversight: carrying a state into
-        a chunked prefill is what chunked prefill, prefix caching or
-        multi-token prediction would need, and none of the three exists at the
-        pin.
+        A PREFILL ENTERS WITH ZERO ONLY WHEN IT OPENS THE SEQUENCE. A prompt
+        longer than one batch of tokens is prefilled in segments, and the second
+        segment has to continue the recurrence the first left, so the entering
+        state is the carrier's whenever ``start_position`` is above zero. At
+        position zero it is zero whatever the slot holds, because a fresh
+        sequence must not inherit the last one's state; the position, not the
+        contents of the slot, is what decides that.
+
+        THE POSITION IS ENOUGH TO DECIDE IT, and that rests on the caller rather
+        than on this method: the runner refuses a step that does not continue the
+        sequence its cursor names, so a prefill arriving here above zero is a
+        later segment of a sequence this process already prefilled, and a warmup
+        or an idle step arrives at zero.
 
         WHOLE CHUNKS GO THROUGH THE CHUNKED PAIR AND THE REMAINDER WALKS. A
         prefill of ``T = n * chunk + r`` tokens takes one intra-chunk and one
@@ -4150,7 +4165,7 @@ class Glm5NextKDAAttention(nn.Module):
             gk_h = gate_parts[h]
             beta_h = beta[:, h].contiguous()
 
-            if is_prefill:
+            if is_prefill and int(start_position) == 0:
                 state = torch.zeros(kdim, kdim, dtype=torch.float32)
             else:
                 state = recurrent_state[h].to(torch.float32)
@@ -4171,6 +4186,7 @@ class Glm5NextKDAAttention(nn.Module):
                     gk_h[:chunked].reshape(shape).contiguous(),
                     q_h[:chunked].reshape(shape).contiguous(),
                     intra.aqk,
+                    state=state,
                 )
                 core[:chunked, span] = inter.o.reshape(chunked, kdim)
                 state = inter.final_state
@@ -4205,6 +4221,15 @@ class Glm5NextKDAAttention(nn.Module):
         attn_out = shaped.reshape(tokens, width) @ (
             self.o_proj_weight.to(torch.float32).t()
         )
+        # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
+        # Reduce it in fp32, before the cast below: partials add at the width they
+        # were computed in, and reducing after the cast would round each rank's
+        # fraction to the caller's dtype and add the rounded parts instead of
+        # rounding the whole. In place is safe -- ``attn_out`` is a fresh matmul
+        # result, not a view of a cached weight or of the caller's residual.
+        group = _resolve_tp_group()
+        if group is not None:
+            group.all_reduce(attn_out)
         return attn_out.to(hidden_states.dtype)
 
 
@@ -4297,6 +4322,7 @@ class Glm5NextKDALayer(nn.Module):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         is_prefill: bool,
+        start_position: int = 0,
         chunk_size: int | None = None,
         streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -4332,7 +4358,7 @@ class Glm5NextKDALayer(nn.Module):
                 one-stream route. Every other argument is the attention module's,
                 passed through unchanged; see
                 :meth:`Glm5NextKDAAttention.forward` for what the two carriers
-                mean.
+                and the position mean.
 
         Returns:
             ``[T, H]`` on the one-stream route -- the input dtype, unchanged. On
@@ -4355,6 +4381,7 @@ class Glm5NextKDALayer(nn.Module):
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
                 is_prefill=is_prefill,
+                start_position=start_position,
                 chunk_size=chunk_size,
             )
 
@@ -4872,12 +4899,15 @@ class Glm5NextDSAIndexer(nn.Module):
         tail: torch.Tensor,
         key: torch.Tensor,
         gate_score: torch.Tensor,
-        position: int,
+        position: torch.Tensor | int,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Advance the decode ring by one token. Returns ``(pooled, new_tail)``.
 
-        ``pooled`` is ``[1, index_head_dim]`` when this token COMPLETED a pool
-        and ``None`` when it did not; ``new_tail`` always has ``tail``'s shape.
+        ``new_tail`` always has ``tail``'s shape. ``pooled`` is
+        ``[1, index_head_dim]`` when this token COMPLETED a pool and ``None``
+        when it did not -- but ONLY when the position arrives as a python int.
+        A tensor position always answers a row, because whether a pool ended is
+        then a value on device; the seam's own ``Returns`` states that half.
 
         THE RING IS STATE AND THIS METHOD DOES NOT OWN IT. The seam's own
         docstring is explicit -- *"The caller threads ``new_tail`` into the next
@@ -4894,15 +4924,23 @@ class Glm5NextDSAIndexer(nn.Module):
         assigns the raw remainder to this ring rather than to the pooling seam,
         which *"NEVER SEES A PARTIAL POOL"*.
 
-        ``position`` IS THE TOKEN'S ABSOLUTE POSITION and a python int, not a
-        tensor, for the reason the seam's module docstring gives; it decides
-        which ring row is written and whether the pool completes.
+        ``position`` IS THE TOKEN'S ABSOLUTE POSITION and it decides which ring
+        row is written and whether the pool completes. A TENSOR IS THE ROUTE THIS
+        METHOD IS FOR, and the python int is kept beside it rather than replaced:
+        a decode graph is captured once and replayed at every step, so a ring row
+        derived from a host int is the row the capture happened at, written again
+        at every later position. The seam's module docstring carries the whole
+        argument and names the rotation that keeps the kernel's own slot a
+        constant. The int route stays because it is the eager reference the
+        acceptance compares the tensor route against, bit for bit.
 
-        ONE DISPATCH, on ``dsa_decode_tail_update``, and it is the only seam in
-        this chain that fires on the decode leg and not the prefill leg.
+        ONE DISPATCH either way, on the seam pair that shares one kernel and one
+        counter, and it is the only seam in this chain that fires on the decode
+        leg and not the prefill leg.
         """
         from vllm_neuron.functional.dsa.decode_tail_update import (
             dsa_decode_tail_update,
+            dsa_decode_tail_update_at,
         )
 
         pool = self.index_kpool
@@ -4919,7 +4957,12 @@ class Glm5NextDSAIndexer(nn.Module):
                     f"{name} must be [1, index_head_dim] = {want_row} for one "
                     f"decode token; got {tuple(operand.shape)}"
                 )
-        if int(position) < 0:
+        # THE REFUSAL IS THE INT ROUTE'S ALONE, and its place in the order is
+        # unchanged. Reading a tensor position to compare it with zero is the
+        # host read this method exists to remove, so the tensor route carries no
+        # such refusal: the runner computes the position and can refuse before the
+        # trace, which is where the sibling layer's own bound check went too.
+        if not torch.is_tensor(position) and int(position) < 0:
             raise Glm5NextDSAIndexerError(
                 f"position must be the token's absolute position in the "
                 f"request; got {position}"
@@ -4933,6 +4976,10 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"{None if ape is None else tuple(ape.shape)}"
             )
 
+        if torch.is_tensor(position):
+            return dsa_decode_tail_update_at(
+                tail, key, gate_score, ape.to(torch.float32), position
+            )
         return dsa_decode_tail_update(
             tail, key, gate_score, ape.to(torch.float32), int(position)
         )
@@ -4942,9 +4989,13 @@ class Glm5NextDSAIndexer(nn.Module):
         tail: torch.Tensor,
         key: torch.Tensor,
         gate_score: torch.Tensor,
-        end_position: int,
-    ) -> int:
+        end_position: torch.Tensor | int,
+    ) -> torch.Tensor | int:
         """Stash this chunk's REMAINDER in the decode ring. Returns the rows written.
+
+        The count comes back as a python int when ``end_position`` is one and as a
+        0-d int32 tensor when it is a tensor, because that count is then a value on
+        device and no caller may have it as a number without reading one.
 
         WHAT THE REMAINDER IS. A prefill pools only complete blocks of
         ``index_kpool`` keys (:meth:`pool_window`); the positions after its last
@@ -4975,7 +5026,14 @@ class Glm5NextDSAIndexer(nn.Module):
         runner (``neuron_model_runner.py``'s ``_glm5next_model_kwargs``).
 
         THE SUBSTRATE (P13). One slice copy of values the kernel-class
-        :meth:`project_stage` already produced. No value is computed here.
+        :meth:`project_stage` already produced -- a masked whole-ring copy on the
+        tensor route, which moves the same values to the same slots. No value is
+        computed here on either route.
+
+        WHICH ROUTE, AND WHY BOTH. ``end_position`` decides the slots, so a host
+        int here compiles this chunk's remainder length into the graph. The tensor
+        route below writes the same slots without reading the value, and the int
+        route stays as the eager reference the acceptance compares it against.
         """
         pool = self.index_kpool
         want_tail = (2, pool, self.index_head_dim)
@@ -4996,6 +5054,8 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"against {tuple(key.shape)}"
             )
         tokens = int(key.shape[0])
+        if torch.is_tensor(end_position):
+            return self._seed_tail_at(tail, key, gate_score, end_position, tokens)
         if int(end_position) < tokens:
             raise Glm5NextDSAIndexerError(
                 f"end_position is the sequence length AFTER this chunk and "
@@ -5011,6 +5071,53 @@ class Glm5NextDSAIndexer(nn.Module):
         tail[0, rows - take:rows, :] = key[tokens - take:].to(tail.dtype)
         tail[1, rows - take:rows, :] = gate_score[tokens - take:].to(tail.dtype)
         return take
+
+    def _seed_tail_at(
+        self,
+        tail: torch.Tensor,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        end_position: torch.Tensor,
+        tokens: int,
+    ) -> torch.Tensor:
+        """:meth:`seed_tail`'s write with the chunk's END as a TENSOR. The same slots.
+
+        THE SAME THREE NUMBERS, NONE OF THEM READ. ``r = end_position % index_kpool``
+        is the open pool's row count, the written slots are ``r - take`` through
+        ``r - 1`` for ``take = min(r, tokens)``, and slot ``s`` takes the key at row
+        ``tokens - r + s``. All three are arithmetic on a 0-d tensor here, so the
+        write's ADDRESSES are values rather than trace-time constants.
+
+        WHY THE WHOLE RING IS COPIED TO WRITE PART OF IT. A slice needs its bounds as
+        host ints and a boolean index produces a data-dependent shape, which is the
+        graph break in another costume; ``torch.where`` over all ``index_kpool`` rows
+        has one shape at every position, and the rows outside the window take their
+        own old value, which is what "an earlier chunk's rows stay" means as an op.
+        Nothing is written when the sequence divides evenly, because the mask is then
+        empty everywhere and every row keeps itself.
+
+        THE SOURCE IS CLAMPED, NOT MASKED, and the clamp is not a correction: rows
+        the mask discards still have to name a legal source row, or the gather would
+        read out of bounds to produce values nothing uses.
+        """
+        pool = self.index_kpool
+        device = tail.device
+        rows = torch.remainder(
+            torch.as_tensor(end_position, device=device, dtype=torch.int64).reshape(()),
+            pool,
+        )
+        slots = torch.arange(pool, device=device)
+        write = ((slots >= (rows - tokens).clamp_min(0)) & (slots < rows))[:, None]
+        source = (slots - rows + tokens).clamp(0, tokens - 1)
+        tail[0].copy_(
+            torch.where(write, key.index_select(0, source).to(tail.dtype), tail[0])
+        )
+        tail[1].copy_(
+            torch.where(
+                write, gate_score.index_select(0, source).to(tail.dtype), tail[1]
+            )
+        )
+        return write.sum().to(torch.int32)
 
     def score_pools(
         self,
@@ -5542,9 +5649,9 @@ class Glm5NextDSAIndexer(nn.Module):
         page_size: int,
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
-        position: int | None = None,
+        position: torch.Tensor | int | None = None,
         prefill_tail: torch.Tensor | None = None,
-        prefill_end_position: int | None = None,
+        prefill_end_position: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         """The whole indexer chain. Returns ``topk_indices`` and NOTHING ELSE.
 
@@ -5569,15 +5676,19 @@ class Glm5NextDSAIndexer(nn.Module):
             slot_mapping: ``[tokens]`` int32, pool-granular. Prefill only.
             tail: ``[2, index_kpool, index_head_dim]`` bf16 ring, WRITTEN IN
                 PLACE. Passing it selects the decode leg.
-            position: the decode token's absolute position, a python int.
+            position: the decode token's absolute position, as a TENSOR on the
+                traced path. A python int is admitted and takes the eager route the
+                acceptance compares against; see :meth:`tail_step` for which is
+                which and why both exist.
             prefill_tail: the same ring, on the PREFILL leg, WRITTEN IN PLACE for
                 this chunk's remainder by :meth:`seed_tail`. It does NOT select a
                 leg -- ``tail`` alone does that -- and passing it on a decode step
                 refuses.
-            prefill_end_position: the sequence length AFTER this prefill chunk, a
-                python int, required with ``prefill_tail``. It is NOT
-                ``max_seq_len``: that one is the batch's longest sequence, equal to
-                this sequence's end only while the batch is one request.
+            prefill_end_position: the sequence length AFTER this prefill chunk,
+                required with ``prefill_tail``, as a tensor or a python int on the
+                same terms as ``position``. It is NOT ``max_seq_len``: that one is
+                the batch's longest sequence, equal to this sequence's end only
+                while the batch is one request.
 
         WHY ``max_seq_len`` IS A PYTHON INT AND NOT READ OFF ``seq_lens``. The
         obvious ``int(seq_lens.max())`` is a host read of tensor DATA inside a
@@ -5605,15 +5716,23 @@ class Glm5NextDSAIndexer(nn.Module):
         is ``inc-glm53f-045``'s own measured pattern -- it *"sends every padding
         row to a REAL in-range trash row"* rather than masking by going out of
         bounds. Duplicate trash destinations resolve in unspecified order and
-        that is harmless: the row is never addressed as a candidate.
+        that is harmless: the row is never addressed as a candidate. BOTH LEGS
+        USE IT NOW: the decode leg's completion is a value once the position is
+        a tensor, so it steers the write instead of deciding whether one happens.
 
         THE SUBSTRATE (P13). Every arithmetic stage is one of the eight landed
         kernel-class DSA seams or the landed ``mla_projection`` seam. What is
         torch here is orchestration and named so a reviewer can check it: shape
-        validation, index arithmetic for the gather, one ``index_copy_`` per leg,
-        one ring copy on the decode leg, and one ring slice copy on the prefill
-        leg (:meth:`seed_tail`). No torch path computes an indexer value.
+        validation, index arithmetic for the gather and for the two write
+        addresses, one ``index_copy_`` per leg, one ring copy on the decode leg,
+        and one ring copy on the prefill leg (:meth:`seed_tail`) -- masked over
+        the whole ring when the chunk's end arrives as a tensor. The decode
+        seam's own rotation is three permuted reads of the ring and the bias,
+        which move values and compute none. No torch path computes an indexer
+        value.
         """
+        from vllm_neuron.functional.dsa.decode_tail_update import decode_pool_address
+
         self.require_dials()
 
         pool = self.index_kpool
@@ -5645,15 +5764,32 @@ class Glm5NextDSAIndexer(nn.Module):
         query, key, weights, gate_score = self.project_stage(hidden_states, q_latent)
 
         if is_decode:
-            pooled, new_tail = self.tail_step(tail, key, gate_score, int(position))
+            pooled, new_tail = self.tail_step(tail, key, gate_score, position)
             # The seam does not mutate its argument, so the ring is threaded
             # back into the caller's buffer here.
             tail.copy_(new_tail)
-            if pooled is not None:
+            if torch.is_tensor(position):
+                # THE POOL WRITE, ADDRESSED ON DEVICE. Whether this token ended a
+                # pool is a value now, so it cannot choose whether a write happens
+                # -- it chooses WHERE the write lands, and a step that ended no
+                # pool lands on the trash row. That is the prefill leg's own
+                # pattern two branches below, for the same reason: a write the
+                # graph performs at every position beats a write whose existence
+                # was decided when the graph was captured.
+                pool_index, completes = decode_pool_address(
+                    position, pool, pool_cache.device
+                )
+                destination = torch.where(
+                    completes,
+                    pool_index,
+                    torch.tensor(trash, dtype=torch.int64, device=pool_cache.device),
+                ).reshape(1)
+                pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+            elif pooled is not None:
                 # `pooled is not None` is decided from `position`, a python int,
                 # so this branch is a trace-time choice and not a data read.
                 pool_slot = torch.full(
-                    (1,), int(position) // pool, dtype=torch.int64,
+                    (1,), position // pool, dtype=torch.int64,
                     device=pool_cache.device,
                 )
                 pool_cache.index_copy_(0, pool_slot, pooled.to(pool_cache.dtype))
@@ -5670,7 +5806,7 @@ class Glm5NextDSAIndexer(nn.Module):
                 # the complete pools above, and the open pool's rows exist only
                 # here. `inc-glm53f-054b` commit 6.
                 self.seed_tail(
-                    prefill_tail, key, gate_score, int(prefill_end_position)
+                    prefill_tail, key, gate_score, prefill_end_position
                 )
 
         if not selects:
@@ -5907,6 +6043,10 @@ class Glm5NextMLAAttention(nn.Module):
     #: MLA compresses KV to one latent per token; the latent is replicated
     #: across tensor-parallel ranks, so this is 1 at every world size.
     NUM_LATENT_KV_HEADS = 1
+
+    #: One latent vector per token, and no value half to cache. The runner reads
+    #: this to size the page for one buffer instead of a key/value pair.
+    LATENT_KV_CACHE = True
 
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
@@ -6731,9 +6871,9 @@ class Glm5NextMLAAttention(nn.Module):
         page_size: int,
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
-        position: int | None = None,
+        position: torch.Tensor | int | None = None,
         prefill_tail: torch.Tensor | None = None,
-        prefill_end_position: int | None = None,
+        prefill_end_position: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -6886,9 +7026,9 @@ class Glm5NextDSALayer(nn.Module):
         page_size: int,
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
-        position: int | None = None,
+        position: torch.Tensor | int | None = None,
         prefill_tail: torch.Tensor | None = None,
-        prefill_end_position: int | None = None,
+        prefill_end_position: torch.Tensor | int | None = None,
         streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
@@ -8800,6 +8940,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     kda_recurrent_state_dtype=getattr(
                         attention, "kda_recurrent_state_dtype", None
                     ),
+                    latent_kv=getattr(attention, "LATENT_KV_CACHE", False),
                 )
             )
         return KVSpec(layers=layers)
@@ -8835,11 +8976,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
           the short convolution and position 1 the recurrent state
           (``neuron_model_runner.py:9100-9130``);
         * a sparse-attention (DSA) layer reports none of it, and the runner
-          allocated ``[blocks, num_kv_heads, block_size, head_size]`` for each half
-          of a key/value pair (``:9002-9038``). Only the FIRST half is this
-          attention's latent cache: MLA keeps one latent vector per slot and has no
-          value half to read, which is also why ``num_kv_heads`` is 1
-          (``NUM_LATENT_KV_HEADS``).
+          allocated ONE ``[blocks, num_kv_heads, block_size, head_size]`` bank for
+          it. MLA keeps one latent vector per slot and has no value half, so the
+          layer declares a latent cache and the runner sizes a page for one buffer
+          rather than for a key/value pair -- which is also why ``num_kv_heads``
+          is 1 (``NUM_LATENT_KV_HEADS``). The bank is read at position 0 and
+          there is no second position.
 
         THE LATENT BANK IS ALSO KEPT AS ITS SEQUENCE VIEW, because that is the shape
         ``Glm5NextDSALayer.forward`` declares: ``[slots, 1, head_size]``, one slot
@@ -8940,15 +9082,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if not tensors:
                 raise ValueError(
                     f"KV layer '{name}' has no cache tensor at all; the runner "
-                    f"allocates a key/value pair for a sparse-attention layer "
-                    f"(neuron_model_runner.py:9002-9038)"
+                    f"allocates one latent bank for a sparse-attention layer"
                 )
             bank = tensors[0]
             if bank.dim() != 4:
                 raise ValueError(
                     f"KV layer '{name}' has a latent bank of {tuple(bank.shape)}; "
                     f"the runner allocates [blocks, num_kv_heads, block_size, "
-                    f"head_size] for each half of the pair"
+                    f"head_size] for a latent cache"
                 )
             blocks, heads, block_size, width = (int(value) for value in bank.shape)
             if heads != int(layer_spec.num_kv_heads) or width != int(

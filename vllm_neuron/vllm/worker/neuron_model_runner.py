@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -4571,7 +4572,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size, kv_segment_size, device=device
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            # ``kwargs`` stays bound to the generic mapping: the drafter branch
+            # below reads its attention metadata after this call returns.
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
@@ -4923,8 +4926,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         and the ring it seeds -- ``prefill_tail`` with ``prefill_end_position`` --
         on the prefill leg, or ``tail`` and ``position`` on the decode leg
         (``model_fp8.py:6696-6713``); a linear (KDA) layer takes ``conv_state``,
-        ``recurrent_state`` and ``is_prefill`` (``:4149``). Which leg is running is
-        the caller's reading of the batch, passed in rather than guessed here.
+        ``recurrent_state``, ``is_prefill`` and ``start_position`` (``:4149``).
+        Which leg is running is the caller's reading of the batch, passed in
+        rather than guessed here.
+
+        BOTH FAMILIES READ THE POSITION FROM ONE VARIABLE. The linear family
+        needs it for the same reason the sparse one does: a prompt longer than one
+        batch of tokens arrives in segments, and a later segment continues state
+        the earlier one wrote, which the receiving layer can only know from how
+        many tokens are already computed.
 
         ONE SEQUENCE PER CALL, REFUSED RATHER THAN MIS-SLICED. The latent cache a
         DSA layer takes is one sequence's slots in position order, and
@@ -4985,6 +4995,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "conv_state": bank["conv_state"][int(state_slot)],
                         "recurrent_state": bank["recurrent_state"][int(state_slot)],
                         "is_prefill": bool(is_prefill),
+                        "start_position": int(start_position),
                     }
                 )
                 continue
@@ -5053,9 +5064,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         RETURNS ITS ARGUMENT UNCHANGED unless the loaded model kept cache banks,
         which only ``Glm5NextForConditionalGeneration.bind_kv_cache`` does. That is
-        what lets all five call sites go through one function: for llama3, qwen3,
-        gpt_oss, qwen3_vl and synthetic this is one ``getattr`` and a return of the
-        same object.
+        what lets all eight call sites -- three warmup calls, the execute path, the
+        idle dummy step and the three graph-capture calls -- go through one
+        function: for llama3, qwen3, gpt_oss, qwen3_vl and synthetic this is one
+        ``getattr`` and a return of the same object.
 
         WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
         ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
@@ -5477,7 +5489,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             compiled_graph_input=True,
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for decode completed: batch size=%s", batch_size
@@ -5499,7 +5511,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 compiled_graph_input=True,
             )
             try:
-                _ = self.capture_backend_model(**kwargs)
+                _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
             except CaptureComplete:
                 logger.debug(
                     "Graph capture for target model decode completed: batch size=%s",
@@ -9108,6 +9120,40 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     num_kv_heads = kv_cache_spec.num_kv_heads
                     head_size = kv_cache_spec.head_size
 
+                    # A latent cache holds ONE compressed vector per token and no
+                    # value half, so it gets one buffer and the whole page is it.
+                    # The spec class carries that fact, which is why the page
+                    # above already budgeted one buffer; allocating a pair here
+                    # would hand the layer a second buffer no reader touches and
+                    # leave half of every page dead.
+                    if isinstance(kv_cache_spec, MLAAttentionSpec):
+                        if self._kv_cache_is_fp8_packed(kv_cache_spec.dtype):
+                            raise NotImplementedError(
+                                f"KV layer '{layer_name}' has a latent cache and "
+                                "an FP8-packed key layout; the swizzle is defined "
+                                "for a key/value pair, so this refuses rather "
+                                "than guessing a packed latent layout"
+                            )
+                        latent_shape = (
+                            num_blocks,
+                            num_kv_heads,
+                            block_size,
+                            head_size,
+                        )
+                        kv_caches[layer_name] = [
+                            _shared_dtype_view(
+                                raw_tensor, kv_cache_spec.dtype
+                            ).view(latent_shape)
+                        ]
+                        # Deliberately NOT registered in `_kv_cache_full_tensors`:
+                        # that dict feeds the KV-transfer connector's full
+                        # (2, num_blocks, ...) K/V view, and a latent cache has no
+                        # K/V pair to hand it. The connector's own MLA branch
+                        # wants this layout instead, and the registration helper
+                        # falls back to the per-layer dict when nothing is
+                        # registered.
+                        continue
+
                     # Packed FP8 K cache: store K swizzled as
                     # [num_blocks, num_kv_heads, block_size // 2, head_size, 2]
                     # so the decode kernel can bf16-reinterpret + DMA-transpose.
@@ -9319,6 +9365,42 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         layer.kda_conv_state_dtype,
                         layer.kda_recurrent_state_dtype,
                     ),
+                )
+            # A latent-attention layer caches ONE compressed vector per token and
+            # has no value half, so its page must carry one buffer and not two.
+            # `MLAAttentionSpec` is the vendor's own name for that page: its
+            # `real_page_size_bytes` has no second term, where the plain
+            # attention page hardcodes a factor 2 for the key/value pair
+            # (`vllm/v1/kv_cache_interface.py`). Reporting the plain class here
+            # bought every latent layer a second buffer nothing reads and halved
+            # the blocks a byte budget holds -- and it could not be corrected
+            # downstream, because `page_size_padded` only ever pads a page UP.
+            #
+            # The LAYER declares this, never a name test here: the field comes
+            # from the model's own spec, on the same ground as the recurrent
+            # geometry above. Subclassing is what keeps the change local --
+            # `MLAAttentionSpec` IS a `FullAttentionSpec`, so the allocation
+            # branch below and the page unification further down still admit it
+            # unchanged, and the vendor's own exact-type gates already name it
+            # beside its parent.
+            elif layer.latent_kv:
+                # A windowed latent cache is REFUSED rather than silently
+                # stripped of its window: this branch is taken before the sliding
+                # one, so a layer declaring both would otherwise lose it here.
+                if layer.sliding_window_size is not None:
+                    raise NotImplementedError(
+                        f"KV layer '{layer_name}' declares a latent cache and a "
+                        f"sliding window of {layer.sliding_window_size}; no "
+                        "windowed latent page is implemented, so this refuses "
+                        "rather than dropping the window"
+                    )
+                spec = MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=layer.num_kv_heads,
+                    head_size=layer.head_size,
+                    dtype=kv_cache_dtype,
+                    sliding_window=None,
+                    attention_chunk_size=layer.chunk_size,
                 )
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
