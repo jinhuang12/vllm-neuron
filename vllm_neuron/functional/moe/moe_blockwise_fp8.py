@@ -1235,12 +1235,21 @@ def _swiglu_bound_operand(
     unset limit beside a set one is the neutral infinity, which bounds nothing.
     """
     if gate_upper is None and up_upper is None:
-        return torch.zeros((TILE_SIZE, 1), dtype=torch.float32, device=device)
+        return torch.full((TILE_SIZE, 1), 0.0, dtype=torch.float32, device=device)
     unbounded = float("inf")
     gate = unbounded if gate_upper is None else float(gate_upper)
     up = unbounded if up_upper is None else float(up_upper)
-    row = torch.tensor([[gate, -up, up]], dtype=torch.float32, device=device)
-    return row.expand(TILE_SIZE, _SWIGLU_BOUND_COLUMNS).contiguous()
+    # ONE COLUMN PER LIMIT, built the way every kernel-class block in this package
+    # builds a constant operand. A ``torch.tensor`` over a Python list materialises a
+    # REAL tensor inside the capture backend's fake mode -- this fork measured that on
+    # its own backend -- and these two calls do not.
+    return torch.cat(
+        [
+            torch.full((TILE_SIZE, 1), value, dtype=torch.float32, device=device)
+            for value in (gate, -up, up)
+        ],
+        dim=1,
+    )
 
 
 def _require_routing(
@@ -1532,14 +1541,23 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
                     operand0=bounds_sb[0:TILE_SIZE, 0:1],
                 )
                 gate = bounded
-                bounded_up = _gate_up_sbuf()
+                # TWO CALLS AND NOT ONE FUSED PAIR. A ``[P, 1]`` column is the
+                # landed form for ``operand0`` in this package and no landed call
+                # passes one as ``operand1``; only the compiler's verifier could settle
+                # that, and a maximum followed by a minimum is the same closed form.
+                floored = _gate_up_sbuf()
                 nisa.tensor_scalar(
-                    dst=bounded_up,
+                    dst=floored,
                     data=up,
                     op0=nl.maximum,
                     operand0=bounds_sb[0:TILE_SIZE, 1:2],
-                    op1=nl.minimum,
-                    operand1=bounds_sb[0:TILE_SIZE, 2:3],
+                )
+                bounded_up = _gate_up_sbuf()
+                nisa.tensor_scalar(
+                    dst=bounded_up,
+                    data=floored,
+                    op0=nl.minimum,
+                    operand0=bounds_sb[0:TILE_SIZE, 2:3],
                 )
                 up = bounded_up
             # sigmoid is one activation-engine op on this image, not a composition.

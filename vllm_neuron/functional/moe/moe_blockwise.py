@@ -131,11 +131,20 @@ def build_blockwise_mapping(
     # of serving. The torch construction below is static-shape -- every extent is a
     # trace-time int and every write is a fixed-shape index_put -- so it is what a
     # captured graph gets, and it is the flow that already traced at one token. The
-    # reading is FakeTensor rather than ``torch.compiler.is_compiling()``, which
-    # ``attention_decode.py:597`` records as unreliable on this backend: Dynamo
-    # traces with fake inputs. Eager keeps the subkernels, so they stay the reference
-    # the equality item measures this construction against.
-    capturing = isinstance(expert_mask, FakeTensor)
+    # THREE READINGS, BECAUSE NO ONE OF THEM FIRES EVERYWHERE. Dynamo answers
+    # ``is_compiling()`` True while it traces, and it folds an ``isinstance`` against a
+    # tensor class to a trace-time constant -- so the fake-tensor test ALONE reads
+    # False under the runner's capture, which is the reading this gate first shipped
+    # with and the reason it never fired. The fake test still catches a propagation
+    # raised outside dynamo, and the device test catches a shape-only pass, which is
+    # why ``attention_decode.py`` needs a device clause of its own beside the same
+    # construct. Eager answers all three False, so it keeps the subkernels and they
+    # stay the reference the equality item measures this construction against.
+    capturing = (
+        torch.compiler.is_compiling()
+        or isinstance(expert_mask, FakeTensor)
+        or expert_mask.device.type == "meta"
+    )
     use_kernel_flow = (
         can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel and not capturing
     )

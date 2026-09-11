@@ -1679,7 +1679,13 @@ def test_moe_path_capture_safe_mapping_routes_what_the_vendor_routes(
             tp_degree=1,
         )
 
+    # THE VENDOR SUBKERNELS RUN HERE, under the simulator and at the serving shape.
+    # These rows are the only thing that distinguishes a slow reference from a hang
+    # while the step is still running; they carry their own tag, so the rows the host
+    # counts as this item's verdict stay two.
+    print(f"[mapping-progress] reference_opens tokens={tokens} experts={experts}")
     reference = build()
+    print(f"[mapping-progress] reference_closed tokens={tokens} experts={experts}")
     monkeypatch.setattr(moe_blockwise, "can_run_kernel", lambda *_a, **_k: False)
     candidate = build()
     reference_routing = _routing_by_expert(reference, experts, B)
