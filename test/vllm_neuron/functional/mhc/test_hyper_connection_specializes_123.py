@@ -61,6 +61,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 import nki.simulator
+from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.mhc.hyper_connection import (
     MHC_STREAMS,
