@@ -453,7 +453,11 @@ def test_initialize_kv_cache_c03_dsa_entries_allocate_the_reported_head_size(
 
     by_name = {layer.name: layer for layer in layers}
     reported = {by_name[name].head_size for name in dsa_names}
-    allocated = {int(caches[name][1].shape[-1]) for name in dsa_names}
+    # A latent layer has ONE bank since its page dropped the second buffer, so
+    # this reads position 0 where it used to read `caches[name][1]` -- the value
+    # half that no longer exists. `k_last` below is now the same reading; both
+    # names are kept so no key disappears from this conjunct's transcript.
+    allocated = {int(caches[name][0].shape[-1]) for name in dsa_names}
     k_last = {int(caches[name][0].shape[-1]) for name in dsa_names}
     config_value = _model_reported_head_size(raw)
     _record(
@@ -472,8 +476,9 @@ def test_initialize_kv_cache_c03_dsa_entries_allocate_the_reported_head_size(
     assert allocated == reported
     assert k_last == reported
     assert reported == {config_value}
-    # The KDA work moved neither half's buffer count.
-    assert all(len(caches[name]) == 2 for name in dsa_names)
+    # The buffer counts, each read against what its own family holds: one latent
+    # bank per attention layer, two state banks per recurrent layer.
+    assert all(len(caches[name]) == 1 for name in dsa_names)
     assert all(len(caches[name]) == 2 for name in kda_names)
 
 
@@ -611,9 +616,13 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
 # this file would move every line below it.
 # ===========================================================================
 
-#: The unified page every KDA entry now reports. MEASURED at round 1, read from
-#: `probe-086-r1-landed-diagnostic.out` (`KDA_page_size_padded_DISTINCT`).
-MEASURED_PADDED_PAGE_BYTES = 262_144
+#: The unified page every KDA entry now reports, which is the attention page it
+#: is padded up to. Round 1 MEASURED that page at 262,144 B
+#: (`probe-086-r1-landed-diagnostic.out`, `KDA_page_size_padded_DISTINCT`), while
+#: the latent layers still reported a key/value page of two buffers. They report
+#: a one-buffer page now, so the value this file asserts is half of what that
+#: probe read, and the acceptance transcript records it.
+MEASURED_PADDED_PAGE_BYTES = 131_072
 
 
 def _addressable_page_bytes(spec) -> int:
