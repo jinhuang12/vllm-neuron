@@ -8203,8 +8203,10 @@ class _MetaSlice:
             # its dtypes in its own spelling and torch has no reader for that
             # spelling, so a table here would be a second place every dtype in the
             # checkpoint is written down -- including the fp8 ones this model
-            # depends on. One row from the front is a few bytes and carries the
-            # dtype torch itself gives the stored bytes.
+            # depends on. What one row costs is the trailing dimensions times the
+            # item size, not a few bytes: about 4 KB for a [1536, 4096] fp8
+            # weight, and one row per tensor over the whole checkpoint. A 0-D
+            # tensor has no row, so it is taken whole.
             probe = self._source[0:1] if shape and shape[0] else self._source[:]
             self._empty = torch.empty(shape, dtype=probe.dtype, device="meta")
         return self._empty
@@ -8225,17 +8227,34 @@ class _MetaShapeCheckpoint(SafetensorsCheckpoint):
         """One tensor's slice, wrapped so its data reads as meta."""
         return _MetaSlice(super()._get_slice(name))
 
-    def _load_to_page_cache(self, *args: object, **kwargs: object) -> None:
-        """Read no file into the page cache, because no data will be read.
+    def _load_to_page_cache(
+        self,
+        rank: int,
+        world_size: int,
+        cached_files_store: "torch.distributed.Store",
+        shutdown_event: "threading.Event",
+    ) -> None:
+        """Announce this rank's files without reading their bytes.
 
-        Skipping this is safe rather than merely faster: the reader that consumes
-        it CHECKS the store and does not wait on it
-        (``utils/checkpoints.py:388``, ``cached_files_store.check``), so a file
-        that never arrives leaves the pipeline reading headers instead of
-        blocking. Leaving it in would pull the whole checkpoint through the page
-        cache to build tensors that hold nothing.
+        THE ANNOUNCEMENT IS NOT OPTIONAL. The pipelined load's main loop waits
+        for exactly the keys this method writes: it turns on a file only when
+        ``cached_files_store.check([file_name])`` answers, and nothing else ever
+        calls ``add`` (``utils/checkpoints.py:385-395``, the store write at
+        ``:533``). A method that returned without adding them would leave that
+        loop spinning on its 1 ms sleep until the process was killed, so the
+        shape-only pass keeps the round-robin and the store write and drops only
+        the read-through that pulls the whole checkpoint into RAM.
+
+        The file is still made local first, because the loop opens it for its
+        headers two lines after the key appears.
         """
-        return None
+        for index, file_name in enumerate(self._source.get_file_names()):
+            if shutdown_event.is_set():
+                return
+            if index % world_size != rank:
+                continue
+            self._source.download_file(file_name)
+            cached_files_store.add(file_name, 1)
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
