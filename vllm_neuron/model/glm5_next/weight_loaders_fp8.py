@@ -1102,6 +1102,13 @@ def dequantise_blockwise(
 # --------------------------------------------------------------------------- #
 
 
+#: Value censuses skipped because the tensor they would count carried no values.
+#: A shape-only load appends one name per skip; a load with values never appends.
+#: It is a record and not a control: nothing in this module reads it, and a test
+#: clears it, runs a load and reads which censuses the pass reached.
+SKIPPED_VALUE_CENSUSES: list[str] = []
+
+
 @dataclass(frozen=True)
 class BlockScaleCompensation:
     """A compensated per-block scale grid, with the census of what it changed.
@@ -1122,6 +1129,10 @@ class BlockScaleCompensation:
     below_minval_after: int
     #: ``(row, col)`` of every block whose scale the floor raised.
     floored_blocks: tuple[tuple[int, int], ...]
+    #: False when the grid carried no values and the census was skipped. The three
+    #: counted fields are then zero because they are unanswerable, not because the
+    #: grid was clean, and a caller that reports them must say which it has.
+    values_read: bool = True
 
 
 def compensate_block_scales(scale_inv: torch.Tensor) -> BlockScaleCompensation:
@@ -1136,6 +1147,24 @@ def compensate_block_scales(scale_inv: torch.Tensor) -> BlockScaleCompensation:
     on either platform gets the same reported quantities.
     """
     grid = scale_inv.to(torch.float32)
+    if grid.device.type == "meta":
+        # A SHAPE-ONLY GRID CARRIES NO NUMBERS, and the census below reads three of
+        # them before the platform gate is even consulted. The transform itself is
+        # arithmetic and runs on shapes, so the grid this returns is the grid a real
+        # load would store; what cannot be answered is how many of its scales fall
+        # below the floor, so those counts are zero, no block is named, and the skip
+        # is recorded on the result and in the module list below.
+        applied = needs_240_downscale()
+        stored = (grid * _FP8_SCALE_COMPENSATION).clamp(min=MINVAL) if applied else grid
+        SKIPPED_VALUE_CENSUSES.append("compensate_block_scales")
+        return BlockScaleCompensation(
+            scale_inv=stored,
+            applied=applied,
+            below_minval_before=0,
+            below_minval_after=0,
+            floored_blocks=(),
+            values_read=False,
+        )
     below_before = int((grid < MINVAL).sum().item())
 
     if not needs_240_downscale():

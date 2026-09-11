@@ -4234,6 +4234,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     padded_num_reqs, dtype=torch.int32, device=self.device
                 )
 
+            # The host's own arrays, carried beside the device tensors for the
+            # geometry a step decides before its traced call. ``num_reqs`` rows and
+            # not the padded count: a padding row names no request, and its cached
+            # length is the previous occupant's. Both are CPU TENSORS rather than
+            # the numpy view beside them, because this mapping is an input to the
+            # compiled model for every other family in this tree: a tensor entry
+            # guards on dtype and shape, while a value that changes every step
+            # would guard on its contents and recompile.
+            num_reqs = self.input_batch.num_reqs
+            host_block_table = blk_table.get_cpu_tensor()[:num_reqs]
+            host_num_computed_tokens = self.input_batch.num_computed_tokens_cpu_tensor[
+                :num_reqs
+            ]
+
             attn_metadata_i = {
                 "block_table_tensor": blk_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4242,6 +4256,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "max_blocks_per_seq": blk_table_tensor.shape[1],
                 "decode_token_threshold": decode_token_threshold,
                 "cached_seq_len": cached_seq_len_tensor,
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 # Full (untrimmed) block_table_tensor for use cases that
                 # need to compute slot indices into the *full* KV cache,
@@ -4415,6 +4431,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.neuron_config.kv_segment_size_buckets is not None:
                 kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
 
+            # The same host-side geometry the serving builder carries, so a capture
+            # reads its numbers the one way and needs no case of its own: this
+            # bucket's own blocks, and the cached length warmup declares.
+            host_block_table = (
+                torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(num_reqs, -1)
+                .contiguous()
+            )
+            host_num_computed_tokens = torch.full(
+                (num_reqs,), int(cached_seq_len), dtype=torch.int32
+            )
+
             attn_metadata_i = {
                 "block_table_tensor": block_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4425,6 +4454,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "cached_seq_len": torch.tensor(
                     [[cached_seq_len]], dtype=torch.int32, device=device
                 ),
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 "full_block_table_tensor": full_block_table_tensor,
             }
@@ -4810,6 +4841,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return torch.tensor(int(start_position), dtype=torch.int32, device=device)
 
     @staticmethod
+    def _glm5next_host_geometry(metadata: dict, key: str, name: str) -> list:
+        """One metadata entry's host-side geometry, as plain Python integers.
+
+        A device tensor is refused by name rather than read: this runs before the
+        traced call, where reading a value off a ``meta`` or device tensor is the
+        thing a captured graph cannot do.
+        """
+        if key not in metadata:
+            raise ValueError(
+                f"KV layer '{name}' has no '{key}' entry; the runner writes the "
+                f"host-side geometry beside the device tensors of every KV-cache "
+                f"group, and this call site handed {sorted(metadata)}"
+            )
+        value = metadata[key]
+        if torch.is_tensor(value) and value.device.type != "cpu":
+            raise ValueError(
+                f"KV layer '{name}'s '{key}' is a {value.device.type} tensor; the "
+                f"geometry of a step is decided on the host, so it comes from the "
+                f"runner's own host arrays and never from a device or meta tensor"
+            )
+        return value.tolist() if hasattr(value, "tolist") else list(value)
+
+    @staticmethod
     def _glm5next_side_caches(
         banks, *, index_kpool: int, index_head_dim: int, max_seq_len: int
     ) -> list[dict]:
@@ -5133,6 +5187,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         this function needs and cannot find refuses by name with what the site did
         hand it.
 
+        EVERY GEOMETRY NUMBER COMES FROM THE HOST, AND A DEVICE TENSOR IS REFUSED.
+        The cached length and the block-table row are read from the entry's
+        ``host_num_computed_tokens`` and ``host_block_table``, which both builders
+        fill from the runner's own host arrays. The device tensors beside them carry
+        the same numbers for the kernels, but reading a value off one costs a
+        ``Tensor.item()``, which a graph capture cannot do at all: under
+        ``VLLM_NEURON_CPU_COMPILE`` the whole batch is on ``meta``, where a value
+        does not exist. ``_glm5next_host_geometry`` therefore refuses a non-CPU
+        tensor by name instead of converting it, so the rule holds for a call site
+        that has not been written yet.
+
         ``block_size`` IS NOT PASSED EITHER, AND THAT IS THE POINT. The root's
         parameter of that name is the FP8 WEIGHT-QUANT block, "tokens per block,
         forwarded to the expert bank unread" (``model_fp8.py:8386``), and the bank
@@ -5198,43 +5263,83 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             metadata = metadata_map[name]
             block_size = int(metadata["block_size"])
-            table = metadata["block_table_tensor"]
-            if int(table.shape[0]) != 1:
+            rows = self._glm5next_host_geometry(metadata, "host_block_table", name)
+            positions = self._glm5next_host_geometry(
+                metadata, "host_num_computed_tokens", name
+            )
+            if len(rows) != len(positions):
+                raise ValueError(
+                    f"KV layer '{name}' was handed {len(rows)} block-table row(s) "
+                    f"against {len(positions)} cached length(s); both are the "
+                    f"batch's own rows, so there is one of each per request"
+                )
+            if len(rows) != 1:
                 raise ValueError(
                     f"this half threads ONE sequence per forward, because the layers "
                     f"take a single sequence's cache slots (inc-glm53f-051's declared "
-                    f"interface); this batch carries {int(table.shape[0])} request(s)"
+                    f"interface); this batch carries {len(rows)} request(s)"
                 )
-            cached = metadata["cached_seq_len"]
-            start_position = (
-                int(cached.reshape(-1)[0]) if torch.is_tensor(cached) else int(cached)
-            )
-            row = table[0].reshape(-1)
+            row = [int(value) for value in rows[0]]
+            start_position = int(positions[0])
             blocks_used = -(-(start_position + tokens) // block_size)
+            if not row:
+                raise ValueError(
+                    f"KV layer '{name}' was handed an empty block-table row; a row "
+                    f"names either the pages a paged bank steps through or the one "
+                    f"slot a recurrent bank keeps its state in, and an empty row "
+                    f"names neither"
+                )
+            # A PAGED ROW ADDRESSES PAGES; A RECURRENT ROW NAMES ONE SLOT. The difference is
+            # not the table: a recurrent group's spec carries the ATTENTION block size
+            # (:9458-9459), so its table is as wide as the paged one. What differs is what the
+            # layer reads out of the row -- a paged layer walks the pages its step covers,
+            # and a recurrent layer keeps one sequence's state in the one slot at the row's
+            # head however many tokens the step covers. So the width a paged row needs says
+            # nothing about a recurrent one.
+            if bank["family"] == "self_attn":
+                if blocks_used > len(row):
+                    raise ValueError(
+                        f"KV layer '{name}' holds {start_position + tokens} slot(s) of "
+                        f"sequence, which occupy {blocks_used} page(s), and its "
+                        f"block-table row is {len(row)} entry(ies) wide; a row that "
+                        f"cannot address the step would slice another sequence's pages"
+                    )
+            # A RECURRENT ROW'S WIDTH BELONGS TO ITS TABLE, not to this layer, so nothing is
+            # asked of it here: every row arrives at its cache group's full padded width,
+            # whether the builder wrote ``torch.arange(max_num_blocks_per_req)``
+            # (:4437-4442) or sliced the served table (:4246). The one slot the scheduler
+            # allocated is the row's first entry, and THAT is what has to name a slot the
+            # bank holds -- checked once, where the slot is used to take the view (:5041),
+            # rather than a second time here.
             # THE WINDOW THE LAYER IS HANDED IS THE LEG'S BUCKET SPAN, not this step's
-            # span and not the table's width. A length derived from the cached position
+            # span and not the row's width. A length derived from the cached position
             # would change with every decode step and a captured graph would fit only
-            # the position it was captured at; a length taken from the table's width
-            # would be the whole model length on the prefill leg, because that width
-            # falls back to `max_model_len` when a group has no context bucket
-            # (`:4314-4327`). The seam copies every row of the window into on-chip
+            # the position it was captured at; a length taken from the block table's
+            # width would be the whole model length on the prefill leg, because that
+            # width falls back to `max_model_len` when a group has no context bucket
+            # (`:4325-4344`). The seam copies every row of the window into on-chip
             # memory, so that width is not merely wasteful -- it does not fit.
             #
             # Both numbers below are python ints the metadata already carries, so the
             # window is constant per captured graph without reading a tensor value:
             # a decode step's span IS the context bucket, which is what
             # `max_blocks_per_seq` holds for a decode group, and a prefill chunk's span
-            # is the segment it may carry plus the chunk itself. The table's width is
-            # the ceiling for both, since a window wider than the table would name
-            # blocks the request cannot have been given.
-            table_width = int(table.shape[1])
-            declared_window = int(metadata.get("max_blocks_per_seq", table_width))
-            if declared_window != table_width:
+            # is the segment it may carry plus the chunk itself.
+            #
+            # THE WIDTH IS THE DECLARED ONE, NOT THE HOST ROW'S. `max_blocks_per_seq` is
+            # the block-table dim the graph was compiled with (`:4256`, `:4452`), so it
+            # is the number that stays put across the steps of one captured graph, while
+            # the host row arrives at its group's full padded width and stays that wide
+            # even when the served table is trimmed to a decode bucket (`:4214-4232`,
+            # `:4246`). The row is the ADDRESSABILITY ceiling instead: a declared width
+            # past its end would name entries the row does not carry.
+            table_width = int(metadata.get("max_blocks_per_seq", len(row)))
+            if table_width > len(row):
                 raise ValueError(
-                    f"KV layer '{name}' reports a block table of {table_width} "
-                    f"block(s) per sequence and metadata declaring {declared_window}; "
-                    f"the window handed to the layer is one number or the slice is "
-                    f"wrong"
+                    f"KV layer '{name}' declares {table_width} block(s) per sequence "
+                    f"against a host block-table row {len(row)} entry(ies) wide; the "
+                    f"window handed to the layer is read out of that row, so a width "
+                    f"past its end names blocks this step cannot address"
                 )
             leg_is_prefill = int(metadata["max_query_len"]) > int(
                 metadata["decode_token_threshold"]
@@ -5259,8 +5364,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             window_blocks = min(table_width, max(1, span_blocks))
             geometries.append(
                 {
-                    "block_ids": [int(value) for value in row[:blocks_used]],
-                    "state_slot": int(row[0]),
+                    "block_ids": row[:blocks_used],
+                    "state_slot": row[0],
                     "page_size": block_size,
                     "window_blocks": window_blocks,
                 }
