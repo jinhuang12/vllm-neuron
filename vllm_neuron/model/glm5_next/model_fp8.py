@@ -8152,6 +8152,69 @@ class Glm5NextWeightLoadError(ValueError):
     """
 
 
+class _MetaSlice:
+    """One checkpoint tensor's header, answering data reads with meta tensors.
+
+    The loaders read a slice by indexing it, and every index they use is a plain
+    torch index. So the shape arithmetic of a shard or a fusion is done by
+    indexing a meta tensor of the stored shape, which is torch's own answer to
+    the question rather than a second implementation of it here.
+    """
+
+    def __init__(self, source: object) -> None:
+        self._source = source
+        self._empty: torch.Tensor | None = None
+
+    def get_shape(self) -> list[int]:
+        """The stored shape, as the header gives it."""
+        return self._source.get_shape()
+
+    def get_dtype(self) -> str:
+        """The stored dtype, as the header gives it."""
+        return self._source.get_dtype()
+
+    def _meta(self) -> torch.Tensor:
+        if self._empty is None:
+            shape = tuple(int(extent) for extent in self._source.get_shape())
+            # THE DTYPE COMES OFF ONE ROW, not off a name table. safetensors names
+            # its dtypes in its own spelling and torch has no reader for that
+            # spelling, so a table here would be a second place every dtype in the
+            # checkpoint is written down -- including the fp8 ones this model
+            # depends on. One row from the front is a few bytes and carries the
+            # dtype torch itself gives the stored bytes.
+            probe = self._source[0:1] if shape and shape[0] else self._source[:]
+            self._empty = torch.empty(shape, dtype=probe.dtype, device="meta")
+        return self._empty
+
+    def __getitem__(self, index: object) -> torch.Tensor:
+        return self._meta()[index]
+
+
+class _MetaShapeCheckpoint(SafetensorsCheckpoint):
+    """The checkpoint reader that answers with shapes and reads no weight data.
+
+    Only the two places that touch bytes are replaced. File discovery, the key
+    index and the load pipeline stay the shared reader's own, so a fusion or a
+    shard that the real load performs is performed here too.
+    """
+
+    def _get_slice(self, name: str) -> _MetaSlice:
+        """One tensor's slice, wrapped so its data reads as meta."""
+        return _MetaSlice(super()._get_slice(name))
+
+    def _load_to_page_cache(self, *args: object, **kwargs: object) -> None:
+        """Read no file into the page cache, because no data will be read.
+
+        Skipping this is safe rather than merely faster: the reader that consumes
+        it CHECKS the store and does not wait on it
+        (``utils/checkpoints.py:388``, ``cached_files_store.check``), so a file
+        that never arrives leaves the pipeline reading headers instead of
+        blocking. Leaving it in would pull the whole checkpoint through the page
+        cache to build tensors that hold nothing.
+        """
+        return None
+
+
 class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 GLM-5.3-Flash implementation.
 
@@ -8422,13 +8485,58 @@ class Glm5NextForConditionalGeneration(nn.Module):
             module.register_parameter(leaf, placeholder)
         return len(planned)
 
-    def load_weights(
+    def load_weights_lite(
         self,
         checkpoint_path: str,
         device: torch.device,
         cache_dir: str | None = None,
     ) -> None:
+        """Shape the tree from the checkpoint's headers, reading no weight data.
+
+        The runner calls this on a CPU-compile start, where no weights are wanted
+        and the whole module is moved to meta afterwards
+        (``neuron_model_runner.py:1358-1367``). Before this method the arm loaded
+        nothing at all: every parameter stayed a ``register_parameter(name, None)``
+        declaration, so the root forward refused at its embedding table and the
+        mHC sites were never bound.
+
+        IT RUNS THE REAL LOAD, and that is the whole design. The shapes a
+        parameter ends up with are decided by the loaders -- which checkpoint keys
+        fuse into one tensor, how the shard geometry narrows it -- and those rules
+        live in one place. So this method changes WHERE the numbers come from and
+        nothing else: :class:`_MetaShapeCheckpoint` answers with meta tensors of
+        the checkpoint's own shapes, and every loader, prep and bind then executes
+        the code the real load executes.
+
+        ``device`` IS IGNORED AND META IS USED INSTEAD. The runner passes the CPU
+        because that is where it wants compile-time constants read from, but a CPU
+        tensor of these shapes would allocate the whole model; meta allocates
+        nothing and is where the runner moves the module two lines later anyway.
+        """
+        meta = torch.device("meta")
+        self.to(meta)
+        self.load_weights(
+            checkpoint_path,
+            meta,
+            cache_dir,
+            reader=_MetaShapeCheckpoint(checkpoint_path, cache_dir),
+        )
+
+    def load_weights(
+        self,
+        checkpoint_path: str,
+        device: torch.device,
+        cache_dir: str | None = None,
+        *,
+        reader: object | None = None,
+    ) -> None:
         """Read the checkpoint's weights onto ``device``.
+
+        ``reader`` is the seam :meth:`load_weights_lite` replaces, and it is
+        keyword-only with a default so the three-argument call the runner makes
+        (``neuron_model_runner.py:1299``) is the call it always was. Passed
+        ``None``, this method opens the real checkpoint on the line it always
+        opened it.
 
         ``inc-glm53f-091``. This method is what the runner already calls:
         ``neuron_model_runner.py:1299`` invokes ``self.model.load_weights(...)``
@@ -8486,7 +8594,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         acceptance over it -- is recorded on the raising function.
         """
         try:
-            checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
+            checkpoint = reader or SafetensorsCheckpoint(checkpoint_path, cache_dir)
             num_files = checkpoint.get_num_files()
         except Exception as exc:
             raise Glm5NextWeightLoadError(
