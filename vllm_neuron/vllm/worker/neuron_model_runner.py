@@ -4893,8 +4893,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         one trash row above every addressable candidate pool -- "allocate at least
         ``candidates + 1``" where ``candidates = max_seq_len // index_kpool``
         (``model_fp8.py:5288-5295``). Passing the longest sequence the engine admits
-        therefore covers every batch that can be scheduled, and a batch's own
-        shorter ``max_seq_len`` rides in the carrier. ``tail`` is ``[2,
+        therefore covers every batch that can be scheduled, and the carrier now
+        carries THAT SAME number rather than a shorter one of its own: the value is
+        a python int, so a shorter one would be a different int per step and each
+        step would want its own captured graph. RE-PINNED; the reading this replaces,
+        verbatim: "a batch's own shorter ``max_seq_len`` rides in the carrier".
+        ``tail`` is ``[2,
         index_kpool, index_head_dim]``, half 0 keys and half 1 gate scores
         (``model_fp8.py:4735``).
 
@@ -4942,11 +4946,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _glm5next_live_side_caches(self, banks) -> list[dict]:
         """The one live set of side caches for this process, allocated on first use.
 
-        THE ALLOCATION BOUND IS ``max_model_len``, not the batch's own length, for
-        the reason the allocator's docstring gives: the pooled store must outlive
-        the step and cover every sequence the engine admits, while the carrier
-        carries the batch's own ``max_seq_len`` so the indexer's candidate count
-        stays the batch's.
+        THE ALLOCATION BOUND IS ``max_model_len``, and so is the carrier's, which is
+        why the two cannot disagree about how many candidate pools the indexer may
+        address. RE-PINNED; the clause this replaces, verbatim: "while the carrier
+        carries the batch's own ``max_seq_len`` so the indexer's candidate count stays
+        the batch's" -- the candidate count is now the ENGINE's, and each row is still
+        bounded to its own length before selection.
 
         ONE SET FOR THE PROCESS IS ALSO A HAZARD, and the converter answers it. A
         new sequence would otherwise start on the previous sequence's partial pool,
@@ -5528,7 +5533,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
                 ** -0.5
             ),
-            max_seq_len=start_position + tokens,
+            # THE INDEXER'S BOUND IS THE ENGINE'S LONGEST SEQUENCE, NOT THIS STEP'S END.
+            # It stays a python int, because the indexer's own docstring records why: the
+            # obvious `int(seq_lens.max())` is a host read of tensor data inside a traced
+            # region. An int is therefore baked into every graph captured with it -- and
+            # `start_position + tokens` is a DIFFERENT int at every decode step, so each
+            # step wanted its own graph. This value is the same at every step of the
+            # process, so one graph serves them all.
+            #
+            # NOTHING BEYOND THE SEQUENCE BECOMES VISIBLE. The number sizes the candidate
+            # pool count, and each row is bounded to its own length by `seq_lens` before
+            # selection (`model_fp8.py`'s `select_bounded_pools`), so raising it adds
+            # candidates that the causal bound then removes. It also fixes which regime
+            # the indexer runs, which is the point: a graph captured on the short-sequence
+            # bypass could not serve a longer one.
+            #
+            # AND IT IS THE ENGINE'S LENGTH RATHER THAN THE WINDOW'S, because the pooled
+            # store is allocated from exactly this number (`:4967`, rows
+            # `max_seq_len // pool + 1`). The window is rounded up to the block table's
+            # alignment and can therefore be LONGER than the model length, which would
+            # leave the indexer's own "one trash row above every candidate" refusal firing
+            # on a step that is otherwise correct.
+            max_seq_len=int(self.max_model_len),
             index_kpool=int(text_config.index_kpool),
         )
         # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
