@@ -6843,9 +6843,10 @@ class Glm5NextMLAAttention(nn.Module):
         past this sequence's context hold other pages, so they must never be
         attended. Two things already prevent it, and neither is a length: the
         indexer builds candidates only out of ``seq_lens``, so no index beyond the
-        context exists to select, and the sparse seam masks its ``-1`` rows itself
-        (entry ``design-20260905-af`` route (a)). Nothing between the indexer and
-        this method may clamp or refill those indices -- the same ruling -- so a
+        context exists to select, and the sparse seam masks its ``-1`` rows itself.
+        Nothing between the indexer and this method may clamp or refill those
+        indices, because a clamp would turn an out-of-context index into an
+        in-context one and attend a row this bound exists to exclude -- so a
         caller that hands indices outside the context is the one error this
         method cannot catch, and the acceptance reads the bound host-side instead.
 
