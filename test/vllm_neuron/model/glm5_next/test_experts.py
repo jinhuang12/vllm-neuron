@@ -783,8 +783,14 @@ def test_sharding_tp_degree_freeze_is_the_registered_value_and_not_configurable(
             env_reads += 1
         if isinstance(node, ast.Name) and node.id in {"getenv", "environ"}:
             env_reads += 1
-    assert env_reads == 0
-    assert "os.environ" not in source and "getenv" not in source
+    assert env_reads == 0, (
+        f"the factory module reads the environment at {env_reads} site(s), so this "
+        f"degree could be set outside the plan"
+    )
+    # THE WALK ABOVE IS THE WHOLE READING. It already covers both names, and it covers
+    # them as CODE: the substring check that used to sit here read the file's text, so
+    # a comment or a docstring naming either name would have failed a module that never
+    # reads the environment.
 
     # The value is a module-level literal, not computed from anything.
     assignments = [

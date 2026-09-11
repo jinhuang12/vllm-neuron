@@ -487,16 +487,29 @@ def test_a03_the_decode_leg_spells_no_host_read_of_the_position() -> None:
     assert "torch.is_tensor(position)" in source
     assert "decode_pool_address(" in source
 
-    # The seam files are read as bytes for the one name that must NOT come back: a
-    # host read spelled as a method rather than as a cast. Both paths come from the
-    # loaded modules, so neither can point at a file this run did not import.
+    # The seam files are read for the one name that must NOT come back: a host read
+    # spelled as a method rather than as a cast. Both paths come from the loaded
+    # modules, so neither can point at a file this run did not import.
+    #
+    # THE READING IS OF THE CODE, NOT OF THE TEXT. A comment or a docstring naming
+    # `.item()` -- to say why the call is not there -- is not a call, and a scan over
+    # the bytes cannot tell the two apart. So the count is of CALL sites: an
+    # attribute access named `item` that is being called. Prose cannot enter it, and
+    # a call cannot hide from it behind a line break or spacing either.
     for path in (
         Path(model_fp8.__file__).resolve(),
         Path(_seam_module().__file__).resolve(),
     ):
-        text = path.read_text()
-        say("A03_ITEM_CALLS", path.name, text.count(".item()"))
-        assert ".item()" not in text, (
-            f"{path.name} spells `.item()`, which is the same host read under another "
-            f"name"
+        calls = [
+            node
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "item"
+        ]
+        say("A03_ITEM_CALLS", path.name, len(calls))
+        assert not calls, (
+            f"{path.name} calls `.item()` at line(s) "
+            f"{[node.lineno for node in calls]}, which is the same host read under "
+            f"another name"
         )
