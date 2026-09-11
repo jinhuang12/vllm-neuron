@@ -5101,6 +5101,31 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"{int(geometry['page_size'])}; the slice and the layer's own page "
                     f"are one number or the slice is wrong"
                 )
+            # THE WRITE HAS TO LAND IN THE REQUEST'S OWN PAGES, AND THIS IS WHERE THAT
+            # IS DECIDED NOW. The layer writes rows `start_position` through
+            # `start_position + tokens` of the window it is handed. It used to refuse a
+            # write past the end of what it was given, because what it was given WAS the
+            # request's pages; the window is longer than those pages by design, so the
+            # same check inside the layer can no longer see the difference -- a write
+            # past the request's last page lands on a neighbour's rows, inside the
+            # window, in silence.
+            #
+            # IT CANNOT MOVE ANY FURTHER IN THAN HERE. The check is arithmetic on the
+            # position's VALUE, and past this point the position is a tensor whose value
+            # a captured graph cannot read; here it is still the host integer this
+            # function was handed, beside the block run it was handed for the same step.
+            # The converter derives one from the other, so a step it built satisfies this
+            # by construction and the refusal speaks to a caller that does not.
+            own_slots = len(ids) * block_size
+            if int(start_position) < 0 or int(start_position) + int(tokens) > own_slots:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {int(tokens)} token(s) at "
+                    f"position {int(start_position)} against {len(ids)} block(s) of "
+                    f"{block_size} slot(s), which is {own_slots} slot(s) of this "
+                    f"request's own pages; the window this layer reads is longer than "
+                    f"those pages, so a write outside them would land on another "
+                    f"sequence's rows without shortening anything"
+                )
             # THE WINDOW SLICE. Its LENGTH is the bucket's, so one captured graph
             # serves every position; the request's own pages sit at the front of it
             # and the position bounds what is written. Two refusals guard the form.
