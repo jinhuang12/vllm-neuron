@@ -5249,13 +5249,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"block-table row is {len(row)} entry(ies) wide; a row that "
                         f"cannot address the step would slice another sequence's pages"
                     )
-            elif len(row) != 1:
-                raise ValueError(
-                    f"KV layer '{name}' keeps one sequence's state in ONE slot, so its "
-                    f"block-table row names one slot; this row is {len(row)} entry(ies) "
-                    f"wide, and only the first would ever be read, so the rest name "
-                    f"slots this layer would silently leave behind"
-                )
+            # A RECURRENT ROW'S WIDTH BELONGS TO ITS TABLE, not to this layer, so nothing is
+            # asked of it here: every row arrives at its cache group's full padded width,
+            # whether the builder wrote ``torch.arange(max_num_blocks_per_req)``
+            # (:4437-4442) or sliced the served table (:4246). The one slot the scheduler
+            # allocated is the row's first entry, and THAT is what has to name a slot the
+            # bank holds -- checked once, where the slot is used to take the view (:5041),
+            # rather than a second time here.
             geometries.append(
                 {
                     "block_ids": row[:blocks_used],

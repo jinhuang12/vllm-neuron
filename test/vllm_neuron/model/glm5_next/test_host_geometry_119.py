@@ -8,7 +8,7 @@ THE DECLARED ACCEPTANCE:
       test/vllm_neuron/model/glm5_next/test_host_geometry_119.py -s -rA \\
       -p no:randomly -p no:cacheprovider
 
-Six items, one test each, no ``parametrize``.
+Seven items, one test each, no ``parametrize``.
 
 WHAT THIS FILE IS ABOUT. ``NeuronModelRunner._glm5next_model_kwargs`` decides which cache
 pages a step occupies before the traced call runs. It used to read those numbers off
@@ -18,7 +18,7 @@ pages a step occupies before the traced call runs. It used to read those numbers
 extraction raised. The numbers now come from the entry's ``host_num_computed_tokens`` and
 ``host_block_table``, which both metadata builders fill from the runner's own host arrays.
 
-THE SIX ITEMS
+THE SIX HOST-GEOMETRY ITEMS
 
 * A01 -- a captured step. The metadata is built the way ``_build_warmup_attention_metadata``
   builds it, with every device tensor and every bank on ``meta``, and the converter must
@@ -41,7 +41,15 @@ THE SIX ITEMS
   range with ``int(...)``. The seam now reaches its dispatch on a captured step's own
   carrier; at the base it raises the same meta read, one seam further along than A01.
 
-THE BASE ARM, DECLARED: A01, A02, A03, A04 and A06 FAIL and A05 PASSES.
+THE WIDTH ITEM, ON THE SAME CONVERTER
+
+* B01 -- the width a recurrent row arrives at. Both metadata builders hand every cache group
+  the group's own padded row, so a recurrent bank's row is as wide as the table and the one
+  slot the scheduler gave it is the row's first entry. The converter must serve such a row
+  from that entry. This item reads the same at the base, because the base checks no width
+  either; it is here to hold this candidate's own width rule to the shape the runner builds.
+
+THE BASE ARM, DECLARED: A01, A02, A03, A04 and A06 FAIL; A05 and B01 PASS.
 
 CONVENTIONS. The runner is stood up with ``__new__`` and given only the attributes the
 converter reads, which is this campaign's landed harness shape
@@ -446,4 +454,58 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
         message = str(raised)
         assert "cannot be called on meta tensors" not in message, (
             f"the seam still read a value off a meta tensor: {message}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B01. A recurrent row at the table's own width, built the way the runner builds it.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
+    """A recurrent bank is handed its KV group's full padded row, and must be served.
+
+    NEITHER BUILDER NARROWS A ROW TO THE ONE SLOT A RECURRENT BANK USES. The warmup
+    builder writes ``torch.arange(max_num_blocks_per_req)``
+    (``neuron_model_runner.py:4437-4442``) and the serving builder slices the group's own
+    table (``:4246``), whose width is ``max_model_len`` over the page size. The slot the
+    scheduler allocated is the row's first entry and the rest is the table's padding, so a
+    converter that asked a recurrent row to be one entry wide would refuse every hybrid
+    step. Both shapes are driven here, each named in its own failure message.
+    """
+    cpu = torch.device("cpu")
+    banks = [_linear_bank(cpu)]
+    tokens = PAGE
+    width = -(-MAX_MODEL_LEN // PAGE)
+    slot = STATE_SLOTS - 1
+    shapes = {
+        "the warmup builder's ascending row": list(range(width)),
+        "a served row, its slot first and the table's padding after": (
+            [slot] + [0] * (width - 1)
+        ),
+    }
+
+    for what, row in shapes.items():
+        runner = _runner(banks)
+        entry = _entry(
+            host_row=[row],
+            host_cached=[0],
+            device_row=[row],
+            device_cached=0,
+            tokens=tokens,
+            device=cpu,
+        )
+
+        try:
+            translated = runner._glm5next_model_kwargs(
+                _kwargs(banks, entry, tokens=tokens, device=cpu)
+            )
+        except ValueError as refused:
+            raise AssertionError(
+                f"{what} was refused, and it is what the runner hands every recurrent "
+                f"bank: {refused}"
+            ) from refused
+
+        carrier = translated["layer_carriers"][0]
+        state = banks[0]["recurrent_state"]
+        assert carrier["recurrent_state"].data_ptr() == state[row[0]].data_ptr(), (
+            f"{what} was served from a slot other than its first entry, {row[0]}"
         )
