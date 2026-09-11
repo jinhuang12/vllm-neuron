@@ -63,8 +63,10 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import os
 import textwrap
+import tokenize
 from types import SimpleNamespace
 
 import pytest
@@ -131,6 +133,39 @@ DECLARED_CONTINUED_POSITION = DECLARED_PREFILL_TOKENS
 def say(name: str, *values) -> None:
     """One reading per line, tagged so a launcher can anchor on it."""
     print("CAPSHAPE|" + name + "|" + "|".join(str(value) for value in values))
+
+
+_PROSE_TOKENS = {tokenize.COMMENT, tokenize.STRING} | {
+    kind for kind in (getattr(tokenize, name, None)
+                      for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"))
+    if kind is not None
+}
+
+
+def _code_of(obj) -> str:
+    """``obj``'s source with every comment and string constant blanked out.
+
+    A SOURCE SCAN IS ABOUT CODE. A docstring that names the expression the code no
+    longer uses, to say what changed and why, is not the code using it -- and a scan
+    that cannot tell the two apart fails a file for explaining itself. Blanking rather
+    than deleting keeps every remaining character on its own line and column, so an
+    exact match still reads as one. An f-string's ``{...}`` stays, because that part
+    of it really is code.
+    """
+    source = textwrap.dedent(inspect.getsource(obj))
+    rows = [list(row) for row in source.splitlines(keepends=True)]
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type not in _PROSE_TOKENS:
+            continue
+        (first_row, first_col), (last_row, last_col) = token.start, token.end
+        for number in range(first_row, last_row + 1):
+            row = rows[number - 1]
+            start = first_col if number == first_row else 0
+            stop = last_col if number == last_row else len(row)
+            for column in range(start, min(stop, len(row))):
+                if row[column] != "\n":
+                    row[column] = " "
+    return "".join("".join(row) for row in rows)
 
 
 def _require_cpu_mode() -> None:
@@ -351,10 +386,12 @@ def test_the_mla_read_no_longer_depends_on_the_position() -> None:
     """``attend()``'s own source: the read is the whole window and no host read remains.
 
     A structural reading, in the form this suite uses for the state hook. It observes
-    the three lines that changed; it does not observe an attention output.
+    the three lines that changed; it does not observe an attention output. It reads the
+    CODE only: this method's own docstring names the old expression to say what changed,
+    and prose that explains a form is not the code using it.
     """
     _require_cpu_mode()
-    source = inspect.getsource(model_fp8.Glm5NextMLAAttention.attend)
+    source = _code_of(model_fp8.Glm5NextMLAAttention.attend)
 
     say("I5_HOST_READS_OF_THE_POSITION", source.count("int(start_position)"))
     assert source.count("int(start_position)") == 0
@@ -382,7 +419,7 @@ def test_the_kda_entering_state_is_chosen_without_reading_the_position() -> None
     with answers in a 0-d bool tensor rather than a python bool.
     """
     _require_cpu_mode()
-    source = inspect.getsource(model_fp8.Glm5NextKDAAttention.forward)
+    source = _code_of(model_fp8.Glm5NextKDAAttention.forward)
 
     say("I6_HOST_READS_OF_THE_POSITION", source.count("int(start_position)"))
     assert source.count("int(start_position)") == 0
