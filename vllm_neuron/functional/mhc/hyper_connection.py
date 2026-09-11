@@ -184,7 +184,7 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
     Args:
         x: ``[T, H]`` fp32 in HBM -- the sub-block's single-stream output. ``T``
             occupies the partition axis, so it is walked in tiles of
-            ``nl.tile_size.pmax`` and is NOT bounded by it (``inc-glm53f-029b``).
+            :data:`PARTITION_MAX` rows and is NOT bounded by it.
         residual: ``[T, S, H]`` fp32 in HBM -- the ``S`` residual streams.
         post_layer_mix: ``[T, S, 1]`` fp32 -- per token, per OUTPUT stream.
         comb_res_mix: ``[T, S, S]`` fp32 -- per token, ``[i, j]`` weights input
@@ -198,16 +198,41 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
     not a stylistic one: the route predicate declares ``1`` dispatch per case, and
     a host-driven loop over output streams would read ``S``.
 
-    THE ROW LOOP IS TRACE-TIME FOR THE SAME REASON (``inc-glm53f-029b``). The
-    token axis is walked in tiles of ``nl.tile_size.pmax`` inside this one
-    dispatch, so a token extent above the partition limit costs more tiles and
-    never a second dispatch. Each row's arithmetic is unchanged and in the same
-    order, which is why the tiled output is BIT-IDENTICAL to the untiled body
-    below the old ceiling rather than merely close to it.
+    THE ROW LOOP IS TRACE-TIME FOR THE SAME REASON. The token axis is walked in
+    tiles of :data:`PARTITION_MAX` rows inside this one dispatch, so a token
+    extent above the partition limit costs more tiles and never a second
+    dispatch. Each row's arithmetic is unchanged and in the same order, which is
+    why the tiled output is BIT-IDENTICAL to the untiled body below the old
+    ceiling rather than merely close to it.
+
+    Which PYTHON this body may use
+    ------------------------------
+    The body this replaced computed the same numbers and did not COMPILE: the
+    NKI compiler refused to specialise it -- ``failed to specialize NKI kernel:
+    Collected 1 different diagnostics: - [x1] error: unsupported expression`` --
+    at the first kernel call of every layer's forward, so no graph of the whole
+    model could be captured. A simulator-only acceptance never asked the
+    question, because the simulator executes this body as ordinary python and
+    never runs the compiler frontend at all.
+
+    The refused construct is a python COMPREHENSION inside a traced kernel, and
+    the ``[x1]`` counts comprehension SITES: this body had exactly one, a list
+    comprehension over the loaded stream tiles. The identical list built by a
+    ``for`` loop and ``append``, indexed by the same loop variable, specialises --
+    that is the whole repair, and ``sinkhorn.py:353-379`` and
+    ``dsa/causal_bound.py:296-320`` already carry these forms for the same
+    reason. Two further changes below are conservative rather than required: the
+    short last tile comes from an ``if``/``else`` rather than from ``min``, whose
+    arithmetic it matches exactly and which the sibling module dropped in its own
+    repair; and the tile height is :data:`PARTITION_MAX`, the constant this
+    package already imports, rather than an attribute read inside the traced
+    body. No arithmetic moved -- the same loads in the same order feed the same
+    three ``nisa`` calls per ``(j, i)`` pair -- which is why the acceptance
+    compares this body against the refused one for BIT-IDENTITY rather than for
+    closeness.
     """
     t_extent, s_extent, h_extent = residual.shape
-    pmax = nl.tile_size.pmax
-    n_tiles = (t_extent + pmax - 1) // pmax
+    n_tiles = (t_extent + PARTITION_MAX - 1) // PARTITION_MAX
 
     # `out` is HBM, which has no partition cap, so it is allocated at the FULL
     # token extent and only the sbuf tiles below are per-tile.
@@ -216,11 +241,16 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
     )
 
     for t in range(n_tiles):
+        off = t * PARTITION_MAX
         # The last tile is short whenever the token count is not a multiple of
-        # `pmax`, and it is narrowed rather than padded: a padded tile would put
-        # values the caller never sent into the arithmetic.
-        rows = min(pmax, t_extent - t * pmax)
-        off = t * pmax
+        # the tile height, and it is narrowed rather than padded: a padded tile
+        # would put values the caller never sent into the arithmetic. The branch
+        # and `min(PARTITION_MAX, t_extent - off)` agree for every input.
+        remaining = t_extent - off
+        if remaining < PARTITION_MAX:
+            rows = remaining
+        else:
+            rows = PARTITION_MAX
 
         # The single-stream layer output, loaded once per tile: every output
         # stream of this tile reads it.
@@ -228,10 +258,12 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
 
         # All S streams loaded once each, rather than S times each inside the j
         # loop. S * S loads of the same data would be S * (S - 1) redundant DMAs.
-        streams = [
-            nl.load(residual[off : off + rows, i, 0:h_extent], dtype=nl.float32)
-            for i in range(s_extent)
-        ]
+        streams = []
+        for i in range(s_extent):
+            stream = nl.load(
+                residual[off : off + rows, i, 0:h_extent], dtype=nl.float32
+            )
+            streams.append(stream)
 
         # Two scratch tiles, allocated once per row tile and reused across all S
         # output streams of that tile.
