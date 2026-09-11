@@ -4275,6 +4275,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         return attn_metadata
 
+    def _aligned_table_width(self, *, context_length: int, block_size: int) -> int:
+        """The block-table width a group of ``block_size`` reports for a context length.
+
+        It is the whole blocks the context needs, divided across the context-parallel
+        ranks, and then rounded up again to a multiple of ``128 // block_size`` to match
+        upstream's InputBatch width. This is the width the warmup builder hands over and
+        the width a prefill graph is captured with, since a prefill never trims it back.
+
+        ONE ARITHMETIC, TWO READERS. The KV allocator sizes each latent bank's spare
+        window from this same number, and a spare that disagreed with the width actually
+        handed over would be the wrong size in exactly the case it exists for.
+        """
+        dcp_block_size = int(block_size) * max(self._dcp_size, 1)
+        blocks = -(-int(context_length) // dcp_block_size)
+        alignment = 128 // int(block_size) if int(block_size) <= 128 else 1
+        return -(-blocks // alignment) * alignment
+
     def _build_warmup_attention_metadata(
         self,
         num_tokens: int,
@@ -4331,16 +4348,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ctx_bucket if ctx_bucket is not None else self.max_model_len
             )
             dcp_block_size = block_size * max(self._dcp_size, 1)
-            max_num_blocks_per_req = (
-                ctx_for_blocks + dcp_block_size - 1
-            ) // dcp_block_size
             # Match upstream's TRTLLM alignment (vLLM PR #39324): InputBatch
             # block_table width is rounded up to a multiple of 128/block_size.
             # Prefill doesn't trim at runtime so warmup must use the aligned
             # width. Decode with ctx-length buckets trims back below.
-            alignment = 128 // block_size if block_size <= 128 else 1
-            max_num_blocks_per_req = (
-                (max_num_blocks_per_req + alignment - 1) // alignment * alignment
+            max_num_blocks_per_req = self._aligned_table_width(
+                context_length=ctx_for_blocks, block_size=block_size
             )
             # Untrimmed block-table seq dim — used by the on-device
             # ``correct_spec_decode_positions_and_slot_mapping`` correction
@@ -4830,6 +4843,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
     @staticmethod
+    def _glm5next_start_position(position: int, device) -> torch.Tensor:
+        """A host position number, as a tensor for the traced boundary.
+
+        The runner keeps the host int for its own arithmetic -- it sizes the window
+        and checks the pages with it -- and hands the layers this tensor, because a
+        python int reaching a traced region is baked into the captured graph and
+        pins it to the position it was captured at. Three numbers go through here:
+        this step's first slot, this decode step's own position, and the sequence
+        length after a prefill chunk. All three are host numbers when this runs.
+        """
+        return torch.tensor(int(position), dtype=torch.int32, device=device)
+
+    @staticmethod
     def _glm5next_host_geometry(metadata: dict, key: str, name: str) -> list:
         """One metadata entry's host-side geometry, as plain Python integers.
 
@@ -4869,8 +4895,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         one trash row above every addressable candidate pool -- "allocate at least
         ``candidates + 1``" where ``candidates = max_seq_len // index_kpool``
         (``model_fp8.py:5288-5295``). Passing the longest sequence the engine admits
-        therefore covers every batch that can be scheduled, and a batch's own
-        shorter ``max_seq_len`` rides in the carrier. ``tail`` is ``[2,
+        therefore covers every batch that can be scheduled, and the carrier now
+        carries THAT SAME number rather than a shorter one of its own: the value is
+        a python int, so a shorter one would be a different int per step and each
+        step would want its own captured graph. RE-PINNED; the reading this replaces,
+        verbatim: "a batch's own shorter ``max_seq_len`` rides in the carrier".
+        ``tail`` is ``[2,
         index_kpool, index_head_dim]``, half 0 keys and half 1 gate scores
         (``model_fp8.py:4735``).
 
@@ -4918,11 +4948,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _glm5next_live_side_caches(self, banks) -> list[dict]:
         """The one live set of side caches for this process, allocated on first use.
 
-        THE ALLOCATION BOUND IS ``max_model_len``, not the batch's own length, for
-        the reason the allocator's docstring gives: the pooled store must outlive
-        the step and cover every sequence the engine admits, while the carrier
-        carries the batch's own ``max_seq_len`` so the indexer's candidate count
-        stays the batch's.
+        THE ALLOCATION BOUND IS ``max_model_len``, and so is the carrier's, which is
+        why the two cannot disagree about how many candidate pools the indexer may
+        address. RE-PINNED; the clause this replaces, verbatim: "while the carrier
+        carries the batch's own ``max_seq_len`` so the indexer's candidate count stays
+        the batch's" -- the candidate count is now the ENGINE's, and each row is still
+        bounded to its own length before selection.
 
         ONE SET FOR THE PROCESS IS ALSO A HAZARD, and the converter answers it. A
         new sequence would otherwise start on the previous sequence's partial pool,
@@ -5049,7 +5080,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "conv_state": bank["conv_state"][int(state_slot)],
                         "recurrent_state": bank["recurrent_state"][int(state_slot)],
                         "is_prefill": bool(is_prefill),
-                        "start_position": int(start_position),
+                        "start_position": cls._glm5next_start_position(
+                            start_position, bank["recurrent_state"].device
+                        ),
                     }
                 )
                 continue
@@ -5075,9 +5108,75 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"{int(geometry['page_size'])}; the slice and the layer's own page "
                     f"are one number or the slice is wrong"
                 )
-            latent = bank["latent_cache"][
-                ids[0] * block_size : (ids[-1] + 1) * block_size
-            ]
+            # THE WRITE HAS TO LAND IN THE REQUEST'S OWN PAGES, AND THIS IS WHERE THAT
+            # IS DECIDED NOW. The layer writes rows `start_position` through
+            # `start_position + tokens` of the window it is handed. It used to refuse a
+            # write past the end of what it was given, because what it was given WAS the
+            # request's pages; the window is longer than those pages by design, so the
+            # same check inside the layer can no longer see the difference -- a write
+            # past the request's last page lands on a neighbour's rows, inside the
+            # window, in silence.
+            #
+            # IT CANNOT MOVE ANY FURTHER IN THAN HERE. The check is arithmetic on the
+            # position's VALUE, and past this point the position is a tensor whose value
+            # a captured graph cannot read; here it is still the host integer this
+            # function was handed, beside the block run it was handed for the same step.
+            # The converter derives one from the other, so a step it built satisfies this
+            # by construction and the refusal speaks to a caller that does not.
+            own_slots = len(ids) * block_size
+            if int(start_position) < 0 or int(start_position) + int(tokens) > own_slots:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {int(tokens)} token(s) at "
+                    f"position {int(start_position)} against {len(ids)} block(s) of "
+                    f"{block_size} slot(s), which is {own_slots} slot(s) of this "
+                    f"request's own pages; the window this layer reads is longer than "
+                    f"those pages, so a write outside them would land on another "
+                    f"sequence's rows without shortening anything"
+                )
+            # THE WINDOW SLICE. Its LENGTH is the bucket's, so one captured graph
+            # serves every position; the request's own pages sit at the front of it
+            # and the position bounds what is written. Two refusals guard the form.
+            if "window_blocks" not in geometry:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed a geometry with no "
+                    f"'window_blocks'; the window this layer reads has a length that is "
+                    f"fixed for the bucket, and a caller that does not state that length "
+                    f"cannot be given a window one captured graph can serve"
+                )
+            window_blocks = int(geometry["window_blocks"])
+            if len(ids) > window_blocks:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {len(ids)} block(s) for one "
+                    f"sequence and the bucket's block table holds {window_blocks} per "
+                    f"sequence; a request longer than its bucket cannot be served by "
+                    f"this window"
+                )
+            base = ids[0] * block_size
+            window = window_blocks * block_size
+            bank_slots = int(bank["latent_cache"].shape[0])
+            if base + window > bank_slots:
+                # THE ALLOCATION IS SHORT, AND CLAMPING THE BASE IS NOT THE REMEDY. A
+                # torch slice past the end does not raise: it returns a SHORTER view,
+                # which is how a bucket-constant length silently becomes a per-request
+                # one where a captured graph cannot see it. Clamping the base instead
+                # would keep the length and move every write onto another sequence's
+                # rows. So the bank owes a spare window of blocks past the last one a
+                # request can be given, and the runner's allocator is where
+                # that headroom is added -- not here.
+                raise ValueError(
+                    f"KV layer '{bank['name']}'s bank holds {bank_slots} slot(s) and a "
+                    f"window of {window} slot(s) from block {ids[0]} would end at "
+                    f"{base + window}; the bank needs a spare {window_blocks} block(s) "
+                    f"past the last block a request can be given, and neither a "
+                    f"shortened view nor a clamped base is a substitute"
+                )
+            latent = bank["latent_cache"][base : base + window]
+            if int(latent.shape[0]) != window:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' produced a window of "
+                    f"{int(latent.shape[0])} slot(s) where {window} was asked for; the "
+                    f"window's length is what one captured graph depends on"
+                )
             device = latent.device
             carrier = {
                 "latent_cache": latent,
@@ -5085,7 +5184,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "seq_lens": cls._glm5next_row_seq_lens(
                     tokens=tokens, start_position=start_position, device=device
                 ),
-                "start_position": int(start_position),
+                "start_position": cls._glm5next_start_position(start_position, device),
                 "softmax_scale": float(softmax_scale),
                 "max_seq_len": int(max_seq_len),
                 "page_size": int(geometry["page_size"]),
@@ -5105,11 +5204,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # sequence, equal to this sequence's end only while the batch is
                 # one request -- which this half refuses to exceed, but the model
                 # must not depend on that.
+                # THE END POSITION RIDES AS A TENSOR, built here from two host ints.
+                # It decides which ring slots this chunk's remainder occupies, so an
+                # int would bake those slots into the captured graph and pin it to
+                # the length this chunk happened to end at. The seam's int route
+                # refuses an end position shorter than the chunk, and that refusal
+                # cannot run on a tensor -- it is made above instead, where the
+                # position is still a number and a negative one is rejected.
                 carrier["prefill_tail"] = side["tail"]
-                carrier["prefill_end_position"] = int(start_position) + int(tokens)
+                carrier["prefill_end_position"] = cls._glm5next_start_position(
+                    int(start_position) + int(tokens), device
+                )
             else:
+                # AND SO DOES THE DECODE POSITION, for the same reason: it chooses
+                # the ring slot this token's key is written to.
                 carrier["tail"] = side["tail"]
-                carrier["position"] = int(start_position)
+                carrier["position"] = cls._glm5next_start_position(
+                    start_position, device
+                )
             carriers.append(carrier)
         return carriers
 
@@ -5257,17 +5369,69 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # allocated is the row's first entry, and THAT is what has to name a slot the
             # bank holds -- checked once, where the slot is used to take the view (:5041),
             # rather than a second time here.
+            # THE WINDOW THE LAYER IS HANDED IS THE LEG'S BUCKET SPAN, not this step's
+            # span and not the row's width. A length derived from the cached position
+            # would change with every decode step and a captured graph would fit only
+            # the position it was captured at; a length taken from the block table's
+            # width would be the whole model length on the prefill leg, because that
+            # width falls back to `max_model_len` when a group has no context bucket
+            # (`:4325-4344`). The seam copies every row of the window into on-chip
+            # memory, so that width is not merely wasteful -- it does not fit.
+            #
+            # Both numbers below are python ints the metadata already carries, so the
+            # window is constant per captured graph without reading a tensor value:
+            # a decode step's span IS the context bucket, which is what
+            # `max_blocks_per_seq` holds for a decode group, and a prefill chunk's span
+            # is the segment it may carry plus the chunk itself.
+            #
+            # THE WIDTH IS THE DECLARED ONE, NOT THE HOST ROW'S. `max_blocks_per_seq` is
+            # the block-table dim the graph was compiled with (`:4256`, `:4452`), so it
+            # is the number that stays put across the steps of one captured graph, while
+            # the host row arrives at its group's full padded width and stays that wide
+            # even when the served table is trimmed to a decode bucket (`:4214-4232`,
+            # `:4246`). The row is the ADDRESSABILITY ceiling instead: a declared width
+            # past its end would name entries the row does not carry.
+            table_width = int(metadata.get("max_blocks_per_seq", len(row)))
+            if table_width > len(row):
+                raise ValueError(
+                    f"KV layer '{name}' declares {table_width} block(s) per sequence "
+                    f"against a host block-table row {len(row)} entry(ies) wide; the "
+                    f"window handed to the layer is read out of that row, so a width "
+                    f"past its end names blocks this step cannot address"
+                )
+            leg_is_prefill = int(metadata["max_query_len"]) > int(
+                metadata["decode_token_threshold"]
+            )
+            segment = int(metadata.get("kv_segment_size", 0))
+            if not leg_is_prefill:
+                # A DECODE STEP'S SPAN IS ITS CONTEXT BUCKET, which for a decode group
+                # is the whole block table: the bucket was chosen so the longest
+                # sequence in it fits, so its table is not the model length.
+                span_blocks = table_width
+            elif segment > 0:
+                span_blocks = -(
+                    -(segment + int(metadata["max_query_len"])) // block_size
+                )
+            else:
+                # A PREFILL CHUNK WITH NO SEGMENT BUCKET STATED. Nothing here says how
+                # much context this chunk may carry, so the table's width is the only
+                # honest ceiling left -- and on this leg that width is the fallback
+                # above, the expensive case. It is taken rather than guessed, and a
+                # serving configuration that reaches it has to be measured first.
+                span_blocks = table_width
+            window_blocks = min(table_width, max(1, span_blocks))
             geometries.append(
                 {
                     "block_ids": row[:blocks_used],
                     "state_slot": row[0],
                     "page_size": block_size,
+                    "window_blocks": window_blocks,
                 }
             )
-            legs.add(
-                int(metadata["max_query_len"])
-                > int(metadata["decode_token_threshold"])
-            )
+            # ONE READING OF THE LEG PER GROUP, the one the window was sized from. Two
+            # evaluations of the same test are two things that can drift apart, and the
+            # window would then be sized for a leg this step is not on.
+            legs.add(leg_is_prefill)
             starts.add(start_position)
         if len(legs) != 1 or len(starts) != 1:
             raise ValueError(
@@ -5384,7 +5548,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
                 ** -0.5
             ),
-            max_seq_len=start_position + tokens,
+            # THE INDEXER'S BOUND IS THE ENGINE'S LONGEST SEQUENCE, NOT THIS STEP'S END.
+            # It stays a python int, because the indexer's own docstring records why: the
+            # obvious `int(seq_lens.max())` is a host read of tensor data inside a traced
+            # region. An int is therefore baked into every graph captured with it -- and
+            # `start_position + tokens` is a DIFFERENT int at every decode step, so each
+            # step wanted its own graph. This value is the same at every step of the
+            # process, so one graph serves them all.
+            #
+            # NOTHING BEYOND THE SEQUENCE BECOMES VISIBLE. The number sizes the candidate
+            # pool count, and each row is bounded to its own length by `seq_lens` before
+            # selection (`model_fp8.py`'s `select_bounded_pools`), so raising it adds
+            # candidates that the causal bound then removes. It also fixes which regime
+            # the indexer runs, which is the point: a graph captured on the short-sequence
+            # bypass could not serve a longer one.
+            #
+            # AND IT IS THE ENGINE'S LENGTH RATHER THAN THE WINDOW'S, because the pooled
+            # store is allocated from exactly this number (`:4967`, rows
+            # `max_seq_len // pool + 1`). The window is rounded up to the block table's
+            # alignment and can therefore be LONGER than the model length, which would
+            # leave the indexer's own "one trash row above every candidate" refusal firing
+            # on a step that is otherwise correct.
+            max_seq_len=int(self.max_model_len),
             index_kpool=int(text_config.index_kpool),
         )
         # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
@@ -9137,6 +9322,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return (num_blocks, num_kv_heads, block_size // 2, head_size, 2)
         return (num_blocks, num_kv_heads, block_size, head_size)
 
+    def _latent_spare_bytes(self, kv_cache_config: KVCacheConfig) -> dict[str, int]:
+        """Extra bytes each latent layer's bank needs, keyed by layer name.
+
+        The names come from the KV-cache GROUPS rather than from a model attribute,
+        because the groups are what carry each layer's spec and the spec class is what
+        says a bank is latent. A stack with two families therefore grows its latent group
+        and leaves its recurrent group at the size the engine budgeted.
+
+        The spare is ONE WINDOW: the aligned block-table width, which is the widest window
+        the converter can hand a layer of this group, times that group's page in bytes.
+        """
+        spare: dict[str, int] = {}
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not isinstance(spec, MLAAttentionSpec):
+                continue
+            blocks = self._aligned_table_width(
+                context_length=self.max_model_len, block_size=spec.block_size
+            )
+            for layer_name in group.layer_names:
+                spare[layer_name] = blocks * spec.page_size_bytes
+        return spare
+
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -9183,10 +9391,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             is_pooling_model=self.is_pooling_model,
         )
 
+        # A LATENT BANK IS ALLOCATED WITH A SPARE WINDOW PAST THE SCHEDULER'S BLOCKS.
+        # A layer of this family is handed a WINDOW of its bank whose length is fixed
+        # for the bucket, not the pages this step happens to occupy, so one captured
+        # graph serves every position. A request placed at the last block the scheduler
+        # can give it then needs slots past that block, and a torch slice past the end
+        # of a bank does not raise -- it returns a SHORTER view, which turns the
+        # bucket-constant length back into a per-request one where a captured graph
+        # cannot see it. The remedy is space, and it belongs here: the carrier builder
+        # refuses the short bank by name rather than shortening the view or clamping the
+        # window's base onto a neighbour's rows.
+        #
+        # THE SCHEDULER'S BLOCK COUNT IS UNTOUCHED. ``kv_cache_config.num_blocks`` is
+        # what hands out blocks and it is not read here; only the bytes behind each
+        # latent tensor grow, so the spare blocks exist and are never allocated to a
+        # request. The whole cost is HBM: one window per latent layer.
+        spare_bytes = self._latent_spare_bytes(kv_cache_config)
+
         # Initialize the KV Cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for tensor in kv_cache_config.kv_cache_tensors:
-            raw_tensor = torch.zeros(tensor.size, dtype=torch.int8, device=self.device)
+            spare = max(
+                (spare_bytes.get(layer_name, 0) for layer_name in tensor.shared_by),
+                default=0,
+            )
+            raw_tensor = torch.zeros(
+                tensor.size + spare, dtype=torch.int8, device=self.device
+            )
             # Case where the KV cache is shared across layers
             for layer_name in tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = raw_tensor

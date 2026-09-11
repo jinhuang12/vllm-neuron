@@ -3804,6 +3804,14 @@ def _build_mlp(text_config: Glm5NextTextConfig, layer_idx: int) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 
+def _start_is_zero(start_position: torch.Tensor | int, device: torch.device):
+    """``start_position == 0`` as a 0-d bool tensor, never as a python bool."""
+    return (
+        torch.as_tensor(start_position, device=device, dtype=torch.int64).reshape(())
+        == 0
+    )
+
+
 class Glm5NextKDAAttention(nn.Module):
     """Gated-delta linear attention at ``self_attn``.
 
@@ -3995,7 +4003,7 @@ class Glm5NextKDAAttention(nn.Module):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         is_prefill: bool,
-        start_position: int = 0,
+        start_position: torch.Tensor | int = 0,
         chunk_size: int | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
@@ -4188,10 +4196,22 @@ class Glm5NextKDAAttention(nn.Module):
             gk_h = gate_parts[h]
             beta_h = beta[:, h].contiguous()
 
-            if is_prefill and int(start_position) == 0:
-                state = torch.zeros(kdim, kdim, dtype=torch.float32)
+            # THE ENTERING STATE, CHOSEN WITHOUT READING THE POSITION. A sequence
+            # starting at 0 enters with a zero state and a continuation enters with
+            # its carried one. The leg is a python bool, so it may branch -- one
+            # graph per leg is captured anyway -- but the POSITION is a tensor, and
+            # a python branch on it would compile the choice made at capture time
+            # into every later step. ``torch.where`` makes the choice on device, so
+            # one graph serves position 0 and position N.
+            carried = recurrent_state[h].to(torch.float32)
+            if is_prefill:
+                state = torch.where(
+                    _start_is_zero(start_position, carried.device),
+                    torch.zeros_like(carried),
+                    carried,
+                )
             else:
-                state = recurrent_state[h].to(torch.float32)
+                state = carried
 
             if chunked:
                 shape = (n_chunks, chunk, kdim)
@@ -4345,7 +4365,7 @@ class Glm5NextKDALayer(nn.Module):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         is_prefill: bool,
-        start_position: int = 0,
+        start_position: torch.Tensor | int = 0,
         chunk_size: int | None = None,
         streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -6791,7 +6811,7 @@ class Glm5NextMLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         latent_cache: torch.Tensor,
-        start_position: int,
+        start_position: torch.Tensor | int,
         topk_indices: torch.Tensor,
         softmax_scale: float,
         batch_size: int = 1,
@@ -6799,12 +6819,29 @@ class Glm5NextMLAAttention(nn.Module):
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
-        tokens at once and a decode step passes one. ``latent_cache`` is this
-        layer's latent cache in the model's own declared spec layout --
+        tokens at once and a decode step passes one. ``latent_cache`` is a WINDOW
+        of this layer's latent cache in the model's own declared spec layout --
         ``[slots, NUM_LATENT_KV_HEADS, head_size]``, one latent per token, bf16 --
         and ``start_position`` is the slot the first of these tokens occupies.
-        The cache is WRITTEN in place for those tokens and then READ from slot 0
-        through the last written slot, which is the context this attention sees.
+        The cache is WRITTEN in place for those tokens and then READ WHOLE.
+
+        THE WINDOW'S LENGTH IS A CONSTANT AND THE POSITION IS A TENSOR, and that
+        pairing is the whole point of this signature. A graph is captured once and
+        replayed at every position, so a length derived from a position -- the
+        earlier ``[: start + tokens]`` read -- compiled a context of exactly the
+        captured length and matched no other step. The caller therefore hands a
+        window whose length is fixed for the bucket, and the position arrives as a
+        tensor so no host read of it can specialise the graph either.
+
+        WHAT BOUNDS THE READ, NOW THAT THE LENGTH DOES NOT. Rows of the window
+        past this sequence's context hold other pages, so they must never be
+        attended. Two things already prevent it, and neither is a length: the
+        indexer builds candidates only out of ``seq_lens``, so no index beyond the
+        context exists to select, and the sparse seam masks its ``-1`` rows itself
+        (entry ``design-20260905-af`` route (a)). Nothing between the indexer and
+        this method may clamp or refill those indices -- the same ruling -- so a
+        caller that hands indices outside the context is the one error this
+        method cannot catch, and the acceptance reads the bound host-side instead.
 
         WHY ``batch_size`` IS A PARAMETER AND NOT INFERRED. ``latent_cache`` here
         is ONE sequence's slots, because MLA caches one latent per token per
@@ -6838,13 +6875,22 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{tuple(latent_cache.shape)}"
             )
         slots = int(latent_cache.shape[0])
-        start = int(start_position)
-        if start < 0 or start + tokens > slots:
+        # A SHAPE CHECK, NOT A POSITION CHECK. The window has to be long enough to
+        # hold this step's own tokens, and that reads off the shape, which is real
+        # even on a meta tensor. Whether the POSITION plus these tokens stays
+        # inside the sequence's own pages is arithmetic on values, and checking it
+        # here would need a host read of a tensor in a traced region. The runner
+        # owns that check: it sizes the window and it computes the position, so it
+        # can refuse before the trace. This method no longer duplicates it.
+        if tokens > slots:
             raise Glm5NextMLADecodeError(
-                f"these {tokens} token(s) at start_position={start} do not fit "
-                f"the cache's {slots} slot(s); a write past the end would "
-                f"silently wrap onto another sequence's rows"
+                f"these {tokens} token(s) cannot fit a cache window of {slots} "
+                f"slot(s); the window's length is fixed for the bucket and the "
+                f"runner sizes it, so a window this short is the caller's error"
             )
+        start = torch.as_tensor(
+            start_position, device=latent_cache.device, dtype=torch.int64
+        ).reshape(())
 
         query, kv_latent = self.project_query_and_latent(hidden_states)
 
@@ -6852,11 +6898,21 @@ class Glm5NextMLAAttention(nn.Module):
         # head. Done before the read below, so a decode step attends to its own
         # token as well as its context -- the same set a prefill of the same
         # tokens would see, which is what makes the two comparable.
-        latent_cache[start : start + tokens, 0, :] = kv_latent.to(latent_cache.dtype)
+        #
+        # WHY AN INDEXED WRITE RATHER THAN A SLICE. A slice needs two host ints,
+        # and the position is a tensor here. ``index_copy_`` takes the rows as a
+        # tensor instead, and it writes THROUGH the window view into the caller's
+        # bank -- the same in-place contract the slice had. The row count is
+        # ``tokens``, a shape, so the write's own shape is constant too.
+        rows = start + torch.arange(tokens, device=latent_cache.device)
+        latent_cache[:, 0, :].index_copy_(
+            0, rows, kv_latent.to(latent_cache.dtype)
+        )
 
-        # THE CACHE READ. Slot 0 through the last slot written is this sequence's
-        # context. ``[S_kv, latent]`` is the shape the sparse seam contracts.
-        c_kv = latent_cache[: start + tokens, 0, :]
+        # THE CACHE READ. The WHOLE window, because its length is the bucket's and
+        # not this step's. ``[S_kv, latent]`` is the shape the sparse seam
+        # contracts, and it is now the same shape at every position.
+        c_kv = latent_cache[:, 0, :]
 
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention
@@ -6888,7 +6944,7 @@ class Glm5NextMLAAttention(nn.Module):
         latent_cache: torch.Tensor,
         pool_cache: torch.Tensor,
         seq_lens: torch.Tensor,
-        start_position: int,
+        start_position: torch.Tensor | int,
         softmax_scale: float,
         max_seq_len: int,
         page_size: int,
@@ -6957,7 +7013,7 @@ class Glm5NextMLAAttention(nn.Module):
         return self.attend(
             normed_hidden_states,
             latent_cache,
-            int(start_position),
+            start_position,
             topk_indices,
             float(softmax_scale),
         )
@@ -7043,7 +7099,7 @@ class Glm5NextDSALayer(nn.Module):
         latent_cache: torch.Tensor,
         pool_cache: torch.Tensor,
         seq_lens: torch.Tensor,
-        start_position: int,
+        start_position: torch.Tensor | int,
         softmax_scale: float,
         max_seq_len: int,
         page_size: int,
@@ -7116,7 +7172,7 @@ class Glm5NextDSALayer(nn.Module):
                 latent_cache=latent_cache,
                 pool_cache=pool_cache,
                 seq_lens=seq_lens,
-                start_position=int(start_position),
+                start_position=start_position,
                 softmax_scale=float(softmax_scale),
                 max_seq_len=int(max_seq_len),
                 page_size=int(page_size),
