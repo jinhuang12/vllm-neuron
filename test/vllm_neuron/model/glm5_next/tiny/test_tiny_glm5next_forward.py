@@ -3828,15 +3828,22 @@ def _stack_text_config(**overrides):
     rather than belt-and-braces: ``dataclasses.replace`` copies the source instance's
     already-defaulted 45-entry schedule, and ``__post_init__`` then refuses a schedule
     whose length disagrees with the layer count (``config.py:337-341``).
+
+    ``layer_types`` IS A DIAL WITH A DEFAULT, not a fixed argument. Passed beside
+    ``**overrides`` it made a caller's own schedule a duplicate keyword and a
+    ``TypeError``, so no caller could ask this one authority for a stack of another
+    shape. The default is the sparse-attention schedule every landed item reads, so a
+    caller that names nothing gets exactly the stack it got before.
     """
     from vllm_neuron.model.glm5_next.config import DSA_LAYER_TYPE
 
+    layer_types = overrides.pop("layer_types", [DSA_LAYER_TYPE] * STACK_LAYERS)
     return _mla_text_config(
         hidden_size=STACK_HIDDEN_SIZE,
         intermediate_size=STACK_DENSE_INTERMEDIATE_SIZE,
         moe_intermediate_size=STACK_MOE_INTERMEDIATE_SIZE,
         num_hidden_layers=STACK_LAYERS,
-        layer_types=[DSA_LAYER_TYPE] * STACK_LAYERS,
+        layer_types=layer_types,
         first_k_dense_replace=STACK_FIRST_K_DENSE,
         n_routed_experts=STACK_EXPERTS,
         num_experts_per_tok=STACK_EXPERTS_PER_TOKEN,
