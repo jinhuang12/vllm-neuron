@@ -396,6 +396,14 @@ def _prefill_metadata(banks) -> dict:
     The block table is WIDER than the bucket's span on purpose: its width is what the
     prefill leg's ``max_blocks_per_seq`` falls back to when a group has no context
     bucket, and reading the window off that width is the defect this item closes.
+
+    THE HOST HALF AND THE DEVICE HALF CARRY THE SAME NUMBERS, which is what the runner's
+    own builders do (``neuron_model_runner.py:4246-4249``, ``:4437-4445``). The converter
+    reads the host half, because a step's geometry is decided before the traced call and a
+    device tensor holds no readable value inside a capture. Both halves are written here so
+    the entry is the runner's whole key set and not the subset one function happens to
+    read; an item that wants to show WHICH half was read is
+    ``test_host_geometry_119.py``'s, and this file does not repeat it.
     """
     table = torch.tensor(
         [[DECLARED_FIRST_BLOCK + offset for offset in range(DECLARED_TABLE_WIDTH)]],
@@ -410,6 +418,8 @@ def _prefill_metadata(banks) -> dict:
         "max_blocks_per_seq": DECLARED_TABLE_WIDTH,
         "decode_token_threshold": DECLARED_DECODE_THRESHOLD,
         "cached_seq_len": torch.tensor([[0]], dtype=torch.int32),
+        "host_block_table": table.clone(),
+        "host_num_computed_tokens": torch.zeros(1, dtype=torch.int32),
         "kv_segment_size": DECLARED_SEGMENT,
     }
     return {bank["name"]: dict(entry) for bank in banks}
@@ -433,6 +443,9 @@ def _decode_metadata(banks) -> dict:
     entry["max_query_len"] = DECLARED_TOKENS
     entry["cached_seq_len"] = torch.tensor(
         [[DECLARED_CONTINUED_POSITION]], dtype=torch.int32
+    )
+    entry["host_num_computed_tokens"] = torch.full(
+        (1,), DECLARED_CONTINUED_POSITION, dtype=torch.int32
     )
     entry["slot_mapping"] = torch.arange(DECLARED_TOKENS, dtype=torch.int32)
     return {bank["name"]: dict(entry) for bank in banks}
