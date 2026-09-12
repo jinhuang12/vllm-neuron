@@ -4878,6 +4878,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return torch.tensor(int(position), dtype=torch.int32, device=device)
 
     @staticmethod
+    def _glm5next_real_row_extent(
+        tokens: int, real_tokens: int, device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A step's real length and its row mask, both from ONE host number.
+
+        A padded step's operands keep the bucket's width, so the recurrent layers are
+        told which of those rows carry a token of the sequence. The two operands are
+        built here in one call because two calls could disagree, and a mask that
+        disagreed with the length would mask one set of rows and cut the convolution's
+        history at another. Both values are the host's, and the construction is the
+        only crossing.
+        """
+        rows = [1.0] * int(real_tokens) + [0.0] * (int(tokens) - int(real_tokens))
+        return (
+            torch.tensor([int(real_tokens)], dtype=torch.int32, device=device),
+            torch.tensor(rows, dtype=torch.float32, device=device).reshape(-1, 1),
+        )
+
+    @staticmethod
     def _glm5next_host_geometry(metadata: dict, key: str, name: str) -> list:
         """One metadata entry's host-side geometry, as plain Python integers.
 
@@ -5106,7 +5125,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         while the SEQUENCE reaches only the real length. The slots the request holds,
         the position the chunk ends at and the pools it completes are therefore read
         from ``real_tokens``; ``None`` says the whole chunk is real, which is what a
-        warmup or capture caller hands.
+        warmup or capture caller hands. THE RECURRENT LAYERS ARE HANDED THAT SAME
+        NUMBER, as a tensor beside a row mask, because their scan is over the rows
+        themselves: an unmasked padding row would decay the state and update it with
+        a row that carries no token, and the state is what the next step continues
+        from. The sparse layers need no mask -- their window is the slots
+        ``real_tokens`` already sizes.
         """
         if len(banks) != len(side_caches) or len(banks) != len(geometries):
             raise ValueError(
@@ -5142,6 +5166,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"slot(s) and this request was given slot "
                         f"{int(state_slot)}"
                     )
+                real_length, row_mask = cls._glm5next_real_row_extent(
+                    int(tokens), real, bank["recurrent_state"].device
+                )
                 carriers.append(
                     {
                         "conv_state": bank["conv_state"][int(state_slot)],
@@ -5150,6 +5177,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "start_position": cls._glm5next_start_position(
                             start_position, bank["recurrent_state"].device
                         ),
+                        "real_tokens": real_length,
+                        "row_mask": row_mask,
                     }
                 )
                 continue
