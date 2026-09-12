@@ -150,6 +150,34 @@ MINI_PLAIN_SHAPE = (4,)
 #: the way the code under test expects them.
 FLOAT32_CHECKPOINT_LEAVES = ("A_log", "dt_bias")
 
+#: The other five float32 families, as ``(parameter leaf, checkpoint leaf)``
+#: pairs. Read off the same real load's report, which logged one cast line per
+#: rank for each of them:
+#: ``increments/launch-124-r7-trn2-1-20260912T145630Z.out``, grouped in
+#: ``increments/reading-128-load-casts.md``.
+#:
+#: TWO NAMES PER FAMILY, because these five are the first float32 families whose
+#: two sides differ: the router bias is ``mlp.experts.router_bias`` as a
+#: parameter and ``mlp.gate.e_score_correction_bias`` in the checkpoint
+#: (``weight_loaders_fp8.py``'s ``_add_moe_mlp``). The writers below type a
+#: CHECKPOINT KEY, and the readings below name a PARAMETER, so a single-name
+#: tuple would have to be right for one of them and wrong for the other. The
+#: pair above keeps one name each and is left alone: its own reading asks for a
+#: parameter by that leaf, and both of its sides are spelled the same.
+FLOAT32_MIX_FAMILIES = (
+    ("hc_attn_base", "hc_attn_base"),
+    ("hc_attn_scale", "hc_attn_scale"),
+    ("hc_ffn_base", "hc_ffn_base"),
+    ("hc_ffn_scale", "hc_ffn_scale"),
+    ("router_bias", "e_score_correction_bias"),
+)
+
+#: The checkpoint side of :data:`FLOAT32_MIX_FAMILIES`, derived so the writers
+#: cannot read a second spelling of it.
+FLOAT32_MIX_CHECKPOINT_LEAVES = tuple(
+    checkpoint_leaf for _, checkpoint_leaf in FLOAT32_MIX_FAMILIES
+)
+
 #: The one file each miniature checkpoint is written to. Named once so the writer
 #: and the shape reader below cannot disagree about where it is.
 MINI_CHECKPOINT_FILE = "model.safetensors"
@@ -327,10 +355,14 @@ def _checkpoint_plain_dtype(name: str) -> torch.dtype:
 
     Takes a checkpoint key or a bare leaf name, so the two writers below can ask
     the same question of whichever of the two they hold.
+
+    ONE DECISION POINT for both declarations above, so a fixture cannot type a
+    family one way here and another way somewhere else.
     """
+    leaf = name.rsplit(".", 1)[-1]
     return (
         torch.float32
-        if name.rsplit(".", 1)[-1] in FLOAT32_CHECKPOINT_LEAVES
+        if leaf in FLOAT32_CHECKPOINT_LEAVES + FLOAT32_MIX_CHECKPOINT_LEAVES
         else torch.bfloat16
     )
 
@@ -8117,3 +8149,297 @@ def test_the_kda_state_leaves_take_the_reference_dtype_and_per_rank_extent(
         f"state pair at all"
     )
     print(f"KDASTATE_IMPORT_ORIGIN|{_MODEL_FP8.__file__}")
+
+
+# --------------------------------------------------------------------------- #
+# The four mHC mix leaves and the router correction bias, against the reference.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_float32_mix_families_take_the_checkpoint_dtype(
+    single_rank_process_group,
+) -> None:
+    """The five families read float32 from the placeholder rule, on the real config.
+
+    THE REFERENCE DECLARES ALL FIVE FLOAT32. The four mix leaves are
+    ``nn.Parameter(torch.empty(..., dtype=torch.float32))`` at
+    ``vllm/models/deepseek_v4/nvidia/model.py:1095-1121`` and the fused mHC entry
+    point refuses anything else --
+    ``vllm/model_executor/kernels/mhc/tilelang.py:138-140`` asserts each of the
+    three tensors it takes is float32. The router correction bias is float32 at
+    ``vllm/model_executor/models/step3p5.py:335-337``, beside the assert that the
+    gate runs in fp32.
+
+    THE PLACEHOLDER IS WHAT THE READER CASTS TO, so a config-dtype placeholder
+    narrows the checkpoint's own float32 before any consumer sees it. The reading
+    is on the REAL config rather than a miniature one, because the population is
+    every layer of the published model and a miniature config could carry a
+    family this one does not.
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+
+    typed: dict[str, torch.dtype] = {}
+    for parameter_leaf, _ in FLOAT32_MIX_FAMILIES:
+        names = [
+            name
+            for name in sorted(mappings)
+            if name.rsplit(".", 1)[-1] == parameter_leaf
+        ]
+        assert names, (
+            f"no mapped parameter has the leaf {parameter_leaf}, so this reading "
+            f"would certify a family the map does not carry"
+        )
+        typed[parameter_leaf] = model._placeholder_dtype(
+            mappings[names[0]], param_name=names[0], mappings=mappings
+        )
+        print(
+            f"MIXDTYPE|{parameter_leaf}|{names[0]}|parameters={len(names)}"
+            f"|{typed[parameter_leaf]}"
+        )
+
+    assert sorted(typed) == sorted(leaf for leaf, _ in FLOAT32_MIX_FAMILIES), (
+        f"the reading covered {sorted(typed)} where the declared families are "
+        f"{sorted(leaf for leaf, _ in FLOAT32_MIX_FAMILIES)}"
+    )
+    assert set(typed.values()) == {torch.float32}, (
+        f"the mix families take {sorted(str(dtype) for dtype in typed.values())}; "
+        f"the checkpoint holds all five in float32 and the reference declares all "
+        f"five float32, so anything narrower is a cast on every rank"
+    )
+
+
+def test_a_miniature_load_publishes_the_float32_mix_families_unchanged(
+    tmp_path, single_rank_process_group
+) -> None:
+    """A real load hands the five families through with no cast, value for value.
+
+    THE WITNESS VALUES CANNOT SURVIVE BFLOAT16. Every tensor the fixture writer
+    builds itself is constant, and a constant round-trips through bfloat16
+    unchanged, so a constant would pass this reading under the very narrowing it
+    exists to catch. Each family therefore gets its own ramp of values one part
+    in 4096 apart, and the item first proves that ramp differs from its own
+    bfloat16 round trip.
+
+    THE ROUTED FIXTURE, because the router bias is mapped by ``_add_moe_mlp`` and
+    a layer-only fixture carries the four mix leaves alone.
+    """
+    directory = tmp_path / "mixfamilies"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+
+    covered: dict[str, str] = {}
+    for parameter_leaf, checkpoint_leaf in FLOAT32_MIX_FAMILIES:
+        for name in sorted(mappings):
+            if name.rsplit(".", 1)[-1] != parameter_leaf:
+                continue
+            keys = _keys_of(mappings, name)
+            assert len(keys) == 1, (
+                f"{name} maps to {len(keys)} checkpoint keys; these five are plain "
+                f"one-key entries and a fused entry would need a different reading"
+            )
+            assert keys[0].rsplit(".", 1)[-1] == checkpoint_leaf, (
+                f"{name} maps to {keys[0]}, whose leaf is not the declared "
+                f"checkpoint name {checkpoint_leaf}, so the writers below would "
+                f"type this family the way the code expects it and not the way "
+                f"the checkpoint holds it"
+            )
+            covered[name] = keys[0]
+
+    assert {name.rsplit(".", 1)[-1] for name in covered} == {
+        leaf for leaf, _ in FLOAT32_MIX_FAMILIES
+    }, (
+        f"the routed fixture carries "
+        f"{sorted({name.rsplit('.', 1)[-1] for name in covered})}, so at least one "
+        f"declared family would go unread by this load"
+    )
+    print(
+        f"MIXLOAD_COVERED|parameters={len(covered)}"
+        f"|families={len(FLOAT32_MIX_FAMILIES)}"
+    )
+
+    want: dict[str, torch.Tensor] = {}
+    for index, name in enumerate(sorted(covered), start=1):
+        ramp = torch.arange(
+            1, MINI_PLAIN_SHAPE[0] + 1, dtype=torch.float32
+        ) * 2.0**-12
+        value = (float(index) + ramp).reshape(MINI_PLAIN_SHAPE)
+        assert not torch.equal(value, value.to(torch.bfloat16).to(torch.float32)), (
+            f"the witness values for {name} survive a bfloat16 round trip, so this "
+            f"item would pass under the narrowing it exists to catch"
+        )
+        want[covered[name]] = value
+
+    written = _write_miniature_checkpoint(
+        directory,
+        mappings,
+        model,
+        extra_overrides={**_blocked_bank_overrides(model, mappings), **want},
+    )
+    print(f"MIXLOAD_WRITTEN={written}")
+    model.load_weights(str(directory), torch.device("cpu"), None)
+
+    published = dict(model.named_parameters())
+    for name in sorted(covered):
+        assert name in published, (
+            f"{name} is mapped but absent from the loaded model's parameters"
+        )
+        got = published[name].detach()
+        expected = want[covered[name]]
+        print(f"MIXLOAD|{name}|{got.dtype}|{got.flatten()[:2].tolist()}")
+        assert got.dtype is torch.float32, (
+            f"{name} published {got.dtype} where the checkpoint holds float32"
+        )
+        assert torch.equal(got, expected), (
+            f"{name} published {got.flatten()[:4].tolist()} where the checkpoint "
+            f"holds {expected.flatten()[:4].tolist()}, so the load moved the "
+            f"values it was meant to hand through"
+        )
+
+
+def test_the_router_projection_still_takes_the_config_dtype(
+    single_rank_process_group,
+) -> None:
+    """The bias's own sibling on the same module keeps the config dtype.
+
+    THE CONTROL FOR THE FOUR READINGS ABOVE. Without it, a rule that typed every
+    plain leaf float32 would satisfy them all. The router projection is the
+    sharpest control available: it is declared on the same module as the
+    correction bias and mapped two lines from it
+    (``weight_loaders_fp8.py``'s ``_add_moe_mlp``), it is unquantised, and the
+    published checkpoint holds it in the config dtype -- the real load logged no
+    cast line for it
+    (``increments/reading-128-load-casts.md``).
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+
+    control_name = next(
+        name for name in sorted(mappings) if name.endswith(".router_weight")
+    )
+    control_dtype = model._placeholder_dtype(
+        mappings[control_name], param_name=control_name, mappings=mappings
+    )
+    print(f"MIXCONTROL|{control_name}|{control_dtype}")
+    assert control_dtype is real_config.text_config.torch_dtype, (
+        f"{control_name} takes {control_dtype} where the config declares "
+        f"{real_config.text_config.torch_dtype}, so the float32 rule is not keyed "
+        f"on the five names at all"
+    )
+
+
+def test_without_the_declared_leaves_the_mix_families_narrow_to_the_config_dtype(
+    monkeypatch, single_rank_process_group
+) -> None:
+    """Emptying the declared tuple reddens the five families, one by one.
+
+    THE ARM IS THE THING THAT DECIDES, and this is the reading that says so. The
+    tuple is emptied where the rule reads it rather than the method being
+    replaced wholesale, so every other clause of the placeholder rule stays live
+    and the config dtype below is what this one clause was holding back.
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+    config_dtype = real_config.text_config.torch_dtype
+
+    monkeypatch.setattr(_MODEL_FP8, "FLOAT32_PLAIN_LEAVES", ())
+    for parameter_leaf, _ in FLOAT32_MIX_FAMILIES:
+        name = next(
+            candidate
+            for candidate in sorted(mappings)
+            if candidate.rsplit(".", 1)[-1] == parameter_leaf
+        )
+        narrowed = model._placeholder_dtype(
+            mappings[name], param_name=name, mappings=mappings
+        )
+        print(f"MIXREMOVED|{parameter_leaf}|{narrowed}")
+        assert narrowed is config_dtype, (
+            f"{parameter_leaf} still takes {narrowed} with the declared tuple "
+            f"emptied, so something other than that tuple is typing it and the "
+            f"readings above are not measuring the arm they name"
+        )
+
+
+def test_the_router_correction_bias_reaches_the_seam_in_float32() -> None:
+    """The consumer widens the bias to float32, so the load-time width is the one.
+
+    THE LINK IS READ, NOT ASSUMED. ``Glm5NextRoutedExperts.route_tokens`` enters
+    the seam with ``correction_bias=self.router_bias``, and the seam legalises
+    that argument through ``_legalize_correction_bias``, which returns fp32
+    because "the bias decides a DISCRETE selection". Both links are read off the
+    source below, and then the widening itself is measured.
+
+    THE MEASUREMENT IS A SELECTION, not a tolerance. Four expert biases one part
+    in 4096 apart stay four distinct corrections through the seam when the
+    parameter arrives in float32, and collapse to fewer when it arrives in
+    bfloat16 -- the seam cannot restore a width the placeholder already spent,
+    and experts the checkpoint separated then tie on index order.
+    """
+    from vllm_neuron.functional.moe.router import (  # the seam's own legaliser
+        _legalize_correction_bias,
+        noaux_tc_rmsnorm_router_topk,
+    )
+
+    call = next(
+        node
+        for node in ast.walk(
+            ast.parse(
+                textwrap.dedent(
+                    inspect.getsource(_MODEL_FP8.Glm5NextRoutedExperts.route_tokens)
+                )
+            )
+        )
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "noaux_tc_rmsnorm_router_topk"
+    )
+    handed = {
+        keyword.arg: ast.unparse(keyword.value)
+        for keyword in call.keywords
+        if keyword.arg == "correction_bias"
+    }
+    print(f"ROUTERSEAM_HANDED={handed}")
+    assert handed == {"correction_bias": "self.router_bias"}, (
+        f"the seam is entered with {handed}, so the parameter this block types is "
+        f"not the tensor the router corrects with"
+    )
+    assert "_legalize_correction_bias" in inspect.getsource(
+        noaux_tc_rmsnorm_router_topk
+    ), (
+        "the seam no longer legalises its correction bias, so the fp32 widening "
+        "read below is not on the path the router takes"
+    )
+
+    experts = MINI_ROUTED_EXPERTS
+    bias = torch.tensor(
+        [1.0 + step * 2.0**-12 for step in range(1, experts + 1)],
+        dtype=torch.float32,
+    )
+    legalised = _legalize_correction_bias(bias, experts)
+    narrowed = _legalize_correction_bias(bias.to(torch.bfloat16), experts)
+    distinct = len(set(legalised.flatten().tolist()))
+    distinct_narrowed = len(set(narrowed.flatten().tolist()))
+    print(
+        f"ROUTERSEAM|dtype={legalised.dtype}|distinct={distinct}"
+        f"|narrowed_dtype={narrowed.dtype}|narrowed_distinct={distinct_narrowed}"
+    )
+    assert legalised.dtype is torch.float32 and narrowed.dtype is torch.float32, (
+        f"the seam returned {legalised.dtype} and {narrowed.dtype}; it is declared "
+        f"to return fp32 for either input"
+    )
+    assert distinct == experts, (
+        f"{distinct} of {experts} corrections stay distinct through the seam from a "
+        f"float32 parameter, so this fixture cannot tell the two widths apart"
+    )
+    assert distinct_narrowed < experts, (
+        f"all {experts} corrections stay distinct through a bfloat16 parameter, so "
+        f"the load-time width would not decide the router's choice here"
+    )

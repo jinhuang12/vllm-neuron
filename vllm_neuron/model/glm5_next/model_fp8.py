@@ -81,6 +81,7 @@ from vllm_neuron.model.glm5_next.config import (
 )
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     DSA_SCALED_PROJECTIONS,
+    FLOAT32_PLAIN_LEAVES,
     FP8_SCALE_SUFFIX,
     KDA_BARE_LEAVES,
     MAPPED_KEY_QUANTISED_WEIGHT,
@@ -8717,11 +8718,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
         second classifier of the three cases: ``classify_mapped_keys`` still
         decides, and this only distinguishes the two kinds of ``plain``.
 
-        ONE LEAF PAIR IS TYPED BY NAME RATHER THAN BY KIND. The linear-attention
+        TWO GROUPS ARE TYPED BY NAME RATHER THAN BY KIND. The linear-attention
         decay and gate bias arrive as plain keys, so the kinds above would hand
         them the config dtype -- and the checkpoint holds them in float32. The
         reference keeps that width all the way to the gate; a narrowing placeholder
         spends it before the gate's exponential and sigmoid ever read them.
+
+        The second group is ``FLOAT32_PLAIN_LEAVES``: the four mHC mix leaves and
+        the router correction bias, which the checkpoint also holds in float32.
+        The defect has the same shape as the pair above, so the remedy does too.
         """
         kind = classify_mapped_keys(checkpoint_keys)
         if kind == MAPPED_KEY_SCALE_GRID:
@@ -8733,6 +8738,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # ``vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:237-239``
             # for the gate bias and ``:265-267`` for the decay -- and its kernels
             # then read them as float32 as well.
+            return torch.float32
+        if param_name.rsplit(".", 1)[-1] in FLOAT32_PLAIN_LEAVES:
+            # The mHC mix state and the router correction bias. Both seams of
+            # ``Glm5NextHyperConnection`` are fp32 in and fp32 out, and the
+            # router seam widens the bias to float32 before it corrects the
+            # scores (``functional/moe/router.py``'s
+            # ``_legalize_correction_bias``), so a narrowing placeholder spends
+            # the width before either one reads it.
             return torch.float32
         if self._sibling_scale_grid_name(param_name) in mappings:
             return _FP8_DTYPE
