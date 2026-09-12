@@ -593,13 +593,16 @@ def scatter_packed_k(
     # Precondition: even, pair-aligned row count (rows 2k/2k+1 are the two lanes
     # of one packed slot). Eager-only: under torch.compile ``num_rows % 2``
     # branches on a SymInt (GuardOnDataDependentSymNode) and crashes the prefill
-    # compile, so gate on FakeTensor (Dynamo traces with fake inputs;
-    # torch.compiler.is_compiling() is unreliable on the Neuron backend). The
-    # check still runs in eager mode and in test_scatter_packed_k_* with real
-    # tensors. The reshape below uses -1, so it does not need num_rows at trace
-    # time. The rest of the pair-alignment contract (each block filled
-    # contiguously from an even position) is guaranteed by the caller's
-    # slot_mapping.
+    # compile, so gate on FakeTensor, which is what the fake-tensor pass hands
+    # this function. An earlier note here called
+    # ``torch.compiler.is_compiling()`` unreliable on this backend; it recorded
+    # no measurement and named no path, and ``values_are_readable`` now relies on
+    # that call for the tracer this clause does not see -- the one that presents a
+    # traced tensor as the caller's own type. The check still runs in eager mode
+    # and in test_scatter_packed_k_* with real tensors. The reshape below uses -1,
+    # so it does not need num_rows at trace time. The rest of the pair-alignment
+    # contract (each block filled contiguously from an even position) is
+    # guaranteed by the caller's slot_mapping.
     if not isinstance(k_flat, FakeTensor):
         assert num_rows % 2 == 0, (
             f"scatter_packed_k requires an even, pair-aligned row count (even "
