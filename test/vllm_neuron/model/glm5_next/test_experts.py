@@ -1930,8 +1930,8 @@ def test_shared_expert_section_imports_neither_scale_layout_helper():
 
     The campaign carries two helpers of that name at different arities
     (``functional/blockwise_fp8_mm.py:309`` takes ``(weight_scale, rows, cols)``;
-    ``functional/moe/moe_blockwise_fp8.py:170`` takes ``(consumer_scales,
-    num_experts, rows, cols, projection)``), and they are deliberately not
+    ``functional/moe/moe_blockwise_fp8.py``'s ``to_kernel_scale_layout``
+    takes ``(consumer_scales, num_experts, rows, cols, projection)``), and they are deliberately not
     flat-exported. This section removes the hazard instead of navigating it: it
     passes the PUBLIC scale grid and lets ``blockwise_fp8_mm`` apply the dense
     helper itself. Asserted mechanically so a later edit cannot quietly

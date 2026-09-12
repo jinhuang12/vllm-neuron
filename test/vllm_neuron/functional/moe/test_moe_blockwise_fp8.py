@@ -54,9 +54,11 @@ from vllm_neuron.functional.moe.blockwise_fp8_retile import (
     BLOCK_QUANT_SIZE,
     GATE_UP,
     DOWN,
+    I_TILES_PER_BLOCK,
     TILE_SIZE,
+    consumer_scale_shape,
+    flat_scale_index,
     is_pow2_exact,
-    retile_block_scales,
 )
 from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     GATE_UP_FUSION,
@@ -208,10 +210,11 @@ def _pow2_checkpoint_scales(seed: int, rows: int, cols: int) -> torch.Tensor:
     """``(E, rows//128, cols//128)`` fp32 scales, every entry an exact power of two.
 
     Exact powers of two, and therefore mutually pow2-related within any
-    ``256``-block, and each retained block scale itself a power of two: the
-    COMPLETE condition `inc-glm53f-024` part 5 declares, satisfied by
-    construction and then RE-ASSERTED from the emitted records in
-    :func:`test_cte_f1_precondition_complete_condition_n_over_n`.
+    ``256``-block, and each retained block scale itself a power of two. The
+    routed limbs index this grid as it stands and need no such relation; the
+    property is kept because the items that coarsen onto the vendor seam's
+    ``256`` grid rely on it to keep their pinned tolerances, and
+    :func:`_vendor_256_pair` says why.
 
     Exponents vary per tile so the scales are DISTINCT: a comparison run on
     uniform scales cannot see a permuted layout.
@@ -250,43 +253,101 @@ def _fp8_grid_weights(seed: int, *shape: int, signed: bool = False) -> torch.Ten
     return raw
 
 
+def _vendor_256_pair(
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    projection: str,
+    gate_or_up: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The vendor seam's ``256``-granular pair, coarsened HERE and by no module.
+
+    The vendor matmul carries one scale per ``256x256`` block, so a checkpoint's
+    ``[128, 128]`` grid reaches it only through a mapping: keep one tile's scale
+    per block and re-express the other three tiles' weight bytes against it,
+    ``w * s_tile / s_kept``. No module in this tree performs that mapping any
+    more -- the routed limbs index the checkpoint grid directly -- so the seam's
+    fixture is built here, beside the items that measure the seam.
+
+    This fixture's scales are powers of two, so every ratio is exact in fp8 and
+    the coarsened pair dequantises to the same product as the checkpoint pair.
+    That is what lets these items keep the tolerances they were pinned with.
+
+    Slots outside ``gate_or_up``'s half are left NaN, so an unwritten slot
+    poisons its consumer instead of passing quietly.
+
+    Returns:
+        The rescaled fp8 weight in the input's own axis order, and the flat
+        ``(E, n_blocks * TILE_SIZE)`` scale tensor the seam consumes.
+    """
+    experts, rows, cols = weights.shape
+    h_256, i_256 = rows // BLOCK_QUANT_SIZE, cols // BLOCK_QUANT_SIZE
+    flat = torch.full(
+        consumer_scale_shape(experts, rows, cols, projection),
+        float("nan"),
+        dtype=torch.float32,
+    )
+    rescaled = weights.to(torch.float32).clone()
+    for expert in range(experts):
+        for h_tile in range(rows // TILE_SIZE):
+            for i_tile in range(cols // TILE_SIZE):
+                kept = float(
+                    scales[
+                        expert,
+                        h_tile - h_tile % I_TILES_PER_BLOCK,
+                        i_tile - i_tile % I_TILES_PER_BLOCK,
+                    ]
+                )
+                ratio = float(scales[expert, h_tile, i_tile]) / kept
+                window = (
+                    expert,
+                    slice(h_tile * TILE_SIZE, (h_tile + 1) * TILE_SIZE),
+                    slice(i_tile * TILE_SIZE, (i_tile + 1) * TILE_SIZE),
+                )
+                rescaled[window] = (rescaled[window] * ratio).to(_FP8).to(torch.float32)
+                block = flat_scale_index(
+                    h_tile, i_tile, h_256, i_256, projection, gate_or_up
+                )
+                flat[expert, block * TILE_SIZE : (block + 1) * TILE_SIZE] = kept
+    assert bool(torch.isfinite(rescaled).all()), (
+        "a rescaled byte left the fp8 range, so this fixture measures saturation "
+        "rather than the seam"
+    )
+    return rescaled.to(_FP8), flat
+
+
 def _build_case(signed: bool = False) -> dict:
-    """The tiny config, retiled through `inc-glm53f-024`, in the kernel's layout."""
-    # --- gate/up: the producer runs per fusion half, on (E, H, I_TP) ---------- #
+    """The tiny config, coarsened onto the vendor seam's ``256`` scale grid."""
+    # --- gate/up: the mapping runs per fusion half, on (E, H, I_TP) ---------- #
     gup_scale_logical = torch.empty(
         kernel_scale_shape(E, H, I_TP, GATE_UP), dtype=torch.float32
     )
     gup_weight = torch.empty((E, H, 2, I_TP), dtype=torch.float32)
-    gup_results = []
     for gate_or_up in range(2):
         checkpoint = _pow2_checkpoint_scales(11 + gate_or_up, H, I_TP)
         weights = _fp8_grid_weights(21 + gate_or_up, E, H, I_TP, signed=signed)
-        result = retile_block_scales(
-            weights.to(_FP8), checkpoint, projection=GATE_UP, gate_or_up=gate_or_up
+        retiled_weights, consumer_scales = _vendor_256_pair(
+            weights.to(_FP8), checkpoint, GATE_UP, gate_or_up
         )
-        gup_results.append((checkpoint, weights, result))
-        gup_weight[:, :, gate_or_up, :] = result.retiled_weights.to(torch.float32)
+        gup_weight[:, :, gate_or_up, :] = retiled_weights.to(torch.float32)
         # One C-order reshape, in the module, at the one place it is written.
         bridged = to_kernel_scale_layout(
-            result.consumer_scales, E, H, I_TP, projection=GATE_UP
+            consumer_scales, E, H, I_TP, projection=GATE_UP
         )
-        # The producer writes only this half's slots, so take this half's slice.
+        # The mapping writes only this half's slots, so take this half's slice.
         gup_scale_logical[:, :, gate_or_up, :, :] = bridged[:, :, gate_or_up, :, :]
 
-    # --- down: the producer's `rows` is the H axis and `cols` the I axis, so    #
-    # --- the physically-[E, I_TP, H] weight is retiled in (E, H, I_TP) view.    #
+    # --- down: the mapping's `rows` is the H axis and `cols` the I axis, so     #
+    # --- the physically-[E, I_TP, H] weight is coarsened in (E, H, I_TP) view.  #
     down_checkpoint = _pow2_checkpoint_scales(31, H, I_TP)
     down_weight_hi = _fp8_grid_weights(41, E, H, I_TP, signed=signed)
-    down_result = retile_block_scales(
-        down_weight_hi.to(_FP8), down_checkpoint, projection=DOWN
+    down_retiled, down_consumer_scales = _vendor_256_pair(
+        down_weight_hi.to(_FP8), down_checkpoint, DOWN
     )
     down_scale_logical = to_kernel_scale_layout(
-        down_result.consumer_scales, E, H, I_TP, projection=DOWN
+        down_consumer_scales, E, H, I_TP, projection=DOWN
     )
     # Back to the kernel's physical [E, I_TP, H].
-    down_weight = (
-        down_result.retiled_weights.to(torch.float32).transpose(1, 2).contiguous()
-    )
+    down_weight = down_retiled.to(torch.float32).transpose(1, 2).contiguous()
 
     hidden = _fp8_grid_weights(51, T + 1, H, signed=signed).to(torch.bfloat16)
     affinities = torch.zeros(((T + 1) * E, 1), dtype=torch.bfloat16)
@@ -309,8 +370,6 @@ def _build_case(signed: bool = False) -> dict:
             gate_up_proj_scale=gup_scale_logical,
             down_proj_scale=down_scale_logical,
         ),
-        "gup_results": gup_results,
-        "down_result": down_result,
         "block_to_expert": block_to_expert,
     }
 
@@ -437,121 +496,6 @@ def test_cte_signed_fixture_agrees_in_norm_under_cancellation() -> None:
             f"block {block}: relative L2 {rel_l2:.6e} exceeds the declared "
             f"rtol {RTOL}; that is a structural disagreement, not cancellation"
         )
-
-
-# --------------------------------------------------------------------------- #
-# F1 PRECONDITION -- re-asserted here, not inherited from `inc-glm53f-024`.     #
-# --------------------------------------------------------------------------- #
-def test_cte_f1_precondition_complete_condition_n_over_n() -> None:
-    """Both losslessness conjuncts hold on THIS case's scales, N/N blocks.
-
-    Conjunct 1: the four constituent ``[128,128]`` scales are mutually
-    power-of-two-related. Conjunct 2: the retained ``256``-block scale is itself
-    a power of two. Both by the **bit-pattern** predicate
-    :func:`is_pow2_exact`, never ``log2``.
-
-    Recomputed from the emitted records rather than read off the producer's own
-    ``lossless`` flag, so this is an independent instrument on `inc-glm53f-024`'s
-    central claim.
-    """
-    case = _build_case()
-    banks = [
-        (f"gate_up[g={g}]", result)
-        for g, (_checkpoint, _weights, result) in enumerate(case["gup_results"])
-    ] + [("down", case["down_result"])]
-
-    total = 0
-    lossless = 0
-    for label, result in banks:
-        records = result.records
-        if not records:
-            raise VacuousControlError(
-                f"{label}: the producer emitted 0 block records, so an N/N "
-                f"reading would be 0/0 -- vacuous"
-            )
-        for record in records:
-            total += 1
-            conjunct1 = all(is_pow2_exact(ratio) for ratio in record.ratios)
-            conjunct2 = is_pow2_exact(record.block_scale)
-            if conjunct1 and conjunct2:
-                lossless += 1
-            else:
-                raise F1PreconditionError(
-                    f"{label} block {record.key}: conjunct1(quad mutually pow2)"
-                    f"={conjunct1} ratios={record.ratios} "
-                    f"conjunct2(block scale pow2)={conjunct2} "
-                    f"block_scale={record.block_scale!r}. The tolerance "
-                    f"{RTOL}/{ATOL} certifies kernel error only when both hold; "
-                    f"widening it to absorb remapping error is the user's "
-                    f"election, not this test's."
-                )
-        # The retile must also be bit-exact on the weights it rescaled, or the
-        # kernel would be fed a weight the checkpoint did not contain.
-        assert result.inexact_rescales == 0, (
-            f"{label}: inexact_rescales={result.inexact_rescales}, declared 0"
-        )
-        assert result.emitted_unsupplied == 0, (
-            f"{label}: emitted_unsupplied={result.emitted_unsupplied}, declared 0"
-        )
-        assert result.input_scales_dropped == 0, (
-            f"{label}: input_scales_dropped={result.input_scales_dropped}, declared 0"
-        )
-
-    print(f"[f1] complete_condition_blocks={lossless}/{total} (N/N required)")
-    assert lossless == total, f"{lossless}/{total} blocks satisfy both conjuncts"
-    assert total > 0
-
-
-def test_cte_f1_detector_catches_a_non_pow2_block_scale() -> None:
-    """DETECTOR: the F1 predicate must FAIL a block that violates conjunct 2.
-
-    Without this arm, ``N/N`` above is a tautology over scales the test itself
-    chose. The detector feeds the real predicate a real violating scale and
-    requires a real negative.
-    """
-    checkpoint = _pow2_checkpoint_scales(11, H, I_TP)
-    weights = _fp8_grid_weights(21, E, H, I_TP)
-
-    clean = retile_block_scales(weights.to(_FP8), checkpoint, projection=DOWN)
-    clean_bad = [
-        record.key
-        for record in clean.records
-        if not (all(is_pow2_exact(r) for r in record.ratios)
-                and is_pow2_exact(record.block_scale))
-    ]
-    if clean_bad:
-        raise VacuousControlError(
-            f"the clean arm already violates F1 at {clean_bad[:3]}, so the "
-            f"detector cannot attribute a negative to its injection"
-        )
-
-    # Inject: 3.0 is not a power of two (significand field non-zero), so the
-    # retained block scale for block (0, 0) violates conjunct 2, and the three
-    # ratios against it violate conjunct 1.
-    poisoned = checkpoint.clone()
-    poisoned[0, 0, 0] = 3.0
-    if torch.equal(poisoned, checkpoint):
-        raise VacuousControlError("injection changed nothing -- control is vacuous")
-
-    dirty = retile_block_scales(weights.to(_FP8), poisoned, projection=DOWN)
-    violations = [
-        record.key
-        for record in dirty.records
-        if not (all(is_pow2_exact(r) for r in record.ratios)
-                and is_pow2_exact(record.block_scale))
-    ]
-    print(
-        f"[f1-detector] clean_violations={len(clean_bad)} "
-        f"poisoned_violations={len(violations)} first={violations[:1]}"
-    )
-    assert violations, (
-        "the F1 predicate passed a non-pow2 block scale (3.0); it is therefore "
-        "not a discriminator and the N/N reading above means nothing"
-    )
-    assert (0, 0, 0) in violations, f"expected block (0,0,0) flagged, got {violations}"
-    # And the bit-pattern predicate itself, on the injected value.
-    assert not is_pow2_exact(3.0)
-    assert is_pow2_exact(2.0) and is_pow2_exact(0.25)
 
 
 # --------------------------------------------------------------------------- #

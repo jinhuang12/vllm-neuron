@@ -245,15 +245,16 @@ def to_kernel_scale_layout(
 ) -> Tensor:
     """Reshape the producer's flat scale tensor into the kernel's logical view.
 
-    ``consumer_scales`` is what
-    :func:`~vllm_neuron.functional.moe.blockwise_fp8_retile.retile_block_scales`
-    emits: ``(E, n_blocks * TILE_SIZE)``, flat.
+    ``consumer_scales`` is the vendor limb's own flat form,
+    ``(E, n_blocks * TILE_SIZE)``, one ``256``-block scale broadcast across
+    ``TILE_SIZE`` partitions. No producer in this tree coarsens onto it any more:
+    the NKI limbs index the checkpoint's ``[128, 128]`` grid directly, so this
+    helper is the vendor seam's adapter and its caller supplies the flat tensor.
 
     This is a **C-order** reshape, and that is the settled byte order rather
-    than a default taken for convenience. Under C order the producer's flat
-    offset for block ``b`` and replica ``t`` is ``b * TILE_SIZE + t``, which is
-    exactly the offset the kernel's DMA reads (``:1131`` + ``:1135``, ``:2001``
-    + ``:2007``). The producer's own
+    than a default taken for convenience. Under C order the flat offset for block
+    ``b`` and replica ``t`` is ``b * TILE_SIZE + t``, which is exactly the offset
+    the kernel's DMA reads (``:1131`` + ``:1135``, ``:2001`` + ``:2007``).
     :func:`~vllm_neuron.functional.moe.blockwise_fp8_retile.flat_scale_index`
     returns ``b``, so no index arithmetic is repeated here.
 

@@ -149,18 +149,6 @@ def _is_on_device(where: torch.device, target: torch.device) -> bool:
     return where.index == target.index
 
 
-def _values_are_readable(tensor: torch.Tensor) -> bool:
-    """Can a host-side value be read off this tensor at all?
-
-    A shape-only load carries meta tensors: they have the right shape and dtype
-    and no data, so any check that reads a NUMBER out of one raises rather than
-    answering. Checks that read numbers ask this first and record the skip; every
-    check that reads only a shape needs no guard, because a meta tensor's shape is
-    as real as any other tensor's.
-    """
-    return tensor.device.type != "meta"
-
-
 def _declare_parameters(module: nn.Module, *names: str) -> None:
     """Reserve parameter attribute paths on ``module`` without allocating.
 
@@ -2257,12 +2245,13 @@ class Glm5NextRoutedExperts(nn.Module):
     # therefore hands exactly the six operands below, by keyword.
     #
     # WHY ONE METHOD BUILDS THE WEIGHTS AS WELL, though it is named for scales.
-    # The ``-024`` producer emits ``consumer_scales`` and ``retiled_weights``
-    # from ONE pass over a bank. Splitting them across the loop's two hooks
-    # would retile every bank twice and leave two answers to one question, and
-    # the other hook needs ``projection_widths()``, which is the attention
-    # section's 2-D contract rather than an expert bank's. The hook contract is
-    # unchanged: same name, six keyword operands, an int return.
+    # A weight and its scale grid are one pair: the kernel indexes the grid by the
+    # weight's own tiles, and the two orientations below move together or the pair
+    # means something else. Splitting them across the loop's two hooks would leave
+    # two answers to one question, and the other hook needs
+    # ``projection_widths()``, which is the attention section's 2-D contract
+    # rather than an expert bank's. The hook contract is unchanged: same name, six
+    # keyword operands, an int return.
 
     #: Where :meth:`prepare_scale_operands` leaves its four operands. A class
     #: attribute for the reason the shared expert's own is one: the name is part
@@ -2300,21 +2289,19 @@ class Glm5NextRoutedExperts(nn.Module):
             down_proj_scale: ``[E_local, H//128, I_TP//128]`` fp32.
 
         Returns:
-            How many operands were built -- ``4`` on every successful call:
-            the fused gate/up bank, its merged consumer scales, the retiled down
-            bank and its consumer scales.
+            How many operands were built -- ``4`` on every successful call: the
+            fused gate/up bank, its kernel scale operand, the down bank and its
+            kernel scale operand.
 
         Raises:
             Glm5NextBlockQuantRouteError: on a missing operand, a weight that is
-                not 3-D, an expert count that disagrees with this rank's
-                partition, or a fusion merge that left a slot unwritten. Those
-                four are structural. The producer's own health counts --
-                ``emitted_unsupplied``, ``input_scales_dropped`` and
-                ``inexact_rescales`` -- are RECORDED on this module instead of
-                refused on, and the acceptance reads them: they are numeric
-                properties of a particular checkpoint's scales, so a refusal
-                here would turn a reportable measurement into a load failure on
-                a case no test has run.
+                not 3-D, or an expert count that disagrees with this rank's
+                partition. All three are structural. The publisher's three health
+                counts -- ``emitted_unsupplied``, ``input_scales_dropped`` and
+                ``inexact_rescales`` -- are RECORDED on this module rather than
+                refused on, and every one of them is zero because no scale is
+                remapped: the grid the checkpoint shipped is the grid the kernels
+                index.
 
         THOSE ARE THE LOADER'S ORIENTATIONS AND NOT THE KERNEL'S, which is why
         the body below transposes two of the three banks on the way in and one on
@@ -2411,9 +2398,8 @@ class Glm5NextRoutedExperts(nn.Module):
         # value everywhere.
         #
         # A DENSE BUFFER IS THE FORM THE PRODUCER IS KNOWN TO WORK ON. Every landed
-        # call of it hands a freshly built contiguous tensor. The copy is bounded by
-        # what the producer does next anyway: it upcasts its weight to fp32
-        # internally, four times the size of the fp8 copy made here.
+        # call of it hands a freshly built contiguous tensor, and the kernel-operand
+        # builders below read the same pair.
         #
         # EVERYTHING BELOW COMPUTES ON HOST COPIES AND WRITES TO THE DEVICE ONCE, and
         # the hop happens here, before the first materialisation. These six operands
@@ -2422,9 +2408,9 @@ class Glm5NextRoutedExperts(nn.Module):
         # a slice made dense on the device raises ``Expected self.is_contiguous() to be
         # true, but got false``, which the runner already writes down at
         # ``vllm/worker/neuron_model_runner.py:4136``. That covers this method's own
-        # transposes AND every producer it calls: ``retile_block_scales`` walks the bank
-        # tile by tile, and the two kernel-operand builders each broadcast a flat grid
-        # across the partition axis with ``expand(...).contiguous()``. On host copies
+        # transposes AND every producer it calls: the two kernel-operand builders each
+        # broadcast a flat grid across the partition axis with
+        # ``expand(...).contiguous()``. On host copies
         # all of that is ordinary torch, and one move at the end puts the finished
         # operands where the forward wants them -- cheaper than the round trip per
         # relayout it replaces, and it leaves no producer holding a device tensor.
@@ -2458,37 +2444,22 @@ class Glm5NextRoutedExperts(nn.Module):
         )
         down = retile_block_scales(down_proj_weight, down_proj_scale, DOWN)
 
-        # ---- THE FUSION MERGE, and its completeness check.
-        gate_up_scales = torch.where(
-            torch.isnan(gate.consumer_scales), up.consumer_scales, gate.consumer_scales
-        )
-        # THIS CHECK COUNTS NaNs, so it needs values and a shape-only load has
-        # none. It runs exactly as it always did whenever values are there; on a
-        # shape-only pass the skip is RECORDED rather than passed over silently,
-        # because a completeness check that quietly stops checking is worse than
-        # one that says it did not run.
-        if _values_are_readable(gate_up_scales):
-            unwritten = int(torch.isnan(gate_up_scales).sum())
-            if unwritten:
-                raise Glm5NextBlockQuantRouteError(
-                    f"the fused gate/up consumer scales have {unwritten} slots "
-                    f"that neither half wrote. The producer writes one half per "
-                    f"call and leaves the other NaN, so every slot must come from "
-                    f"exactly one of the two calls above; a survivor means the two "
-                    f"emissions do not tile the same space"
-                )
-        else:
-            self._value_checks_skipped = (
-                *getattr(self, "_value_checks_skipped", ()),
-                "gate_up_fusion_completeness",
-            )
-
-        # ---- THE CAMPAIGN LIMBS' OPERANDS, from the checkpoint's own bytes.
-        # The three NKI limbs consume the checkpoint at its own ``[128, 128]``
-        # granularity, so their operands are built from the six arguments this
-        # method received and NOT from the retile above: a retiled weight has been
-        # rescaled against a retained scale, and pairing it with the checkpoint's
-        # unaltered grid would be a different function.
+        # NO FUSION MERGE OF PUBLISHED SCALES, AND THAT IS THIS CHANGE. The publisher
+        # used to coarsen each half onto a flat ``256``-block layout, writing one
+        # fusion half per call and leaving the other half NaN, so the two emissions
+        # had to be merged and the merge had to be checked for slots neither half
+        # wrote. There is no coarser layout now and no NaN sentinel in it: each half
+        # publishes the grid it was handed, at the granularity the kernels index, so
+        # there is nothing to merge and no hole a merge could leave. The fusion the
+        # kernels do see is the stack two blocks below, whose axis is asserted by the
+        # operand builders' own shape checks.
+        #
+        # ---- THE KERNEL LIMBS' OPERANDS, from the checkpoint's own bytes. The three
+        # NKI limbs consume the checkpoint at its own ``[128, 128]`` granularity, so
+        # their operands are built from the six arguments this method received. That
+        # is now the same pair the publisher returns; they are built from the
+        # arguments rather than from its result so that the orientation each limb
+        # needs is visible at the line that produces it.
         #
         # ORIENTATION, WHICH IS THE SAME RULE THE RETILE VIEW USES ABOVE. Gate and
         # up are registered ``[E, I_TP, H]`` and the limb contracts H on axis 0, so
@@ -2855,11 +2826,11 @@ class Glm5NextSharedExperts(nn.Module):
     # removal is safe rather than convenient. Coarsening kept ONE of the four tile
     # scales per block, so the other three tiles' values were wrong against the
     # retained scale until rescaled by their own ratio -- which is what
-    # ``retile_block_scales`` did to the weight it returned
-    # (``blockwise_fp8_retile.py:414-424``). Publishing the coarser grid beside the
-    # original weight would have changed no shape and every number, and the seam's
-    # element-count check would have passed it. Not coarsening at all is the one
-    # option that needs neither half of that pair.
+    # ``retile_block_scales`` did to the weight it returned, in the loop that module
+    # no longer carries. Publishing the coarser grid beside the original weight
+    # would have changed no shape and every number, and the seam's element-count
+    # check would have passed it. Not coarsening at all is the one option that
+    # needs neither half of that pair.
     #
     # IT MOVES NO LANDED COUNT, and that is measured rather than hoped. A module of
     # this class exists only where a MoE block does, and of the fixtures in
@@ -8062,10 +8033,11 @@ def _publish_compute_frame_operands(
             # kernel consumes and there is nothing to rescale. Removing the call
             # removes arithmetic from the load path; it does not move it elsewhere.
             #
-            # The MoE bank is NOT this path and still retiles: it prepares its own
-            # operands in ``Glm5NextRoutedExperts.prepare_scale_operands`` against
-            # the 256-granular MoE kernel, and `moe/blockwise_fp8_retile.py` is
-            # untouched.
+            # The MoE bank is NOT this path, and it no longer coarsens either: it
+            # prepares its own operands in
+            # ``Glm5NextRoutedExperts.prepare_scale_operands``, against NKI limbs
+            # that index the same 128 tiles, and its publisher emits the grid it
+            # was handed.
             record.update(
                 {
                     "retiled": False,
