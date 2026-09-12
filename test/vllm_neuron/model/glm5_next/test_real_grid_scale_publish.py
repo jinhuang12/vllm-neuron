@@ -14,11 +14,18 @@ config change moves this file's population instead of leaving it asserting an ex
 the model no longer has.
 
 THE VALUES ARE CONSTRUCTED, AND THAT IS DISCLOSED. The real checkpoint's own scale
-values live on the leased host; a read of them recorded six counts over this layer's
-110,592 blocks, and the grid built here reproduces all six, measured by the module's
+values live on the leased host; a read of them recorded eight counts over this layer's
+110,592 blocks, and the grid built here reproduces all eight, measured by the module's
 own bit predicate rather than assumed. What this file proves is therefore: on a grid
 that refuses under the removed guard exactly as often as the real one does, the
 publisher emits every tile unchanged and refuses nothing.
+
+ONE COUNT OF THAT READ IS NOT REPRODUCED, and it is named rather than left out: the real
+grid has 33,928 blocks whose quad maximum TIES the top-left scale, where this fixture
+has none -- its four classes give every block either a top-left maximum outright or a
+strictly larger sibling. Ties do not enter the guard's predicate, which compares against
+the fp8 bound, so the refusal count is unaffected; a later block that measures tie
+behaviour needs a fifth class.
 """
 
 from __future__ import annotations
@@ -71,10 +78,12 @@ RETAINED_POW2 = 2.0**-10
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_BOUND = float(torch.finfo(FP8_DTYPE).max)
 
-#: Every tile of the fixture's weight holds a byte at that bound. The real-weights
-#: read tested this premise on real bytes rather than assuming it and found it held
-#: on 32 of 32 sampled tiles (``C1_TILES_HOLDING_A_BYTE_AT_THE_FP8_BOUND|32 of 32``),
-#: which is what makes the removed guard's refusal count a property of the grid.
+#: Every tile of the fixture's weight holds a byte at that bound, WHICH THE ITEMS
+#: MEASURE off the weight rather than assume: the guard's predicate reads a window
+#: maximum, so the maxima are read back and published. The fixture fills to the bound
+#: because the real checkpoint's tiles do -- 32 of 32 sampled
+#: (``C1_TILES_HOLDING_A_BYTE_AT_THE_FP8_BOUND|32 of 32``) -- so the refusal count here
+#: is the count the real grid would draw.
 TILES_PER_BLOCK_AXIS = BLOCK_QUANT_SIZE // TILE_SIZE
 
 #: The order the three sibling tiles are read in, against the block's top-left one.
@@ -216,14 +225,21 @@ def _quads(grid: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _census(grids: dict[str, torch.Tensor]) -> dict[str, int]:
-    """The six readings the real-weights read reported, over the whole fixture.
+def _census(
+    grids: dict[str, torch.Tensor], window_max: torch.Tensor
+) -> dict[str, int]:
+    """The eight readings the real-weights read reported, over the whole fixture.
 
     THE POWER-OF-TWO QUESTION IS ASKED OF THE PUBLISHER'S OWN MODULE, one value at a
     time, rather than re-derived here from exponent bits: the predicate that decides
     losslessness must be the one the design depends on. The values reach it as plain
     floats through one flat list, so the loop costs one pass and not one tensor per
     block.
+
+    THE GUARD'S QUESTION IS ASKED OF THE WEIGHT. Its predicate reads the ``128``-tile
+    window MAXIMUM, so ``window_max`` -- measured off the tensor the publisher is handed
+    -- is what enters it, over all four tiles of the block rather than the three sibling
+    ratios the losslessness conjunct counts.
     """
     quads = torch.cat([_quads(grid) for grid in grids.values()])
     retained_column = quads[:, 0, 0]
@@ -243,9 +259,14 @@ def _census(grids: dict[str, torch.Tensor]) -> dict[str, int]:
     ]
     quad_max = quads.reshape(quads.shape[0], -1).max(dim=1).values
     # The removed guard's own predicate, transliterated from the tree this subject was
-    # removed from: a tile refuses when ``|weight * ratio|`` passes the fp8 bound, and
-    # every tile of this fixture holds a byte at that bound.
-    worst = (ratios * FP8_BOUND).max(dim=1).values
+    # removed from: a tile refuses when its rescaled window is not finite, or when
+    # ``|weight * ratio|`` passes the fp8 bound. Both limbs read the measured window
+    # maximum rather than the bound itself, so a weight that could not reach the bound
+    # moves this count instead of leaving it standing on an assumption.
+    wanted = window_max * (quads / retained_column[:, None, None])
+    flat = wanted.reshape(wanted.shape[0], -1)
+    finite = torch.isfinite(flat).all(dim=1)
+    worst = flat.max(dim=1).values
     return {
         "blocks": int(quads.shape[0]),
         "ratios": int(ratios.numel()),
@@ -256,7 +277,7 @@ def _census(grids: dict[str, torch.Tensor]) -> dict[str, int]:
             1 for quad, retained in zip(quad_flags, retained_flags) if quad and retained
         ),
         "topleft_is_quad_max": int((quad_max == retained_column).sum()),
-        "removed_guard_refusals": int((worst > FP8_BOUND).sum()),
+        "removed_guard_refusals": int((~finite | (worst > FP8_BOUND)).sum()),
     }
 
 
@@ -265,9 +286,33 @@ def _bank_weight(rows: int, cols: int) -> torch.Tensor:
 
     ONE TENSOR FOR EVERY EXPERT, because every byte of it is the same value: the
     publisher reads no weight value, and the removed guard's predicate reads only the
-    per-tile maximum, which this weight makes the bound everywhere.
+    per-tile maximum, which this weight makes the bound everywhere. Nothing below takes
+    that on trust -- :func:`weight_window_maxima` measures it.
     """
     return torch.full((1, rows, cols), FP8_BOUND, dtype=torch.float32).to(FP8_DTYPE)
+
+
+def weight_window_maxima(weight: torch.Tensor, blocks: int) -> torch.Tensor:
+    """The ``128``-tile window maxima of one bank's weight, as ``(blocks, 2, 2)``.
+
+    The removed guard read ``|weights[window] * ratio|.max()``, so this reads the same
+    window maximum off the tensor the publisher is handed. One expert's maxima are
+    repeated across the population because one tensor is published for every expert of
+    every projection, and the items assert that those maxima are one value, which is
+    what licenses the repeat.
+    """
+    experts, rows, cols = weight.shape
+    maxima = (
+        weight.to(torch.float32)
+        .abs()
+        .reshape(experts, rows // TILE_SIZE, TILE_SIZE, cols // TILE_SIZE, TILE_SIZE)
+        .amax(dim=(2, 4))
+    )
+    per_expert = _quads(maxima)
+    assert blocks % per_expert.shape[0] == 0, (
+        f"{blocks} blocks do not divide into {per_expert.shape[0]} per published weight"
+    )
+    return per_expert.repeat(blocks // per_expert.shape[0], 1, 1)
 
 
 def publish_bank(grids: dict[str, torch.Tensor]) -> dict[str, int]:
@@ -325,14 +370,33 @@ def test_the_fixture_reproduces_the_measured_grid_of_the_real_expert_bank() -> N
     """
     experts, rows, cols = real_bank_geometry()
     grids = build_real_grid()
-    census = _census(grids)
+    window_max = weight_window_maxima(_bank_weight(rows, cols), MEASURED_BLOCKS)
+    census = _census(grids, window_max)
     emit(
         "GEOMETRY",
         f"layer={REAL_LAYER}|experts={experts}|rows={rows}|cols={cols}"
         f"|projections={len(PROJECTIONS)}",
     )
+    # THE WEIGHT SIDE OF THE GUARD, MEASURED. The refusal count below is a property of
+    # the ratio grid AND of the window maxima, so those maxima are read off the weight
+    # and published here rather than assumed from the bound.
+    emit(
+        "WEIGHT_WINDOW",
+        f"min={int(window_max.min())}|max={int(window_max.max())}"
+        f"|tiles={window_max.numel()}|bound={int(FP8_BOUND)}",
+    )
     for key in sorted(census):
         emit("CENSUS", f"{key}={census[key]}")
+
+    assert float(FP8_BOUND).is_integer(), (
+        f"the fp8 bound {FP8_BOUND!r} is not an integer, so the rows above cannot "
+        f"carry it as one"
+    )
+    assert int(window_max.min()) == int(window_max.max()) == int(FP8_BOUND), (
+        f"the weight's window maxima run {int(window_max.min())}..."
+        f"{int(window_max.max())} where every tile must reach {int(FP8_BOUND)}; the "
+        f"refusal count below is about a weight that cannot reach the fp8 bound"
+    )
 
     assert census["blocks"] == MEASURED_BLOCKS, (
         f"the fixture holds {census['blocks']} blocks where the real read measured "
@@ -413,8 +477,11 @@ def test_every_published_scale_equals_its_checkpoint_input() -> None:
 
 def test_the_publisher_refuses_nothing_on_the_grid_the_removed_guard_refused() -> None:
     """No refusal, on the same blocks the removed guard refused 61,273 times."""
+    _, rows, cols = real_bank_geometry()
     grids = build_real_grid()
-    census = _census(grids)
+    census = _census(
+        grids, weight_window_maxima(_bank_weight(rows, cols), MEASURED_BLOCKS)
+    )
     refused = publish_bank(grids)["refused"]
     emit(
         "REFUSALS",
@@ -437,35 +504,52 @@ def test_restoring_the_mapping_breaks_the_equality_and_refuses_on_the_measured_c
     """The control: the removed mapping and its guard, on the same fixture.
 
     The mapping kept each block's top-left scale and rescaled the other three tiles'
-    bytes by their own ratio against it, refusing when a rescaled byte passed the fp8
+    bytes by their own ratio against it, refusing when a rescaled tile passed the fp8
     bound (the tree this file's subject was removed from,
-    ``blockwise_fp8_retile.py:500-515`` at that commit). It is transliterated here
+    ``blockwise_fp8_retile.py:436-520`` at that commit). It is transliterated here
     because it no longer exists to import, and it must both change values and refuse:
     a control that did neither would leave the four items above passing on a path that
     could not tell the two behaviours apart.
+
+    THE REFUSAL IS THE GUARD'S PREDICATE, COUNTED, RATHER THAN A RAISE PER BLOCK. The
+    original raised on the FIRST offending tile and stopped, so a population count is
+    only obtainable by asking its predicate of every block; what this item settles is
+    the count the design names, on the maxima measured off the weight the publisher is
+    handed.
     """
+    _, rows, cols = real_bank_geometry()
     grids = build_real_grid()
     quads = torch.cat([_quads(grid) for grid in grids.values()])
     retained = quads[:, 0, 0].unsqueeze(1).unsqueeze(2)
     ratios = quads / retained
+    window_max = weight_window_maxima(_bank_weight(rows, cols), quads.shape[0])
 
     mapped_scales = retained.expand_as(quads)
     changed_scales = int((mapped_scales != quads).sum())
-    rescaled_bytes = int(((ratios * FP8_BOUND) != FP8_BOUND).sum())
-    refusals = int(((ratios * FP8_BOUND).amax(dim=(1, 2)) > FP8_BOUND).sum())
+    wanted = window_max * ratios
+    flat = wanted.reshape(wanted.shape[0], -1)
+    rescaled_tiles = int((wanted != window_max).sum())
+    refusals = int(
+        (~torch.isfinite(flat).all(dim=1) | (flat.max(dim=1).values > FP8_BOUND)).sum()
+    )
     emit(
         "CONTROL",
-        f"changed_scales={changed_scales}|rescaled_bytes={rescaled_bytes}"
-        f"|refusals={refusals}",
+        f"changed_scales={changed_scales}|rescaled_tiles={rescaled_tiles}"
+        f"|refusals={refusals}|window_min={int(window_max.min())}"
+        f"|window_max={int(window_max.max())}",
     )
 
     assert changed_scales > 0, (
         "the restored mapping changed no scale, so it is not the mapping and the "
         "equality item above is not discriminating"
     )
-    assert rescaled_bytes > 0, (
-        "the restored mapping rescaled no weight byte, so it is a scale swap rather "
+    assert rescaled_tiles > 0, (
+        "the restored mapping moved no weight tile, so it is a scale swap rather "
         "than a retile"
+    )
+    assert int(window_max.max()) == int(FP8_BOUND), (
+        f"the weight's tiles reach {int(window_max.max())} and not "
+        f"{int(FP8_BOUND)}, so this refusal count is about a different weight"
     )
     assert refusals == MEASURED_REMOVED_GUARD_REFUSALS, (
         f"the restored guard refuses {refusals} times where the real read measured "
