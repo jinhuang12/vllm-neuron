@@ -180,6 +180,74 @@ def _declare_parameters(module: nn.Module, *names: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Relayout on the host, because the device refuses a strided copy
+# ---------------------------------------------------------------------------
+
+
+def _on_the_host(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """The operands a load-time prep computes on, where a strided read is legal."""
+    # A META TENSOR IS RETURNED AS IT IS, and that is not an optimisation. Meta has
+    # no data to copy, so ``.cpu()`` on it raises "Cannot copy out of meta tensor;
+    # no data!" -- and the shape-only rehearsal the runner starts a CPU compile with
+    # runs this whole load path on meta (``load_weights_lite`` moves the module to
+    # meta and then runs the real loaders and preps, for
+    # ``neuron_model_runner.py:1358-1367``). Meta is also already a venue where a
+    # strided read is legal: a transpose, a permute, a slice and the
+    # ``.contiguous()`` after them are shape-and-stride arithmetic there, with no
+    # copy to refuse. So the rehearsal needs no host copy and must not attempt one.
+    return tuple(tensor if tensor.is_meta else tensor.cpu() for tensor in tensors)
+
+
+def _on_the_device(
+    device: torch.device, *tensors: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """The finished operands, moved to ``device`` in one step each."""
+    # The other half of the pair above, so a prep reads as one hop out and one hop
+    # back rather than a round trip per operand. For meta ``device`` is meta and
+    # every move is a no-op.
+    return tuple(tensor.to(device) for tensor in tensors)
+
+
+def _relaid_out_on_the_host(
+    tensor: torch.Tensor,
+    relayout: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """``relayout(tensor)`` made dense, with every strided read taken on the host."""
+    # THE RULE IS THE RUNNER'S, NOT A NEW ONE: "Neuron tensors don't support
+    # ``.contiguous()``" (``vllm/worker/neuron_model_runner.py:4136``, which slices on
+    # the host and moves back for exactly this reason, and again at ``:9276`` -- "a
+    # non-contiguous view that ``.contiguous()`` cannot resolve on Neuron device"). A
+    # transpose, a permute and a strided slice are all views, and materialising one on
+    # the device raises ``Expected self.is_contiguous() to be true, but got false``. A
+    # real 64-rank load raised exactly that, on this load path, before any rank
+    # finished its weights.
+    #
+    # ``tensor`` MUST ALREADY BE DENSE. The move to the host is itself a copy and a
+    # strided one refuses for the same reason, so the strided step belongs INSIDE
+    # ``relayout``, where it runs on the host copy. Every caller passes an operand the
+    # loader or a prep has just built, and puts its slice, its transpose, its permute
+    # and any cast in the callback.
+    #
+    # NO BRANCH ON DEVICE TYPE, ON PURPOSE. For a tensor already on the host both moves
+    # are no-ops, so this returns what the direct expression returned -- same values,
+    # same strides. A branch would leave the device arm ungraded by a suite that runs
+    # entirely on the host. The one venue that is not a device at all -- meta, with no
+    # data to copy either way -- is answered inside :func:`_on_the_host`, so this
+    # function has one body for every caller.
+    (host,) = _on_the_host(tensor)
+    (dense,) = _on_the_device(tensor.device, relayout(host).contiguous())
+    return dense
+
+
+def _transposed_on_the_host(tensor: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
+    """``tensor`` with two axes swapped, dense, and never transposed on the device."""
+    # The common shape of the rule above, spelled once so twelve call sites do not each
+    # carry a callback. ``transpose`` rather than ``.t()`` because the stacked operand
+    # banks swap axes 1 and 2 while the 2-D projections swap 0 and 1.
+    return _relaid_out_on_the_host(tensor, lambda host: host.transpose(dim0, dim1))
+
+
+# ---------------------------------------------------------------------------
 # Geometry resolution for ``get_kv_spec``
 # ---------------------------------------------------------------------------
 
@@ -2342,12 +2410,40 @@ class Glm5NextRoutedExperts(nn.Module):
         # neither should be, which for DOWN changes no shape anywhere and every
         # value everywhere.
         #
-        # ``.contiguous()`` IS THE FORM THE PRODUCER IS KNOWN TO WORK ON. Every
-        # landed call of it hands a freshly built contiguous tensor, and this file
-        # already uses ``.t().contiguous()`` for the same job in both
-        # ``prepare_projection_weights`` methods. The copy is bounded by what the
-        # producer does next anyway: it upcasts its weight to fp32 internally,
-        # four times the size of the fp8 copy made here.
+        # A DENSE BUFFER IS THE FORM THE PRODUCER IS KNOWN TO WORK ON. Every landed
+        # call of it hands a freshly built contiguous tensor. The copy is bounded by
+        # what the producer does next anyway: it upcasts its weight to fp32
+        # internally, four times the size of the fp8 copy made here.
+        #
+        # EVERYTHING BELOW COMPUTES ON HOST COPIES AND WRITES TO THE DEVICE ONCE, and
+        # the hop happens here, before the first materialisation. These six operands
+        # are device-resident -- the caller's pre-flight says so one line before the
+        # call -- and the Neuron backend has no strided copy: a transpose, a permute or
+        # a slice made dense on the device raises ``Expected self.is_contiguous() to be
+        # true, but got false``, which the runner already writes down at
+        # ``vllm/worker/neuron_model_runner.py:4136``. That covers this method's own
+        # transposes AND every producer it calls: ``retile_block_scales`` walks the bank
+        # tile by tile, and the two kernel-operand builders each broadcast a flat grid
+        # across the partition axis with ``expand(...).contiguous()``. On host copies
+        # all of that is ordinary torch, and one move at the end puts the finished
+        # operands where the forward wants them -- cheaper than the round trip per
+        # relayout it replaces, and it leaves no producer holding a device tensor.
+        device = gate_proj_weight.device
+        (
+            gate_proj_weight,
+            up_proj_weight,
+            down_proj_weight,
+            gate_proj_scale,
+            up_proj_scale,
+            down_proj_scale,
+        ) = _on_the_host(
+            gate_proj_weight,
+            up_proj_weight,
+            down_proj_weight,
+            gate_proj_scale,
+            up_proj_scale,
+            down_proj_scale,
+        )
         gate = retile_block_scales(
             gate_proj_weight.transpose(1, 2).contiguous(),
             gate_proj_scale.transpose(1, 2).contiguous(),
@@ -2432,6 +2528,20 @@ class Glm5NextRoutedExperts(nn.Module):
             ]
         )
 
+        # ---- THE ONE WRITE TO THE DEVICE. Four operands, four moves, after every
+        # relayout and every producer has run on the host.
+        (
+            gate_up_kernel_weight,
+            gate_up_scale_operands,
+            down_kernel_weight,
+            down_scale_operands,
+        ) = _on_the_device(
+            device,
+            gate_up_kernel_weight,
+            gate_up_scale_operands,
+            down_kernel_weight,
+            down_scale_operands,
+        )
         prepared = {
             "gate_up_proj_weight": gate_up_kernel_weight,
             "gate_up_scale_operands": gate_up_scale_operands,
@@ -2865,7 +2975,19 @@ class Glm5NextSharedExperts(nn.Module):
                     f"extents, got shape {tuple(weight.shape)}"
                 )
             rows, cols = int(weight.shape[0]), int(weight.shape[1])
-            prepared[name] = to_kernel_scale_layout(scale, rows, cols)
+            # THE PRODUCER RUNS ON A HOST COPY AND ITS RESULT MOVES BACK ONCE, the
+            # same rule the routed bank's prep follows. ``to_kernel_scale_layout``
+            # broadcasts the flat grid across the partition axis with
+            # ``expand(...).contiguous()``, and the Neuron backend has no strided
+            # copy to make that dense with, so on a device-resident grid it raises
+            # ``Expected self.is_contiguous() to be true, but got false``. Nothing
+            # about the operand changes: the grid check it performs is on shapes,
+            # which the copy preserves.
+            (host_scale,) = _on_the_host(scale)
+            (operand,) = _on_the_device(
+                scale.device, to_kernel_scale_layout(host_scale, rows, cols)
+            )
+            prepared[name] = operand
         setattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, prepared)
         return len(prepared)
 
@@ -4658,8 +4780,14 @@ class Glm5NextDSAIndexer(nn.Module):
                     f"{(odim, idim)}"
                 )
             # ``.t()`` alone is a view and the kernel loads from memory, so the
-            # copy is forced here -- once -- rather than left for the seam.
-            prepared[name] = weight.to(torch.float32).t().contiguous()
+            # copy is forced here -- once -- rather than left for the seam. It is
+            # forced on a HOST copy, because this operand is device-resident by the
+            # caller's pre-flight and a Neuron tensor refuses ``.contiguous()`` on a
+            # transposed view. THE UPCAST RIDES ALONG ON THE HOST, so no fp32 copy of
+            # the weight -- four times the fp8 size -- is ever built on the device.
+            prepared[name] = _relaid_out_on_the_host(
+                weight, lambda host: host.to(torch.float32).t()
+            )
         setattr(self, self.PREPARED_WEIGHTS_ATTR, prepared)
         return len(prepared)
 
@@ -6375,10 +6503,28 @@ class Glm5NextMLAAttention(nn.Module):
             #    only THEN is the weight transposed by the line below -- so
             #    ``inc-glm53f-039b``'s one-time transpose keeps both its position
             #    and its ground.
+            # THE HOP TO THE HOST COMES FIRST, BEFORE THE DEQUANT AND NOT AFTER IT.
+            # The dequant is not a cheap read: it upcasts the weight to fp32 and
+            # multiplies it by a scale grid broadcast to the weight's own shape, and
+            # that broadcast is `repeat_interleave` twice
+            # (``weight_loaders_fp8.py:1076-1078``), which torch implements as an
+            # expand followed by a contiguous copy. So a device-resident weight put
+            # through it builds an fp32 copy AND materialises a zero-stride view
+            # there -- the second one being the refusal this whole change exists to
+            # remove. Four of the five MLA projections arrive as fp8 bytes in the
+            # published checkpoint, so this is the ordinary path and not an edge.
+            #
+            # Everything below therefore runs on host memory: the dequant, the
+            # upcast, and the transpose whose copy `.contiguous()` forces because
+            # ``.t()`` alone is a view and the kernel loads from memory. One move
+            # puts the finished operand back.
+            device = weight.device
+            (weight,) = _on_the_host(weight)
             weight = self._dequantised_projection_weight(name, weight)
-            # ``.t()`` alone is a view, and the kernel loads from memory, so the
-            # copy is forced here -- once -- rather than left for the seam.
-            prepared[name] = weight.to(torch.float32).t().contiguous()
+            (operand,) = _on_the_device(
+                device, weight.to(torch.float32).t().contiguous()
+            )
+            prepared[name] = operand
         setattr(self, self.PREPARED_WEIGHTS_ATTR, prepared)
         return len(prepared)
 
@@ -6415,6 +6561,12 @@ class Glm5NextMLAAttention(nn.Module):
         method chooses no arithmetic of its own. It returns fp32, so the
         caller's following ``.to(torch.float32)`` is already satisfied and
         stays a no-op rather than a second conversion.
+
+        BOTH OPERANDS ARE ON THE HOST WHEN THE DEQUANT RUNS. The caller hands a
+        host copy of the weight and this method takes one of the scale grid,
+        because the dequant broadcasts that grid with ``repeat_interleave`` and
+        the copy behind it is refused on a Neuron tensor. The scale is read off
+        the module, so nothing but this line can put it on the host.
         """
         if not _is_fp8_dtype(weight.dtype):
             return weight
@@ -6427,6 +6579,7 @@ class Glm5NextMLAAttention(nn.Module):
                 f"dequantised; load the checkpoint's {FP8_SCALE_SUFFIX} "
                 f"companion for {name} before preparing the projection weights"
             )
+        (scale,) = _on_the_host(scale)
         return dequantise_blockwise(weight, scale)
 
     def _prepared_weight(self, name: str) -> torch.Tensor:
@@ -6555,13 +6708,24 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{closed_form}, so the absorb split would silently mix heads"
             )
         per_head = prepared.reshape(latent, heads, nope + vdim)
+        # BOTH HALVES RELAYOUT ON A HOST COPY. ``per_head`` is a dense view of a
+        # device-resident prepared weight, and each half is a strided slice before its
+        # permute even runs, so a Neuron tensor refuses the copy. The slice AND the
+        # permute go into the callback, where they run on the host copy. Two copies of
+        # ``per_head`` cross the boundary rather than one, which is a load-time cost on
+        # a tensor of latent by heads by head width, and it keeps every strided read
+        # inside the one helper the census reads.
         operands = {
             # [latent, heads, nope] -> [heads, nope, latent]: the key half,
             # transposed, because absorb-in contracts the HEAD width.
-            "W_UK": per_head[:, :, :nope].permute(1, 2, 0).contiguous(),
+            "W_UK": _relaid_out_on_the_host(
+                per_head, lambda host: host[:, :, :nope].permute(1, 2, 0)
+            ),
             # [latent, heads, v] -> [heads, latent, v]: the value half as it
             # already stands, because absorb-out contracts the LATENT.
-            "W_UV": per_head[:, :, nope:].permute(1, 0, 2).contiguous(),
+            "W_UV": _relaid_out_on_the_host(
+                per_head, lambda host: host[:, :, nope:].permute(1, 0, 2)
+            ),
         }
         for name, exp_heads, contraction, out_features in self.absorb_widths():
             got = tuple(operands[name].shape)
@@ -7925,11 +8089,13 @@ def _publish_compute_frame_operands(
             )
             published += 1
 
-        # ---- STEP 2, unconditional. ``.contiguous()`` and not a bare view: the
-        # seam hands its weight to a kernel that reads it as a dense buffer, and a
-        # transposed view's strides are not that buffer.
-        weight.data = weight.data.t().contiguous()
-        transposed_grid = getattr(module, grid_name).t().contiguous()
+        # ---- STEP 2, unconditional. A DENSE BUFFER and not a bare view: the seam
+        # hands its weight to a kernel that reads it as a dense buffer, and a
+        # transposed view's strides are not that buffer. Where the copy is taken is
+        # the helper's subject; both operands are on the device by this line, which
+        # is what the caller's pre-flight established.
+        weight.data = _transposed_on_the_host(weight.data, 0, 1)
+        transposed_grid = _transposed_on_the_host(getattr(module, grid_name), 0, 1)
         setattr(module, grid_name, transposed_grid)
         record["transposed"] = True
         record["compute_frame"] = tuple(weight.data.shape)
