@@ -2129,6 +2129,38 @@ def _weight_slice_only(
     return SafetensorsWeightLoader(transform=transform)
 
 
+#: The one parameter this package stores in the TRANSPOSE of its checkpoint
+#: orientation. Matched on the leaf: the prefix carries a layer number.
+TRANSPOSED_AT_LOAD_LEAF = "experts.router_weight"
+
+
+def transposed_weight_loader() -> SafetensorsWeightLoader:
+    """Load one plain weight key with its two dimensions swapped.
+
+    The checkpoint stores a projection as ``[out_features, in_features]`` and
+    this package keeps that orientation, on the reading :func:`_sharding_loader`
+    records: the parameter layout IS the checkpoint layout, and every consumer
+    transposes at compute time. The router's consumer cannot -- it is not a
+    matmul this file writes. ``noaux_tc_rmsnorm_router_topk``
+    hands the tensor to an NKI kernel whose HBM operand layout is ``[H, E]``
+    (``functional/moe/rmsnorm_router_topk_tkg.py:363``) and validates it
+    unconditionally before either route (``:148``), so the orientation is that
+    kernel's contract rather than a matmul convention it could absorb.
+
+    Swapping once here rather than at the call site keeps the parameter in the
+    orientation the seam consumes, which is the orientation every landed fixture
+    already builds (``tiny/test_tiny_glm5next_forward.py:2371-2373``), and puts
+    no transpose in the traced graph. ``SafetensorsWeightLoader.load`` makes the
+    result contiguous (``utils/weight_loader.py:77``), so the view does not
+    reach the parameter.
+    """
+
+    def transform(slices, rank):
+        return slices[0][:].t()
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def _grid_spans_more_blocks_whole_than_per_rank(
     geometry: ShardGeometry,
     block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
@@ -2264,7 +2296,16 @@ def loader_for_mapped_keys(
     before ``-094`` byte for byte, which is what keeps every replicated family --
     the majority of them -- on exactly the path ``-091`` measured.
 
-    Four cases, one per
+    ONE LEAF IS ANSWERED BY NAME AND BEFORE THE KINDS, and it is the only one:
+    :data:`TRANSPOSED_AT_LOAD_LEAF`, whose consumer's operand layout is the
+    transpose of the checkpoint's. It is answered first so the answer is total --
+    every combination this loader cannot serve honestly is refused here rather
+    than reaching a kind that would load the tensor in the wrong orientation
+    without saying so. The refusal is unreachable on today's map, on the
+    precedent the unquantised-bank refusal below records: no such entry exists
+    yet, and a named refusal costs one branch.
+
+    Then four cases, one per
     :func:`classify_mapped_keys` kind, and one REFUSAL that cuts across the
     last of them:
 
@@ -2344,6 +2385,18 @@ def loader_for_mapped_keys(
     """
     keys = _as_key_list(checkpoint_keys)
     kind = classify_mapped_keys(keys)
+    if (param_name or "").endswith(TRANSPOSED_AT_LOAD_LEAF):
+        if kind != MAPPED_KEY_PLAIN or len(keys) != 1 or geometry is not None:
+            raise Glm5NextWeightMapError(
+                f"{param_name} is transposed at load, which is defined for one "
+                f"replicated plain key, but it arrived as {kind} over "
+                f"{len(keys)} keys with geometry={geometry!r}. A quantised or "
+                f"sharded entry would need the transpose composed with the "
+                f"other transform, and its dim would name the other axis, so "
+                f"this is refused by name rather than loaded in the "
+                f"checkpoint's orientation in silence."
+            )
+        return transposed_weight_loader()
     if kind == MAPPED_KEY_SCALE_GRID:
         # A GEOMETRY REACHES THIS BRANCH FROM ``inc-glm53f-100`` ON, and that is
         # ``inc-glm53f-105``'s change here. The reading this replaces was true when
