@@ -2773,6 +2773,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # _pool() (called from sample_tokens) needs them to build the pooling
         # cursor's gather indices over the flattened [T, H] buffer.
         self._pooling_num_scheduled_tokens_per_seq = actual_num_tokens
+        # The GLM-5.3-Flash geometry converter reads its block run and its cursor
+        # from these lengths. The tensors it is handed carry the padded bucket, so
+        # the real lengths cannot be recovered below and travel as their own array.
+        self._glm5next_request_tokens = self._glm5next_request_token_counts(
+            req_ids, scheduler_output.num_scheduled_tokens
+        )
 
         logger.debug(
             "Token counts: scheduled=%s, actual=%s",
@@ -4795,7 +4801,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @classmethod
     def _glm5next_pool_slot_mapping(
-        cls, *, tokens: int, start_position: int, index_kpool: int, device
+        cls,
+        *,
+        tokens: int,
+        start_position: int,
+        index_kpool: int,
+        device,
+        real_tokens: int | None = None,
     ) -> torch.Tensor:
         """``[tokens]`` int32: the POOL id where a pool completes, ``-1`` elsewhere.
 
@@ -4814,6 +4826,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ``test_tiny_glm5next_e2e.py`` asserts this function equals it, so the two
         derivations cannot drift apart unnoticed.
 
+        ``real_tokens`` IS THE CHUNK'S OWN LENGTH INSIDE A PADDED WIDTH, and no pool
+        completes past it. A padded row carries no token of the sequence, so a pool
+        that counted one would pool a padding member and the sequence's next
+        completion would read it. ``None`` says every row of the chunk is real,
+        which is what a caller with nothing to pad hands.
+
         IT IS BUILT ON THE HOST IN int32 AND MOVED ONCE. The eager Neuron backend
         refuses a dtype-converting copy of a tensor that already lives on the device,
         so nothing here may construct on ``device`` and cast afterwards. The host half
@@ -4823,22 +4841,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             tokens=int(tokens),
             start_position=int(start_position),
             index_kpool=int(index_kpool),
+            real_tokens=real_tokens,
         ).to(device)
 
     @staticmethod
     def _glm5next_pool_slot_mapping_host(
-        *, tokens: int, start_position: int, index_kpool: int
+        *,
+        tokens: int,
+        start_position: int,
+        index_kpool: int,
+        real_tokens: int | None = None,
     ) -> torch.Tensor:
         """``[tokens]`` int32 ON THE HOST: the pool id where a pool completes.
 
-        The rule and the arithmetic are the public form's; only the move is missing,
-        which is what lets a batch concatenate several of these and move once.
+        The rule and the arithmetic are the public form's, including the real length no
+        pool may complete past; only the move is missing, which is what lets a batch
+        concatenate several of these and move once.
         """
         pool = int(index_kpool)
         if pool <= 0:
             raise ValueError(f"index_kpool must be positive; got {index_kpool!r}")
-        positions = torch.arange(int(tokens), dtype=torch.int32) + int(start_position)
-        completes = ((positions + 1) % pool) == 0
+        real = int(tokens) if real_tokens is None else int(real_tokens)
+        rows = torch.arange(int(tokens), dtype=torch.int32)
+        positions = rows + int(start_position)
+        completes = (((positions + 1) % pool) == 0) & (rows < real)
         return torch.where(
             completes, positions // pool, torch.full_like(positions, -1)
         )
@@ -5002,6 +5028,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"runner's own host arrays and never from a device or meta tensor"
             )
         return value.tolist() if hasattr(value, "tolist") else list(value)
+
     @staticmethod
     def _glm5next_start_positions(positions, device) -> torch.Tensor:
         """``[requests]`` int32: every request's own position, one row each.
@@ -5019,6 +5046,61 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return torch.tensor(
             [int(position) for position in positions], dtype=torch.int32
         ).to(device)
+
+    @staticmethod
+    def _glm5next_request_token_counts(
+        req_ids, num_scheduled_tokens: dict
+    ) -> np.ndarray:
+        """Per request, in batch order: one host int32 entry, its real length."""
+        return np.array(
+            [int(num_scheduled_tokens[req_id]) for req_id in req_ids], dtype=np.int32
+        )
+
+    def _glm5next_take_request_tokens(self) -> tuple[int, ...]:
+        """Each request's real token count for this step, from the builder's own array.
+
+        THE ARRAY IS ONE STEP'S, so it is taken and not merely read: a warmup or a
+        capture step is built without one, and the width of the tensor such a step
+        carries IS its real length. Leaving a used array in place would hand the
+        next unprepared step the previous request's length, so an unprepared step
+        gets an empty tuple and the caller divides the width it was handed.
+
+        RE-PINNED, WITH THE READING THIS REPLACES RECORDED VERBATIM: "this half
+        threads ONE request per step until the request-keyed slot table lands, and
+        the input builder left N request length(s); the geometry below reads one
+        sequence's own length." That table is what this candidate lands, so the
+        lengths now travel one per request, in the order the builder wrote them.
+        """
+        counts = getattr(self, "_glm5next_request_tokens", None)
+        self._glm5next_request_tokens = None
+        if counts is None:
+            return ()
+        return tuple(int(value) for value in counts)
+
+    @staticmethod
+    def _glm5next_resolve_request_tokens(
+        real_counts, requests: int, tokens: int, *, name: str = "this step"
+    ) -> list[int]:
+        """Each request's real token count, in the batch's order.
+
+        The builder's array is taken when it describes this batch. An UNPREPARED step
+        -- a warmup or a capture -- left no array and carries no padding either, so
+        its rows divide evenly among the requests it serves. Anything else is a
+        disagreement between the builder and the block tables, and it refuses by
+        name: a length matched to the wrong request would page another sequence's
+        blocks and stand its cursor at a position it never reached.
+        """
+        if requests <= 0:
+            raise ValueError(f"{name} serves no request; there is nothing to size")
+        if not real_counts:
+            return [max(1, int(tokens) // requests)] * requests
+        if len(real_counts) != requests:
+            raise ValueError(
+                f"{name} carries {requests} block-table row(s) and the input builder "
+                f"left {len(real_counts)} real length(s); both are the batch's own "
+                f"rows, so there is one of each per request"
+            )
+        return [int(value) for value in real_counts]
 
     @staticmethod
     def _glm5next_side_caches(
@@ -5373,6 +5455,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         index_kpool: int,
         requests: int = 1,
         request_starts=None,
+        real_tokens: int | None = None,
     ) -> list[dict]:
         """One mapping per layer, in stack order, each holding THAT layer's own state.
 
@@ -5433,6 +5516,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``
         (``model_fp8.py:6972-6978``). It arrives as an argument so this function
         holds no copy of the constant.
+
+        ``tokens`` IS THE OPERAND WIDTH AND ``real_tokens`` IS THE CHUNK'S LENGTH.
+        A prefill arrives padded up to its bucket, so every operand built here keeps
+        the padded width -- that width is what a captured graph was compiled for --
+        while the SEQUENCE reaches only the real length. The slots the request holds,
+        the position the chunk ends at and the pools it completes are therefore read
+        from ``real_tokens``; ``None`` says the whole chunk is real, which is what a
+        warmup or capture caller hands.
         """
         if len(banks) != len(side_caches) or len(banks) != len(geometries):
             raise ValueError(
@@ -5455,6 +5546,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"step carries {int(tokens)} token(s) for {int(requests)} request(s). "
                 f"Threading a multi-token decode, which is speculative decoding's "
                 f"verify step, is not inc-glm53f-054b's work"
+            )
+        real = int(tokens) if real_tokens is None else int(real_tokens)
+        if real <= 0 or real > int(tokens):
+            raise ValueError(
+                f"this step's operands are {int(tokens)} row(s) wide and its chunk was "
+                f"handed {real} real token(s); the real length is at least one token "
+                f"and never more than the width it was padded into"
             )
 
         # THE REQUESTS ARE A LIST OF (SLOT, POSITION) PAIRS, and the singular
@@ -5590,9 +5688,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # The converter derives one from the other, so a step it built satisfies this
             # by construction and the refusal speaks to a caller that does not.
             own_slots = len(ids) * block_size
-            if int(start_position) < 0 or int(start_position) + int(tokens) > own_slots:
+            if int(start_position) < 0 or int(start_position) + real > own_slots:
                 raise ValueError(
-                    f"KV layer '{bank['name']}' was handed {int(tokens)} token(s) at "
+                    f"KV layer '{bank['name']}' was handed {real} real token(s) at "
                     f"position {int(start_position)} against {len(ids)} block(s) of "
                     f"{block_size} slot(s), which is {own_slots} slot(s) of this "
                     f"request's own pages; the window this layer reads is longer than "
@@ -5666,6 +5764,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     [(tokens, start_position)],
                     index_kpool=index_kpool,
                     device=device,
+                    real_tokens=real,
                 )
                 # THE RING IS ON BOTH LEGS NOW, under its own keyword. The prefill
                 # leg seeds this chunk's remainder into it (`model_fp8.py`'s
@@ -5682,9 +5781,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # refuses an end position shorter than the chunk, and that refusal
                 # cannot run on a tensor -- it is made above instead, where the
                 # position is still a number and a negative one is rejected.
+                # AND THE END IS THE CHUNK'S REAL END, not the width it was padded
+                # into: the ring slots past it hold no token of this sequence, and a
+                # remainder seeded into them would be pooled by the next completion.
                 carrier["prefill_tail"] = side["tail"][state_slot]
                 carrier["prefill_end_position"] = cls._glm5next_start_position(
-                    int(start_position) + int(tokens), device
+                    int(start_position) + real, device
                 )
             else:
                 # AND SO DOES THE DECODE POSITION, for the same reason: it chooses
@@ -5754,9 +5856,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         together or not at all.
 
         THE BLOCK RUN IS DERIVED FROM THE SEQUENCE, not from the row's length: the
-        request holds ``start_position + tokens`` slots, so it occupies that many
-        slots rounded up to whole blocks IN THAT GROUP'S PAGE, and the trailing
+        request holds ``start_position + real_tokens`` slots, so it occupies that
+        many slots rounded up to whole blocks IN THAT GROUP'S PAGE, and the trailing
         entries of a padded block-table row are not read.
+
+        AND THE SEQUENCE'S LENGTH IS THE REQUEST'S, NOT THE TENSOR'S. The input
+        builder pads a prefill up to its bucket (``:3402-3428``) AFTER the scheduler
+        has allocated blocks for the real count (``scheduler.py:794-803``), so a run
+        taken from the padded width would name row entries this request was never
+        given. The slots it holds, the position it ends at and the pools it completes
+        are therefore read from the real length the builder leaves beside the
+        tensors, while every traced operand keeps the padded width, which is the
+        width the captured graph was compiled for.
         """
         banks = getattr(self.model, "glm5next_layer_banks", None)
         if not banks:
@@ -5779,6 +5890,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         input_ids = kwargs["input_ids"]
         tokens = int(input_ids.shape[0])
+        # THE OPERAND WIDTH AND THE SEQUENCE'S END ARE TWO NUMBERS HERE. Every
+        # tensor below is as wide as the bucket this step was padded to, and that
+        # width is what a captured graph carries; the pages each request holds and
+        # the position it reaches are its REAL length, one per request in the
+        # batch's own order.
+        real_counts = self._glm5next_take_request_tokens()
         geometries: list[dict] = []
         legs: set[bool] = set()
         # THE CACHED LENGTHS TRAVEL AS A TUPLE PER GROUP, one entry per request in the
@@ -5820,14 +5937,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # linear family serves a batch, and a walk that turned every two-request
             # step away before either family was reached could not deliver one.
             #
-            # EACH REQUEST ADVANCES BY ITS OWN TOKENS. A decode step carries one token
-            # per request, so the batch's token total over its request count IS that
-            # number, and at one request it is the whole step -- which is what the
-            # sparse family and the pinned one-sequence shape read. A multi-request
-            # PREFILL is refused by name in the layer, so no chunk's tokens are divided.
+            # EACH REQUEST ADVANCES BY ITS OWN REAL TOKENS, which the input builder
+            # wrote down one per request: a step arrives padded up to its bucket, so
+            # dividing the padded width would hand every request the padding as well
+            # and page blocks the scheduler never allocated. The width is still what
+            # every operand carries; only the pages and the positions read the array.
             request_rows = [[int(value) for value in row] for row in rows]
             request_starts = [int(value) for value in positions]
-            per_request_tokens = max(1, int(tokens) // len(request_rows))
+            request_tokens = self._glm5next_resolve_request_tokens(
+                real_counts, len(request_rows), tokens, name=f"KV layer '{name}'"
+            )
             for index, row in enumerate(request_rows):
                 if not row:
                     raise ValueError(
@@ -5837,8 +5956,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"state in, and an empty row names neither"
                     )
             blocks_used = [
-                -(-(start + per_request_tokens) // block_size)
-                for start in request_starts
+                -(-(start + count) // block_size)
+                for start, count in zip(request_starts, request_tokens)
             ]
             # A PAGED ROW ADDRESSES PAGES; A RECURRENT ROW NAMES ONE SLOT. The difference is
             # not the table: a recurrent group's spec carries the ATTENTION block size
@@ -5856,7 +5975,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     if blocks_used[index] > len(row):
                         raise ValueError(
                             f"KV layer '{name}' holds "
-                            f"{request_starts[index] + per_request_tokens} slot(s) of "
+                            f"{request_starts[index] + request_tokens[index]} slot(s) of "
                             f"request {index}'s sequence, which occupy "
                             f"{blocks_used[index]} page(s), and that request's "
                             f"block-table row is {len(row)} entry(ies) wide; a row that "
@@ -5957,6 +6076,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # NAME in the carrier builder, so the scalar can never reach an answer for a
         # request it does not describe.
         start_position = request_starts[0]
+        # AND SO IS THE REAL LENGTH THE SPARSE FAMILY PAGES AND POOLS BY. The counts are
+        # derived once more here, from the agreed cached lengths rather than from
+        # whichever group the walk above ended on, so the number the carriers and the
+        # cursor read cannot depend on the order the banks were visited in. The
+        # derivation is a pure function of the builder's array and the batch's width, so
+        # this second reading agrees with every group's by construction.
+        request_tokens = self._glm5next_resolve_request_tokens(
+            real_counts, len(request_starts), tokens
+        )
         text_config = self.model.text_config
         side_caches = self._glm5next_live_side_caches(banks)
         # A SYNTHETIC DECODE IS NOT A SEQUENCE STEP, AND WARMUP IS PART OF SERVING.
@@ -6086,6 +6214,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index_kpool=int(text_config.index_kpool),
             requests=len(state_slots),
             request_starts=request_starts,
+            # THE FIRST REQUEST'S REAL LENGTH, which is the sparse family's: that family
+            # serves one sequence per forward and refuses a second by name, and its ring
+            # and its pool mask must stop where the sequence stops rather than where the
+            # bucket does.
+            real_tokens=request_tokens[0],
         )
         # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
         # several shapes of its own -- a multi-token decode, a bank whose paging
@@ -6097,15 +6230,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # A SYNTHETIC STEP LEAVES NO CLAIM. It never read the cursor above and it does
         # not write one here, so a warmup between two real steps of one sequence is
         # invisible to that sequence.
-        # EACH REQUEST ADVANCES BY ITS OWN TOKENS, not by the batch's total, or a
-        # concurrent decode would record every sequence as if it had consumed the
-        # whole batch.
+        # EACH REQUEST ADVANCES BY ITS OWN REAL TOKENS, not by the batch's total and not
+        # by the bucket's width: the first would record every sequence as if it had
+        # consumed the whole batch, and the second would stand a padded request's cursor
+        # past the tokens it actually holds, so its next step would be refused for a
+        # mismatch this one wrote.
         if not synthetic_step:
-            advance = max(1, tokens // len(request_starts))
-            for one_slot, one_start in zip(state_slots, request_starts):
+            for one_slot, one_start, one_count in zip(
+                state_slots, request_starts, request_tokens
+            ):
                 self._glm5next_side_cache_positions[int(one_slot)] = (
-                    int(one_start) + advance
+                    int(one_start) + one_count
                 )
+            # THE SPARSE FAMILY'S OWN CURSOR, WRITTEN FROM THE SAME NUMBER. That family
+            # serves one sequence per forward, so its cursor is the first request's
+            # position and nothing else; the per-slot record above is what this
+            # converter reads back. One assignment, from the value already computed, so
+            # the two cannot say different things about the same request.
+            self._glm5next_side_cache_cursor = (
+                int(request_starts[0]) + request_tokens[0]
+            )
         return {
             "input_ids": kwargs["input_ids"],
             "layer_carriers": carriers,

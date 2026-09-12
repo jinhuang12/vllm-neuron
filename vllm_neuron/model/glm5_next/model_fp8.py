@@ -5241,6 +5241,7 @@ class Glm5NextDSAIndexer(nn.Module):
         key: torch.Tensor,
         gate_score: torch.Tensor,
         end_position: torch.Tensor | int,
+        start_position: torch.Tensor | int | None = None,
     ) -> torch.Tensor | int:
         """Stash this chunk's REMAINDER in the decode ring. Returns the rows written.
 
@@ -5285,6 +5286,13 @@ class Glm5NextDSAIndexer(nn.Module):
         int here compiles this chunk's remainder length into the graph. The tensor
         route below writes the same slots without reading the value, and the int
         route stays as the eager reference the acceptance compares it against.
+
+        THE REMAINDER COMES FROM THE CHUNK'S REAL ROWS. A padded chunk's trailing
+        rows carry no token of the sequence, so ``start_position`` is taken here to
+        say where the chunk began: its real length is ``end_position -
+        start_position`` and the remainder is read from the LAST REAL rows of
+        ``key``. Without it the length falls back to the operand's width, which is
+        what an unpadded caller hands anyway.
         """
         pool = self.index_kpool
         want_tail = (2, pool, self.index_head_dim)
@@ -5305,16 +5313,26 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"against {tuple(key.shape)}"
             )
         tokens = int(key.shape[0])
-        if torch.is_tensor(end_position):
-            return self._seed_tail_at(tail, key, gate_score, end_position, tokens)
-        if int(end_position) < tokens:
+        # EITHER POSITION BEING A TENSOR TAKES THE TENSOR ROUTE. Both describe the
+        # same chunk, so a caller that has one as a value has both, and the int
+        # route below may then read neither as a number.
+        if torch.is_tensor(end_position) or torch.is_tensor(start_position):
+            return self._seed_tail_at(
+                tail, key, gate_score, end_position, tokens, start_position
+            )
+        real = (
+            tokens
+            if start_position is None
+            else int(end_position) - int(start_position)
+        )
+        if int(end_position) < real:
             raise Glm5NextDSAIndexerError(
                 f"end_position is the sequence length AFTER this chunk and "
-                f"{int(end_position)} is shorter than the chunk's own {tokens} "
+                f"{int(end_position)} is shorter than the chunk's own {real} "
                 f"token(s)"
             )
         rows = int(end_position) % pool
-        take = min(rows, tokens)
+        take = min(rows, real)
         if take <= 0:
             return 0
         # `take` and `rows` are python ints, so these are trace-time addresses --
@@ -5322,11 +5340,13 @@ class Glm5NextDSAIndexer(nn.Module):
         # Both sides stay rank 3. Slicing the half rather than indexing it keeps the
         # target's rank, so no source can reach it by broadcast: eager torch allows
         # that, and the graph compiler refuses it at the slice write-back.
+        # THE SLICE ENDS AT THE CHUNK'S REAL LAST ROW, which is its width when
+        # nothing was padded.
         tail[0:1, rows - take:rows, :] = (
-            key[tokens - take:].to(tail.dtype).reshape(1, take, -1)
+            key[real - take:real].to(tail.dtype).reshape(1, take, -1)
         )
         tail[1:2, rows - take:rows, :] = (
-            gate_score[tokens - take:].to(tail.dtype).reshape(1, take, -1)
+            gate_score[real - take:real].to(tail.dtype).reshape(1, take, -1)
         )
         return take
 
@@ -5337,14 +5357,20 @@ class Glm5NextDSAIndexer(nn.Module):
         gate_score: torch.Tensor,
         end_position: torch.Tensor,
         tokens: int,
+        start_position: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         """:meth:`seed_tail`'s write with the chunk's END as a TENSOR. The same slots.
 
         THE SAME THREE NUMBERS, NONE OF THEM READ. ``r = end_position % index_kpool``
         is the open pool's row count, the written slots are ``r - take`` through
-        ``r - 1`` for ``take = min(r, tokens)``, and slot ``s`` takes the key at row
-        ``tokens - r + s``. All three are arithmetic on a 0-d tensor here, so the
+        ``r - 1`` for ``take = min(r, real)``, and slot ``s`` takes the key at row
+        ``real - r + s``. All three are arithmetic on a 0-d tensor here, so the
         write's ADDRESSES are values rather than trace-time constants.
+
+        ``real`` IS THE CHUNK'S OWN LENGTH, ``end_position - start_position``, and it
+        is the operand's width only when nothing was padded. The remainder belongs to
+        the sequence's LAST REAL rows; taken from the width, a padded chunk would seed
+        the ring from padding rows and the next completion would pool them.
 
         WHY THE WHOLE RING IS COPIED TO WRITE PART OF IT. A slice needs its bounds as
         host ints and a boolean index produces a data-dependent shape, which is the
@@ -5365,8 +5391,19 @@ class Glm5NextDSAIndexer(nn.Module):
             pool,
         )
         slots = torch.arange(pool, device=device)
-        write = ((slots >= (rows - tokens).clamp_min(0)) & (slots < rows))[:, None]
-        source = (slots - rows + tokens).clamp(0, tokens - 1)
+        real = torch.as_tensor(tokens, device=device, dtype=torch.int64).reshape(())
+        if start_position is not None:
+            began = torch.as_tensor(
+                start_position, device=device, dtype=torch.int64
+            ).reshape(())
+            real = (
+                torch.as_tensor(
+                    end_position, device=device, dtype=torch.int64
+                ).reshape(())
+                - began
+            )
+        write = ((slots >= (rows - real).clamp_min(0)) & (slots < rows))[:, None]
+        source = (slots - rows + real).clamp_min(0).minimum(real - 1)
         tail[0].copy_(
             torch.where(write, key.index_select(0, source).to(tail.dtype), tail[0])
         )
@@ -5953,6 +5990,7 @@ class Glm5NextDSAIndexer(nn.Module):
         position: torch.Tensor | int | None = None,
         prefill_tail: torch.Tensor | None = None,
         prefill_end_position: torch.Tensor | int | None = None,
+        prefill_start_position: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         """The whole indexer chain. Returns ``topk_indices`` and NOTHING ELSE.
 
@@ -5990,6 +6028,10 @@ class Glm5NextDSAIndexer(nn.Module):
                 same terms as ``position``. It is NOT ``max_seq_len``: that one is
                 the batch's longest sequence, equal to this sequence's end only
                 while the batch is one request.
+            prefill_start_position: where this chunk BEGAN, so the remainder is
+                read from the chunk's real rows and not from a padded operand's
+                trailing ones. Optional: without it the chunk's length is taken to
+                be the operand's width, which is what an unpadded caller hands.
 
         WHY ``max_seq_len`` IS A PYTHON INT AND NOT READ OFF ``seq_lens``. The
         obvious ``int(seq_lens.max())`` is a host read of tensor DATA inside a
@@ -6110,7 +6152,11 @@ class Glm5NextDSAIndexer(nn.Module):
                 # the complete pools above, and the open pool's rows exist only
                 # here. `inc-glm53f-054b` commit 6.
                 self.seed_tail(
-                    prefill_tail, key, gate_score, prefill_end_position
+                    prefill_tail,
+                    key,
+                    gate_score,
+                    prefill_end_position,
+                    prefill_start_position,
                 )
 
         if not selects:
@@ -7112,6 +7158,7 @@ class Glm5NextMLAAttention(nn.Module):
         topk_indices: torch.Tensor,
         softmax_scale: float,
         batch_size: int = 1,
+        prefill_end_position: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
@@ -7202,7 +7249,28 @@ class Glm5NextMLAAttention(nn.Module):
         # tensor instead, and it writes THROUGH the window view into the caller's
         # bank -- the same in-place contract the slice had. The row count is
         # ``tokens``, a shape, so the write's own shape is constant too.
-        rows = start + torch.arange(tokens, device=latent_cache.device)
+        offsets = torch.arange(tokens, device=latent_cache.device)
+        # A PADDED CHUNK CARRIES ROWS THAT ARE NOT THE SEQUENCE'S, and they must not
+        # reach slots the request does not hold: the chunk arrives padded up to its
+        # bucket while the pages it was allocated cover the REAL length. Clamping the
+        # offset at the last real row collapses those rows onto it, INDEX AND VALUE
+        # together -- the gather takes each row's own latent and the clamped rows take
+        # the last real one -- so every write lands inside the request's own pages and
+        # writes that slot's own latent. The repeated indices are therefore idempotent:
+        # no order of the writes can change the result. An unpadded chunk clamps
+        # nothing, so its write is unchanged.
+        #
+        # A CLAMP AND A GATHER RATHER THAN TWO ``where``s, deliberately: ``where``
+        # promotes when its arms differ and the eager Neuron backend refuses a
+        # dtype-converting copy of a tensor already on the device, so a selection
+        # that cannot promote at all is the one that stays safe as the arms change.
+        if prefill_end_position is not None:
+            end = torch.as_tensor(
+                prefill_end_position, device=latent_cache.device, dtype=torch.int64
+            ).reshape(())
+            offsets = torch.minimum(offsets, end - start - 1)
+            kv_latent = kv_latent.index_select(0, offsets)
+        rows = start + offsets
         latent_cache[:, 0, :].index_copy_(
             0, rows, kv_latent.to(latent_cache.dtype)
         )
@@ -7307,6 +7375,9 @@ class Glm5NextMLAAttention(nn.Module):
             position=position,
             prefill_tail=prefill_tail,
             prefill_end_position=prefill_end_position,
+            prefill_start_position=(
+                None if prefill_end_position is None else start_position
+            ),
         )
         return self.attend(
             normed_hidden_states,
@@ -7314,6 +7385,7 @@ class Glm5NextMLAAttention(nn.Module):
             start_position,
             topk_indices,
             float(softmax_scale),
+            prefill_end_position=prefill_end_position,
         )
 
 
