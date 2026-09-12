@@ -142,6 +142,14 @@ MINI_WEIGHT_SHAPE = (128, 128)
 MINI_SCALE_SHAPE = (1, 1)
 MINI_PLAIN_SHAPE = (4,)
 
+#: The leaves the published checkpoint stores in float32 while every other
+#: unquantised family arrives in the config dtype. Read off the real load's own
+#: report, which names the dtype its loader produced for both:
+#: ``increments/launch-124-r4-trn2-1-20260912T120310Z.out:5566``. Written here as a
+#: literal, so the writers below type these two the way the CHECKPOINT does and not
+#: the way the code under test expects them.
+FLOAT32_CHECKPOINT_LEAVES = ("A_log", "dt_bias")
+
 #: The one file each miniature checkpoint is written to. Named once so the writer
 #: and the shape reader below cannot disagree about where it is.
 MINI_CHECKPOINT_FILE = "model.safetensors"
@@ -314,6 +322,19 @@ def _mla_key_overrides(
     return overrides
 
 
+def _checkpoint_plain_dtype(name: str) -> torch.dtype:
+    """The dtype the checkpoint holds one UNQUANTISED tensor in.
+
+    Takes a checkpoint key or a bare leaf name, so the two writers below can ask
+    the same question of whichever of the two they hold.
+    """
+    return (
+        torch.float32
+        if name.rsplit(".", 1)[-1] in FLOAT32_CHECKPOINT_LEAVES
+        else torch.bfloat16
+    )
+
+
 def _write_miniature_checkpoint(
     directory: Path,
     mappings: dict[str, str | list[str]],
@@ -378,7 +399,9 @@ def _write_miniature_checkpoint(
                     MINI_WEIGHT_SHAPE, dtype=torch.bfloat16
                 ).to(torch.float8_e4m3fn)
             else:
-                tensors[key] = torch.ones(MINI_PLAIN_SHAPE, dtype=torch.bfloat16)
+                tensors[key] = torch.ones(
+                    MINI_PLAIN_SHAPE, dtype=_checkpoint_plain_dtype(key)
+                )
     directory.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(directory / MINI_CHECKPOINT_FILE))
     return len(tensors)
@@ -3202,8 +3225,18 @@ SHARD_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
     ("Glm5NextKDAAttention", "v_conv1d_weight"): (0, _KDA_FULL),
     ("Glm5NextKDAAttention", "o_proj_weight"): (1, _KDA_FULL),
     ("Glm5NextKDAAttention", "b_proj_weight"): (0, _KDA_HEADS),
+    # THE TWO STATE LEAVES DO NOT SHARE AN EXTENT, and the row below said they did.
+    # The decay is one number per head; the gate bias is one per key CHANNEL. The
+    # GPU reference declares exactly that pair of widths -- ``local_num_heads`` for
+    # ``A_log`` and ``local_projection_size`` for ``dt_bias`` --
+    # (``vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:190-193``,
+    # ``:237-239``, ``:265-267``), and its gate kernel indexes the bias by head AND
+    # channel where the per-head families index it by head alone
+    # (``vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py:87-93``).
+    # The model file's own table has read the head WIDTH here since the forward was
+    # measured against it; this declaration is the one that stayed behind.
     ("Glm5NextKDAAttention", "A_log"): (0, _KDA_HEADS),
-    ("Glm5NextKDAAttention", "dt_bias"): (0, _KDA_HEADS),
+    ("Glm5NextKDAAttention", "dt_bias"): (0, _KDA_FULL),
     ("Glm5NextDenseMLP", "gate_proj_weight"): (0, SHARD_INTERMEDIATE),
     ("Glm5NextDenseMLP", "up_proj_weight"): (0, SHARD_INTERMEDIATE),
     ("Glm5NextDenseMLP", "down_proj_weight"): (1, SHARD_INTERMEDIATE),
@@ -3229,7 +3262,8 @@ SHARD_OTHER_EXTENT: dict[tuple[str, str], int] = {
     ("Glm5NextMLAAttention", "o_proj_weight"): MINI_MLA_WIDTHS["hidden_size"],
 }
 
-#: The two KDA leaves that are one number per head rather than a matrix.
+#: The two KDA state leaves, which are 1-D rather than a matrix: one number per
+#: head for the decay, one per key channel for the gate bias.
 SHARD_ONE_DIMENSIONAL = ("A_log", "dt_bias")
 
 #: The dense MLP's three leaves, in the order conjunct (3) reports them.
@@ -3574,7 +3608,7 @@ def _shard_key_overrides(
                 )
             else:
                 overrides[weight_key] = _shard_pattern(
-                    shape, shard_dim, torch.bfloat16
+                    shape, shard_dim, _checkpoint_plain_dtype(leaf)
                 )
     return overrides
 
@@ -4739,7 +4773,9 @@ def _deferred_key_overrides(
             if not scales:
                 # The map answers "is this family quantised", not a name list here.
                 for key in weights:
-                    overrides[key] = _shard_pattern(shape, shard_dim, torch.bfloat16)
+                    overrides[key] = _shard_pattern(
+                        shape, shard_dim, _checkpoint_plain_dtype(leaf)
+                    )
                 continue
             grid_shape = block_grid_shape(shape, DEFAULT_WEIGHT_BLOCK_SIZE)
             for key in weights:
@@ -7970,3 +8006,114 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
         f"the ramp load published non-finite values in {nonfinite[:6]}, reached on a "
         f"path that no longer coarsens at all"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The two linear-attention state leaves, against the GPU reference.
+# --------------------------------------------------------------------------- #
+
+#: The registered tensor-parallel degree. ``test_kda_layer.py:102`` is this
+#: number's landed home in this tree; it is restated here rather than imported so
+#: this file still collects on its own. At this degree the head count divides to
+#: exactly one head per rank, so a per-head extent and a per-channel one differ by
+#: the whole head width and cannot be confused.
+KDA_STATE_READING_WORLD = 64
+
+
+def test_the_kda_state_leaves_take_the_reference_dtype_and_per_rank_extent(
+    single_rank_process_group,
+) -> None:
+    """The decay and the gate bias, read against the GPU reference at the degree.
+
+    THE REFERENCE IS THE KDA LAYER, not this package. It declares the gate bias at
+    ``local_projection_size`` and the decay at ``local_num_heads``, both float32,
+    and shards both on dim 0 --
+    ``vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:190-193``,
+    ``:237-241`` and ``:265-268``. Its gate kernel indexes the bias by head AND
+    channel where the per-head families index it by head alone
+    (``vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py:87-93``).
+    The two expected extents below are those two closed forms, computed from the
+    config this file already reads, and never asked of the table under test.
+
+    THE DTYPE HALF READS THE PLACEHOLDER, because the placeholder is what the
+    checkpoint reader casts to: a config-dtype placeholder narrows the checkpoint's
+    own float32 decay and bias to bfloat16 before the gate's exponential and
+    sigmoid see them. The control is an ordinary plain leaf on the same module,
+    which must still take the config dtype -- otherwise the two rows above would
+    also pass on a rule that typed everything float32.
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    text_config = real_config.text_config
+    linear = text_config.linear_attn_config
+    heads = int(linear["num_heads"])
+    head_dim = int(linear["head_dim"])
+    print(
+        f"KDASTATE_CONFIG|heads={heads}|head_dim={head_dim}"
+        f"|world={KDA_STATE_READING_WORLD}"
+    )
+    assert heads % KDA_STATE_READING_WORLD == 0, (
+        f"{heads} heads do not divide across {KDA_STATE_READING_WORLD} ranks, so "
+        f"neither reference extent is a whole number here"
+    )
+
+    module = _MODEL_FP8.Glm5NextKDAAttention(text_config, KDA_STATE_READING_WORLD)
+    expected = {
+        "A_log": heads // KDA_STATE_READING_WORLD,
+        "dt_bias": (heads * head_dim) // KDA_STATE_READING_WORLD,
+    }
+    for leaf, want_extent in sorted(expected.items()):
+        geometry = _MODEL_FP8._shard_geometry_for(
+            module, leaf, KDA_STATE_READING_WORLD
+        )
+        assert geometry is not None, (
+            f"{leaf} is replicated at world size {KDA_STATE_READING_WORLD}; the "
+            f"reference shards it on dim 0, so every rank above 0 would read "
+            f"another rank's numbers"
+        )
+        dim = int(getattr(geometry, "shard_dim", -1))
+        size = int(getattr(geometry, "shard_size", -1))
+        print(
+            f"KDASTATE_SHARD|{leaf}|dim={dim}|per_rank={size}"
+            f"|reassembled={size * KDA_STATE_READING_WORLD}"
+        )
+        assert (dim, size) == (0, want_extent), (
+            f"{leaf} lands (dim {dim}, {size}) per rank where the reference gives "
+            f"(dim 0, {want_extent}) at this degree"
+        )
+
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+    typed: dict[str, torch.dtype] = {}
+    for leaf in sorted(FLOAT32_CHECKPOINT_LEAVES):
+        name = next(
+            candidate
+            for candidate in sorted(mappings)
+            if candidate.rsplit(".", 1)[-1] == leaf
+        )
+        typed[leaf] = model._placeholder_dtype(
+            mappings[name], param_name=name, mappings=mappings
+        )
+        print(f"KDASTATE_PLACEHOLDER|{leaf}|{name}|{typed[leaf]}")
+    assert set(typed.values()) == {torch.float32}, (
+        f"the state leaves take {sorted(str(d) for d in typed.values())}; the "
+        f"reference keeps both float32 and the checkpoint holds both float32, so "
+        f"anything narrower is a cast on every rank"
+    )
+
+    control_name = next(
+        candidate
+        for candidate in sorted(mappings)
+        if candidate.endswith(".o_norm_weight")
+    )
+    control_dtype = model._placeholder_dtype(
+        mappings[control_name], param_name=control_name, mappings=mappings
+    )
+    print(f"KDASTATE_CONTROL|{control_name}|{control_dtype}")
+    assert control_dtype is text_config.torch_dtype, (
+        f"{control_name} takes {control_dtype} where the config declares "
+        f"{text_config.torch_dtype}, so the float32 rule above is not keyed on the "
+        f"state pair at all"
+    )
+    print(f"KDASTATE_IMPORT_ORIGIN|{_MODEL_FP8.__file__}")
