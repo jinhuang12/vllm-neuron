@@ -4,11 +4,12 @@ Increment ``inc-glm53f-092``, plan revision 94.
 
 THE QUESTION THIS FILE ANSWERS
 ------------------------------
-Seven seams under ``vllm_neuron/functional/`` expose an identity function that reports which
-NKI member the seam talks to. Five read a **module-level name** -- an import in
-``depthwise_conv1d``, a same-file ``@nki.jit def`` in four more. The two MoE matmul limbs
-read no such name: each takes the name from its own seam's source. No claim watches a
-dispatch.
+This file has SEVEN ENTRIES, and they are its own set rather than a census of the package,
+which carries more seams than these. Each entry is a seam under ``vllm_neuron/functional/``
+that exposes an identity function reporting which NKI member the seam talks to. Five of the
+seven read a **module-level name** -- an import in ``depthwise_conv1d``, a same-file
+``@nki.jit def`` in four more. The two MoE matmul limbs read no such name: each takes the
+name from its own seam's source. No claim watches a dispatch.
 
 So each test here takes an INDEPENDENT reading -- the first positional argument handed to
 ``nki.simulator.simulate_kernel``, which is the kernel the CPU dispatch actually ran -- and
@@ -42,9 +43,10 @@ THE THREE INSTRUMENTS, AND WHY THREE
 3. real ``nki.simulator.simulate_kernel`` invocations, counted and ATTRIBUTED to the seam
    under test.
 
-Instrument 3 counts the vendor entry point, so a bug in instrument 1 cannot fake it. This file
-uses instruments 2 and 3, because the question is which kernel ran and a reading taken with no
-dispatch at all would be the self-referential certificate the increment exists to close.
+Instrument 3 counts the simulator's own entry point, so a bug in instrument 1 cannot fake it.
+This file uses instruments 2 and 3, because the question is which kernel ran and a reading
+taken with no dispatch at all would be the self-referential certificate the increment exists
+to close.
 
 ATTRIBUTION IS BY (FILE, ENCLOSING FUNCTION), NOT BY FILE
 ---------------------------------------------------------
@@ -53,6 +55,13 @@ Two files here carry more than one seam. ``kda/chunked_recurrence.py`` carries
 limbs this file compares beside two more seams. A frame walk that matched the filename alone
 could not tell any of them apart, and would read a dispatch from one seam as belonging to
 another. Matching the enclosing function name too removes that.
+
+WHAT NO ITEM HERE EXERCISES, said plainly so the next reader does not trust a proof that is
+not present. Every measurement opens a recorder of its own and drives ONE seam inside it, so
+only that seam's events can be recorded and a filename-only walk would read the same value
+for all seven entries. The precision above is the walk's design, not a property any item of
+this file can fail on. An item that could fail on it would drive two seams of one file inside
+ONE recorder and require only the seam under test to be attributed.
 
 THE LAST ITEM CARRIES A CONTROL, AND WHY THE CONTROL PATCHES THE SEAM
 --------------------------------------------------------------------
@@ -98,7 +107,8 @@ _OWNER_TEST = {
     "moe_gate_up": "test.vllm_neuron.functional.moe.test_moe_blockwise_fp8",
     "moe_down": "test.vllm_neuron.functional.moe.test_moe_blockwise_fp8",
 }
-#: The seam whose dispatches are attributed to it. Four of these live in two files.
+#: The seam whose dispatches are attributed to it. THREE of these seven entries live in two
+#: files, and those two files carry six seams between them.
 _SEAM = {
     "blockwise_fp8_mm": "blockwise_fp8_mm",
     "chunked_recurrence": "kda_intra_chunk",
@@ -310,7 +320,7 @@ def test_blockwise_fp8_mm_first_hop_identity_matches_the_dispatch():
 
 
 def test_chunked_recurrence_first_hop_identity_matches_the_dispatch():
-    """``kda_intra_chunk``: the reading is attributed to this seam, not its file-mate."""
+    """``kda_intra_chunk``: the one seam of its file this entry drives, read at its own hop."""
     _assert_first_hop_agrees("chunked_recurrence")
 
 
@@ -332,12 +342,14 @@ def test_sinkhorn_first_hop_identity_matches_the_dispatch():
 def test_moe_gate_up_first_hop_identity_matches_the_dispatch():
     """``moe_gate_up_blockwise_fp8``: the routed gate/up limb, read through its own seam."""
     r = _assert_first_hop_agrees("moe_gate_up")
-    # ASSERTED, not merely recorded: the two limbs share a file, so the attribution walk must
-    # separate them. Equal dispatch readings would mean one limb's event was read as the
-    # other's, and both comparisons would then pass while measuring one seam twice.
+    # ASSERTED, not merely recorded: the two limbs of this file must read DIFFERENT kernels.
+    # Each measurement opens its own recorder around one limb, so this cannot be a claim about
+    # the walk mixing two seams up -- no event of the other limb exists to be mixed in. What it
+    # catches is the two entries reading ONE kernel twice, which would leave the file with two
+    # ids and one comparison. The owner test pins the same distinctness from its own side.
     assert r["attributed"] != _measure("moe_down")["attributed"], (
-        f"the gate/up and down limbs read the same dispatch {r['attributed']}, so the "
-        f"attribution walk did not separate two seams that live in one file"
+        f"the gate/up and down limbs both dispatched {r['attributed']}, so these two entries "
+        f"are two readings of one kernel rather than two seams"
     )
 
 
