@@ -7697,15 +7697,17 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
 ) -> None:
     """``inc-glm53f-112``: on the DENSE path the ramp hazard is gone, and it is SHOWN.
 
-    WHAT THIS ITEM ADDS TO THE ITEM ABOVE. That one guards a REFUSAL: a grid the
-    ``256`` coarsening cannot reproduce must be refused rather than turned into NaN.
-    That refusal is the MoE producer's, inside the routed bank's own prep, and
-    ``inc-glm53f-112`` leaves it exactly where it was. The same hazard used to exist
-    on the DENSE path too, because the dense load path coarsened as well, and there it
-    is gone: the step publishes the checkpoint's own ``128`` grid and rescales no
-    weight byte. A removed hazard deserves a positive reading rather than silence, so
-    this item takes the very fixture the refusal item calls dangerous and reads the
-    dense side of it.
+    WHAT THIS ITEM ADDS TO THE ITEM ABOVE. That one reads a ramping grid for
+    FINITENESS: the load must complete and publish no ``NaN``. It once guarded a
+    refusal as well -- a grid the ``256`` coarsening could not reproduce had to be
+    refused rather than turned into NaN -- and that half is gone, because the routed
+    prep no longer coarsens either and a publish that rescales no byte cannot overflow.
+    The same hazard used to exist on the DENSE path, because the dense load path
+    coarsened as well, and there it is gone the same way: the step publishes the
+    checkpoint's own ``128`` grid and rescales no weight byte. A removed hazard
+    deserves a positive reading rather than silence, so this item takes the very
+    fixture that grid family made dangerous and reads the dense side of it EXACTLY,
+    which finiteness alone does not say.
 
     THE READING IS AGAINST THE CHECKPOINT'S OWN TENSORS, not against the module
     itself. ``_deferred_checkpoint`` returns the tensors it wrote, so the reference
