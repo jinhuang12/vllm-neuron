@@ -127,7 +127,7 @@ def real_bank_geometry() -> tuple[int, int, int]:
 def class_sizes() -> dict[str, int]:
     """How many blocks each ratio class holds, SOLVED from the measured counts.
 
-    Four classes carry all six measurements at once. The quad-power-of-two class
+    Four classes carry all eight measurements at once. The quad-power-of-two class
     keeps its top-left maximum, so it never refuses; the two-power-of-two class and
     one plain class refuse; the last plain class keeps. Every size below is arithmetic
     on the measured numbers, so a measurement corrected upstream moves the fixture
@@ -292,14 +292,12 @@ def _bank_weight(rows: int, cols: int) -> torch.Tensor:
     return torch.full((1, rows, cols), FP8_BOUND, dtype=torch.float32).to(FP8_DTYPE)
 
 
-def weight_window_maxima(weight: torch.Tensor, blocks: int) -> torch.Tensor:
-    """The ``128``-tile window maxima of one bank's weight, as ``(blocks, 2, 2)``.
+def weight_window_maxima(weight: torch.Tensor) -> torch.Tensor:
+    """The ``128``-tile window maxima MEASURED on one published weight, ``(n, 2, 2)``.
 
     The removed guard read ``|weights[window] * ratio|.max()``, so this reads the same
-    window maximum off the tensor the publisher is handed. One expert's maxima are
-    repeated across the population because one tensor is published for every expert of
-    every projection, and the items assert that those maxima are one value, which is
-    what licenses the repeat.
+    window maximum off the tensor the publisher is handed. One published weight carries
+    ``rows x cols / 128**2`` windows, and this is how many values are measured.
     """
     experts, rows, cols = weight.shape
     maxima = (
@@ -308,11 +306,21 @@ def weight_window_maxima(weight: torch.Tensor, blocks: int) -> torch.Tensor:
         .reshape(experts, rows // TILE_SIZE, TILE_SIZE, cols // TILE_SIZE, TILE_SIZE)
         .amax(dim=(2, 4))
     )
-    per_expert = _quads(maxima)
-    assert blocks % per_expert.shape[0] == 0, (
-        f"{blocks} blocks do not divide into {per_expert.shape[0]} per published weight"
+    return _quads(maxima)
+
+
+def aligned_to_population(per_weight: torch.Tensor, blocks: int) -> torch.Tensor:
+    """One published weight's maxima, aligned to every block of the bank.
+
+    THE COUNT MEASURED AND THE COUNT COVERED ARE DIFFERENT NUMBERS, and both are
+    published: the same tensor is handed to every expert of every projection, so its
+    maxima repeat across the population. The items assert that those maxima are one
+    value, which is what licenses the repeat.
+    """
+    assert blocks % per_weight.shape[0] == 0, (
+        f"{blocks} blocks do not divide into {per_weight.shape[0]} per published weight"
     )
-    return per_expert.repeat(blocks // per_expert.shape[0], 1, 1)
+    return per_weight.repeat(blocks // per_weight.shape[0], 1, 1)
 
 
 def publish_bank(grids: dict[str, torch.Tensor]) -> dict[str, int]:
@@ -361,7 +369,7 @@ def publish_bank(grids: dict[str, torch.Tensor]) -> dict[str, int]:
 
 
 def test_the_fixture_reproduces_the_measured_grid_of_the_real_expert_bank() -> None:
-    """The fixture's own census equals the real-weights read's six numbers.
+    """The fixture's own census equals the real-weights read's eight numbers.
 
     WITHOUT THIS ITEM the four below would measure a population nobody had connected
     to the checkpoint. The counts are measured with the publisher module's own
@@ -370,7 +378,8 @@ def test_the_fixture_reproduces_the_measured_grid_of_the_real_expert_bank() -> N
     """
     experts, rows, cols = real_bank_geometry()
     grids = build_real_grid()
-    window_max = weight_window_maxima(_bank_weight(rows, cols), MEASURED_BLOCKS)
+    measured = weight_window_maxima(_bank_weight(rows, cols))
+    window_max = aligned_to_population(measured, MEASURED_BLOCKS)
     census = _census(grids, window_max)
     emit(
         "GEOMETRY",
@@ -382,8 +391,9 @@ def test_the_fixture_reproduces_the_measured_grid_of_the_real_expert_bank() -> N
     # and published here rather than assumed from the bound.
     emit(
         "WEIGHT_WINDOW",
-        f"min={int(window_max.min())}|max={int(window_max.max())}"
-        f"|tiles={window_max.numel()}|bound={int(FP8_BOUND)}",
+        f"min={int(measured.min())}|max={int(measured.max())}"
+        f"|windows={measured.numel()}|tiles={window_max.numel()}"
+        f"|bound={int(FP8_BOUND)}",
     )
     for key in sorted(census):
         emit("CENSUS", f"{key}={census[key]}")
@@ -392,9 +402,9 @@ def test_the_fixture_reproduces_the_measured_grid_of_the_real_expert_bank() -> N
         f"the fp8 bound {FP8_BOUND!r} is not an integer, so the rows above cannot "
         f"carry it as one"
     )
-    assert int(window_max.min()) == int(window_max.max()) == int(FP8_BOUND), (
-        f"the weight's window maxima run {int(window_max.min())}..."
-        f"{int(window_max.max())} where every tile must reach {int(FP8_BOUND)}; the "
+    assert int(measured.min()) == int(measured.max()) == int(FP8_BOUND), (
+        f"the weight's window maxima run {int(measured.min())}..."
+        f"{int(measured.max())} where every tile must reach {int(FP8_BOUND)}; the "
         f"refusal count below is about a weight that cannot reach the fp8 bound"
     )
 
@@ -480,7 +490,10 @@ def test_the_publisher_refuses_nothing_on_the_grid_the_removed_guard_refused() -
     _, rows, cols = real_bank_geometry()
     grids = build_real_grid()
     census = _census(
-        grids, weight_window_maxima(_bank_weight(rows, cols), MEASURED_BLOCKS)
+        grids,
+        aligned_to_population(
+            weight_window_maxima(_bank_weight(rows, cols)), MEASURED_BLOCKS
+        ),
     )
     refused = publish_bank(grids)["refused"]
     emit(
@@ -522,7 +535,9 @@ def test_restoring_the_mapping_breaks_the_equality_and_refuses_on_the_measured_c
     quads = torch.cat([_quads(grid) for grid in grids.values()])
     retained = quads[:, 0, 0].unsqueeze(1).unsqueeze(2)
     ratios = quads / retained
-    window_max = weight_window_maxima(_bank_weight(rows, cols), quads.shape[0])
+    window_max = aligned_to_population(
+        weight_window_maxima(_bank_weight(rows, cols)), quads.shape[0]
+    )
 
     mapped_scales = retained.expand_as(quads)
     changed_scales = int((mapped_scales != quads).sum())
