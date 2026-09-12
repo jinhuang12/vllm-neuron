@@ -35,6 +35,7 @@ import inspect
 import numpy as np
 import pytest
 import torch
+import torch._dynamo
 
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
@@ -412,6 +413,46 @@ def _wide_arm(*, width: int, text_config, banks, side, ids):
     return carriers, padded_ids
 
 
+def _wide_written(root, *, width: int, ids, positions, call=None) -> list[torch.Tensor]:
+    """One run of ``width`` rows on fresh caches; the banks' first slot afterwards.
+
+    ``call`` is the entry point, so a compiled forward can be handed in where the eager
+    one is the default and the two arms share every other operand.
+    """
+    text_config = root.text_config
+    caches = e2e._runner_shaped_caches(root)
+    root.bind_kv_cache(caches)
+    banks = root.glm5next_layer_banks
+    side = NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=int(text_config.index_kpool),
+        index_head_dim=int(text_config.index_head_dim),
+        max_seq_len=WIDE_PADDED,
+    )
+    carriers, input_ids = _wide_arm(
+        width=width,
+        text_config=text_config,
+        banks=banks,
+        side=side,
+        ids=ids,
+    )
+    (call or root.forward)(
+        input_ids, layer_carriers=carriers, sampling_positions=positions
+    )
+    return [caches[bank["name"]][0].clone() for bank in banks]
+
+
+def _wide_ids():
+    """The one prompt both write items run, drawn from the sibling file's own seed."""
+    return torch.randint(
+        0,
+        item.STACK_VOCAB_SIZE,
+        (WIDE_REAL,),
+        generator=torch.Generator().manual_seed(item.SEED_STACK_IDS),
+        dtype=torch.int64,
+    )
+
+
 def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     """Two runs of one prompt -- padded and not -- must leave the request's pages equal.
 
@@ -432,38 +473,14 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     """
     e2e._require_cpu_mode()
     assert WIDE_PADDED > WIDE_REAL, "the padded arm must be wider than the prompt"
-    fixture = e2e._fixture()
-    root = fixture["root"]
-    text_config = root.text_config
-    ids = torch.randint(
-        0,
-        item.STACK_VOCAB_SIZE,
-        (WIDE_REAL,),
-        generator=torch.Generator().manual_seed(item.SEED_STACK_IDS),
-        dtype=torch.int64,
-    )
+    root = e2e._fixture()["root"]
+    ids = _wide_ids()
     positions = torch.tensor([WIDE_REAL - 1], dtype=torch.long)
 
-    written = {}
-    for label, width in (("padded", WIDE_PADDED), ("unpadded", WIDE_REAL)):
-        caches = e2e._runner_shaped_caches(root)
-        root.bind_kv_cache(caches)
-        banks = root.glm5next_layer_banks
-        side = NeuronModelRunner._glm5next_side_caches(
-            banks,
-            index_kpool=int(text_config.index_kpool),
-            index_head_dim=int(text_config.index_head_dim),
-            max_seq_len=WIDE_PADDED,
-        )
-        carriers, input_ids = _wide_arm(
-            width=width,
-            text_config=text_config,
-            banks=banks,
-            side=side,
-            ids=ids,
-        )
-        root.forward(input_ids, layer_carriers=carriers, sampling_positions=positions)
-        written[label] = [caches[bank["name"]][0].clone() for bank in banks]
+    written = {
+        label: _wide_written(root, width=width, ids=ids, positions=positions)
+        for label, width in (("padded", WIDE_PADDED), ("unpadded", WIDE_REAL))
+    }
 
     for index, (padded, unpadded) in enumerate(zip(written["padded"], written["unpadded"])):
         own = padded[:WIDE_REAL_BLOCKS]
@@ -575,3 +592,60 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
         "the slots above the open pool belong to no position of this chunk and must "
         "keep what they held"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 8. the collapsed write TRACES: a compiler records the duplicate indices, and the
+# recorded graph stores what the eager run stored.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_padded_write_traces_and_stores_what_the_eager_run_stored():
+    """The collapsed write must survive being recorded, not only being executed.
+
+    WHY TRACING IS ITS OWN READING. The clamp makes several rows share one index and the
+    write goes in place through a view, so a compiler has to record a write whose indices
+    repeat. ``backend="eager"`` records the graph and then runs it eagerly, which asks the
+    tracing question on its own, without any backend's further limits.
+
+    WHAT IT GRADES. The recorded run's own pages equal the eager run's byte for byte, and
+    no block past the request's pages is written, so a trace that dropped a duplicate
+    write or reordered the writes into a different result cannot pass. The graph-break
+    count is PRINTED and not graded: a break elsewhere in this stack is not this reading.
+    """
+    e2e._require_cpu_mode()
+    root = e2e._fixture()["root"]
+    ids = _wide_ids()
+    positions = torch.tensor([WIDE_REAL - 1], dtype=torch.long)
+
+    eager = _wide_written(root, width=WIDE_PADDED, ids=ids, positions=positions)
+    torch._dynamo.reset()
+    counters = torch._dynamo.utils.counters
+    counters.clear()
+    traced = _wide_written(
+        root,
+        width=WIDE_PADDED,
+        ids=ids,
+        positions=positions,
+        call=torch.compile(root.forward, backend="eager", dynamic=False),
+    )
+    breaks = sum(counters["graph_break"].values())
+    print(f"INC133|traced|graph_breaks={breaks}|banks={len(traced)}")
+
+    for index, (one, two) in enumerate(zip(eager, traced)):
+        own = two[:WIDE_REAL_BLOCKS]
+        beyond = two[WIDE_REAL_BLOCKS:]
+        same = torch.equal(own, one[:WIDE_REAL_BLOCKS])
+        touched = int((beyond != 0).sum())
+        print(
+            f"INC133|traced_write|layer={index}|own_pages_equal={same}"
+            f"|nonzero_beyond={touched}"
+        )
+        assert same, (
+            f"layer {index}'s own pages differ between the recorded run and the eager "
+            f"one; the trace did not store what the writes store"
+        )
+        assert touched == 0, (
+            f"layer {index} wrote {touched} value(s) past the {WIDE_REAL_BLOCKS} page(s) "
+            f"the request holds while it was traced"
+        )
