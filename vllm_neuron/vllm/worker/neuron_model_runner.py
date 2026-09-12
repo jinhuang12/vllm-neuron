@@ -1930,6 +1930,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.num_prompt_logprobs.pop(req_id, None)
         # The per-request cache-state table frees on this set and on nothing else,
         # because an unscheduled live request also leaves the persistent batch below.
+        # The acceptance check binding this line: the_finished_set_is_recorded_where_the_engine_reports_it.
         self._glm5next_note_finished_requests(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and

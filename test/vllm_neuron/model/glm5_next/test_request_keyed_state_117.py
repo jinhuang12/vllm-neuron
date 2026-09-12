@@ -36,17 +36,20 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   (tripwire: the previous commit's walk refused a second row). The SPARSE arm: on a
   hybrid stack the same batch is refused by name at the sparse carrier, which takes
   one contiguous slice of the paged latent bank.
-* A2, SIX ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
+* A2, SEVEN ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
   over-admission refuses by name; a synthetic step takes no claim; the prefill
   WARMUP's own shape, which has no request at all, is served from slot 0 and takes
   no claim either; the per-sequence side caches carry ONE set per admitted sequence
-  and not one per bank slot; and a live request the scheduler skips for one step
-  keeps its slot and its state. Tripwires: a table that never frees cannot seat the
-  later request, one that frees without zeroing fails the zero read, a synthetic step
-  that seated itself changes the table, a converter that demands an identity
-  from warmup raises where the base served it, an allocator sized by the block space
-  reports the bank's slot count as its axis, and a table that frees on absence loses
-  the skipped request's slot and recurrence.
+  and not one per bank slot; a live request the scheduler skips for one step
+  keeps its slot and its state; and a stack whose recurrent banks hold FEWER slots
+  than the engine admits sequences refuses by name. Tripwires: a table that never
+  frees cannot seat the later request, one that frees without zeroing fails the zero
+  read, a synthetic step that seated itself changes the table, a converter that
+  demands an identity from warmup raises where the base served it, an allocator sized
+  by the block space reports the bank's slot count as its axis, a table that frees on
+  absence loses the skipped request's slot and recurrence, and a capacity read that
+  checks only that the bound is positive returns a slot number the banks cannot
+  address.
 * A3 -- one request's pooled store and tail ring are byte-unchanged by a step of
   the other request, on both legs. Tripwire: the process-wide allocation, which
   made the two carriers one storage.
@@ -948,6 +951,33 @@ def test_a2_more_live_requests_than_slots_refuses_by_name() -> None:
           f"|bank_slots={DECLARED_STATE_SLOTS}")
     with pytest.raises(ValueError, match="has no free slot"):
         runner._glm5next_request_slots(banks, too_many, synthetic=False)
+
+
+def test_a2_banks_holding_fewer_slots_than_the_bound_refuse_by_name() -> None:
+    """Banks holding fewer slots than the engine admits sequences refuse by name.
+
+    ONE slot number addresses the recurrent banks and the indexer's per-sequence
+    caches together, so a stack whose banks hold fewer slots than the engine's
+    concurrent-sequence bound has no slot at all for the last sequence. Without this
+    refusal the capacity read returns the bound, the table hands out a slot number the
+    banks cannot address, and the last sequence overwrites another sequence's state
+    mid-serve. The case is reached by raising the runner's own bound past the banks'
+    slot count, because the banks' geometry is what a real stack ships.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    banked = runner._glm5next_state_slot_count(banks)
+    if banked <= 0:
+        raise VacuousControlError(
+            "this item raises the bound past the banks' own slot count, and the "
+            "harness's banks report no recurrent state slot at all"
+        )
+    runner.max_num_reqs = banked + 1
+
+    print(f"KEYED|a2|banked={banked}|bound={runner.max_num_reqs}")
+    with pytest.raises(ValueError, match="no slot to hand the last sequence"):
+        runner._glm5next_request_slot_capacity(banks)
 
 
 def test_a2_the_side_cache_slot_axis_is_the_engines_concurrency_bound() -> None:
