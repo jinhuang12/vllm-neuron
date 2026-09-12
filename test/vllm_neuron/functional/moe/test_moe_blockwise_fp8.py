@@ -8,32 +8,46 @@ Acceptance command (plan block, `#### inc-glm53f-025`)::
     pytest test/vllm_neuron/functional/moe/test_moe_blockwise_fp8.py -k cte \
     --timeout 60
 
+What this file covers, and what it stopped covering
+---------------------------------------------------
+Every item here is a ``cte_128`` item: it measures the three limbs the routed
+bank actually calls -- ``moe_gate_up_blockwise_fp8``,
+``moe_swiglu_transposed`` and ``moe_down_blockwise_fp8`` -- which index the
+checkpoint's own ``[128, 128]`` scale grid.
+
+The items that measured the vendor member at ``256`` granularity were retired
+once no product path fed it: the routed bank calls the three limbs above and
+nothing in this tree calls ``blockwise_fp8_moe``. Removing the vendor entry
+point and its flat-scale adapter is recorded as a separate debt, not done here.
+
 Why the route predicate is an acceptance criterion and not a diagnostic (F1)
 ---------------------------------------------------------------------------
 The declared numeric expectation compares simulated NKI output against a torch
-oracle. If the seam silently took its torch path, *both* sides of that
-comparison would be torch and it would pass green while measuring nothing about
-a kernel. So every case that dispatches reads three route instruments, and each
-is reported as a number:
+oracle. If a limb silently took a torch path, *both* sides of that comparison
+would be torch and it would pass green while measuring nothing about a kernel.
+So every case that dispatches reads three route instruments, and each is
+reported as a number:
 
-1. the seam's own dispatch counter (form R-1) -- ``nki_dispatch == 1``,
+1. the limb's own dispatch counter (form R-1) -- ``nki_dispatch == 1``,
    ``torch_fallback == 0`` per case;
 2. ``can_run_kernel()`` -- ``True``;
 3. real ``nki.simulator.simulate_kernel`` invocations on the F1 chain -- ``1``
    per kernel call. Instrument 3 is independent of this repository's code: it
    counts the vendor entry point, so a bug in instrument 1 cannot fake it.
 
-Both instruments are armed rather than assumed. ``test_cte_route_control_*``
-shows instrument 1 reading ``(0, 1)`` on the fallback path and instrument 3
-reading ``0``, so a zero is a measurement and not an unwired counter.
+The zeros are armed rather than assumed:
+``test_cte_128_route_control_the_gate_up_limb_has_no_torch_route`` shows what
+the counters read when no kernel runs, so a zero is a measurement and not an
+unwired counter.
 
 Why the numeric comparison alone cannot settle the scale layout
 --------------------------------------------------------------
-The NKI kernel and its vendor torch oracle read the scale tensor through the
-*same* convention. A layout error consistent between them is therefore
-invisible to a kernel-vs-oracle comparison. The two ``test_cte_layout_*`` cases
-settle the layout with **oracle-free** instruments instead: a one-hot scale
-probe whose observable consequence differs between the two candidate orders.
+A kernel and a torch oracle that read the scale tensor through the *same*
+convention share any layout error, so the comparison cannot see it.
+``test_cte_128_scale_operand_order_is_the_checkpoint_grid_order`` and
+``test_cte_128_a_one_hot_scale_moves_only_its_own_output_columns`` settle the
+order with **oracle-free** instruments instead: a one-hot scale probe whose
+observable consequence differs between the two candidate orders.
 """
 
 from __future__ import annotations
@@ -54,23 +68,15 @@ from vllm_neuron.functional.moe.blockwise_fp8_retile import (
     BLOCK_QUANT_SIZE,
     GATE_UP,
     DOWN,
-    I_TILES_PER_BLOCK,
     TILE_SIZE,
-    consumer_scale_shape,
-    flat_scale_index,
-    is_pow2_exact,
 )
 from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     GATE_UP_FUSION,
     GATE_UP_SCALE_BLOCK,
-    NUM_SHARDS,
     MoeBlockwiseFp8Error,
-    blockwise_fp8_moe,
-    blockwise_fp8_moe_torch_oracle,
     can_run_blockwise_fp8_moe,
     can_run_moe_down_blockwise_fp8,
     can_run_moe_gate_up_blockwise_fp8,
-    dispatch_counters,
     down_dispatch_counters,
     down_kernel_identity,
     gate_up_dispatch_counters,
@@ -81,7 +87,6 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     moe_down_blockwise_fp8,
     moe_gate_up_blockwise_fp8,
     moe_swiglu_transposed,
-    reset_dispatch_counters,
     reset_down_dispatch_counters,
     reset_gate_up_dispatch_counters,
     reset_swiglu_dispatch_counters,
@@ -126,14 +131,6 @@ class RouteInstrumentError(AssertionError):
     """
 
 
-class F1PreconditionError(AssertionError):
-    """The pow2 losslessness precondition did not hold on this case's scales."""
-
-
-class LayoutSettlementError(AssertionError):
-    """The kernel's observed scale-block mapping is not the one recorded."""
-
-
 class VacuousControlError(AssertionError):
     """A control whose input could not have made it fail.
 
@@ -169,533 +166,11 @@ class _SimulatorCounter:
         nki.simulator.simulate_kernel = self._real
 
 
-def _assert_route(sim: _SimulatorCounter, expected_dispatches: int, label: str) -> str:
-    """Read all three route instruments and return the reading for the transcript."""
-    nki_dispatch, torch_fallback = dispatch_counters()
-    gate = can_run_kernel(torch.zeros(1))
-    reading = (
-        f"[{label}] nki_dispatch={nki_dispatch} torch_fallback={torch_fallback} "
-        f"can_run_kernel={gate} simulate_kernel_calls={sim.calls}"
-    )
-    print(reading)
-    if nki_dispatch != expected_dispatches:
-        raise RouteInstrumentError(
-            f"{label}: seam dispatch counter read {nki_dispatch}, declared "
-            f"{expected_dispatches}. {reading}"
-        )
-    if torch_fallback != 0:
-        raise RouteInstrumentError(
-            f"{label}: torch-fallback counter read {torch_fallback}, declared "
-            f"exactly 0 -- a fallback pass would compare torch against torch. "
-            f"{reading}"
-        )
-    if gate is not True:
-        raise RouteInstrumentError(
-            f"{label}: can_run_kernel() read {gate!r}, declared True. {reading}"
-        )
-    if sim.calls != expected_dispatches:
-        raise RouteInstrumentError(
-            f"{label}: nki.simulator.simulate_kernel ran {sim.calls} times, "
-            f"declared {expected_dispatches}. A numeric pass without a simulator "
-            f"call is the F1 false green. {reading}"
-        )
-    return reading
-
-
-# --------------------------------------------------------------------------- #
-# Case construction. Built FROM 128-granularity checkpoint scales through       #
-# `inc-glm53f-024`'s producer, so the retile is exercised rather than mimicked.  #
-# --------------------------------------------------------------------------- #
-def _pow2_checkpoint_scales(seed: int, rows: int, cols: int) -> torch.Tensor:
-    """``(E, rows//128, cols//128)`` fp32 scales, every entry an exact power of two.
-
-    Exact powers of two, and therefore mutually pow2-related within any
-    ``256``-block, and each retained block scale itself a power of two. The
-    routed limbs index this grid as it stands and need no such relation; the
-    property is kept because the items that coarsen onto the vendor seam's
-    ``256`` grid rely on it to keep their pinned tolerances, and
-    :func:`_vendor_256_pair` says why.
-
-    Exponents vary per tile so the scales are DISTINCT: a comparison run on
-    uniform scales cannot see a permuted layout.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    exponents = torch.randint(
-        -3, 4, (E, rows // TILE_SIZE, cols // TILE_SIZE), generator=generator
-    )
-    return torch.ldexp(torch.ones_like(exponents, dtype=torch.float32), exponents)
-
-
-def _fp8_grid_weights(seed: int, *shape: int, signed: bool = False) -> torch.Tensor:
-    """Values already on the fp8-e4m3 grid, so every cast in the fixture is exact.
-
-    ``signed=False`` is the default and it is a CONDITIONING choice, measured
-    rather than assumed. With signed values every dot product over the ``H=512``
-    contraction is a near-cancelling sum, so elements of the reference land
-    arbitrarily close to zero while the terms that built them are ~1e4. A
-    pointwise *relative* tolerance is then dominated by cancellation rather than
-    by kernel error, and NO correct bf16-accumulating kernel can satisfy it:
-    measured on the signed fixture, agreement is ``0.99996`` in best-fit scale
-    and ``3.8e-03`` in per-block relative L2, while the pointwise maximum reads
-    ``3.6e+02`` on elements whose reference is ~1e-1.
-
-    So the declared tolerance is measured on a well-conditioned fixture -- which
-    is what makes ``rtol=3e-2`` a statement about the kernel -- and the signed
-    case is kept as its own arm, compared in a cancellation-robust norm at the
-    same declared ``rtol``:
-    :func:`test_cte_signed_fixture_agrees_in_norm_under_cancellation`.
-    The tolerance itself is UNCHANGED; only the world it is measured in is
-    narrowed, exactly as the F1 clause does for the scales.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    low = -7 if signed else 1
-    raw = torch.randint(low, 8, shape, generator=generator).to(torch.float32) / 8.0
-    return raw
-
-
-def _vendor_256_pair(
-    weights: torch.Tensor,
-    scales: torch.Tensor,
-    projection: str,
-    gate_or_up: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The vendor seam's ``256``-granular pair, coarsened HERE and by no module.
-
-    The vendor matmul carries one scale per ``256x256`` block, so a checkpoint's
-    ``[128, 128]`` grid reaches it only through a mapping: keep one tile's scale
-    per block and re-express the other three tiles' weight bytes against it,
-    ``w * s_tile / s_kept``. No module in this tree performs that mapping any
-    more -- the routed limbs index the checkpoint grid directly -- so the seam's
-    fixture is built here, beside the items that measure the seam.
-
-    This fixture's scales are powers of two, so every ratio is exact in fp8 and
-    the coarsened pair dequantises to the same product as the checkpoint pair.
-    That is what lets these items keep the tolerances they were pinned with.
-
-    Slots outside ``gate_or_up``'s half are left NaN, so an unwritten slot
-    poisons its consumer instead of passing quietly.
-
-    Returns:
-        The rescaled fp8 weight in the input's own axis order, and the flat
-        ``(E, n_blocks * TILE_SIZE)`` scale tensor the seam consumes.
-    """
-    experts, rows, cols = weights.shape
-    h_256, i_256 = rows // BLOCK_QUANT_SIZE, cols // BLOCK_QUANT_SIZE
-    flat = torch.full(
-        consumer_scale_shape(experts, rows, cols, projection),
-        float("nan"),
-        dtype=torch.float32,
-    )
-    rescaled = weights.to(torch.float32).clone()
-    for expert in range(experts):
-        for h_tile in range(rows // TILE_SIZE):
-            for i_tile in range(cols // TILE_SIZE):
-                kept = float(
-                    scales[
-                        expert,
-                        h_tile - h_tile % I_TILES_PER_BLOCK,
-                        i_tile - i_tile % I_TILES_PER_BLOCK,
-                    ]
-                )
-                ratio = float(scales[expert, h_tile, i_tile]) / kept
-                window = (
-                    expert,
-                    slice(h_tile * TILE_SIZE, (h_tile + 1) * TILE_SIZE),
-                    slice(i_tile * TILE_SIZE, (i_tile + 1) * TILE_SIZE),
-                )
-                rescaled[window] = (rescaled[window] * ratio).to(_FP8).to(torch.float32)
-                block = flat_scale_index(
-                    h_tile, i_tile, h_256, i_256, projection, gate_or_up
-                )
-                flat[expert, block * TILE_SIZE : (block + 1) * TILE_SIZE] = kept
-    assert bool(torch.isfinite(rescaled).all()), (
-        "a rescaled byte left the fp8 range, so this fixture measures saturation "
-        "rather than the seam"
-    )
-    return rescaled.to(_FP8), flat
-
-
-def _build_case(signed: bool = False) -> dict:
-    """The tiny config, coarsened onto the vendor seam's ``256`` scale grid."""
-    # --- gate/up: the mapping runs per fusion half, on (E, H, I_TP) ---------- #
-    gup_scale_logical = torch.empty(
-        kernel_scale_shape(E, H, I_TP, GATE_UP), dtype=torch.float32
-    )
-    gup_weight = torch.empty((E, H, 2, I_TP), dtype=torch.float32)
-    for gate_or_up in range(2):
-        checkpoint = _pow2_checkpoint_scales(11 + gate_or_up, H, I_TP)
-        weights = _fp8_grid_weights(21 + gate_or_up, E, H, I_TP, signed=signed)
-        retiled_weights, consumer_scales = _vendor_256_pair(
-            weights.to(_FP8), checkpoint, GATE_UP, gate_or_up
-        )
-        gup_weight[:, :, gate_or_up, :] = retiled_weights.to(torch.float32)
-        # One C-order reshape, in the module, at the one place it is written.
-        bridged = to_kernel_scale_layout(
-            consumer_scales, E, H, I_TP, projection=GATE_UP
-        )
-        # The mapping writes only this half's slots, so take this half's slice.
-        gup_scale_logical[:, :, gate_or_up, :, :] = bridged[:, :, gate_or_up, :, :]
-
-    # --- down: the mapping's `rows` is the H axis and `cols` the I axis, so     #
-    # --- the physically-[E, I_TP, H] weight is coarsened in (E, H, I_TP) view.  #
-    down_checkpoint = _pow2_checkpoint_scales(31, H, I_TP)
-    down_weight_hi = _fp8_grid_weights(41, E, H, I_TP, signed=signed)
-    down_retiled, down_consumer_scales = _vendor_256_pair(
-        down_weight_hi.to(_FP8), down_checkpoint, DOWN
-    )
-    down_scale_logical = to_kernel_scale_layout(
-        down_consumer_scales, E, H, I_TP, projection=DOWN
-    )
-    # Back to the kernel's physical [E, I_TP, H].
-    down_weight = down_retiled.to(torch.float32).transpose(1, 2).contiguous()
-
-    hidden = _fp8_grid_weights(51, T + 1, H, signed=signed).to(torch.bfloat16)
-    affinities = torch.zeros(((T + 1) * E, 1), dtype=torch.bfloat16)
-    affinities_2d = affinities.view(T + 1, E)
-    token_position_to_id = torch.arange(N_BLOCKS * B, dtype=torch.int32)
-    block_to_expert = torch.arange(N_BLOCKS, dtype=torch.int32).reshape(N_BLOCKS, 1) % E
-    for block in range(N_BLOCKS):
-        expert = int(block_to_expert[block, 0])
-        affinities_2d[block * B : (block + 1) * B, expert] = 1.0
-
-    return {
-        "kernel_inputs": dict(
-            hidden_states=hidden,
-            expert_affinities_masked=affinities,
-            gate_up_proj_weight=gup_weight.to(_FP8),
-            down_proj_weight=down_weight.to(_FP8),
-            block_size=B,
-            token_position_to_id=token_position_to_id,
-            block_to_expert=block_to_expert,
-            gate_up_proj_scale=gup_scale_logical,
-            down_proj_scale=down_scale_logical,
-        ),
-        "block_to_expert": block_to_expert,
-    }
-
-
-def _per_block_rows(block: int) -> slice:
-    """Output rows the given token block owns. Disjoint by construction."""
-    return slice(block * B, (block + 1) * B)
-
-
 def _max_rel_error(got: torch.Tensor, want: torch.Tensor) -> float:
     """``max |got - want| / (|want| + ATOL)`` -- reported as a number, not a verdict."""
     return float(
         ((got - want).abs() / (want.abs() + ATOL)).max()
     )
-
-
-# --------------------------------------------------------------------------- #
-# THE DECLARED ACCEPTANCE CASE.                                                #
-# --------------------------------------------------------------------------- #
-def test_cte_output_matches_torch_oracle_per_expert_block() -> None:
-    """Simulated NKI output vs the nkilib torch oracle, per expert block.
-
-    The plan's declared Expected: ``assert_close(rtol=3e-2, atol=1e-5)`` per
-    expert block, all blocks passing, worst per-block ``max_rel_error``
-    reported as a number.
-    """
-    case = _build_case()
-    reset_dispatch_counters()
-    with _SimulatorCounter() as sim:
-        got = blockwise_fp8_moe(**case["kernel_inputs"])
-    _assert_route(sim, 1, "acceptance")
-
-    want = blockwise_fp8_moe_torch_oracle(**case["kernel_inputs"])
-
-    got_f32 = got.to(torch.float32)
-    want_f32 = want.to(torch.float32)
-
-    # Nonemptiness gate: an all-zero reference would make assert_close vacuous.
-    nonzero_rows = int((want_f32.abs().sum(-1) > 0).sum())
-    if nonzero_rows == 0:
-        raise VacuousControlError(
-            "the torch oracle produced an all-zero reference, so the comparison "
-            "would pass over empty input; refusing to report it as a pass"
-        )
-    print(f"[acceptance] oracle_nonzero_rows={nonzero_rows} of {T}")
-    # Reported so the reader can see which half of the declared tolerance binds:
-    # at these magnitudes rtol dominates and atol=1e-5 is far below one ulp.
-    print(
-        f"[acceptance] want_absmax={float(want_f32[:T].abs().max()):.4e} "
-        f"want_absmin={float(want_f32[:T].abs().min()):.4e} "
-        f"got_absmax={float(got_f32[:T].abs().max()):.4e}"
-    )
-
-    worst = -1.0
-    worst_block = -1
-    passed = 0
-    for block in range(N_BLOCKS):
-        rows = _per_block_rows(block)
-        expert = int(case["block_to_expert"][block, 0])
-        rel = _max_rel_error(got_f32[rows], want_f32[rows])
-        print(
-            f"[acceptance] block={block} expert={expert} "
-            f"rows={rows.start}:{rows.stop} max_rel_error={rel:.6e}"
-        )
-        if rel > worst:
-            worst, worst_block = rel, block
-        torch.testing.assert_close(
-            got_f32[rows], want_f32[rows], rtol=RTOL, atol=ATOL
-        )
-        passed += 1
-
-    print(
-        f"[acceptance] blocks_passing={passed}/{N_BLOCKS} "
-        f"worst_max_rel_error={worst:.6e} worst_block={worst_block} "
-        f"rtol={RTOL} atol={ATOL}"
-    )
-    assert passed == N_BLOCKS, f"{passed}/{N_BLOCKS} blocks passed"
-
-
-def test_cte_signed_fixture_agrees_in_norm_under_cancellation() -> None:
-    """SUPPLEMENTARY, not the declared acceptance: signed weights, compared in norm.
-
-    Kept so sign handling stays covered after the declared arm moved to a
-    well-conditioned fixture. Over the ``H=512`` contraction a signed fixture
-    cancels, so this arm applies the SAME declared ``rtol`` to a per-block
-    relative L2 norm, which is what cancellation does not distort. No new
-    tolerance number is introduced: the bound is ``RTOL``.
-
-    The pointwise numbers are printed alongside, unrounded, so the conditioning
-    effect is visible in the transcript rather than described in prose.
-    """
-    case = _build_case(signed=True)
-    reset_dispatch_counters()
-    with _SimulatorCounter() as sim:
-        got = blockwise_fp8_moe(**case["kernel_inputs"]).to(torch.float32)
-    _assert_route(sim, 1, "signed-norm")
-    want = blockwise_fp8_moe_torch_oracle(**case["kernel_inputs"]).to(torch.float32)
-
-    got_t, want_t = got[:T], want[:T]
-    within = (got_t - want_t).abs() <= (ATOL + RTOL * want_t.abs())
-    denom = float((want_t * want_t).sum())
-    best_fit = float((got_t * want_t).sum()) / denom if denom > 0 else float("nan")
-    print(
-        f"[signed-norm] pointwise_within_declared_tol="
-        f"{int(within.sum())}/{within.numel()} "
-        f"pointwise_max_rel_error={_max_rel_error(got_t, want_t):.6e} "
-        f"best_fit_scale={best_fit:.6f} "
-        f"want_absmax={float(want_t.abs().max()):.4e} "
-        f"want_absmin={float(want_t.abs().min()):.4e}"
-    )
-
-    for block in range(N_BLOCKS):
-        rows = _per_block_rows(block)
-        residual = float((got_t[rows] - want_t[rows]).pow(2).sum().sqrt())
-        reference = float(want_t[rows].pow(2).sum().sqrt())
-        if reference == 0.0:
-            raise VacuousControlError(
-                f"block {block}: the reference has zero norm, so a relative "
-                f"comparison against it is vacuous"
-            )
-        rel_l2 = residual / reference
-        print(f"[signed-norm] block={block} rel_L2={rel_l2:.6e} bound={RTOL}")
-        assert rel_l2 <= RTOL, (
-            f"block {block}: relative L2 {rel_l2:.6e} exceeds the declared "
-            f"rtol {RTOL}; that is a structural disagreement, not cancellation"
-        )
-
-
-# --------------------------------------------------------------------------- #
-# LAYOUT SETTLEMENT -- oracle-free, because kernel and oracle share the          #
-# convention and a shared error is invisible to their comparison.               #
-# --------------------------------------------------------------------------- #
-def _down_scale_onehot(flat_slot: int, hot: float) -> torch.Tensor:
-    """Down scales: all ``1.0`` except one flat ``256``-block slot set to ``hot``.
-
-    Built in the flat producer layout and bridged through the module's one
-    reshape, so the probe measures the layout the module actually ships.
-    """
-    n_blocks = I_256 * H_256
-    flat = torch.ones((E, n_blocks * TILE_SIZE), dtype=torch.float32)
-    flat[:, flat_slot * TILE_SIZE : (flat_slot + 1) * TILE_SIZE] = hot
-    return to_kernel_scale_layout(flat, E, H, I_TP, projection=DOWN)
-
-
-def test_cte_layout_block_order_is_i_block_major() -> None:
-    """Which ``(i_block, h_block)`` does the kernel read from flat slot 1?
-
-    The two candidate orders make DIFFERENT, falsifiable predictions at
-    ``H//256 == I_TP//256 == 2``:
-
-    * ``i_block`` major -- ``flat = i_block * (H//256) + h_block`` -- slot 1 is
-      ``(i_block=0, h_block=1)``, so the changed output columns are
-      ``[256:512]``.
-    * ``h_block`` major -- ``flat = h_block * (I_TP//256) + i_block`` -- slot 1
-      is ``(h_block=0, i_block=1)``, so the changed columns are ``[0:256]``.
-
-    The down scale multiplies the contribution landing in its ``h_block``'s
-    output columns (``bwmm_shard_on_I.py:2133`` computes ``dst_h_start`` from the
-    H block, ``:2138`` applies the scale there), so the changed column range
-    identifies ``h_block`` and therefore the order. No oracle is involved.
-    """
-    case = _build_case()
-    inputs = dict(case["kernel_inputs"])
-
-    reset_dispatch_counters()
-    with _SimulatorCounter() as sim:
-        inputs["down_proj_scale"] = _down_scale_onehot(1, 1.0)
-        baseline = blockwise_fp8_moe(**inputs).to(torch.float32)
-        inputs["down_proj_scale"] = _down_scale_onehot(1, 2.0)
-        probed = blockwise_fp8_moe(**inputs).to(torch.float32)
-    _assert_route(sim, 2, "layout-block-order")
-
-    delta = (probed - baseline).abs()
-    lower = float(delta[:T, 0:BLOCK_QUANT_SIZE].max())
-    upper = float(delta[:T, BLOCK_QUANT_SIZE : 2 * BLOCK_QUANT_SIZE].max())
-    print(
-        f"[layout] onehot_slot=1 delta_max_columns[0:256]={lower:.6e} "
-        f"delta_max_columns[256:512]={upper:.6e}"
-    )
-
-    if lower == 0.0 and upper == 0.0:
-        raise VacuousControlError(
-            "changing a scale changed no output at all, so this probe cannot "
-            "identify any block; the instrument is unarmed"
-        )
-    if not (upper > 0.0 and lower == 0.0):
-        raise LayoutSettlementError(
-            "flat slot 1 did not map to (i_block=0, h_block=1): observed "
-            f"delta_max[0:256]={lower:.6e}, delta_max[256:512]={upper:.6e}. "
-            "The recorded order is i_block-major over C-order storage; this "
-            "reading contradicts it and is a design contradiction to route, "
-            "never a silent re-layout of inc-glm53f-024's landed code."
-        )
-    print("[layout] SETTLED: i_block-major, matching flat_scale_index(DOWN)")
-
-
-def test_cte_layout_tile_axis_is_minor_not_partition_major() -> None:
-    """Is ``TILE_SIZE`` the minor (contiguous) axis, or is the layout partition-major?
-
-    The kernel reads a width-1 column across ``TILE_SIZE`` partitions
-    (``bwmm_shard_on_I.py:2005``), filled by a DMA whose partition axis walks
-    with stride ``1`` (``:2007`` ``pattern=[[1, TILE_SIZE], [TILE_SIZE, 1]]``).
-    So consecutive elements of the host tensor land on consecutive PARTITIONS,
-    and the partition axis is the token axis within a ``128``-token tile.
-
-    Consequence, and the falsifiable prediction: setting only replica ``0`` of
-    one block makes the kernel apply a different scale to the token at partition
-    ``0`` of each tile -- a PER-TOKEN pattern with period ``TILE_SIZE``. Under a
-    partition-major layout the same bytes would instead vary per BLOCK and every
-    token in the affected column range would move together.
-    """
-    case = _build_case()
-    inputs = dict(case["kernel_inputs"])
-    n_blocks = I_256 * H_256
-
-    uniform = torch.ones((E, n_blocks * TILE_SIZE), dtype=torch.float32)
-    replica0 = uniform.clone()
-    replica0[:, 0] = 2.0  # slot 0, replica 0 only
-    if torch.equal(replica0, uniform):
-        raise VacuousControlError("injection changed nothing -- control is vacuous")
-
-    reset_dispatch_counters()
-    with _SimulatorCounter() as sim:
-        inputs["down_proj_scale"] = to_kernel_scale_layout(
-            uniform, E, H, I_TP, projection=DOWN
-        )
-        baseline = blockwise_fp8_moe(**inputs).to(torch.float32)
-        inputs["down_proj_scale"] = to_kernel_scale_layout(
-            replica0, E, H, I_TP, projection=DOWN
-        )
-        probed = blockwise_fp8_moe(**inputs).to(torch.float32)
-    _assert_route(sim, 2, "layout-tile-axis")
-
-    delta = (probed - baseline).abs()
-    per_token = delta[:T].max(dim=-1).values
-    moved = torch.nonzero(per_token > 0, as_tuple=False).flatten().tolist()
-    if not moved:
-        raise VacuousControlError(
-            "changing replica 0 changed no output, so this probe cannot "
-            "distinguish the two layouts; the instrument is unarmed"
-        )
-    residues = sorted({index % TILE_SIZE for index in moved})
-    print(
-        f"[layout] replica0 probe: moved_tokens={len(moved)} of {T} "
-        f"distinct_residues_mod_{TILE_SIZE}={residues}"
-    )
-
-    if residues != [0]:
-        raise LayoutSettlementError(
-            f"replica 0 moved tokens at residues {residues} mod {TILE_SIZE}, "
-            f"expected exactly [0]. A partition-major layout would move whole "
-            f"blocks of tokens together. The recorded layout is C-order with "
-            f"TILE_SIZE minor; this reading contradicts it and routes to the "
-            f"lead as a design contradiction."
-        )
-    if len(moved) == T:
-        raise LayoutSettlementError(
-            f"every one of {T} tokens moved, which is the partition-major "
-            f"signature, not the per-token signature C-order predicts"
-        )
-    print("[layout] SETTLED: TILE_SIZE is the minor axis; partition-major refuted")
-
-
-# --------------------------------------------------------------------------- #
-# ROUTE CONTROLS -- so every zero above is a measurement, not an unwired counter.#
-# --------------------------------------------------------------------------- #
-def test_cte_route_control_fallback_counter_discriminates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With the simulator disabled the seam takes the torch path, and it is COUNTED.
-
-    This is the arm that makes ``torch_fallback == 0`` above meaningful: the
-    counter is shown reading ``1``, and ``nki_dispatch`` reading ``0``, through
-    the real gate rather than a mock. It is also the measured form of the plan's
-    claim that a pure-torch implementation yields ``0`` dispatches.
-    """
-    case = _build_case()
-    monkeypatch.setitem(os.environ, "NKI_SIMULATOR", "0")
-    assert can_run_kernel(torch.zeros(1)) is False, (
-        "the gate did not flip with NKI_SIMULATOR=0, so this control is unarmed"
-    )
-
-    reset_dispatch_counters()
-    with _SimulatorCounter() as sim:
-        out = blockwise_fp8_moe(**case["kernel_inputs"])
-    nki_dispatch, torch_fallback = dispatch_counters()
-    print(
-        f"[route-control] nki_dispatch={nki_dispatch} "
-        f"torch_fallback={torch_fallback} simulate_kernel_calls={sim.calls}"
-    )
-    assert nki_dispatch == 0, f"expected 0 NKI dispatches, got {nki_dispatch}"
-    assert torch_fallback == 1, f"expected 1 torch fallback, got {torch_fallback}"
-    assert sim.calls == 0, f"the simulator ran {sim.calls} times with it disabled"
-    assert out.shape == (T + 1, H)
-
-
-def test_cte_route_control_simulator_is_load_bearing() -> None:
-    """The NKI chain RAISES without the simulator rather than computing torch.
-
-    Recorded because it is what forecloses the F1 false green below this
-    repository's seam: if the HOP silently degraded to a torch path, a green
-    numeric comparison could not be attributed to a kernel at all.
-    """
-    case = _build_case()
-    inputs = case["kernel_inputs"]
-    saved = os.environ.get("NKI_SIMULATOR")
-    os.environ["NKI_SIMULATOR"] = "0"
-    try:
-        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-        from nkilib.core.moe.moe_cte.bwmm_shard_on_I import (
-            blockwise_mm_baseline_shard_intermediate,
-        )
-
-        with pytest.raises(RuntimeError) as excinfo:
-            wrap_nki(blockwise_mm_baseline_shard_intermediate)[NUM_SHARDS](
-                is_block_quant=True, **inputs
-            )
-    finally:
-        if saved is None:
-            os.environ.pop("NKI_SIMULATOR", None)
-        else:
-            os.environ["NKI_SIMULATOR"] = saved
-
-    message = str(excinfo.value)
-    print(f"[route-control] simulator_off_raise={message[:160]!r}")
-    assert "simulator" in message.lower(), message
 
 
 # --------------------------------------------------------------------------- #
