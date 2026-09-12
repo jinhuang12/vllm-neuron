@@ -487,9 +487,17 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
         beyond = padded[WIDE_REAL_BLOCKS:]
         same = torch.equal(own, unpadded[:WIDE_REAL_BLOCKS])
         touched = int((beyond != 0).sum())
+        stored = int((own != 0).sum())
         print(
             f"INC133|write|layer={index}|own_pages_equal={same}"
             f"|blocks_beyond_the_request={tuple(beyond.shape)[0]}|nonzero_beyond={touched}"
+            f"|values_in_its_own_pages={stored}"
+        )
+        # THE POSITIVE CONTROL FIRST. Two banks that were never written are equal to each
+        # other, so byte equality alone would pass on a run that stored nothing at all.
+        assert stored > 0, (
+            f"layer {index} holds nothing in the {WIDE_REAL_BLOCKS} page(s) the request "
+            f"owns, so the equality below would compare two empty banks"
         )
         assert same, (
             f"layer {index}'s own pages differ between the padded and the unpadded run; "
@@ -512,8 +520,10 @@ SEED_REAL = BUCKET_TOKENS - item.MLA_INDEX_KPOOL - 2
 
 #: The value planted in every padded row. No real row can hold it: the real rows carry
 #: their own 1-based position, so the ring holding this number can only have read a row
-#: that is not the sequence's.
-PADDING_MARKER = -1234.0
+#: that is not the sequence's. It is EXACT IN BFLOAT16, which the item checks before it
+#: plants it: a value the bank's dtype rounds away is stored as something else, and then
+#: the comparison against it can never be true and the reading says nothing.
+PADDING_MARKER = -1024.0
 
 
 def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
@@ -554,6 +564,14 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
     dim = int(text_config.index_head_dim)
     rows = torch.arange(1, BUCKET_TOKENS + 1, dtype=torch.float32).reshape(-1, 1)
     key = rows.expand(BUCKET_TOKENS, dim).clone().to(torch.bfloat16)
+    # THE MARKER MUST SURVIVE THE DTYPE IT IS PLANTED IN. A value bfloat16 rounds away is
+    # stored as something else, and the comparison below could then never be true: the
+    # reading would pass on any tree, which is the same as no reading at all.
+    planted = float(torch.tensor(PADDING_MARKER, dtype=key.dtype))
+    assert planted == PADDING_MARKER, (
+        f"the marker {PADDING_MARKER} is stored as {planted} in {key.dtype}, so the row "
+        f"below would compare against a value the ring can never hold"
+    )
     key[SEED_REAL:] = PADDING_MARKER
     gate_score = key.clone()
 
@@ -637,9 +655,15 @@ def test_the_padded_write_traces_and_stores_what_the_eager_run_stored():
         beyond = two[WIDE_REAL_BLOCKS:]
         same = torch.equal(own, one[:WIDE_REAL_BLOCKS])
         touched = int((beyond != 0).sum())
+        stored = int((own != 0).sum())
         print(
             f"INC133|traced_write|layer={index}|own_pages_equal={same}"
-            f"|nonzero_beyond={touched}"
+            f"|nonzero_beyond={touched}|values_in_its_own_pages={stored}"
+        )
+        # THE SAME POSITIVE CONTROL AS THE EAGER ITEM: two banks nothing wrote are equal.
+        assert stored > 0, (
+            f"layer {index} holds nothing in the {WIDE_REAL_BLOCKS} page(s) the request "
+            f"owns, so the equality below would compare two empty banks"
         )
         assert same, (
             f"layer {index}'s own pages differ between the recorded run and the eager "
