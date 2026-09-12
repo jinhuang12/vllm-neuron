@@ -4681,16 +4681,17 @@ def _deferred_key_overrides(
 ) -> dict[str, torch.Tensor]:
     """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
 
-    A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK, and that
-    is R6 item R-T2's change here. Every family in :data:`_COARSENED_AT_LOAD_CLASSES`
-    has whole-256 extents in this fixture, so its load coarsens the grid; on the
-    ramp that coarsening rescaled weight bytes, which contradicted the bit-exact
-    readings below. :func:`_pow2_block_grid_pattern` carries the reasoning and what
-    it gives up. Nothing coarsens a routed grid any more, so nothing rescales a
-    byte and no grid family can overflow the fp8 bound.
+    A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK. This is a
+    FIXTURE choice, not a load behaviour: every family in
+    :data:`_COARSENED_AT_LOAD_CLASSES` has whole-256 extents here, so the writer
+    below gives it a pow2 grid instead of the plain pattern. The load coarsens
+    nothing any more and rescales no byte, so no grid family can overflow the fp8
+    bound; the pow2 pattern stays because a plain grid on that seam once rescaled
+    weight bytes and contradicted the bit-exact readings below.
+    :func:`_pow2_block_grid_pattern` carries the reasoning and what it gives up.
 
     ``ramp_grids=True`` writes the ramp for EVERY family, which is the fixture the
-    surviving ramp item needs and the only caller that asks for it.
+    two ramp items need.
 
     A bank entry is E weight keys and E scale keys interleaved, so its arm writes
     one tensor per expert at that expert's own full width -- the loader's job is to
@@ -4760,11 +4761,11 @@ def _deferred_checkpoint(
     name: str = "deferred",
     dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> tuple[Path, dict, dict]:
-    """One checkpoint holding every full tensor these five items read.
+    """One checkpoint holding every full tensor the items below read.
 
-    ``ramp_grids`` and ``name`` exist for the ramp item alone: it needs the SAME
-    checkpoint with the ramp scale grid restored, written beside this one rather than
-    over it, so its two loads differ in exactly the one field it varies.
+    ``ramp_grids`` and ``name`` exist for the two ramp items alone: each needs the
+    SAME checkpoint with the ramp scale grid restored, written beside this one rather
+    than over it, so a pair of loads differs in exactly the one field it varies.
 
     ``dense_intermediate`` exists for conjunct (3) alone, whose subject is a padded
     rank: see :data:`PAD_DENSE_INTERMEDIATE`. It reaches the config AND the written
