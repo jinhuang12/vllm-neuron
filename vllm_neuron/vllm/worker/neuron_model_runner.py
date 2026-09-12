@@ -1928,6 +1928,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+        # The per-request cache-state table frees on this set and on nothing else,
+        # because an unscheduled live request also leaves the persistent batch below.
+        self._glm5next_note_finished_requests(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -4883,6 +4886,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bank's flattened sequence view (``model_fp8.py:9135``), which is why the
         latent write can consume it instead of deriving a contiguous run.
 
+        NO PRODUCT PATH CONSUMES THIS YET. The latent write that takes it arrives with
+        the paged sparse gather that lifts the carrier's contiguity refusal; until then
+        the sparse carrier hands the layer one contiguous window. It is kept rather
+        than deleted because the equality it must satisfy is asserted today.
+
         THE PADDED ROWS CARRY ``PAD_SLOT_ID`` AND NOT THE PADDING VALUE THE KV
         MACHINERY WRITES. That value is ``NULL_BLOCK_ID``, which is ZERO (``:95``),
         and zero is a REAL slot -- block 0, offset 0 -- not a sentinel. A decode
@@ -4958,6 +4966,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 for tokens, start in requests
             ]
         ).to(device)
+
+    @staticmethod
     def _glm5next_start_position(position: int, device) -> torch.Tensor:
         """A host position number, as a tensor for the traced boundary.
 
@@ -5025,9 +5035,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         request-slot axis, because each holds ONE sequence's indexer state: the
         pooled store accumulates that sequence's keys and the ring holds its most
         recent pool. Sharing them across requests is what made a second request
-        read the first one's rows, and no shape disagreed while it happened. The
-        slot axis is the recurrent banks' own slot count, so a request's recurrent
-        state and its indexer state live at ONE slot number.
+        read the first one's rows, and no shape disagreed while it happened.
+
+        THE SLOT AXIS IS THE CONCURRENCY BOUND, NOT THE BLOCK SPACE, and the caller
+        derives it. Both of these tensors are per SEQUENCE, so their axis is how many
+        sequences may hold state at once. The recurrent banks' leading dimension is a
+        paging geometry -- one entry per KV block of the group -- and sizing a
+        per-sequence cache by it asks for thousands of sets: at the serving shape that
+        is gigabytes per layer, allocated outside the engine's KV budget on a rank
+        whose memory is already committed. RE-PINNED; the reading this replaces,
+        verbatim: "The slot axis is the recurrent banks' own slot count, so a request's
+        recurrent state and its indexer state live at ONE slot number." The second half
+        of that sentence still holds and is why the caller checks the two against each
+        other: a slot number addresses both, so the banks must hold at least as many
+        slots as the engine admits concurrent sequences.
 
         WHY THE KV MACHINERY DOES NOT ALLOCATE THESE. A sparse-attention layer needs
         a pooled-key store and a decode tail ring besides its latent cache, and
@@ -5123,7 +5144,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index_kpool=int(text_config.index_kpool),
             index_head_dim=int(text_config.index_head_dim),
             max_seq_len=int(self.max_model_len),
-            request_slots=self._glm5next_state_slot_count(banks),
+            request_slots=self._glm5next_request_slot_capacity(banks),
         )
         self._glm5next_side_cache_set = live
         # A FRESHLY ALLOCATED SET IS OWNED BY NOBODY, and the ownership record goes
@@ -5206,6 +5227,51 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         return counts.pop()
 
+    def _glm5next_request_slot_capacity(self, banks) -> int:
+        """How many sequences may hold cache state at once: the engine's own bound.
+
+        THE BOUND IS ``max_num_seqs`` AND NOT THE BANKS' LEADING DIMENSION. A slot is
+        a place for one SEQUENCE's state, so the axis it needs is the scheduler's
+        concurrency limit, which this runner reads once at construction. The banks'
+        leading dimension counts KV blocks of the group; using it would allocate one
+        set of per-sequence caches per block.
+
+        THE BANKS MUST STILL HOLD THE BOUND. A slot number addresses the recurrent
+        banks and the indexer's caches alike, so a stack whose banks hold fewer slots
+        than the engine admits sequences has no slot to hand the last of them, and it
+        refuses here rather than at a silent overwrite.
+        """
+        capacity = int(self.max_num_reqs)
+        if capacity <= 0:
+            raise ValueError(
+                f"the request slot axis is the engine's concurrent-sequence bound, "
+                f"so it must be positive; this runner reports {self.max_num_reqs!r}"
+            )
+        banked = self._glm5next_state_slot_count(banks)
+        if banked < capacity:
+            raise ValueError(
+                f"the recurrent banks of this stack hold {banked} state slot(s) while "
+                f"the engine admits {capacity} concurrent sequence(s); one slot number "
+                f"addresses the recurrent banks and the indexer's caches together, so "
+                f"there is no slot to hand the last sequence"
+            )
+        return capacity
+
+    def _glm5next_note_finished_requests(self, finished_req_ids) -> None:
+        """Record the engine's FINISHED request ids for the slot table to free.
+
+        The slot table cannot derive "finished" from the batch it is handed: this
+        runner also removes a live request from the persistent batch when the
+        scheduler gives it no tokens in a step, and that request keeps its state and
+        comes back. So the engine's own finished set is recorded here, at the one
+        place that receives it, and the table frees against it.
+        """
+        noted = getattr(self, "_glm5next_finished_request_ids", None)
+        if noted is None:
+            noted = set()
+            self._glm5next_finished_request_ids = noted
+        noted.update(finished_req_ids or ())
+
     def _glm5next_request_slots(
         self, banks, request_ids, *, synthetic: bool, side_caches=None
     ):
@@ -5224,19 +5290,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         moment ownership changes -- rather than on release, where a crash between
         the two would leave a dirty slot looking clean.
 
-        A FINISHED REQUEST IS ONE THAT STOPPED APPEARING. The engine hands this
-        runner the batch it scheduled and nothing else, so a request absent from
-        it is done and its slot returns to the pool. That derivation needs no
-        second bookkeeping to fall out of step with the batch.
+        A FINISHED REQUEST IS ONE THE ENGINE CALLED FINISHED. Only the ids this
+        runner recorded from the scheduler's finished set release a slot. RE-PINNED;
+        the rule this replaces, verbatim: "A FINISHED REQUEST IS ONE THAT STOPPED
+        APPEARING. The engine hands this runner the batch it scheduled and nothing
+        else, so a request absent from it is done and its slot returns to the pool."
+        Absence is NOT finishing: a running request that gets no tokens in a step is
+        removed from the persistent batch and keeps its cached state, so freeing on
+        absence would take that request's recurrence away and hand its slot, zeroed,
+        to somebody else while it was still alive.
 
         A SYNTHETIC STEP TAKES NO CLAIM. Warmup and the idle data-parallel dummy
         step reach this converter too, and they are not sequence steps: they are
         served from slot 0 with the table neither read nor written, so a warmup
         between two real steps of one sequence cannot evict it.
         """
-        slots = self._glm5next_state_slot_count(banks)
+        # A SYNTHETIC STEP NEEDS NO CAPACITY: it takes slot 0 and no claim, so the
+        # bound is read only where a claim is about to be taken.
         if synthetic:
             return [0 for _ in request_ids]
+        slots = self._glm5next_request_slot_capacity(banks)
         table = getattr(self, "_glm5next_request_slot_table", None)
         if table is None:
             table = {}
@@ -5245,10 +5318,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if positions is None:
             positions = {}
             self._glm5next_side_cache_positions = positions
-        live = set(request_ids)
-        for finished in [key for key in table if key not in live]:
-            positions.pop(table[finished], None)
-            del table[finished]
+        noted = getattr(self, "_glm5next_finished_request_ids", None)
+        if noted:
+            for finished in [key for key in table if key in noted]:
+                positions.pop(table[finished], None)
+                del table[finished]
+            # An id the engine finished that never held a slot has nothing to release,
+            # so the record is emptied whole and cannot grow for the process's life.
+            noted.clear()
         for request_id in request_ids:
             if request_id in table:
                 continue
@@ -5258,8 +5335,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
             if free is None:
                 raise ValueError(
-                    f"this stack holds {slots} recurrent state slot(s) and all of "
-                    f"them are owned by live requests, so request "
+                    f"this stack keys {slots} concurrent sequence(s) and all of "
+                    f"those slots are owned by live requests, so request "
                     f"{request_id!r} has no free slot; the engine admitted more "
                     f"concurrent requests than the cache was allocated for"
                 )

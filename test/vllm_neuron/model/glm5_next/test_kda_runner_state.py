@@ -119,10 +119,18 @@ DECLARED_HOOK_CALL_SITES = 1
 #: and the builder refuses a slot outside the bank it was handed.
 DECLARED_STATE_SLOTS = 1
 
-#: The state slot every geometry in this file resolves to. The converter reads it
-#: as the FIRST block id of the row (``neuron_model_runner.py:5151``), so the row
-#: below starts at 0 and this is that 0, named rather than implied.
+#: The state slot this file's one request resolves to. RE-PINNED: the converter no
+#: longer reads a slot off the block row -- it hands the request the slot its own
+#: table owns -- so this value is the table's first hand-out and the items below read
+#: the TABLE rather than this constant, which cannot tell the two sources apart.
+#: The original reading, verbatim: "The converter reads it as the FIRST block id of
+#: the row (``neuron_model_runner.py:5151``), so the row below starts at 0 and this
+#: is that 0, named rather than implied."
 DECLARED_STATE_SLOT = 0
+
+#: How many sequences the modelled engine admits at once. One, because this file
+#: runs one request, and the bank above holds exactly that many slots.
+DECLARED_MAX_NUM_SEQS = 1
 
 #: The page the metadata declares. The linear branch of the carrier builder never
 #: reads it -- only the sparse branch cross-checks paging -- so this is the
@@ -227,6 +235,8 @@ def _runner(text_config, banks) -> NeuronModelRunner:
     # Only the side-cache allocator reads this, and with no sparse bank in the
     # stack it allocates nothing; it must still be positive.
     runner.max_model_len = DECLARED_PREFILL_TOKENS + DECLARED_DECODE_STEPS + 1
+    # THE SLOT AXIS IS THE ENGINE'S CONCURRENCY BOUND, so the harness carries it.
+    runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
     return runner
 
 
@@ -419,6 +429,12 @@ def _world(*, clear_state_before_decode: bool) -> SimpleNamespace:
         decode_carriers=decode_carriers,
         reference_prefill=reference_prefill,
         reference_decode=reference_decode,
+        # THE SLOT THE TABLE HANDED THIS REQUEST, read off the runner rather than
+        # assumed: a view assertion against a declared 0 cannot tell a slot the table
+        # owns from a slot read off a block row, because the first hand-out is 0 too.
+        owned_slot=dict(runner._glm5next_request_slot_table)[
+            runner.input_batch.req_ids[0]
+        ],
     )
 
 
@@ -594,14 +610,14 @@ def test_kda_runner_state_b03_the_runner_carries_the_state_through_the_layer(
             # not a copy, on every step -- is unchanged, and it is the entry that
             # must be the view, because that is what the layer advances in place.
             assert carrier["recurrent_state"][0].data_ptr() == (
-                bank["recurrent_state"][DECLARED_STATE_SLOT].data_ptr()
+                bank["recurrent_state"][run.owned_slot].data_ptr()
             ), (
                 f"step {step}: bank {index}'s recurrent carrier is not a view of "
                 f"its own slot, so the layer's in-place advance is written where "
                 f"the next step will not read it"
             )
             assert carrier["conv_state"][0].data_ptr() == (
-                bank["conv_state"][DECLARED_STATE_SLOT].data_ptr()
+                bank["conv_state"][run.owned_slot].data_ptr()
             ), f"step {step}: bank {index}'s conv carrier is not a view of its own slot"
             assert carrier["is_prefill"] is False, (
                 f"step {step}: bank {index} received is_prefill=True for a "
@@ -610,7 +626,7 @@ def test_kda_runner_state_b03_the_runner_carries_the_state_through_the_layer(
 
     # It ADVANCED, and the advance is in the bank the runner owns.
     for index, bank in enumerate(run.banks):
-        recurrent = bank["recurrent_state"][DECLARED_STATE_SLOT]
+        recurrent = bank["recurrent_state"][run.owned_slot]
         attention = run.layers[index].attention
         assert tuple(recurrent.shape) == tuple(attention.kda_recurrent_state_shape)
         assert recurrent.dtype is attention.kda_recurrent_state_dtype

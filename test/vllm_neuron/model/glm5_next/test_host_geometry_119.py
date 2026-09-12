@@ -85,9 +85,16 @@ PAGE = 4
 BANK_PAGES = 32
 LATENT_WIDTH = 8
 
-#: Recurrent state slots in the linear-attention bank. The converter reads a state slot as
-#: the first block id of the row, so the bank must be wide enough for the rows below.
+#: Recurrent state slots in the linear-attention bank. RE-PINNED: the converter no longer
+#: reads a state slot off the block row -- it hands each request a slot of its own table --
+#: so this width is the bank's paging geometry and the bound below is the request axis.
+#: The original reading, verbatim: "The converter reads a state slot as the first block id
+#: of the row, so the bank must be wide enough for the rows below."
 STATE_SLOTS = 8
+
+#: How many sequences the modelled engine admits at once. One, and the bank above holds
+#: more slots than that on purpose: the two numbers are not the same axis.
+DECLARED_MAX_NUM_SEQS = 1
 
 #: A single-token step is a decode and anything longer is a prefill.
 DECODE_THRESHOLD = 1
@@ -165,6 +172,9 @@ def _runner(banks) -> NeuronModelRunner:
         text_config=_text_config(), glm5next_layer_banks=tuple(banks)
     )
     runner.max_model_len = MAX_MODEL_LEN
+    # RE-PINNED: the converter now sizes its per-sequence caches by the engine's
+    # concurrent-sequence bound, so a runner shell must model that bound too.
+    runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
     return runner
 
 

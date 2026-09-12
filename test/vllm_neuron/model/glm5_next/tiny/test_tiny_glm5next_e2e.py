@@ -118,6 +118,11 @@ E2E_CONV_STATE_SHAPE = (2, 3)
 E2E_RECURRENT_STATE_SHAPE = (2, 4, 4)
 E2E_STATE_SLOTS = 8
 
+#: How many sequences the modelled engine admits at once. The runner sizes its per-sequence
+#: side caches by THIS number and not by the bank's slot count, so the two are deliberately
+#: different here: one sequence runs through this file, and the banks hold eight slots.
+E2E_MAX_NUM_SEQS = 1
+
 
 def _fixture(**overrides):
     """`-054a`'s root fixture, with the ONE dial the registered constraint set names.
@@ -1067,6 +1072,7 @@ def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     prompt = torch.randint(
         0,
@@ -1223,6 +1229,7 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     tokens = GENERATED_TOKENS
     state_slot = E2E_STATE_SLOTS - 1
     sparse_row = [0, 1]
@@ -1357,6 +1364,7 @@ def test_the_converter_does_not_hand_the_root_a_kv_page_as_its_quant_block():
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     translated = _model_kwargs(
         runner,
@@ -1441,6 +1449,7 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     live = runner._glm5next_live_side_caches(banks)
     again = runner._glm5next_live_side_caches(banks)
@@ -1744,6 +1753,7 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     remainder = REMAINDER_PROMPT % pool
     completed_pool = (EVEN_PROMPT - 1) // pool
@@ -2042,6 +2052,7 @@ def test_the_indexer_refuses_a_prefill_ring_handed_to_a_decode_step():
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     indexer = _sparse_indexer(layers)
     rings = _live_rings(runner, banks)
     if not rings:
@@ -2127,6 +2138,7 @@ def test_the_indexer_refuses_a_prefill_ring_with_no_end_position():
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     indexer = _sparse_indexer(layers)
     rings = _live_rings(runner, banks)
     if not rings:
@@ -2214,6 +2226,7 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     prompt = int(item.STACK_TOKENS)
     stale = prompt + STALE_DECODE_GAP
     if STALE_DECODE_GAP == 0:
@@ -2384,6 +2397,7 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     prompt = int(item.STACK_TOKENS)
 
     def step(cached: int, tokens: int):
@@ -2453,6 +2467,7 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     def step(cached: int, tokens: int):
         return _model_kwargs(

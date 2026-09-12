@@ -8,7 +8,7 @@ THE DECLARED ACCEPTANCE, the Tier N harness this campaign uses:
       test/vllm_neuron/model/glm5_next/test_request_keyed_state_117.py \\
       -s -rA -p no:randomly -p no:cacheprovider --timeout 60
 
-EVERY ITEM IN THIS FILE FAILS AT THE BASE COMMIT, WITH ONE NAMED EXCEPTION, AND
+EVERY ITEM IN THIS FILE FAILS AT THE BASE COMMIT, WITH TWO NAMED EXCEPTIONS, AND
 THAT IS THE POINT. At base the converter refused a block table carrying more than
 one row (``neuron_model_runner.py:5136-5141`` at base), so each two-request item
 below raises that refusal instead of reading a value, and the helper-level items
@@ -16,10 +16,12 @@ raise ``AttributeError`` for methods base does not have. An item that passed at
 base would be measuring nothing. THAT REFUSAL IS NOW THE SPARSE FAMILY'S: the walk
 admits a batch, the linear family serves it, and the sparse carrier refuses a
 second request by name because its slice is contiguous -- which is the arm A1's
-fourth item reads. THE EXCEPTION is the prefill-warmup arm of A2,
+fourth item reads. THE FIRST EXCEPTION is the prefill-warmup arm of A2,
 which passes at base BECAUSE base served that step: it is a regression arm, it
 pins the base's behaviour, and it fails on the bytes of this increment's fifth
-commit, which is where review round 1 found the regression.
+commit, which is where review round 1 found the regression. THE SECOND EXCEPTION is
+A5's mapping half: it calls only base code and this file's own tensors, so it passes
+at both ends and is here as a standing property rather than as an arrival.
 
 THE ITEMS HERE, and each names the tripwire it must fail on.
 
@@ -34,13 +36,17 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   (tripwire: the previous commit's walk refused a second row). The SPARSE arm: on a
   hybrid stack the same batch is refused by name at the sparse carrier, which takes
   one contiguous slice of the paged latent bank.
-* A2, FOUR ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
-  over-admission refuses by name; a synthetic step takes no claim; and the prefill
+* A2, SIX ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
+  over-admission refuses by name; a synthetic step takes no claim; the prefill
   WARMUP's own shape, which has no request at all, is served from slot 0 and takes
-  no claim either. Tripwires: a table that never frees cannot seat the later
-  request, one that frees without zeroing fails the zero read, a synthetic step
-  that seated itself changes the table, and a converter that demands an identity
-  from warmup raises where the base served it.
+  no claim either; the per-sequence side caches carry ONE set per admitted sequence
+  and not one per bank slot; and a live request the scheduler skips for one step
+  keeps its slot and its state. Tripwires: a table that never frees cannot seat the
+  later request, one that frees without zeroing fails the zero read, a synthetic step
+  that seated itself changes the table, a converter that demands an identity
+  from warmup raises where the base served it, an allocator sized by the block space
+  reports the bank's slot count as its axis, and a table that frees on absence loses
+  the skipped request's slot and recurrence.
 * A3 -- one request's pooled store and tail ring are byte-unchanged by a step of
   the other request, on both legs. Tripwire: the process-wide allocation, which
   made the two carriers one storage.
@@ -62,10 +68,10 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   therefore a REAL slot; the item asserts that value is inside the addressable range
   before asserting no padded entry lands there.
 
-STILL TO COME IN THIS FILE: A1's carrier-VIEW half, which needs the per-request
-carrier container and arrives with this increment's model-side sliver. A5's
-write-and-read-back clause, the interleaved-vs-sequential differential and the R-3
-seam readings belong to this increment's kernel half.
+STILL TO COME IN THIS FILE: A5's write-and-read-back clause, the
+interleaved-vs-sequential differential and the R-3 seam readings, which belong to
+this increment's kernel half. A1's carrier-VIEW half is no longer among them: it
+landed with the model-side sliver and is the second item below.
 
 WHY THE HARNESS IS RE-AUTHORED HERE rather than imported. The two landed files
 with a converter harness -- ``test_kda_runner_state.py`` and
@@ -108,7 +114,16 @@ DECLARED_REQUESTS = 2
 
 #: The recurrent-state bank's slot count. Four rather than two so that a slot
 #: number can never be confused with a block id or a request index by accident.
+#: THIS IS A PAGING GEOMETRY, not a request axis: on the serving stack it is the
+#: group's KV block count, which is why it is deliberately larger than the bound
+#: below and why no per-sequence cache may be sized by it.
 DECLARED_STATE_SLOTS = 4
+
+#: How many sequences the modelled engine admits at once -- the scheduler's
+#: ``max_num_seqs``, which the runner reads once at construction. Two, so that the
+#: number DIFFERS from the bank's slot count above: an allocation sized by the wrong
+#: one of the two is then visible as a shape rather than passing by coincidence.
+DECLARED_MAX_NUM_SEQS = 2
 
 #: The page. Nothing landed binds a page for a synthetic bank, so this file
 #: declares one and the bank below is built to it; the converter cross-checks the
@@ -261,6 +276,9 @@ def _runner(banks, *, request_ids=None) -> NeuronModelRunner:
         text_config=_text_config(), glm5next_layer_banks=tuple(banks)
     )
     runner.max_model_len = DECLARED_BLOCKS * DECLARED_PAGE_SIZE
+    # THE CONCURRENCY BOUND IS THE SLOT AXIS, so the harness carries it: a runner
+    # without it raises here rather than letting the code fall back to a geometry.
+    runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
     if request_ids is None:
         request_ids = [f"req-{index}" for index in range(DECLARED_REQUESTS)]
     runner.input_batch = SimpleNamespace(req_ids=list(request_ids))
@@ -383,7 +401,13 @@ def _linear_banks(banks) -> list[dict]:
 
 
 def _side_caches(banks):
-    """The indexer's two caches, one set per sparse layer with a slot axis."""
+    """The indexer's two caches, one set per sparse layer with a slot axis.
+
+    THE AXIS HERE IS DECLARED WIDER THAN THE ENGINE'S BOUND, on purpose: items that
+    build carriers directly place two requests at NON-ADJACENT slots, which a
+    two-slot axis could not hold. Which axis the RUNNER chooses is a separate
+    property, read from the runner's own allocator by the item that asks it.
+    """
     return NeuronModelRunner._glm5next_side_caches(
         banks,
         index_kpool=DECLARED_INDEX_KPOOL,
@@ -524,9 +548,8 @@ def test_a3_one_requests_side_caches_are_untouched_by_the_others_step() -> None:
 def test_a1_two_requests_are_assigned_distinct_state_slots() -> None:
     """The slot is the request's identity, not the block table's first block id.
 
-    THIS IS THE SLOT HALF OF A1. The carrier-view half needs the per-request
-    carrier container, which arrives with this increment's model-side sliver after
-    the sibling increment's fold; this item asserts what the runner alone decides.
+    THIS IS THE SLOT HALF OF A1, and it asserts what the runner alone decides; the
+    carrier-view half is the item below it.
 
     THE TRIPWIRE: a table that hands both requests one slot. The assertion is that
     the two slots DIFFER, so such a table fails here rather than downstream where
@@ -549,9 +572,13 @@ def test_a1_two_requests_are_assigned_distinct_state_slots() -> None:
         f"the two requests were handed slots {slots}; two live requests sharing a "
         f"slot means one continues the other's recurrence"
     )
+    # RE-PINNED: the range a slot must lie in. ORIGINAL READING
+    # ``0 <= slot < DECLARED_STATE_SLOTS``, the bank's slot count. NEW VALUE the
+    # engine's concurrency bound, which is the axis the per-sequence caches carry: a
+    # slot at or above it would index those caches out of range.
     for slot in slots:
-        assert 0 <= slot < DECLARED_STATE_SLOTS, (
-            f"slot {slot} is outside the {DECLARED_STATE_SLOTS}-slot bank"
+        assert 0 <= slot < DECLARED_MAX_NUM_SEQS, (
+            f"slot {slot} is outside the {DECLARED_MAX_NUM_SEQS} keyed sequence slot(s)"
         )
     # The mapping is STABLE: asking again inside one request's life returns the
     # same slots, because a slot that moved would abandon the state it holds.
@@ -813,6 +840,14 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
     raised refusal. A table that frees WITHOUT zeroing hands the new owner the last
     one's recurrence, which the zero read fails on -- and the read is only
     meaningful because this item dirties the rows first, which it asserts it did.
+
+    RE-PINNED: WHAT MAKES THE FIRST REQUEST FINISHED. The runner is now TOLD, with
+    the engine's own finished set, and this item tells it. The reading this replaces,
+    verbatim: "A LATER BATCH WITHOUT req-0 IS req-0 FINISHING. Nothing else is told."
+    Absence from a batch is not finishing -- the item below drives that case -- so the
+    old form would now leave the slot held and this item would fail on the reuse read.
+    The property under test did not move: a finished request's slot is reused, and it
+    is zeroed at hand-out.
     """
     _require_cpu_mode()
     banks = _banks()
@@ -855,7 +890,8 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
             f"and the banks read {dirtied}"
         )
 
-    # A LATER BATCH WITHOUT req-0 IS req-0 FINISHING. Nothing else is told.
+    # req-0 FINISHES, and the engine's finished set is what says so.
+    runner._glm5next_note_finished_requests(["req-0"])
     later = runner._glm5next_request_slots(
         banks, ["req-2"], synthetic=False, side_caches=side
     )
@@ -889,22 +925,152 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
 
 
 def test_a2_more_live_requests_than_slots_refuses_by_name() -> None:
-    """The bank is a fixed size, so an over-admission refuses instead of colliding.
+    """The keyed axis is a fixed size, so an over-admission refuses instead of colliding.
 
     Called at the helper rather than through the converter on purpose: an
-    over-admission needs MORE live requests than the bank has slots, and the
+    over-admission needs MORE live requests than the axis keys, and the
     converter's own batch is bounded by the pinned launch shape, so the case is
     only reachable here. The refusal is matched on its own message, not on the
     exception type alone.
+
+    RE-PINNED: the count that bounds it. ORIGINAL READING ``DECLARED_STATE_SLOTS + 1``,
+    the bank's slot count plus one. NEW VALUE ``DECLARED_MAX_NUM_SEQS + 1``: the axis a
+    request occupies is the engine's concurrency bound, so one request past THAT is what
+    over-admission means. The bank still holds more slots than the bound, which is why
+    the old count would no longer reach this refusal first.
     """
     _require_cpu_mode()
     banks = _banks()
     runner = _runner(banks)
-    too_many = [f"req-{index}" for index in range(DECLARED_STATE_SLOTS + 1)]
+    too_many = [f"req-{index}" for index in range(DECLARED_MAX_NUM_SEQS + 1)]
 
-    print(f"KEYED|a2|requested={len(too_many)}|slots={DECLARED_STATE_SLOTS}")
+    print(f"KEYED|a2|requested={len(too_many)}|keyed={DECLARED_MAX_NUM_SEQS}"
+          f"|bank_slots={DECLARED_STATE_SLOTS}")
     with pytest.raises(ValueError, match="has no free slot"):
         runner._glm5next_request_slots(banks, too_many, synthetic=False)
+
+
+def test_a2_the_side_cache_slot_axis_is_the_engines_concurrency_bound() -> None:
+    """The per-sequence caches are sized by ``max_num_seqs``, never by the block space.
+
+    WHY THIS ITEM EXISTS. Both indexer caches hold ONE sequence's state, so their
+    leading axis is how many sequences may hold state at once. The recurrent banks'
+    leading dimension is a paging geometry -- one entry per KV block of the group -- and
+    on the serving stack it is thousands of entries: a per-sequence cache sized by it
+    allocates gigabytes per layer outside the engine's KV budget, at the first warmup
+    step, on a rank whose memory is already committed.
+
+    THE TRIPWIRE, AND WHY IT IS NOT A COINCIDENCE. The harness declares the two numbers
+    DIFFERENT -- two sequences against four bank slots -- so an allocator reading either
+    one is visible in the shape. The item asserts the axis equals the bound AND that it
+    is not the bank's count, and it refuses to run if the harness ever makes the two
+    equal, because then neither assertion could fail.
+
+    THE SIZE IS READ, NOT RESTATED. The row count beside the slot axis is the
+    indexer's own minimum from ``max_model_len``, which this item does not re-derive; it
+    reads only which axis the slots ride on.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    if DECLARED_MAX_NUM_SEQS == DECLARED_STATE_SLOTS:
+        raise VacuousControlError(
+            "this item tells the concurrency bound from the bank's slot count by their "
+            f"shapes, and the harness declares both as {DECLARED_MAX_NUM_SEQS}"
+        )
+
+    live = runner._glm5next_live_side_caches(banks)
+
+    rings = [entry for entry in live if entry]
+    if not rings:
+        raise VacuousControlError(
+            "no bank in this stack carries indexer side caches, so this item has no "
+            "slot axis to read"
+        )
+    axes = [
+        (int(entry["pool_cache"].shape[0]), int(entry["tail"].shape[0]))
+        for entry in rings
+    ]
+    print(f"KEYED|a2|side_cache_axes={axes}|bound={DECLARED_MAX_NUM_SEQS}"
+          f"|bank_slots={DECLARED_STATE_SLOTS}")
+    for pool_axis, tail_axis in axes:
+        assert pool_axis == DECLARED_MAX_NUM_SEQS, (
+            f"the pooled store carries {pool_axis} slot(s) while the engine admits "
+            f"{DECLARED_MAX_NUM_SEQS} concurrent sequence(s)"
+        )
+        assert tail_axis == DECLARED_MAX_NUM_SEQS, (
+            f"the tail ring carries {tail_axis} slot(s) while the engine admits "
+            f"{DECLARED_MAX_NUM_SEQS} concurrent sequence(s)"
+        )
+        assert pool_axis != DECLARED_STATE_SLOTS, (
+            f"the pooled store carries one set per bank slot ({pool_axis}), which is "
+            f"the block space and not a sequence count"
+        )
+
+
+def test_a2_a_request_skipped_for_one_step_keeps_its_slot_and_state() -> None:
+    """Absence from a step's batch is not finishing, and the state must survive it.
+
+    THE CASE. This runner removes a live request from its persistent batch when the
+    scheduler gives it no tokens in a step, and that request keeps its cached state and
+    comes back. A table that freed on absence would hand its slot away, zeroed, while
+    the request was still alive; the request would then return to a slot holding
+    somebody else's recurrence, or to a refusal with its own recurrence gone.
+
+    THE TRIPWIRE, IN TWO HALVES. The skipped request must come back to the SAME slot
+    with its planted state intact -- a free-on-absence table fails on both -- and the
+    second half proves the item is not simply asserting that nothing is ever freed: the
+    same request, once the engine calls it finished, releases the slot.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    both = list(runner.input_batch.req_ids)
+    assert len(both) == DECLARED_REQUESTS
+
+    seated = runner._glm5next_request_slots(banks, both, synthetic=False)
+    skipped, kept = both[0], both[1]
+    skipped_slot = seated[both.index(skipped)]
+    for bank in _linear_banks(banks):
+        bank["recurrent_state"][skipped_slot].fill_(4.0)
+    planted = [
+        bool(bank["recurrent_state"][skipped_slot].any()) for bank in _linear_banks(banks)
+    ]
+    if not all(planted):
+        raise VacuousControlError(
+            "the skipped request's state must be non-zero before the step that skips "
+            f"it, and the banks read {planted}"
+        )
+
+    # THE STEP THAT SKIPS IT. Only the other request is scheduled, and the engine says
+    # nobody finished.
+    runner._glm5next_request_slots(banks, [kept], synthetic=False)
+    returned = runner._glm5next_request_slots(banks, both, synthetic=False)
+
+    survived = [
+        bool(bank["recurrent_state"][skipped_slot].any()) for bank in _linear_banks(banks)
+    ]
+    print(f"KEYED|a2|skipped={skipped}|slot={skipped_slot}|returned={returned}"
+          f"|state_survived={survived}")
+    assert returned[both.index(skipped)] == skipped_slot, (
+        f"request {skipped!r} was skipped for one step and came back to slot "
+        f"{returned[both.index(skipped)]} instead of its own {skipped_slot}"
+    )
+    assert all(survived), (
+        f"request {skipped!r}'s recurrent state was cleared by a step that merely did "
+        f"not schedule it; the banks read {survived}"
+    )
+
+    # AND THE SLOT DOES FREE WHEN THE ENGINE SAYS SO, which is what keeps the half
+    # above from passing on a table that never frees anything.
+    runner._glm5next_note_finished_requests([skipped])
+    runner._glm5next_request_slots(banks, [kept], synthetic=False)
+    table = dict(runner._glm5next_request_slot_table)
+    print(f"KEYED|a2|table_after_finish={table}")
+    assert skipped not in table, (
+        f"request {skipped!r} was finished by the engine and still owns slot "
+        f"{table.get(skipped)}"
+    )
 
 
 def test_a2_a_synthetic_step_takes_no_claim() -> None:

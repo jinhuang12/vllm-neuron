@@ -92,6 +92,9 @@ DECLARED_WINDOW_BLOCKS = 4
 #: Blocks the bank holds. It carries a spare window past the last block a request is
 #: given here, which is the headroom item 3 reads.
 DECLARED_BANK_BLOCKS = 12
+#: How many sequences the modelled engine admits at once, which is the axis the
+#: converter's per-sequence caches carry. One: this file drives one request's shapes.
+DECLARED_MAX_NUM_SEQS = 1
 #: The first block this request is given, deliberately not block 0, so a window that
 #: started at the bank's own base rather than the request's would be visible.
 DECLARED_FIRST_BLOCK = 2
@@ -450,6 +453,10 @@ def _runner(text_config, banks) -> NeuronModelRunner:
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.model = SimpleNamespace(text_config=text_config, glm5next_layer_banks=banks)
     runner.max_model_len = DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE
+    # RE-PINNED: the converter now sizes its per-sequence caches by the engine's
+    # concurrent-sequence bound, so a runner shell must model that bound too. One
+    # sequence is what this file drives.
+    runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
     # The context-parallel width the block-table arithmetic divides by. One is the
     # single-rank case, which is what a shell with no parallel world can honestly say.
     runner._dcp_size = 1
