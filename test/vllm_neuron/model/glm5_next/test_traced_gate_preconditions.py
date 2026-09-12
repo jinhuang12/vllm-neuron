@@ -13,9 +13,10 @@ that tracer as well now.
 A01 is a census of the value reads in the model file and the KDA, attention and MHC
 packages, plus a reading of the predicate's own code. A02 compiles the two KDA seams the
 serving run traces, at prefill and at decode shapes, under the runner's own
-``fullgraph=True``. A03 holds the eager message: an inadmissible gate still names its
-cause where values ARE readable. With ``GLM53F_131_EXPECT_BASE=1`` A01 and A02 assert the
-PRE-REPAIR readings instead, which is this file's control arm.
+``fullgraph=True``, and A04 compiles the KDA layer forward that reaches them. A03 holds
+the eager message: an inadmissible gate still names its cause where values ARE readable.
+With ``GLM53F_131_EXPECT_BASE=1`` A01, A02 and A04 assert the PRE-REPAIR readings
+instead, which is this file's control arm.
 """
 
 from __future__ import annotations
@@ -165,20 +166,21 @@ def decode_operands(gate: float) -> tuple[torch.Tensor, ...]:
     )
 
 
-def traced_call(seam, operands) -> tuple[bool, str, str]:
-    """``(raised, text, scalars)`` for one seam compiled as the worker compiles the model.
+def traced_call(subject, operands, keywords=None) -> tuple[bool, str, str]:
+    """``(raised, text, scalars)`` for one subject compiled as the worker compiles.
 
     Scalar capture is SET rather than assumed: it is what makes ``.item()`` produce a
     symbol instead of breaking the graph, and the reading being reproduced is a serving
-    run that produced one. The value found and the value used are both reported.
+    run that produced one. Neither this fork nor the vLLM it serves under sets it, so the
+    value found here is the torch default and both values are reported.
     """
     found = torch._dynamo.config.capture_scalar_outputs
     torch._dynamo.config.capture_scalar_outputs = True
     torch._dynamo.reset()
-    compiled = torch.compile(seam, backend="eager", fullgraph=True)
+    compiled = torch.compile(subject, backend="eager", fullgraph=True)
     scalars = f"found={found},used=True"
     try:
-        compiled(*operands)
+        compiled(*operands, **(keywords or {}))
     except Exception as error:  # the tracer's refusal is this file's reading
         return True, str(error), scalars
     return False, "", scalars
@@ -232,6 +234,82 @@ def test_a02_the_traced_seams_read_no_gate_value() -> None:
     else:
         for phase, (raised, text, _) in readings.items():
             assert not raised, f"the {phase} seam did not compile: {text}"
+
+
+def _kda_layer_case():
+    """One KDA layer with the landed fixture's own weights, its bank, and its tokens.
+
+    The fixture is imported rather than restated: the layer stack that drives this
+    forward on the CPU is already landed, and a second copy of its weight shapes would
+    drift from it.
+    """
+    from test.vllm_neuron.model.glm5_next import test_kda_layer as stack
+
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    config = Glm5NextTextConfig()
+    hidden = int(config.hidden_size)
+    heads = stack.DECLARED_KDA_NUM_HEADS // stack.REGISTERED_TP_WORLD_SIZE
+    torch.manual_seed(stack.SEED)
+    weights = stack._make_weights(
+        hidden, heads, stack.DECLARED_KDA_HEAD_SIZE, stack.DECLARED_KDA_CONV_KERNEL_SIZE
+    )
+    layer = stack._impl().Glm5NextKDALayer(config, 0, stack.REGISTERED_TP_WORLD_SIZE)
+    for name, tensor in weights.items():
+        target = layer if name == "input_layernorm_weight" else layer.attention
+        setattr(target, name, torch.nn.Parameter(tensor.clone(), requires_grad=False))
+    attention = layer.attention
+    bank = (
+        torch.zeros(attention.kda_conv_state_shape, dtype=attention.kda_conv_state_dtype),
+        torch.zeros(
+            attention.kda_recurrent_state_shape, dtype=attention.kda_recurrent_state_dtype
+        ),
+    )
+    torch.manual_seed(stack.SEED + 1)
+    tokens = torch.randn(
+        stack.DECLARED_PREFILL_TOKENS + 1, hidden, dtype=torch.float32
+    )
+    return layer, bank, tokens, stack.DECLARED_PREFILL_TOKENS, stack.DECLARED_CHUNK
+
+
+def test_a04_the_traced_layer_forward_reads_no_gate_value() -> None:
+    """The layer forward the worker compiles, at prefill and at decode.
+
+    The candidate arm asserts the absence of THIS block's refusal and not the absence of
+    every dynamo limitation: a graph break elsewhere in the layer is a different claim,
+    and the row prints whatever came back so the distinction stays visible.
+    """
+    require_cpu_mode()
+    layer, bank, tokens, prefill, chunk = _kda_layer_case()
+    conv_state, recurrent_state = bank
+
+    def drive(rows: torch.Tensor, is_prefill: bool):
+        return traced_call(
+            layer,
+            (rows,),
+            dict(conv_state=conv_state, recurrent_state=recurrent_state,
+                 is_prefill=is_prefill, chunk_size=chunk),
+        )
+
+    readings = {
+        "prefill": drive(tokens[:prefill], True),
+        "decode": drive(tokens[prefill:prefill + 1], False),
+    }
+    for phase, (raised, text, scalars) in readings.items():
+        say("layer", f"phase={phase}", f"raised={raised}",
+            f"data_dependent={REFUSAL in text}", f"scalar_capture={scalars}",
+            f"text={text.splitlines()[0] if text else 'none'}")
+    if expect_base():
+        for phase, (raised, text, _) in readings.items():
+            assert raised and REFUSAL in text, (
+                f"the {phase} layer forward was expected to refuse on the pre-repair "
+                f"tree with {REFUSAL!r}; read raised={raised} text={text!r}"
+            )
+    else:
+        for phase, (_, text, _) in readings.items():
+            assert REFUSAL not in text, (
+                f"the {phase} layer forward still branched on a traced value: {text}"
+            )
 
 
 def test_a03_an_inadmissible_gate_still_names_its_cause_in_eager() -> None:
