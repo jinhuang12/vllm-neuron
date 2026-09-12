@@ -453,6 +453,23 @@ def _wide_ids():
     )
 
 
+def _where_they_differ(own, reference, index: int, family: str) -> str:
+    """Where two banks of one layer disagree, as a reading: the pages, not just a boolean.
+
+    The first dimension is the page, which is the one axis that means the same thing in
+    every bank this fixture allocates; nothing below reads a slot, because a bank with two
+    KV heads interleaves them under the page and a slot number there names no one row.
+    """
+    unequal = (own != reference).flatten(start_dim=1).any(dim=1).nonzero().flatten()
+    pages = [int(page) for page in unequal[:8]]
+    return (
+        f"INC133|write_diff|layer={index}|family={family}|shape={tuple(own.shape)}"
+        f"|pages={tuple(own.shape)[0]}|pages_that_differ={int(unequal.numel())}"
+        f"|first_pages_that_differ={pages}"
+        f"|elements_that_differ={int((own != reference).sum())}"
+    )
+
+
 def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     """Two runs of one prompt -- padded and not -- must leave the request's pages equal.
 
@@ -482,6 +499,7 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
         for label, width in (("padded", WIDE_PADDED), ("unpadded", WIDE_REAL))
     }
 
+    families = [bank["family"] for bank in root.glm5next_layer_banks]
     for index, (padded, unpadded) in enumerate(zip(written["padded"], written["unpadded"])):
         own = padded[:WIDE_REAL_BLOCKS]
         beyond = padded[WIDE_REAL_BLOCKS:]
@@ -493,6 +511,7 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
             f"|blocks_beyond_the_request={tuple(beyond.shape)[0]}|nonzero_beyond={touched}"
             f"|values_in_its_own_pages={stored}"
         )
+        print(_where_they_differ(own, unpadded[:WIDE_REAL_BLOCKS], index, families[index]))
         # THE POSITIVE CONTROL FIRST. Two banks that were never written are equal to each
         # other, so byte equality alone would pass on a run that stored nothing at all.
         assert stored > 0, (
