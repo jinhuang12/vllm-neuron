@@ -107,8 +107,10 @@ from vllm_neuron.functional.moe.blockwise_fp8_retile import (
     BLOCK_QUANT_SIZE,
     DOWN,
     GATE_UP,
+    I_TILES_PER_BLOCK,
     TILE_SIZE,
     consumer_scale_shape,
+    flat_scale_index,
     is_pow2_exact,
     retile_block_scales,
 )
@@ -587,10 +589,10 @@ def _pow2_checkpoint_scales(seed: int, rows: int, cols: int) -> torch.Tensor:
     """``(E, rows//128, cols//128)`` fp32 scales, every entry an exact power of 2.
 
     Exact powers of two, hence mutually pow2-related within any ``256``-block and
-    each retained block scale itself a power of two: the COMPLETE losslessness
-    condition ``inc-glm53f-024`` part 5 declares. Satisfied by construction here
-    and RE-ASSERTED from the producer's emitted records in
-    :func:`test_moe_path_f1_precondition_complete_condition_n_over_n`.
+    each retained block scale itself a power of two. The routed limbs index this
+    grid as it stands and need no such relation; the property is kept because the
+    ONE item that still coarsens onto the vendor seam's ``256`` grid relies on it
+    to keep its pinned tolerance, and :func:`_vendor_256_pair` says why.
 
     Exponents vary per tile so the scales are DISTINCT: a comparison run on
     uniform scales cannot see a permuted scale layout.
@@ -618,6 +620,68 @@ def _fp8_grid_values(seed: int, *shape: int) -> torch.Tensor:
     return torch.randint(1, 8, shape, generator=generator).to(torch.float32) / 8.0
 
 
+def _vendor_256_pair(
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    projection: str,
+    gate_or_up: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The vendor seam's ``256``-granular pair, coarsened HERE and by no module.
+
+    The vendor matmul carries one scale per ``256x256`` block, so a checkpoint's
+    ``[128, 128]`` grid reaches it only through a mapping: keep one tile's scale
+    per block and re-express the other three tiles' weight bytes against it,
+    ``w * s_tile / s_kept``. No module in this tree performs that mapping any
+    more -- the routed limbs index the checkpoint grid directly -- so the seam's
+    fixture is built here, beside the one item that measures the seam.
+
+    This fixture's scales are powers of two, so every ratio is exact in fp8 and
+    the coarsened pair dequantises to the same product as the checkpoint pair.
+    That is what lets that item keep the tolerance it was pinned with.
+
+    Slots outside ``gate_or_up``'s half are left NaN, so an unwritten slot
+    poisons its consumer instead of passing quietly.
+
+    Returns:
+        The rescaled fp8 weight in the input's own axis order, and the flat
+        ``(E, n_blocks * TILE_SIZE)`` scale tensor the seam consumes.
+    """
+    experts, rows, cols = weights.shape
+    h_256, i_256 = rows // BLOCK_QUANT_SIZE, cols // BLOCK_QUANT_SIZE
+    flat = torch.full(
+        consumer_scale_shape(experts, rows, cols, projection),
+        float("nan"),
+        dtype=torch.float32,
+    )
+    rescaled = weights.to(torch.float32).clone()
+    for expert in range(experts):
+        for h_tile in range(rows // TILE_SIZE):
+            for i_tile in range(cols // TILE_SIZE):
+                kept = float(
+                    scales[
+                        expert,
+                        h_tile - h_tile % I_TILES_PER_BLOCK,
+                        i_tile - i_tile % I_TILES_PER_BLOCK,
+                    ]
+                )
+                ratio = float(scales[expert, h_tile, i_tile]) / kept
+                window = (
+                    expert,
+                    slice(h_tile * TILE_SIZE, (h_tile + 1) * TILE_SIZE),
+                    slice(i_tile * TILE_SIZE, (i_tile + 1) * TILE_SIZE),
+                )
+                rescaled[window] = (rescaled[window] * ratio).to(_FP8).to(torch.float32)
+                block = flat_scale_index(
+                    h_tile, i_tile, h_256, i_256, projection, gate_or_up
+                )
+                flat[expert, block * TILE_SIZE : (block + 1) * TILE_SIZE] = kept
+    assert bool(torch.isfinite(rescaled).all()), (
+        "a rescaled byte left the fp8 range, so this fixture measures saturation "
+        "rather than the seam"
+    )
+    return rescaled.to(_FP8), flat
+
+
 def _build_case() -> dict:
     """The tiny config in the form the CALL SITE takes -- not the seam's form.
 
@@ -628,13 +692,13 @@ def _build_case() -> dict:
       ``[T+1, H]``);
     * ``[T, E]`` scattered router scores -- the call site flattens and masks
       them through ``build_blockwise_mapping``, not ``[(T+1)*E, 1]``;
-    * FLAT consumer scales as ``inc-glm53f-024``'s producer emits them -- the
-      call site bridges them to the kernel's logical view.
+    * FLAT consumer scales in the vendor seam's own form -- the call site
+      bridges them to the kernel's logical view.
     """
-    # --- gate/up: the producer runs per fusion half, on (E, H, I_TP). ------- #
+    # --- gate/up: the mapping runs per fusion half, on (E, H, I_TP). -------- #
     # The two halves are merged in the FLAT domain, which is legitimate because
     # ``moe_to_kernel_scale_layout`` is a documented C-order reshape
-    # (``moe_blockwise_fp8.py:170-206``): a ``view`` onto the logical shape
+    # (``moe_to_kernel_scale_layout``'s own docstring): a ``view`` onto the shape
     # addresses exactly the elements that reshape would.
     gup_flat = torch.full(
         consumer_scale_shape(E, H, I_TP, GATE_UP), float("nan"), dtype=torch.float32
@@ -642,29 +706,27 @@ def _build_case() -> dict:
     gup_logical_view = gup_flat.view(*kernel_scale_shape(E, H, I_TP, GATE_UP))
     gup_weight = torch.empty((E, H, 2, I_TP), dtype=torch.float32)
     # The bytes and the grid the CAMPAIGN limbs consume: the checkpoint's own, never
-    # retiled. The retiled pair beside them is the producer's, and two items in this
-    # file are about the producer.
+    # coarsened. The coarsened pair beside them is the vendor seam's, and one item in
+    # this file is about that seam.
     gup_original = torch.empty((E, H, 2, I_TP), dtype=torch.float32)
     gup_grid = torch.empty(
         (E, H // TILE_SIZE, 2, I_TP // TILE_SIZE), dtype=torch.float32
     )
-    gup_results = []
     for gate_or_up, (weight_seed, scale_seed) in enumerate(
         ((WEIGHT_SEED_GATE, SCALE_SEED_GATE), (WEIGHT_SEED_UP, SCALE_SEED_UP))
     ):
         checkpoint = _pow2_checkpoint_scales(scale_seed, H, I_TP)
         weights = _fp8_grid_values(weight_seed, E, H, I_TP)
-        result = retile_block_scales(
-            weights.to(_FP8), checkpoint, projection=GATE_UP, gate_or_up=gate_or_up
+        retiled_weights, consumer_scales = _vendor_256_pair(
+            weights.to(_FP8), checkpoint, GATE_UP, gate_or_up
         )
-        gup_results.append(result)
-        gup_weight[:, :, gate_or_up, :] = result.retiled_weights.to(torch.float32)
+        gup_weight[:, :, gate_or_up, :] = retiled_weights.to(torch.float32)
         gup_original[:, :, gate_or_up, :] = weights
         gup_grid[:, :, gate_or_up, :] = checkpoint
         bridged = moe_to_kernel_scale_layout(
-            result.consumer_scales, E, H, I_TP, projection=GATE_UP
+            consumer_scales, E, H, I_TP, projection=GATE_UP
         )
-        # The producer writes only THIS half's slots and leaves the other half
+        # The mapping writes only THIS half's slots and leaves the other half
         # NaN on purpose, so take this half's slice. Merging the two is the
         # weight loader's step in production; here it is the fixture's.
         gup_logical_view[:, :, gate_or_up, :, :] = bridged[:, :, gate_or_up, :, :]
@@ -679,23 +741,20 @@ def _build_case() -> dict:
             f"the call site, is wrong"
         )
 
-    # --- down: the producer's ``rows`` is the H axis and ``cols`` the I axis, --
-    # --- so the physically-[E, I_TP, H] weight is retiled in (E, H, I_TP) view.
+    # --- down: the mapping's ``rows`` is the H axis and ``cols`` the I axis, ---
+    # --- so the physically-[E, I_TP, H] weight is coarsened in (E, H, I_TP).
     down_checkpoint = _pow2_checkpoint_scales(SCALE_SEED_DOWN, H, I_TP)
     down_weight_hi = _fp8_grid_values(WEIGHT_SEED_DOWN, E, H, I_TP)
-    down_result = retile_block_scales(
-        down_weight_hi.to(_FP8), down_checkpoint, projection=DOWN
+    down_retiled, down_flat = _vendor_256_pair(
+        down_weight_hi.to(_FP8), down_checkpoint, DOWN
     )
-    down_flat = down_result.consumer_scales
     if not bool(torch.isfinite(down_flat).all()):
         raise VacuousControlError(
-            "down-projection scale slots contain NaN; a single producer call "
-            "covers every DOWN slot, so this is a producer contract change"
+            "down-projection scale slots contain NaN; one mapping pass covers "
+            "every DOWN slot, so a NaN here is a fixture defect"
         )
     # Back to the kernel's physical [E, I_TP, H].
-    down_weight = (
-        down_result.retiled_weights.to(torch.float32).transpose(1, 2).contiguous()
-    )
+    down_weight = down_retiled.to(torch.float32).transpose(1, 2).contiguous()
 
     # --- activations and router scores, in the call site's own form. -------- #
     hidden = _fp8_grid_values(HIDDEN_SEED, T, H).to(torch.bfloat16)
@@ -732,8 +791,6 @@ def _build_case() -> dict:
         "down_logical": moe_to_kernel_scale_layout(
             down_flat, E, H, I_TP, projection=DOWN
         ),
-        "gup_results": gup_results,
-        "down_result": down_result,
     }
 
 
@@ -2385,60 +2442,6 @@ def test_moe_path_colliding_helper_names_are_not_flat_exported() -> None:
                     f"{label} has attribute {name!r}, which resolves one of two "
                     f"different-arity definitions by import order"
                 )
-
-
-# ===========================================================================
-# Preconditions and fixture conditioning.
-# ===========================================================================
-def test_moe_path_f1_precondition_complete_condition_n_over_n() -> None:
-    """Both losslessness conjuncts hold on THIS case's scales, N/N blocks.
-
-    Conjunct 1: the constituent ``[128, 128]`` scales are mutually
-    power-of-two-related. Conjunct 2: the retained ``256``-block scale is itself
-    a power of two. Both by the BIT-PATTERN predicate ``is_pow2_exact``, never
-    ``log2``. Recomputed from the producer's emitted records rather than read
-    off its own ``lossless`` flag, so this is an independent instrument.
-
-    The declared tolerance certifies KERNEL error only when both conjuncts hold;
-    if they did not, the comparison would be measuring the retile's remapping
-    loss and the tolerance would be answering the wrong question.
-    """
-    case = _build_case()
-    banks = [
-        (f"gate_up[g={index}]", result)
-        for index, result in enumerate(case["gup_results"])
-    ] + [("down", case["down_result"])]
-
-    total = 0
-    lossless = 0
-    for label, result in banks:
-        if not result.records:
-            raise VacuousControlError(
-                f"{label}: the producer emitted 0 block records, so an N/N "
-                f"reading would be 0/0 -- vacuous"
-            )
-        for record in result.records:
-            total += 1
-            conjunct1 = all(is_pow2_exact(ratio) for ratio in record.ratios)
-            conjunct2 = is_pow2_exact(record.block_scale)
-            if conjunct1 and conjunct2:
-                lossless += 1
-            else:
-                raise F1PreconditionError(
-                    f"{label} block {record.key}: conjunct1={conjunct1} "
-                    f"ratios={record.ratios} conjunct2={conjunct2} "
-                    f"block_scale={record.block_scale!r}"
-                )
-        assert result.inexact_rescales == 0, (
-            f"{label}: inexact_rescales={result.inexact_rescales}, declared 0"
-        )
-        assert result.input_scales_dropped == 0, (
-            f"{label}: input_scales_dropped={result.input_scales_dropped}, "
-            f"declared 0"
-        )
-    print(f"[f1] complete_condition_blocks={lossless}/{total} (N/N required)")
-    assert total > 0
-    assert lossless == total
 
 
 def test_moe_path_fixture_conditioning_is_measured_not_assumed() -> None:

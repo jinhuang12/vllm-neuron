@@ -1752,18 +1752,17 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
             f"prepare_scale_operands built {built} operands and the bank's forward "
             f"looks up 4"
         )
-    # ONLY THE THIRD COUNT IS ASSERTED, and the other two are reported. The producer
-    # writes ONE fusion half per call and leaves the other unwritten, so a nonzero
-    # ``emitted_unsupplied`` on gate and up is the arrangement working rather than
-    # failing. ``inexact_rescales`` is the one this fixture's exact-power-of-two premise
-    # predicts to be zero, and it is the reading that says the widening from TILE_SIZE
-    # to BLOCK_QUANT_SIZE lost nothing.
+    # ONLY THE THIRD COUNT IS ASSERTED, and the other two are reported. The publisher
+    # emits the grid it was handed, so all three counts are zero by absence: there is
+    # no coarser layout to leave a slot unwritten in, no input scale to drop and no
+    # rescale to be inexact. Asserting the third one keeps a reader on the load path
+    # that would notice a producer starting to rescale again.
     inexact = {bank: counts[2] for bank, counts in health.items() if counts[2]}
     if inexact:
         raise VacuousControlError(
-            f"the retile reports inexact rescales {inexact}; this fixture's scales are "
-            f"exact powers of two uniform inside every 256-block, so a nonzero count "
-            f"means the widening is not the one this reference models"
+            f"the publisher reports inexact rescales {inexact}; it emits the "
+            f"checkpoint's own grid and rescales nothing, so a nonzero count means a "
+            f"remapping has come back onto the load path"
         )
 
     reference = _routed_output(
