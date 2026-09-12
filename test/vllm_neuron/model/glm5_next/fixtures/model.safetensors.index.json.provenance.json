@@ -1,0 +1,19 @@
+{
+  "fixture": "model.safetensors.index.json",
+  "fixture_form": "BYTE-IDENTICAL COPY",
+  "source_url": "https://huggingface.co/zai-org/GLM-5.3-Flash/raw/main/model.safetensors.index.json",
+  "source_artifact": "artifacts/run/external-review-20260902/hf-model.safetensors.index.json",
+  "upstream_repo": "zai-org/GLM-5.3-Flash",
+  "upstream_revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+  "upstream_revision_proof": "artifacts/run/intake-preflight/03-glm53flash-weights.md L28 and L45 record main == this sha at fetch time (lastModified 2026-08-27T10:33:43.000Z), and L56 records this file at 8406613 bytes under that sha, which is this fixture's own byte count",
+  "upstream_revision_caveat": "the fetch used the ref 'main' rather than the sha, and the run's verification.json records no per-fetch commit id; the sha above is the intake artifact's reading of what main resolved to, corroborated by the byte count only",
+  "sha256": "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05",
+  "bytes": 8406613,
+  "holds_weights": false,
+  "contents": "one weight_map object (76108 checkpoint-key-to-shard entries over 62 shards) and one metadata.total_size field",
+  "landed_whole_because": "inc-glm53f-078's acceptance is a k/N over the complete key set, so any trim would need its own trimming rule verified before the coverage number meant anything",
+  "note": "ZERO network access was used to build this file; it was copied from the run's own review artifact.",
+  "landed_by": "inc-glm53f-078",
+  "design_entry_id": "design-20260902-h",
+  "pinned_by": "inc-glm53f-078 acceptance conjunct (h) -- the sha256 and byte count above are read off this file in the test and compared to the vendor's own numbers, so a later hand cannot quietly edit this fixture to make a comparison pass"
+}

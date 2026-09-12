@@ -5,7 +5,7 @@ The kernel consumes ``nl.float8_e4m3fn_x4``, which is 4 ``float8_e4m3fn``
 bytes packed little-endian into one 32-bit element. ``torch`` lacks an
 ``x4`` dtype, so we store packed weights as ``torch.uint32``; the in-kernel
 wrapper reinterprets the dtype back to ``nl.float8_e4m3fn_x4`` (mirroring
-``vllm_neuron/functional/moe/moe_block_tkg_wrapper.py:71-78``).
+``vllm_neuron/functional/moe/moe_block_tkg_wrapper.py:67-70``).
 """
 
 import torch

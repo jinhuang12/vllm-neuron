@@ -1,0 +1,592 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The carrier geometry of a GLM-5.3-Flash step comes from the host, not from a device tensor.
+
+THE DECLARED ACCEPTANCE:
+
+    VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 \\
+      NEURON_PLATFORM_TARGET_OVERRIDE=trn2 python -m pytest \\
+      test/vllm_neuron/model/glm5_next/test_host_geometry_119.py -s -rA \\
+      -p no:randomly -p no:cacheprovider
+
+Seven items, one test each, no ``parametrize``.
+
+WHAT THIS FILE IS ABOUT. ``NeuronModelRunner._glm5next_model_kwargs`` decides which cache
+pages a step occupies before the traced call runs. It used to read those numbers off
+``attn_metadata``'s device tensors with ``int()``, which is ``Tensor.item()``. Under
+``VLLM_NEURON_CPU_COMPILE`` the whole batch lives on ``meta``
+(``neuron_worker.py:500-501``), where a value does not exist, so every prefill graph
+extraction raised. The numbers now come from the entry's ``host_num_computed_tokens`` and
+``host_block_table``, which both metadata builders fill from the runner's own host arrays.
+
+THE SIX HOST-GEOMETRY ITEMS
+
+* A01 -- a captured step. The metadata is built the way ``_build_warmup_attention_metadata``
+  builds it, with every device tensor and every bank on ``meta``, and the converter must
+  produce carriers. This item is the one the failed hardware run reproduces: at the base it
+  raises ``Tensor.item() cannot be called on meta tensors``.
+* A02 -- the source, made visible. The host row and the device row name DIFFERENT pages, and
+  the slice the layer receives must be the host row's. At the base the slice follows the
+  device row.
+* A03 -- the request count. The device block table carries the padded row count and the host
+  arrays carry the batch's own. At the base the padded count is read as the batch and a
+  single request is refused as four.
+* A04 -- the rule made mechanical. A device tensor placed under a host key is refused BY NAME
+  rather than converted, so a call site written later cannot reintroduce the defect quietly.
+* A05 -- the view rule, and the base-passing control. The slice handed to a layer spans whole
+  pages from the request's first page, covers ``start_position + tokens``, and is an ALIAS of
+  the bank rather than a copy. This item reads the same at the base, because it is about the
+  rule the converter has always implemented rather than about the source it reads.
+* A06 -- the second host read on the same path. Every MLA layer of every step calls
+  ``mla_sparse_attention`` (``model_fp8.py:6873``), whose range refusal read the selected-row
+  range with ``int(...)``. The seam now reaches its dispatch on a captured step's own
+  carrier; at the base it raises the same meta read, one seam further along than A01.
+
+THE WIDTH ITEM, ON THE SAME CONVERTER
+
+* B01 -- the width a recurrent row arrives at. Both metadata builders hand every cache group
+  the group's own padded row, so a recurrent bank's row is as wide as the table and the one
+  slot the scheduler gave it is the row's first entry. The converter must serve such a row
+  from that entry. This item reads the same at the base, because the base checks no width
+  either; it is here to hold this candidate's own width rule to the shape the runner builds.
+
+THE BASE ARM, DECLARED: A01, A02, A03, A04 and A06 FAIL; A05 and B01 PASS.
+
+RE-PINNED AFTER THE PAGED-WINDOW WORK. The converter hands a layer a window whose length is
+the leg's bucket span, so the view is WIDER than the step's own pages and the position
+arrives as a tensor rather than an int. Five readings moved: the three view lengths in A01,
+A02 and A03, and the position reads in A01 and A06, which asked a ``meta`` tensor for a value
+it does not hold. Each original is quoted verbatim where it was replaced. A05 keeps its
+base-passing arm on purpose -- it pins whole pages and coverage rather than the exact length,
+which the window's own acceptance file measures.
+
+CONVENTIONS. The runner is stood up with ``__new__`` and given only the attributes the
+converter reads, which is this campaign's landed harness shape
+(``test_kda_runner_state.py:209-228``). No layer is driven here: every carrier under
+assertion is the one the runner decided to build.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+
+# ---------------------------------------------------------------------------
+# Declared values. Small, and each one named where it is used.
+# ---------------------------------------------------------------------------
+
+#: Slots per page. Four is the tiny fixture's KV page (``test_tiny_glm5next_e2e.py``).
+PAGE = 4
+
+#: The latent bank: pages, and the width one slot holds.
+BANK_PAGES = 32
+LATENT_WIDTH = 8
+
+#: Recurrent state slots in the linear-attention bank. The converter reads a state slot as
+#: the first block id of the row, so the bank must be wide enough for the rows below.
+STATE_SLOTS = 8
+
+#: A single-token step is a decode and anything longer is a prefill.
+DECODE_THRESHOLD = 1
+
+#: The longest sequence the harness admits, which is what the side-cache allocator bounds
+#: its pooled store by (``neuron_model_runner.py:4917-4921``).
+MAX_MODEL_LEN = BANK_PAGES * PAGE
+
+
+def _window_slots(row) -> int:
+    """The carrier view's length for an entry ``_entry`` built from ``row``.
+
+    The converter hands a layer a window whose length is the LEG's bucket span capped by
+    the declared blocks per sequence, and no longer this step's own pages. Every entry in
+    this file declares both numbers off the same row -- the blocks per sequence is the row's
+    width and the segment is that width in slots -- so the span always reaches the cap and
+    the window is the row's whole width. That is one number per item and it does not move
+    with the position, which is the property the window exists to give.
+    """
+    return len(row) * PAGE
+
+
+def _text_config() -> SimpleNamespace:
+    """The four config fields the converter reads, and nothing else."""
+    return SimpleNamespace(
+        index_kpool=4,
+        index_head_dim=LATENT_WIDTH,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=8,
+    )
+
+
+def _sparse_bank(device: torch.device) -> dict:
+    """One sparse-attention bank, in the shape ``bind_kv_cache`` leaves on the model.
+
+    The four keys are the ones the carrier builder reads for this family
+    (``neuron_model_runner.py:5016-5026``): the name it is looked up by, the family that
+    selects the branch, the page its bank is cut into, and the bank flattened over pages and
+    slots, which is the sequence view the layers take.
+    """
+    latent = torch.zeros(
+        (BANK_PAGES * PAGE, 1, LATENT_WIDTH), dtype=torch.bfloat16, device=device
+    )
+    return {
+        "name": "model.layers.0.self_attn",
+        "family": "self_attn",
+        "block_size": PAGE,
+        "latent_cache": latent,
+    }
+
+
+def _linear_bank(device: torch.device) -> dict:
+    """One linear-attention bank, whose carrier is a slot of each state tensor."""
+    return {
+        "name": "model.layers.1.attention",
+        "family": "linear_attn",
+        "state_slots": STATE_SLOTS,
+        "conv_state": torch.zeros(
+            (STATE_SLOTS, 4, 6), dtype=torch.bfloat16, device=device
+        ),
+        "recurrent_state": torch.zeros(
+            (STATE_SLOTS, 2, 6, 6), dtype=torch.float32, device=device
+        ),
+    }
+
+
+def _runner(banks) -> NeuronModelRunner:
+    """A runner carrying only what the converter reads.
+
+    Building it with ``__new__`` keeps every other attribute absent, so a converter that
+    started reading something new would raise here rather than quietly find a stand-in.
+    """
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.model = SimpleNamespace(
+        text_config=_text_config(), glm5next_layer_banks=tuple(banks)
+    )
+    runner.max_model_len = MAX_MODEL_LEN
+    return runner
+
+
+def _entry(
+    *,
+    host_row,
+    host_cached: int,
+    device_row,
+    device_cached: int,
+    tokens: int,
+    device: torch.device,
+) -> dict:
+    """One KV-cache group's metadata entry, with its host and device halves set apart.
+
+    THE KEYS ARE THE RUNNER'S OWN, read off the mapping it builds at
+    ``neuron_model_runner.py:4418-4442``. The two halves are given separately here because
+    that is the whole measurement: in the runner they carry the same numbers, and an item
+    that sets them apart shows which half the converter read.
+    """
+    device_table = torch.tensor(
+        [[int(value) for value in row] for row in device_row],
+        dtype=torch.int32,
+        device=device,
+    )
+    return {
+        "block_table_tensor": device_table,
+        "full_block_table_tensor": device_table,
+        "slot_mapping": torch.arange(tokens, dtype=torch.int32, device=device),
+        "max_query_len": int(tokens),
+        "block_size": PAGE,
+        "max_blocks_per_seq": int(device_table.shape[1]),
+        "decode_token_threshold": DECODE_THRESHOLD,
+        "cached_seq_len": torch.tensor(
+            [[int(device_cached)]], dtype=torch.int32, device=device
+        ),
+        "host_block_table": host_row,
+        "host_num_computed_tokens": host_cached,
+        "kv_segment_size": int(device_table.shape[1]) * PAGE,
+    }
+
+
+def _kwargs(banks, entry, *, tokens: int, device: torch.device) -> dict:
+    """The generic mapping a call site hands the converter, at this step's token count."""
+    return {
+        "input_ids": torch.ones(tokens, dtype=torch.int32, device=device),
+        "attn_metadata": {str(bank["name"]): entry for bank in banks},
+        "sampling_positions": torch.zeros(1, dtype=torch.int32, device=device),
+    }
+
+
+def _open_ring_at(runner, banks, position: int) -> None:
+    """Stand the live indexer ring up and declare which position it holds.
+
+    A prefill at position 0 opens the ring inside the converter. A step that continues a
+    sequence is refused unless the ring already stands at its position
+    (``neuron_model_runner.py:5339-5346``), so an item at a non-zero position hands the
+    runner the same two attributes the previous step would have left.
+    """
+    runner._glm5next_side_cache_set = NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=int(_text_config().index_kpool),
+        index_head_dim=int(_text_config().index_head_dim),
+        max_seq_len=MAX_MODEL_LEN,
+    )
+    runner._glm5next_side_cache_cursor = int(position)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A01. A captured step: every device tensor and every bank on ``meta``.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
+    """The graph-extraction world, which is where the hardware run stopped.
+
+    Warmup declares a cached length of 0, one row, and this bucket's own pages
+    (``neuron_model_runner.py:4373-4380``, ``neuron_model_runner.py:4431-4442``). The device
+    half is on ``meta``, where reading a value is impossible; the host half is the array the
+    runner already holds.
+    """
+    meta = torch.device("meta")
+    banks = [_sparse_bank(meta), _linear_bank(meta)]
+    runner = _runner(banks)
+    tokens = 8
+    host_row = [0, 1, 2, 3]
+    entry = _entry(
+        host_row=[host_row],
+        host_cached=[0],
+        device_row=[[0, 1, 2, 3]],
+        device_cached=0,
+        tokens=tokens,
+        device=meta,
+    )
+
+    translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=meta))
+
+    carriers = translated["layer_carriers"]
+    assert len(carriers) == 2
+    sparse, linear = carriers
+    # RE-PINNED: the view's length is the window's, not this step's pages, because a length
+    # that follows the position is a new graph at every step. The reading this
+    # replaces, verbatim: "Eight tokens at position 0 occupy two pages of four" —
+    # `assert int(sparse["latent_cache"].shape[0]) == 2 * PAGE`. Those two pages are still
+    # the ones this step writes, and they are the front of the window, so the second line
+    # keeps the original claim.
+    assert int(sparse["latent_cache"].shape[0]) == _window_slots(host_row)
+    assert int(sparse["latent_cache"].shape[0]) >= 2 * PAGE
+    # RE-PINNED: the position arrives as a tensor -- for the window's own reason, that a
+    # host number here is baked into the graph it was captured with -- and this item's
+    # carrier is on `meta`, where a value does not exist to be read. The reading this
+    # replaces, verbatim:
+    # `assert int(sparse["start_position"]) == 0`. What `meta` does answer is the operand's
+    # form, which is what a captured graph depends on; the VALUE is read where it is
+    # readable, on the continuing CPU step in A05.
+    assert tuple(sparse["start_position"].shape) == ()
+    assert sparse["start_position"].dtype == torch.int32
+    assert sparse["start_position"].device.type == "meta"
+    assert sparse["latent_cache"].device.type == "meta"
+    # The linear layer's carrier is the bank's slot, which the row's first id names.
+    assert tuple(linear["conv_state"].shape) == (4, 6)
+    # RE-PINNED for the same reason -- a host number at this boundary is a captured
+    # constant -- replacing `assert int(linear["start_position"]) == 0`.
+    assert tuple(linear["start_position"].shape) == ()
+    assert linear["start_position"].device.type == "meta"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A02. Which half the converter read, made visible by making the halves disagree.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a02_the_host_row_is_the_one_the_slice_follows() -> None:
+    """A serving-shaped step whose two halves name different pages.
+
+    The host row names pages 4 and 5 of the bank; the device row names pages 500 and 501,
+    which the bank does not have. A slice taken from the device row is empty, so the item
+    reads the difference rather than inferring it.
+    """
+    cpu = torch.device("cpu")
+    banks = [_sparse_bank(cpu)]
+    runner = _runner(banks)
+    tokens = 6
+    host_row = [4, 5, 6, 7]
+    entry = _entry(
+        host_row=[host_row],
+        host_cached=[0],
+        device_row=[[500, 501, 502, 503]],
+        device_cached=0,
+        tokens=tokens,
+        device=cpu,
+    )
+
+    translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
+
+    carrier = translated["layer_carriers"][0]
+    # RE-PINNED: the length is the window's, which is one number for every position in the
+    # bucket where the step's own pages were a different number each step. The reading
+    # this replaces, verbatim: "Six
+    # tokens at position 0 occupy two pages, and they are the host row's first two" —
+    # `assert int(carrier["latent_cache"].shape[0]) == 2 * PAGE`. Which row the view follows
+    # is what this item measures, and the pointer line below is what measures it.
+    assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)
+    bank = banks[0]["latent_cache"]
+    assert carrier["latent_cache"].data_ptr() == bank[4 * PAGE].data_ptr()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A03. The batch's own row count, not the padded one.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a03_a_padded_device_table_does_not_decide_the_request_count() -> None:
+    """One request, in a device table padded to four rows.
+
+    ``_build_attention_metadata`` sizes its device tensors by ``padded_num_reqs`` and its host
+    arrays by ``num_reqs`` (``neuron_model_runner.py:4237-4244``). A padding row names no
+    request, so reading the padded height as the batch refuses a step that is single.
+    """
+    cpu = torch.device("cpu")
+    banks = [_sparse_bank(cpu)]
+    runner = _runner(banks)
+    tokens = 4
+    host_row = [0, 1]
+    entry = _entry(
+        host_row=[host_row],
+        host_cached=[0],
+        device_row=[[0, 1], [0, 0], [0, 0], [0, 0]],
+        device_cached=0,
+        tokens=tokens,
+        device=cpu,
+    )
+
+    translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
+
+    # RE-PINNED: the length is the window's, which for this two-entry row is two pages, and
+    # it is that length at every position rather than at this one. The
+    # reading this replaces, verbatim:
+    # `assert int(translated["layer_carriers"][0]["latent_cache"].shape[0]) == PAGE`. What
+    # this item measures is that the step was NOT refused as a four-request batch, and a
+    # carrier that exists at all is that reading.
+    carrier = translated["layer_carriers"][0]
+    assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A04. The rule, mechanical: a device tensor under a host key is refused.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a04_a_device_tensor_under_a_host_key_is_refused_by_name() -> None:
+    """The refusal that keeps the rule true for a call site written later.
+
+    Converting the tensor instead would be the defect again, one lap removed: it reads on
+    CPU and raises inside a capture.
+    """
+    cpu = torch.device("cpu")
+    banks = [_sparse_bank(cpu)]
+    runner = _runner(banks)
+    tokens = 4
+    entry = _entry(
+        host_row=[[0, 1]],
+        host_cached=[0],
+        device_row=[[0, 1]],
+        device_cached=0,
+        tokens=tokens,
+        device=cpu,
+    )
+    entry["host_block_table"] = torch.zeros(
+        (1, 2), dtype=torch.int32, device=torch.device("meta")
+    )
+
+    with pytest.raises(ValueError) as refused:
+        runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
+
+    message = str(refused.value)
+    assert "host_block_table" in message
+    assert "meta" in message
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A05. The view rule, and the control that passes at the base.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
+    """The rule the converter implements, read back off one continuing step.
+
+    THE RULE. The slice spans the whole pages the request's own tokens occupy, counted from
+    the request's first page: ``ceil((start_position + tokens) / page)`` pages. It therefore
+    covers ``start_position + tokens`` slots, which is the bound the layer checks before it
+    writes (``model_fp8.py:6840-6845``), and its rows are the request's own.
+
+    WHY THE ALIAS MATTERS. The layer writes this step's latents THROUGH the slice
+    (``model_fp8.py:6855``) and reads slot 0 to the last written slot back out of it
+    (``model_fp8.py:6859``). A basic slice is a view, so both land in the bank. A gather
+    would return a copy, and the write would be discarded where the next step reads.
+
+    RE-PINNED. The length is now the bucket's window and the read is the whole of it,
+    because the old length was derived from the position and therefore held only for the
+    step it was captured at. The
+    rule this replaces, verbatim: "The slice spans the whole pages the request's own tokens
+    occupy, counted from the request's first page: ``ceil((start_position + tokens) / page)``
+    pages. It therefore covers ``start_position + tokens`` slots, which is the bound the
+    layer checks before it writes". Every clause of it that this item can still read is
+    still read below: the view starts at the request's first page, it COVERS the step's own
+    slots, and it aliases the bank. What changed is that covering is no longer exactness --
+    a length that tracked the position is what pinned a captured graph to one position.
+    """
+    cpu = torch.device("cpu")
+    banks = [_sparse_bank(cpu)]
+    runner = _runner(banks)
+    cached, tokens = 5, 6
+    _open_ring_at(runner, banks, cached)
+    entry = _entry(
+        host_row=[[4, 5, 6, 7, 8]],
+        host_cached=[cached],
+        device_row=[[4, 5, 6, 7, 8]],
+        device_cached=cached,
+        tokens=tokens,
+        device=cpu,
+    )
+
+    translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
+
+    carrier = translated["layer_carriers"][0]
+    view = carrier["latent_cache"]
+    pages = -(-(cached + tokens) // PAGE)
+    assert pages == 3
+    # RE-PINNED: `assert int(view.shape[0]) == pages * PAGE` became the two clauses of that
+    # reading which survive the window -- whole pages, and enough of them for this step.
+    # `pages` counts THIS step's, and a length counted that way moves as the step does.
+    # The EXACT length is the window's now and belongs to the item that measures the window;
+    # pinning it here would also cost this item its base-passing arm, which is the whole
+    # reason it is in the file.
+    assert int(view.shape[0]) % PAGE == 0
+    assert int(view.shape[0]) >= pages * PAGE
+    # The layer's own bound: the step's last slot is inside the slice it was handed.
+    assert int(view.shape[0]) >= cached + tokens
+    # The position's VALUE, read here because this item's carrier is on CPU: A01's is on
+    # `meta`, where the tensor has a form but no value.
+    assert int(carrier["start_position"]) == cached
+    # The slice starts at the request's first page, and it is the bank's own storage.
+    bank = banks[0]["latent_cache"]
+    assert view.data_ptr() == bank[4 * PAGE].data_ptr()
+    view[cached : cached + tokens, 0, :] = 1.0
+    assert bool(bank[4 * PAGE + cached].eq(1.0).all())
+    assert bool(bank[4 * PAGE + cached - 1].eq(0.0).all())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A06. The attention seam reaches its dispatch on a captured step's carrier.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
+    """A precondition that reads values cannot run where values do not exist.
+
+    ``mla_sparse_attention`` refused an out-of-range selected row by reading the row range
+    with ``int(...)`` (``mla_sparse.py:1411``), which is the same call the converter used to
+    make and which a ``meta`` tensor cannot answer. Every MLA layer of every step goes
+    through that seam (``model_fp8.py:6873``, unconditionally), so a captured prefill reached
+    it and stopped there.
+
+    WHAT THIS ITEM MEASURES AND WHAT IT DOES NOT. It measures that the call gets PAST the
+    precondition: the seam's own dispatch counter, one line beyond it, moves. Whatever the
+    kernel boundary does with ``meta`` inputs after that is NOT measured here -- that is
+    a vendor question and ``D01`` in ``test_meta_forward_119.py`` reports it.
+
+    THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, sliced the
+    way the layer slices it (``model_fp8.py:6855``, ``model_fp8.py:6859``), and the scale is the
+    carrier's own. The selected-row width is the seam's declared tile, ``KEY_CHUNK``,
+    imported rather than typed: the admissibility clause requires a positive multiple of it
+    (``mla_sparse.py:1293-1299``).
+    """
+    from vllm_neuron.functional.attention import mla_sparse as seam
+
+    meta = torch.device("meta")
+    banks = [_sparse_bank(meta)]
+    runner = _runner(banks)
+    tokens = 2 * PAGE
+    entry = _entry(
+        host_row=[[0, 1]],
+        host_cached=[0],
+        device_row=[[0, 1]],
+        device_cached=0,
+        tokens=tokens,
+        device=meta,
+    )
+
+    carrier = runner._glm5next_model_kwargs(
+        _kwargs(banks, entry, tokens=tokens, device=meta)
+    )["layer_carriers"][0]
+    # RE-PINNED: the cache side is sliced the way the layer slices it, and the layer now
+    # reads the window WHOLE, so the extent it reads is the bucket's and not this step's.
+    # The reading this replaces, verbatim:
+    # `start = int(carrier["start_position"])` then
+    # `c_kv = carrier["latent_cache"][: start + tokens, 0, :]`. That `int()` cannot answer on
+    # a `meta` carrier, and reading a length off the position is what the window removed.
+    c_kv = carrier["latent_cache"][:, 0, :]
+    q_lift = torch.zeros((1, 1, LATENT_WIDTH), dtype=torch.float32, device=meta)
+    selected = torch.zeros((1, seam.KEY_CHUNK), dtype=torch.int32, device=meta)
+
+    seam.reset_mla_sparse_dispatch_counters()
+    before = seam.mla_sparse_dispatch_counters()
+    raised: Exception | None = None
+    try:
+        seam.mla_sparse_attention(
+            q_lift, c_kv, selected, float(carrier["softmax_scale"])
+        )
+    except Exception as caught:  # noqa: BLE001 -- the kernel boundary is not measured here
+        raised = caught
+    after = seam.mla_sparse_dispatch_counters()
+
+    assert after[0] == before[0] + 1, (
+        f"the seam's dispatch counter did not move: {before} -> {after}. The call did not "
+        f"get past the range refusal, which is the line this increment repairs"
+        + (f"; it raised {type(raised).__name__}: {raised}" if raised else "")
+    )
+    if raised is not None:
+        message = str(raised)
+        assert "cannot be called on meta tensors" not in message, (
+            f"the seam still read a value off a meta tensor: {message}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B01. A recurrent row at the table's own width, built the way the runner builds it.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
+    """A recurrent bank is handed its KV group's full padded row, and must be served.
+
+    NEITHER BUILDER NARROWS A ROW TO THE ONE SLOT A RECURRENT BANK USES. The warmup builder
+    writes ``torch.arange(max_num_blocks_per_req)`` (``neuron_model_runner.py:4437-4442``) and
+    the serving builder slices the group's own table (``neuron_model_runner.py:4246``), whose
+    width is ``max_model_len`` over the page size. The slot the scheduler allocated is the row's
+    first entry and the rest is the table's padding, so a converter that asked a recurrent row
+    to be one entry wide would refuse every hybrid step. Both shapes are driven here, each named
+    in its own failure message.
+    """
+    cpu = torch.device("cpu")
+    banks = [_linear_bank(cpu)]
+    tokens = PAGE
+    width = -(-MAX_MODEL_LEN // PAGE)
+    slot = STATE_SLOTS - 1
+    shapes = {
+        "the warmup builder's ascending row": list(range(width)),
+        "a served row, its slot first and the table's padding after": (
+            [slot] + [0] * (width - 1)
+        ),
+    }
+
+    for what, row in shapes.items():
+        runner = _runner(banks)
+        entry = _entry(
+            host_row=[row],
+            host_cached=[0],
+            device_row=[row],
+            device_cached=0,
+            tokens=tokens,
+            device=cpu,
+        )
+
+        try:
+            translated = runner._glm5next_model_kwargs(
+                _kwargs(banks, entry, tokens=tokens, device=cpu)
+            )
+        except ValueError as refused:
+            raise AssertionError(
+                f"{what} was refused, and it is what the runner hands every recurrent "
+                f"bank: {refused}"
+            ) from refused
+
+        carrier = translated["layer_carriers"][0]
+        state = banks[0]["recurrent_state"]
+        assert carrier["recurrent_state"].data_ptr() == state[row[0]].data_ptr(), (
+            f"{what} was served from a slot other than its first entry, {row[0]}"
+        )

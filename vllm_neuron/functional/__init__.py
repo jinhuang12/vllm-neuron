@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from .argsort_unstable import argsort_unstable
+
+# ``inc-glm53f-027``: the dense half of WP6's block-quant path
+# (`inc-glm53f-026`). Only the SEAM is re-exported; its module-level helpers
+# share names with the MoE half at different arities and stay at their own
+# module path -- see ``moe/__init__.py`` for the measured collision set.
+from .blockwise_fp8_mm import blockwise_fp8_mm
 from .spec_decode_correction import (
     correct_spec_decode_positions_and_slot_mapping as correct_spec_decode_positions_and_slot_mapping,
 )  # noqa: F401
@@ -32,6 +38,11 @@ from .moe.hierarchical_all2all_dispatch_permute import (
     hierarchical_all2all_dispatch_permute,
 )
 from .moe.moe_blockwise import build_blockwise_mapping
+
+# ``inc-glm53f-027``: the MoE half of WP6's block-quant path
+# (`inc-glm53f-025`), re-exported under the same one-name-per-module pattern the
+# line above uses.
+from .moe.moe_blockwise_fp8 import blockwise_fp8_moe
 from .moe.moe_block_tkg import moe_block_tkg
 from .moe.moe_tkg import moe_tkg
 from .moe.moe_cte import moe_cte
@@ -54,6 +65,8 @@ __all__ = [
     "all_to_all_v",
     "argsort_unstable",
     "attention_decode",
+    "blockwise_fp8_mm",
+    "blockwise_fp8_moe",
     "build_all2all_combine_metadata",
     "build_all2all_dispatch_metadata",
     "build_all_gatherv_metadata",

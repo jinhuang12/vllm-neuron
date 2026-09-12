@@ -16,6 +16,44 @@ from typing import Any, Optional
 import torch
 
 
+def select_hf_model_cls(arch: str) -> type:
+    """Select the HuggingFace ``AutoModel`` class for an architecture string.
+
+    Extracted from :func:`init_hf_model` so the architecture decision is a pure
+    ``arch -> class`` function that can be observed on its own. Reading it
+    through ``init_hf_model`` is not possible without a real checkpoint load:
+    that function calls ``from_pretrained`` on every path.
+
+    The mapping is the one this module has always documented:
+
+    - an architecture naming ``ForConditionalGeneration`` (Qwen3-VL, LLaVA,
+      ``Glm5NextForConditionalGeneration``) loads through
+      ``AutoModelForImageTextToText``;
+    - every other architecture (Llama, GPT-OSS) loads through
+      ``AutoModelForCausalLM``.
+
+    Both ``transformers`` imports stay **inside** this function, exactly as the
+    ``AutoModelForImageTextToText`` import was lazy before the extraction, so
+    importing this module still does not import ``transformers``.
+
+    Args:
+        arch: The architecture string, e.g. ``config.architectures[0]``. An
+            empty string selects the causal-LM class, which is the behaviour
+            ``init_hf_model`` has when a config declares no architectures.
+
+    Returns:
+        The ``AutoModel`` class to load the checkpoint with.
+    """
+    if "ForConditionalGeneration" in arch:
+        from transformers import AutoModelForImageTextToText
+
+        return AutoModelForImageTextToText
+
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM
+
+
 def init_hf_model(
     model_checkpoint: str,
     dtype: torch.dtype,
@@ -77,12 +115,7 @@ def init_hf_model(
         _cfg = AutoConfig.from_pretrained(model_checkpoint, trust_remote_code=True)
         arch = (_cfg.architectures or [""])[0] if hasattr(_cfg, "architectures") else ""
 
-    if "ForConditionalGeneration" in arch:
-        from transformers import AutoModelForImageTextToText
-
-        model_cls = AutoModelForImageTextToText
-    else:
-        model_cls = AutoModelForCausalLM
+    model_cls = select_hf_model_cls(arch)
 
     kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": True}
     if config is not None:

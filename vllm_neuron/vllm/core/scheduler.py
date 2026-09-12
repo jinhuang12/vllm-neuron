@@ -824,13 +824,105 @@ class NeuronScheduler(Scheduler):
         while self.waiting:
             self.holdback_queue.append(self.waiting.popleft())
 
+        # Step 1.5: Resolve the hybrid KDA/DSA admission window.
+        #
+        # A hybrid stack mixes CONSTANT-size recurrent state (KDA layers, which
+        # the runner reports as `MambaSpec`) with PAGED attention (DSA layers,
+        # `FullAttentionSpec`). `_max_kv_concurrent` comes from vLLM's
+        # `get_max_concurrency_for_kv_cache_config`, which prices one request by
+        # SUMMING per-group bytes and dividing by group 0's page size. That
+        # arithmetic presumes a uniform page. On a hybrid stack the pages are
+        # not uniform, so the quotient over-prices a request and `can_schedule`
+        # holds back requests that in fact fit -- starvation, not safety.
+        #
+        # This window re-prices a request in BLOCKS, mirroring the allocator's
+        # own per-group `get_num_blocks_to_allocate`: a recurrent group holds a
+        # constant `1 + num_speculative_blocks` pages in the default
+        # `mamba_cache_mode`, while an attention group grows as
+        # `cdiv(tokens, block_size)`.
+        #
+        # BLOCKS, NEVER BYTES, deliberately. A byte-priced window would have to
+        # read `page_size_padded` / the mamba page size, whose mechanism and
+        # prohibition belong to the KV-spec increment that owns that field; this
+        # path neither sets nor reads it, and takes `num_blocks` as given.
+        #
+        # Resolved ONCE per scheduler instance and cached. A window of `0`
+        # records "not a hybrid stack" and is the pin-preserving path: with no
+        # recurrent group present nothing below changes any decision.
+        if not hasattr(self, "_hybrid_kv_window"):
+            # Function-local imports, matching this file's own idiom for vLLM
+            # internals (see the `get_max_concurrency_for_kv_cache_config`
+            # import in `__init__`). This branch runs once per instance.
+            from vllm.utils.math_utils import cdiv
+            from vllm.v1.kv_cache_interface import MambaSpec
+
+            self._hybrid_kv_blocks_per_request = 0
+            self._hybrid_kv_window = 0
+            groups = getattr(
+                getattr(self, "kv_cache_config", None), "kv_cache_groups", None
+            )
+            specs = [group.kv_cache_spec for group in groups or ()]
+            # THE OPT-IN: a recurrent group is present, so the uniform window
+            # does not describe this stack. No recurrent group -> untouched.
+            if any(isinstance(spec, MambaSpec) for spec in specs):
+                mamba_cache_mode = getattr(
+                    getattr(self, "cache_config", None), "mamba_cache_mode", "none"
+                )
+                blocks_per_request = 0
+                for spec in specs:
+                    if isinstance(spec, MambaSpec):
+                        if mamba_cache_mode == "all":
+                            blocks = (
+                                cdiv(self.max_model_len, spec.block_size)
+                                + spec.num_speculative_blocks
+                            )
+                        elif mamba_cache_mode == "align":
+                            blocks = 2 + spec.num_speculative_blocks
+                        else:
+                            blocks = 1 + spec.num_speculative_blocks
+                    else:
+                        blocks = cdiv(self.max_model_len, spec.block_size)
+                    blocks_per_request += blocks
+                if blocks_per_request > 0:
+                    self._hybrid_kv_blocks_per_request = blocks_per_request
+                    self._hybrid_kv_window = (
+                        self.kv_cache_config.num_blocks // blocks_per_request
+                    )
+                    logger.info(
+                        "Hybrid KDA/DSA admission window: %d block(s) per "
+                        "request over %d group(s) at max_model_len=%d "
+                        "(mamba_cache_mode=%s) -> %d concurrent request(s); "
+                        "uniform worst-case window was %d.",
+                        blocks_per_request,
+                        len(specs),
+                        self.max_model_len,
+                        mamba_cache_mode,
+                        self._hybrid_kv_window,
+                        self._max_kv_concurrent,
+                    )
+
+        # The window this step admits against. On a non-hybrid stack
+        # `_hybrid_kv_window` is 0, so this is `_max_kv_concurrent` unchanged.
+        effective_kv_concurrent = max(self._max_kv_concurrent, self._hybrid_kv_window)
+
         # Step 2: Selectively restore based on can_schedule()
-        while self.holdback_queue:
-            if self.can_schedule(self.holdback_queue[0]):
-                self.waiting.append(self.holdback_queue.popleft())
-            else:
-                # Stop to preserve priority order
-                break
+        # `can_schedule` reads `_max_kv_concurrent` off the instance, so the
+        # hybrid window is applied by scoping that attribute across the
+        # admission loop -- the same save/override/restore shape step 4 below
+        # uses for `max_num_running_reqs`, and restored in `finally` for the
+        # same reason: the attribute persists on the instance, so a raise here
+        # must not leave it permanently widened.
+        original_max_kv_concurrent = self._max_kv_concurrent
+        self._max_kv_concurrent = effective_kv_concurrent
+        try:
+            while self.holdback_queue:
+                if self.can_schedule(self.holdback_queue[0]):
+                    self.waiting.append(self.holdback_queue.popleft())
+                else:
+                    # Stop to preserve priority order
+                    break
+        finally:
+            self._max_kv_concurrent = original_max_kv_concurrent
 
         # Step 3: Separate prefill/decode. Upstream can promote ready
         # structured-output grammar requests from skipped_waiting in this step.
@@ -841,7 +933,10 @@ class NeuronScheduler(Scheduler):
             has_prefill_waiting
             and not self.at_capacity
             and not self.has_prefill_in_running
-            and len(self.running) < self._max_kv_concurrent
+            # Same window step 2 admitted against: a request admitted there and
+            # then refused a prefill slot here would still be starved, one gate
+            # later. On a non-hybrid stack this is `_max_kv_concurrent`.
+            and len(self.running) < effective_kv_concurrent
         )
         running_holdback: list[Request] = []
         max_num_running_reqs_override: int | None = None

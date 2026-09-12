@@ -48,6 +48,13 @@ testpaths = ["test/unit", "test/vllm_neuron"]
 python_files = ["test_*.py", "*_test.py", "*_tests.py"]
 python_classes = "Test*"
 python_functions = "test_*"
+# Registered so @pytest.mark.* in test/ raises no PytestUnknownMarkWarning.
+# Meanings live in test/OVERLAY.md.
+markers = [
+    "fast: cheap and device-free; safe to run on every change",
+    "forked: must run in its own process (import-time state does not reset)",
+    "quarantined: collected but skipped -- vendored ahead of the code it exercises",
+]
 
 [tool.coverage.run]
 branch = true
@@ -59,7 +66,7 @@ omit = [
     "doc/*",
     "*.md",
     "setup.py",
-    "vllm_neuron/patches/*",
+    "vllm_neuron/vllm/patches/*",
     "test/evaluation/*",
 ]
 
