@@ -142,7 +142,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
 
@@ -728,7 +728,16 @@ def kda_intra_chunk(
             f"leading dimensions {(n_chunks, chunk)}"
         )
 
-    gate_abs_max = float(gk.float().cumsum(dim=1).abs().max().item())
+    # The gate range is an EAGER-CALL precondition, because forming it reads the gate
+    # values themselves. A traced or meta-built call has no values to read, so a graph
+    # build passes 0.0 -- inside the limit, so the clause refuses nothing there. Nothing
+    # else reads this number and the route is `can_run_kernel`'s alone, so no route
+    # moves and no result changes; what a graph build gives up is the message.
+    gate_abs_max = (
+        float(gk.float().cumsum(dim=1).abs().max().item())
+        if values_are_readable(gk)
+        else 0.0
+    )
     if not can_run_intra_chunk(q, n_chunks, chunk, kdim, vdim, gate_abs_max):
         _COUNTERS.torch_fallback += 1
         logger.debug(
@@ -1290,7 +1299,13 @@ def kda_inter_chunk(
                 f"state is combined with these operands and is not cast here"
             )
 
-    gate_abs_max = float(gk.float().cumsum(dim=1).abs().max().item())
+    # Read on an eager call and 0.0 under a graph build, for the reason
+    # `kda_intra_chunk` states above.
+    gate_abs_max = (
+        float(gk.float().cumsum(dim=1).abs().max().item())
+        if values_are_readable(gk)
+        else 0.0
+    )
     if not can_run_inter_chunk(q, n_chunks, chunk, kdim, vdim, gate_abs_max):
         _INTER_COUNTERS.torch_fallback += 1
         logger.debug(

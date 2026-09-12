@@ -95,7 +95,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
 
@@ -1397,12 +1397,23 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     # refusing it here would refuse the producer's normal output. -2 and below are still
     # nothing at all, and are still refused by the same clause. The upper bound does not
     # move: s_kv is out of range whether or not a sentinel is present.
-    lo, hi = int(topk_indices.min()), int(topk_indices.max())
-    if lo < SENTINEL_INDEX or hi >= s_kv:
-        raise MlaSparseAttentionError(
-            f"every selected row must index the cache or be the {SENTINEL_INDEX} "
-            f"sentinel; got the range [{lo}, {hi}] against s_kv={s_kv}"
-        )
+    # AND IT IS AN EAGER-CALL PRECONDITION, because it reads the values themselves. A
+    # traced or meta-built call has no values to read, so the same two reads that make
+    # this message possible are what a graph build cannot do at all. What holds the
+    # range in that case is the producer's contract and not this clause: a column is
+    # either an expanded position or the sentinel, and a position past the row's
+    # sequence is upstream's documented behaviour under a violated CALLER precondition,
+    # `0 <= pool_ids[row, g] < seq_len[row] // pool_size`
+    # (`dsa/index_expand.py:44-56`). Masking the sentinel is the consumer's, which is
+    # this seam's kernels. So the clause below still runs in every eager call -- CPU
+    # mode, the simulator and every test -- and a graph build proceeds without it.
+    if values_are_readable(topk_indices):
+        lo, hi = int(topk_indices.min()), int(topk_indices.max())
+        if lo < SENTINEL_INDEX or hi >= s_kv:
+            raise MlaSparseAttentionError(
+                f"every selected row must index the cache or be the {SENTINEL_INDEX} "
+                f"sentinel; got the range [{lo}, {hi}] against s_kv={s_kv}"
+            )
 
     _MLA_SPARSE_COUNTERS.nki_dispatch += 1
 

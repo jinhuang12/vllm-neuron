@@ -142,6 +142,42 @@ MINI_WEIGHT_SHAPE = (128, 128)
 MINI_SCALE_SHAPE = (1, 1)
 MINI_PLAIN_SHAPE = (4,)
 
+#: The leaves the published checkpoint stores in float32 while every other
+#: unquantised family arrives in the config dtype. Read off the real load's own
+#: report, which names the dtype its loader produced for both:
+#: ``increments/launch-124-r4-trn2-1-20260912T120310Z.out:5566``. Written here as a
+#: literal, so the writers below type these two the way the CHECKPOINT does and not
+#: the way the code under test expects them.
+FLOAT32_CHECKPOINT_LEAVES = ("A_log", "dt_bias")
+
+#: The other five float32 families, as ``(parameter leaf, checkpoint leaf)``
+#: pairs. Read off the same real load's report, which logged one cast line per
+#: rank for each of them:
+#: ``increments/launch-124-r7-trn2-1-20260912T145630Z.out``, grouped in
+#: ``increments/reading-128-load-casts.md``.
+#:
+#: TWO NAMES PER FAMILY, because these five are the first float32 families whose
+#: two sides differ: the router bias is ``mlp.experts.router_bias`` as a
+#: parameter and ``mlp.gate.e_score_correction_bias`` in the checkpoint
+#: (``weight_loaders_fp8.py``'s ``_add_moe_mlp``). The writers below type a
+#: CHECKPOINT KEY, and the readings below name a PARAMETER, so a single-name
+#: tuple would have to be right for one of them and wrong for the other. The
+#: pair above keeps one name each and is left alone: its own reading asks for a
+#: parameter by that leaf, and both of its sides are spelled the same.
+FLOAT32_MIX_FAMILIES = (
+    ("hc_attn_base", "hc_attn_base"),
+    ("hc_attn_scale", "hc_attn_scale"),
+    ("hc_ffn_base", "hc_ffn_base"),
+    ("hc_ffn_scale", "hc_ffn_scale"),
+    ("router_bias", "e_score_correction_bias"),
+)
+
+#: The checkpoint side of :data:`FLOAT32_MIX_FAMILIES`, derived so the writers
+#: cannot read a second spelling of it.
+FLOAT32_MIX_CHECKPOINT_LEAVES = tuple(
+    checkpoint_leaf for _, checkpoint_leaf in FLOAT32_MIX_FAMILIES
+)
+
 #: The one file each miniature checkpoint is written to. Named once so the writer
 #: and the shape reader below cannot disagree about where it is.
 MINI_CHECKPOINT_FILE = "model.safetensors"
@@ -314,6 +350,23 @@ def _mla_key_overrides(
     return overrides
 
 
+def _checkpoint_plain_dtype(name: str) -> torch.dtype:
+    """The dtype the checkpoint holds one UNQUANTISED tensor in.
+
+    Takes a checkpoint key or a bare leaf name, so the two writers below can ask
+    the same question of whichever of the two they hold.
+
+    ONE DECISION POINT for both declarations above, so a fixture cannot type a
+    family one way here and another way somewhere else.
+    """
+    leaf = name.rsplit(".", 1)[-1]
+    return (
+        torch.float32
+        if leaf in FLOAT32_CHECKPOINT_LEAVES + FLOAT32_MIX_CHECKPOINT_LEAVES
+        else torch.bfloat16
+    )
+
+
 def _write_miniature_checkpoint(
     directory: Path,
     mappings: dict[str, str | list[str]],
@@ -378,7 +431,9 @@ def _write_miniature_checkpoint(
                     MINI_WEIGHT_SHAPE, dtype=torch.bfloat16
                 ).to(torch.float8_e4m3fn)
             else:
-                tensors[key] = torch.ones(MINI_PLAIN_SHAPE, dtype=torch.bfloat16)
+                tensors[key] = torch.ones(
+                    MINI_PLAIN_SHAPE, dtype=_checkpoint_plain_dtype(key)
+                )
     directory.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(directory / MINI_CHECKPOINT_FILE))
     return len(tensors)
@@ -3202,8 +3257,18 @@ SHARD_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
     ("Glm5NextKDAAttention", "v_conv1d_weight"): (0, _KDA_FULL),
     ("Glm5NextKDAAttention", "o_proj_weight"): (1, _KDA_FULL),
     ("Glm5NextKDAAttention", "b_proj_weight"): (0, _KDA_HEADS),
+    # THE TWO STATE LEAVES DO NOT SHARE AN EXTENT, and the row below said they did.
+    # The decay is one number per head; the gate bias is one per key CHANNEL. The
+    # GPU reference declares exactly that pair of widths -- ``local_num_heads`` for
+    # ``A_log`` and ``local_projection_size`` for ``dt_bias`` --
+    # (``vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:190-193``,
+    # ``:237-239``, ``:265-267``), and its gate kernel indexes the bias by head AND
+    # channel where the per-head families index it by head alone
+    # (``vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py:87-93``).
+    # The model file's own table has read the head WIDTH here since the forward was
+    # measured against it; this declaration is the one that stayed behind.
     ("Glm5NextKDAAttention", "A_log"): (0, _KDA_HEADS),
-    ("Glm5NextKDAAttention", "dt_bias"): (0, _KDA_HEADS),
+    ("Glm5NextKDAAttention", "dt_bias"): (0, _KDA_FULL),
     ("Glm5NextDenseMLP", "gate_proj_weight"): (0, SHARD_INTERMEDIATE),
     ("Glm5NextDenseMLP", "up_proj_weight"): (0, SHARD_INTERMEDIATE),
     ("Glm5NextDenseMLP", "down_proj_weight"): (1, SHARD_INTERMEDIATE),
@@ -3229,7 +3294,8 @@ SHARD_OTHER_EXTENT: dict[tuple[str, str], int] = {
     ("Glm5NextMLAAttention", "o_proj_weight"): MINI_MLA_WIDTHS["hidden_size"],
 }
 
-#: The two KDA leaves that are one number per head rather than a matrix.
+#: The two KDA state leaves, which are 1-D rather than a matrix: one number per
+#: head for the decay, one per key channel for the gate bias.
 SHARD_ONE_DIMENSIONAL = ("A_log", "dt_bias")
 
 #: The dense MLP's three leaves, in the order conjunct (3) reports them.
@@ -3440,9 +3506,9 @@ def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
 
     WHAT IT GIVES UP, STATED RATHER THAN LEFT TO BE FOUND. A scale-position mixup
     INSIDE one 256 block is invisible on this grid, where the ramp would catch it.
-    No single fixture can hold both readings. The ramp reading is kept by the item
-    that keeps the ramp and asserts the refusal fires by name,
-    :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`.
+    No single fixture can hold both readings. The ramp reading is kept by
+    :func:`test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish`,
+    which loads the ramp and reads what the publish emitted.
     """
     per_block = _tiles_per_producer_block()
     extent = shape[dim]
@@ -3451,69 +3517,6 @@ def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
     line = torch.ldexp(
         torch.ones(extent, dtype=torch.float32), exponents[block % exponents.numel()]
     )
-    view = [1] * len(shape)
-    view[dim] = extent
-    return line.reshape(view).expand(shape).contiguous()
-
-
-def _squeezed_byte_ceiling() -> float:
-    """The largest magnitude a squeezed load can store, MEASURED through the loader.
-
-    ``inc-glm53f-054e`` added this because the number moved. It pushes the OCP
-    maximum through the production squeeze rather than reading the loader's private
-    factor, so what comes back is what a load would really store: 224.0 at this
-    increment's exact half, 240.0 at the older 240/448, and 448.0 on a platform where
-    the squeeze does not engage at all. A measurement rather than a constant is what
-    keeps the item below armed at whatever the factor becomes.
-    """
-    ocp_max = float(torch.finfo(torch.float8_e4m3fn).max)
-    probe = torch.tensor([ocp_max], dtype=torch.float32).to(torch.float8_e4m3fn)
-    squeezed = downscale_fp8_weight_bytes(probe).to(torch.float32)
-    return float(squeezed.abs().max())
-
-
-def _ratio_the_retile_must_refuse() -> int:
-    """The smallest whole rescale the retile cannot hold, DERIVED not chosen.
-
-    The retile refuses when a rescaled byte passes fp8's own bound
-    (``blockwise_fp8_retile.py:461-463``, the bound being
-    ``torch.finfo(torch.float8_e4m3fn).max``). The largest byte a squeezed load
-    stores is :func:`_squeezed_byte_ceiling`, so the smallest whole ratio that MUST
-    overflow is ``floor(bound / ceiling) + 1``.
-
-    That is 3 at ``inc-glm53f-054e``'s exact half (224 x 3 = 672) and was 2 at the
-    older 240/448 (240 x 2 = 480). It is the whole reason the plain ramp armed the
-    refusal before this increment and no longer does: the ramp's worst 256-block
-    ratio is exactly 2, and 224 x 2 = 448 is exactly the bound, which the strict
-    comparison holds rather than refuses.
-    """
-    bound = float(torch.finfo(torch.float8_e4m3fn).max)
-    return int(bound // _squeezed_byte_ceiling()) + 1
-
-
-def _steep_block_grid_pattern(
-    shape: tuple[int, ...], dim: int, ratio: int
-) -> torch.Tensor:
-    """A ``128``-tile grid whose EVERY ``256`` block asks for a rescale of ``ratio``.
-
-    Alternating 1 and ``ratio`` per tile, so each block retains 1 -- the coarsening
-    keeps its ``(h_tile 0, i_tile 0)`` scale (``blockwise_fp8_retile.py:400-401``) --
-    and every other tile in it rescales by exactly ``ratio``.
-
-    ALTERNATING RATHER THAN A GROWING RAMP, and that is the point of the fixture.
-    ``ratio ** 255`` is ``inf`` in fp32 and a non-finite scale is refused by a
-    DIFFERENT branch (``:405-414``), which would make this item pass for the wrong
-    reason. Alternating keeps every scale small and finite, so the only thing that
-    can refuse the load is the one thing this fixture varies.
-    """
-    per_block = _tiles_per_producer_block()
-    assert per_block >= 2, (
-        f"a producer block holds {per_block} tiles of the checkpoint's granularity, "
-        f"so no block has a second tile to rescale and this fixture varies nothing"
-    )
-    extent = shape[dim]
-    line = torch.ones(extent, dtype=torch.float32)
-    line[1::per_block] = float(ratio)
     view = [1] * len(shape)
     view[dim] = extent
     return line.reshape(view).expand(shape).contiguous()
@@ -3574,7 +3577,7 @@ def _shard_key_overrides(
                 )
             else:
                 overrides[weight_key] = _shard_pattern(
-                    shape, shard_dim, torch.bfloat16
+                    shape, shard_dim, _checkpoint_plain_dtype(leaf)
                 )
     return overrides
 
@@ -4674,29 +4677,21 @@ def _deferred_key_overrides(
     mappings: dict[str, str | list[str]],
     *,
     ramp_grids: bool = False,
-    steep_ratio: int | None = None,
     dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> dict[str, torch.Tensor]:
     """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
 
-    A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK, and that
-    is R6 item R-T2's change here. Every family in :data:`_COARSENED_AT_LOAD_CLASSES`
-    has whole-256 extents in this fixture, so its load coarsens the grid; on the
-    ramp that coarsening rescales weight bytes, which contradicts the bit-exact
-    readings below and now REFUSES where a byte leaves the fp8 range (R6 item
-    R-P1). :func:`_pow2_block_grid_pattern` carries the reasoning and what it gives
-    up. Every other family keeps the ramp: nothing rescales its weights.
+    A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK. This is a
+    FIXTURE choice, not a load behaviour: every family in
+    :data:`_COARSENED_AT_LOAD_CLASSES` has whole-256 extents here, so the writer
+    below gives it a pow2 grid instead of the plain pattern. The load coarsens
+    nothing any more and rescales no byte, so no grid family can overflow the fp8
+    bound; the pow2 pattern stays because a plain grid on that seam once rescaled
+    weight bytes and contradicted the bit-exact readings below.
+    :func:`_pow2_block_grid_pattern` carries the reasoning and what it gives up.
 
     ``ramp_grids=True`` writes the ramp for EVERY family, which is the fixture the
-    refusal item needs and the only caller that asks for it.
-
-    ``steep_ratio`` is ``inc-glm53f-054e``'s addition, and it varies ONE field
-    against the pow2 fixture: the retiled families' grids become
-    :func:`_steep_block_grid_pattern` at that ratio and every other family keeps its
-    ramp. It exists because the plain ramp no longer overflows the fp8 bound once the
-    squeeze leaves 224 rather than 240, so the refusal it was written to arm needs a
-    steeper grid to stay reachable. :func:`_ratio_the_retile_must_refuse` derives the
-    ratio from the loader rather than choosing one.
+    two ramp items need.
 
     A bank entry is E weight keys and E scale keys interleaved, so its arm writes
     one tensor per expert at that expert's own full width -- the loader's job is to
@@ -4739,7 +4734,9 @@ def _deferred_key_overrides(
             if not scales:
                 # The map answers "is this family quantised", not a name list here.
                 for key in weights:
-                    overrides[key] = _shard_pattern(shape, shard_dim, torch.bfloat16)
+                    overrides[key] = _shard_pattern(
+                        shape, shard_dim, _checkpoint_plain_dtype(leaf)
+                    )
                 continue
             grid_shape = block_grid_shape(shape, DEFAULT_WEIGHT_BLOCK_SIZE)
             for key in weights:
@@ -4748,11 +4745,7 @@ def _deferred_key_overrides(
                 )
             coarsened = not ramp_grids and family in _COARSENED_AT_LOAD_CLASSES
             for key in scales:
-                if coarsened and steep_ratio is not None:
-                    overrides[key] = _steep_block_grid_pattern(
-                        grid_shape, shard_dim, steep_ratio
-                    )
-                elif coarsened:
+                if coarsened:
                     overrides[key] = _pow2_block_grid_pattern(grid_shape, shard_dim)
                 else:
                     overrides[key] = _shard_pattern(
@@ -4765,18 +4758,14 @@ def _deferred_checkpoint(
     tmp_path: Path,
     *,
     ramp_grids: bool = False,
-    steep_ratio: int | None = None,
     name: str = "deferred",
     dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> tuple[Path, dict, dict]:
-    """One checkpoint holding every full tensor these five items read.
+    """One checkpoint holding every full tensor the items below read.
 
-    ``ramp_grids`` and ``name`` exist for R6 item R-T2's refusal item alone: it
-    needs the SAME checkpoint with the ramp scale grid restored, written beside this
-    one rather than over it, so the two loads in that item differ in exactly the one
-    field it varies. ``steep_ratio`` is the third grid family the same item needs
-    since ``inc-glm53f-054e``, and it is written beside the other two for the same
-    reason.
+    ``ramp_grids`` and ``name`` exist for the two ramp items alone: each needs the
+    SAME checkpoint with the ramp scale grid restored, written beside this one rather
+    than over it, so a pair of loads differs in exactly the one field it varies.
 
     ``dense_intermediate`` exists for conjunct (3) alone, whose subject is a padded
     rank: see :data:`PAD_DENSE_INTERMEDIATE`. It reaches the config AND the written
@@ -4789,7 +4778,6 @@ def _deferred_checkpoint(
         reference,
         mappings,
         ramp_grids=ramp_grids,
-        steep_ratio=steep_ratio,
         dense_intermediate=dense_intermediate,
     )
     directory = tmp_path / name
@@ -7443,9 +7431,10 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
         shard dim, so a layout that dropped or invented a scale would move them.
         R6 item R-T2 changed that granularity from ``-095b``'s per-128-tile ramp
         and corrected this sentence with it -- on the ramp the coarsening rescales
-        weight bytes, which is what these counters were reporting and what R-P1 now
-        refuses; :func:`_pow2_block_grid_pattern` records the trade and
-        :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`
+        weight bytes, which is what these counters were reporting. Nothing rescales
+        a byte any more, so nothing can overflow and there is no refusal to arm;
+        :func:`_pow2_block_grid_pattern` records the grid trade and
+        :func:`test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish`
         keeps the ramp reading.
     (5) Every routed bank carries its prepared kernel operands. This is the plan's
         own sentence for this item -- the prep's arrival makes the loop visit the
@@ -7556,54 +7545,40 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
     )
 
 
-def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
+def test_blocked_a_ramp_scale_grid_loads_and_publishes_only_finite_values(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
-    """R6 item R-T2's pair: a grid the coarsening cannot reproduce is REFUSED, and
-    the ramp is no longer one of them.
+    """A scale grid the old coarsening could not reproduce loads, and emits no NaN.
 
-    ``inc-glm53f-054e`` c7 re-argued this item on a measurement rather than on a
-    preference. Grant 181 ran it at the exact ``x 1/2`` squeeze and it read
-    ``DID NOT RAISE``, and the arithmetic says it should: the squeeze stores at most
-    ``448 x 1/2 = 224`` where the old ``240/448`` stored 240, the plain ramp's worst
-    256-block ratio is exactly 2, and ``224 x 2 = 448`` is exactly fp8's bound, which
-    the retile's strict comparison HOLDS rather than refuses
-    (``blockwise_fp8_retile.py:461-463``). At 240 the same ramp reached 480 and was
-    refused. Nothing in the production path regressed: a checkpoint the old factor
-    could not load now loads, exactly, with no NaN.
+    THIS ITEM ONCE ARMED A REFUSAL, AND THAT REFUSAL IS NOW UNREACHABLE. The step
+    that rescaled a stored byte from the checkpoint's own ``128``-tile grid onto a
+    ``256``-wide one is gone: the publisher hands back the two tensors it was given,
+    unchanged (``blockwise_fp8_retile.py::retile_block_scales``). Nothing on this
+    path rescales a byte, so no rescale can pass the ``fp8`` bound, so the overflow
+    refusal cannot fire for any grid the checkpoint holds. An item that arms an
+    unreachable refusal measures its own fixture rather than the product, and the
+    identity readings on the publish are the stronger statement in its place.
 
-    So the item keeps both halves of what it was protecting, on THREE grid families
-    written from one checkpoint and differing in one field each:
+    WHAT SURVIVES IS THE POSITIVE HALF, which is what the refusal existed to
+    protect: a checkpoint whose scale grid ramps must LOAD, and must publish finite
+    numbers rather than NaN. That claim rests on no refusal, and it is still worth a
+    reading because the load path still squeezes bytes and still compensates per
+    block.
 
-    * the pow2 grid loads and completes, which is the arming half. Without it a
-      refusal below could be any load failure wearing the right words.
-    * the RAMP grid is now a positive claim: the load completes, every published
-      tensor is finite -- which is what "instead of emitting NaN" means, measured
-      rather than implied -- and the retile's own ``inexact_rescales`` per leaf are
-      PRINTED as readings. They are not zero and are not asserted: the first block
-      rescales by exactly 2 and stays bit-exact, while later blocks rescale by
-      fractions like 4/3 that fp8 cannot hold exactly. The old factor never reached
-      them, because it refused on the first block.
-    * the STEEP grid keeps the refusal armed, at a ratio DERIVED from the loader
-      rather than chosen: :func:`_ratio_the_retile_must_refuse` reads the squeezed
-      byte ceiling through the production squeeze and returns the smallest whole
-      ratio that must overflow -- 3 here, 2 at the old factor. The refusal must fire
-      and must still name the expert, the 256 block, the 128 tile, the ratio, the
-      retained scale, the bound and both health counters.
+    TWO GRID FAMILIES, written from one checkpoint and differing in one field:
 
-    A clamp is deliberately not the alternative: it would ship numbers the
-    checkpoint does not contain (lead ruling ``LEAD-LOG.md`` §901). Lowering the
-    bound is not one either -- it is ``torch.finfo(torch.float8_e4m3fn).max``, and
-    448 is a value the format holds exactly.
+    * the POW2 grid loads and completes. Without it the ramp reading below could be
+      any load failure wearing the right shape.
+    * the RAMP grid loads, and every published parameter and buffer is finite --
+      which is what "no NaN" means, measured rather than implied.
 
-    The refusal is read off the exception CHAIN rather than the outermost type,
-    because the load path is entitled to wrap it; what this item claims is that a
-    ``BlockwiseFp8RetileError`` is in that chain and that its sentence names the
-    coordinates, not that nothing re-raises it.
+    THE RESCALE COUNTERS ARE PRINTED AND GATED ON NOTHING, and this item asserts no
+    sign for them. They were non-zero while the load path coarsened. A publish that
+    rescales nothing has nothing to count, and the record itself carries the reason
+    (``model_fp8.py::_publish_compute_frame_operands``). Printing them keeps the row
+    honest either way; asserting a sign here would redden this item on the day the
+    count legitimately changes.
     """
-    from vllm_neuron.functional.moe.blockwise_fp8_retile import (
-        BlockwiseFp8RetileError,
-    )
 
     pow2_directory, pow2_overrides, _mappings = _deferred_checkpoint(tmp_path)
     ramp_directory, ramp_overrides, _ramp_mappings = _deferred_checkpoint(
@@ -7628,10 +7603,10 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
         for key, tensor in ramp_overrides.items()
         if not _same(tensor, pow2_overrides[key])
     )
-    print(f"RAMPREFUSAL_KEYS_THAT_DIFFER={len(differing)}")
+    print(f"RAMPFINITE_KEYS_THAT_DIFFER={len(differing)}")
     assert differing, (
         "the ramp fixture and the pow2 fixture hold identical tensors, so this "
-        "item varies nothing and the refusal below would not be attributable to "
+        "item varies nothing and the readings below would not be attributable to "
         "the grid"
     )
     assert all(key.endswith(FP8_SCALE_SUFFIX) for key in differing), (
@@ -7643,22 +7618,11 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
     # THE ARMING HALF. Same widths, same weights, pow2 grid: the load completes.
     armed = _load_blocked(pow2_directory, monkeypatch)
     assert _modules_named(armed, "Glm5NextSharedExperts"), (
-        "the pow2 load built no shared-expert module, so the refusal below cannot "
-        "be attributed to the grid the retile read"
+        "the pow2 load built no shared-expert module, so the ramp reading below "
+        "cannot be attributed to the grid the publish was handed"
     )
 
-    # ---- ARM 1: THE RAMP COMPLETES AT THIS FACTOR, AND EMITS NO NaN.
-    # The ceiling and the ratio are read, not typed, so the two rows below say what
-    # this run's own loader does rather than what an earlier one did.
-    ceiling = _squeezed_byte_ceiling()
-    steep_ratio = _ratio_the_retile_must_refuse()
-    bound = float(torch.finfo(torch.float8_e4m3fn).max)
-    print(
-        f"RAMPREFUSAL_CEILING={ceiling!r}|bound={bound!r}"
-        f"|ramp_worst_ratio_is_2_reaches={ceiling * 2!r}"
-        f"|refused_only_if_above={bound!r}"
-    )
-    print(f"RAMPREFUSAL_DERIVED_STEEP_RATIO={steep_ratio}|reaches={ceiling * steep_ratio!r}")
+    # THE RAMP HALF. The load completes and publishes no non-finite value.
     ramp_loaded = _load_blocked(ramp_directory, monkeypatch)
     assert _modules_named(ramp_loaded, "Glm5NextSharedExperts"), (
         "the ramp load built no shared-expert module, so it did not complete the "
@@ -7670,45 +7634,32 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
         for name, tensor in published
         if not bool(torch.isfinite(tensor.detach().to(torch.float32)).all())
     ]
-    print(f"RAMPREFUSAL_TENSORS_CHECKED={len(published)}|nonfinite={nonfinite[:6]}")
+    print(f"RAMPFINITE_TENSORS_CHECKED={len(published)}|nonfinite={nonfinite[:6]}")
     assert published, (
         "the completed ramp load published no parameter or buffer at all, so the "
         "finiteness reading below is over nothing"
     )
     assert not nonfinite, (
         f"the ramp load completed but published non-finite values in {nonfinite[:6]}. "
-        f"That is the silent NaN this item is named for: at this factor the retile "
-        f"does not refuse the ramp, so finiteness is the claim that replaces the "
-        f"refusal and it just failed"
+        f"That is the silent NaN this item is named for. The publish rescales no "
+        f"byte, so a ramping grid must arrive finite, and it just did not"
     )
-    # The health counters, PRINTED as readings and gated on nothing: the first 256
-    # block rescales by exactly 2 and stays bit-exact, later blocks rescale by
-    # fractions fp8 cannot hold, and the old factor never reached them.
+
+    # The rescale counters, PRINTED as readings and gated on nothing.
     #
     # THE TWO DICT-SHAPED RECORDS, EACH NAMED. A suffix scan over
     # ``dir(type(module))`` also matches the ROUTED bank's own
     # ``RETILE_HEALTH_ATTR`` (``model_fp8.py::Glm5NextRoutedExperts``), and that
-    # one publishes a dict of TUPLES --
-    # ``(emitted_unsupplied, input_scales_dropped, inexact_rescales)`` per
-    # projection (``:2334-2352``) -- so ``record.get`` reached a tuple and a
-    # CORRECT load raised ``AttributeError``. The deferred fixture has four routed
-    # experts and the load path prepares every module that offers a prep
-    # (``model_fp8.py::Glm5NextForConditionalGeneration._run_load_time_preps``), so
-    # it was reached every time.
+    # one publishes a dict of TUPLES per projection, so ``record.get`` reached a
+    # tuple and a CORRECT load raised ``AttributeError``.
     #
-    # NAMING BOTH IS A POSITIVE SELECTION, not a filter. "Skip anything that is not
-    # a dict" would also pass on the day the shared or dense record changed shape:
-    # the loop would collect nothing and only the emptiness assert below would be
-    # left to speak, and it speaks only if BOTH banks vanish. With the names, a
-    # missing attribute makes ``getattr`` return ``None`` and that assert names it.
-    # Both landed readers of these two records name them the same way: ``:7191``
-    # for the shared bank, ``:4861`` for the dense MLP.
-    #
-    # THE ROUTED BANK'S COUNTS ARE THEREFORE NOT IN THIS TOTAL, and the row says so.
-    # Reading them needs an index convention for a nameless tuple, which is a
-    # different change from this repair; the shared and dense records carry
-    # ``inexact_rescales`` by name
-    # (``model_fp8.py::_publish_compute_frame_operands``).
+    # NAMING BOTH IS A POSITIVE SELECTION, not a filter. "Skip anything that is
+    # not a dict" would also pass on the day the shared or dense record changed
+    # shape: the loop would collect nothing, and only the emptiness assert below
+    # would be left to speak -- and it speaks only if BOTH banks vanish. With the
+    # names, a missing attribute makes ``getattr`` return ``None`` and that assert
+    # names it. The routed bank's counts are therefore NOT in this total, and the
+    # row below says so.
     health_records: dict[tuple[str, str], dict] = {}
     for path, module in ramp_loaded.named_modules():
         for attribute_name in (
@@ -7733,74 +7684,13 @@ def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
         count = int(record.get("inexact_rescales", 0))
         total_inexact += count
         print(
-            f"RAMPREFUSAL_HEALTH|{path}.{leaf}|retiled={record.get('retiled')}"
+            f"RAMPFINITE_HEALTH|{path}.{leaf}|retiled={record.get('retiled')}"
             f"|inexact_rescales={count}|gated_on_none"
         )
     print(
-        f"RAMPREFUSAL_INEXACT_TOTAL={total_inexact}|records={len(health_records)}"
-        f"|banks=shared+dense|gated_on_none|a fraction fp8 cannot hold is a "
-        f"rescale, not a refusal"
+        f"RAMPFINITE_INEXACT_TOTAL={total_inexact}|records={len(health_records)}"
+        f"|banks=shared+dense|gated_on_none|no sign is asserted for this total"
     )
-
-    # ---- ARM 2: THE REFUSAL IS STILL REACHABLE, at the derived ratio.
-    steep_directory, steep_overrides, _steep_mappings = _deferred_checkpoint(
-        tmp_path, steep_ratio=steep_ratio, name="deferred-steep"
-    )
-    assert sorted(steep_overrides) == sorted(pow2_overrides), (
-        "the steep fixture and the pow2 fixture do not hold the same keys, so they "
-        "differ in more than the grid family this arm varies"
-    )
-    steep_differing = sorted(
-        key
-        for key, tensor in steep_overrides.items()
-        if not _same(tensor, pow2_overrides[key])
-    )
-    print(f"RAMPREFUSAL_STEEP_KEYS_THAT_DIFFER={len(steep_differing)}")
-    assert steep_differing and all(
-        key.endswith(FP8_SCALE_SUFFIX) for key in steep_differing
-    ), (
-        f"the steep fixture varies "
-        f"{[key for key in steep_differing if not key.endswith(FP8_SCALE_SUFFIX)][:6]}"
-        f" besides scale grids, or varies nothing at all ({len(steep_differing)} "
-        f"keys differ). This arm varies the grid family and must vary nothing else"
-    )
-
-    with pytest.raises(Exception) as raised:  # noqa: B017 -- the chain is the claim
-        _load_blocked(steep_directory, monkeypatch)
-
-    chain: list[BaseException] = []
-    error: BaseException | None = raised.value
-    while error is not None and error not in chain:
-        chain.append(error)
-        error = error.__cause__ or error.__context__
-    types = [type(item).__name__ for item in chain]
-    refusals = [item for item in chain if isinstance(item, BlockwiseFp8RetileError)]
-    print(f"RAMPREFUSAL_EXCEPTION_CHAIN={types}")
-    for item in refusals:
-        print(f"RAMPREFUSAL_MESSAGE={str(item)[:400]}")
-    assert refusals, (
-        f"the steep grid at ratio {steep_ratio} raised {types}, with no "
-        f"BlockwiseFp8RetileError anywhere in the chain. That ratio takes a stored "
-        f"byte to {ceiling * steep_ratio!r} against a bound of {bound!r}, so either "
-        f"the retile no longer refuses an unrepresentable rescale -- in which case "
-        f"it is emitting NaN again -- or the load failed for some other reason and "
-        f"this item is measuring that instead"
-    )
-    message = str(refusals[0])
-    for phrase in (
-        "REFUSES",
-        "256-block",
-        "128-tile",
-        "ratio",
-        "retained scale",
-        "inexact_rescales",
-        "input_scales_dropped",
-    ):
-        assert phrase in message, (
-            f"the refusal does not say {phrase!r}: {message[:300]}. The whole point "
-            f"of refusing rather than emitting NaN is that the message locates the "
-            f"block and reports the counters"
-        )
 
 
 def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish(
@@ -7808,15 +7698,17 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
 ) -> None:
     """``inc-glm53f-112``: on the DENSE path the ramp hazard is gone, and it is SHOWN.
 
-    WHAT THIS ITEM ADDS TO THE ITEM ABOVE. That one guards a REFUSAL: a grid the
-    ``256`` coarsening cannot reproduce must be refused rather than turned into NaN.
-    That refusal is the MoE producer's, inside the routed bank's own prep, and
-    ``inc-glm53f-112`` leaves it exactly where it was. The same hazard used to exist
-    on the DENSE path too, because the dense load path coarsened as well, and there it
-    is gone: the step publishes the checkpoint's own ``128`` grid and rescales no
-    weight byte. A removed hazard deserves a positive reading rather than silence, so
-    this item takes the very fixture the refusal item calls dangerous and reads the
-    dense side of it.
+    WHAT THIS ITEM ADDS TO THE ITEM ABOVE. That one reads a ramping grid for
+    FINITENESS: the load must complete and publish no ``NaN``. It once guarded a
+    refusal as well -- a grid the ``256`` coarsening could not reproduce had to be
+    refused rather than turned into NaN -- and that half is gone, because the routed
+    prep no longer coarsens either and a publish that rescales no byte cannot overflow.
+    The same hazard used to exist on the DENSE path, because the dense load path
+    coarsened as well, and there it is gone the same way: the step publishes the
+    checkpoint's own ``128`` grid and rescales no weight byte. A removed hazard
+    deserves a positive reading rather than silence, so this item takes the very
+    fixture that grid family made dangerous and reads the dense side of it EXACTLY,
+    which finiteness alone does not say.
 
     THE READING IS AGAINST THE CHECKPOINT'S OWN TENSORS, not against the module
     itself. ``_deferred_checkpoint`` returns the tensors it wrote, so the reference
@@ -7828,8 +7720,10 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
 
     WHAT WOULD HAVE FAILED BEFORE. Three things this item asserts were false at the
     parent commit. The carried block would have been ``256`` and not the checkpoint's
-    ``128``; ``inexact_rescales`` was NOT zero on the ramp -- the item above prints
-    those non-zero counts as readings -- so the dequantised product moved; and the
+    ``128``; ``inexact_rescales`` was NOT zero on the ramp while this path
+    coarsened, so the dequantised product moved -- the item above prints those
+    counts as readings and asserts no sign for them, because a publish that
+    rescales nothing has nothing to count; and the
     older reference could only be reached on the POW2 fixture, which
     :func:`_pow2_block_grid_pattern` exists solely to arrange. The ramp is the grid
     family the coarsening could not hold, and the publish holds it.
@@ -7969,4 +7863,409 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
     assert not nonfinite, (
         f"the ramp load published non-finite values in {nonfinite[:6]}, reached on a "
         f"path that no longer coarsens at all"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The two linear-attention state leaves, against the GPU reference.
+# --------------------------------------------------------------------------- #
+
+#: The registered tensor-parallel degree. ``test_kda_layer.py:102`` is this
+#: number's landed home in this tree; it is restated here rather than imported so
+#: this file still collects on its own. At this degree the head count divides to
+#: exactly one head per rank, so a per-head extent and a per-channel one differ by
+#: the whole head width and cannot be confused.
+KDA_STATE_READING_WORLD = 64
+
+
+def test_the_kda_state_leaves_take_the_reference_dtype_and_per_rank_extent(
+    single_rank_process_group,
+) -> None:
+    """The decay and the gate bias, read against the GPU reference at the degree.
+
+    THE REFERENCE IS THE KDA LAYER, not this package. It declares the gate bias at
+    ``local_projection_size`` and the decay at ``local_num_heads``, both float32,
+    and shards both on dim 0 --
+    ``vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:190-193``,
+    ``:237-241`` and ``:265-268``. Its gate kernel indexes the bias by head AND
+    channel where the per-head families index it by head alone
+    (``vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py:87-93``).
+    The two expected extents below are those two closed forms, computed from the
+    config this file already reads, and never asked of the table under test.
+
+    THE DTYPE HALF READS THE PLACEHOLDER, because the placeholder is what the
+    checkpoint reader casts to: a config-dtype placeholder narrows the checkpoint's
+    own float32 decay and bias to bfloat16 before the gate's exponential and
+    sigmoid see them. The control is an ordinary plain leaf on the same module,
+    which must still take the config dtype -- otherwise the two rows above would
+    also pass on a rule that typed everything float32.
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    text_config = real_config.text_config
+    linear = text_config.linear_attn_config
+    heads = int(linear["num_heads"])
+    head_dim = int(linear["head_dim"])
+    print(
+        f"KDASTATE_CONFIG|heads={heads}|head_dim={head_dim}"
+        f"|world={KDA_STATE_READING_WORLD}"
+    )
+    assert heads % KDA_STATE_READING_WORLD == 0, (
+        f"{heads} heads do not divide across {KDA_STATE_READING_WORLD} ranks, so "
+        f"neither reference extent is a whole number here"
+    )
+
+    module = _MODEL_FP8.Glm5NextKDAAttention(text_config, KDA_STATE_READING_WORLD)
+    expected = {
+        "A_log": heads // KDA_STATE_READING_WORLD,
+        "dt_bias": (heads * head_dim) // KDA_STATE_READING_WORLD,
+    }
+    for leaf, want_extent in sorted(expected.items()):
+        geometry = _MODEL_FP8._shard_geometry_for(
+            module, leaf, KDA_STATE_READING_WORLD
+        )
+        assert geometry is not None, (
+            f"{leaf} is replicated at world size {KDA_STATE_READING_WORLD}; the "
+            f"reference shards it on dim 0, so every rank above 0 would read "
+            f"another rank's numbers"
+        )
+        dim = int(getattr(geometry, "shard_dim", -1))
+        size = int(getattr(geometry, "shard_size", -1))
+        print(
+            f"KDASTATE_SHARD|{leaf}|dim={dim}|per_rank={size}"
+            f"|reassembled={size * KDA_STATE_READING_WORLD}"
+        )
+        assert (dim, size) == (0, want_extent), (
+            f"{leaf} lands (dim {dim}, {size}) per rank where the reference gives "
+            f"(dim 0, {want_extent}) at this degree"
+        )
+
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+    typed: dict[str, torch.dtype] = {}
+    for leaf in sorted(FLOAT32_CHECKPOINT_LEAVES):
+        name = next(
+            candidate
+            for candidate in sorted(mappings)
+            if candidate.rsplit(".", 1)[-1] == leaf
+        )
+        typed[leaf] = model._placeholder_dtype(
+            mappings[name], param_name=name, mappings=mappings
+        )
+        print(f"KDASTATE_PLACEHOLDER|{leaf}|{name}|{typed[leaf]}")
+    assert set(typed.values()) == {torch.float32}, (
+        f"the state leaves take {sorted(str(d) for d in typed.values())}; the "
+        f"reference keeps both float32 and the checkpoint holds both float32, so "
+        f"anything narrower is a cast on every rank"
+    )
+
+    control_name = next(
+        candidate
+        for candidate in sorted(mappings)
+        if candidate.endswith(".o_norm_weight")
+    )
+    control_dtype = model._placeholder_dtype(
+        mappings[control_name], param_name=control_name, mappings=mappings
+    )
+    print(f"KDASTATE_CONTROL|{control_name}|{control_dtype}")
+    assert control_dtype is text_config.torch_dtype, (
+        f"{control_name} takes {control_dtype} where the config declares "
+        f"{text_config.torch_dtype}, so the float32 rule above is not keyed on the "
+        f"state pair at all"
+    )
+    print(f"KDASTATE_IMPORT_ORIGIN|{_MODEL_FP8.__file__}")
+
+
+# --------------------------------------------------------------------------- #
+# The four mHC mix leaves and the router correction bias, against the reference.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_float32_mix_families_take_the_checkpoint_dtype(
+    single_rank_process_group,
+) -> None:
+    """The five families read float32 from the placeholder rule, on the real config.
+
+    THE REFERENCE DECLARES ALL FIVE FLOAT32. The four mix leaves are
+    ``nn.Parameter(torch.empty(..., dtype=torch.float32))`` at
+    ``vllm/models/deepseek_v4/nvidia/model.py:1095-1121`` and the fused mHC entry
+    point refuses anything else --
+    ``vllm/model_executor/kernels/mhc/tilelang.py:138-140`` asserts each of the
+    three tensors it takes is float32. The router correction bias is float32 at
+    ``vllm/model_executor/models/step3p5.py:335-337``, beside the assert that the
+    gate runs in fp32.
+
+    THE PLACEHOLDER IS WHAT THE READER CASTS TO, so a config-dtype placeholder
+    narrows the checkpoint's own float32 before any consumer sees it. The reading
+    is on the REAL config rather than a miniature one, because the population is
+    every layer of the published model and a miniature config could carry a
+    family this one does not.
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+
+    typed: dict[str, torch.dtype] = {}
+    for parameter_leaf, _ in FLOAT32_MIX_FAMILIES:
+        names = [
+            name
+            for name in sorted(mappings)
+            if name.rsplit(".", 1)[-1] == parameter_leaf
+        ]
+        assert names, (
+            f"no mapped parameter has the leaf {parameter_leaf}, so this reading "
+            f"would certify a family the map does not carry"
+        )
+        typed[parameter_leaf] = model._placeholder_dtype(
+            mappings[names[0]], param_name=names[0], mappings=mappings
+        )
+        print(
+            f"MIXDTYPE|{parameter_leaf}|{names[0]}|parameters={len(names)}"
+            f"|{typed[parameter_leaf]}"
+        )
+
+    assert sorted(typed) == sorted(leaf for leaf, _ in FLOAT32_MIX_FAMILIES), (
+        f"the reading covered {sorted(typed)} where the declared families are "
+        f"{sorted(leaf for leaf, _ in FLOAT32_MIX_FAMILIES)}"
+    )
+    assert set(typed.values()) == {torch.float32}, (
+        f"the mix families take {sorted(str(dtype) for dtype in typed.values())}; "
+        f"the checkpoint holds all five in float32 and the reference declares all "
+        f"five float32, so anything narrower is a cast on every rank"
+    )
+
+
+def test_a_miniature_load_publishes_the_float32_mix_families_unchanged(
+    tmp_path, single_rank_process_group
+) -> None:
+    """A real load hands the five families through with no cast, value for value.
+
+    THE WITNESS VALUES CANNOT SURVIVE BFLOAT16. Every tensor the fixture writer
+    builds itself is constant, and a constant round-trips through bfloat16
+    unchanged, so a constant would pass this reading under the very narrowing it
+    exists to catch. Each family therefore gets its own ramp of values one part
+    in 4096 apart, and the item first proves that ramp differs from its own
+    bfloat16 round trip.
+
+    THE ROUTED FIXTURE, because the router bias is mapped by ``_add_moe_mlp`` and
+    a layer-only fixture carries the four mix leaves alone.
+    """
+    directory = tmp_path / "mixfamilies"
+    model = _stacked_model()
+    mappings = _mappings_for(_stacked_config())
+
+    covered: dict[str, str] = {}
+    for parameter_leaf, checkpoint_leaf in FLOAT32_MIX_FAMILIES:
+        for name in sorted(mappings):
+            if name.rsplit(".", 1)[-1] != parameter_leaf:
+                continue
+            keys = _keys_of(mappings, name)
+            assert len(keys) == 1, (
+                f"{name} maps to {len(keys)} checkpoint keys; these five are plain "
+                f"one-key entries and a fused entry would need a different reading"
+            )
+            assert keys[0].rsplit(".", 1)[-1] == checkpoint_leaf, (
+                f"{name} maps to {keys[0]}, whose leaf is not the declared "
+                f"checkpoint name {checkpoint_leaf}, so the writers below would "
+                f"type this family the way the code expects it and not the way "
+                f"the checkpoint holds it"
+            )
+            covered[name] = keys[0]
+
+    assert {name.rsplit(".", 1)[-1] for name in covered} == {
+        leaf for leaf, _ in FLOAT32_MIX_FAMILIES
+    }, (
+        f"the routed fixture carries "
+        f"{sorted({name.rsplit('.', 1)[-1] for name in covered})}, so at least one "
+        f"declared family would go unread by this load"
+    )
+    print(
+        f"MIXLOAD_COVERED|parameters={len(covered)}"
+        f"|families={len(FLOAT32_MIX_FAMILIES)}"
+    )
+
+    want: dict[str, torch.Tensor] = {}
+    for index, name in enumerate(sorted(covered), start=1):
+        ramp = torch.arange(
+            1, MINI_PLAIN_SHAPE[0] + 1, dtype=torch.float32
+        ) * 2.0**-12
+        value = (float(index) + ramp).reshape(MINI_PLAIN_SHAPE)
+        assert not torch.equal(value, value.to(torch.bfloat16).to(torch.float32)), (
+            f"the witness values for {name} survive a bfloat16 round trip, so this "
+            f"item would pass under the narrowing it exists to catch"
+        )
+        want[covered[name]] = value
+
+    written = _write_miniature_checkpoint(
+        directory,
+        mappings,
+        model,
+        extra_overrides={**_blocked_bank_overrides(model, mappings), **want},
+    )
+    print(f"MIXLOAD_WRITTEN={written}")
+    model.load_weights(str(directory), torch.device("cpu"), None)
+
+    published = dict(model.named_parameters())
+    for name in sorted(covered):
+        assert name in published, (
+            f"{name} is mapped but absent from the loaded model's parameters"
+        )
+        got = published[name].detach()
+        expected = want[covered[name]]
+        print(f"MIXLOAD|{name}|{got.dtype}|{got.flatten()[:2].tolist()}")
+        assert got.dtype is torch.float32, (
+            f"{name} published {got.dtype} where the checkpoint holds float32"
+        )
+        assert torch.equal(got, expected), (
+            f"{name} published {got.flatten()[:4].tolist()} where the checkpoint "
+            f"holds {expected.flatten()[:4].tolist()}, so the load moved the "
+            f"values it was meant to hand through"
+        )
+
+
+def test_the_router_projection_still_takes_the_config_dtype(
+    single_rank_process_group,
+) -> None:
+    """The bias's own sibling on the same module keeps the config dtype.
+
+    THE CONTROL FOR THE FOUR READINGS ABOVE. Without it, a rule that typed every
+    plain leaf float32 would satisfy them all. The router projection is the
+    sharpest control available: it is declared on the same module as the
+    correction bias and mapped two lines from it
+    (``weight_loaders_fp8.py``'s ``_add_moe_mlp``), it is unquantised, and the
+    published checkpoint holds it in the config dtype -- the real load logged no
+    cast line for it
+    (``increments/reading-128-load-casts.md``).
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+
+    control_name = next(
+        name for name in sorted(mappings) if name.endswith(".router_weight")
+    )
+    control_dtype = model._placeholder_dtype(
+        mappings[control_name], param_name=control_name, mappings=mappings
+    )
+    print(f"MIXCONTROL|{control_name}|{control_dtype}")
+    assert control_dtype is real_config.text_config.torch_dtype, (
+        f"{control_name} takes {control_dtype} where the config declares "
+        f"{real_config.text_config.torch_dtype}, so the float32 rule is not keyed "
+        f"on the five names at all"
+    )
+
+
+def test_without_the_declared_leaves_the_mix_families_narrow_to_the_config_dtype(
+    monkeypatch, single_rank_process_group
+) -> None:
+    """Emptying the declared tuple reddens the five families, one by one.
+
+    THE ARM IS THE THING THAT DECIDES, and this is the reading that says so. The
+    tuple is emptied where the rule reads it rather than the method being
+    replaced wholesale, so every other clause of the placeholder rule stays live
+    and the config dtype below is what this one clause was holding back.
+    """
+    real_config = Glm5NextConfig.from_configs(
+        json.loads(REAL_CONFIG_PATH.read_text())
+    )
+    model = Glm5NextForConditionalGeneration(real_config)
+    mappings = _mappings_for(real_config)
+    config_dtype = real_config.text_config.torch_dtype
+
+    monkeypatch.setattr(_MODEL_FP8, "FLOAT32_PLAIN_LEAVES", ())
+    for parameter_leaf, _ in FLOAT32_MIX_FAMILIES:
+        name = next(
+            candidate
+            for candidate in sorted(mappings)
+            if candidate.rsplit(".", 1)[-1] == parameter_leaf
+        )
+        narrowed = model._placeholder_dtype(
+            mappings[name], param_name=name, mappings=mappings
+        )
+        print(f"MIXREMOVED|{parameter_leaf}|{narrowed}")
+        assert narrowed is config_dtype, (
+            f"{parameter_leaf} still takes {narrowed} with the declared tuple "
+            f"emptied, so something other than that tuple is typing it and the "
+            f"readings above are not measuring the arm they name"
+        )
+
+
+def test_the_router_correction_bias_reaches_the_seam_in_float32() -> None:
+    """The consumer widens the bias to float32, so the load-time width is the one.
+
+    THE LINK IS READ, NOT ASSUMED. ``Glm5NextRoutedExperts.route_tokens`` enters
+    the seam with ``correction_bias=self.router_bias``, and the seam legalises
+    that argument through ``_legalize_correction_bias``, which returns fp32
+    because "the bias decides a DISCRETE selection". Both links are read off the
+    source below, and then the widening itself is measured.
+
+    THE MEASUREMENT IS A SELECTION, not a tolerance. Four expert biases one part
+    in 4096 apart stay four distinct corrections through the seam when the
+    parameter arrives in float32, and collapse to fewer when it arrives in
+    bfloat16 -- the seam cannot restore a width the placeholder already spent,
+    and experts the checkpoint separated then tie on index order.
+    """
+    from vllm_neuron.functional.moe.router import (  # the seam's own legaliser
+        _legalize_correction_bias,
+        noaux_tc_rmsnorm_router_topk,
+    )
+
+    call = next(
+        node
+        for node in ast.walk(
+            ast.parse(
+                textwrap.dedent(
+                    inspect.getsource(_MODEL_FP8.Glm5NextRoutedExperts.route_tokens)
+                )
+            )
+        )
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "noaux_tc_rmsnorm_router_topk"
+    )
+    handed = {
+        keyword.arg: ast.unparse(keyword.value)
+        for keyword in call.keywords
+        if keyword.arg == "correction_bias"
+    }
+    print(f"ROUTERSEAM_HANDED={handed}")
+    assert handed == {"correction_bias": "self.router_bias"}, (
+        f"the seam is entered with {handed}, so the parameter this block types is "
+        f"not the tensor the router corrects with"
+    )
+    assert "_legalize_correction_bias" in inspect.getsource(
+        noaux_tc_rmsnorm_router_topk
+    ), (
+        "the seam no longer legalises its correction bias, so the fp32 widening "
+        "read below is not on the path the router takes"
+    )
+
+    experts = MINI_ROUTED_EXPERTS
+    bias = torch.tensor(
+        [1.0 + step * 2.0**-12 for step in range(1, experts + 1)],
+        dtype=torch.float32,
+    )
+    legalised = _legalize_correction_bias(bias, experts)
+    narrowed = _legalize_correction_bias(bias.to(torch.bfloat16), experts)
+    distinct = len(set(legalised.flatten().tolist()))
+    distinct_narrowed = len(set(narrowed.flatten().tolist()))
+    print(
+        f"ROUTERSEAM|dtype={legalised.dtype}|distinct={distinct}"
+        f"|narrowed_dtype={narrowed.dtype}|narrowed_distinct={distinct_narrowed}"
+    )
+    assert legalised.dtype is torch.float32 and narrowed.dtype is torch.float32, (
+        f"the seam returned {legalised.dtype} and {narrowed.dtype}; it is declared "
+        f"to return fp32 for either input"
+    )
+    assert distinct == experts, (
+        f"{distinct} of {experts} corrections stay distinct through the seam from a "
+        f"float32 parameter, so this fixture cannot tell the two widths apart"
+    )
+    assert distinct_narrowed < experts, (
+        f"all {experts} corrections stay distinct through a bfloat16 parameter, so "
+        f"the load-time width would not decide the router's choice here"
     )

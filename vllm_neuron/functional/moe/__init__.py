@@ -12,7 +12,7 @@ this file and of its parent's export list -- establishes the hub for them.
 WHAT IS EXPORTED, AND WHAT IS DELIBERATELY NOT
 ----------------------------------------------
 Exported: the two **entry points** of the block-quant MoE path -- the kernel
-seam (`inc-glm53f-025`) and the host-side retile producer (`inc-glm53f-024`).
+seam and the host-side scale publisher.
 
 NOT exported, and this is the point rather than an omission: every helper whose
 NAME IS SHARED BY TWO MODULES OF THIS CAMPAIGN AT DIFFERENT SIGNATURES.
@@ -21,9 +21,9 @@ Measured over the three landed WP6 modules:
 * ``to_kernel_scale_layout`` -- ``moe/moe_blockwise_fp8.py:181``
   ``(consumer_scales, num_experts, rows, cols, projection)`` versus
   ``blockwise_fp8_mm.py:309`` ``(weight_scale, rows, cols)``;
-* ``flat_scale_index`` -- ``moe/blockwise_fp8_retile.py:194``
+* ``flat_scale_index`` -- ``moe/blockwise_fp8_retile.flat_scale_index``
   ``(h_tile, i_tile, h_256, i_256, projection, gate_or_up)`` versus
-  ``blockwise_fp8_mm.py:291`` ``(k_block, n_block, n_n_blocks)``;
+  ``blockwise_fp8_mm.flat_scale_index`` ``(k_block, n_block, n_n_blocks)``;
 * ``kernel_scale_shape``, ``dispatch_counters``, ``reset_dispatch_counters``,
   ``kernel_identity``, ``BLOCK_QUANT_SIZE``, ``TILE_SIZE`` -- each defined or
   re-exported by more than one of the three.

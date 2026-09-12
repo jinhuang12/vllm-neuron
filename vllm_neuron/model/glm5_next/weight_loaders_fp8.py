@@ -437,6 +437,29 @@ MHC_LEAVES: tuple[str, ...] = (
     "hc_ffn_scale",
 )
 
+#: The plain leaves the published checkpoint holds in float32, other than the
+#: two at :data:`KDA_BARE_LEAVES`: the four mHC mix leaves and the router
+#: correction bias. Each one arrives as a plain key, so a placeholder typed by
+#: kind alone would give it the config dtype and narrow the checkpoint's own
+#: float32 before any consumer reads it.
+#:
+#: The reference declares all five float32. Its fused mHC entry point asserts
+#: the mix leaves (``vllm/models/deepseek_v4/nvidia/model.py:1095-1121``,
+#: ``vllm/model_executor/kernels/mhc/tilelang.py:138-140``) and its router keeps
+#: the correction bias float32 beside an fp32-gate assert
+#: (``vllm/model_executor/models/step3p5.py:335-342``).
+#:
+#: The two ``fn`` leaves are absent on purpose. The published checkpoint holds
+#: them in the config dtype, so there is no cast to remove here, and whether a
+#: bfloat16 tensor may fill a float32 seam is a question about the checkpoint.
+FLOAT32_PLAIN_LEAVES: tuple[str, ...] = (
+    "hc_attn_base",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_scale",
+    "router_bias",
+)
+
 #: The DSA half's four scaled projections -- the ONLY ``self_attn`` leaves on a
 #: sparse-attention layer that carry a ``weight_scale_inv`` companion. Measured:
 #: ``kv_b_proj`` and every indexer leaf carry none, so asking for one makes the
@@ -1102,6 +1125,13 @@ def dequantise_blockwise(
 # --------------------------------------------------------------------------- #
 
 
+#: Value censuses skipped because the tensor they would count carried no values.
+#: A shape-only load appends one name per skip; a load with values never appends.
+#: It is a record and not a control: nothing in this module reads it, and a test
+#: clears it, runs a load and reads which censuses the pass reached.
+SKIPPED_VALUE_CENSUSES: list[str] = []
+
+
 @dataclass(frozen=True)
 class BlockScaleCompensation:
     """A compensated per-block scale grid, with the census of what it changed.
@@ -1122,6 +1152,10 @@ class BlockScaleCompensation:
     below_minval_after: int
     #: ``(row, col)`` of every block whose scale the floor raised.
     floored_blocks: tuple[tuple[int, int], ...]
+    #: False when the grid carried no values and the census was skipped. The three
+    #: counted fields are then zero because they are unanswerable, not because the
+    #: grid was clean, and a caller that reports them must say which it has.
+    values_read: bool = True
 
 
 def compensate_block_scales(scale_inv: torch.Tensor) -> BlockScaleCompensation:
@@ -1136,6 +1170,24 @@ def compensate_block_scales(scale_inv: torch.Tensor) -> BlockScaleCompensation:
     on either platform gets the same reported quantities.
     """
     grid = scale_inv.to(torch.float32)
+    if grid.device.type == "meta":
+        # A SHAPE-ONLY GRID CARRIES NO NUMBERS, and the census below reads three of
+        # them before the platform gate is even consulted. The transform itself is
+        # arithmetic and runs on shapes, so the grid this returns is the grid a real
+        # load would store; what cannot be answered is how many of its scales fall
+        # below the floor, so those counts are zero, no block is named, and the skip
+        # is recorded on the result and in the module list below.
+        applied = needs_240_downscale()
+        stored = (grid * _FP8_SCALE_COMPENSATION).clamp(min=MINVAL) if applied else grid
+        SKIPPED_VALUE_CENSUSES.append("compensate_block_scales")
+        return BlockScaleCompensation(
+            scale_inv=stored,
+            applied=applied,
+            below_minval_before=0,
+            below_minval_after=0,
+            floored_blocks=(),
+            values_read=False,
+        )
     below_before = int((grid < MINVAL).sum().item())
 
     if not needs_240_downscale():
@@ -2100,6 +2152,38 @@ def _weight_slice_only(
     return SafetensorsWeightLoader(transform=transform)
 
 
+#: The one parameter this package stores in the TRANSPOSE of its checkpoint
+#: orientation. Matched on the leaf: the prefix carries a layer number.
+TRANSPOSED_AT_LOAD_LEAF = "experts.router_weight"
+
+
+def transposed_weight_loader() -> SafetensorsWeightLoader:
+    """Load one plain weight key with its two dimensions swapped.
+
+    The checkpoint stores a projection as ``[out_features, in_features]`` and
+    this package keeps that orientation, on the reading :func:`_sharding_loader`
+    records: the parameter layout IS the checkpoint layout, and every consumer
+    transposes at compute time. The router's consumer cannot -- it is not a
+    matmul this file writes. ``noaux_tc_rmsnorm_router_topk``
+    hands the tensor to an NKI kernel whose HBM operand layout is ``[H, E]``
+    (``functional/moe/rmsnorm_router_topk_tkg.py:363``) and validates it
+    unconditionally before either route (``:148``), so the orientation is that
+    kernel's contract rather than a matmul convention it could absorb.
+
+    Swapping once here rather than at the call site keeps the parameter in the
+    orientation the seam consumes, which is the orientation every landed fixture
+    already builds (``tiny/test_tiny_glm5next_forward.py:2371-2373``), and puts
+    no transpose in the traced graph. ``SafetensorsWeightLoader.load`` makes the
+    result contiguous (``utils/weight_loader.py:77``), so the view does not
+    reach the parameter.
+    """
+
+    def transform(slices, rank):
+        return slices[0][:].t()
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def _grid_spans_more_blocks_whole_than_per_rank(
     geometry: ShardGeometry,
     block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
@@ -2235,7 +2319,16 @@ def loader_for_mapped_keys(
     before ``-094`` byte for byte, which is what keeps every replicated family --
     the majority of them -- on exactly the path ``-091`` measured.
 
-    Four cases, one per
+    ONE LEAF IS ANSWERED BY NAME AND BEFORE THE KINDS, and it is the only one:
+    :data:`TRANSPOSED_AT_LOAD_LEAF`, whose consumer's operand layout is the
+    transpose of the checkpoint's. It is answered first so the answer is total --
+    every combination this loader cannot serve honestly is refused here rather
+    than reaching a kind that would load the tensor in the wrong orientation
+    without saying so. The refusal is unreachable on today's map, on the
+    precedent the unquantised-bank refusal below records: no such entry exists
+    yet, and a named refusal costs one branch.
+
+    Then four cases, one per
     :func:`classify_mapped_keys` kind, and one REFUSAL that cuts across the
     last of them:
 
@@ -2315,6 +2408,18 @@ def loader_for_mapped_keys(
     """
     keys = _as_key_list(checkpoint_keys)
     kind = classify_mapped_keys(keys)
+    if (param_name or "").endswith(TRANSPOSED_AT_LOAD_LEAF):
+        if kind != MAPPED_KEY_PLAIN or len(keys) != 1 or geometry is not None:
+            raise Glm5NextWeightMapError(
+                f"{param_name} is transposed at load, which is defined for one "
+                f"replicated plain key, but it arrived as {kind} over "
+                f"{len(keys)} keys with geometry={geometry!r}. A quantised or "
+                f"sharded entry would need the transpose composed with the "
+                f"other transform, and its dim would name the other axis, so "
+                f"this is refused by name rather than loaded in the "
+                f"checkpoint's orientation in silence."
+            )
+        return transposed_weight_loader()
     if kind == MAPPED_KEY_SCALE_GRID:
         # A GEOMETRY REACHES THIS BRANCH FROM ``inc-glm53f-100`` ON, and that is
         # ``inc-glm53f-105``'s change here. The reading this replaces was true when

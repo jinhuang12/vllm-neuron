@@ -93,13 +93,37 @@ Each of these is owned elsewhere, and leaving it out is a recorded decision rath
   token, for the route-predicate reason ``-036`` records above. A batched call would also need a
   per-request slot, which is a data-dependent address, and ``slot`` here is a trace-time constant.
 
-Why ``position`` is a python int
---------------------------------
-``slot`` selects which ring row is read as the current token and which row is written, so it is an
-ADDRESS. Passing it as a tensor would force a data-dependent trace, the same reason ``-047`` gives
-for its ``n_pools`` and ``pool_size``. The compiled graph specialises on
-``(pool_size, slot, head_dim, dtype)``, so a steady-state decode loop compiles at most ``pool_size``
-traces -- four on the target checkpoint -- and then reuses them forever.
+Why the kernel's ``slot`` is a python int, and why a caller need not have one
+----------------------------------------------------------------------------
+``slot`` selects which ring row is read as the current token and which row is written, so inside the
+kernel it is an ADDRESS and it stays a python int -- the same reason ``-047`` gives for its
+``n_pools`` and ``pool_size``. What follows from that is what this module used to state as a rule for
+its callers, and it was wrong as a rule: the compiled graph specialises on
+``(pool_size, slot, head_dim, dtype)``, so a caller that derives ``slot`` from a decode step's real
+position gets one graph per residue of that position. A graph captured once and replayed at every
+step then writes the ring row it was CAPTURED with, at every later position, which is silent
+corruption rather than a recompile.
+
+So there are TWO seams, and the difference between them is the whole point:
+
+* :func:`dsa_decode_tail_update` takes the position as a python int. Every landed reading of the
+  ring's addressing is on this seam, it is the eager reference the other is compared against, and
+  its ``slot`` reaches the kernel exactly as before.
+* :func:`dsa_decode_tail_update_at` takes the position as a TENSOR (a python int is admitted and
+  behaves identically) and calls the kernel with ``slot = pool_size - 1``, a CONSTANT. It gets there
+  by ROTATING the ring so this token's row is the last one, and rotating the result back. The
+  rotation is a permuted read of ``pool_size`` rows -- values move, nothing is computed -- so the
+  kernel keeps every arithmetic op it had.
+
+WHY THE ROTATION COSTS NO ACCURACY, WHICH IS AN IDENTITY AND NOT A TOLERANCE. A pool ends exactly
+when ``slot == pool_size - 1``, and at that slot the rotation is the IDENTITY permutation: the
+completing step hands the kernel the same rows, in the same order, with the same per-slot bias, so
+its pooled key is bit-identical to the int seam's. On a step that ends no pool the kernel still
+compresses -- the branch it used to resolve at trace time is now always taken -- and that value is
+DEFINED but meaningless, so the caller addresses it to a trash row exactly as the prefill leg
+already addresses its non-completions. The cost said out loud: a non-completing step now traces and
+runs one ``pool_size``-member softmax it throws away, plus three permuted reads of at most
+``2 * pool_size`` rows, against the ring copy the step already paid for.
 """
 
 from __future__ import annotations
@@ -439,6 +463,24 @@ def _record_nki_dispatch(entry: str, pool_size: int, slot: int, head_dim: int) -
     )
 
 
+@torch._dynamo.assume_constant_result
+def _record_nki_dispatch_at(entry: str, pool_size: int, head_dim: int) -> None:
+    """The same record for the tensor-position seam, WITHOUT a slot.
+
+    The slot is deliberately absent rather than logged as a value: on this seam it lives in a tensor,
+    and a folded helper converts every non-tensor argument to a python constant at trace time -- so
+    handing it one would be the host read this seam exists to remove. The kernel's own slot is the
+    constant ``pool_size - 1`` on every call here, which is a fact about the seam and not a reading.
+    """
+    _COUNTERS.last_kernel = _kernel_identity_of(_decode_tail_update_nki)
+    logger.info(
+        "[dsa-decode-tail-update] kernel=nki entry=%s pool_size=%d slot=last head_dim=%d",
+        entry,
+        pool_size,
+        head_dim,
+    )
+
+
 def slot_of(position: int, pool_size: int) -> int:
     """The ring row this position writes: ``position % pool_size``.
 
@@ -457,6 +499,47 @@ def completes_pool(position: int, pool_size: int) -> bool:
     (``:521``), with its ``pos_valid`` left to the caller: a negative position raises here rather
     than being silently treated as a padded entry."""
     return slot_of(position, pool_size) == pool_size - 1
+
+
+def decode_pool_address(
+    position: Tensor | int, pool_size: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """Where this token's pooled key belongs, and whether it has one. Two 0-d tensors.
+
+    Returns ``(pool_index, completes)``: the id of the pool this token would end, which is
+    ``position // pool_size``, and whether it ends one at all, which is :func:`completes_pool`'s
+    question answered on device. A negative position is not refused here, because refusing it would
+    read the value; :func:`slot_of` still refuses one on the int seam.
+
+    THIS IS THE THIRD SPELLING OF ONE RULE AND IT IS HERE FOR THE SECOND'S REASON. ``slot_of`` is
+    public because the caller needs the pool arithmetic to decide when a pool ends, and two
+    spellings of that rule are how they drift apart. A caller holding the position in a tensor
+    cannot use either of the first two, so the arithmetic is written once more, in the same module,
+    beside the two it must agree with.
+    """
+    at = torch.as_tensor(position, device=device, dtype=torch.int64).reshape(())
+    return (
+        torch.div(at, pool_size, rounding_mode="floor"),
+        torch.remainder(at, pool_size) == pool_size - 1,
+    )
+
+
+def _ring_permutations(
+    slot: Tensor, pool_size: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """The permutation that moves ring row ``slot`` to the LAST row, and the one that undoes it.
+
+    Row ``m`` of the rotated ring is row ``(slot + 1 + m) % pool_size`` of the original, so the last
+    rotated row is ``slot`` itself. The inverse sends rotated row ``(j - slot - 1) % pool_size`` back
+    to row ``j``. At ``slot == pool_size - 1`` both are the identity, which is the property the
+    module docstring's accuracy argument rests on, and the acceptance reads it as a value rather
+    than trusting this sentence.
+    """
+    rows = torch.arange(pool_size, device=device)
+    return (
+        torch.remainder(slot + 1 + rows, pool_size),
+        torch.remainder(rows - slot - 1, pool_size),
+    )
 
 
 def _validate(tail: Tensor, key: Tensor, score: Tensor, ape: Tensor) -> tuple[int, int]:
@@ -548,6 +631,71 @@ def dsa_decode_tail_update(
     return (pooled if ends_pool else None), new_tail
 
 
+def dsa_decode_tail_update_at(
+    tail: Tensor, key: Tensor, score: Tensor, ape: Tensor, position: Tensor | int
+) -> tuple[Tensor, Tensor]:
+    """THE COUNTED SEAM FOR A POSITION THIS PROCESS DOES NOT KNOW. Advance the ring by one token.
+
+    Args:
+        tail: ``[2, pool_size, head_dim]`` bf16 -- the ring, in the SAME slot-addressed layout
+            :func:`dsa_decode_tail_update` reads and writes. The rotation below is internal to one
+            call; no stored ring changes shape or meaning.
+        key: ``[1, head_dim]`` bf16 -- this token's indexer key.
+        score: ``[1, head_dim]`` bf16 -- this token's gate score.
+        ape: ``[pool_size, head_dim]`` fp32 -- the per-slot additive bias.
+        position: this token's absolute position, as a tensor of any integer dtype (a python int is
+            admitted and gives the same answer). It is never read on the host.
+
+    Returns:
+        ``(pooled, new_tail)``. ``pooled`` is ``[1, head_dim]`` ALWAYS -- there is no ``None`` here,
+        because whether a pool ended is a value on device and a return type cannot depend on one.
+        The row is this token's completed pool when :func:`decode_pool_address` says it completes one
+        and is meaningless otherwise, so the caller addresses it accordingly; the prefill leg's
+        ``pool_window`` states the same contract for its own non-completions.
+        ``new_tail`` has ``tail``'s shape and layout, with this token stashed at its own slot.
+
+    WHAT THIS COSTS AND WHY IT IS EXACT: see the module docstring. The one thing to keep in view at
+    this level is that the rotation is the identity on the step whose value is used, so this seam and
+    the int seam agree BIT FOR BIT wherever the answer means anything.
+
+    ONE DISPATCH, on the same kernel, with the same counter -- a step is a step whichever seam the
+    caller reached it through, and the route predicate's equality against the caller's step count
+    would stop being readable if one of the two seams counted differently.
+    """
+    pool_size, head_dim = _validate(tail, key, score, ape)
+    device = tail.device
+    slot = torch.remainder(
+        torch.as_tensor(position, device=device, dtype=torch.int64).reshape(()), pool_size
+    )
+    forward_perm, inverse_perm = _ring_permutations(slot, pool_size, device)
+    tail_rotated = tail.index_select(1, forward_perm)
+    ape_rotated = ape.index_select(0, forward_perm)
+    last = pool_size - 1
+
+    if not can_run_dsa_decode_tail_update(tail, key, score, ape):
+        # THE ROTATED RING AT THE LAST SLOT IS THE FALLBACK'S OWN CASE, so the landed function
+        # serves it unchanged rather than a second single-step implementation appearing here. It
+        # counts, as it must: this is still the torch route.
+        pooled, new_rotated = _dsa_decode_tail_update_torch(
+            tail_rotated, key, score, ape_rotated, last
+        )
+    else:
+        flat_tail = tail_rotated.reshape(TAIL_HALVES * pool_size, head_dim).contiguous()
+        _COUNTERS.nki_dispatch += 1
+        _record_nki_dispatch_at("step_at", pool_size, head_dim)
+        pooled, new_flat = wrap_nki(_decode_tail_update_nki)(
+            flat_tail,
+            key.contiguous(),
+            score.contiguous(),
+            ape_rotated.contiguous(),
+            pool_size,
+            last,
+        )
+        new_rotated = new_flat.reshape(TAIL_HALVES, pool_size, head_dim)
+
+    return pooled, new_rotated.index_select(1, inverse_perm)
+
+
 # ---------------------------------------------------------------------------------------------
 # Torch: the fallback, and the batch reference. TWO functions, and the split is deliberate.
 # ---------------------------------------------------------------------------------------------
@@ -568,12 +716,18 @@ def _compress_pool_torch(pool_key: Tensor, pool_score: Tensor, ape: Tensor) -> T
     ``dim=0`` is the SLOT axis, which is what makes the softmax per ``(slot, channel)``; a ``dim=-1``
     here would be a whole-vector softmax, which is a different kernel, and the test carries a case
     whose only job is to tell the two apart.
+
+    THE MATRIX FOLLOWS ITS OPERAND'S DEVICE, which is a one-line move and no numerics: the factory
+    builds on the default device, and this reference is driven on a SHAPE-ONLY device by the
+    acceptance that reads whether a position is ever read on the host. On a real device the move is
+    the identity.
     """
     dtype = pool_key.dtype
     weights = torch.softmax(pool_score.float() + ape.float(), dim=0)
     pooled = (weights * pool_key.float()).sum(dim=0, keepdim=True)
     pooled = pooled.to(dtype).float()
-    rotated = pooled @ hadamard_matrix(int(pool_key.shape[1])).t()
+    matrix = hadamard_matrix(int(pool_key.shape[1])).to(pool_key.device)
+    rotated = pooled @ matrix.t()
     return (rotated * HADAMARD_SCALE).to(dtype)
 
 

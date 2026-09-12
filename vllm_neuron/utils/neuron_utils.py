@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 from vllm_neuron import envs
 
@@ -21,6 +22,19 @@ def can_run_kernel(device: torch.Tensor | str = "") -> bool:
         return os.environ.get("NKI_SIMULATOR") == "1"
     device_str = str(device.device) if isinstance(device, torch.Tensor) else device
     return device_str != "cpu"
+
+
+def values_are_readable(tensor: torch.Tensor) -> bool:
+    """True when a VALUE can be read off ``tensor`` on the host.
+
+    A precondition that reads data cannot run while a graph is being traced or built:
+    Dynamo traces with fake inputs, and a graph built for the device is built on ``meta``,
+    where a value does not exist. Both are decided from the tensor rather than from
+    ``torch.compiler.is_compiling()``, which ``attention_decode.py:592-597`` records as
+    unreliable on this backend. Shape and dtype reads stay legitimate in either case and
+    do not belong here.
+    """
+    return not isinstance(tensor, FakeTensor) and tensor.device.type != "meta"
 
 
 def model_forward_context(

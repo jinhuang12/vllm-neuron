@@ -84,6 +84,33 @@ E2E_BLOCKS = _blocks_for(item.STACK_TOKENS + GENERATED_TOKENS)
 #: the runner sizes them from ``max_model_len``.
 E2E_MAX_SEQ_LEN = item.STACK_TOKENS + GENERATED_TOKENS
 
+
+def _aligned_blocks(slots: int) -> int:
+    """The block-table WIDTH the runner's warmup builder reports for ``slots``.
+
+    It is the whole blocks, rounded up again to a multiple of ``128 // page``, which the
+    builder does to match upstream's InputBatch width (``neuron_model_runner.py:4321-4328``).
+    A prefill never trims it back, so the width the captured graph carries is this one and
+    not the sequence's own block count.
+    """
+    alignment = 128 // item.MLA_PAGE_SIZE if item.MLA_PAGE_SIZE <= 128 else 1
+    return -(-_blocks_for(slots) // alignment) * alignment
+
+
+#: The window one captured graph reads: the block table's width on the warmup path, because
+#: the shell states no ``kv_segment_size`` bucket, so the converter's prefill span falls back
+#: to that width (``neuron_model_runner.py:5239-5259``). It is WIDER than the sequence, which
+#: is the whole point -- a window whose length moved with the position pinned the graph.
+E2E_WINDOW_BLOCKS = _aligned_blocks(E2E_MAX_SEQ_LEN)
+
+#: The banks this file allocates: the last block a request can be given, plus one whole spare
+#: window past it. The window's length is fixed for the bucket, so a request placed near the
+#: end of a bank sized to the sequence alone would need a window that runs off the end --
+#: which the carrier builder refuses rather than shortening the view. The spare is the
+#: ALIGNED width, not the sequence's block count, since that is the length actually handed
+#: over. The runner's own allocator owes the same spare in production.
+E2E_BANK_BLOCKS = E2E_BLOCKS + E2E_WINDOW_BLOCKS
+
 #: The recurrent-state geometry the substituted spec reports. Small and arbitrary: the mapper
 #: under test reads shapes off the spec and never off a layer, so these numbers only have to
 #: be self-consistent between the spec and the banks this file allocates for it.
@@ -125,11 +152,25 @@ def _require_cpu_mode() -> None:
 def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
     """The dict ``initialize_kv_cache`` hands ``bind_kv_cache``, built the runner's own way.
 
-    Every shape here is the runner's: a sparse layer gets a key/value PAIR of
-    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:9002-9038``)
-    and a recurrent layer gets two ``[slots, *state shape]`` banks in conv-then-recurrent
-    order (``:9100-9130``). The geometry is read off the spec the model itself produced, so
-    this helper cannot disagree with the model about what was asked for.
+    Every shape here is the runner's: a layer that declares a latent cache gets ONE bank of
+    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:9118-9136``),
+    a layer that does not still gets a key/value PAIR of that shape, and a recurrent layer
+    gets two ``[slots, *state shape]`` banks in conv-then-recurrent order (``:9100-9130``).
+    The geometry is read off the spec the model itself produced, so this helper cannot
+    disagree with the model about what was asked for.
+
+    The reading this replaces, kept verbatim: "a sparse layer gets a key/value PAIR of
+    ``[blocks, num_kv_heads, block_size, head_size]`` (``neuron_model_runner.py:9002-9038``)".
+    It described the runner before the latent cache became one buffer; the branch below now
+    keys on the layer's own declaration, so both classes are still mirrored here.
+
+    RE-PINNED: the block dim is ``E2E_BANK_BLOCKS`` and was
+    ``E2E_BLOCKS``, the sequence's own blocks. The reading this replaces, kept verbatim: "a
+    layer that declares a latent cache gets ONE bank of ``[blocks, num_kv_heads, block_size,
+    head_size]``" -- the shape is that same shape and only ``blocks`` moved. A carrier is now
+    handed a window whose length is the bucket's, so a bank sized to the sequence alone has
+    no room for the window the warmup path asks for at block 0 and the builder refuses
+    before the model is entered.
     """
     caches: dict[str, list[torch.Tensor]] = {}
     for layer_spec in root.get_kv_spec().layers:
@@ -150,14 +191,14 @@ def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
             ]
             continue
         shape = (
-            E2E_BLOCKS,
+            E2E_BANK_BLOCKS,
             int(layer_spec.num_kv_heads),
             item.MLA_PAGE_SIZE,
             int(layer_spec.head_size),
         )
+        banks = 1 if layer_spec.latent_kv else 2
         caches[layer_spec.name] = [
-            torch.zeros(shape, dtype=layer_spec.dtype),
-            torch.zeros(shape, dtype=layer_spec.dtype),
+            torch.zeros(shape, dtype=layer_spec.dtype) for _ in range(banks)
         ]
     return caches
 
@@ -210,19 +251,29 @@ def _recurrent_spec(root) -> KVSpec:
     )
 
 
-def _geometries(banks, *, block_ids, state_slot: int, page_size: int | None = None):
+def _geometries(banks, *, block_ids, state_slot: int, page_size: int | None = None,
+                window_blocks: int | None = None):
     """One geometry per bank, the shape the carrier builder pairs positionally with its banks.
 
     THE PAGE COMES FROM THE LANDED DIAL, not from the bank, so the builder's cross-check
     between the group's page and the bank's own paging compares two independently sourced
     numbers instead of one number twice.
+
+    RE-PINNED: the builder now also requires the WINDOW's length in blocks, because the
+    slice it hands a layer is the bucket's window and not this request's pages. The
+    original reading of this helper was the three keys above and a slice of exactly the
+    blocks named here; `window_blocks` defaults to `len(block_ids)`, which is that same
+    slice, so every landed item reads what it read before and only a caller that asks
+    for a longer window gets one.
     """
     page = item.MLA_PAGE_SIZE if page_size is None else page_size
+    ids = [int(value) for value in block_ids]
     return [
         {
-            "block_ids": [int(value) for value in block_ids],
+            "block_ids": ids,
             "state_slot": int(state_slot),
             "page_size": int(page),
+            "window_blocks": len(ids) if window_blocks is None else int(window_blocks),
         }
         for _ in banks
     ]
@@ -293,7 +344,8 @@ def test_bind_kv_cache_maps_every_sparse_layer_onto_its_own_slots():
     banks = root.glm5next_layer_banks
 
     print(f"TINYE2E|bind_sparse|layers={len(banks)}|spec={len(spec_layers)}"
-          f"|blocks={E2E_BLOCKS}|page={item.MLA_PAGE_SIZE}")
+          f"|blocks={E2E_BLOCKS}|page={item.MLA_PAGE_SIZE}"
+          f"|bank_blocks={E2E_BANK_BLOCKS}|window_blocks={E2E_WINDOW_BLOCKS}")
     assert len(banks) == len(spec_layers) == item.STACK_LAYERS
     assert [bank["name"] for bank in banks] == [s.name for s in spec_layers]
     assert [bank["layer_index"] for bank in banks] == list(range(len(spec_layers)))
@@ -305,12 +357,16 @@ def test_bind_kv_cache_maps_every_sparse_layer_onto_its_own_slots():
         view = bank["latent_cache"]
         print(f"TINYE2E|bank|{bank['name']}|bank={tuple(allocated.shape)}"
               f"|view={tuple(view.shape)}|slots={bank['slots']}")
+        # RE-PINNED: both numbers were `E2E_BLOCKS * page`. The reading
+        # this replaces, verbatim: "the flattened view covers the whole bank, one row per
+        # slot, and `slots` reports that same count". It still does; the BANK grew by one
+        # spare window, so the count the view and `slots` agree on is the bank's.
         assert tuple(view.shape) == (
-            E2E_BLOCKS * item.MLA_PAGE_SIZE,
+            E2E_BANK_BLOCKS * item.MLA_PAGE_SIZE,
             1,
             int(layer_spec.head_size),
         )
-        assert int(bank["slots"]) == E2E_BLOCKS * item.MLA_PAGE_SIZE
+        assert int(bank["slots"]) == E2E_BANK_BLOCKS * item.MLA_PAGE_SIZE
         assert view.data_ptr() == allocated.data_ptr(), (
             f"{bank['name']}'s latent view does not start at the runner's own storage, so "
             f"the layers would write a copy the runner never reads"
@@ -384,7 +440,10 @@ def test_bind_kv_cache_refuses_a_bank_of_the_wrong_rank():
     caches = _runner_shaped_caches(root)
     name = root.get_kv_spec().layers[0].name
     flat = caches[name][0]
-    caches[name] = [flat.reshape(-1), caches[name][1]]
+    # Bank zero is flattened and every other bank is kept as allocated. The reading this
+    # replaces, verbatim: `caches[name] = [flat.reshape(-1), caches[name][1]]` — it named
+    # bank one, which a latent layer no longer has.
+    caches[name] = [flat.reshape(-1), *caches[name][1:]]
     with pytest.raises(ValueError, match="the runner allocates"):
         root.bind_kv_cache(caches)
 
@@ -395,12 +454,18 @@ def test_bind_kv_cache_refuses_a_bank_whose_geometry_is_not_the_specs():
     root = _fixture()["root"]
     caches = _runner_shaped_caches(root)
     layer_spec = root.get_kv_spec().layers[0]
+    # The wrong head count goes in bank zero and every other bank is kept as allocated. The
+    # reading this replaces, verbatim: the list ended `caches[layer_spec.name][1],` — it
+    # named bank one, which a latent layer no longer has.
+    # RE-PINNED: the block dim is `E2E_BANK_BLOCKS`, as allocated. It was
+    # `E2E_BLOCKS`; with the bank grown, leaving it there would have made this bank wrong in
+    # TWO ways and the item could then pass on the one it does not name.
     caches[layer_spec.name] = [
         torch.zeros(
-            (E2E_BLOCKS, 2, item.MLA_PAGE_SIZE, int(layer_spec.head_size)),
+            (E2E_BANK_BLOCKS, 2, item.MLA_PAGE_SIZE, int(layer_spec.head_size)),
             dtype=layer_spec.dtype,
         ),
-        caches[layer_spec.name][1],
+        *caches[layer_spec.name][1:],
     ]
     with pytest.raises(ValueError, match="head count and width"):
         root.bind_kv_cache(caches)
@@ -630,13 +695,14 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
         )
         assert tuple(got["latent_cache"].shape) == tuple(want["latent_cache"].shape)
         # RE-PINNED (D17.1): ORIGINAL READING `int(got["start_position"])`, one
-        # number for every family. NEW VALUE: the LINEAR family's position is a
-        # per-request tuple, while the SPARSE family's stays one number until its
-        # own paged gather lands, so this reads the first entry when it is a tuple.
-        # The asymmetry is the two families' different boundaries, stated rather
-        # than hidden behind a cast that would raise on one of them.
+        # number for every family. NEW VALUE: the LINEAR family's position is ONE
+        # int32 tensor with a row per request, while the SPARSE family's stays a
+        # single 0-d tensor until its own paged gather lands, so this reads the first
+        # row of whichever form it is handed. The asymmetry is the two families'
+        # different boundaries, stated rather than hidden behind a cast that raises
+        # on one of them.
         position = got["start_position"]
-        assert int(position[0] if isinstance(position, tuple) else position) == 0
+        assert int(position.reshape(-1)[0]) == 0
         assert float(got["softmax_scale"]) == float(item.MLA_SOFTMAX_SCALE)
 
     input_ids = torch.randint(
@@ -769,10 +835,11 @@ def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) ->
     """ONE KV-cache group's attention-metadata entry, at this step's geometry.
 
     THE KEYS AND THEIR SHAPES ARE THE RUNNER'S OWN, read off the mapping it builds at
-    `neuron_model_runner.py:4417-4429`; the converter under test reads five of them --
-    `block_table_tensor`, `block_size`, `max_query_len`, `decode_token_threshold` and
-    `cached_seq_len` -- and the rest are present so that this is the runner's mapping and not
-    a five-key stand-in.
+    `neuron_model_runner.py:4418-4442`; the converter under test reads five of them --
+    `host_block_table`, `host_num_computed_tokens`, `block_size`, `max_query_len` and
+    `decode_token_threshold` -- and the rest are present so that this is the runner's mapping
+    and not a five-key stand-in. The device copies of the first two are among the rest: the
+    converter is measured NOT reading them.
     """
     table = torch.tensor([[int(value) for value in row]], dtype=torch.int32)
     return {
@@ -784,6 +851,8 @@ def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) ->
         "max_blocks_per_seq": int(table.shape[1]),
         "decode_token_threshold": int(threshold),
         "cached_seq_len": torch.tensor([cached], dtype=torch.int32),
+        "host_block_table": table,
+        "host_num_computed_tokens": [int(cached)],
         "kv_segment_size": int(table.shape[1]) * int(block_size),
     }
 
@@ -1231,8 +1300,13 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
         )
 
     # ---- THE CONTROL: one table for the whole stack lands the sparse slice elsewhere.
+    # THE SHARED ROW STILL HAS TO ADDRESS THE STEP: what this control varies is WHOSE table the
+    # lookup goes through, not how wide the row is, and a real shared table hands every group
+    # the same full-width row. The measurement is unchanged -- this run of pages starts away
+    # from `sparse_row`, and the recurrent banks read the first entry, the slot, as before.
+    shared_row = [state_slot + offset for offset in range(_blocks_for(tokens))]
     single = {
-        bank["name"]: _entry(row=[state_slot], tokens=tokens, cached=0, threshold=1,
+        bank["name"]: _entry(row=shared_row, tokens=tokens, cached=0, threshold=1,
                              block_size=item.MLA_PAGE_SIZE)
         for bank in banks
     }

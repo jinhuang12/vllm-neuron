@@ -274,6 +274,13 @@ def _entry(*, rows, tokens: int, cached, block_size: int) -> dict:
     (``neuron_model_runner.py:4417-4429``). ``rows`` carries one block row PER
     REQUEST and ``cached`` one cached length per request, which is the only
     difference from the landed single-request helpers this shape comes from.
+
+    THE GEOMETRY THE CONVERTER READS IS THE HOST-SIDE PAIR, not the device tensors
+    beside it: ``host_block_table`` and ``host_num_computed_tokens`` are the runner's
+    own host arrays, and the converter refuses a device tensor for either by name
+    because a captured graph cannot read a value off one. The device tensors stay in
+    the entry, since the entry is the runner's whole mapping and the layers do consume
+    them; what changed is which of the two pairs this step's geometry comes from.
     """
     table = torch.tensor([[int(value) for value in row] for row in rows], dtype=torch.int32)
     lengths = torch.tensor([int(value) for value in cached], dtype=torch.int32)
@@ -287,6 +294,8 @@ def _entry(*, rows, tokens: int, cached, block_size: int) -> dict:
         "max_blocks_per_seq": int(table.shape[1]),
         "decode_token_threshold": DECLARED_DECODE_THRESHOLD,
         "cached_seq_len": lengths,
+        "host_block_table": [[int(value) for value in row] for row in rows],
+        "host_num_computed_tokens": [int(value) for value in cached],
         "kv_segment_size": int(table.shape[1]) * int(block_size),
     }
 
@@ -626,10 +635,19 @@ def test_a1_each_requests_carrier_is_a_view_of_its_own_bank_row() -> None:
         f"the carrier holds {len(carrier['conv_state'])} conv entry(ies) for "
         f"{DECLARED_REQUESTS} requests"
     )
-    assert carrier["start_position"] == tuple(DECLARED_CACHED_LENGTHS), (
-        f"the carrier carries positions {carrier['start_position']} rather than each "
-        f"request's own {tuple(DECLARED_CACHED_LENGTHS)}; one position for the batch "
-        f"would enter the second request's recurrence at the first one's point"
+    # THE POSITIONS ARE ONE int32 TENSOR WITH A ROW PER REQUEST, compared as a tensor:
+    # a python int at this boundary is baked into the graph it was captured with, and a
+    # tuple of them is that defect once per request.
+    assert carrier["start_position"].dtype == torch.int32, (
+        f"the carrier's positions are {carrier['start_position'].dtype}, not int32"
+    )
+    assert torch.equal(
+        carrier["start_position"],
+        torch.tensor(DECLARED_CACHED_LENGTHS, dtype=torch.int32),
+    ), (
+        f"the carrier carries positions {carrier['start_position'].tolist()} rather "
+        f"than each request's own {list(DECLARED_CACHED_LENGTHS)}; one position for the "
+        f"batch would enter the second request's recurrence at the first one's point"
     )
     for index, slot in enumerate(slots):
         assert carrier["conv_state"][index].data_ptr() == (
@@ -695,13 +713,17 @@ def test_a1_a_two_request_linear_batch_is_served_through_the_converter() -> None
     slots = [table[request_id] for request_id in request_ids]
     positions = runner._glm5next_side_cache_positions
     print(f"KEYED|a1|converter_batch|slots={slots}|carrier_positions="
-          f"{carrier['start_position']}|recorded={[positions[slot] for slot in slots]}")
+          f"{carrier['start_position'].tolist()}|recorded="
+          f"{[positions[slot] for slot in slots]}")
     assert len(set(slots)) == DECLARED_REQUESTS, (
         f"the converter seated both requests at {slots}"
     )
-    assert carrier["start_position"] == (opening,) * DECLARED_REQUESTS, (
-        f"the carrier carries positions {carrier['start_position']} for a decode at "
-        f"{opening}"
+    assert torch.equal(
+        carrier["start_position"],
+        torch.tensor([opening] * DECLARED_REQUESTS, dtype=torch.int32),
+    ), (
+        f"the carrier carries positions {carrier['start_position'].tolist()} for a "
+        f"decode at {opening}"
     )
     for index, slot in enumerate(slots):
         assert carrier["conv_state"][index].data_ptr() == (

@@ -100,10 +100,8 @@ from vllm_neuron.functional.blockwise_fp8_mm import (
     to_kernel_scale_layout,
 )
 from vllm_neuron.functional.moe.blockwise_fp8_retile import (
-    DOWN,
     is_pow2_exact,
-    BLOCK_QUANT_SIZE as _PRODUCER_BLOCK_SIZE,
-    retile_block_scales,
+    BLOCK_QUANT_SIZE as _VENDOR_BLOCK_SIZE,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -116,10 +114,10 @@ N = 512   # output width; a whole number of SCALE_BLOCK_SIZE scale blocks
 
 M_TILES = M // TILE_SIZE            # 2
 # RE-PINNED by `inc-glm53f-112` (D17.1). The kernel's scale grid IS the
-# checkpoint's, so these are the 128-block counts. The producer's 256 grid keeps
-# its own names below, because two items in this file are about the PRODUCER and
-# not about the kernel's index granularity -- one name for both would be exactly
-# the drift the re-pin removes.
+# checkpoint's, so these are the 128-block counts. The vendor matmul's ``256``
+# grid keeps its own names below, because the fixture's scale CONDITIONING is
+# stated on that grid -- one name for both would be exactly the drift the re-pin
+# removes.
 K_BLOCKS = K // SCALE_BLOCK_SIZE    # 4
 N_BLOCKS = N // SCALE_BLOCK_SIZE    # 4
 OUTPUT_TILES = M_TILES * N_BLOCKS   # 8 -- the "per output tile" population
@@ -131,12 +129,12 @@ OUTPUT_TILES = M_TILES * N_BLOCKS   # 8 -- the "per output tile" population
 #: stops testing a refusal.
 INADMISSIBLE_K = SCALE_BLOCK_SIZE * 2 + SCALE_BLOCK_SIZE // 2   # 320
 
-#: The MoE retile producer's block extent, imported from the producer itself.
-PRODUCER_BLOCK_SIZE = _PRODUCER_BLOCK_SIZE
-PRODUCER_K_BLOCKS = K // PRODUCER_BLOCK_SIZE    # 2
-PRODUCER_N_BLOCKS = N // PRODUCER_BLOCK_SIZE    # 2
+#: The vendor matmul's scale-block extent, imported and never typed.
+VENDOR_BLOCK_SIZE = _VENDOR_BLOCK_SIZE
+VENDOR_K_BLOCKS = K // VENDOR_BLOCK_SIZE    # 2
+VENDOR_N_BLOCKS = N // VENDOR_BLOCK_SIZE    # 2
 #: 128-tiles per producer block, per axis. Derived, never typed as ``2``.
-TILES_PER_PRODUCER_BLOCK = PRODUCER_BLOCK_SIZE // TILE_SIZE
+TILES_PER_VENDOR_BLOCK = VENDOR_BLOCK_SIZE // TILE_SIZE
 
 #: The declared tolerance pair, from the plan block. Not moved anywhere below.
 RTOL = 3e-2
@@ -156,10 +154,6 @@ _MODULE = "vllm_neuron.functional.blockwise_fp8_mm"
 
 class RouteInstrumentError(AssertionError):
     """A route reading that is not what the plan declares."""
-
-
-class F1PreconditionError(AssertionError):
-    """The pow2 losslessness precondition did not hold on this case's scales."""
 
 
 class ScaleMappingError(AssertionError):
@@ -236,65 +230,55 @@ def _assert_route(sim: _SimulatorCounter, expected_dispatches: int, label: str) 
 # --------------------------------------------------------------------------- #
 # Case construction.                                                           #
 #                                                                              #
-# The retile is `inc-glm53f-024`'s LANDED producer, not a re-implementation:    #
-# this test consumes its `block_scales` / `retiled_weights` / `records` and     #
-# never its MoE `consumer_scales`, so no MoE flat-index semantics enter the     #
-# dense path. The one claim that reuse makes -- the axis mapping from the       #
-# producer's (E, i_256, h_256) to this module's [k_block, n_block] -- is        #
-# SETTLED by a bit-exact dequantisation-invariance reading, not assumed:        #
-# `test_retile_reuse_is_dequantisation_invariant`.                             #
+# The kernel indexes the CHECKPOINT's own [128, 128] grid, so the case is the  #
+# checkpoint's pair and no coarsening step stands between the two. Nothing here #
+# consumes a MoE flat scale index, so no MoE layout semantics enter the dense   #
+# path.                                                                        #
 # --------------------------------------------------------------------------- #
-#: Per-``256``-block exponent of the RETAINED scale, and the per-constituent
-#: offsets around it. DETERMINISTIC rather than sampled, because four properties
-#: of this fixture are load-bearing and a draw can only satisfy them by luck:
-#: (i) every entry an exact power of two, (ii) the four block scales DISTINCT so a
-#: transposed flat index is numerically visible, (iii) the block-scale matrix
-#: ASYMMETRIC so the transposed-mapping control in
-#: :func:`test_retile_reuse_is_dequantisation_invariant` can fail, and (iv) every
-#: constituent ratio NON-UNIT for three of four positions so conjunct 1 is
-#: exercised rather than satisfied by uniformity.
+#: Per-``256``-block base exponent, and the per-tile offsets around it.
+#: DETERMINISTIC rather than sampled, because three properties of this fixture are
+#: load-bearing and a draw can only satisfy them by luck: (i) every entry an exact
+#: power of two, so the fixture's own casts are exact; (ii) the block scales
+#: DISTINCT, so a transposed flat index is numerically visible; (iii) the
+#: block-scale matrix ASYMMETRIC, so a transposed-mapping control can fail.
 _BLOCK_EXPONENTS = (-3, 1, 2, -1)
-#: Offsets at ``(d_k, d_n)``. ``(0, 0)`` is ``0`` because `inc-glm53f-024` retains
-#: the block's ``(0, 0)`` constituent as the block scale. The others are bounded
-#: at ONE exponent so that rescaling weights on ``m/8`` (``m in 1..7``) by the
-#: ratio stays inside e4m3's NORMAL range -- ``1/16 = 2**-4`` against a minimum
-#: normal of ``2**-6`` -- which is what makes ``inexact_rescales == 0`` a
-#: property of the construction rather than of the seed.
+#: Offsets at ``(d_k, d_n)``, bounded at ONE exponent so that a weight on ``m/8``
+#: (``m in 1..7``) scaled by any neighbour ratio stays inside e4m3's NORMAL range
+#: -- ``1/16 = 2**-4`` against a minimum normal of ``2**-6``.
 _RATIO_OFFSETS = ((0, 1), (-1, 1))
 
 
 def _pow2_checkpoint_scales(uniform_one: bool = False) -> torch.Tensor:
     """``(1, K//128, N//128)`` fp32 checkpoint scales, every entry an exact pow2.
 
-    Built so the F1 COMPLETE condition holds NON-trivially: the retained
-    ``256``-block scale is ``2 ** e_block`` with ``e_block`` varying per block,
-    and the other three constituents are ``2 ** (e_block + d)`` with
-    ``d in {-1, 0, 1}`` -- mutually pow2-related without being uniform.
+    Every entry in one ``256``-block is ``2 ** (e_block + d)`` with
+    ``d in {-1, 0, 1}`` and ``e_block`` varying per block: mutually pow2-related
+    without being uniform. The kernel indexes each ``128`` tile's own scale and
+    needs no relation between neighbours; the relation is kept so this grid stays
+    the one the filed readings were taken on.
 
-    ``uniform_one=True`` returns all ``1.0`` -- the exact arm. ``1.0`` is
-    ``2 ** 0`` (all-zero significand under the bit-pattern test), so that arm
-    already satisfies both conjuncts by construction and needs no repair,
-    exactly as the plan block states.
+    ``uniform_one=True`` returns all ``1.0`` -- the exact arm, which isolates the
+    dequantisation arithmetic, exactly as the plan block states.
     """
     grid = (1, K // TILE_SIZE, N // TILE_SIZE)
     if uniform_one:
         return torch.ones(grid, dtype=torch.float32)
 
     exponents = torch.zeros(grid[1:], dtype=torch.int64)
-    # The quad structure is the PRODUCER's: one 256 block spans a
-    # TILES_PER_PRODUCER_BLOCK square of 128 checkpoint tiles. Driven by the
-    # producer's counts since `inc-glm53f-112`, because the kernel's own block
-    # count is no longer 2 and this loop was never about the kernel.
-    for k_block in range(PRODUCER_K_BLOCKS):
-        for n_block in range(PRODUCER_N_BLOCKS):
+    # The quad structure is the VENDOR matmul's: one 256 block spans a
+    # TILES_PER_VENDOR_BLOCK square of 128 checkpoint tiles. Driven by those
+    # counts since `inc-glm53f-112`, because the kernel's own block count is no
+    # longer 2 and this loop was never about the kernel.
+    for k_block in range(VENDOR_K_BLOCKS):
+        for n_block in range(VENDOR_N_BLOCKS):
             base = _BLOCK_EXPONENTS[
-                (k_block * PRODUCER_N_BLOCKS + n_block) % len(_BLOCK_EXPONENTS)
+                (k_block * VENDOR_N_BLOCKS + n_block) % len(_BLOCK_EXPONENTS)
             ]
-            for d_k in range(TILES_PER_PRODUCER_BLOCK):
-                for d_n in range(TILES_PER_PRODUCER_BLOCK):
+            for d_k in range(TILES_PER_VENDOR_BLOCK):
+                for d_n in range(TILES_PER_VENDOR_BLOCK):
                     exponents[
-                        k_block * TILES_PER_PRODUCER_BLOCK + d_k,
-                        n_block * TILES_PER_PRODUCER_BLOCK + d_n,
+                        k_block * TILES_PER_VENDOR_BLOCK + d_k,
+                        n_block * TILES_PER_VENDOR_BLOCK + d_n,
                     ] = base + _RATIO_OFFSETS[d_k][d_n]
     return torch.ldexp(torch.ones(grid, dtype=torch.float32), exponents.unsqueeze(0))
 
@@ -325,29 +309,17 @@ def _fp8_grid(seed: int, *shape: int, signed: bool = False) -> torch.Tensor:
 
 
 def _build_case(uniform_one: bool = False, signed: bool = False) -> dict:
-    """The tiny config the kernel consumes, plus the producer's pair beside it.
+    """The tiny config the kernel consumes: the checkpoint's own pair.
 
     RE-PINNED by `inc-glm53f-112` (D17.1), and this is the increment in one
-    function. The kernel used to be handed the producer's RETILED pair --
-    weights re-expressed against ``256``-granular scales -- because it indexed
-    its scales by ``256`` blocks. It now indexes by the ``128`` blocks the
+    function. The kernel used to be handed a RETILED pair -- weights
+    re-expressed against ``256``-granular scales -- because it indexed its
+    scales by ``256`` blocks. It now indexes by the ``128`` blocks the
     checkpoint itself stores, so ``weight`` and ``weight_scale`` ARE the
-    checkpoint's own pair and no producer step stands between them.
-
-    The producer's pair is still built and still returned, under
-    ``retiled_weight`` and ``retiled_scale``, because two items in this file are
-    about the producer's axis mapping and not about the kernel.
+    checkpoint's own pair and nothing stands between them.
     """
     checkpoint = _pow2_checkpoint_scales(uniform_one=uniform_one)
     weights = _fp8_grid(21, 1, K, N, signed=signed)
-
-    result = retile_block_scales(weights.to(_FP8), checkpoint, projection=DOWN)
-
-    # The producer's block_scales are (E, i_256, h_256) with rows=K and cols=N,
-    # so the transpose lands on this module's [k_block, n_block]. The mapping is
-    # settled by test_retile_reuse_is_dequantisation_invariant, not asserted here.
-    retiled_scale = result.block_scales[0].t().contiguous()
-    retiled_weight = result.retiled_weights[0].contiguous()
     # The checkpoint grid is already ``(1, K//128, N//128)`` = [k_block, n_block],
     # so it needs no transpose: that is what reading the stored grid means.
     x = _fp8_grid(31, M, K, signed=signed).to(torch.bfloat16)
@@ -356,11 +328,8 @@ def _build_case(uniform_one: bool = False, signed: bool = False) -> dict:
         "x": x,
         "weight": weights[0].to(_FP8).contiguous(),
         "weight_scale": checkpoint[0].contiguous(),
-        "retiled_weight": retiled_weight,
-        "retiled_scale": retiled_scale,
         "checkpoint": checkpoint,
         "raw_weights": weights,
-        "result": result,
     }
 
 
@@ -653,196 +622,6 @@ def test_numeric_comparison_is_armed() -> None:
     )
     with pytest.raises(AssertionError):
         torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
-
-
-# --------------------------------------------------------------------------- #
-# F1 PRECONDITION -- asserted HERE, not inherited from `inc-glm53f-024`.        #
-# --------------------------------------------------------------------------- #
-def test_f1_precondition_complete_condition_n_over_n() -> None:
-    """Both losslessness conjuncts hold on the tolerance arm's scales, N/N tiles.
-
-    Conjunct 1: the four constituent ``[128,128]`` scales are mutually
-    power-of-two-related. Conjunct 2: the retained ``256``-block scale is itself
-    a power of two. Both by the **bit-pattern** predicate
-    :func:`~vllm_neuron.functional.moe.blockwise_fp8_retile.is_pow2_exact`,
-    never ``log2``.
-
-    Recomputed from the producer's emitted records rather than read off its own
-    ``lossless`` flag, so this is an independent reading.
-    """
-    case = _build_case()
-    result = case["result"]
-    records = result.records
-    if not records:
-        raise VacuousControlError(
-            "the producer emitted 0 block records, so an N/N reading would be "
-            "0/0 -- vacuous"
-        )
-
-    lossless = 0
-    ratio_count = 0
-    non_unit_ratios = 0
-    for record in records:
-        conjunct1 = all(is_pow2_exact(ratio) for ratio in record.ratios)
-        conjunct2 = is_pow2_exact(record.block_scale)
-        ratio_count += len(record.ratios)
-        non_unit_ratios += sum(1 for ratio in record.ratios if ratio != 1.0)
-        if conjunct1 and conjunct2:
-            lossless += 1
-        else:
-            raise F1PreconditionError(
-                f"block {record.key}: conjunct1(quad mutually pow2)={conjunct1} "
-                f"ratios={record.ratios} conjunct2(block scale pow2)="
-                f"{conjunct2} block_scale={record.block_scale!r}. The tolerance "
-                f"{RTOL}/{ATOL} certifies KERNEL error only when both hold; "
-                f"widening it to absorb remapping error is the user's election, "
-                f"not this test's."
-            )
-
-    print(
-        f"[f1] complete_condition_blocks={lossless}/{len(records)} (N/N required) "
-        f"ratios_tested={ratio_count} non_unit_ratios={non_unit_ratios} "
-        f"inexact_rescales={result.inexact_rescales} "
-        f"emitted_unsupplied={result.emitted_unsupplied} "
-        f"input_scales_dropped={result.input_scales_dropped}"
-    )
-    assert lossless == len(records), (
-        f"{lossless}/{len(records)} blocks satisfy both conjuncts"
-    )
-    # The population is the PRODUCER's: one record per 256 block, which is
-    # PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS and NOT the kernel's block count.
-    # Since `inc-glm53f-112` the two differ (4 against 16), and this item reads
-    # the producer's emission.
-    assert len(records) == PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS, (
-        f"expected {PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS} block records, got "
-        f"{len(records)}"
-    )
-    # The retile must be bit-exact on the weights it rescaled, or the kernel
-    # would be fed a weight the checkpoint does not contain.
-    assert result.inexact_rescales == 0, (
-        f"inexact_rescales={result.inexact_rescales}, declared 0"
-    )
-    # Conjunct 1 must be exercised, not satisfied by a uniform quad: if every
-    # ratio were 1.0 the mutual-pow2 conjunct would be a tautology here.
-    assert non_unit_ratios > 0, (
-        "every constituent ratio is 1.0, so conjunct 1 is satisfied by "
-        "uniformity and this reading does not exercise it"
-    )
-
-
-def test_f1_detector_catches_a_non_pow2_block_scale() -> None:
-    """DETECTOR: the F1 predicate must FAIL a block that violates the condition.
-
-    Without this arm, ``N/N`` above is a tautology over scales this test itself
-    chose. The detector feeds the real predicate a real violating scale and
-    requires a real negative.
-    """
-    clean = _build_case()["result"]
-    clean_bad = [
-        record.key
-        for record in clean.records
-        if not (
-            all(is_pow2_exact(r) for r in record.ratios)
-            and is_pow2_exact(record.block_scale)
-        )
-    ]
-    if clean_bad:
-        raise VacuousControlError(
-            f"the clean arm already violates F1 at {clean_bad[:3]}, so the "
-            f"detector cannot attribute a negative to its injection"
-        )
-
-    # 3.0 has a non-zero significand field, so it is not a power of two: the
-    # retained block scale for block (0, 0) violates conjunct 2 and the three
-    # ratios taken against it violate conjunct 1.
-    checkpoint = _pow2_checkpoint_scales()
-    poisoned = checkpoint.clone()
-    poisoned[0, 0, 0] = 3.0
-    if torch.equal(poisoned, checkpoint):
-        raise VacuousControlError("injection changed nothing -- control is vacuous")
-
-    dirty = retile_block_scales(
-        _fp8_grid(21, 1, K, N).to(_FP8), poisoned, projection=DOWN
-    )
-    violations = [
-        record.key
-        for record in dirty.records
-        if not (
-            all(is_pow2_exact(r) for r in record.ratios)
-            and is_pow2_exact(record.block_scale)
-        )
-    ]
-    print(
-        f"[f1-detector] clean_violations={len(clean_bad)} "
-        f"poisoned_violations={len(violations)} first={violations[:1]} "
-        f"poisoned_inexact_rescales={dirty.inexact_rescales}"
-    )
-    assert violations, (
-        "the F1 predicate passed a non-pow2 block scale (3.0); it is therefore "
-        "not a discriminator and the N/N reading above means nothing"
-    )
-    assert (0, 0, 0) in violations, f"expected block (0,0,0) flagged, got {violations}"
-    assert not is_pow2_exact(3.0)
-    assert is_pow2_exact(2.0) and is_pow2_exact(0.25)
-
-
-# --------------------------------------------------------------------------- #
-# The `inc-glm53f-024` reuse, settled rather than assumed.                      #
-# --------------------------------------------------------------------------- #
-def test_retile_reuse_is_dequantisation_invariant() -> None:
-    """The retiled (weight, block scale) pair dequantises to the SAME product.
-
-    This is the one reading the reuse of `inc-glm53f-024`'s MoE-shaped producer
-    needs: it settles the axis mapping from the producer's
-    ``(E, i_256, h_256)`` block scales onto this module's
-    ``[k_block, n_block]`` grid **without** any claim about which axis is which.
-    A transposed mapping changes the dequantised product wherever the blocks
-    carry distinct scales, and this fixture's blocks do.
-
-    Required BIT-EXACT, not within a tolerance: both sides scale the same fp8
-    weight by powers of two, which is exact in fp32 barring overflow.
-    """
-    case = _build_case()
-    retiled = case["retiled_weight"].to(torch.float32) * case[
-        "retiled_scale"
-    ].repeat_interleave(PRODUCER_BLOCK_SIZE, 0).repeat_interleave(
-        PRODUCER_BLOCK_SIZE, 1
-    )
-    checkpoint = case["raw_weights"][0] * case["checkpoint"][0].repeat_interleave(
-        TILE_SIZE, 0
-    ).repeat_interleave(TILE_SIZE, 1)
-
-    distinct = case["retiled_scale"].unique().numel()
-    print(
-        f"[retile-reuse] distinct_block_scales={distinct} of "
-        f"{PRODUCER_K_BLOCKS * PRODUCER_N_BLOCKS} "
-        f"bit_exact={bool(torch.equal(retiled, checkpoint))} "
-        f"max_abs_diff={float((retiled - checkpoint).abs().max()):.6e}"
-    )
-    if distinct < 2:
-        raise VacuousControlError(
-            "every block carries the same scale, so a transposed axis mapping "
-            "would be invisible to this reading"
-        )
-    assert torch.equal(retiled, checkpoint), (
-        "the retiled weight and block scale do not dequantise to the checkpoint "
-        "product bit-exactly, so either the axis mapping onto [k_block, "
-        "n_block] is wrong or the rescale was inexact"
-    )
-
-    # Control: the reading must move when the mapping is wrong.
-    transposed = case["retiled_scale"].t().contiguous()
-    mistaken = case["retiled_weight"].to(torch.float32) * transposed.repeat_interleave(
-        PRODUCER_BLOCK_SIZE, 0
-    ).repeat_interleave(PRODUCER_BLOCK_SIZE, 1)
-    print(
-        f"[retile-reuse] control transposed_mapping_bit_exact="
-        f"{bool(torch.equal(mistaken, checkpoint))}"
-    )
-    assert not torch.equal(mistaken, checkpoint), (
-        "a transposed scale mapping dequantises identically, so this reading "
-        "cannot settle the mapping and the control is unarmed"
-    )
 
 
 # --------------------------------------------------------------------------- #
