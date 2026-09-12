@@ -437,6 +437,29 @@ MHC_LEAVES: tuple[str, ...] = (
     "hc_ffn_scale",
 )
 
+#: The plain leaves the published checkpoint holds in float32, other than the
+#: two at :data:`KDA_BARE_LEAVES`: the four mHC mix leaves and the router
+#: correction bias. Each one arrives as a plain key, so a placeholder typed by
+#: kind alone would give it the config dtype and narrow the checkpoint's own
+#: float32 before any consumer reads it.
+#:
+#: The reference declares all five float32. Its fused mHC entry point asserts
+#: the mix leaves (``vllm/models/deepseek_v4/nvidia/model.py:1095-1121``,
+#: ``vllm/model_executor/kernels/mhc/tilelang.py:138-140``) and its router keeps
+#: the correction bias float32 beside an fp32-gate assert
+#: (``vllm/model_executor/models/step3p5.py:335-342``).
+#:
+#: The two ``fn`` leaves are absent on purpose. The published checkpoint holds
+#: them in the config dtype, so there is no cast to remove here, and whether a
+#: bfloat16 tensor may fill a float32 seam is a question about the checkpoint.
+FLOAT32_PLAIN_LEAVES: tuple[str, ...] = (
+    "hc_attn_base",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_scale",
+    "router_bias",
+)
+
 #: The DSA half's four scaled projections -- the ONLY ``self_attn`` leaves on a
 #: sparse-attention layer that carry a ``weight_scale_inv`` companion. Measured:
 #: ``kv_b_proj`` and every indexer leaf carry none, so asking for one makes the
