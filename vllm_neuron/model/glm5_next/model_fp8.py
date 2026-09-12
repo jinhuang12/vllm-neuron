@@ -5531,19 +5531,62 @@ class Glm5NextDSAIndexer(nn.Module):
         key is ``[rows, select_k]``, so an NKI route would be one call per row or a new 2-D
         kernel. The lead has recorded that; the substrate argument belongs to the plan rev.
 
-        The key is stable BY CONSTRUCTION rather than by a ``stable=`` keyword: a real id at
-        column ``i`` sorts at ``i`` and a sentinel at column ``i`` sorts at ``k + i``, so the
-        two groups cannot interleave and neither group is reordered within itself.
+        NO SORT: THE TARGET HAS NONE. An argsort spelled this ordering until the graph reached
+        the compiler, which refused it by name -- ``Operation sort is not supported on trn2.
+        Use supported equivalent operation like TopK or replace it with an alternate
+        implementation via Neuron Kernel Interface (NKI)`` -- in both the prefill and the
+        decode graph, so nothing compiled. The refusal is a statement about the target's
+        operation set rather than about a shape or an option, and it leaves the substrate note
+        above untouched: what belongs in a kernel is one question, and whether ``sort`` runs
+        here at all is another.
+
+        THE SORT WAS NEVER SORTING, which is why a cheaper form is exact rather than merely
+        close. The ordering wanted is a stable PARTITION: real ids first in their own column
+        order, sentinels after them in theirs. So each id's destination is countable instead of
+        comparable -- a real id goes to the number of reals before it, and a sentinel to the
+        real total plus the number of sentinels before it. Both counts are exclusive prefix
+        sums of one boolean mask, and together they are a bijection on every row, which is
+        what makes the result the same permutation the argsort produced and not an
+        approximation of it.
+
+        SCATTER RATHER THAN GATHER, because the inverse permutation cannot be had for free.
+        Gathering needs, for each output column, the source column that lands there -- the
+        index of the n-th set bit of the mask -- and building that needs either a scatter or a
+        search over the prefix sums. A scatter of the forward destinations is the same work
+        without the second step, and it is out-of-place: nothing is written into a slice of a
+        traced buffer, which is the failure the two graphs before this one were spent on.
+
+        THE PREFIX SUMS GO THROUGH THE FORK'S OWN ``cumsum`` AND NOT ``torch.cumsum``, which
+        this package names unsupported in the same breath as ``torch.softmax`` and
+        ``torch.multinomial`` (``functional/sampling.py:6``). ``functional/cumsum.py`` is the
+        replacement it ships: 2-D, last dimension, the NKI kernel when ``can_run_kernel``
+        allows and an upper-triangular matmul otherwise. A raw ``torch.cumsum`` here would be
+        this fork's first one inside a compiled graph, in the very change whose purpose is
+        lowerability -- one refused operation traded for another.
+
+        THE COUNTS ARE ``int32``, WHICH IS THE DTYPE THIS FORK ALREADY HANDS THAT FUNCTION
+        (``functional/moe/build_all2all_dispatch_metadata.py:218`` and
+        ``build_all2all_combine_metadata.py:85`` both pass ``int32`` counts). It is exact by
+        construction, so no ceiling argument is needed at all, and the cast to ``int64``
+        happens once at the end because scatter's index must be that width. The row's real
+        total is read off the inclusive sum's LAST COLUMN rather than taken as a second
+        reduction, which is the same number with one less operation in the graph.
         """
         if pool_ids.ndim != 2:
             raise Glm5NextDSAIndexerError(
                 f"pool_ids must be [rows, select_k] from the sentinel; got "
                 f"{tuple(pool_ids.shape)}"
             )
-        k = int(pool_ids.shape[1])
-        position = torch.arange(k, device=pool_ids.device, dtype=torch.int64)
-        key = (pool_ids < 0).to(torch.int64) * k + position
-        return pool_ids.gather(1, key.argsort(dim=1))
+        from vllm_neuron.functional.cumsum import cumsum
+
+        real = (pool_ids >= 0).to(torch.int32)
+        sentinel = 1 - real
+        reals = cumsum(real, dim=-1)
+        sentinels = cumsum(sentinel, dim=-1)
+        destination = torch.where(
+            real.bool(), reals - real, reals[:, -1:] + sentinels - sentinel
+        ).to(torch.int64)
+        return torch.zeros_like(pool_ids).scatter(1, destination, pool_ids)
 
     def expand_indices(
         self, pool_ids: torch.Tensor, seq_lens: torch.Tensor
