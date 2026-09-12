@@ -3474,9 +3474,9 @@ def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
 
     WHAT IT GIVES UP, STATED RATHER THAN LEFT TO BE FOUND. A scale-position mixup
     INSIDE one 256 block is invisible on this grid, where the ramp would catch it.
-    No single fixture can hold both readings. The ramp reading is kept by the item
-    that keeps the ramp and asserts the refusal fires by name,
-    :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`.
+    No single fixture can hold both readings. The ramp reading is kept by
+    :func:`test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish`,
+    which loads the ramp and reads what the publish emitted.
     """
     per_block = _tiles_per_producer_block()
     extent = shape[dim]
@@ -3485,69 +3485,6 @@ def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
     line = torch.ldexp(
         torch.ones(extent, dtype=torch.float32), exponents[block % exponents.numel()]
     )
-    view = [1] * len(shape)
-    view[dim] = extent
-    return line.reshape(view).expand(shape).contiguous()
-
-
-def _squeezed_byte_ceiling() -> float:
-    """The largest magnitude a squeezed load can store, MEASURED through the loader.
-
-    ``inc-glm53f-054e`` added this because the number moved. It pushes the OCP
-    maximum through the production squeeze rather than reading the loader's private
-    factor, so what comes back is what a load would really store: 224.0 at this
-    increment's exact half, 240.0 at the older 240/448, and 448.0 on a platform where
-    the squeeze does not engage at all. A measurement rather than a constant is what
-    keeps the item below armed at whatever the factor becomes.
-    """
-    ocp_max = float(torch.finfo(torch.float8_e4m3fn).max)
-    probe = torch.tensor([ocp_max], dtype=torch.float32).to(torch.float8_e4m3fn)
-    squeezed = downscale_fp8_weight_bytes(probe).to(torch.float32)
-    return float(squeezed.abs().max())
-
-
-def _ratio_the_retile_must_refuse() -> int:
-    """The smallest whole rescale the retile cannot hold, DERIVED not chosen.
-
-    The retile refuses when a rescaled byte passes fp8's own bound
-    (``blockwise_fp8_retile.py:461-463``, the bound being
-    ``torch.finfo(torch.float8_e4m3fn).max``). The largest byte a squeezed load
-    stores is :func:`_squeezed_byte_ceiling`, so the smallest whole ratio that MUST
-    overflow is ``floor(bound / ceiling) + 1``.
-
-    That is 3 at ``inc-glm53f-054e``'s exact half (224 x 3 = 672) and was 2 at the
-    older 240/448 (240 x 2 = 480). It is the whole reason the plain ramp armed the
-    refusal before this increment and no longer does: the ramp's worst 256-block
-    ratio is exactly 2, and 224 x 2 = 448 is exactly the bound, which the strict
-    comparison holds rather than refuses.
-    """
-    bound = float(torch.finfo(torch.float8_e4m3fn).max)
-    return int(bound // _squeezed_byte_ceiling()) + 1
-
-
-def _steep_block_grid_pattern(
-    shape: tuple[int, ...], dim: int, ratio: int
-) -> torch.Tensor:
-    """A ``128``-tile grid whose EVERY ``256`` block asks for a rescale of ``ratio``.
-
-    Alternating 1 and ``ratio`` per tile, so each block retains 1 -- the coarsening
-    keeps its ``(h_tile 0, i_tile 0)`` scale (``blockwise_fp8_retile.py:400-401``) --
-    and every other tile in it rescales by exactly ``ratio``.
-
-    ALTERNATING RATHER THAN A GROWING RAMP, and that is the point of the fixture.
-    ``ratio ** 255`` is ``inf`` in fp32 and a non-finite scale is refused by a
-    DIFFERENT branch (``:405-414``), which would make this item pass for the wrong
-    reason. Alternating keeps every scale small and finite, so the only thing that
-    can refuse the load is the one thing this fixture varies.
-    """
-    per_block = _tiles_per_producer_block()
-    assert per_block >= 2, (
-        f"a producer block holds {per_block} tiles of the checkpoint's granularity, "
-        f"so no block has a second tile to rescale and this fixture varies nothing"
-    )
-    extent = shape[dim]
-    line = torch.ones(extent, dtype=torch.float32)
-    line[1::per_block] = float(ratio)
     view = [1] * len(shape)
     view[dim] = extent
     return line.reshape(view).expand(shape).contiguous()
@@ -4708,7 +4645,6 @@ def _deferred_key_overrides(
     mappings: dict[str, str | list[str]],
     *,
     ramp_grids: bool = False,
-    steep_ratio: int | None = None,
     dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> dict[str, torch.Tensor]:
     """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
@@ -4716,21 +4652,13 @@ def _deferred_key_overrides(
     A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK, and that
     is R6 item R-T2's change here. Every family in :data:`_COARSENED_AT_LOAD_CLASSES`
     has whole-256 extents in this fixture, so its load coarsens the grid; on the
-    ramp that coarsening rescales weight bytes, which contradicts the bit-exact
-    readings below and now REFUSES where a byte leaves the fp8 range (R6 item
-    R-P1). :func:`_pow2_block_grid_pattern` carries the reasoning and what it gives
-    up. Every other family keeps the ramp: nothing rescales its weights.
+    ramp that coarsening rescaled weight bytes, which contradicted the bit-exact
+    readings below. :func:`_pow2_block_grid_pattern` carries the reasoning and what
+    it gives up. Nothing coarsens a routed grid any more, so nothing rescales a
+    byte and no grid family can overflow the fp8 bound.
 
     ``ramp_grids=True`` writes the ramp for EVERY family, which is the fixture the
-    refusal item needs and the only caller that asks for it.
-
-    ``steep_ratio`` is ``inc-glm53f-054e``'s addition, and it varies ONE field
-    against the pow2 fixture: the retiled families' grids become
-    :func:`_steep_block_grid_pattern` at that ratio and every other family keeps its
-    ramp. It exists because the plain ramp no longer overflows the fp8 bound once the
-    squeeze leaves 224 rather than 240, so the refusal it was written to arm needs a
-    steeper grid to stay reachable. :func:`_ratio_the_retile_must_refuse` derives the
-    ratio from the loader rather than choosing one.
+    surviving ramp item needs and the only caller that asks for it.
 
     A bank entry is E weight keys and E scale keys interleaved, so its arm writes
     one tensor per expert at that expert's own full width -- the loader's job is to
@@ -4784,11 +4712,7 @@ def _deferred_key_overrides(
                 )
             coarsened = not ramp_grids and family in _COARSENED_AT_LOAD_CLASSES
             for key in scales:
-                if coarsened and steep_ratio is not None:
-                    overrides[key] = _steep_block_grid_pattern(
-                        grid_shape, shard_dim, steep_ratio
-                    )
-                elif coarsened:
+                if coarsened:
                     overrides[key] = _pow2_block_grid_pattern(grid_shape, shard_dim)
                 else:
                     overrides[key] = _shard_pattern(
@@ -4801,18 +4725,14 @@ def _deferred_checkpoint(
     tmp_path: Path,
     *,
     ramp_grids: bool = False,
-    steep_ratio: int | None = None,
     name: str = "deferred",
     dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> tuple[Path, dict, dict]:
     """One checkpoint holding every full tensor these five items read.
 
-    ``ramp_grids`` and ``name`` exist for R6 item R-T2's refusal item alone: it
-    needs the SAME checkpoint with the ramp scale grid restored, written beside this
-    one rather than over it, so the two loads in that item differ in exactly the one
-    field it varies. ``steep_ratio`` is the third grid family the same item needs
-    since ``inc-glm53f-054e``, and it is written beside the other two for the same
-    reason.
+    ``ramp_grids`` and ``name`` exist for the ramp item alone: it needs the SAME
+    checkpoint with the ramp scale grid restored, written beside this one rather than
+    over it, so its two loads differ in exactly the one field it varies.
 
     ``dense_intermediate`` exists for conjunct (3) alone, whose subject is a padded
     rank: see :data:`PAD_DENSE_INTERMEDIATE`. It reaches the config AND the written
@@ -4825,7 +4745,6 @@ def _deferred_checkpoint(
         reference,
         mappings,
         ramp_grids=ramp_grids,
-        steep_ratio=steep_ratio,
         dense_intermediate=dense_intermediate,
     )
     directory = tmp_path / name
@@ -7479,9 +7398,10 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
         shard dim, so a layout that dropped or invented a scale would move them.
         R6 item R-T2 changed that granularity from ``-095b``'s per-128-tile ramp
         and corrected this sentence with it -- on the ramp the coarsening rescales
-        weight bytes, which is what these counters were reporting and what R-P1 now
-        refuses; :func:`_pow2_block_grid_pattern` records the trade and
-        :func:`test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan`
+        weight bytes, which is what these counters were reporting. Nothing rescales
+        a byte any more, so nothing can overflow and there is no refusal to arm;
+        :func:`_pow2_block_grid_pattern` records the grid trade and
+        :func:`test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish`
         keeps the ramp reading.
     (5) Every routed bank carries its prepared kernel operands. This is the plan's
         own sentence for this item -- the prep's arrival makes the loop visit the
@@ -7590,253 +7510,6 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
         "the control built no routed bank either, so it varies more than the one "
         "field it declares and cannot isolate anything"
     )
-
-
-def test_blocked_a_ramp_scale_grid_refuses_instead_of_emitting_nan(
-    tmp_path, monkeypatch, single_rank_process_group
-) -> None:
-    """R6 item R-T2's pair: a grid the coarsening cannot reproduce is REFUSED, and
-    the ramp is no longer one of them.
-
-    ``inc-glm53f-054e`` c7 re-argued this item on a measurement rather than on a
-    preference. Grant 181 ran it at the exact ``x 1/2`` squeeze and it read
-    ``DID NOT RAISE``, and the arithmetic says it should: the squeeze stores at most
-    ``448 x 1/2 = 224`` where the old ``240/448`` stored 240, the plain ramp's worst
-    256-block ratio is exactly 2, and ``224 x 2 = 448`` is exactly fp8's bound, which
-    the retile's strict comparison HOLDS rather than refuses
-    (``blockwise_fp8_retile.py:461-463``). At 240 the same ramp reached 480 and was
-    refused. Nothing in the production path regressed: a checkpoint the old factor
-    could not load now loads, exactly, with no NaN.
-
-    So the item keeps both halves of what it was protecting, on THREE grid families
-    written from one checkpoint and differing in one field each:
-
-    * the pow2 grid loads and completes, which is the arming half. Without it a
-      refusal below could be any load failure wearing the right words.
-    * the RAMP grid is now a positive claim: the load completes, every published
-      tensor is finite -- which is what "instead of emitting NaN" means, measured
-      rather than implied -- and the retile's own ``inexact_rescales`` per leaf are
-      PRINTED as readings. They are not zero and are not asserted: the first block
-      rescales by exactly 2 and stays bit-exact, while later blocks rescale by
-      fractions like 4/3 that fp8 cannot hold exactly. The old factor never reached
-      them, because it refused on the first block.
-    * the STEEP grid keeps the refusal armed, at a ratio DERIVED from the loader
-      rather than chosen: :func:`_ratio_the_retile_must_refuse` reads the squeezed
-      byte ceiling through the production squeeze and returns the smallest whole
-      ratio that must overflow -- 3 here, 2 at the old factor. The refusal must fire
-      and must still name the expert, the 256 block, the 128 tile, the ratio, the
-      retained scale, the bound and both health counters.
-
-    A clamp is deliberately not the alternative: it would ship numbers the
-    checkpoint does not contain (lead ruling ``LEAD-LOG.md`` §901). Lowering the
-    bound is not one either -- it is ``torch.finfo(torch.float8_e4m3fn).max``, and
-    448 is a value the format holds exactly.
-
-    The refusal is read off the exception CHAIN rather than the outermost type,
-    because the load path is entitled to wrap it; what this item claims is that a
-    ``BlockwiseFp8RetileError`` is in that chain and that its sentence names the
-    coordinates, not that nothing re-raises it.
-    """
-    from vllm_neuron.functional.moe.blockwise_fp8_retile import (
-        BlockwiseFp8RetileError,
-    )
-
-    pow2_directory, pow2_overrides, _mappings = _deferred_checkpoint(tmp_path)
-    ramp_directory, ramp_overrides, _ramp_mappings = _deferred_checkpoint(
-        tmp_path, ramp_grids=True, name="deferred-ramp"
-    )
-
-    # THE ONE FIELD THIS ITEM VARIES, measured rather than declared: the two
-    # checkpoints differ on the grids of the retiled families and nowhere else.
-    # The comparison goes through fp32 because the weight tensors are fp8, where a
-    # dtype-native equality is not something this file assumes it has.
-    def _same(left: torch.Tensor, right: torch.Tensor) -> bool:
-        if left.dtype != right.dtype or tuple(left.shape) != tuple(right.shape):
-            return False
-        return bool(torch.equal(left.to(torch.float32), right.to(torch.float32)))
-
-    assert sorted(ramp_overrides) == sorted(pow2_overrides), (
-        "the two fixtures do not even hold the same keys, so they differ in more "
-        "than the grid family this item varies"
-    )
-    differing = sorted(
-        key
-        for key, tensor in ramp_overrides.items()
-        if not _same(tensor, pow2_overrides[key])
-    )
-    print(f"RAMPREFUSAL_KEYS_THAT_DIFFER={len(differing)}")
-    assert differing, (
-        "the ramp fixture and the pow2 fixture hold identical tensors, so this "
-        "item varies nothing and the refusal below would not be attributable to "
-        "the grid"
-    )
-    assert all(key.endswith(FP8_SCALE_SUFFIX) for key in differing), (
-        f"the two fixtures differ on tensors that are not scale grids: "
-        f"{[key for key in differing if not key.endswith(FP8_SCALE_SUFFIX)][:6]}. "
-        f"This item varies the grid family and must vary nothing else"
-    )
-
-    # THE ARMING HALF. Same widths, same weights, pow2 grid: the load completes.
-    armed = _load_blocked(pow2_directory, monkeypatch)
-    assert _modules_named(armed, "Glm5NextSharedExperts"), (
-        "the pow2 load built no shared-expert module, so the refusal below cannot "
-        "be attributed to the grid the retile read"
-    )
-
-    # ---- ARM 1: THE RAMP COMPLETES AT THIS FACTOR, AND EMITS NO NaN.
-    # The ceiling and the ratio are read, not typed, so the two rows below say what
-    # this run's own loader does rather than what an earlier one did.
-    ceiling = _squeezed_byte_ceiling()
-    steep_ratio = _ratio_the_retile_must_refuse()
-    bound = float(torch.finfo(torch.float8_e4m3fn).max)
-    print(
-        f"RAMPREFUSAL_CEILING={ceiling!r}|bound={bound!r}"
-        f"|ramp_worst_ratio_is_2_reaches={ceiling * 2!r}"
-        f"|refused_only_if_above={bound!r}"
-    )
-    print(f"RAMPREFUSAL_DERIVED_STEEP_RATIO={steep_ratio}|reaches={ceiling * steep_ratio!r}")
-    ramp_loaded = _load_blocked(ramp_directory, monkeypatch)
-    assert _modules_named(ramp_loaded, "Glm5NextSharedExperts"), (
-        "the ramp load built no shared-expert module, so it did not complete the "
-        "way the readings below assume"
-    )
-    published = list(ramp_loaded.named_parameters()) + list(ramp_loaded.named_buffers())
-    nonfinite = [
-        name
-        for name, tensor in published
-        if not bool(torch.isfinite(tensor.detach().to(torch.float32)).all())
-    ]
-    print(f"RAMPREFUSAL_TENSORS_CHECKED={len(published)}|nonfinite={nonfinite[:6]}")
-    assert published, (
-        "the completed ramp load published no parameter or buffer at all, so the "
-        "finiteness reading below is over nothing"
-    )
-    assert not nonfinite, (
-        f"the ramp load completed but published non-finite values in {nonfinite[:6]}. "
-        f"That is the silent NaN this item is named for: at this factor the retile "
-        f"does not refuse the ramp, so finiteness is the claim that replaces the "
-        f"refusal and it just failed"
-    )
-    # The health counters, PRINTED as readings and gated on nothing: the first 256
-    # block rescales by exactly 2 and stays bit-exact, later blocks rescale by
-    # fractions fp8 cannot hold, and the old factor never reached them.
-    #
-    # THE TWO DICT-SHAPED RECORDS, EACH NAMED. A suffix scan over
-    # ``dir(type(module))`` also matches the ROUTED bank's own
-    # ``RETILE_HEALTH_ATTR`` (``model_fp8.py::Glm5NextRoutedExperts``), and that
-    # one publishes a dict of TUPLES --
-    # ``(emitted_unsupplied, input_scales_dropped, inexact_rescales)`` per
-    # projection (``:2334-2352``) -- so ``record.get`` reached a tuple and a
-    # CORRECT load raised ``AttributeError``. The deferred fixture has four routed
-    # experts and the load path prepares every module that offers a prep
-    # (``model_fp8.py::Glm5NextForConditionalGeneration._run_load_time_preps``), so
-    # it was reached every time.
-    #
-    # NAMING BOTH IS A POSITIVE SELECTION, not a filter. "Skip anything that is not
-    # a dict" would also pass on the day the shared or dense record changed shape:
-    # the loop would collect nothing and only the emptiness assert below would be
-    # left to speak, and it speaks only if BOTH banks vanish. With the names, a
-    # missing attribute makes ``getattr`` return ``None`` and that assert names it.
-    # Both landed readers of these two records name them the same way: ``:7191``
-    # for the shared bank, ``:4861`` for the dense MLP.
-    #
-    # THE ROUTED BANK'S COUNTS ARE THEREFORE NOT IN THIS TOTAL, and the row says so.
-    # Reading them needs an index convention for a nameless tuple, which is a
-    # different change from this repair; the shared and dense records carry
-    # ``inexact_rescales`` by name
-    # (``model_fp8.py::_publish_compute_frame_operands``).
-    health_records: dict[tuple[str, str], dict] = {}
-    for path, module in ramp_loaded.named_modules():
-        for attribute_name in (
-            "SHARED_RETILE_HEALTH_ATTR",
-            "DENSE_RETILE_HEALTH_ATTR",
-        ):
-            attribute = getattr(type(module), attribute_name, None)
-            if attribute is None:
-                continue
-            health = getattr(module, attribute, None)
-            if not health:
-                continue
-            for leaf, record in health.items():
-                health_records[(path, leaf)] = record
-    assert health_records, (
-        "the completed ramp load published no shared-expert or dense-MLP retile "
-        "health record, so that retile either did not run or does not report -- "
-        "and this item's readings about rescales would be about nothing"
-    )
-    total_inexact = 0
-    for (path, leaf), record in sorted(health_records.items()):
-        count = int(record.get("inexact_rescales", 0))
-        total_inexact += count
-        print(
-            f"RAMPREFUSAL_HEALTH|{path}.{leaf}|retiled={record.get('retiled')}"
-            f"|inexact_rescales={count}|gated_on_none"
-        )
-    print(
-        f"RAMPREFUSAL_INEXACT_TOTAL={total_inexact}|records={len(health_records)}"
-        f"|banks=shared+dense|gated_on_none|a fraction fp8 cannot hold is a "
-        f"rescale, not a refusal"
-    )
-
-    # ---- ARM 2: THE REFUSAL IS STILL REACHABLE, at the derived ratio.
-    steep_directory, steep_overrides, _steep_mappings = _deferred_checkpoint(
-        tmp_path, steep_ratio=steep_ratio, name="deferred-steep"
-    )
-    assert sorted(steep_overrides) == sorted(pow2_overrides), (
-        "the steep fixture and the pow2 fixture do not hold the same keys, so they "
-        "differ in more than the grid family this arm varies"
-    )
-    steep_differing = sorted(
-        key
-        for key, tensor in steep_overrides.items()
-        if not _same(tensor, pow2_overrides[key])
-    )
-    print(f"RAMPREFUSAL_STEEP_KEYS_THAT_DIFFER={len(steep_differing)}")
-    assert steep_differing and all(
-        key.endswith(FP8_SCALE_SUFFIX) for key in steep_differing
-    ), (
-        f"the steep fixture varies "
-        f"{[key for key in steep_differing if not key.endswith(FP8_SCALE_SUFFIX)][:6]}"
-        f" besides scale grids, or varies nothing at all ({len(steep_differing)} "
-        f"keys differ). This arm varies the grid family and must vary nothing else"
-    )
-
-    with pytest.raises(Exception) as raised:  # noqa: B017 -- the chain is the claim
-        _load_blocked(steep_directory, monkeypatch)
-
-    chain: list[BaseException] = []
-    error: BaseException | None = raised.value
-    while error is not None and error not in chain:
-        chain.append(error)
-        error = error.__cause__ or error.__context__
-    types = [type(item).__name__ for item in chain]
-    refusals = [item for item in chain if isinstance(item, BlockwiseFp8RetileError)]
-    print(f"RAMPREFUSAL_EXCEPTION_CHAIN={types}")
-    for item in refusals:
-        print(f"RAMPREFUSAL_MESSAGE={str(item)[:400]}")
-    assert refusals, (
-        f"the steep grid at ratio {steep_ratio} raised {types}, with no "
-        f"BlockwiseFp8RetileError anywhere in the chain. That ratio takes a stored "
-        f"byte to {ceiling * steep_ratio!r} against a bound of {bound!r}, so either "
-        f"the retile no longer refuses an unrepresentable rescale -- in which case "
-        f"it is emitting NaN again -- or the load failed for some other reason and "
-        f"this item is measuring that instead"
-    )
-    message = str(refusals[0])
-    for phrase in (
-        "REFUSES",
-        "256-block",
-        "128-tile",
-        "ratio",
-        "retained scale",
-        "inexact_rescales",
-        "input_scales_dropped",
-    ):
-        assert phrase in message, (
-            f"the refusal does not say {phrase!r}: {message[:300]}. The whole point "
-            f"of refusing rather than emitting NaN is that the message locates the "
-            f"block and reports the counters"
-        )
 
 
 def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish(

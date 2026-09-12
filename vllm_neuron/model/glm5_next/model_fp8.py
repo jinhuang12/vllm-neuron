@@ -2324,15 +2324,10 @@ class Glm5NextRoutedExperts(nn.Module):
         increment therefore measures which axis arrives as the producer's ``rows``,
         and plants that exact pair to show the check rejects it.
 
-        THE MERGE IS CHECKED RATHER THAN ASSUMED. ``block_quant_expert_mm``
-        requires both fusion halves present and says the producer writes one per
-        call, leaving the other ``NaN``. The producer fills its emission with
-        ``NaN`` and writes only the slots of its own half, whose flat index is
-        ``(h_block * 2 + gate_or_up) * i_256 + i_block``, so the halves are
-        disjoint by construction. This takes the gate emission, fills its
-        ``NaN`` slots from the up emission, and refuses if one survives -- which
-        is what makes that requirement something a load can fail on instead of a
-        sentence in a docstring.
+        THERE IS NO MERGE TO CHECK. The half-slot emission and its ``NaN`` fill
+        belonged to the vendor seam's flat scale tensor, which no limb here reads:
+        each half's kernel operand is built from that half's own checkpoint grid,
+        so the two never share a tensor and neither can leave a slot unwritten.
         """
         from vllm_neuron.functional.moe.blockwise_fp8_retile import (
             DOWN,

@@ -7,13 +7,16 @@ Two identity items and their shared control. The grid carries neighbour ratios t
 are not powers of two inside one ``256``-block, and one item uses the values a
 whole-model load actually stopped on, so the mapping's return is what reddens here.
 
-The consumer-granularity question this change turns on -- does a grid that varies
-inside a ``256``-block reach a different number than a block-uniform one, on the
-kernels the routed bank now calls -- is already settled at ``128`` granularity by
-``test_moe_blockwise_fp8.py::test_cte_128_a_lossy_256_retile_must_not_reach_exactness``
-and ``::test_cte_128_down_a_lossy_256_retile_must_not_reach_exactness``, whose
-fixtures build from the checkpoint grid and never call this producer. Repeating them
-here would add a second answer to a settled question.
+The consumer-granularity question this change turns on -- do the kernels the routed
+bank now calls READ a scale per ``128`` tile rather than per ``256`` block -- is
+already settled positively by
+``test_moe_blockwise_fp8.py::test_cte_128_gate_up_matches_the_model_reference_per_expert_block``
+and ``::test_cte_128_down_matches_the_model_reference_per_expert_block``: each
+compares a kernel fed the checkpoint's own ``[128, 128]`` grid, with distinct scales
+inside one ``256`` block, against a reference that dequantises at ``128``. A kernel
+reading one scale per ``256`` block cannot match that reference. Their fixtures build
+from the checkpoint grid and never call this publisher, so repeating the question
+here would add a second answer to a settled one.
 """
 
 from __future__ import annotations
