@@ -2007,8 +2007,14 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"got shape {tuple(expert_affinities.shape)}"
             )
         if routed != num_experts:
-            local_indices = torch.tensor(
-                self.local_expert_indices(int(expert_parallel_rank)),
+            # A tensor built from python data stays REAL while the rest of the trace is
+            # fake, and graph extraction refuses that mix. The partition hands back a
+            # contiguous ascending run (``factory.py:139``), so an ``arange`` over it
+            # gives the same indices without building from data.
+            owned = self.local_expert_indices(int(expert_parallel_rank))
+            local_indices = torch.arange(
+                owned[0],
+                owned[0] + len(owned),
                 dtype=torch.int64,
                 device=expert_affinities.device,
             )
@@ -5839,10 +5845,13 @@ class Glm5NextDSAIndexer(nn.Module):
                 pool_index, completes = decode_pool_address(
                     position, pool, pool_cache.device
                 )
+                # ``new_full`` and not ``torch.tensor``: a tensor built from python data
+                # stays REAL while the rest of the trace is fake, and graph extraction
+                # refuses that mix. Both pool writes below take the same form.
                 destination = torch.where(
                     completes,
                     pool_index,
-                    torch.tensor(trash, dtype=torch.int64, device=pool_cache.device),
+                    pool_cache.new_full((), trash, dtype=torch.int64),
                 ).reshape(1)
                 pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
             elif pooled is not None:
@@ -5856,9 +5865,9 @@ class Glm5NextDSAIndexer(nn.Module):
         else:
             pooled, write_mask = self.pool_window(key, gate_score, slot_mapping)
             destination = torch.where(
-                write_mask, slot_mapping.to(torch.int64), torch.tensor(
-                    trash, dtype=torch.int64, device=pool_cache.device
-                )
+                write_mask,
+                slot_mapping.to(torch.int64),
+                pool_cache.new_full((), trash, dtype=torch.int64),
             )
             pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
             if prefill_tail is not None:
@@ -6041,13 +6050,13 @@ class Glm5NextDSAIndexer(nn.Module):
 
         # The fp32 gate moves by index_select, NOT through the seam: F11. The row index
         # is built from the lengths, which are python ints, so its shape is a trace-time
-        # constant and no tensor data is read on the host.
-        keep = [
-            b * max_len + r for b, n in enumerate(checked) for r in range(n)
-        ]
-        packed_weights = weights.index_select(
-            0, torch.tensor(keep, dtype=torch.int64, device=weights.device)
-        )
+        # constant and no tensor data is read on the host. It comes from ``arange`` and
+        # a slice rather than from a python list, because a tensor built from python data
+        # stays REAL while the rest of the trace is fake, and graph extraction refuses
+        # that mix.
+        grid = torch.arange(max_len, dtype=torch.int64, device=weights.device)
+        keep = torch.cat([grid[:n] + b * max_len for b, n in enumerate(checked)])
+        packed_weights = weights.index_select(0, keep)
 
         if not selects:
             # inc-glm53f-099, placed AFTER the pack rather than before it, deliberately.
