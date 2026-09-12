@@ -165,15 +165,23 @@ def decode_operands(gate: float) -> tuple[torch.Tensor, ...]:
     )
 
 
-def traced_call(seam, operands) -> tuple[bool, str]:
-    """``(raised, text)`` for one seam compiled the way the worker compiles the model."""
+def traced_call(seam, operands) -> tuple[bool, str, str]:
+    """``(raised, text, scalars)`` for one seam compiled as the worker compiles the model.
+
+    Scalar capture is SET rather than assumed: it is what makes ``.item()`` produce a
+    symbol instead of breaking the graph, and the reading being reproduced is a serving
+    run that produced one. The value found and the value used are both reported.
+    """
+    found = torch._dynamo.config.capture_scalar_outputs
+    torch._dynamo.config.capture_scalar_outputs = True
     torch._dynamo.reset()
     compiled = torch.compile(seam, backend="eager", fullgraph=True)
+    scalars = f"found={found},used=True"
     try:
         compiled(*operands)
     except Exception as error:  # the tracer's refusal is this file's reading
-        return True, str(error)
-    return False, ""
+        return True, str(error), scalars
+    return False, "", scalars
 
 
 def test_a01_every_value_read_on_the_traced_path_is_guarded() -> None:
@@ -211,19 +219,18 @@ def test_a02_the_traced_seams_read_no_gate_value() -> None:
         "prefill": traced_call(kda_intra_chunk, intra_operands(GATE_OK)),
         "decode": traced_call(kda_decode_step, decode_operands(GATE_OK)),
     }
-    for phase, (raised, text) in readings.items():
+    for phase, (raised, text, scalars) in readings.items():
         say("traced", f"phase={phase}", f"raised={raised}",
-            f"data_dependent={REFUSAL in text}",
-            f"scalar_capture={torch._dynamo.config.capture_scalar_outputs}",
+            f"data_dependent={REFUSAL in text}", f"scalar_capture={scalars}",
             f"text={text.splitlines()[0] if text else 'none'}")
     if expect_base():
-        for phase, (raised, text) in readings.items():
+        for phase, (raised, text, _) in readings.items():
             assert raised and REFUSAL in text, (
                 f"the {phase} seam was expected to refuse on the pre-repair tree with "
                 f"{REFUSAL!r}; read raised={raised} text={text!r}"
             )
     else:
-        for phase, (raised, text) in readings.items():
+        for phase, (raised, text, _) in readings.items():
             assert not raised, f"the {phase} seam did not compile: {text}"
 
 
