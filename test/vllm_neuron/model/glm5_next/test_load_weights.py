@@ -7512,6 +7512,154 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
     )
 
 
+def test_blocked_a_ramp_scale_grid_loads_and_publishes_only_finite_values(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """A scale grid the old coarsening could not reproduce loads, and emits no NaN.
+
+    THIS ITEM ONCE ARMED A REFUSAL, AND THAT REFUSAL IS NOW UNREACHABLE. The step
+    that rescaled a stored byte from the checkpoint's own ``128``-tile grid onto a
+    ``256``-wide one is gone: the publisher hands back the two tensors it was given,
+    unchanged (``blockwise_fp8_retile.py::retile_block_scales``). Nothing on this
+    path rescales a byte, so no rescale can pass the ``fp8`` bound, so the overflow
+    refusal cannot fire for any grid the checkpoint holds. An item that arms an
+    unreachable refusal measures its own fixture rather than the product, and the
+    identity readings on the publish are the stronger statement in its place.
+
+    WHAT SURVIVES IS THE POSITIVE HALF, which is what the refusal existed to
+    protect: a checkpoint whose scale grid ramps must LOAD, and must publish finite
+    numbers rather than NaN. That claim rests on no refusal, and it is still worth a
+    reading because the load path still squeezes bytes and still compensates per
+    block.
+
+    TWO GRID FAMILIES, written from one checkpoint and differing in one field:
+
+    * the POW2 grid loads and completes. Without it the ramp reading below could be
+      any load failure wearing the right shape.
+    * the RAMP grid loads, and every published parameter and buffer is finite --
+      which is what "no NaN" means, measured rather than implied.
+
+    THE RESCALE COUNTERS ARE PRINTED AND GATED ON NOTHING, and this item asserts no
+    sign for them. They were non-zero while the load path coarsened. A publish that
+    rescales nothing has nothing to count, and the record itself carries the reason
+    (``model_fp8.py::_publish_compute_frame_operands``). Printing them keeps the row
+    honest either way; asserting a sign here would redden this item on the day the
+    count legitimately changes.
+    """
+
+    pow2_directory, pow2_overrides, _mappings = _deferred_checkpoint(tmp_path)
+    ramp_directory, ramp_overrides, _ramp_mappings = _deferred_checkpoint(
+        tmp_path, ramp_grids=True, name="deferred-ramp"
+    )
+
+    # THE ONE FIELD THIS ITEM VARIES, measured rather than declared: the two
+    # checkpoints differ on the grids of the retiled families and nowhere else.
+    # The comparison goes through fp32 because the weight tensors are fp8, where a
+    # dtype-native equality is not something this file assumes it has.
+    def _same(left: torch.Tensor, right: torch.Tensor) -> bool:
+        if left.dtype != right.dtype or tuple(left.shape) != tuple(right.shape):
+            return False
+        return bool(torch.equal(left.to(torch.float32), right.to(torch.float32)))
+
+    assert sorted(ramp_overrides) == sorted(pow2_overrides), (
+        "the two fixtures do not even hold the same keys, so they differ in more "
+        "than the grid family this item varies"
+    )
+    differing = sorted(
+        key
+        for key, tensor in ramp_overrides.items()
+        if not _same(tensor, pow2_overrides[key])
+    )
+    print(f"RAMPFINITE_KEYS_THAT_DIFFER={len(differing)}")
+    assert differing, (
+        "the ramp fixture and the pow2 fixture hold identical tensors, so this "
+        "item varies nothing and the readings below would not be attributable to "
+        "the grid"
+    )
+    assert all(key.endswith(FP8_SCALE_SUFFIX) for key in differing), (
+        f"the two fixtures differ on tensors that are not scale grids: "
+        f"{[key for key in differing if not key.endswith(FP8_SCALE_SUFFIX)][:6]}. "
+        f"This item varies the grid family and must vary nothing else"
+    )
+
+    # THE ARMING HALF. Same widths, same weights, pow2 grid: the load completes.
+    armed = _load_blocked(pow2_directory, monkeypatch)
+    assert _modules_named(armed, "Glm5NextSharedExperts"), (
+        "the pow2 load built no shared-expert module, so the ramp reading below "
+        "cannot be attributed to the grid the publish was handed"
+    )
+
+    # THE RAMP HALF. The load completes and publishes no non-finite value.
+    ramp_loaded = _load_blocked(ramp_directory, monkeypatch)
+    assert _modules_named(ramp_loaded, "Glm5NextSharedExperts"), (
+        "the ramp load built no shared-expert module, so it did not complete the "
+        "way the readings below assume"
+    )
+    published = list(ramp_loaded.named_parameters()) + list(ramp_loaded.named_buffers())
+    nonfinite = [
+        name
+        for name, tensor in published
+        if not bool(torch.isfinite(tensor.detach().to(torch.float32)).all())
+    ]
+    print(f"RAMPFINITE_TENSORS_CHECKED={len(published)}|nonfinite={nonfinite[:6]}")
+    assert published, (
+        "the completed ramp load published no parameter or buffer at all, so the "
+        "finiteness reading below is over nothing"
+    )
+    assert not nonfinite, (
+        f"the ramp load completed but published non-finite values in {nonfinite[:6]}. "
+        f"That is the silent NaN this item is named for. The publish rescales no "
+        f"byte, so a ramping grid must arrive finite, and it just did not"
+    )
+
+    # The rescale counters, PRINTED as readings and gated on nothing.
+    #
+    # THE TWO DICT-SHAPED RECORDS, EACH NAMED. A suffix scan over
+    # ``dir(type(module))`` also matches the ROUTED bank's own
+    # ``RETILE_HEALTH_ATTR`` (``model_fp8.py::Glm5NextRoutedExperts``), and that
+    # one publishes a dict of TUPLES per projection, so ``record.get`` reached a
+    # tuple and a CORRECT load raised ``AttributeError``.
+    #
+    # NAMING BOTH IS A POSITIVE SELECTION, not a filter. "Skip anything that is
+    # not a dict" would also pass on the day the shared or dense record changed
+    # shape: the loop would collect nothing, and only the emptiness assert below
+    # would be left to speak -- and it speaks only if BOTH banks vanish. With the
+    # names, a missing attribute makes ``getattr`` return ``None`` and that assert
+    # names it. The routed bank's counts are therefore NOT in this total, and the
+    # row below says so.
+    health_records: dict[tuple[str, str], dict] = {}
+    for path, module in ramp_loaded.named_modules():
+        for attribute_name in (
+            "SHARED_RETILE_HEALTH_ATTR",
+            "DENSE_RETILE_HEALTH_ATTR",
+        ):
+            attribute = getattr(type(module), attribute_name, None)
+            if attribute is None:
+                continue
+            health = getattr(module, attribute, None)
+            if not health:
+                continue
+            for leaf, record in health.items():
+                health_records[(path, leaf)] = record
+    assert health_records, (
+        "the completed ramp load published no shared-expert or dense-MLP retile "
+        "health record, so that retile either did not run or does not report -- "
+        "and this item's readings about rescales would be about nothing"
+    )
+    total_inexact = 0
+    for (path, leaf), record in sorted(health_records.items()):
+        count = int(record.get("inexact_rescales", 0))
+        total_inexact += count
+        print(
+            f"RAMPFINITE_HEALTH|{path}.{leaf}|retiled={record.get('retiled')}"
+            f"|inexact_rescales={count}|gated_on_none"
+        )
+    print(
+        f"RAMPFINITE_INEXACT_TOTAL={total_inexact}|records={len(health_records)}"
+        f"|banks=shared+dense|gated_on_none|no sign is asserted for this total"
+    )
+
+
 def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
@@ -7537,8 +7685,10 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
 
     WHAT WOULD HAVE FAILED BEFORE. Three things this item asserts were false at the
     parent commit. The carried block would have been ``256`` and not the checkpoint's
-    ``128``; ``inexact_rescales`` was NOT zero on the ramp -- the item above prints
-    those non-zero counts as readings -- so the dequantised product moved; and the
+    ``128``; ``inexact_rescales`` was NOT zero on the ramp while this path
+    coarsened, so the dequantised product moved -- the item above prints those
+    counts as readings and asserts no sign for them, because a publish that
+    rescales nothing has nothing to count; and the
     older reference could only be reached on the POW2 fixture, which
     :func:`_pow2_block_grid_pattern` exists solely to arrange. The ramp is the grid
     family the coarsening could not hold, and the publish holds it.
