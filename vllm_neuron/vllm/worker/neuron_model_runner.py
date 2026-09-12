@@ -4810,17 +4810,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         (``test_tiny_glm5next_forward.py:2853-2856``) and
         ``test_tiny_glm5next_e2e.py`` asserts this function equals it, so the two
         derivations cannot drift apart unnoticed.
+
+        IT IS BUILT ON THE HOST IN int32 AND MOVED ONCE. The eager Neuron backend
+        refuses a dtype-converting copy of a tensor that already lives on the device,
+        so nothing here may construct on ``device`` and cast afterwards.
         """
         pool = int(index_kpool)
         if pool <= 0:
             raise ValueError(f"index_kpool must be positive; got {index_kpool!r}")
-        positions = torch.arange(
-            int(tokens), dtype=torch.int64, device=device
-        ) + int(start_position)
+        positions = torch.arange(int(tokens), dtype=torch.int32) + int(start_position)
         completes = ((positions + 1) % pool) == 0
-        return torch.where(
+        slots = torch.where(
             completes, positions // pool, torch.full_like(positions, -1)
-        ).to(torch.int32)
+        )
+        return slots.to(device)
 
     @staticmethod
     def _glm5next_row_seq_lens(
