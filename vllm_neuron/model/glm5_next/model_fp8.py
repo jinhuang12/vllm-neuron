@@ -4266,7 +4266,11 @@ class Glm5NextKDAAttention(nn.Module):
                     beta_h[t].reshape(1, 1),
                     gk_h[t : t + 1],
                 )
-                core[t, span] = step.o.reshape(-1)
+                # Both sides stay rank 2, like the chunked write above. The step
+                # kernel already returns ``[1, V]``, and flattening it made the
+                # source rank 1 against a rank-2 target slice: eager torch
+                # broadcasts that, and the graph compiler refuses it.
+                core[t : t + 1, span] = step.o.reshape(1, kdim)
                 state = step.state
 
             recurrent_state[h] = state.to(recurrent_state.dtype)
@@ -5134,8 +5138,15 @@ class Glm5NextDSAIndexer(nn.Module):
             return 0
         # `take` and `rows` are python ints, so these are trace-time addresses --
         # the same reason `tail_step`'s slot is a python int and not a tensor.
-        tail[0, rows - take:rows, :] = key[tokens - take:].to(tail.dtype)
-        tail[1, rows - take:rows, :] = gate_score[tokens - take:].to(tail.dtype)
+        # Both sides stay rank 3. Slicing the half rather than indexing it keeps the
+        # target's rank, so no source can reach it by broadcast: eager torch allows
+        # that, and the graph compiler refuses it at the slice write-back.
+        tail[0:1, rows - take:rows, :] = (
+            key[tokens - take:].to(tail.dtype).reshape(1, take, -1)
+        )
+        tail[1:2, rows - take:rows, :] = (
+            gate_score[tokens - take:].to(tail.dtype).reshape(1, take, -1)
+        )
         return take
 
     def _seed_tail_at(
