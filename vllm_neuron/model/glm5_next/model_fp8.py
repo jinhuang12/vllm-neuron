@@ -82,6 +82,7 @@ from vllm_neuron.model.glm5_next.config import (
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     DSA_SCALED_PROJECTIONS,
     FP8_SCALE_SUFFIX,
+    KDA_BARE_LEAVES,
     MAPPED_KEY_QUANTISED_WEIGHT,
     MAPPED_KEY_SCALE_GRID,
     MAPPED_KEY_STACKED_BANK,
@@ -8715,12 +8716,24 @@ class Glm5NextForConditionalGeneration(nn.Module):
         one question, asked of the two places that have to agree. It adds no
         second classifier of the three cases: ``classify_mapped_keys`` still
         decides, and this only distinguishes the two kinds of ``plain``.
+
+        ONE LEAF PAIR IS TYPED BY NAME RATHER THAN BY KIND. The linear-attention
+        decay and gate bias arrive as plain keys, so the kinds above would hand
+        them the config dtype -- and the checkpoint holds them in float32. The
+        reference keeps that width all the way to the gate; a narrowing placeholder
+        spends it before the gate's exponential and sigmoid ever read them.
         """
         kind = classify_mapped_keys(checkpoint_keys)
         if kind == MAPPED_KEY_SCALE_GRID:
             return torch.float32
         if kind in (MAPPED_KEY_QUANTISED_WEIGHT, MAPPED_KEY_STACKED_BANK):
             return _FP8_DTYPE
+        if param_name.rsplit(".", 1)[-1] in KDA_BARE_LEAVES:
+            # The GPU reference declares both in float32 --
+            # ``vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py:237-239``
+            # for the gate bias and ``:265-267`` for the decay -- and its kernels
+            # then read them as float32 as well.
+            return torch.float32
         if self._sibling_scale_grid_name(param_name) in mappings:
             return _FP8_DTYPE
         return self.text_config.torch_dtype
