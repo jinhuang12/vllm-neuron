@@ -95,6 +95,10 @@ STATE_SLOTS = 8
 #: How many sequences the modelled engine admits at once. One, and the bank above holds
 #: more slots than that on purpose: the two numbers are not the same axis.
 DECLARED_MAX_NUM_SEQS = 1
+#: The id of that one request. The converter keys a sequence's state by its id and refuses a
+#: real step served without one, so a shell with no id can only ever be served the opening
+#: bucket -- which no item here reads, and one of them steps past.
+DECLARED_REQUEST = "host-geometry-request"
 
 #: The slot a step carrying no request id is served from, which is every step this file
 #: drives: the converter takes no claim for such a step and reads slot 0.
@@ -179,6 +183,9 @@ def _runner(banks) -> NeuronModelRunner:
     # RE-PINNED: the converter now sizes its per-sequence caches by the engine's
     # concurrent-sequence bound, so a runner shell must model that bound too.
     runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
+    # RE-PINNED AGAIN: it also keys each sequence's state by its request id, and a step
+    # served without one is the opening bucket's. Every step here is the one request's.
+    runner.input_batch = SimpleNamespace(req_ids=[DECLARED_REQUEST])
     return runner
 
 

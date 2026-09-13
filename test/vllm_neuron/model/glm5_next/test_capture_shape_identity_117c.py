@@ -95,6 +95,10 @@ DECLARED_BANK_BLOCKS = 12
 #: How many sequences the modelled engine admits at once, which is the axis the
 #: converter's per-sequence caches carry. One: this file drives one request's shapes.
 DECLARED_MAX_NUM_SEQS = 1
+#: The id of that one request. The converter keys a sequence's state by its id and refuses a
+#: real step served without one, so a shell with no id can only ever be served the opening
+#: bucket: no item here reads that classification, and three of them read a position past it.
+DECLARED_REQUEST = "capture-shape-request"
 #: The first block this request is given, deliberately not block 0, so a window that
 #: started at the bank's own base rather than the request's would be visible.
 DECLARED_FIRST_BLOCK = 2
@@ -463,6 +467,10 @@ def _runner(text_config, banks) -> NeuronModelRunner:
     # concurrent-sequence bound, so a runner shell must model that bound too. One
     # sequence is what this file drives.
     runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
+    # RE-PINNED AGAIN, and the bound above was only half of it: the converter also keys each
+    # sequence's state by its request id, and a step served without one is the opening
+    # bucket's. Every step this file drives belongs to the one request named above.
+    runner.input_batch = SimpleNamespace(req_ids=[DECLARED_REQUEST])
     # The context-parallel width the block-table arithmetic divides by. One is the
     # single-rank case, which is what a shell with no parallel world can honestly say.
     runner._dcp_size = 1
