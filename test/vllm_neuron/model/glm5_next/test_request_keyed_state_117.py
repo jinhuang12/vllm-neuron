@@ -179,14 +179,18 @@ DECLARED_WARMUP_BUCKET = 4
 
 #: The state-carrier keys, in the model's own declared spelling
 #: (``model_fp8.py:4149``). The carrier is splatted into the layer, so an extra
-#: key is a TypeError and a missing one is served as a default. RE-PINNED: the
-#: fourth key is the sibling increment's, which landed by tip merge; the original
-#: reading was the three-key set.
+#: key is a TypeError and a missing one is served as a default. RE-PINNED TWICE,
+#: and each time as a UNION rather than a replacement: the fourth key arrived with
+#: a sibling increment by tip merge, and the fifth and sixth are the row extent the
+#: recurrent carrier now moves, so a padded prefill scans the request's own rows
+#: instead of the bucket's. The original reading was the three-key set.
 DECLARED_STATE_CARRIER_KEYS = {
     "conv_state",
     "recurrent_state",
     "is_prefill",
     "start_position",
+    "real_tokens",
+    "row_mask",
 }
 
 #: The conv and recurrent state shapes per slot. Small, and their only
