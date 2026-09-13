@@ -92,9 +92,21 @@ DECLARED_WINDOW_BLOCKS = 4
 #: Blocks the bank holds. It carries a spare window past the last block a request is
 #: given here, which is the headroom item 3 reads.
 DECLARED_BANK_BLOCKS = 12
+#: How many sequences the modelled engine admits at once, which is the axis the
+#: converter's per-sequence caches carry. One: this file drives one request's shapes.
+DECLARED_MAX_NUM_SEQS = 1
+#: The id of that one request. The converter keys a sequence's state by its id and refuses a
+#: real step served without one, so a shell with no id can only ever be served the opening
+#: bucket: no item here reads that classification, and three of them read a position past it.
+DECLARED_REQUEST = "capture-shape-request"
 #: The first block this request is given, deliberately not block 0, so a window that
 #: started at the bank's own base rather than the request's would be visible.
 DECLARED_FIRST_BLOCK = 2
+#: This request's slot in the per-sequence caches. RE-PINNED: the state slot is now a
+#: request slot on an axis as wide as the engine's bound, so it is no longer a block id
+#: and no longer moves with the pages a request is given. The original reading, verbatim:
+#: "state_slot": DECLARED_FIRST_BLOCK -- the first block the request holds.
+DECLARED_STATE_SLOT = 0
 #: The two positions items 1 and 2 compare. They differ by enough to change how many
 #: BLOCKS the request occupies, which is what moved the base's window length.
 DECLARED_LOW_POSITION = 3
@@ -206,7 +218,7 @@ def _geometry(*, position: int, window_blocks: int = DECLARED_WINDOW_BLOCKS,
     used = max(1, -(-(position + tokens) // DECLARED_PAGE_SIZE))
     return {
         "block_ids": [DECLARED_FIRST_BLOCK + offset for offset in range(used)],
-        "state_slot": DECLARED_FIRST_BLOCK,
+        "state_slot": DECLARED_STATE_SLOT,
         "page_size": DECLARED_PAGE_SIZE,
         "window_blocks": int(window_blocks),
     }
@@ -226,6 +238,7 @@ def _carrier(bank: dict, text_config, *, position: int, geometry: dict,
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE,
+        request_slots=DECLARED_MAX_NUM_SEQS,
     )
     carriers = NeuronModelRunner._glm5next_layer_carriers(
         [bank],
@@ -450,6 +463,14 @@ def _runner(text_config, banks) -> NeuronModelRunner:
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.model = SimpleNamespace(text_config=text_config, glm5next_layer_banks=banks)
     runner.max_model_len = DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE
+    # RE-PINNED: the converter now sizes its per-sequence caches by the engine's
+    # concurrent-sequence bound, so a runner shell must model that bound too. One
+    # sequence is what this file drives.
+    runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
+    # RE-PINNED AGAIN, and the bound above was only half of it: the converter also keys each
+    # sequence's state by its request id, and a step served without one is the opening
+    # bucket's. Every step this file drives belongs to the one request named above.
+    runner.input_batch = SimpleNamespace(req_ids=[DECLARED_REQUEST])
     # The context-parallel width the block-table arithmetic divides by. One is the
     # single-rank case, which is what a shell with no parallel world can honestly say.
     runner._dcp_size = 1
@@ -594,13 +615,19 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
     opened = runner._glm5next_model_kwargs(_converter_kwargs(
         [bank], _prefill_metadata([bank]), DECLARED_PREFILL_TOKENS
     ))
-    cursor = getattr(runner, "_glm5next_side_cache_cursor", None)
-    say("I8_OPENED", f"carriers={len(opened['layer_carriers'])}", f"cursor={cursor}")
+    # RE-PINNED: the ring stands at one position PER REQUEST SLOT, so the premise is read
+    # off this request's own slot. The original reading, verbatim:
+    # `cursor = getattr(runner, "_glm5next_side_cache_cursor", None)`.
+    positions = dict(getattr(runner, "_glm5next_side_cache_positions", None) or {})
+    cursor = positions.get(DECLARED_STATE_SLOT)
+    say("I8_OPENED", f"carriers={len(opened['layer_carriers'])}",
+        f"slots={sorted(positions)}", f"cursor={cursor}")
     assert cursor == DECLARED_CONTINUED_POSITION, (
-        f"the opening prefill left the ring at {cursor} and this item's decode step "
-        f"carries position {DECLARED_CONTINUED_POSITION}; without a ring that continues "
-        f"this sequence the step below would be refused before any window is built, and "
-        f"the reading would be about the cursor and not about the window"
+        f"the opening prefill left slot {DECLARED_STATE_SLOT}'s ring at {cursor} of "
+        f"{sorted(positions)} and this item's decode step carries position "
+        f"{DECLARED_CONTINUED_POSITION}; without a ring that continues this sequence the "
+        f"step below would be refused before any window is built, and the reading would "
+        f"be about the cursor and not about the window"
     )
 
     converted = runner._glm5next_model_kwargs(_converter_kwargs(
@@ -684,7 +711,7 @@ def test_the_allocator_sizes_the_spare_window_the_carrier_builder_requires() -> 
     bank = _bank(DECLARED_HEAD_SIZE, blocks=schedulable_blocks + spare_blocks)
     geometry = {
         "block_ids": [last_block],
-        "state_slot": last_block,
+        "state_slot": DECLARED_STATE_SLOT,
         "page_size": DECLARED_PAGE_SIZE,
         "window_blocks": spare_blocks,
     }
@@ -727,7 +754,7 @@ def test_a_write_outside_the_requests_own_pages_is_refused_runner_side() -> None
     own_blocks = 1
     geometry = {
         "block_ids": [DECLARED_FIRST_BLOCK],
-        "state_slot": DECLARED_FIRST_BLOCK,
+        "state_slot": DECLARED_STATE_SLOT,
         "page_size": DECLARED_PAGE_SIZE,
         "window_blocks": DECLARED_WINDOW_BLOCKS,
     }

@@ -47,6 +47,7 @@ from __future__ import annotations
 import inspect
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -116,6 +117,20 @@ E2E_BANK_BLOCKS = E2E_BLOCKS + E2E_WINDOW_BLOCKS
 E2E_CONV_STATE_SHAPE = (2, 3)
 E2E_RECURRENT_STATE_SHAPE = (2, 4, 4)
 E2E_STATE_SLOTS = 8
+
+#: How many sequences the modelled engine admits at once. The runner sizes its per-sequence
+#: side caches by THIS number and not by the bank's slot count, so the two are deliberately
+#: different here: one sequence runs through this file, and the banks hold eight slots.
+E2E_MAX_NUM_SEQS = 1
+
+#: The bound ITEM 10 ALONE runs at, and it is its own because of what that item reads: the
+#: clearing's SCOPE, one request's ring row emptied while a row it does not own keeps what was
+#: planted in it. At the one-sequence bound above there is no row it does not own, so the item's
+#: own control refuses it as vacuous on every run -- a conjunct that cannot be read is not a
+#: conjunct. Two is the smallest bound that carries the reading, and the banks hold eight slots,
+#: so nothing else about the stack moves. Every other item keeps the bound above, which is why
+#: this value is declared here beside it instead of replacing it.
+E2E_SCOPE_MAX_NUM_SEQS = 2
 
 
 def _fixture(**overrides):
@@ -596,6 +611,7 @@ def test_side_caches_meet_the_indexers_own_stated_minimum():
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=item.STACK_TOKENS,
+        request_slots=E2E_STATE_SLOTS,
     )
     candidates = item.STACK_TOKENS // int(text_config.index_kpool)
     print(f"TINYE2E|side_caches|sets={len(side)}|candidates={candidates}"
@@ -603,9 +619,16 @@ def test_side_caches_meet_the_indexers_own_stated_minimum():
           f"|tail={tuple(side[0]['tail'].shape)}")
     assert len(side) == len(banks)
     for entry, bank in zip(side, banks):
-        assert int(entry["pool_cache"].shape[0]) >= candidates + 1
-        assert int(entry["pool_cache"].shape[1]) == int(text_config.index_head_dim)
+        # RE-PINNED (D17.1). ORIGINAL READING: `pool_cache` was `[rows, width]` and
+        # `tail` was `[2, kpool, width]`, one set per LAYER for the whole process.
+        # NEW VALUE: both gain a leading REQUEST-SLOT axis, so one sequence's
+        # indexer state cannot be read by another request. The minimum this item
+        # exists to check is unchanged and is still read on the row axis.
+        assert int(entry["pool_cache"].shape[0]) == E2E_STATE_SLOTS
+        assert int(entry["pool_cache"].shape[1]) >= candidates + 1
+        assert int(entry["pool_cache"].shape[2]) == int(text_config.index_head_dim)
         assert tuple(entry["tail"].shape) == (
+            E2E_STATE_SLOTS,
             2,
             int(text_config.index_kpool),
             int(text_config.index_head_dim),
@@ -652,6 +675,7 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=item.STACK_TOKENS,
+        request_slots=E2E_STATE_SLOTS,
     )
     carriers = NeuronModelRunner._glm5next_layer_carriers(
         banks,
@@ -684,7 +708,15 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
             f"which the landed prefill carrier declares"
         )
         assert tuple(got["latent_cache"].shape) == tuple(want["latent_cache"].shape)
-        assert int(got["start_position"]) == 0
+        # RE-PINNED (D17.1): ORIGINAL READING `int(got["start_position"])`, one
+        # number for every family. NEW VALUE: the LINEAR family's position is ONE
+        # int32 tensor with a row per request, while the SPARSE family's stays a
+        # single 0-d tensor until its own paged gather lands, so this reads the first
+        # row of whichever form it is handed. The asymmetry is the two families'
+        # different boundaries, stated rather than hidden behind a cast that raises
+        # on one of them.
+        position = got["start_position"]
+        assert int(position.reshape(-1)[0]) == 0
         assert float(got["softmax_scale"]) == float(item.MLA_SOFTMAX_SCALE)
 
     input_ids = torch.randint(
@@ -772,6 +804,45 @@ def test_the_tiny_config_is_the_registered_constraint_set():
 # ══════════════════════════════════════════════════════════════════════════════════════
 # ITEM 7. THE REGISTERED ACCEPTANCE: eight tokens, the route predicate, and the reference.
 # ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def _slot_position(runner, slot=None):
+    """RE-PINNED (D17.1): the scalar ring cursor became one position per request slot.
+
+    ORIGINAL READING: `runner._glm5next_side_cache_cursor`, a single int or None --
+    the position the one process-wide ring stood at. NEW VALUE: a dict keyed by the
+    request's state slot, because the rings are per slot now and a scalar cannot say
+    whose position it holds. Every landed item below reads through this helper, so
+    the re-pin is expressed once rather than at each of its call sites.
+    """
+    positions = getattr(runner, "_glm5next_side_cache_positions", None) or {}
+    if slot is None:
+        table = getattr(runner, "_glm5next_request_slot_table", None) or {}
+        slot = table.get("req-0")
+    return None if slot is None else positions.get(int(slot))
+
+
+def _own_slot(runner, key: str = "req-0") -> int:
+    """RE-PINNED (D17.1): a side cache's ROWS are one request's rows, not the process's.
+
+    ORIGINAL READING: `side["tail"]` and `side["pool_cache"]` whole, because one set
+    served every step. NEW VALUE: `[_own_slot(runner)]` of each, the row set the
+    request owns, because both caches gained a leading request-slot axis. The items
+    below plant and read through this index, so the re-pin is expressed once.
+
+    THE SLOT IS THE RUNNER'S ANSWER, never this file's guess: it is read out of the
+    table the converter wrote. Reading it demands that a real step has already run,
+    which is why the items that plant before their first step claim the slot first --
+    hand-out zeroes BOTH of a new owner's caches (`neuron_model_runner.py:5119-5123`),
+    so a plant made before the claim would be wiped by the step that took it.
+    """
+    table = getattr(runner, "_glm5next_request_slot_table", None) or {}
+    if key not in table:
+        raise item.VacuousControlError(
+            f"no state slot is assigned to {key!r} yet, so a per-request row cannot "
+            f"be read; a real step must claim the slot before this is called"
+        )
+    return int(table[key])
 
 
 def _entry(*, row, tokens: int, cached: int, threshold: int, block_size: int) -> dict:
@@ -1004,8 +1075,13 @@ def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
     root.bind_kv_cache(caches)
 
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     prompt = torch.randint(
         0,
@@ -1156,8 +1232,13 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
         )
 
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     tokens = GENERATED_TOKENS
     state_slot = E2E_STATE_SLOTS - 1
     sparse_row = [0, 1]
@@ -1180,14 +1261,34 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
             )
             assert int(carrier["latent_cache"].shape[0]) == len(sparse_row) * page
         else:
-            print(f"TINYE2E|group_slice|{index}|recurrent|state_slot={state_slot}")
-            assert (carrier["conv_state"].data_ptr()
-                    == bank["conv_state"][state_slot].data_ptr()), (
-                f"layer {index} is recurrent and its conv state is not the slot its own "
-                f"group's table names"
+            # RE-PINNED (D17.1). ORIGINAL READING, kept beside the new one so the
+            # change is legible: this asserted the carrier was a view of
+            # `bank[...][state_slot]` where `state_slot = E2E_STATE_SLOTS - 1` was
+            # the recurrent group's own block-table row value, because the
+            # converter read the slot as that row's FIRST BLOCK ID. NEW VALUE: the
+            # slot is the one the runner's request-keyed table assigned, read off
+            # the table rather than restated, so the block number and the slot are
+            # no longer the same number by construction.
+            #
+            # THE ITEM'S PURPOSE IS UNCHANGED and does not rest on this half: the
+            # per-group reading is still measured by the sparse arm above and by
+            # this item's own single-table control below, and the recurrent group's
+            # own entry is still what reaches this carrier -- the `state_cached=1`
+            # arm further down refuses precisely because that entry is read.
+            assigned = runner._glm5next_request_slot_table["req-0"]
+            print(f"TINYE2E|group_slice|{index}|recurrent|assigned_slot={assigned}"
+                  f"|group_row={state_slot}")
+            # RE-PINNED (D17.1) a second time, for the per-request TUPLE the linear
+            # carrier's state values became. ORIGINAL READING:
+            # `carrier["conv_state"].data_ptr()`, the bare view. NEW VALUE: entry
+            # `[0]`, this single request's view.
+            assert (carrier["conv_state"][0].data_ptr()
+                    == bank["conv_state"][assigned].data_ptr()), (
+                f"layer {index} is recurrent and its conv state is not the slot the "
+                f"runner's request table assigned"
             )
-            assert (carrier["recurrent_state"].data_ptr()
-                    == bank["recurrent_state"][state_slot].data_ptr())
+            assert (carrier["recurrent_state"][0].data_ptr()
+                    == bank["recurrent_state"][assigned].data_ptr())
 
     # ---- A layer with no entry of its own refuses by name rather than borrowing one.
     short = dict(grouped)
@@ -1266,8 +1367,13 @@ def test_the_converter_does_not_hand_the_root_a_kv_page_as_its_quant_block():
     caches = _runner_shaped_caches(root)
     root.bind_kv_cache(caches)
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     translated = _model_kwargs(
         runner,
@@ -1331,6 +1437,12 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     come back UNCLEARED. A converter that zeroed the ring on every call would satisfy the first
     conjunct and fail this one, so the item cannot pass by clearing too much.
 
+    THIS ITEM RUNS AT ITS OWN BOUND, and it is the only one in this file that does. The scope
+    conjunct reads a ring row this request does NOT own, so the modelled engine has to admit two
+    sequences for such a row to exist; at the file's one-sequence bound the item's own control
+    refused it as vacuous every run, which is a conjunct going unread rather than a conjunct
+    passing. The other items keep the one-sequence bound and every reading they always made.
+
     WHAT ITEM 11 MEASURES INSTEAD, and this item deliberately does not: the prefill's own
     remainder. The rows past the last complete pool exist only inside the model's prefill
     branch (`:5486-5500`), which now seeds them into the ring the converter binds with
@@ -1346,8 +1458,18 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     root.bind_kv_cache(caches)
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    # RE-PINNED. ORIGINAL READING, VERBATIM: `runner.max_num_reqs = E2E_MAX_NUM_SEQS`. NEW
+    # VALUE: this item's own two-slot bound, on the lead's ruling. The scope conjunct below
+    # reads a row this request does not own, and at the file's one-sequence bound there is no
+    # such row, so its control refused the item as vacuous on every run. Nothing else here
+    # moves: the banks already hold eight slots and one request still runs through the item.
+    runner.max_num_reqs = E2E_SCOPE_MAX_NUM_SEQS
 
     live = runner._glm5next_live_side_caches(banks)
     again = runner._glm5next_live_side_caches(banks)
@@ -1361,7 +1483,20 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
             "no bank in this stack carries a ring, so this item measures nothing"
         )
 
-    above_the_bound = int(rings[0]["pool_cache"].shape[0]) - 1
+    # RE-PINNED: the request claims its slot before anything is planted. Hand-out
+    # zeroes both of a new owner's caches, so a plant made before the claim would be
+    # wiped by the step that took the slot rather than by the property under test.
+    _model_kwargs(
+        runner,
+        input_ids=torch.zeros(item.STACK_TOKENS, dtype=torch.long),
+        cached=0,
+        sampling_row=item.STACK_TOKENS - 1,
+    )
+    own = _own_slot(runner)
+    # RE-PINNED: ORIGINAL READING `rings[0]["pool_cache"].shape[0]`, the pool ROW
+    # count. NEW VALUE `shape[1]`: axis 0 is the request-slot axis now, and reading it
+    # here would compare a slot count against a candidate count.
+    above_the_bound = int(rings[0]["pool_cache"].shape[1]) - 1
     candidates = item.STACK_TOKENS // int(root.text_config.index_kpool)
     print(f"TINYE2E|pool_rows|planted_row={above_the_bound}|this_sequences_candidates="
           f"{candidates}")
@@ -1371,9 +1506,15 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
             f"{candidates}, so planting there would be reachable and the second conjunct "
             f"would be measuring the wrong thing"
         )
+    # RE-PINNED: the plant fills EVERY slot's ring, and the reads below take this
+    # request's own row. ORIGINAL READING: `side["tail"]` and
+    # `side["pool_cache"][above_the_bound]` whole, one set per process. Planting wide
+    # and reading narrow is what makes the clearing's SCOPE visible: the other slots
+    # must keep their planted values, because a fresh sequence clears its own ring
+    # and not a concurrent request's.
     for side in rings:
         side["tail"].fill_(3.0)
-        side["pool_cache"][above_the_bound].fill_(5.0)
+        side["pool_cache"][:, above_the_bound].fill_(5.0)
 
     _model_kwargs(
         runner,
@@ -1381,12 +1522,33 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
         cached=0,
         sampling_row=item.STACK_TOKENS - 1,
     )
-    cleared = max(float(side["tail"].abs().max()) for side in rings)
-    stale = min(float(side["pool_cache"][above_the_bound].abs().max()) for side in rings)
-    print(f"TINYE2E|fresh_prefill|ring_max={cleared}|planted_pool_row_min={stale}")
+    cleared = max(float(side["tail"][own].abs().max()) for side in rings)
+    stale = min(
+        float(side["pool_cache"][own][above_the_bound].abs().max()) for side in rings
+    )
+    others = [
+        float(side["tail"][index].abs().max())
+        for side in rings
+        for index in range(int(side["tail"].shape[0]))
+        if index != own
+    ]
+    if not others:
+        raise item.VacuousControlError(
+            f"this item runs at a bound of {E2E_SCOPE_MAX_NUM_SEQS} sequence(s) so that a row "
+            f"this request does not own exists to read the clearing's scope against, and the "
+            f"ring it was handed carries {int(rings[0]['tail'].shape[0])} row(s)"
+        )
+    untouched = min(others)
+    print(f"TINYE2E|fresh_prefill|slot={own}|ring_max={cleared}|planted_pool_row_min={stale}"
+          f"|other_slots_min={untouched}")
     assert cleared == 0.0, (
         "a prefill at position 0 is a new sequence and must start on an empty ring; this one "
         "inherited the planted state"
+    )
+    assert untouched == 3.0, (
+        "the fresh prefill cleared a ring row this request does not own; the rows are per "
+        "request now, so clearing wider than one slot is the cross-request destruction the "
+        "slot axis exists to end"
     )
     assert stale == 5.0, (
         "the pooled store must not be blanket-cleared: the planted row is above this "
@@ -1403,8 +1565,8 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
         cached=item.STACK_TOKENS,
         sampling_row=0,
     )
-    kept = min(float(side["tail"].abs().max()) for side in rings)
-    print(f"TINYE2E|decode_step|ring_min={kept}")
+    kept = min(float(side["tail"][own].abs().max()) for side in rings)
+    print(f"TINYE2E|decode_step|slot={own}|ring_min={kept}")
     assert kept == 7.0, (
         "a decode step must not clear the ring; the ring is the decode leg's own state and "
         "clearing it would lose the partial pool this step is meant to advance"
@@ -1606,8 +1768,13 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     banks = root.glm5next_layer_banks
     pool = int(root.text_config.index_kpool)
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     remainder = REMAINDER_PROMPT % pool
     completed_pool = (EVEN_PROMPT - 1) // pool
@@ -1636,8 +1803,19 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     if not rings:
         raise item.VacuousControlError("no bank in this stack carries a ring")
 
+    # RE-PINNED: the request claims its slot before any row is read or cleared,
+    # because hand-out zeroes both of a new owner's caches and would otherwise wipe
+    # the row this item compares part-way through Route A.
+    _model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
+                  sampling_row=REMAINDER_PROMPT - 1)
+    own = _own_slot(runner)
+
     def _rows() -> list[torch.Tensor]:
-        return [entry["pool_cache"][completed_pool] for entry in rings]
+        """RE-PINNED: ORIGINAL READING `entry["pool_cache"][completed_pool]`, the pool
+        row of the one process-wide store. NEW VALUE `[own][completed_pool]`: axis 0 is
+        the request-slot axis now, so the pool id belongs on axis 1.
+        """
+        return [entry["pool_cache"][own][completed_pool] for entry in rings]
 
     def _clear_the_row() -> None:
         for row in _rows():
@@ -1671,8 +1849,12 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     _clear_the_row()
     root(**_model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
                          sampling_row=REMAINDER_PROMPT - 1))
-    low = min(float(entry["tail"][0, :remainder].abs().max()) for entry in rings)
-    high = max(float(entry["tail"][0, remainder:].abs().max()) for entry in rings)
+    # RE-PINNED: ORIGINAL READING `entry["tail"][0, :remainder]`, ring 0's low
+    # positions of the one process-wide ring. NEW VALUE `[own][0, :remainder]`: the
+    # leading axis is the request slot, so ring 0 and the positions both shift right
+    # by one -- without this the slice selected slot 0 and sliced the two-ring axis.
+    low = min(float(entry["tail"][own][0, :remainder].abs().max()) for entry in rings)
+    high = max(float(entry["tail"][own][0, remainder:].abs().max()) for entry in rings)
     print(f"TINYE2E|seeded_ring|low_slots_min={low:.6g}|high_slots_max={high:.6g}"
           f"|seeded_slots={remainder}")
     assert low > 0.0, (
@@ -1708,7 +1890,10 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
     root(**_model_kwargs(runner, input_ids=ids[:REMAINDER_PROMPT], cached=0,
                          sampling_row=REMAINDER_PROMPT - 1))
     for entry in rings:
-        entry["tail"].zero_()
+        # RE-PINNED: ORIGINAL READING `entry["tail"].zero_()`, the whole ring. NEW
+        # VALUE: this request's own ring. The control takes the seeding back out of
+        # the sequence under test, so it must reach that sequence's rows and no other.
+        entry["tail"][own].zero_()
     for step in range(remainder):
         position = REMAINDER_PROMPT + step
         root(**_model_kwargs(runner, input_ids=ids[position:position + 1], cached=position,
@@ -1821,6 +2006,7 @@ def test_the_decode_leg_refuses_a_step_carrying_more_than_one_token():
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=item.STACK_TOKENS,
+        request_slots=E2E_STATE_SLOTS,
     )
 
     def build(tokens: int):
@@ -1881,8 +2067,13 @@ def test_the_indexer_refuses_a_prefill_ring_handed_to_a_decode_step():
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     indexer = _sparse_indexer(layers)
     rings = _live_rings(runner, banks)
     if not rings:
@@ -1890,7 +2081,13 @@ def test_the_indexer_refuses_a_prefill_ring_handed_to_a_decode_step():
             "the live side caches carry no ring, so there is no prefill_tail to hand a "
             "decode step and this arm cannot reach its refusal"
         )
-    ring = rings[0]["tail"]
+    # RE-PINNED (D17.1): ORIGINAL READING `rings[0]["tail"]`, the one
+    # process-wide ring. NEW VALUE: `[0]`, one request's ring, because the rows
+    # gained a leading request-slot axis. Without the index the seam receives a
+    # four-dimensional tensor: the named refusals below still fire on the argument
+    # being absent, so the arm would still pass, but the CONTROL would no longer
+    # reach the seam it exists to exercise.
+    ring = rings[0]["tail"][0]
     pool_cache = item._mla_pool_cache(pages=item.STACK_PAGES)
     # THE OPERAND HELPER HAS A PRECONDITION OF ITS OWN, and commit 1 tripped it. At
     # `tokens=1` the helper computes `1 // index_kpool(4) = 0` candidate pools, which is
@@ -1956,8 +2153,13 @@ def test_the_indexer_refuses_a_prefill_ring_with_no_end_position():
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     indexer = _sparse_indexer(layers)
     rings = _live_rings(runner, banks)
     if not rings:
@@ -1965,7 +2167,13 @@ def test_the_indexer_refuses_a_prefill_ring_with_no_end_position():
             "the live side caches carry no ring, so there is no prefill_tail to seed and "
             "this arm cannot reach its refusal"
         )
-    ring = rings[0]["tail"]
+    # RE-PINNED (D17.1): ORIGINAL READING `rings[0]["tail"]`, the one
+    # process-wide ring. NEW VALUE: `[0]`, one request's ring, because the rows
+    # gained a leading request-slot axis. Without the index the seam receives a
+    # four-dimensional tensor: the named refusals below still fire on the argument
+    # being absent, so the arm would still pass, but the CONTROL would no longer
+    # reach the seam it exists to exercise.
+    ring = rings[0]["tail"][0]
     pool_cache = item._mla_pool_cache(pages=item.STACK_PAGES)
     selection = item._mla_selection_operands(
         tokens=item.STACK_TOKENS, pages=item.STACK_PAGES
@@ -2033,8 +2241,13 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     prompt = int(item.STACK_TOKENS)
     stale = prompt + STALE_DECODE_GAP
     if STALE_DECODE_GAP == 0:
@@ -2058,9 +2271,9 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
 
     # ---- 1. the first sequence opens and advances.
     step(0, prompt)
-    opened = int(runner._glm5next_side_cache_cursor)
+    opened = int(_slot_position(runner))
     step(prompt, 1)
-    advanced = int(runner._glm5next_side_cache_cursor)
+    advanced = int(_slot_position(runner))
     print(f"TINYE2E|cursor_first_sequence|opened={opened}|advanced={advanced}"
           f"|prompt={prompt}")
     assert opened == prompt, (
@@ -2080,7 +2293,7 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     assert "stands at position" in message, (
         f"a decode at {stale} raised, but not the cursor refusal this arm names: {message}"
     )
-    assert int(runner._glm5next_side_cache_cursor) == advanced, (
+    assert int(_slot_position(runner)) == advanced, (
         "the refused step moved the cursor; a refusal must leave the ring's recorded "
         "position exactly as it was, or the next legitimate step is refused for a "
         "mismatch the refused one caused"
@@ -2119,8 +2332,8 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
             "builder, so this control never reaches the window between emptying the ring "
             "and opening its cursor -- the window it exists to close"
         )
-    assert runner._glm5next_side_cache_cursor is None, (
-        f"a refused opening left the cursor at {runner._glm5next_side_cache_cursor}, while "
+    assert _slot_position(runner) is None, (
+        f"a refused opening left the cursor at {_slot_position(runner)}, while "
         f"the ring had already been emptied; the previous sequence's next step would then "
         f"be served from blanks instead of refused"
     )
@@ -2137,8 +2350,16 @@ def test_a_fresh_sequence_resets_the_cursor_so_two_requests_never_share_the_ring
     for side in _live_rings(runner, banks):
         side["tail"].fill_(PLANTED_RING)
     step(0, prompt)
-    reset = int(runner._glm5next_side_cache_cursor)
-    planted = max(float(side["tail"].abs().max()) for side in _live_rings(runner, banks))
+    reset = int(_slot_position(runner))
+    # RE-PINNED: ORIGINAL READING `side["tail"]` whole, the one process-wide ring.
+    # NEW VALUE: this request's own row. The plant above still fills EVERY slot, so
+    # what this reads is the clearing's SCOPE as well as its effect: the fresh
+    # sequence empties its own row and the other slots keep the planted value, which
+    # is what makes two concurrent requests possible at all.
+    own = _own_slot(runner)
+    planted = max(
+        float(side["tail"][own].abs().max()) for side in _live_rings(runner, banks)
+    )
     print(f"TINYE2E|cursor_second_sequence|reset={reset}|ring_max={planted}"
           f"|planted={PLANTED_RING}")
     assert reset == prompt, (
@@ -2186,13 +2407,26 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
     prefill, it would clear the ring and open the cursor, and this arm would be measuring
     the opening path instead. The carrier it produces is checked for the decode leg's own
     keyword, so a mis-classified call cannot pass quietly.
+
+    WHAT MAKES A STEP SYNTHETIC IS THE ABSENCE OF A REQUEST, and the call below is
+    re-pinned to that shape. A step at position 0 whose batch NAMES a request is a
+    request that has computed nothing, which is an opening sequence: it takes its own
+    slot and opens its own ring. Warmup is not that -- the engine has scheduled nothing
+    when it runs, so its batch names nobody -- and the batch is emptied for the one call
+    that models it. The property, the two readings and the control are the ones this
+    item always made.
     """
     _require_cpu_mode()
     root = _fixture()["root"]
     root.bind_kv_cache(_runner_shaped_caches(root))
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
     prompt = int(item.STACK_TOKENS)
 
     def step(cached: int, tokens: int):
@@ -2205,10 +2439,16 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
 
     step(0, prompt)
     step(prompt, 1)
-    before = int(runner._glm5next_side_cache_cursor)
+    before = int(_slot_position(runner))
 
+    # RE-PINNED. ORIGINAL READING, VERBATIM: `synthetic = step(0, 1)`, with the batch
+    # above naming `req-0` for it. NEW VALUE: the same call with an EMPTY batch, which
+    # is what the engine hands a warmup.
+    scheduled = runner.input_batch
+    runner.input_batch = SimpleNamespace(req_ids=[])
     synthetic = step(0, 1)
-    after = runner._glm5next_side_cache_cursor
+    runner.input_batch = scheduled
+    after = _slot_position(runner)
     carrier = synthetic["layer_carriers"][0]
     print(f"TINYE2E|synthetic_decode|cursor_before={before}|cursor_after={after}"
           f"|carrier_keys={sorted(carrier)}")
@@ -2228,7 +2468,7 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
 
     # ---- THE CONTROL: the real sequence is still servable after the synthetic step.
     step(before, 1)
-    resumed = int(runner._glm5next_side_cache_cursor)
+    resumed = int(_slot_position(runner))
     print(f"TINYE2E|synthetic_decode_control|resumed={resumed}|want={before + 1}")
     assert resumed == before + 1, (
         f"after the synthetic step the real sequence resumed to {resumed} rather than "
@@ -2247,17 +2487,30 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     through.
 
     THE MUST-FAIL CONTROL is the same call one position lower. At position 0 it is served,
-    which is what shows the refusal is decided by the position rather than by something
-    incidental to the call. If both positions refused, the carve-out would be dead and
+    which is what shows the refusal is decided by what the step has already COMPUTED --
+    nothing at position 0, something above it -- rather than by anything incidental to the
+    call. The position is how this arm varies that count; the count is what the code reads.
+    If both positions refused, the carve-out would be dead and
     every warmup broken; if neither refused, the cursor would guard nothing.
+
+    THE CONTROL READS THE REQUEST-LESS SHAPE, re-pinned. The refused call names a request,
+    because a continuation with nobody to continue is the case being refused. The served
+    call must name none: a step at position 0 that names a request has computed nothing,
+    so it is an opening sequence and claims its ring, which the item above measures. The
+    reading here is the claim's absence, so it is the warmup's shape that carries it.
     """
     _require_cpu_mode()
     root = _fixture()["root"]
     root.bind_kv_cache(_runner_shaped_caches(root))
     banks = root.glm5next_layer_banks
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    # RE-PINNED: the converter now keys per-request cache state on the engine's
+    # own request ids and refuses a real step that carries none, so a harness
+    # that models a runner must model its batch too.
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = E2E_MAX_NUM_SEQS
 
     def step(cached: int, tokens: int):
         return _model_kwargs(
@@ -2269,7 +2522,7 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
 
     # allocating the ring is what clears the cursor, so do it before reading one
     _live_rings(runner, banks)
-    opened = getattr(runner, "_glm5next_side_cache_cursor", None)
+    opened = _slot_position(runner)
     if opened is not None:
         raise item.VacuousControlError(
             f"this runner already carries a cursor at {opened}, so 'no open sequence' is "
@@ -2286,8 +2539,14 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     )
 
     # ---- THE CONTROL: the same shape at position 0 is served, cursor untouched.
+    # RE-PINNED. ORIGINAL READING, VERBATIM: `served = step(0, 1)`, with the batch above
+    # naming `req-0` for it. NEW VALUE: the same call with an EMPTY batch. A step at
+    # position 0 that names a request has computed nothing, so it is an opening sequence
+    # and claims its ring; the step this control needs is the one with no request at all,
+    # which is what the engine hands a warmup. The reading below is unchanged.
+    runner.input_batch = SimpleNamespace(req_ids=[])
     served = step(0, 1)
-    after = getattr(runner, "_glm5next_side_cache_cursor", None)
+    after = _slot_position(runner)
     print(f"TINYE2E|real_decode_without_a_sequence_control|at=0"
           f"|carrier_keys={sorted(served['layer_carriers'][0])}|cursor={after}")
     assert after is None, (

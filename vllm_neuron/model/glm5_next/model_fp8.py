@@ -3911,6 +3911,19 @@ def _build_mlp(text_config: Glm5NextTextConfig, layer_idx: int) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 
+def _per_request_entries(part):
+    """One entry per request: a tuple's items, a stacked tensor's rows, or the whole.
+
+    A one-row tensor stays whole, so the batch form and the pinned one-sequence form
+    reach the seams as the same shape.
+    """
+    if isinstance(part, (tuple, list)):
+        return tuple(part)
+    if torch.is_tensor(part) and part.dim() == 1 and int(part.shape[0]) > 1:
+        return tuple(torch.unbind(part))
+    return (part,)
+
+
 def _start_is_zero(start_position: torch.Tensor | int, device: torch.device):
     """``start_position == 0`` as a 0-d bool tensor, never as a python bool."""
     return (
@@ -4107,8 +4120,8 @@ class Glm5NextKDAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        conv_state: torch.Tensor,
-        recurrent_state: torch.Tensor,
+        conv_state: torch.Tensor | tuple[torch.Tensor, ...],
+        recurrent_state: torch.Tensor | tuple[torch.Tensor, ...],
         is_prefill: bool,
         start_position: torch.Tensor | int = 0,
         chunk_size: int | None = None,
@@ -4143,6 +4156,16 @@ class Glm5NextKDAAttention(nn.Module):
                 whether the recurrence enters with the carrier's state.
             chunk_size: overrides the resolved chunk width, for a test that
                 needs to name it.
+
+        THE THREE PER-REQUEST ARGUMENTS ALSO ARRIVE ONE PER REQUEST, in the
+        batch's order, which is how a concurrent decode comes: the two state
+        carriers as TUPLES OF VIEWS, because each request's states live at its own
+        slot of the bank and stacking them would copy, and the positions as ONE
+        int32 tensor with a row per request, because a host number here becomes a
+        constant of the captured graph. Both are served one request at a time by
+        this same method, and refused on the prefill leg, where the carrier says
+        nothing about where one request's tokens end. A bare tensor, or a tensor of
+        one row, is one request.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -4187,6 +4210,67 @@ class Glm5NextKDAAttention(nn.Module):
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
             )
+        # ONE CARRIER PER REQUEST, AND THE LOOP IS THE DISPATCH. Concurrent requests
+        # hold their states at different slots of one bank, so what arrives here is a
+        # tuple of views -- one per request, in the batch's own order -- rather than
+        # one sequence's state. Each request is then served by this same method on
+        # its own token, which keeps the recurrence one request's from end to end and
+        # leaves the arithmetic below untouched. The cost is one dispatch per request
+        # per layer, taken deliberately: batching the requests into the seams needs
+        # the seams to carry a request axis, which is not this layer's to decide.
+        #
+        # THE VIEWS ARE NOT COPIED, which is what makes the loop correct at all. The
+        # recurrence advances its state in place, so each request's write has to land
+        # in the bank row its own view names.
+        # ONE ENTRY PER REQUEST, WHATEVER THE CARRIER'S SHAPE. The two state carriers
+        # arrive as tuples of VIEWS -- two requests' states are two rows of one bank and
+        # cannot be one tensor without copying -- while the position arrives as ONE
+        # int32 tensor with a row per request. Its rows are taken with ``unbind``, a
+        # tensor operation: reading the value here to split it would be a host read of
+        # tensor data inside a traced region, which is what pins a captured graph to the
+        # position it was captured at.
+        states = tuple(_per_request_entries(part)
+                       for part in (conv_state, recurrent_state, start_position))
+        counts = {len(part) for part in states}
+        if len(counts) != 1:
+            raise ValueError(
+                f"the two state carriers and the position describe the same requests, "
+                f"so they arrive in equal numbers; this call carries "
+                f"{len(states[0])} conv, {len(states[1])} recurrent and "
+                f"{len(states[2])} position entry(ies)"
+            )
+        if len(states[0]) > 1:
+            requests = len(states[0])
+            if is_prefill:
+                raise ValueError(
+                    f"this call prefills {requests} requests together, and a prefill "
+                    f"carries a different number of tokens for each of them; the "
+                    f"carrier says nothing about where one request's tokens end and "
+                    f"the next one's begin, so serving it would run every request "
+                    f"over the whole batch's tokens. Concurrent DECODE is what this "
+                    f"layer serves"
+                )
+            if int(hidden_states.shape[0]) != requests:
+                raise ValueError(
+                    f"a decode step advances each sequence by one token, so this call "
+                    f"carries one token per request; it holds "
+                    f"{int(hidden_states.shape[0])} token(s) for {requests} request(s)"
+                )
+            return torch.cat(
+                [
+                    self.forward(
+                        hidden_states[index : index + 1],
+                        conv_state=conv,
+                        recurrent_state=recurrent,
+                        is_prefill=is_prefill,
+                        start_position=position,
+                        chunk_size=chunk_size,
+                    )
+                    for index, (conv, recurrent, position) in enumerate(zip(*states))
+                ],
+                dim=0,
+            )
+        conv_state, recurrent_state, start_position = (part[0] for part in states)
         tokens = int(hidden_states.shape[0])
         heads = int(self.num_kv_heads_per_rank)
         kdim = int(self.head_dim)
@@ -4224,13 +4308,35 @@ class Glm5NextKDAAttention(nn.Module):
             self.g_b_proj_weight.to(torch.float32).t()
         )
 
+        # A SEQUENCE THAT HAS COMPUTED NOTHING ENTERS WITH A ZERO STATE, AND THIS IS
+        # THE ONE PREDICATE THAT SAYS SO. A sequence at position 0 carries no history,
+        # and the slot it was handed may still hold the bytes of whichever request held
+        # it before -- nothing empties the recurrent banks, because an eager write on a
+        # buffer whose storage is shared is refused by the runtime. So BOTH state
+        # reads below select zero here instead. It is computed ONCE, outside the head
+        # loop that used to compute it per head, and it is a TENSOR comparison: a
+        # python branch on the position would compile the choice made at capture time
+        # into every later step.
+        #
+        # AND IT IS READ ON EVERY LEG, because the position is what says whether a
+        # sequence is opening and the number of tokens in the step is not. A one-token
+        # prompt computes its whole prompt in a step whose query length does not exceed
+        # the decode threshold, and a preempted request resumes at position 0 however
+        # many tokens it is given; both are opening, and a predicate the leg switched
+        # off would hand exactly those two the previous owner's history. The position
+        # arrives per request and this method serves one request per call, so what is
+        # read here is THIS sequence's own position.
+        opening = _start_is_zero(start_position, conv_state.device)
+
         # --- seam 1: the short convolution, ONE dispatch for q, k and v ------
         # The three streams are convolved together as one channel block, which
         # is the same channel extent the state calculator reports
         # (``conv_dim = proj + 2 * proj_k``). Padding is carried by the state
         # rather than by the seam, which refuses non-zero width padding.
         conv_in = torch.cat((q_in, k_in, v_in), dim=-1)
-        padded = torch.cat((self._conv_history(conv_state), conv_in), dim=0)
+        history = self._conv_history(conv_state)
+        history = torch.where(opening, torch.zeros_like(history), history)
+        padded = torch.cat((history, conv_in), dim=0)
         channels = 3 * width
         img = (
             padded.t().contiguous().reshape(1, channels, 1, state_rows + tokens)
@@ -4247,6 +4353,12 @@ class Glm5NextKDAAttention(nn.Module):
         conv_out = conv_out.reshape(channels, tokens).t()
         conv_out = torch.nn.functional.silu(conv_out)
         q_conv, k_conv, v_conv = conv_out.split(width, dim=-1)
+        # WHAT AN OPENING CHUNK SHORTER THAN THE WINDOW STORES, said here because the
+        # zero above is what makes it right. The stored rows are the tail of
+        # ``padded``, which on an opening chunk is zeros followed by this chunk's own
+        # rows, so a chunk of fewer than ``state_rows`` rows leaves a window whose
+        # leading rows are zero -- the padding a sequence with no history has -- rather
+        # than the previous owner's rows or this chunk's rows repeated.
         self._store_conv_history(conv_state, padded[padded.shape[0] - state_rows :])
 
         # --- seam 2: the gate clamp, one dispatch per head per token tile -----
@@ -4311,20 +4423,13 @@ class Glm5NextKDAAttention(nn.Module):
 
             # THE ENTERING STATE, CHOSEN WITHOUT READING THE POSITION. A sequence
             # starting at 0 enters with a zero state and a continuation enters with
-            # its carried one. The leg is a python bool, so it may branch -- one
-            # graph per leg is captured anyway -- but the POSITION is a tensor, and
-            # a python branch on it would compile the choice made at capture time
-            # into every later step. ``torch.where`` makes the choice on device, so
-            # one graph serves position 0 and position N.
+            # its carried one, under the one predicate computed above the seams --
+            # the same one the convolution's history is selected with, because both
+            # states belong to one request and a second signal for one fact is a
+            # place for the two to disagree. ``torch.where`` makes the choice on
+            # device, so one graph serves position 0 and position N.
             carried = recurrent_state[h].to(torch.float32)
-            if is_prefill:
-                state = torch.where(
-                    _start_is_zero(start_position, carried.device),
-                    torch.zeros_like(carried),
-                    carried,
-                )
-            else:
-                state = carried
+            state = torch.where(opening, torch.zeros_like(carried), carried)
 
             if chunked:
                 shape = (n_chunks, chunk, kdim)
@@ -4479,8 +4584,8 @@ class Glm5NextKDALayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        conv_state: torch.Tensor,
-        recurrent_state: torch.Tensor,
+        conv_state: torch.Tensor | tuple[torch.Tensor, ...],
+        recurrent_state: torch.Tensor | tuple[torch.Tensor, ...],
         is_prefill: bool,
         start_position: torch.Tensor | int = 0,
         chunk_size: int | None = None,
@@ -4516,9 +4621,10 @@ class Glm5NextKDALayer(nn.Module):
         Args:
             streams: ``[T, S, H]`` residual streams, or ``None`` for the
                 one-stream route. Every other argument is the attention module's,
-                passed through unchanged; see
-                :meth:`Glm5NextKDAAttention.forward` for what the two carriers
-                and the position mean.
+                passed through unchanged -- including the per-request TUPLE form
+                of the two carriers and the position, which this method neither
+                reads nor splits; see :meth:`Glm5NextKDAAttention.forward` for
+                what the two carriers and the position mean.
 
         Returns:
             ``[T, H]`` on the one-stream route -- the input dtype, unchanged. On

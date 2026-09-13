@@ -22,6 +22,8 @@ HOW TO RUN IT, both variables from the process environment:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -37,6 +39,12 @@ pytestmark = [pytest.mark.fast, pytest.mark.forked]
 #: read as a clear that never happened.
 PLANTED = 3.0
 
+#: The one request this file's single step belongs to. The converter keys a sequence's state
+#: by its id and refuses a real step served without one, so a step with no id is classified
+#: SYNTHETIC and opens no ring at all -- which is a step this file cannot read either
+#: property from.
+REQUEST = "ring-replacement-request"
+
 
 def test_a_fresh_sequence_replaces_the_ring_and_never_writes_the_old_one():
     """The entry's object changes on reset, and the buffer it replaced keeps its bytes.
@@ -47,6 +55,13 @@ def test_a_fresh_sequence_replaces_the_ring_and_never_writes_the_old_one():
 
     A CLEAR IN PLACE FAILS BOTH READINGS: the entry still holds the same object, and that
     object's bytes are now zero rather than the planted value.
+
+    THE SHELL GAINED TWO ATTRIBUTES AND NEITHER READING MOVED. The converter now sizes the
+    per-sequence caches by the engine's concurrency bound and keys each sequence's state by
+    its request id, so a shell carrying neither cannot get as far as the reset: the first
+    call below asks for the live caches and the bound is read there, and a step with no id
+    is served as synthetic, which opens no ring. Both assertions and the printed reading are
+    the ones this item always made, over the one request it always served.
     """
     e2e._require_cpu_mode()
     root = e2e._fixture()["root"]
@@ -55,6 +70,8 @@ def test_a_fresh_sequence_replaces_the_ring_and_never_writes_the_old_one():
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.model = root
     runner.max_model_len = e2e.E2E_MAX_SEQ_LEN
+    runner.max_num_reqs = e2e.E2E_MAX_NUM_SEQS
+    runner.input_batch = SimpleNamespace(req_ids=[REQUEST])
 
     rings = [side for side in runner._glm5next_live_side_caches(banks) if "tail" in side]
     if not rings:

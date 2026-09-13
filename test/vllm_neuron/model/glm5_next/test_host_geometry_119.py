@@ -85,9 +85,24 @@ PAGE = 4
 BANK_PAGES = 32
 LATENT_WIDTH = 8
 
-#: Recurrent state slots in the linear-attention bank. The converter reads a state slot as
-#: the first block id of the row, so the bank must be wide enough for the rows below.
+#: Recurrent state slots in the linear-attention bank. RE-PINNED: the converter no longer
+#: reads a state slot off the block row -- it hands each request a slot of its own table --
+#: so this width is the bank's paging geometry and the bound below is the request axis.
+#: The original reading, verbatim: "The converter reads a state slot as the first block id
+#: of the row, so the bank must be wide enough for the rows below."
 STATE_SLOTS = 8
+
+#: How many sequences the modelled engine admits at once. One, and the bank above holds
+#: more slots than that on purpose: the two numbers are not the same axis.
+DECLARED_MAX_NUM_SEQS = 1
+#: The id of that one request. The converter keys a sequence's state by its id and refuses a
+#: real step served without one, so a shell with no id can only ever be served the opening
+#: bucket -- which no item here reads, and one of them steps past.
+DECLARED_REQUEST = "host-geometry-request"
+
+#: The slot a step carrying no request id is served from, which is every step this file
+#: drives: the converter takes no claim for such a step and reads slot 0.
+SYNTHETIC_SLOT = 0
 
 #: A single-token step is a decode and anything longer is a prefill.
 DECODE_THRESHOLD = 1
@@ -165,6 +180,12 @@ def _runner(banks) -> NeuronModelRunner:
         text_config=_text_config(), glm5next_layer_banks=tuple(banks)
     )
     runner.max_model_len = MAX_MODEL_LEN
+    # RE-PINNED: the converter now sizes its per-sequence caches by the engine's
+    # concurrent-sequence bound, so a runner shell must model that bound too.
+    runner.max_num_reqs = DECLARED_MAX_NUM_SEQS
+    # RE-PINNED AGAIN: it also keys each sequence's state by its request id, and a step
+    # served without one is the opening bucket's. Every step here is the one request's.
+    runner.input_batch = SimpleNamespace(req_ids=[DECLARED_REQUEST])
     return runner
 
 
@@ -219,17 +240,24 @@ def _open_ring_at(runner, banks, position: int) -> None:
     """Stand the live indexer ring up and declare which position it holds.
 
     A prefill at position 0 opens the ring inside the converter. A step that continues a
-    sequence is refused unless the ring already stands at its position
-    (``neuron_model_runner.py:5339-5346``), so an item at a non-zero position hands the
-    runner the same two attributes the previous step would have left.
+    sequence is refused unless the ring already stands at its position, so an item at a
+    non-zero position hands the runner every record the previous step would have left.
+    RE-PINNED: the ring is one position PER REQUEST SLOT and this shell names one request,
+    so the records are THREE and the slot the request owns is one of them. Handing the
+    position alone is not enough: a request absent from the table is a new one, and
+    claiming a slot empties whatever position that slot stood at, which would take this
+    ring back down before the step reads it. The original reading, verbatim:
+    ``runner._glm5next_side_cache_cursor = int(position)``.
     """
     runner._glm5next_side_cache_set = NeuronModelRunner._glm5next_side_caches(
         banks,
         index_kpool=int(_text_config().index_kpool),
         index_head_dim=int(_text_config().index_head_dim),
         max_seq_len=MAX_MODEL_LEN,
+        request_slots=DECLARED_MAX_NUM_SEQS,
     )
-    runner._glm5next_side_cache_cursor = int(position)
+    runner._glm5next_request_slot_table = {DECLARED_REQUEST: SYNTHETIC_SLOT}
+    runner._glm5next_side_cache_positions = {SYNTHETIC_SLOT: int(position)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -281,11 +309,23 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     assert sparse["start_position"].dtype == torch.int32
     assert sparse["start_position"].device.type == "meta"
     assert sparse["latent_cache"].device.type == "meta"
-    # The linear layer's carrier is the bank's slot, which the row's first id names.
-    assert tuple(linear["conv_state"].shape) == (4, 6)
+    # The linear layer's carrier is the bank's slot, which this request owns.
+    # RE-PINNED: the carrier holds ONE VIEW PER REQUEST rather than one tensor, because
+    # two requests' states are two rows of one bank. The reading this replaces, verbatim:
+    # `assert tuple(linear["conv_state"].shape) == (4, 6)`. The same claim is made here on
+    # this step's one request's own view.
+    assert len(linear["conv_state"]) == 1
+    assert tuple(linear["conv_state"][0].shape) == (4, 6)
     # RE-PINNED for the same reason -- a host number at this boundary is a captured
     # constant -- replacing `assert int(linear["start_position"]) == 0`.
-    assert tuple(linear["start_position"].shape) == ()
+    # RE-PINNED AGAIN: the linear carrier carries ONE ROW PER REQUEST, so its position is
+    # a 1-D int32 tensor as long as the batch rather than a 0-d one. The reading this
+    # replaces, verbatim:
+    # `assert tuple(linear["start_position"].shape) == ()`. What that line claimed --
+    # that the position reaches the layer as a tensor whose value no captured graph
+    # holds -- is what these three lines claim, at this step's one request.
+    assert tuple(linear["start_position"].shape) == (1,)
+    assert linear["start_position"].dtype == torch.int32
     assert linear["start_position"].device.type == "meta"
 
 
@@ -547,10 +587,18 @@ def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
     NEITHER BUILDER NARROWS A ROW TO THE ONE SLOT A RECURRENT BANK USES. The warmup builder
     writes ``torch.arange(max_num_blocks_per_req)`` (``neuron_model_runner.py:4437-4442``) and
     the serving builder slices the group's own table (``neuron_model_runner.py:4246``), whose
-    width is ``max_model_len`` over the page size. The slot the scheduler allocated is the row's
-    first entry and the rest is the table's padding, so a converter that asked a recurrent row
-    to be one entry wide would refuse every hybrid step. Both shapes are driven here, each named
-    in its own failure message.
+    width is ``max_model_len`` over the page size, so a converter that asked a recurrent row to
+    be one entry wide would refuse every hybrid step. Both shapes are driven here, each named in
+    its own failure message.
+
+    RE-PINNED. The state slot no longer comes from the block table at all: it is the request's
+    own, handed out by the slot table the runner keys on request id, and the carrier holds one
+    view per request rather than one tensor. The reading this replaces, verbatim: "The slot the
+    scheduler allocated is the row's first entry and the rest is the table's padding" -- graded
+    as ``carrier["recurrent_state"].data_ptr() == state[row[0]].data_ptr()``. What survives is
+    the acceptance this item is named for: the full-width row is served rather than refused. What
+    replaces the slot clause is the property that made the change worth making -- the two rows
+    name different first entries, and both are now served from ONE slot, which is the request's.
     """
     cpu = torch.device("cpu")
     banks = [_linear_bank(cpu)]
@@ -564,6 +612,7 @@ def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
         ),
     }
 
+    served = {}
     for what, row in shapes.items():
         runner = _runner(banks)
         entry = _entry(
@@ -586,7 +635,18 @@ def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
             ) from refused
 
         carrier = translated["layer_carriers"][0]
-        state = banks[0]["recurrent_state"]
-        assert carrier["recurrent_state"].data_ptr() == state[row[0]].data_ptr(), (
-            f"{what} was served from a slot other than its first entry, {row[0]}"
+        assert len(carrier["recurrent_state"]) == 1, (
+            f"{what} names one request, and its carrier holds "
+            f"{len(carrier['recurrent_state'])} state view(s)"
         )
+        served[what] = carrier["recurrent_state"][0].data_ptr()
+
+    state = banks[0]["recurrent_state"]
+    assert len(set(served.values())) == 1, (
+        f"the two rows were served from different slots, so the slot still follows the "
+        f"block table: {served}"
+    )
+    assert set(served.values()) == {state[0].data_ptr()}, (
+        f"neither row was served from the slot the request table hands a step with no "
+        f"request of its own, which is slot 0: {served}"
+    )
