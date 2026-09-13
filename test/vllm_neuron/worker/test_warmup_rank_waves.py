@@ -16,7 +16,7 @@ integer across the group: the sum is the wave's barrier AND it carries how many
 ranks failed, so a rank that raises is reported to the others in that wave rather
 than left for them to wait out the barrier timeout.
 
-Fourteen items, ONE test each, no ``parametrize``:
+Fifteen items, ONE test each, no ``parametrize``:
 
 * T01 -- rank 0 is alone in the first wave.
 * T02 -- no wave after the first holds more than the wave size.
@@ -30,8 +30,9 @@ Fourteen items, ONE test each, no ``parametrize``:
 * T10 -- a set "0" is refused instead of read as the default.
 * T11 -- a negative value is refused.
 * T12 -- the rank that raises re-raises its own error.
-* T13 -- rank 0 learns of that failure on the same wave and raises, naming the count.
-* T14 -- a rank whose own wave is later learns on that wave too, and never works.
+* T13 -- the rank that raises contributes its 1 to the exchange BEFORE it re-raises.
+* T14 -- rank 0 learns of that failure on the same wave and raises, naming the count.
+* T15 -- a rank whose own wave is later learns on that wave too, and never works.
 
 T02 and T05 print the numbers they measured, so the transcript carries the wave
 sizes and the exchange count rather than only a verdict. Run pytest with ``-s``.
@@ -52,13 +53,14 @@ class _Group:
         self.rank_in_group = rank
 
 
-def _run_on(monkeypatch, world_size, rank, wave, work=None, fail_on_wave=0):
+def _run_on(monkeypatch, world_size, rank, wave, work=None, fail_on_wave=0, exchanges=None):
     """Run the wave runner as ``rank``; return (values exchanged, work calls made).
 
     ``fail_on_wave`` makes the exchange report one OTHER rank as failed on that wave,
-    which is what a rank hears when a rank it cannot see has raised.
+    which is what a rank hears when a rank it cannot see has raised. Pass ``exchanges``
+    to read what this rank contributed even when the run ends in a raise.
     """
-    exchanges = []
+    exchanges = [] if exchanges is None else exchanges
     works = []
     monkeypatch.setattr(
         neuron_worker, "get_tp_group", lambda: _Group(world_size, rank)
@@ -147,6 +149,26 @@ def test_the_rank_that_raises_re_raises_its_own_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="this rank could not compile"):
         _run_on(monkeypatch, world_size=64, rank=9, wave=8, work=_boom)
+
+
+def test_the_raising_rank_exchanges_before_it_re_raises(monkeypatch):
+    exchanges = []
+
+    def _boom():
+        raise RuntimeError("this rank could not compile")
+
+    with pytest.raises(RuntimeError, match="this rank could not compile"):
+        _run_on(
+            monkeypatch,
+            world_size=64,
+            rank=5,
+            wave=8,
+            work=_boom,
+            exchanges=exchanges,
+        )
+    # Rank 5 warms up in the second wave: it contributed 0 to the first wave's exchange and 1 to
+    # its own, so the group learned of the failure before this rank re-raised it.
+    assert exchanges == [0, 1]
 
 
 def test_rank_zero_learns_of_a_failure_on_the_wave_it_happened(monkeypatch):
