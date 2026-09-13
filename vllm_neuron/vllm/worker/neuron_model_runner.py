@@ -4832,9 +4832,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """``[tokens]`` int32: each score ROW's own causal length.
 
         ``seq_lens`` IS PER TOKEN, NOT PER REQUEST -- "one per PACKED row", guarded
-        at ``model_fp8.py:5648`` -- and it is the causal bound ``inc-glm53f-103``
-        consumes (``model_fp8.py:5021``). Row ``i`` of a chunk that starts at
-        ``start_position`` sees ``start_position + i + 1`` tokens including itself.
+        at ``model_fp8.py:6179`` and documented at ``:6095`` -- and it is the causal
+        bound ``inc-glm53f-103`` consumes (``model_fp8.py:5533``). Row ``i`` of a chunk
+        that starts at ``start_position`` sees ``start_position + i + 1`` tokens
+        including itself.
         The landed tiny operand is ``arange(1, tokens + 1)``
         (``test_tiny_glm5next_forward.py:2872``), which is this expression at
         ``start_position == 0``.
