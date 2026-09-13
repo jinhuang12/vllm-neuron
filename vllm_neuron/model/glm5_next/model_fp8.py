@@ -5877,7 +5877,9 @@ class Glm5NextDSAIndexer(nn.Module):
         for the compiler to lay out. That is kernel-class work, which is where the substrate note
         in :meth:`select_bounded_pools` now lands for this seam; the torch spelling survives as that
         module's oracle and serves any call the gate refuses. The result is exact for integer ids:
-        every count is below 2**24. What only the device can show is whether the prefill graph's
+        every count is below 2**24, a bound ``can_run_dsa_sentinel_order`` enforces by admitting
+        at most 16384 columns and sending a wider row to the torch oracle. What only the device
+        can show is whether the prefill graph's
         refused DMA transpose was this tensor's; the kernel removes the op either way.
 
         NO SORT: THE TARGET HAS NONE. An argsort spelled this ordering until the graph reached

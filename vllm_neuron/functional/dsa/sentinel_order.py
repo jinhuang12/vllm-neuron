@@ -8,8 +8,10 @@ compiler to choose the scatter source's layout, and it chose a transposed one: i
 InsertOffloadedTransposes pass reports ``load non_local int32 (2, 128, 8, 512) ... # dl =
 tensor_op_name: _scatter`` with the 128-wide axis moved last, one DMA transpose per DSA layer on
 the prefill path. The kernel emits no scatter, so there is nothing for that pass to lay out. The
-order is exact for integer ids: every count it computes is below 2**24, so the fp32 key the search
-runs on is exact.
+order is exact for integer ids: the counts and the search key are fp32, and
+``can_run_dsa_sentinel_order`` admits only ``k <= SEARCH_MAX_FREE`` (16384) columns, so no value the
+kernel computes exceeds 16384, far below the 2**24 an fp32 holds exactly; a wider row takes the
+torch oracle.
 """
 
 from __future__ import annotations

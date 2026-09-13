@@ -116,8 +116,9 @@ def test_c_the_method_body_calls_no_unsupported_operation(ordering) -> None:
     argsort elsewhere in the model does not answer for this one and a line moving
     changes nothing. The census counts METHOD calls, because that is what tells
     ``x.cumsum(...)`` -- which this target has no lowering for -- apart from a free
-    ``cumsum(x)``; the counts themselves now run inside the seam, so the body makes
-    no free cumsum call either.
+    ``cumsum(x)``. Before the kernel this item wanted the torch spelling's two free
+    ``cumsum(x)`` calls; the counts now run inside the seam, so it wants zero of them
+    beside one call into ``dsa_sentinel_order``.
     """
     source = textwrap.dedent(inspect.getsource(ordering))
     path = pathlib.Path(inspect.getsourcefile(ordering))
