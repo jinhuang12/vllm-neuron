@@ -163,11 +163,15 @@ SEED = layer_half.SEED
 #: a missing one would be served as a default. ``start_position`` joined the set
 #: when the layer learned to continue a segmented prompt's recurrence; the
 #: sparse family's carrier has carried the same key from its own beginning.
+#: ``real_tokens`` and ``row_mask`` joined it when the layer learned to scan only the
+#: rows that carry a token, which is the change that moved this pin.
 DECLARED_CARRIER_KEYS = {
     "conv_state",
     "recurrent_state",
     "is_prefill",
     "start_position",
+    "real_tokens",
+    "row_mask",
 }
 
 

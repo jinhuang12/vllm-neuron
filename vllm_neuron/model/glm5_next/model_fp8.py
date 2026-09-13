@@ -4125,6 +4125,8 @@ class Glm5NextKDAAttention(nn.Module):
         is_prefill: bool,
         start_position: torch.Tensor | int = 0,
         chunk_size: int | None = None,
+        real_tokens: torch.Tensor | int | None = None,
+        row_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
@@ -4156,6 +4158,11 @@ class Glm5NextKDAAttention(nn.Module):
                 whether the recurrence enters with the carrier's state.
             chunk_size: overrides the resolved chunk width, for a test that
                 needs to name it.
+            real_tokens: how many of the ``T`` rows carry a token of this
+                sequence, as an ``int32`` tensor. ``None`` says every row does.
+            row_mask: ``[T, 1]`` float, one for a row that carries a token and
+                zero for a padding row. Passed together with ``real_tokens``, or
+                neither is passed.
 
         THE THREE PER-REQUEST ARGUMENTS ALSO ARRIVE ONE PER REQUEST, in the
         batch's order, which is how a concurrent decode comes: the two state
@@ -4190,6 +4197,18 @@ class Glm5NextKDAAttention(nn.Module):
         carry the chunk axis, so ``n`` chunks cost one dispatch each -- and then
         ``r`` single-token decode dispatches for the remainder. A decode call
         takes no chunked dispatch at any token count.
+
+        A PADDING ROW LEAVES THE STATE WHERE IT FOUND IT. A step arrives padded up
+        to its bucket, and every operand here keeps that padded width, because that
+        width is what a captured graph was compiled for. What the padding rows must
+        not do is enter the sequence's state. Two things keep them out. The decay
+        gate and the update rate are multiplied by ``row_mask``, which makes a
+        padding row's decay one and its update zero -- the recurrence's own
+        identity, exact rather than approximate, in both the chunked seams and the
+        single-token one. And the convolution's history is taken from the last REAL
+        rows by ``index_select`` rather than from the bucket's tail, so the next
+        step's left context is the sequence's own. Neither reads a value off a
+        tensor and neither changes a shape.
 
         The imports are function-local because this module's import block is
         another increment's section (D14).
@@ -4288,6 +4307,17 @@ class Glm5NextKDAAttention(nn.Module):
                 f"conv_state {tuple(conv_state.shape)} must be the shape "
                 f"get_kv_spec reports, {tuple(self.kda_conv_state_shape)}"
             )
+        if (row_mask is None) != (real_tokens is None):
+            raise ValueError(
+                "real_tokens and row_mask are one fact in two operands -- which rows "
+                "carry a token -- and this call passed one of them; a masked "
+                "recurrence over an unmasked history would keep the padding rows"
+            )
+        if row_mask is not None and tuple(row_mask.shape) != (tokens, 1):
+            raise ValueError(
+                f"row_mask {tuple(row_mask.shape)} must be [{tokens}, 1], one row "
+                f"for each row of hidden_states"
+            )
 
         x = hidden_states.to(torch.float32)
 
@@ -4353,13 +4383,24 @@ class Glm5NextKDAAttention(nn.Module):
         conv_out = conv_out.reshape(channels, tokens).t()
         conv_out = torch.nn.functional.silu(conv_out)
         q_conv, k_conv, v_conv = conv_out.split(width, dim=-1)
+        # The history is the left context the NEXT step convolves with, so it is the
+        # last rows the SEQUENCE holds and not the last rows of the bucket. The index
+        # is derived from the real length rather than read from it, and a step whose
+        # real length is below the history width keeps the older rows it still needs.
+        #
         # WHAT AN OPENING CHUNK SHORTER THAN THE WINDOW STORES, said here because the
-        # zero above is what makes it right. The stored rows are the tail of
-        # ``padded``, which on an opening chunk is zeros followed by this chunk's own
-        # rows, so a chunk of fewer than ``state_rows`` rows leaves a window whose
-        # leading rows are zero -- the padding a sequence with no history has -- rather
-        # than the previous owner's rows or this chunk's rows repeated.
-        self._store_conv_history(conv_state, padded[padded.shape[0] - state_rows :])
+        # zero above is what makes it right. The window starts at the real length, so on
+        # an opening chunk -- where the history rows are zeroed -- a chunk of fewer than
+        # ``state_rows`` rows leaves a window whose leading rows are zero, the padding a
+        # sequence with no history has, rather than the previous owner's rows or this
+        # chunk's rows repeated.
+        real_length = torch.as_tensor(
+            tokens if real_tokens is None else real_tokens,
+            device=padded.device,
+            dtype=torch.int64,
+        ).reshape(())
+        history_index = torch.arange(state_rows, device=padded.device) + real_length
+        self._store_conv_history(conv_state, padded.index_select(0, history_index))
 
         # --- seam 2: the gate clamp, one dispatch per head per token tile -----
         # The seam takes ONE head per call: it refuses an ``a_log`` holding more
@@ -4401,6 +4442,14 @@ class Glm5NextKDAAttention(nn.Module):
 
         gate_parts = [clamp_one_head(h) for h in range(heads)]
         beta = torch.sigmoid(raw_beta)
+        # THE MASK GOES ON AFTER THE CLAMP AND AFTER THE SIGMOID, on the two values
+        # the recurrence reads per row: a zero log-decay is a decay of one and a zero
+        # rate is no update, so a padding row hands the state straight through. Before
+        # either non-linearity a zero would mean the clamp's own floor and a rate of
+        # a half instead.
+        if row_mask is not None:
+            gate_parts = [part * row_mask for part in gate_parts]
+            beta = beta * row_mask
 
         # --- seams 3 to 5: the recurrence, per head --------------------------
         chunk = self._resolve_chunk_size(chunk_size)
@@ -4589,6 +4638,8 @@ class Glm5NextKDALayer(nn.Module):
         is_prefill: bool,
         start_position: torch.Tensor | int = 0,
         chunk_size: int | None = None,
+        real_tokens: torch.Tensor | int | None = None,
+        row_mask: torch.Tensor | None = None,
         streams: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The linear-attention half, mixed either by mHC or by a plain add.
@@ -4649,6 +4700,8 @@ class Glm5NextKDALayer(nn.Module):
                 is_prefill=is_prefill,
                 start_position=start_position,
                 chunk_size=chunk_size,
+                real_tokens=real_tokens,
+                row_mask=row_mask,
             )
 
         site = _mhc_attention_site(self, streams)
