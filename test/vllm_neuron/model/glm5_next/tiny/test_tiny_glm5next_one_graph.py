@@ -233,19 +233,20 @@ def test_one_graph_serves_both_expert_groups(monkeypatch):
 def test_the_tensor_form_computes_what_the_int_form_computes(monkeypatch):
     """At each group, the tensor form selects the group's experts and equals the int form."""
     fixtures = _pristine_fixtures(GROUP_RANKS)
+    selected: list[list[int]] = []
+    original = functional_hub.get_local_expert_affinities
+
+    def record(expert_affinities, local_expert_indices):
+        selected.append(local_expert_indices.tolist())
+        return original(expert_affinities, local_expert_indices)
+
+    # The bank imports the mapper from the functional package at call time, so the
+    # package is where a stand-in has to sit; one stand-in serves both groups.
+    monkeypatch.setattr(functional_hub, "get_local_expert_affinities", record)
     for rank in GROUP_RANKS:
         root, runner, per_group = _two_group_root(monkeypatch, rank, fixtures[rank])
         translated = par._translated_prompt(runner)
-        selected: list[list[int]] = []
-        original = functional_hub.get_local_expert_affinities
-
-        def record(expert_affinities, local_expert_indices, _original=original):
-            selected.append(local_expert_indices.tolist())
-            return _original(expert_affinities, local_expert_indices)
-
-        # The bank imports the mapper from the functional package at call time, so the
-        # package is where a stand-in has to sit.
-        monkeypatch.setattr(functional_hub, "get_local_expert_affinities", record)
+        selected.clear()
         tensor_form = root(**translated)
         mapped = len(selected)
         int_form = root(**_as_int(translated, rank))
