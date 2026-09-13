@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSA indexer's sentinel ordering: real pool ids first in their own order, sentinels after them.
+"""The DSA indexer's sentinel ordering: real pool ids first in their own order, then the sentinels.
 
 One NKI kernel performs the whole stable partition on chip -- a mask, two prefix scans, one search
 and one gather per 128-row tile -- so the int32 ``[rows, select_k]`` tensor reaches its consumer as
@@ -81,50 +81,56 @@ def _sentinel_order_nki(pool_ids_hbm):
     """``[rows, k]`` int32 as stored -> the same ids the negatives moved to the trailing columns."""
     rows = pool_ids_hbm.shape[0]
     k = pool_ids_hbm.shape[1]
+    # The search reads eight values at a time, so the counted width is padded to a multiple of
+    # eight with trailing sentinel columns: they sort after every real column, so the first k
+    # ordered columns are unchanged and the pad is never stored.
+    k_pad = -(-k // SEARCH_WIDTH) * SEARCH_WIDTH
     out = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.shared_hbm)
     for r0 in range(0, rows, PARTITION_MAX):
         h = min(PARTITION_MAX, rows - r0)
         ids = nl.ndarray((h, k), dtype=nl.int32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=ids, src=nl.load(pool_ids_hbm[r0:r0 + h, 0:k]))
-        ones = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        ones = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=ones, value=1.0)
         zero = nl.ndarray((h, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=zero, value=0.0)
-        # real = min(max(id + 1, 0), 1): one where the id is a pool, zero where it is a sentinel.
-        shifted = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=shifted, data=ids, op0=nl.add, operand0=1.0,
+        # real = min(max(id + 1, 0), 1): one where the id is a pool, zero where it is a sentinel;
+        # the pad columns read zero, which is a sentinel.
+        shifted = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=shifted, value=0.0)
+        nisa.tensor_scalar(dst=shifted[:, 0:k], data=ids, op0=nl.add, operand0=1.0,
                            op1=nl.maximum, operand1=0.0)
-        real = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        real = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=real, data=shifted, op0=nl.minimum, operand0=1.0)
-        sentinel = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        sentinel = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sentinel, data=real, op0=nl.multiply, operand0=-1.0,
                            op1=nl.add, operand1=1.0)
-        reals = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        reals = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor_scan(dst=reals, data0=ones, data1=real, initial=zero,
                                 op0=nl.multiply, op1=nl.add)
-        sentinels = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        sentinels = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor_scan(dst=sentinels, data0=ones, data1=sentinel, initial=zero,
                                 op0=nl.multiply, op1=nl.add)
         n_real = nl.ndarray((h, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=n_real, src=reals[:, k - 1:k])
+        nisa.tensor_copy(dst=n_real, src=reals[:, k_pad - 1:k_pad])
         # key = real * reals + sentinel * (sentinels + n_real): each id's destination plus one, so a
-        # permutation of 1..k that the search below inverts.
-        real_part = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        # permutation of 1..k_pad that the search below inverts; the pads take k+1..k_pad.
+        real_part = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=real_part, data1=real, data2=reals, op=nl.multiply)
-        after_reals = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        after_reals = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=after_reals, data=sentinels, op0=nl.add, operand0=n_real)
-        sentinel_part = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        sentinel_part = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=sentinel_part, data1=sentinel, data2=after_reals, op=nl.multiply)
-        key = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
+        key = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=key, data1=real_part, data2=sentinel_part, op=nl.add)
-        vals = nl.ndarray((h, k), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.iota(dst=vals, pattern=[[1, k]], offset=1, channel_multiplier=0)
-        source = nl.ndarray((h, k), dtype=nl.uint32, buffer=nl.sbuf)
-        for c0 in range(0, k, SEARCH_WIDTH):
+        vals = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(dst=vals, pattern=[[1, k_pad]], offset=1, channel_multiplier=0)
+        source = nl.ndarray((h, k_pad), dtype=nl.uint32, buffer=nl.sbuf)
+        for c0 in range(0, k_pad, SEARCH_WIDTH):
             nisa.nc_find_index8(dst=source[:, c0:c0 + SEARCH_WIDTH], data=key,
                                 vals=vals[:, c0:c0 + SEARCH_WIDTH])
         ordered = nl.ndarray((h, k), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.nc_n_gather(dst=ordered, data=ids, indices=source)
+        nisa.nc_n_gather(dst=ordered, data=ids, indices=source[:, 0:k])
         nl.store(out[r0:r0 + h, 0:k], value=ordered)
     return out
 
@@ -151,18 +157,16 @@ def can_run_dsa_sentinel_order(pool_ids: Tensor) -> bool:
     if pool_ids.dtype not in _SUPPORTED_DTYPES or pool_ids.ndim != 2:
         return False
     rows, k = int(pool_ids.shape[0]), int(pool_ids.shape[1])
-    if rows <= 0 or k < SEARCH_WIDTH or k > SEARCH_MAX_FREE:
-        return False
-    return k % SEARCH_WIDTH == 0
+    return rows > 0 and 1 <= k <= SEARCH_MAX_FREE
 
 
 def dsa_sentinel_order(pool_ids: Tensor) -> Tensor:
     """THE COUNTED SEAM. ``[rows, select_k]`` pool ids, the negatives moved to the trailing columns.
 
     Real ids keep their relative order and so do the sentinels; the multiset of every row is
-    unchanged. int32 with a width that is a multiple of 8 between 8 and 16384 takes the NKI route;
-    any other call is served by the torch oracle. Raises ``SentinelOrderError`` for a tensor that is
-    not 2-D.
+    unchanged. int32 with 1 to 16384 columns takes the NKI route, a width that is not a multiple
+    of 8 padded on chip with trailing sentinel columns; any other call is served by the torch
+    oracle. Raises ``SentinelOrderError`` for a tensor that is not 2-D.
     """
     rows, k = _validate(pool_ids)
     if not can_run_dsa_sentinel_order(pool_ids):

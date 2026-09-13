@@ -208,16 +208,36 @@ def test_the_five_shapes_take_nki_with_zero_fallback():
     assert (nki_n, fallback_n) == (len(_SHAPES), 0)
 
 
-def test_a_width_the_gate_refuses_takes_the_oracle_and_equals_the_frozen_order():
-    """Twelve columns is not a multiple of the search width: the oracle serves it, counted."""
+def test_a_width_that_is_not_a_multiple_of_eight_takes_nki_and_equals_the_frozen_order():
+    """Two and twelve columns are padded on chip to eight and sixteen; the order is unchanged."""
     seam = importlib.import_module(_SEAM)
     seam.reset_sentinel_order_dispatch_counters()
-    pool_ids = dict(_patterns(4, 12))["mixed"]
+    for k in (2, 12):
+        for name, pool_ids in _patterns(4, k):
+            got = _ordering(pool_ids)
+            want = _frozen_order(pool_ids)
+            differing = int(torch.ne(got, want).sum().item())
+            _emit("PADDED", k=k, pattern=name, equal=torch.equal(got, want), differing=differing,
+                  shape=tuple(got.shape))
+            assert tuple(got.shape) == (4, k)
+            assert differing == 0
+            assert torch.equal(got, want)
+    nki_n, fallback_n = seam.sentinel_order_dispatch_counters()
+    _emit("PADDED_DISPATCH", nki_dispatch=nki_n, torch_fallback=fallback_n)
+    assert (nki_n, fallback_n) == (10, 0)
+
+
+def test_a_dtype_the_gate_refuses_takes_the_oracle_and_equals_the_frozen_order():
+    """int64 ids are not the kernel's: the oracle serves them, counted as such, and equal."""
+    seam = importlib.import_module(_SEAM)
+    seam.reset_sentinel_order_dispatch_counters()
+    pool_ids = dict(_patterns(4, 16))["mixed"].to(torch.int64)
     got = _ordering(pool_ids)
     nki_n, fallback_n = seam.sentinel_order_dispatch_counters()
-    _emit("FALLBACK", k=12, nki_dispatch=nki_n, torch_fallback=fallback_n,
+    _emit("FALLBACK", dtype=pool_ids.dtype, nki_dispatch=nki_n, torch_fallback=fallback_n,
           equal=torch.equal(got, _frozen_order(pool_ids)))
     assert (nki_n, fallback_n) == (0, 1)
+    assert got.dtype == torch.int64
     assert torch.equal(got, _frozen_order(pool_ids))
 
 

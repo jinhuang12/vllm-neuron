@@ -386,6 +386,10 @@ _SEAM_REGISTRY = {
         "vllm_neuron.functional.dsa.causal_bound",
         "causal_sentinel_dispatch_counters",
         "reset_causal_sentinel_dispatch_counters"),
+    "dsa_sentinel_order": (
+        "vllm_neuron.functional.dsa.sentinel_order",
+        "sentinel_order_dispatch_counters",
+        "reset_sentinel_order_dispatch_counters"),
     "kda_chunked_recurrence": (
         "vllm_neuron.functional.kda.chunked_recurrence",
         "dispatch_counters", "reset_dispatch_counters"),
@@ -601,6 +605,10 @@ def _declare_bound_and_sentinel(expected: dict) -> None:
     so both entry points take their NKI branch rather than a torch oracle -- which is
     P13's requirement, not a preference.
 
+    ``dsa_sentinel_order`` is owed at the same count: the selector's method hands its
+    sentinelised ids to that seam once per call, straight after the causal sentinel,
+    and the seam serves every width the indexer presents on its NKI route.
+
     An item whose forward reaches no indexer declares no selector count, and this
     helper then declares nothing either: items 1 to 4 are exactly that case, and
     their zeros stay READ rather than becoming expectations.
@@ -610,6 +618,7 @@ def _declare_bound_and_sentinel(expected: dict) -> None:
         return
     expected["dsa_causal_bound"] = selector
     expected["dsa_causal_sentinel"] = selector
+    expected["dsa_sentinel_order"] = selector
 
 
 def _assert_route_predicate(item: str, expected: dict, before: dict, after: dict) -> None:
