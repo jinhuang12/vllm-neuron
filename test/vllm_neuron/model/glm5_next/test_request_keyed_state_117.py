@@ -421,12 +421,19 @@ def _side_caches(banks):
 
 
 def _carriers_for(banks, side, *, slot: int, rows, cached: int, is_prefill: bool):
-    """One request's carriers at a given slot, built by the code under test."""
+    """One request's carriers at a given slot, built by the code under test.
+
+    The window's length is this request's own row count, which is the slice the
+    builder handed back before the length became a required key, so the items
+    below read what they read before it did.
+    """
+    ids = [int(value) for value in rows]
     geometries = [
         {
-            "block_ids": [int(value) for value in rows],
+            "block_ids": ids,
             "state_slot": int(slot),
             "page_size": DECLARED_PAGE_SIZE,
+            "window_blocks": len(ids),
         }
         for _ in banks
     ]
@@ -450,12 +457,18 @@ def _carriers_for_requests(banks, side, *, tokens: int, requests: int, is_prefil
     this stage of the increment; the request COUNT is what the sharpened decode
     refusal reads, and it is passed explicitly rather than inferred from the token
     count -- inferring it is exactly the conflation the refusal used to make.
+
+    The window's length is the row count, as above: these items must reach the
+    request-count refusal, and a geometry the walk turns away first would let them
+    pass on a message they never asked for.
     """
+    ids = [int(value) for value in DECLARED_SPARSE_ROWS[0]]
     geometries = [
         {
-            "block_ids": [int(value) for value in DECLARED_SPARSE_ROWS[0]],
+            "block_ids": ids,
             "state_slot": 0,
             "page_size": DECLARED_PAGE_SIZE,
+            "window_blocks": len(ids),
         }
         for _ in banks
     ]
