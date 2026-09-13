@@ -46,10 +46,14 @@ if TYPE_CHECKING:
     VLLM_NEURON_SKIP_ENCODER_WARMUP: bool = False
     # How many ranks run warmup at the same time. Warmup traces and compiles in
     # each rank's own process, so the peak is one compile times the wave size:
-    # 16 compiles of ~35 GiB over a ~131 GiB resident floor fits the ~1869 GiB
-    # of headroom a 2 TiB host has. At or above the world size the ranks after
-    # rank 0 form a single wave, which is the old all-at-once behaviour.
-    VLLM_NEURON_WARMUP_WAVE_SIZE: int = 16
+    # 8 x 35.4 GiB is about 283 GiB over the ~131 GiB resident floor, well
+    # inside the ~1869 GiB of headroom a 2 TiB host has. 35.4 GiB is the
+    # largest resident size measured at the moment the kernel killed a rank, so
+    # it is a LOWER bound on the real peak; eight ranks stay inside the headroom
+    # even if the true peak is 230 GiB, where sixteen would need it under 117.
+    # At or above the world size the ranks after rank 0 form a single wave,
+    # which is the old all-at-once behaviour.
+    VLLM_NEURON_WARMUP_WAVE_SIZE: int = 8
     # Force the STATIC FP8 (non-MX) attention path on TRN3 even when STATIC_MX
     # kernels are available. Used by FP8 model factories as an escape hatch.
     VLLM_NEURON_FORCE_STATIC_FP8: bool = False
@@ -225,7 +229,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Ranks warming up at once; see the field for the memory arithmetic.
     "VLLM_NEURON_WARMUP_WAVE_SIZE": lambda: require_positive_int(
         "VLLM_NEURON_WARMUP_WAVE_SIZE",
-        maybe_convert_int(os.getenv("VLLM_NEURON_WARMUP_WAVE_SIZE")) or 16,
+        maybe_convert_int(os.getenv("VLLM_NEURON_WARMUP_WAVE_SIZE")) or 8,
     ),
     # Skip decode warmup/compilation without requiring kv-transfer-config.
     # Useful for prefill-only profiling workflows.

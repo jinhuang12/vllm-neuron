@@ -8,7 +8,8 @@ THE DECLARED ACCEPTANCE COMMAND, verbatim:
       -q -rA -p no:randomly -p no:cacheprovider --timeout 600
 
 Warmup traces and compiles in each rank's own process, so 64 ranks warming up at
-once ask the host for 64 compiles at the same time. The waves bound that number.
+once ask the host for 64 compiles at the same time. The waves bound that number
+to the wave size, which ships at eight.
 Rank 0 goes alone first, because if its compiled graph is reusable the ranks
 behind it read it instead of compiling; the wave timings in the log say whether
 it was. Six items, ONE test each, no ``parametrize``:
@@ -56,17 +57,17 @@ def _run_on(monkeypatch, world_size: int, rank: int, wave: int):
 
 
 def test_first_wave_is_rank_zero_alone():
-    assert warmup_rank_waves(64, 16)[0] == [0]
+    assert warmup_rank_waves(64, 8)[0] == [0]
 
 
 def test_no_wave_after_the_first_exceeds_the_wave_size():
-    sizes = [len(ranks) for ranks in warmup_rank_waves(64, 16)]
-    print(f"warmup_waves|world=64|wave=16|waves={len(sizes)}|sizes={sizes}")
-    assert sizes == [1, 16, 16, 16, 15]
+    sizes = [len(ranks) for ranks in warmup_rank_waves(64, 8)]
+    print(f"warmup_waves|world=64|wave=8|waves={len(sizes)}|sizes={sizes}")
+    assert sizes == [1, 8, 8, 8, 8, 8, 8, 8, 7]
 
 
 def test_every_rank_appears_exactly_once_in_order():
-    flattened = [rank for ranks in warmup_rank_waves(64, 16) for rank in ranks]
+    flattened = [rank for ranks in warmup_rank_waves(64, 8) for rank in ranks]
     assert flattened == list(range(64))
 
 
@@ -76,13 +77,13 @@ def test_wave_size_at_or_above_the_world_leaves_one_wave_after_rank_zero():
 
 
 def test_rank_zero_barriers_once_per_wave_and_works_in_the_first(monkeypatch):
-    barriers, works = _run_on(monkeypatch, world_size=64, rank=0, wave=16)
+    barriers, works = _run_on(monkeypatch, world_size=64, rank=0, wave=8)
     print(f"warmup_barriers|rank=0|barriers={len(barriers)}|works={works}")
-    assert len(barriers) == len(warmup_rank_waves(64, 16))
+    assert len(barriers) == len(warmup_rank_waves(64, 8))
     assert works == [0]
 
 
 def test_a_rank_in_the_last_wave_barriers_once_per_wave_and_works_once(monkeypatch):
-    barriers, works = _run_on(monkeypatch, world_size=64, rank=63, wave=16)
-    assert len(barriers) == len(warmup_rank_waves(64, 16))
+    barriers, works = _run_on(monkeypatch, world_size=64, rank=63, wave=8)
+    assert len(barriers) == len(warmup_rank_waves(64, 8))
     assert works == [63]
