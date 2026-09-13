@@ -155,8 +155,16 @@ def _extras(layer, tokens: int, real: int) -> dict:
     return {"real_tokens": real_length, "row_mask": row_mask}
 
 
-def _drive(layers, bank, rows, *, real: int, is_prefill: bool, start_position: int):
-    """One call per layer through the stack, each layer handed its own carrier."""
+def _drive(
+    layers, bank, rows, *, real: int, is_prefill: bool, start_position: int,
+    operands: bool = True,
+):
+    """One call per layer through the stack, each layer handed its own carrier.
+
+    ``operands`` off drives the same rows the way a caller that names neither row
+    operand is served, which is what the no-padding item compares the masked route
+    against.
+    """
     out = rows
     for layer, (conv_state, recurrent_state) in zip(layers, bank):
         out = layer(
@@ -166,7 +174,7 @@ def _drive(layers, bank, rows, *, real: int, is_prefill: bool, start_position: i
             is_prefill=is_prefill,
             start_position=start_position,
             chunk_size=DECLARED_CHUNK,
-            **_extras(layer, int(rows.shape[0]), real),
+            **(_extras(layer, int(rows.shape[0]), real) if operands else {}),
         )
     return out
 
@@ -209,6 +217,19 @@ def _worst(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return (actual.float() - expected.float()).abs().max().item()
 
 
+def _bound(expected: torch.Tensor) -> float:
+    """Eight steps of this carrier's OWN dtype, at the scale its values sit on.
+
+    The bound is derived from the tensor rather than written down, so a carrier that
+    changes dtype changes the bound with it. It is ABSOLUTE at the carrier's scale
+    because the difference propagates from operands of order one and not from each
+    element's own value, so an element near zero carries the same room as its
+    neighbours.
+    """
+    scale = max(1.0, expected.float().abs().max().item())
+    return 8.0 * torch.finfo(expected.dtype).eps * scale
+
+
 def _worst_pair(got_bank, want_bank) -> tuple[float, float]:
     """The worst conv error and the worst recurrent error over every layer."""
     return (
@@ -229,9 +250,18 @@ def test_kda_padded_prefill_c01_a_chunk_multiple_length_leaves_the_same_state(
 
     A whole number of chunks of real rows inside a chunk-aligned bucket, so the real
     rows are chunked identically on both arms and the only difference between them is
-    the padding. Both carriers are asked for bit equality, which is what the masked
-    gates make available: a zero decay rate leaves the state multiplied by one and a
-    zero update rate adds nothing to it, and neither is an approximation.
+    the padding.
+
+    WHAT THE TWO ARMS MAY DIFFER BY, and why it is not bit equality. The masked gates
+    are exact -- a zero decay rate leaves the state multiplied by one and a zero update
+    rate adds nothing to it -- but the two arms run every projection and reduction of
+    the layer at DIFFERENT ROW COUNTS, and floating-point arithmetic is not
+    shape-invariant. The measured oracle is therefore eight steps of each carrier's own
+    dtype at the scale its values sit on, derived from the carrier here and never
+    written down. A padding row that entered a state carries the marker through the
+    projections and moves it by orders of magnitude more than that; the no-padding item
+    below is the control that keeps the exactness claim about the MASK falsifiable, and
+    the equal-shape decode leg of item 3 reads zero.
     """
     real = DECLARED_ALIGNED_REAL
     rows = _padded_rows(stack, real)
@@ -252,23 +282,39 @@ def test_kda_padded_prefill_c01_a_chunk_multiple_length_leaves_the_same_state(
 
     arms = _arms(stack, real)
     worst_conv, worst_state = _worst_pair(arms.got_bank, arms.want_bank)
+    multiples = {"conv": 0.0, "state": 0.0}
+    for index, (got, want) in enumerate(zip(arms.got_bank, arms.want_bank)):
+        for half, half_name in ((0, "conv"), (1, "state")):
+            bound = _bound(want[half])
+            error = _worst(got[half], want[half])
+            multiples[half_name] = max(multiples[half_name], error / bound)
+            print(
+                f"PADPREFILL|item1|layer={index}|carrier={half_name}|"
+                f"dtype={want[half].dtype}|worst_abs_error={error:.3e}|"
+                f"bound={bound:.3e}|multiple_of_bound={error / bound:.3f}",
+                flush=True,
+            )
     print(
         f"PADPREFILL|item1|layers={DECLARED_STACK_LAYERS}|"
         f"worst_abs_error_conv={worst_conv:.3e}|worst_abs_error_state={worst_state:.3e}|"
-        f"expected=bit_identical",
+        f"worst_conv_multiple_of_bound={multiples['conv']:.3f}|"
+        f"worst_state_multiple_of_bound={multiples['state']:.3f}|"
+        f"expected=within_eight_steps_of_each_carriers_own_dtype",
         flush=True,
     )
     for index, (got, want) in enumerate(zip(arms.got_bank, arms.want_bank)):
-        assert torch.equal(got[0], want[0]), (
-            f"layer {index}'s conv history differs between the padded and the "
-            f"unpadded prefill of the same {real} tokens, by at most {worst_conv:.3e}; "
-            f"the history the next step convolves with is the bucket's tail"
-        )
-        assert torch.equal(got[1], want[1]), (
-            f"layer {index}'s recurrent state differs between the padded and the "
-            f"unpadded prefill of the same {real} tokens, by at most {worst_state:.3e}; "
-            f"the padding rows entered the sequence's own state"
-        )
+        for half, half_name, what in (
+            (0, "conv", "the history the next step convolves with is the bucket's tail"),
+            (1, "state", "the padding rows entered the sequence's own state"),
+        ):
+            bound = _bound(want[half])
+            error = _worst(got[half], want[half])
+            assert error <= bound, (
+                f"layer {index}'s {half_name} carrier differs between the padded and "
+                f"the unpadded prefill of the same {real} tokens by {error:.3e}, which "
+                f"is {error / bound:.3f} times the {bound:.3e} eight steps of "
+                f"{want[half].dtype} allow at this carrier's scale; {what}"
+            )
 
 
 def test_kda_padded_prefill_c02_a_ragged_length_carries_to_the_declared_comparator(
@@ -350,4 +396,59 @@ def test_kda_padded_prefill_c03_the_first_decode_after_it_equals_the_unpadded_ar
             after[1].float(), expected[1].float(),
             rtol=DECLARED_RTOL, atol=DECLARED_ATOL,
             name=f"padded.decode_recurrent_state[{index}]",
+        )
+
+
+def test_kda_padded_prefill_c04_the_row_operands_change_nothing_when_no_row_is_padding(
+    stack: SimpleNamespace,
+) -> None:
+    """Item 4. Certifying component: that the masked route is exactly the old route.
+
+    THE ONE PLACE BIT EQUALITY IS THE RIGHT ORACLE. Both arms carry the SAME rows at the
+    same count -- the bucket's own length, so no row is padding -- and the only
+    difference is that one arm is handed the two row operands and the other is served
+    the way a caller that names neither is served. The mask is all ones and the history
+    index lands on the bucket's tail, so the two routes are the same arithmetic in the
+    same order, and a difference of one bit is a difference the mask itself introduced.
+    That is what keeps item 1's claim about the MASK falsifiable now that its carriers
+    are graded to a bound.
+    """
+    real = DECLARED_BUCKET
+    rows = _padded_rows(stack, real)
+    assert bool(torch.equal(rows, stack.tokens[:real])), (
+        "at the bucket's own length no row is padding, so these rows must be the "
+        "request's own; a marker row here would make this item a padded comparison"
+    )
+    assert _masked(stack), (
+        "this tree takes neither row operand, so both arms below are the same call and "
+        "the item could not tell the masked route from the route it replaces"
+    )
+
+    want_bank = _fresh_bank(stack.layers)
+    _drive(
+        stack.layers, want_bank, rows, real=real, is_prefill=True, start_position=0,
+        operands=False,
+    )
+    got_bank = _fresh_bank(stack.layers)
+    _drive(
+        stack.layers, got_bank, rows, real=real, is_prefill=True, start_position=0,
+        operands=True,
+    )
+    worst_conv, worst_state = _worst_pair(got_bank, want_bank)
+    print(
+        f"PADPREFILL|item4|bucket={DECLARED_BUCKET}|real={real}|padding_rows=0|"
+        f"worst_abs_error_conv={worst_conv:.3e}|worst_abs_error_state={worst_state:.3e}|"
+        f"expected=bit_identical|row_operands_accepted={_masked(stack)}",
+        flush=True,
+    )
+    for index, (got, want) in enumerate(zip(got_bank, want_bank)):
+        assert torch.equal(got[0], want[0]), (
+            f"layer {index}'s conv history moved by at most {worst_conv:.3e} when the "
+            f"row operands were handed to a step with no padding row, so masking by "
+            f"one is not the identity the design rests on"
+        )
+        assert torch.equal(got[1], want[1]), (
+            f"layer {index}'s recurrent state moved by at most {worst_state:.3e} when "
+            f"the row operands were handed to a step with no padding row, so masking "
+            f"by one is not the identity the design rests on"
         )
