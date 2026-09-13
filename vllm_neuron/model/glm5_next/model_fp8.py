@@ -3924,6 +3924,21 @@ def _per_request_entries(part):
     return (part,)
 
 
+def _per_request_row_entries(part, one_sequence_dim: int):
+    """One entry per request for a row operand, or ``None`` when it was not passed.
+
+    The per-request form carries ONE MORE AXIS than the one-sequence form --
+    ``[requests, 1]`` beside ``[1]``, and ``[requests, T, 1]`` beside ``[T, 1]`` -- so
+    the split is read off the rank instead of guessed, and each entry this yields already
+    has the shape one sequence's operand has.
+    """
+    if part is None:
+        return None
+    if torch.is_tensor(part) and part.dim() > one_sequence_dim:
+        return tuple(torch.unbind(part, 0))
+    return (part,)
+
+
 def _start_is_zero(start_position: torch.Tensor | int, device: torch.device):
     """``start_position == 0`` as a 0-d bool tensor, never as a python bool."""
     return (
@@ -4159,22 +4174,27 @@ class Glm5NextKDAAttention(nn.Module):
             chunk_size: overrides the resolved chunk width, for a test that
                 needs to name it.
             real_tokens: how many of the ``T`` rows carry a token of this
-                sequence, as an ``int32`` tensor. ``None`` says every row does.
+                sequence, as an ``int32`` tensor -- or ``[requests, 1]``, one row
+                per request. ``None`` says every row does.
             row_mask: ``[T, 1]`` float, one for a row that carries a token and
-                zero for a padding row. Passed together with ``real_tokens``, or
-                neither is passed.
+                zero for a padding row -- or ``[requests, T, 1]``, one mask per
+                request. Passed together with ``real_tokens``, or neither is passed.
 
-        THE THREE PER-REQUEST ARGUMENTS ALSO ARRIVE ONE PER REQUEST, in the
-        batch's order, which is how a concurrent decode comes: the two state
-        carriers as TUPLES OF VIEWS, because each request's states live at its own
-        slot of the bank and stacking them would copy, and the positions as ONE
-        int32 tensor with a row per request, because a host number here becomes a
-        constant of the captured graph. Both are served one request at a time by
-        this same method, and refused on the prefill leg, where the carrier says
-        nothing about where one request's tokens end. A bare tensor, or a tensor of
-        one row, is one request. The two row operands are refused there as well: they
-        describe one sequence's padding, the per-request loop passes them to nobody,
-        and a dropped mask is worse than a refused call.
+        THE FIVE PER-REQUEST ARGUMENTS ALSO ARRIVE ONE PER REQUEST, in the batch's
+        order, which is how a concurrent decode comes. The two state carriers arrive as
+        TUPLES OF VIEWS, because each request's states live at its own slot of the bank
+        and stacking them would copy. The position arrives as ONE int32 tensor with a row
+        per request, and each row operand as ONE tensor carrying a leading request axis,
+        because a host number here becomes a constant of the captured graph -- and
+        because these three are built for the step rather than pointing into the bank, so
+        a stack costs nothing.
+
+        A ROW OPERAND'S PER-REQUEST FORM IS ITS ONE-SEQUENCE FORM WITH ONE MORE AXIS,
+        which is what makes it unmistakable: a ``[requests, 1]`` mask would not do, being
+        also one sequence of ``requests`` rows. Each request is then served one at a time
+        by this same method, on its own entry of all five, and a concurrent PREFILL is
+        refused, because the carrier says nothing about where one request's tokens end. A
+        bare tensor, or a tensor of one row, is one request.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -4260,8 +4280,11 @@ class Glm5NextKDAAttention(nn.Module):
                 f"{len(states[0])} conv, {len(states[1])} recurrent and "
                 f"{len(states[2])} position entry(ies)"
             )
-        if len(states[0]) > 1:
-            requests = len(states[0])
+        requests = len(states[0])
+        # THE CONCURRENT REFUSALS COME BEFORE THE OPERANDS ARE READ, so a call this layer
+        # cannot serve at all is refused for what it is rather than for an operand count
+        # derived from it.
+        if requests > 1:
             if is_prefill:
                 raise ValueError(
                     f"this call prefills {requests} requests together, and a prefill "
@@ -4277,14 +4300,23 @@ class Glm5NextKDAAttention(nn.Module):
                     f"carries one token per request; it holds "
                     f"{int(hidden_states.shape[0])} token(s) for {requests} request(s)"
                 )
-            if row_mask is not None or real_tokens is not None:
+        # THE ROW OPERANDS ARE STACKED RATHER THAN TUPLED, for the same reason the states
+        # are tupled: a tuple carries what must not be copied, and these two are built for
+        # the step rather than pointing into the bank. Their per-request form is therefore
+        # one leading axis on the one-sequence form, which no one-sequence operand can be
+        # mistaken for.
+        rows = tuple(_per_request_row_entries(part, dim)
+                     for part, dim in ((real_tokens, 1), (row_mask, 2)))
+        for name, part in zip(("real_tokens", "row_mask"), rows):
+            if part is not None and len(part) != requests:
                 raise ValueError(
-                    f"real_tokens and row_mask name which rows of ONE sequence carry a "
-                    f"token, and this call carries {requests} requests. The loop below "
-                    f"serves one request at a time and passes neither operand on, so "
-                    f"the mask this caller asked for would be dropped without a word. "
-                    f"Pass one operand pair per request, or pass neither"
+                    f"{name} arrives beside the states, one entry per request, and this "
+                    f"call carries {requests} request(s) against {len(part)} {name} "
+                    f"entry(ies); one request's padding is not another's"
                 )
+        reals = rows[0] if rows[0] is not None else (None,) * requests
+        masks = rows[1] if rows[1] is not None else (None,) * requests
+        if requests > 1:
             return torch.cat(
                 [
                     self.forward(
@@ -4294,12 +4326,17 @@ class Glm5NextKDAAttention(nn.Module):
                         is_prefill=is_prefill,
                         start_position=position,
                         chunk_size=chunk_size,
+                        real_tokens=real,
+                        row_mask=mask,
                     )
-                    for index, (conv, recurrent, position) in enumerate(zip(*states))
+                    for index, (conv, recurrent, position, real, mask) in enumerate(
+                        zip(*states, reals, masks)
+                    )
                 ],
                 dim=0,
             )
         conv_state, recurrent_state, start_position = (part[0] for part in states)
+        real_tokens, row_mask = reals[0], masks[0]
         tokens = int(hidden_states.shape[0])
         heads = int(self.num_kv_heads_per_rank)
         kdim = int(self.head_dim)
