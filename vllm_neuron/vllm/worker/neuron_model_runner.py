@@ -5972,13 +5972,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
         ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
-        three parallelism arguments (``model_fp8.py:8294-8304``), so the generic
+        three parallelism arguments (``model_fp8.py:9877-9888``), so the generic
         mapping's ``positions``, ``sampling_params``, ``spec_decode_metadata``,
         ``rank``, ``logit_mask`` and ``rotary_position_ids`` have no parameter to
         land on -- they belong to features this campaign has not ported. The batch
         geometry is READ out of ``attn_metadata`` before it is dropped, and a key
         this function needs and cannot find refuses by name with what the site did
         hand it.
+
+        THE THREE PARALLELISM ARGUMENTS ARE SUPPLIED HERE, ON EVERY CALL. The root
+        defaults ``moe_group``, ``tp_degree`` and ``expert_parallel_rank`` to the
+        unsharded values and leaves the served values to its caller
+        (``model_fp8.py:7936-7939``); a translation that omitted them made every
+        rank of an expert-parallel serve run expert group 0. They come from
+        ``_glm5next_parallel_kwargs`` below, which reads the parallel state the
+        worker initialised, and they are passed explicitly at degree 1 too.
 
         EVERY GEOMETRY NUMBER COMES FROM THE HOST, AND A DEVICE TENSOR IS REFUSED.
         The cached length and the block-table row are read from the entry's
@@ -6433,7 +6441,44 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "input_ids": kwargs["input_ids"],
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
+            **self._glm5next_parallel_kwargs(),
         }
+
+    def _glm5next_parallel_kwargs(self) -> dict:
+        """The root's three parallelism arguments, read from the parallel state on every call.
+
+        The root's forward leaves ``moe_group``, ``tp_degree`` and ``expert_parallel_rank``
+        to its caller and defaults them to the unsharded values (``model_fp8.py:9885-9888``,
+        ``:7936-7939``): the rank selects which expert slice this rank's bank holds
+        (``:2072``), and the degree with the group name the ranks that shard each expert's
+        intermediate width (``moe_blockwise.py:46-68``). Below expert-parallel degree 2 the
+        defaults are handed over EXPLICITLY, so every site passes the same six keys and a
+        missing key cannot pass for degree 1. The state module is read through its
+        attributes, the way ``factory._resolve_ep_degree`` reads it, so a test can stand in
+        for a collective it cannot initialise. The first resolve on a runner logs ONE row --
+        ``glm5next parallel arguments rank= ep_rank= ep_degree= tp_degree=`` -- so a serve's log
+        carries one row per rank naming the expert group that rank read.
+        """
+        from vllm_neuron.parallel import neuron_parallel_state as parallel_state
+
+        ep_degree = int(parallel_state.get_neuron_ep_degree())
+        if ep_degree < 2:
+            supplied = {"moe_group": None, "tp_degree": 1, "expert_parallel_rank": 0}
+        else:
+            moe_group = parallel_state.get_neuron_ep_tp_group()
+            supplied = {
+                "moe_group": moe_group,
+                "tp_degree": int(moe_group.world_size),
+                "expert_parallel_rank": int(parallel_state.get_neuron_ep_rank()),
+            }
+        if not getattr(self, "_glm5next_parallel_reported", False):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.info(
+                "glm5next parallel arguments rank=%d ep_rank=%d ep_degree=%d tp_degree=%d",
+                rank, supplied["expert_parallel_rank"], ep_degree, supplied["tp_degree"],
+            )
+            self._glm5next_parallel_reported = True
+        return supplied
 
     def _glm5next_position_arm(
         self, slot: int, start_position: int, *, side_caches, is_prefill: bool

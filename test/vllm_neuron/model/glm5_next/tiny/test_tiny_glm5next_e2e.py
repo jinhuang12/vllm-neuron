@@ -1102,7 +1102,8 @@ def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
         runner, input_ids=prompt, cached=0, sampling_row=item.STACK_TOKENS - 1
     )
     assert sorted(converted) == [
-        "input_ids", "layer_carriers", "sampling_positions"
+        "expert_parallel_rank", "input_ids", "layer_carriers", "moe_group",
+        "sampling_positions", "tp_degree",
     ], f"the converter handed the model {sorted(converted)}"
     assert "slot_mapping" in converted["layer_carriers"][0], (
         "the prompt step built a decode carrier; the prefill leg is the one that carries "

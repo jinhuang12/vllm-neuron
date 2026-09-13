@@ -37,10 +37,14 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as 
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
-#: The three keyword arguments the root's forward declares for a threaded step, which are
-#: the only ones the translation may hand it. Sorted, because the assertions compare sets
-#: of keys and a key that appeared or vanished must redden rather than reorder.
-CARRIER_KWARG_KEYS = ["input_ids", "layer_carriers", "sampling_positions"]
+#: The six keyword arguments the translation hands the root for a threaded step -- the
+#: three carriers and the three parallelism arguments -- and the only ones it may hand it.
+#: Sorted, because the assertions compare sets of keys and a key that appeared or vanished
+#: must redden rather than reorder.
+CARRIER_KWARG_KEYS = [
+    "expert_parallel_rank", "input_ids", "layer_carriers", "moe_group",
+    "sampling_positions", "tp_degree",
+]
 
 #: The prefill bucket the capture drives: the fixture's own stack length, so the block run
 #: the translation slices is the run the landed prefill items already measure.

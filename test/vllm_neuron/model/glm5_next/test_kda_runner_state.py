@@ -293,9 +293,12 @@ def _carriers(runner, banks, *, tokens: int, cached: int) -> list[dict]:
     }
     converted = runner._glm5next_model_kwargs(generic)
     assert sorted(converted) == [
+        "expert_parallel_rank",
         "input_ids",
         "layer_carriers",
+        "moe_group",
         "sampling_positions",
+        "tp_degree",
     ], f"the converter returned {sorted(converted)}"
     carriers = converted["layer_carriers"]
     assert len(carriers) == len(banks), (
