@@ -241,10 +241,12 @@ def _open_ring_at(runner, banks, position: int) -> None:
 
     A prefill at position 0 opens the ring inside the converter. A step that continues a
     sequence is refused unless the ring already stands at its position, so an item at a
-    non-zero position hands the runner the same two attributes the previous step would
-    have left. RE-PINNED: the ring is one position PER REQUEST SLOT, and a step this
-    shell drives carries no request id, so it is served from slot 0 and that is the slot
-    the position is recorded at. The original reading, verbatim:
+    non-zero position hands the runner every record the previous step would have left.
+    RE-PINNED: the ring is one position PER REQUEST SLOT and this shell names one request,
+    so the records are THREE and the slot the request owns is one of them. Handing the
+    position alone is not enough: a request absent from the table is a new one, and
+    claiming a slot empties whatever position that slot stood at, which would take this
+    ring back down before the step reads it. The original reading, verbatim:
     ``runner._glm5next_side_cache_cursor = int(position)``.
     """
     runner._glm5next_side_cache_set = NeuronModelRunner._glm5next_side_caches(
@@ -254,6 +256,7 @@ def _open_ring_at(runner, banks, position: int) -> None:
         max_seq_len=MAX_MODEL_LEN,
         request_slots=DECLARED_MAX_NUM_SEQS,
     )
+    runner._glm5next_request_slot_table = {DECLARED_REQUEST: SYNTHETIC_SLOT}
     runner._glm5next_side_cache_positions = {SYNTHETIC_SLOT: int(position)}
 
 
