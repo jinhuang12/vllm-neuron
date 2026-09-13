@@ -1,12 +1,13 @@
 """A new sequence gets a FRESH ring, and the ring it replaces is never written in place.
 
 WHAT THIS FILE MEASURES. The converter opens a sequence by discarding the decode ring's rows.
-It used to empty them with an eager `zero_()`, which the runtime refuses on a device-resident
-buffer -- "Can't call ReserveSpace on shared storage" -- inside the input builder, before any
-forward runs. The ring is now REPLACED by a fresh allocation of the same shape, dtype and
-device, and the carriers built after that loop bind the new buffer. This file reads the two
-properties that distinguishes a replacement from a clear: the entry's object changes, and the
-buffer it replaced keeps its own bytes.
+It used to empty them with an eager `zero_()`, and that call was refused on the device --
+"Can't call ReserveSpace on shared storage" -- inside the input builder, before any forward
+ran. How far that refusal reaches beyond this call on this buffer is not measured here. The
+ring is now REPLACED by a fresh allocation of the same shape, dtype and device, and the
+carriers built after that loop bind the new buffer. This file reads the two properties that
+distinguish a replacement from a clear: the entry's object changes, and the buffer it replaced
+keeps its own bytes.
 
 WHAT IT DOES NOT MEASURE, stated so the gap is not read as coverage. That the new ring is
 EMPTY, and that a decode step keeps the ring it was handed: item 10 of
@@ -88,5 +89,5 @@ def test_a_fresh_sequence_replaces_the_ring_and_never_writes_the_old_one():
     )
     assert untouched == len(rings), (
         f"{len(rings) - untouched} replaced buffer(s) lost their own bytes; something wrote "
-        f"the old ring in place, which is the write the runtime refuses on a device"
+        f"the old ring in place, which is the write that was refused on the device"
     )
