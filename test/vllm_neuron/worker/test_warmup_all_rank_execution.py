@@ -21,12 +21,14 @@ Six items, ONE test each, no ``parametrize``:
 * T04 -- the prefill warmup call does call it, which is what makes T03's zero a reading.
 * T05 -- prefill warmup drives the all-rank runner and not the wave runner.
 * T06 -- decode warmup does the same.
+* T07 -- every rank logs its resident size on both sides of the executing call.
 
 T01 and T02 are one measurement in two arms and both print the ranks that finished, so
 the transcript carries the numbers rather than only a verdict. Run pytest with ``-s``.
 The collective in T02 is given a timeout, because an unbounded wait is the defect itself.
 """
 
+import re
 import threading
 import types
 
@@ -116,6 +118,21 @@ def _run_group(monkeypatch, runner):
         thread.join(timeout=EXCHANGE_TIMEOUT + COLLECTIVE_TIMEOUT)
     assert not [thread for thread in threads if thread.is_alive()]
     return sorted(finished), errors
+
+
+class _Rows:
+    """A logger that keeps every row it renders, so a test can read what a rank wrote."""
+
+    def __init__(self) -> None:
+        self.rows: list[str] = []
+        self._lock = threading.Lock()
+
+    def info(self, message, *args) -> None:
+        with self._lock:
+            self.rows.append(message % args if args else message)
+
+    def debug(self, *args, **kwargs) -> None:
+        pass
 
 
 def _capture_stub(model_calls, capture_calls):
@@ -215,3 +232,27 @@ def test_decode_warmup_drives_the_all_rank_runner(monkeypatch):
     worker = types.SimpleNamespace(_decode_compile_targets=lambda: [(1, 2048)])
     NeuronWorker._warmup_decode(worker)
     assert drivers == [("all_ranks", "decode")]
+
+
+def test_each_rank_logs_its_resident_size_on_both_sides_of_the_call(monkeypatch):
+    rows = _Rows()
+    monkeypatch.setattr(neuron_worker, "logger", rows)
+    finished, errors = _run_group(monkeypatch, run_warmup_on_all_ranks)
+    assert finished == list(range(WORLD))
+    assert errors == {}
+    by_rank: dict[int, list[str]] = {}
+    for row in rows.rows:
+        rank = re.search(r"rank=(\d+)", row)
+        if rank and row.startswith(("warmup_execution_entered|", "warmup_execution_left|")):
+            by_rank.setdefault(int(rank.group(1)), []).append(row)
+    written = [row for rank_rows in by_rank.values() for row in rank_rows]
+    print(f"warmup_rss_rows|ranks={len(by_rank)}|rows={len(written)}")
+    print(f"warmup_rss_sample|{by_rank[0][0]}")
+    assert sorted(by_rank) == list(range(WORLD))
+    assert all(
+        [row.split("|")[0] for row in rank_rows]
+        == ["warmup_execution_entered", "warmup_execution_left"]
+        for rank_rows in by_rank.values()
+    )
+    assert all("rss_kib=" in row for row in written)
+    assert [row for row in written if '"' in row or "'" in row] == []

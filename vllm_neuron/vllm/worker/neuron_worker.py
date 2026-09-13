@@ -389,6 +389,18 @@ def run_warmup_in_waves(phase: str, bucket: str, work) -> None:
         _exchange_warmup_status(phase, bucket, f"wave={index}/{len(waves)}", failure)
 
 
+def _rss_kib() -> int:
+    """Read this process's resident size in KiB, or zero where /proc is not readable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        return 0
+    return 0
+
+
 def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
     """Run ``work`` on every rank of the TP group at once, then exchange status.
 
@@ -398,21 +410,30 @@ def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
     """
     rank = get_tp_group().rank_in_group
     tp_barrier()
-    logger.info("warmup %s bucket=%s all ranks rank=%s start", phase, bucket, rank)
+    # One row per rank on each side of the call. The compiled graph is loaded INSIDE this call,
+    # so a sampler watching the process from outside cannot say whether the resident size grew
+    # in the load or in the execution; a reading on each side of the call can.
+    logger.info(
+        "warmup_execution_entered|phase=%s|bucket=%s|rank=%s|rss_kib=%s",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+    )
     started = time.perf_counter()
     failure = None
     try:
         work()
     except Exception as exc:  # the group is told before this rank re-raises
         failure = exc
-    else:
-        logger.info(
-            "warmup %s bucket=%s all ranks rank=%s done elapsed=%.1fs",
-            phase,
-            bucket,
-            rank,
-            time.perf_counter() - started,
-        )
+    logger.info(
+        "warmup_execution_left|phase=%s|bucket=%s|rank=%s|rss_kib=%s|elapsed_s=%.1f",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+        time.perf_counter() - started,
+    )
     _exchange_warmup_status(phase, bucket, "all ranks", failure)
 
 
