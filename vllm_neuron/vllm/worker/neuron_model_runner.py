@@ -5552,6 +5552,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         requests: int = 1,
         request_starts=None,
         real_tokens: int | None = None,
+        request_real_tokens=None,
     ) -> list[dict]:
         """One mapping per layer, in stack order, each holding THAT layer's own state.
 
@@ -5570,15 +5571,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         Which leg is running is the caller's reading of the batch, passed in
         rather than guessed here.
 
-        THE LINEAR FAMILY'S THREE PER-REQUEST VALUES ARRIVE ONE PER REQUEST, in the
+        THE LINEAR FAMILY'S FIVE PER-REQUEST VALUES ARRIVE ONE PER REQUEST, in the
         batch's order, in the two forms those values allow. The two state carriers are
         TUPLES OF VIEWS, because two requests' states are two rows of one bank and
         stacking them would copy -- and a copy would leave the bank holding the state of
         a step that already ran, since the recurrence advances in place. The positions
         are ONE int32 TENSOR with a row per request, because a python int at this
-        boundary is baked into the graph it was captured with. The key NAMES are
-        unchanged, and both forms are used at ONE request too, so the concurrent shape
-        and the pinned one-sequence shape share one derivation.
+        boundary is baked into the graph it was captured with, and the two row operands
+        are ONE TENSOR EACH on a leading request axis, for that same reason and because
+        nothing about a mask built for this step forbids the copy a stack makes. The key
+        NAMES are unchanged, and every form is used at ONE request too, so the concurrent
+        shape and the pinned one-sequence shape share one derivation.
 
         BOTH FAMILIES READ THE POSITION FROM ONE VARIABLE. The linear family
         needs it for the same reason the sparse one does: a prompt longer than one
@@ -5619,11 +5622,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         while the SEQUENCE reaches only the real length. The slots the request holds,
         the position the chunk ends at and the pools it completes are therefore read
         from ``real_tokens``; ``None`` says the whole chunk is real, which is what a
-        warmup or capture caller hands. THE RECURRENT LAYERS ARE HANDED THAT SAME
-        NUMBER, as a tensor beside a row mask, because their scan is over the rows
+        warmup or capture caller hands. THE RECURRENT LAYERS ARE HANDED EACH REQUEST'S
+        OWN LENGTH, as a tensor beside a row mask, because their scan is over the rows
         themselves: an unmasked padding row would decay the state and update it with
         a row that carries no token, and the state is what the next step continues
-        from. The sparse layers need no mask -- their window is the slots
+        from. ``request_real_tokens`` carries the batch's own reading of those lengths, one
+        entry per request, the way ``request_starts`` carries the positions; absent, they
+        are derived from the leg. The sparse layers read the singular
+        one, which is the FIRST request's: that family serves one sequence per forward and
+        refuses a second by name below, so the scalar cannot reach a request it does not
+        describe. The sparse layers need no mask -- their window is the slots
         ``real_tokens`` already sizes.
         """
         if len(banks) != len(side_caches) or len(banks) != len(geometries):
@@ -5673,6 +5681,47 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"{len(starts)} cached length(s); the count and the per-request "
                 f"positions come from one batch and must agree"
             )
+        # EACH REQUEST'S OWN REAL LENGTH, AND ITS OWN OPERAND WIDTH. A pair built from the
+        # first request's length hands every other request the first one's padding, which
+        # is a scan over rows that carry no token of its own sequence.
+        #
+        # THE OPERAND WIDTH IS THE ROWS ONE REQUEST BRINGS, and it is derived rather than
+        # assumed. One request brings the whole padded step. Several bring one row each,
+        # because the recurrent layer refuses a decode step carrying more tokens than it
+        # has requests. And a PREFILL of several requests brings no per-request width at
+        # all: its rows carry several requests' tokens packed together and the carrier says
+        # nothing about where one request's end, which is why that layer refuses such a call
+        # by name. So the operands stay the batch's there, exactly as they were, and the
+        # refusal keeps reading the whole call instead of a width invented here.
+        #
+        # ``request_real_tokens`` IS THE BATCH'S OWN READING of the lengths, taken from the
+        # block tables rather than from this derivation, so the two are sourced
+        # independently -- the same reason each bank's paging is checked against its
+        # group's -- and the bound below is where they meet.
+        if bool(is_prefill) and len(starts) > 1:
+            reals = [real]
+            request_width = int(tokens)
+        else:
+            request_width = int(tokens) if len(starts) == 1 else 1
+            if request_real_tokens is not None:
+                reals = [int(value) for value in request_real_tokens]
+            elif len(starts) == 1:
+                reals = [real]
+            else:
+                reals = [1] * len(starts)
+            if len(reals) != len(starts):
+                raise ValueError(
+                    f"this step carries {len(starts)} request(s) and hands {len(reals)} "
+                    f"real token count(s); the positions and the per-request lengths come "
+                    f"from one batch and must describe the same requests"
+                )
+        for index, one_real in enumerate(reals):
+            if one_real <= 0 or one_real > request_width:
+                raise ValueError(
+                    f"request {index} of this step was handed {one_real} real token(s) "
+                    f"against operands {request_width} row(s) wide; a request holds at "
+                    f"least one token and never more than the width it was padded into"
+                )
         carriers: list[dict] = []
         for bank, side, geometry in zip(banks, side_caches, geometries):
             state_slots = [
@@ -5696,9 +5745,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             f"slot(s) and this request was given slot "
                             f"{int(one_slot)}"
                         )
-                real_length, row_mask = cls._glm5next_real_row_extent(
-                    int(tokens), real, bank["recurrent_state"].device
-                )
+                # ONE PAIR PER REQUEST, STACKED ON A LEADING REQUEST AXIS -- ``[requests,
+                # 1]`` and ``[requests, width, 1]``. The layer splits them beside the
+                # states and each entry it takes out has the one-sequence shape, so one
+                # request's stack of one is the pinned shape and no second form exists.
+                extents = [
+                    cls._glm5next_real_row_extent(
+                        request_width, one_real, bank["recurrent_state"].device
+                    )
+                    for one_real in reals
+                ]
                 # ONE ENTRY PER REQUEST, UNDER THE LANDED KEY NAMES. The states of two
                 # requests are two rows of one bank, so they cannot be one tensor; the
                 # layer takes the tuple and serves the requests one at a time. VIEWS,
@@ -5722,8 +5778,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "start_position": cls._glm5next_start_positions(
                             starts, bank["recurrent_state"].device
                         ),
-                        "real_tokens": real_length,
-                        "row_mask": row_mask,
+                        "real_tokens": torch.stack([part[0] for part in extents]),
+                        "row_mask": torch.stack([part[1] for part in extents]),
                     }
                 )
                 continue
@@ -6338,6 +6394,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # and its pool mask must stop where the sequence stops rather than where the
             # bucket does.
             real_tokens=request_tokens[0],
+            # AND EVERY REQUEST'S OWN LENGTH, which is the recurrent family's: its mask is
+            # per row, so a second request handed the first one's padding would scan rows
+            # that carry no token of its own sequence into its own state.
+            request_real_tokens=request_tokens,
         )
         # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
         # several shapes of its own -- a multi-token decode, a bank whose paging
