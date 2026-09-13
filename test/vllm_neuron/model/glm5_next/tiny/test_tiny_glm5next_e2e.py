@@ -123,6 +123,15 @@ E2E_STATE_SLOTS = 8
 #: different here: one sequence runs through this file, and the banks hold eight slots.
 E2E_MAX_NUM_SEQS = 1
 
+#: The bound ITEM 10 ALONE runs at, and it is its own because of what that item reads: the
+#: clearing's SCOPE, one request's ring row emptied while a row it does not own keeps what was
+#: planted in it. At the one-sequence bound above there is no row it does not own, so the item's
+#: own control refuses it as vacuous on every run -- a conjunct that cannot be read is not a
+#: conjunct. Two is the smallest bound that carries the reading, and the banks hold eight slots,
+#: so nothing else about the stack moves. Every other item keeps the bound above, which is why
+#: this value is declared here beside it instead of replacing it.
+E2E_SCOPE_MAX_NUM_SEQS = 2
+
 
 def _fixture(**overrides):
     """`-054a`'s root fixture, with the ONE dial the registered constraint set names.
@@ -1428,6 +1437,12 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     come back UNCLEARED. A converter that zeroed the ring on every call would satisfy the first
     conjunct and fail this one, so the item cannot pass by clearing too much.
 
+    THIS ITEM RUNS AT ITS OWN BOUND, and it is the only one in this file that does. The scope
+    conjunct reads a ring row this request does NOT own, so the modelled engine has to admit two
+    sequences for such a row to exist; at the file's one-sequence bound the item's own control
+    refused it as vacuous every run, which is a conjunct going unread rather than a conjunct
+    passing. The other items keep the one-sequence bound and every reading they always made.
+
     WHAT ITEM 11 MEASURES INSTEAD, and this item deliberately does not: the prefill's own
     remainder. The rows past the last complete pool exist only inside the model's prefill
     branch (`:5486-5500`), which now seeds them into the ring the converter binds with
@@ -1449,7 +1464,12 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     runner.input_batch = SimpleNamespace(req_ids=["req-0"])
     runner.model = root
     runner.max_model_len = E2E_MAX_SEQ_LEN
-    runner.max_num_reqs = E2E_MAX_NUM_SEQS
+    # RE-PINNED. ORIGINAL READING, VERBATIM: `runner.max_num_reqs = E2E_MAX_NUM_SEQS`. NEW
+    # VALUE: this item's own two-slot bound, on the lead's ruling. The scope conjunct below
+    # reads a row this request does not own, and at the file's one-sequence bound there is no
+    # such row, so its control refused the item as vacuous on every run. Nothing else here
+    # moves: the banks already hold eight slots and one request still runs through the item.
+    runner.max_num_reqs = E2E_SCOPE_MAX_NUM_SEQS
 
     live = runner._glm5next_live_side_caches(banks)
     again = runner._glm5next_live_side_caches(banks)
@@ -1514,8 +1534,9 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
     ]
     if not others:
         raise item.VacuousControlError(
-            "this fixture allocates one state slot, so there is no other request's "
-            "row to check the clearing's scope against"
+            f"this item runs at a bound of {E2E_SCOPE_MAX_NUM_SEQS} sequence(s) so that a row "
+            f"this request does not own exists to read the clearing's scope against, and the "
+            f"ring it was handed carries {int(rings[0]['tail'].shape[0])} row(s)"
         )
     untouched = min(others)
     print(f"TINYE2E|fresh_prefill|slot={own}|ring_max={cleared}|planted_pool_row_min={stale}"
