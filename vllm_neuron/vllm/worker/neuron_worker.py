@@ -317,72 +317,66 @@ class _SuppressModelRegistryOverwrite(logging.Filter):
         return not self._PATTERN.search(record.getMessage())
 
 
-def warmup_rank_waves(world_size: int, wave: int) -> list[list[int]]:
-    """Partition TP ranks into warmup waves: rank 0 alone, then waves of ``wave``."""
-    if world_size < 1:
-        raise ValueError(f"world_size must be at least 1, got {world_size}")
-    if wave < 1:
-        raise ValueError(f"wave must be at least 1, got {wave}")
-    followers = list(range(1, world_size))
-    return [[0]] + [
-        followers[start : start + wave] for start in range(0, len(followers), wave)
-    ]
-
-
-def run_warmup_in_waves(phase: str, bucket: str, work) -> None:
-    """Run ``work`` on this rank in its warmup wave, exchanging status after every wave.
-
-    The wave size bounds how many ranks compile at once, and what it protects is ONE HOST's
-    memory. The ranks come from the TP group, so the bound holds while that group is the set
-    of workers sharing a host: with several replicas on one host the size has to be divided by
-    their number, and with a TP group spread over nodes each host runs fewer than the size.
-    """
-    tp_group = get_tp_group()
-    waves = warmup_rank_waves(tp_group.world_size, envs.VLLM_NEURON_WARMUP_WAVE_SIZE)
-    rank = tp_group.rank_in_group
-    if rank == 0:
-        logger.info(
-            "warmup waves: %s waves, sizes %s",
-            len(waves),
-            [len(ranks) for ranks in waves],
+def _exchange_warmup_status(phase: str, bucket: str, where: str, failure) -> None:
+    """Sum the failed-rank count across the TP group, then raise if any rank failed."""
+    # The exchange IS the barrier, and it carries how many ranks failed. A bare barrier would
+    # leave every other rank waiting out the barrier timeout for a rank that had already raised,
+    # and a real fault would be recorded as a timeout.
+    failed_total = tp_sum_int(1 if failure is not None else 0)
+    if failure is not None:
+        raise failure
+    if failed_total:
+        raise RuntimeError(
+            f"warmup {phase} bucket={bucket} {where}: {failed_total} rank(s) failed"
         )
-    for index, ranks in enumerate(waves, 1):
-        failure = None
-        if rank in ranks:
-            logger.info(
-                "warmup %s bucket=%s wave=%s/%s rank=%s start",
-                phase,
-                bucket,
-                index,
-                len(waves),
-                rank,
-            )
-            started = time.perf_counter()
-            try:
-                work()
-            except Exception as exc:  # the group is told before this rank re-raises
-                failure = exc
-            else:
-                logger.info(
-                    "warmup %s bucket=%s wave=%s/%s rank=%s done elapsed=%.1fs",
-                    phase,
-                    bucket,
-                    index,
-                    len(waves),
-                    rank,
-                    time.perf_counter() - started,
-                )
-        # The exchange IS this wave's barrier, and it carries how many ranks failed. A bare
-        # barrier would leave every other rank waiting out the barrier timeout for a rank that
-        # had already raised, and a real fault would be recorded as a timeout.
-        failed_total = tp_sum_int(1 if failure is not None else 0)
-        if failure is not None:
-            raise failure
-        if failed_total:
-            raise RuntimeError(
-                f"warmup {phase} bucket={bucket} wave={index}/{len(waves)}: "
-                f"{failed_total} rank(s) failed"
-            )
+
+
+def _rss_kib() -> int:
+    """Read this process's resident size in KiB, or zero where /proc is not readable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        return 0
+    return 0
+
+
+def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
+    """Run ``work`` on every rank of the TP group at once, then exchange status.
+
+    A warmup call executes the model, and the model's forward carries collectives over the
+    whole TP group, so a subset of the ranks cannot run it: the ranks left out would wait in
+    the status exchange while the ranks inside waited for them in the collective.
+    """
+    rank = get_tp_group().rank_in_group
+    tp_barrier()
+    # One row per rank on each side of the call. The compiled graph is loaded INSIDE this call,
+    # so a sampler watching the process from outside cannot say whether the resident size grew
+    # in the load or in the execution; a reading on each side of the call can.
+    logger.info(
+        "warmup_execution_entered|phase=%s|bucket=%s|rank=%s|rss_kib=%s",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+    )
+    started = time.perf_counter()
+    failure = None
+    try:
+        work()
+    except Exception as exc:  # the group is told before this rank re-raises
+        failure = exc
+    logger.info(
+        "warmup_execution_left|phase=%s|bucket=%s|rank=%s|rss_kib=%s|elapsed_s=%.1f",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+        time.perf_counter() - started,
+    )
+    _exchange_warmup_status(phase, bucket, "all ranks", failure)
 
 
 class NeuronWorker(WorkerBase):
@@ -1805,7 +1799,7 @@ class NeuronWorker(WorkerBase):
                     kv_seg_size,
                 )
                 try:
-                    run_warmup_in_waves(
+                    run_warmup_on_all_ranks(
                         "prefill",
                         f"{bucket_size}/kv{kv_seg_size}",
                         lambda: self.model_runner.warmup_prefill(
@@ -1949,7 +1943,7 @@ class NeuronWorker(WorkerBase):
                 ctx_bucket,
             )
             try:
-                run_warmup_in_waves(
+                run_warmup_on_all_ranks(
                     "decode",
                     f"b{batch_size}/s{ctx_bucket}",
                     lambda: self.model_runner.warmup_decode(
