@@ -5986,7 +5986,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         (``model_fp8.py:7936-7939``); a translation that omitted them made every
         rank of an expert-parallel serve run expert group 0. They come from
         ``_glm5next_parallel_kwargs`` below, which reads the parallel state the
-        worker initialised, and they are passed explicitly at degree 1 too.
+        worker initialised, and they are passed explicitly at degree 1 too. The rank
+        travels as an int64 device tensor built on ``input_ids``'s device, so the
+        captured graph reads it as an input and one graph serves every expert group.
 
         EVERY GEOMETRY NUMBER COMES FROM THE HOST, AND A DEVICE TENSOR IS REFUSED.
         The cached length and the block-table row are read from the entry's
@@ -6441,10 +6443,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "input_ids": kwargs["input_ids"],
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
-            **self._glm5next_parallel_kwargs(),
+            **self._glm5next_parallel_kwargs(device=input_ids.device),
         }
 
-    def _glm5next_parallel_kwargs(self) -> dict:
+    def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
         """The root's three parallelism arguments, read from the parallel state on every call.
 
         The root's forward leaves ``moe_group``, ``tp_degree`` and ``expert_parallel_rank``
@@ -6453,7 +6455,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         (``:2072``), and the degree with the group name the ranks that shard each expert's
         intermediate width (``moe_blockwise.py:46-68``). Below expert-parallel degree 2 the
         defaults are handed over EXPLICITLY, so every site passes the same six keys and a
-        missing key cannot pass for degree 1. The state module is read through its
+        missing key cannot pass for degree 1.
+
+        THE RANK IS HANDED OVER AS A TENSOR: int64, shape ``[1]``, on ``device`` -- the
+        batch's device, ``meta`` under a CPU capture -- built here, outside the trace, so
+        it is an input of the captured graph and the expert group is not a constant of it.
+        The bank adds it to an ``arange`` from zero (``model_fp8.py:2067-2100``), so one
+        graph serves every rank; the mapping's own ``rank`` tensor
+        (``moe_blockwise.py:66-69``) is the precedent. A python int at the bank would bake
+        the group into the trace and compile one graph per expert group. The log row below
+        keeps the host int. The state module is read through its
         attributes, the way ``factory._resolve_ep_degree`` reads it, so a test can stand in
         for a collective it cannot initialise. The first resolve on a runner logs ONE row --
         ``glm5next parallel arguments rank= ep_rank= ep_degree= tp_degree=`` -- so a serve's log
@@ -6463,22 +6474,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         ep_degree = int(parallel_state.get_neuron_ep_degree())
         if ep_degree < 2:
-            supplied = {"moe_group": None, "tp_degree": 1, "expert_parallel_rank": 0}
+            moe_group, tp_degree, ep_rank = None, 1, 0
         else:
             moe_group = parallel_state.get_neuron_ep_tp_group()
-            supplied = {
-                "moe_group": moe_group,
-                "tp_degree": int(moe_group.world_size),
-                "expert_parallel_rank": int(parallel_state.get_neuron_ep_rank()),
-            }
+            tp_degree = int(moe_group.world_size)
+            ep_rank = int(parallel_state.get_neuron_ep_rank())
         if not getattr(self, "_glm5next_parallel_reported", False):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             logger.info(
                 "glm5next parallel arguments rank=%d ep_rank=%d ep_degree=%d tp_degree=%d",
-                rank, supplied["expert_parallel_rank"], ep_degree, supplied["tp_degree"],
+                rank, ep_rank, ep_degree, tp_degree,
             )
             self._glm5next_parallel_reported = True
-        return supplied
+        return {
+            "moe_group": moe_group,
+            "tp_degree": tp_degree,
+            "expert_parallel_rank": torch.full((1,), ep_rank, dtype=torch.int64, device=device),
+        }
 
     def _glm5next_position_arm(
         self, slot: int, start_position: int, *, side_caches, is_prefill: bool

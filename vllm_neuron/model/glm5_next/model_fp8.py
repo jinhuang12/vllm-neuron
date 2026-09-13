@@ -1922,7 +1922,7 @@ class Glm5NextRoutedExperts(nn.Module):
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
-        expert_parallel_rank: int = 0,
+        expert_parallel_rank: int | torch.Tensor = 0,
     ) -> torch.Tensor:
         """Run this rank's routed experts through the block-quant NKI kernel.
 
@@ -1940,8 +1940,11 @@ class Glm5NextRoutedExperts(nn.Module):
                 documented as ``[T, E_local]`` and the extent check enforced
                 that, which no caller could satisfy from ``route_tokens`` at any
                 expert-parallel degree above 1 -- finding ``B21-027``.
-            expert_parallel_rank: which rank's expert slice to select, read
-                through :meth:`local_expert_indices`. It is an argument rather
+            expert_parallel_rank: which rank's expert slice to select. An int64
+                device tensor of shape ``[1]``, which is what the runner hands
+                over, makes the slice an INPUT of the captured graph, so every
+                rank shares one graph; a python int keeps it a constant of the
+                trace, and either form is selected by name. It is an argument rather
                 than an attribute because ``__init__`` is ``inc-glm53f-031``'s
                 landed code and this section edits no line above itself. The
                 default 0 is the only rank that exists at degree 1.
@@ -2065,16 +2068,34 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"got shape {tuple(expert_affinities.shape)}"
             )
         if routed != num_experts:
-            # A tensor built from python data stays REAL while the rest of the trace is
-            # fake, and graph extraction refuses that mix. The partition hands back a
-            # contiguous ascending run (``factory.py:139``), so an ``arange`` over it
-            # gives the same indices without building from data.
-            owned = self.local_expert_indices(int(expert_parallel_rank))
-            local_indices = torch.arange(
-                owned[0],
-                owned[0] + len(owned),
-                dtype=torch.int64,
-                device=expert_affinities.device,
+            # The rank arrives as a device tensor, so the slice it selects is an
+            # input of the captured graph and every rank shares one graph; a python
+            # int would bake the group into the trace, one graph per rank. The
+            # partition is uniform and contiguous (``factory.py:139``), so the first
+            # expert this rank owns is ``rank * E_local``, and an ``arange`` from
+            # zero builds the run without a tensor made from python data, which
+            # graph extraction refuses beside fake ones.
+            if num_experts != int(self.num_local_experts):
+                raise Glm5NextBlockQuantRouteError(
+                    f"the prepared weights hold {num_experts} experts and the "
+                    f"partition assigns {int(self.num_local_experts)} per rank; "
+                    f"the rank offset is right only when the two agree"
+                )
+            if isinstance(expert_parallel_rank, int) and not (
+                0 <= expert_parallel_rank < int(self.ep_degree)
+            ):
+                raise Glm5NextBlockQuantRouteError(
+                    f"expert_parallel_rank={expert_parallel_rank} is outside the "
+                    f"partition's {int(self.ep_degree)} ranks"
+                )
+            local_indices = (
+                torch.arange(
+                    0,
+                    num_experts,
+                    dtype=torch.int64,
+                    device=expert_affinities.device,
+                )
+                + expert_parallel_rank * num_experts
             )
             expert_affinities = get_local_expert_affinities(
                 expert_affinities, local_indices
@@ -2590,7 +2611,7 @@ class Glm5NextRoutedExperts(nn.Module):
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
-        expert_parallel_rank: int = 0,
+        expert_parallel_rank: int | torch.Tensor = 0,
     ) -> torch.Tensor:
         """Run this rank's routed experts over ``[T, H]`` tokens.
 
@@ -2603,7 +2624,8 @@ class Glm5NextRoutedExperts(nn.Module):
             block_size: tokens per block; defaults to ``BLOCK_QUANT_SIZE``.
             moe_group: the MoE ``GroupCoordinator``, unread at ``tp_degree`` 1.
             tp_degree: ranks sharding each expert's intermediate dimension.
-            expert_parallel_rank: which rank's expert slice to select.
+            expert_parallel_rank: which rank's expert slice to select, as an
+                int64 device tensor (one graph for every rank) or a python int.
 
         Returns:
             ``[T, H]`` in the seam's own dtype.
@@ -3534,7 +3556,7 @@ class Glm5NextMoEBlock(nn.Module):
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
-        expert_parallel_rank: int = 0,
+        expert_parallel_rank: int | torch.Tensor = 0,
     ) -> torch.Tensor:
         """One sparse layer's MLP: route, run this rank's experts, add the shared.
 
@@ -3552,7 +3574,8 @@ class Glm5NextMoEBlock(nn.Module):
             block_size: tokens per block, forwarded to the bank unread.
             moe_group: the MoE ``GroupCoordinator``, forwarded unread.
             tp_degree: ranks sharding each expert's intermediate dimension.
-            expert_parallel_rank: which rank's expert slice to select.
+            expert_parallel_rank: which rank's expert slice to select, as an
+                int64 device tensor (one graph for every rank) or a python int.
 
         Returns:
             ``[T, H]`` in the seams' own dtype. The residual dtype is the layer
@@ -7740,7 +7763,7 @@ class Glm5NextModel(nn.Module):
         block_size: int | None,
         moe_group: object | None,
         tp_degree: int,
-        expert_parallel_rank: int,
+        expert_parallel_rank: int | torch.Tensor,
     ) -> torch.Tensor:
         """One layer's feed-forward contribution, WITHOUT its residual add.
 
@@ -7868,7 +7891,7 @@ class Glm5NextModel(nn.Module):
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
-        expert_parallel_rank: int = 0,
+        expert_parallel_rank: int | torch.Tensor = 0,
     ) -> torch.Tensor:
         """The whole decoder stack: embed, expand to streams, every layer in config
         order, collapse, final norm.
@@ -7934,8 +7957,9 @@ class Glm5NextModel(nn.Module):
             block_size: tokens per block, forwarded to the expert bank unread.
             moe_group: the MoE ``GroupCoordinator``, forwarded unread.
             tp_degree: ranks sharding each expert's intermediate dimension.
-            expert_parallel_rank: which rank's expert slice to select. The
-                registered TP=64 consumption form (``tp_degree`` 4,
+            expert_parallel_rank: which rank's expert slice to select, as an
+                int64 device tensor (one graph for every rank) or a python int.
+                The registered TP=64 consumption form (``tp_degree`` 4,
                 ``expert_parallel_rank`` from ``get_neuron_ep_rank()``) is the
                 CALLER's to supply, so no degree is frozen at this site.
 
@@ -9885,7 +9909,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
-        expert_parallel_rank: int = 0,
+        expert_parallel_rank: int | torch.Tensor = 0,
     ) -> torch.Tensor:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -9979,7 +10003,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
             block_size: tokens per block, forwarded to the expert bank unread.
             moe_group: the MoE ``GroupCoordinator``, forwarded unread.
             tp_degree: ranks sharding each expert's intermediate dimension.
-            expert_parallel_rank: which rank's expert slice to select.
+            expert_parallel_rank: which rank's expert slice to select, as an
+                int64 device tensor (one graph for every rank) or a python int.
 
         Returns:
             ``[len(sampling_positions), vocab_size]`` logits, in the dtype the
