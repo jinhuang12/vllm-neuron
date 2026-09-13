@@ -317,6 +317,18 @@ class _SuppressModelRegistryOverwrite(logging.Filter):
         return not self._PATTERN.search(record.getMessage())
 
 
+def warmup_rank_waves(world_size: int, wave: int) -> list[list[int]]:
+    """Partition TP ranks into warmup waves: rank 0 alone, then waves of ``wave``."""
+    if world_size < 1:
+        raise ValueError(f"world_size must be at least 1, got {world_size}")
+    if wave < 1:
+        raise ValueError(f"wave must be at least 1, got {wave}")
+    followers = list(range(1, world_size))
+    return [[0]] + [
+        followers[start : start + wave] for start in range(0, len(followers), wave)
+    ]
+
+
 class NeuronWorker(WorkerBase):
     """
     Worker implementation for AWS Neuron/Trainium hardware.
@@ -1712,6 +1724,42 @@ class NeuronWorker(WorkerBase):
                 bucket,
             )
 
+    def _run_warmup_in_waves(self, phase: str, bucket: str, work) -> None:
+        """Run ``work`` on this rank in its warmup wave, barriering after every wave."""
+        tp_group = get_tp_group()
+        waves = warmup_rank_waves(
+            tp_group.world_size, envs.VLLM_NEURON_WARMUP_WAVE_SIZE
+        )
+        rank = tp_group.rank_in_group
+        if rank == 0:
+            logger.info(
+                "warmup waves: %s waves, sizes %s",
+                len(waves),
+                [len(ranks) for ranks in waves],
+            )
+        for index, ranks in enumerate(waves, 1):
+            if rank in ranks:
+                logger.info(
+                    "warmup %s bucket=%s wave=%s/%s start",
+                    phase,
+                    bucket,
+                    index,
+                    len(waves),
+                )
+                started = time.perf_counter()
+                work()
+                logger.info(
+                    "warmup %s bucket=%s wave=%s/%s done elapsed=%.1fs",
+                    phase,
+                    bucket,
+                    index,
+                    len(waves),
+                    time.perf_counter() - started,
+                )
+            # A rank that raises never reaches its barrier, so the ranks waiting
+            # here leave on the barrier timeout rather than on the failure.
+            tp_barrier()
+
     def _warmup_prefill(self) -> None:
         """Run prefill warmup for all bucket and KV segment size combinations."""
         num_batched_tokens_buckets, effective_kv_buckets = self._prefill_buckets()
@@ -1737,7 +1785,13 @@ class NeuronWorker(WorkerBase):
                     kv_seg_size,
                 )
                 try:
-                    self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
+                    self._run_warmup_in_waves(
+                        "prefill",
+                        f"{bucket_size}/kv{kv_seg_size}",
+                        lambda: self.model_runner.warmup_prefill(
+                            bucket_size, kv_seg_size
+                        ),
+                    )
                     logger.info(
                         "  Successfully warmed up for prefill bucket %s "
                         "with kv_segment_size %s",
@@ -1875,7 +1929,13 @@ class NeuronWorker(WorkerBase):
                 ctx_bucket,
             )
             try:
-                self.model_runner.warmup_decode(batch_size, ctx_bucket=ctx_bucket)
+                self._run_warmup_in_waves(
+                    "decode",
+                    f"b{batch_size}/s{ctx_bucket}",
+                    lambda: self.model_runner.warmup_decode(
+                        batch_size, ctx_bucket=ctx_bucket
+                    ),
+                )
                 logger.info(
                     "  Warmed up decode (batch=%s, seq=%s)",
                     batch_size,

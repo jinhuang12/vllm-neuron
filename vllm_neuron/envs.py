@@ -44,6 +44,12 @@ if TYPE_CHECKING:
     VLLM_NEURON_SKIP_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_PREFILL_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_ENCODER_WARMUP: bool = False
+    # How many ranks run warmup at the same time. Warmup traces and compiles in
+    # each rank's own process, so the peak is one compile times the wave size:
+    # 16 compiles of ~35 GiB over a ~131 GiB resident floor fits the ~1869 GiB
+    # of headroom a 2 TiB host has. At or above the world size the ranks after
+    # rank 0 form a single wave, which is the old all-at-once behaviour.
+    VLLM_NEURON_WARMUP_WAVE_SIZE: int = 16
     # Force the STATIC FP8 (non-MX) attention path on TRN3 even when STATIC_MX
     # kernels are available. Used by FP8 model factories as an escape hatch.
     VLLM_NEURON_FORCE_STATIC_FP8: bool = False
@@ -110,6 +116,13 @@ def maybe_convert_int(value: str | None) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def require_positive_int(name: str, value: int) -> int:
+    """Return ``value`` when it is at least 1, else raise ValueError."""
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, got {value}")
+    return value
 
 
 def maybe_convert_float(value: str | None) -> float | None:
@@ -208,6 +221,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # EPD language-only (PD) pools, which have no vision encoder.
     "VLLM_NEURON_SKIP_ENCODER_WARMUP": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_ENCODER_WARMUP")) or False
+    ),
+    # Ranks warming up at once; see the field for the memory arithmetic.
+    "VLLM_NEURON_WARMUP_WAVE_SIZE": lambda: require_positive_int(
+        "VLLM_NEURON_WARMUP_WAVE_SIZE",
+        maybe_convert_int(os.getenv("VLLM_NEURON_WARMUP_WAVE_SIZE")) or 16,
     ),
     # Skip decode warmup/compilation without requiring kv-transfer-config.
     # Useful for prefill-only profiling workflows.
