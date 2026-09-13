@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Acceptance for the row operands meeting a call that carries several requests.
 
-Five items, no ``parametrize``. The layer serves a concurrent decode by recursing once per
+Six items, no ``parametrize``. The layer serves a concurrent decode by recursing once per
 request, and each request's recursion receives THAT request's own row operands. They
 arrive stacked on a leading request axis, which is one axis more than one sequence's pair
 carries and so is a form no one-sequence operand can be mistaken for; the runner's carrier
@@ -40,7 +40,9 @@ lease::
     after the step while the other's advance, and exchanging the two masks exchanges which
     request stood still;
 6. an operand set naming a different number of requests than the states do is refused, and
-    the message names that count rather than the concurrency.
+    the message names that count rather than the concurrency;
+7. the RUNNER's own carrier builder, at two requests, hands the layer one stacked pair
+    per request -- entry by entry, in the states' order -- and the layer serves it.
 
 Every declared value is CARRIED from the landed KDA layer acceptance, imported rather
 than retyped.
@@ -168,6 +170,80 @@ def _per_request_operands(layer, reals) -> dict:
         name: torch.stack([pair[name] for pair in pairs])
         for name in ("real_tokens", "row_mask")
     }
+
+
+#: The two requests' real lengths for the runner-built carrier. They are EQUAL, and one
+#: row each, because that is the only reading a concurrent decode admits: several requests
+#: bring one row apiece (``neuron_model_runner.py:5707``) and a request's real length is
+#: bounded by that width, so a step where they differed would be refused rather than built.
+DECLARED_TWO_REALS = (1, 1)
+
+#: The two requests' positions. These DIFFER, which is the per-request value a concurrent
+#: decode can differ in, so an axis assembled in another order shows up here.
+DECLARED_TWO_POSITIONS = (
+    DECLARED_CONTINUING_POSITION,
+    DECLARED_CONTINUING_POSITION + 1,
+)
+
+#: The recurrent bank's slot count, wider than the request count so a slot number cannot
+#: pass for a request index, and the slots the two requests hold -- not in slot order.
+DECLARED_STATE_SLOTS = 3
+DECLARED_TWO_SLOTS = (2, 0)
+
+
+def _linear_bank(layer) -> dict:
+    """One recurrent bank, built to the layer's own declared state shapes and filled."""
+    attention = layer.attention
+    bank = {
+        "name": "model.layers.0.attention",
+        "layer_index": 0,
+        "family": "linear_attn",
+        "state_slots": DECLARED_STATE_SLOTS,
+        "conv_state": torch.zeros(
+            (DECLARED_STATE_SLOTS, *attention.kda_conv_state_shape),
+            dtype=attention.kda_conv_state_dtype,
+        ),
+        "recurrent_state": torch.zeros(
+            (DECLARED_STATE_SLOTS, *attention.kda_recurrent_state_shape),
+            dtype=attention.kda_recurrent_state_dtype,
+        ),
+    }
+    for index, one_slot in enumerate(DECLARED_TWO_SLOTS):
+        bank["conv_state"][one_slot].fill_(float(index + 1))
+        bank["recurrent_state"][one_slot].fill_(float(index + 1) / 8.0)
+    return bank
+
+
+def _runner_carrier(runner, bank) -> dict:
+    """The carrier the runner's own builder hands a two-request decode.
+
+    The per-request lengths are passed only where the signature takes them, so a tree
+    that has no such keyword builds its own way and is then read on what it produced.
+    """
+    geometry = {
+        "state_slot": DECLARED_TWO_SLOTS[0],
+        "state_slots": list(DECLARED_TWO_SLOTS),
+    }
+    extra = {}
+    accepted = inspect.signature(runner._glm5next_layer_carriers).parameters
+    if "request_real_tokens" in accepted:
+        extra["request_real_tokens"] = list(DECLARED_TWO_REALS)
+    return runner._glm5next_layer_carriers(
+        [bank],
+        [None],
+        geometries=[geometry],
+        is_prefill=False,
+        tokens=DECLARED_REQUESTS,
+        start_position=DECLARED_TWO_POSITIONS[0],
+        softmax_scale=float(DECLARED_KDA_HEAD_SIZE) ** -0.5,
+        max_seq_len=int(DECLARED_TWO_POSITIONS[-1]) + DECLARED_REQUESTS,
+        # The last two belong to the sparse family and are unread for a recurrent bank;
+        # they are required keywords, so the call names them.
+        index_kpool=1,
+        requests=DECLARED_REQUESTS,
+        request_starts=list(DECLARED_TWO_POSITIONS),
+        **extra,
+    )[0]
 
 
 def _decode(layer, rows, requests: int, extras: dict, *, position: int = 0):
@@ -330,4 +406,61 @@ def test_c06_an_operand_set_naming_another_request_count_is_refused(one_layer):
     print(
         f"MANYREQ|c06|route=refused|rows=0|hidden={one_layer.hidden}|"
         f"operands=one_pair|requests={DECLARED_REQUESTS}"
+    )
+
+
+def test_c07_the_runner_builds_one_operand_pair_per_request_for_the_layer(one_layer):
+    """The carrier the runner builds at two requests carries a stacked pair per request."""
+    layer = one_layer.layer
+    runner = layer_half._runner_module().NeuronModelRunner
+    bank = _linear_bank(layer)
+    before = SimpleNamespace(
+        conv=bank["conv_state"].clone(), recurrent=bank["recurrent_state"].clone()
+    )
+    carrier = _runner_carrier(runner, bank)
+    print(
+        f"MANYREQ|c07|real_tokens={tuple(carrier['real_tokens'].shape)}|"
+        f"row_mask={tuple(carrier['row_mask'].shape)}|"
+        f"positions={[int(value) for value in carrier['start_position']]}|"
+        f"requests={DECLARED_REQUESTS}"
+    )
+    # ONE ENTRY PER REQUEST ON A LEADING AXIS. The width is one row, because a decode
+    # advances each sequence by one token, so a pair built from the batch's own reading
+    # carries the request axis and nothing else.
+    assert tuple(carrier["real_tokens"].shape) == (DECLARED_REQUESTS, 1)
+    assert tuple(carrier["row_mask"].shape) == (DECLARED_REQUESTS, 1, 1)
+    for index, one_real in enumerate(DECLARED_TWO_REALS):
+        length, mask = runner._glm5next_real_row_extent(
+            1, one_real, bank["recurrent_state"].device
+        )
+        assert torch.equal(carrier["real_tokens"][index], length)
+        assert torch.equal(carrier["row_mask"][index], mask)
+    # AND THE ENTRIES STAND IN THE STATES' ORDER, which is the batch's. Each request's
+    # position is its own, and the positions DIFFER, so an axis assembled in another
+    # order is visible here rather than in the numbers a later step produces.
+    assert len(carrier["conv_state"]) == DECLARED_REQUESTS
+    assert len(carrier["recurrent_state"]) == DECLARED_REQUESTS
+    assert [int(value) for value in carrier["start_position"]] == list(
+        DECLARED_TWO_POSITIONS
+    )
+    for index, one_slot in enumerate(DECLARED_TWO_SLOTS):
+        assert carrier["conv_state"][index].data_ptr() == (
+            bank["conv_state"][one_slot].data_ptr()
+        )
+    out = layer(one_layer.rows, **carrier)
+    advanced = tuple(
+        (
+            not torch.equal(bank["conv_state"][one_slot], before.conv[one_slot]),
+            not torch.equal(
+                bank["recurrent_state"][one_slot], before.recurrent[one_slot]
+            ),
+        )
+        for one_slot in DECLARED_TWO_SLOTS
+    )
+    print(f"MANYREQ|c07|advanced={list(advanced)}")
+    assert advanced == ((True, True),) * DECLARED_REQUESTS
+    print(
+        f"MANYREQ|c07|route=served|rows={int(out.shape[0])}|"
+        f"hidden={int(out.shape[1])}|operands=runner_built|"
+        f"requests={DECLARED_REQUESTS}"
     )
