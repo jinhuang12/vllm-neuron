@@ -4877,9 +4877,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """``[tokens]`` int32: each score ROW's own causal length.
 
         ``seq_lens`` IS PER TOKEN, NOT PER REQUEST -- "one per PACKED row", guarded
-        at ``model_fp8.py:5648`` -- and it is the causal bound ``inc-glm53f-103``
-        consumes (``model_fp8.py:5021``). Row ``i`` of a chunk that starts at
-        ``start_position`` sees ``start_position + i + 1`` tokens including itself.
+        at ``model_fp8.py:6179`` and documented at ``:6095`` -- and it is the causal
+        bound ``inc-glm53f-103`` consumes (``model_fp8.py:5533``). Row ``i`` of a chunk
+        that starts at ``start_position`` sees ``start_position + i + 1`` tokens
+        including itself.
         The landed tiny operand is ``arange(1, tokens + 1)``
         (``test_tiny_glm5next_forward.py:2872``), which is this expression at
         ``start_position == 0``.
@@ -5169,7 +5170,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         BOTH ARE LIVE ACROSS STEPS, which is why the caller allocates them ONCE and
         keeps them: the decode leg advances the ring in place (``tail.copy_``,
-        ``model_fp8.py:5477``) and the pooled store accumulates the prefill's rows.
+        ``model_fp8.py:5986``) and the pooled store accumulates the prefill's rows.
         Re-allocating per step would reset both and lose every pooled key.
 
         THE DTYPE IS THE LATENT BANK'S, so neither cache adds a second dtype
@@ -5228,7 +5229,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         new sequence would otherwise start on the previous sequence's partial pool,
         because every real token stashes into the ring
         (``vllm_neuron/functional/dsa/decode_tail_update.py``) and nothing here
-        empties it. :meth:`_glm5next_model_kwargs` clears the ring when a prefill
+        empties it. :meth:`_glm5next_model_kwargs` REPLACES the ring when a prefill
         starts at position 0, which is a new sequence by definition; the pooled
         store is left alone for the reason given there.
         """
@@ -6313,13 +6314,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # through the cursor's own gap. Clearing the owner alongside the rows leaves
             # the ring belonging to nobody, so a refused opening makes the next
             # non-opening step refuse by name instead of reading blanks.
-            # ONLY THIS REQUEST'S ROW IS CLEARED. The rows are per slot now, so a
-            # fresh sequence opening cannot disturb a concurrent request's ring --
-            # which the process-wide zeroing this replaces did on every prefill.
+            # ONLY THIS REQUEST'S ROW IS CLEARED, AND THE RING IS REPLACED RATHER THAN
+            # EMPTIED IN PLACE. Two landed rules meet here. The rows are per slot, so a
+            # fresh sequence opening must not disturb a concurrent request's ring, which
+            # the process-wide zeroing this replaces did on every prefill. And an eager
+            # `zero_()` on the live ring was REFUSED on the device -- "Can't call
+            # ReserveSpace on shared storage" -- inside the input builder, before any
+            # forward ran, so warmup never reached its first bucket. A fresh copy
+            # satisfies both: the surviving rows come across untouched, this request's row
+            # is zero, the entry holds a new object, and the buffer it replaced keeps its
+            # own bytes. The carriers are built from these entries after this loop, so the
+            # step binds the new buffer.
+            #
+            # WHAT IS NOT MEASURED, and this comment does not claim it: the refusal was
+            # read on the ring the banks own, whose storage the bank shares. Whether an
+            # in-place write to a buffer allocated ON THIS LINE is refused too is
+            # unmeasured, and the serving run is where it is settled. A mask multiply is
+            # the alternative form, at the cost of one elementwise pass over the ring.
             self._glm5next_side_cache_positions.pop(int(slot), None)
+            # AND THE SPARSE FAMILY'S OWN CURSOR IS CLEARED WITH THEM. That family serves
+            # one sequence per forward and reads this single value, so an opening prefill
+            # must leave it owned by nobody for the same reason the per-slot record is
+            # popped.
+            self._glm5next_side_cache_cursor = None
             for side in side_caches:
                 if "tail" in side:
-                    side["tail"][int(slot)].zero_()
+                    ring = side["tail"]
+                    fresh = ring.clone()
+                    fresh[int(slot)].zero_()
+                    side["tail"] = fresh
         else:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so

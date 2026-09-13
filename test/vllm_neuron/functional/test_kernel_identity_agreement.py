@@ -1,13 +1,15 @@
-"""Does each module's first-hop identity function name the kernel the seam really dispatched?
+"""Does each seam's first-hop identity function name the kernel it really dispatched?
 
 Increment ``inc-glm53f-092``, plan revision 94.
 
 THE QUESTION THIS FILE ANSWERS
 ------------------------------
-Six modules under ``vllm_neuron/functional/`` expose an identity function that reports which
-NKI member the module talks to. Five read a **module-level name** -- an import in
-``depthwise_conv1d``, a same-file ``@nki.jit def`` in four more. ``moe_blockwise_fp8`` reads
-no such name: it takes the name from its seam's source. No claim watches a dispatch.
+This file has SEVEN ENTRIES, and they are its own set rather than a census of the package,
+which carries more seams than these. Each entry is a seam under ``vllm_neuron/functional/``
+that exposes an identity function reporting which NKI member the seam talks to. Five of the
+seven read a **module-level name** -- an import in ``depthwise_conv1d``, a same-file
+``@nki.jit def`` in four more. The two MoE matmul limbs read no such name: each takes the
+name from its own seam's source. No claim watches a dispatch.
 
 So each test here takes an INDEPENDENT reading -- the first positional argument handed to
 ``nki.simulator.simulate_kernel``, which is the kernel the CPU dispatch actually ran -- and
@@ -15,45 +17,63 @@ compares it with what the module claims. The claim is a string; the reading is a
 claim that agrees with a reading derived from the claim would certify nothing, which is why
 the reading never touches the module's imports.
 
-FIRST HOP, AND WHY ONE MODULE USES A DIFFERENT FUNCTION
--------------------------------------------------------
-Five seams wrap their kernel directly, so ``kernel_identity()`` IS the first hop for them.
-``moe_blockwise_fp8`` is the only one of the six that puts a **shim** between seam and kernel:
-its own diagram at ``vllm_neuron/functional/moe/moe_blockwise_fp8.py:545-547`` shows
-``blockwise_fp8_moe --wrap_nki--> the shim --return--> the kernel``, with
-``seam_identity()`` naming the first hop and
-``kernel_identity()`` naming the second. The simulator dispatch is the FIRST hop, because
-``wrap_nki`` registers the shim. So that module's first-hop function is ``seam_identity()``,
-and its ``kernel_identity()`` is deliberately NOT compared here -- it reports a different hop
-by design, and increment ``-077`` already certifies it.
+FIRST HOP, AND THE ONE SEAM THIS FILE DOES NOT ASK ABOUT
+--------------------------------------------------------
+All seven seams wrap their kernel directly, so each one's identity function IS its first hop.
+``moe_blockwise_fp8`` holds two of the seven: the routed gate/up limb, whose reader is
+``gate_up_kernel_identity()``, and the routed down limb, whose reader is
+``down_kernel_identity()``. The activation limb between them has no entry here; the entries
+are the two matmul limbs.
+
+The vendor 256-granular seam ``blockwise_fp8_moe`` has no entry either, and the reason is not
+scope. It is the one seam of the package that puts a **shim** between seam and kernel -- its
+own diagram at ``vllm_neuron/functional/moe/moe_blockwise_fp8.py:545-547`` shows
+``blockwise_fp8_moe --wrap_nki--> the shim --return--> the kernel`` -- and it is also the one
+seam no product path reaches: the routed bank calls the three limbs, and commit ``3e5fc86``
+retired the seam's own test fixture for exactly that reason. An entry driving it would ask
+which kernel ran on a hop nothing dispatches, so the question is asked of the two hops that
+do run. Increment ``-077`` certifies that seam's second hop.
 
 THE THREE INSTRUMENTS, AND WHY THREE
 ------------------------------------
 1. ``nki_dispatch`` / ``torch_fallback`` counters inside each module's seam.
-2. ``can_run_kernel()`` -- the gate that decides kernel versus torch oracle.
+2. the gate that decides kernel versus torch oracle -- ``can_run_kernel()`` for five entries,
+   and each MoE limb's own admissibility gate, which takes the limb's extents beside the
+   probe and raises on a geometry the kernel does not accept.
 3. real ``nki.simulator.simulate_kernel`` invocations, counted and ATTRIBUTED to the seam
    under test.
 
-Instrument 3 counts the vendor entry point, so a bug in instrument 1 cannot fake it. This file
-uses instruments 2 and 3, because the question is which kernel ran and a reading taken with no
-dispatch at all would be the self-referential certificate the increment exists to close.
+Instrument 3 counts the simulator's own entry point, so a bug in instrument 1 cannot fake it.
+This file uses instruments 2 and 3, because the question is which kernel ran and a reading
+taken with no dispatch at all would be the self-referential certificate the increment exists
+to close.
 
 ATTRIBUTION IS BY (FILE, ENCLOSING FUNCTION), NOT BY FILE
 ---------------------------------------------------------
-``kda/chunked_recurrence.py`` carries TWO seams -- ``kda_intra_chunk`` and
-``kda_inter_chunk`` -- each with its own kernel and counters. A frame walk that matched the
-filename alone could not tell them apart, and would read a dispatch from the wrong seam as
-belonging to the one under test. Matching the enclosing function name too removes that.
+Two files here carry more than one seam. ``kda/chunked_recurrence.py`` carries
+``kda_intra_chunk`` and ``kda_inter_chunk``, and ``moe/moe_blockwise_fp8.py`` carries the two
+limbs this file compares beside two more seams. A frame walk that matched the filename alone
+could not tell any of them apart, and would read a dispatch from one seam as belonging to
+another. Matching the enclosing function name too removes that.
 
-THE SEVENTH ITEM CARRIES A CONTROL, AND WHY THE CONTROL PATCHES THE SEAM
-------------------------------------------------------------------------
-Item 7 counts how many of the six disagree and requires exactly ``0``. A counted zero proves
+WHAT NO ITEM HERE EXERCISES, said plainly so the next reader does not trust a proof that is
+not present. Every measurement opens a recorder of its own and drives ONE seam inside it, so
+only that seam's events can be recorded and a filename-only walk would read the same value
+for all seven entries. The precision above is the walk's design, not a property any item of
+this file can fail on. An item that could fail on it would drive two seams of one file inside
+ONE recorder and require only the seam under test to be attributed.
+
+THE LAST ITEM CARRIES A CONTROL, AND WHY THE CONTROL PATCHES THE SEAM
+--------------------------------------------------------------------
+Item 8 counts how many of the seven disagree and requires exactly ``0``. A counted zero proves
 nothing unless the same count can be shown to move, so the control substitutes what the SEAM
 dispatches -- the module's own ``wrap_nki`` reference -- and the count must read exactly ``1``.
 
 The control must NOT patch the module global instead. ``wrap_nki`` applies the same
 ``.func`` unwrap to the same object the identity function reads, so patching the global moves
-BOTH readings together and the count would stay ``0`` while measuring nothing.
+BOTH readings together and the count would stay ``0`` while measuring nothing. That holds for
+the two MoE limbs with particular force: their claim is their seam's own ``wrap_nki`` argument
+resolved in the module's globals, so a patched global would move claim and reading as one.
 """
 
 from __future__ import annotations
@@ -75,7 +95,8 @@ _SOURCE = {
     "depthwise_conv1d": "vllm_neuron.functional.kda.depthwise_conv1d",
     "hyper_connection": "vllm_neuron.functional.mhc.hyper_connection",
     "sinkhorn": "vllm_neuron.functional.mhc.sinkhorn",
-    "moe_blockwise_fp8": "vllm_neuron.functional.moe.moe_blockwise_fp8",
+    "moe_gate_up": "vllm_neuron.functional.moe.moe_blockwise_fp8",
+    "moe_down": "vllm_neuron.functional.moe.moe_blockwise_fp8",
 }
 _OWNER_TEST = {
     "blockwise_fp8_mm": "test.vllm_neuron.functional.test_blockwise_fp8_mm",
@@ -83,25 +104,29 @@ _OWNER_TEST = {
     "depthwise_conv1d": "test.vllm_neuron.functional.kda.test_depthwise_conv1d",
     "hyper_connection": "test.vllm_neuron.functional.mhc.test_hyper_connection",
     "sinkhorn": "test.vllm_neuron.functional.mhc.test_sinkhorn",
-    "moe_blockwise_fp8": "test.vllm_neuron.functional.moe.test_moe_blockwise_fp8",
+    "moe_gate_up": "test.vllm_neuron.functional.moe.test_moe_blockwise_fp8",
+    "moe_down": "test.vllm_neuron.functional.moe.test_moe_blockwise_fp8",
 }
-#: The seam whose dispatches are attributed to it. Two of these live in one file.
+#: The seam whose dispatches are attributed to it. THREE of these seven entries live in two
+#: files, and those two files carry six seams between them.
 _SEAM = {
     "blockwise_fp8_mm": "blockwise_fp8_mm",
     "chunked_recurrence": "kda_intra_chunk",
     "depthwise_conv1d": "depthwise_conv1d",
     "hyper_connection": "hyper_connection_combine",
     "sinkhorn": "sinkhorn_normalise",
-    "moe_blockwise_fp8": "blockwise_fp8_moe",
+    "moe_gate_up": "moe_gate_up_blockwise_fp8",
+    "moe_down": "moe_down_blockwise_fp8",
 }
-#: The FIRST-HOP identity function. One module differs, for the reason the docstring gives.
+#: The FIRST-HOP identity function. The two MoE limbs share a module, so each names its own.
 _FIRST_HOP = {
     "blockwise_fp8_mm": "kernel_identity",
     "chunked_recurrence": "kernel_identity",
     "depthwise_conv1d": "kernel_identity",
     "hyper_connection": "kernel_identity",
     "sinkhorn": "kernel_identity",
-    "moe_blockwise_fp8": "seam_identity",
+    "moe_gate_up": "gate_up_kernel_identity",
+    "moe_down": "down_kernel_identity",
 }
 
 _M = {name: importlib.import_module(path) for name, path in _SOURCE.items()}
@@ -160,7 +185,9 @@ def _drive(name: str):
 
     Each module's own test file already owns a minimal fixture that the seam accepts. Reusing
     it means this file invents no shapes, so a shape the owner later changes cannot leave this
-    file asserting against a case the seam no longer supports.
+    file asserting against a case the seam no longer supports. The two MoE limbs are routed
+    seams, so the owner's own single-block driver is reused as well and the routing operands
+    are the owner's too.
 
     Returns the seam's output and the tensor its gate is asked about.
     """
@@ -181,11 +208,39 @@ def _drive(name: str):
     if name == "sinkhorn":
         affinity = owner._affinity()
         return mod.sinkhorn_normalise(affinity), affinity
-    if name == "moe_blockwise_fp8":
-        case = owner._build_case()
-        inputs = case["kernel_inputs"]
-        return mod.blockwise_fp8_moe(**inputs), inputs["hidden_states"]
+    if name == "moe_gate_up":
+        case = owner._build_gate_up_128_case()
+        hidden = case["hidden"][0]
+        out = owner._gate_up_one_block(hidden, case["weight_fused"][0], case["operands"][0])
+        return out, hidden
+    if name == "moe_down":
+        case = owner._build_down_128_case()
+        intermediate_t = case["intermediate_t"][0]
+        out = owner._down_one_block(
+            intermediate_t, case["down_weight"][0], case["operands"][0], case["affinity"][0]
+        )
+        return out, intermediate_t
     raise AssertionError(f"no driver declared for {name!r}")
+
+
+def _gate_reading(name: str, probe):
+    """Ask THIS entry's own gate about the tensor the seam was driven with.
+
+    Five entries take the package-wide ``can_run_kernel(probe)``. Each MoE limb has its own
+    gate, which reads the same environment and additionally refuses a geometry the kernel does
+    not accept, so the extents ride beside the probe -- lifted from the owner test rather than
+    written here, for the same reason ``_drive`` reuses the owner's fixture.
+    """
+    mod, owner = _M[name], _T[name]
+    if name == "moe_gate_up":
+        return mod.can_run_moe_gate_up_blockwise_fp8(
+            probe, owner.G128_TOKENS, owner.G128_H, owner.G128_I
+        )
+    if name == "moe_down":
+        return mod.can_run_moe_down_blockwise_fp8(
+            probe, owner.G128_TOKENS, owner.G128_I, owner.G128_H
+        )
+    return mod.can_run_kernel(probe)
 
 
 def _measure(name: str) -> dict:
@@ -199,7 +254,7 @@ def _measure(name: str) -> dict:
         "claimed": tuple(claimed),
         "attributed": recorder.attributed,
         "dispatches": len(recorder.attributed),
-        "gate": mod.can_run_kernel(gate_probe),
+        "gate": _gate_reading(name, gate_probe),
         "out": out,
     }
 
@@ -215,7 +270,7 @@ def _assert_first_hop_agrees(name: str) -> dict:
         f"{name}: expected exactly 1 simulator dispatch attributed to seam "
         f"{_SEAM[name]!r}, got {r['dispatches']}: {r['attributed']}"
     )
-    assert r["gate"] is True, f"{name}: can_run_kernel read {r['gate']!r}, expected True"
+    assert r["gate"] is True, f"{name}: the gate read {r['gate']!r}, expected True"
     assert r["claimed"] == r["attributed"][0], (
         f"{name}: {_FIRST_HOP[name]}() reports {r['claimed']} but the seam dispatched "
         f"{r['attributed'][0]}"
@@ -224,7 +279,7 @@ def _assert_first_hop_agrees(name: str) -> dict:
 
 
 def _count_disagreements() -> tuple[int, dict]:
-    """How many of the six report a first-hop identity the seam did not dispatch."""
+    """How many of the seven report a first-hop identity the seam did not dispatch."""
     readings, disagreeing = {}, 0
     for name in _SOURCE:
         r = _measure(name)
@@ -255,9 +310,9 @@ def _decoy_of(kernel):
 
 
 # --------------------------------------------------------------------------- #
-# (1)-(6) one first-hop comparison per module, six named functions.
+# (1)-(7) one first-hop comparison per seam, seven named functions.
 # Deliberately NOT parametrised: the collected item count stays readable from the source, and
-# a failure names its module in the test id rather than in a case index.
+# a failure names its seam in the test id rather than in a case index.
 # --------------------------------------------------------------------------- #
 def test_blockwise_fp8_mm_first_hop_identity_matches_the_dispatch():
     """``blockwise_fp8_mm``: ``kernel_identity()`` names the kernel the seam dispatched."""
@@ -265,12 +320,12 @@ def test_blockwise_fp8_mm_first_hop_identity_matches_the_dispatch():
 
 
 def test_chunked_recurrence_first_hop_identity_matches_the_dispatch():
-    """``kda_intra_chunk``: the reading is attributed to this seam, not its file-mate."""
+    """``kda_intra_chunk``: the one seam of its file this entry drives, read at its own hop."""
     _assert_first_hop_agrees("chunked_recurrence")
 
 
 def test_depthwise_conv1d_first_hop_identity_matches_the_dispatch():
-    """``depthwise_conv1d``: the one module of the six whose claim reads a real import."""
+    """``depthwise_conv1d``: the one entry of the seven whose claim reads a real import."""
     _assert_first_hop_agrees("depthwise_conv1d")
 
 
@@ -284,28 +339,32 @@ def test_sinkhorn_first_hop_identity_matches_the_dispatch():
     _assert_first_hop_agrees("sinkhorn")
 
 
-def test_moe_blockwise_fp8_first_hop_identity_matches_the_dispatch():
-    """``blockwise_fp8_moe``: the first hop is the SHIM, so ``seam_identity()`` is compared.
-
-    ``kernel_identity()`` names the second hop by design and is not compared here. Increment
-    ``-077`` certifies that hop; this test would fail against it for a correct module.
-    """
-    r = _assert_first_hop_agrees("moe_blockwise_fp8")
-    mod = _M["moe_blockwise_fp8"]
-    # ASSERTED, not merely recorded: the two hops must differ, or this file's premise moved.
-    assert tuple(mod.kernel_identity()) != r["claimed"], (
-        "moe_blockwise_fp8 no longer has two distinct hops; seam_identity() and "
-        "kernel_identity() now report the same symbol, so this file's premise moved"
+def test_moe_gate_up_first_hop_identity_matches_the_dispatch():
+    """``moe_gate_up_blockwise_fp8``: the routed gate/up limb, read through its own seam."""
+    r = _assert_first_hop_agrees("moe_gate_up")
+    # ASSERTED, not merely recorded: the two limbs of this file must read DIFFERENT kernels.
+    # Each measurement opens its own recorder around one limb, so this cannot be a claim about
+    # the walk mixing two seams up -- no event of the other limb exists to be mixed in. What it
+    # catches is the two entries reading ONE kernel twice, which would leave the file with two
+    # ids and one comparison. The owner test pins the same distinctness from its own side.
+    assert r["attributed"] != _measure("moe_down")["attributed"], (
+        f"the gate/up and down limbs both dispatched {r['attributed']}, so these two entries "
+        f"are two readings of one kernel rather than two seams"
     )
 
 
+def test_moe_down_first_hop_identity_matches_the_dispatch():
+    """``moe_down_blockwise_fp8``: ``down_kernel_identity()`` names the dispatched kernel."""
+    _assert_first_hop_agrees("moe_down")
+
+
 # --------------------------------------------------------------------------- #
-# (7) the counted zero, with the control that makes it move
+# (8) the counted zero, with the control that makes it move
 # --------------------------------------------------------------------------- #
 def test_no_module_disagrees_and_the_control_makes_exactly_one_disagree():
-    """Zero of six disagree -- and the same count reads 1 when one seam is substituted.
+    """Zero of seven disagree -- and the same count reads 1 when one seam is substituted.
 
-    Without the control a six-way agreement would prove only that the comparison cannot tell
+    Without the control a seven-way agreement would prove only that the comparison cannot tell
     the difference. The control patches the module's ``wrap_nki`` reference, which is what the
     SEAM dispatches; patching the module global instead would move the claim and the reading
     together and leave the count at zero.
