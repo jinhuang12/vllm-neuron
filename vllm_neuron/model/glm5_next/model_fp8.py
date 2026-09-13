@@ -5878,7 +5878,8 @@ class Glm5NextDSAIndexer(nn.Module):
         in :meth:`select_bounded_pools` now lands for this seam; the torch spelling survives as that
         module's oracle and serves any call the gate refuses. The result is exact for integer ids:
         every count is below 2**24, a bound ``can_run_dsa_sentinel_order`` enforces by admitting
-        at most 16384 columns and sending a wider row to the torch oracle. What only the device
+        at most ``SEARCH_MAX_FREE`` columns -- the widest row whose tiles fit one SBUF partition,
+        a few thousand -- and sending a wider row to the torch oracle. What only the device
         can show is whether the prefill graph's
         refused DMA transpose was this tensor's; the kernel removes the op either way.
 
