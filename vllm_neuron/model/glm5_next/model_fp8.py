@@ -4172,7 +4172,9 @@ class Glm5NextKDAAttention(nn.Module):
         constant of the captured graph. Both are served one request at a time by
         this same method, and refused on the prefill leg, where the carrier says
         nothing about where one request's tokens end. A bare tensor, or a tensor of
-        one row, is one request.
+        one row, is one request. The two row operands are refused there as well: they
+        describe one sequence's padding, the per-request loop passes them to nobody,
+        and a dropped mask is worse than a refused call.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -4274,6 +4276,14 @@ class Glm5NextKDAAttention(nn.Module):
                     f"a decode step advances each sequence by one token, so this call "
                     f"carries one token per request; it holds "
                     f"{int(hidden_states.shape[0])} token(s) for {requests} request(s)"
+                )
+            if row_mask is not None or real_tokens is not None:
+                raise ValueError(
+                    f"real_tokens and row_mask name which rows of ONE sequence carry a "
+                    f"token, and this call carries {requests} requests. The loop below "
+                    f"serves one request at a time and passes neither operand on, so "
+                    f"the mask this caller asked for would be dropped without a word. "
+                    f"A concurrent decode passes neither operand"
                 )
             return torch.cat(
                 [
