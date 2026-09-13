@@ -58,21 +58,30 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
-def _two_group_root(monkeypatch, rank: int):
+def _pristine_fixtures(ranks) -> dict[int, dict]:
+    """One tiny root per rank, all built before any stand-in state is installed.
+
+    The shared fixture's load-time prep hands every bank the whole stack, so a bank built
+    under a stand-in degree would refuse it. The roots are therefore built first, under the
+    live degree-1 state, and partitioned afterwards.
+    """
+    landed._require_cpu_mode()
+    return {rank: landed._fixture() for rank in ranks}
+
+
+def _two_group_root(monkeypatch, rank: int, fixture: dict):
     """The tiny root partitioned into two expert groups, holding group ``rank``'s experts.
 
-    The stand-in state is installed BEFORE the root is built, because the bank asks the
-    state for its degree when it is constructed. Each routed bank is then re-bound to its
-    group's slice of the stack operands and re-prepared, so its weights hold eight of the
-    sixteen experts and the global-to-local mapping runs inside the forward.
+    ``fixture`` is one of ``_pristine_fixtures``. The two-group state is installed, then each
+    routed bank is re-partitioned, re-bound to its group's slice of the stack operands and
+    re-prepared, so its weights hold eight of the sixteen experts and the global-to-local
+    mapping runs inside the forward.
     """
+    root = fixture["root"]
     ep_rank, group = par._install_state(
         monkeypatch, world_size=GROUPS, ep_degree=GROUPS, rank=rank
     )
     assert ep_rank == rank and group.world_size == 1
-    landed._require_cpu_mode()
-    fixture = landed._fixture()
-    root = fixture["root"]
     per_group = item.STACK_EXPERTS // GROUPS
     low, high = rank * per_group, (rank + 1) * per_group
     rebound = 0
@@ -80,6 +89,12 @@ def _two_group_root(monkeypatch, rank: int):
         if not isinstance(layer.mlp, model_fp8.Glm5NextMoEBlock):
             continue
         bank = layer.mlp.experts
+        assert int(bank.num_local_experts) == item.STACK_EXPERTS, (index, bank.num_local_experts)
+        bank.ep_degree = GROUPS
+        bank.expert_partition = factory.require_uniform_expert_partition(
+            bank.num_routed_experts, GROUPS
+        )
+        bank.num_local_experts = bank.expert_partition.counts[0]
         assert int(bank.num_local_experts) == per_group, (index, bank.num_local_experts)
         operands = fixture["mlp_operands"][index]
         sliced = {
@@ -153,7 +168,8 @@ def test_the_runner_hands_the_rank_over_as_a_device_tensor(monkeypatch, caplog):
 
 def test_both_captures_and_a_prompt_step_hand_the_root_the_tensor(monkeypatch):
     """Every driven site reaches the root with the rank as a tensor on the batch's device."""
-    root, runner, _per_group = _two_group_root(monkeypatch, GROUPS - 1)
+    fixture = _pristine_fixtures([GROUPS - 1])[GROUPS - 1]
+    root, runner, _per_group = _two_group_root(monkeypatch, GROUPS - 1, fixture)
     reached: list[dict] = []
     original = type(root).forward
 
@@ -190,8 +206,9 @@ def test_one_graph_serves_both_expert_groups(monkeypatch):
     """The traced graph is the same at rank 0 and rank 1; the python-int form gives two."""
     texts: dict[str, dict[int, str]] = {"tensor": {}, "int": {}}
     counts: dict[int, int] = {}
+    fixtures = _pristine_fixtures(GROUP_RANKS)
     for rank in GROUP_RANKS:
-        root, runner, _per_group = _two_group_root(monkeypatch, rank)
+        root, runner, _per_group = _two_group_root(monkeypatch, rank, fixtures[rank])
         translated = par._translated_prompt(runner)
         assert int(translated["expert_parallel_rank"]) == rank
         texts["tensor"][rank], counts[rank] = _graph_text(root, translated)
@@ -215,8 +232,9 @@ def test_one_graph_serves_both_expert_groups(monkeypatch):
 
 def test_the_tensor_form_computes_what_the_int_form_computes(monkeypatch):
     """At each group, the tensor form selects the group's experts and equals the int form."""
+    fixtures = _pristine_fixtures(GROUP_RANKS)
     for rank in GROUP_RANKS:
-        root, runner, per_group = _two_group_root(monkeypatch, rank)
+        root, runner, per_group = _two_group_root(monkeypatch, rank, fixtures[rank])
         translated = par._translated_prompt(runner)
         selected: list[list[int]] = []
         original = functional_hub.get_local_expert_affinities
@@ -244,8 +262,8 @@ def test_the_tensor_form_computes_what_the_int_form_computes(monkeypatch):
 
 def test_the_tensor_form_through_the_translation_equals_the_int_form(monkeypatch):
     """On the narrow mesh, rank 0 and rank 15 through the translation equal the int form."""
-    for rank in (0, par.NARROW_RANK):
-        root, _caches, runner = par._bound_runner()
+    bound = {rank: par._bound_runner() for rank in (0, par.NARROW_RANK)}
+    for rank, (root, _caches, runner) in bound.items():
         ep_rank, _group = par._install_state(
             monkeypatch,
             world_size=par.NARROW_WORLD_SIZE,
