@@ -75,9 +75,31 @@ one already reviewed, and changing it would be an unmeasured performance change
 smuggled in under a correctness increment. It is recorded as a named follow-up
 rather than left for a reader to notice.
 
-WHY THE WEIGHT IS ``[H, K, N]`` AND NOT ``[H, N, K]``. A `nc_matmul` contracts the
-PARTITION axis, so both operands must present the contraction extent there. Per
-head the weight is therefore contraction-major, which is `mla_projection`'s
+WHERE THE TRANSPORT HAPPENS. A `nc_matmul` contracts the PARTITION axis, so both
+operands must present the contraction extent there. The kernel makes that turn for
+`x` itself: each slab is loaded exactly as the caller stores it, ``[sw, kw]`` with
+the sequence on the partition axis, and turned on the PE by one `nisa.nc_transpose`
+through a PSUM tile into the ``[kw, sw]`` stationary operand. The turn happens once
+per (head, sequence tile) ABOVE the output loop and its PSUM tile is dead before the
+accumulator is allocated, so the two never want a bank at the same time. For FINITE
+operands the matmul sees exactly the values the caller holds, and the result is
+bit-identical to the host-relayout kernel this replaces.
+
+WHERE THAT IDENTITY STOPS. The PE turn is a matmul against an identity matrix, and
+the vendor rules it not bit-accurate when the tile holds NaN or Inf (Kaena
+``nki/isa/neuron_isa.py:221-224``, NeuronCore-v2): a non-finite element can reach
+every output of its partition column, so one bad `x` element can touch its own
+``[SEQUENCE_TILE, CONTRACTION_TILE]`` slab for that head, where the host relayout
+kept it to the one element. Outside that slab's sequence tile nothing changes, and
+the planted row itself changes in both kernels; the CPU items prove exactly that and
+record what the simulator emits inside the tile. `w` is not turned, so a non-finite
+weight behaves the same in both. No host-side finiteness scan stands on this path:
+the callers hand this seam a projected query and the sparse seam's own output
+(``model_fp8.py:7409``, ``:7422-7424``), neither of which removes a non-finite
+value, and a scan per call would cost more than the transport it replaces.
+
+WHY THE WEIGHT IS ``[H, K, N]`` AND NOT ``[H, N, K]``. Per head the weight is
+contraction-major for the same partition-axis reason, which is `mla_projection`'s
 ``[in, out]`` convention with a head axis in front -- not torch's `nn.Linear`
 ``[out, in]``. The consequence is declared rather than absorbed: whoever prepares
 `W_UK` and `W_UV` transposes ONCE when they are built, off the per-forward path,
@@ -181,22 +203,48 @@ def mla_absorb_dispatch_counters() -> tuple[int, int]:
     )
 
 
-def _sbuf(rows: int, cols: int):
-    return nl.ndarray((rows, cols), dtype=nl.float32, buffer=nl.sbuf)
+def _sbuf(*shape: int):
+    return nl.ndarray(tuple(shape), dtype=nl.float32, buffer=nl.sbuf)
 
 
 def _psum(rows: int, cols: int):
     return nl.ndarray((rows, cols), dtype=nl.float32, buffer=nl.psum)
 
 
+def _transpose_tile(src_sb, rows: int, cols: int):
+    """``[rows, cols]`` SBUF -> ``[cols, rows]`` SBUF, turned on the PE.
+
+    The destination is PSUM rather than SBUF because a PSUM destination routes the
+    turn to the tensor engine and serves the full 128 partitions, while an SBUF one
+    runs on Vector and refuses a tile above ``[32, 32]`` -- the rule the landed
+    ``chunked_recurrence.py`` records with its own measurement. Every tile here is
+    float32 because the load above casts, so the destination dtype matches the
+    input's without a choice to make.
+    """
+    ps = _psum(cols, rows)
+    nisa.nc_transpose(dst=ps, data=src_sb)
+    tile = _sbuf(cols, rows)
+    nisa.tensor_copy(dst=tile, src=ps)
+    return tile
+
+
 @nki.jit
-def mla_absorb_kernel(xt_hbm, w_hbm):
+def mla_absorb_kernel(x_hbm, w_hbm):
     """``out[s, h, :] = x[s, h, :] @ w[h]``, tiled on all three inner axes.
 
-    ``xt_hbm`` is x ALREADY permuted to ``[H, K, S]`` and ``w_hbm`` is ``[H, K, N]``:
-    per head both present the contraction extent on the partition axis, which is
-    what ``nc_matmul`` contracts. The module docstring says why the caller owns that
-    orientation.
+    ``x_hbm`` is x AS THE CALLER STORES IT, ``[S, H, K]``, and ``w_hbm`` is
+    ``[H, K, N]``. The kernel puts the contraction extent on the partition axis of
+    both operands itself: the weight already presents it, and each ``x`` slab is
+    turned on the PE by :func:`_transpose_tile`. The module docstring says where
+    that turn is exact and where it is not.
+
+    THE TURN IS HOISTED ABOVE THE OUTPUT LOOP. One ``[CONTRACTION_TILE, ktiles, sw]``
+    SBUF tile holds every turned slab for this (head, sequence tile), so a slab is
+    loaded and turned once instead of once per output tile, and no transpose PSUM
+    tile is live while the accumulator is. A whole contraction column cannot be one
+    SBUF tile -- the partition axis stops at 128 -- so the tile carries the
+    contraction-tile index on its free axis, and the matmul reads back the leading
+    ``kw`` partitions of one index.
 
     The head axis is the OUTER loop and carries no arithmetic of its own -- each
     head is an independent matmul, which is exactly why this adapts a rank-2 kernel
@@ -210,25 +258,34 @@ def mla_absorb_kernel(xt_hbm, w_hbm):
     is what lets this kernel return ``[S, H, N]`` and spares the seam a host-side
     permute on every call.
     """
-    heads, kdim, seq = xt_hbm.shape
+    seq, heads, kdim = x_hbm.shape
     odim = w_hbm.shape[2]
+    ktiles = (kdim + CONTRACTION_TILE - 1) // CONTRACTION_TILE
     out = nl.ndarray((seq, heads, odim), dtype=nl.float32, buffer=nl.shared_hbm)
 
     for h in range(heads):
         for s0 in range(0, seq, SEQUENCE_TILE):
             sw = min(SEQUENCE_TILE, seq - s0)
+            xt = _sbuf(CONTRACTION_TILE, ktiles, sw)
+            for ki in range(ktiles):
+                k0 = ki * CONTRACTION_TILE
+                kw = min(CONTRACTION_TILE, kdim - k0)
+                x_sb = _sbuf(sw, kw)
+                nisa.tensor_copy(
+                    dst=x_sb,
+                    src=nl.load(
+                        x_hbm[s0:s0 + sw, h, k0:k0 + kw], dtype=nl.float32
+                    ),
+                )
+                nisa.tensor_copy(
+                    dst=xt[0:kw, ki, :], src=_transpose_tile(x_sb, sw, kw)
+                )
             for o0 in range(0, odim, OUTPUT_TILE):
                 ow = min(OUTPUT_TILE, odim - o0)
                 acc_ps = _psum(sw, ow)
-                for k0 in range(0, kdim, CONTRACTION_TILE):
+                for ki in range(ktiles):
+                    k0 = ki * CONTRACTION_TILE
                     kw = min(CONTRACTION_TILE, kdim - k0)
-                    x_tile = _sbuf(kw, sw)
-                    nisa.tensor_copy(
-                        dst=x_tile,
-                        src=nl.load(
-                            xt_hbm[h, k0:k0 + kw, s0:s0 + sw], dtype=nl.float32
-                        ),
-                    )
                     w_tile = _sbuf(kw, ow)
                     nisa.tensor_copy(
                         dst=w_tile,
@@ -238,9 +295,9 @@ def mla_absorb_kernel(xt_hbm, w_hbm):
                     )
                     nisa.nc_matmul(
                         dst=acc_ps,
-                        stationary=x_tile,
+                        stationary=xt[0:kw, ki, :],
                         moving=w_tile,
-                        accumulate=(k0 > 0),
+                        accumulate=(ki > 0),
                     )
                 out_sb = _sbuf(sw, ow)
                 nisa.tensor_copy(dst=out_sb, src=acc_ps)
@@ -320,7 +377,7 @@ def mla_absorb(x: Tensor, w: Tensor) -> Tensor:
 
     _MLA_ABSORB_COUNTERS.nki_dispatch += 1
     out = wrap_nki(mla_absorb_kernel)(
-        x.permute(1, 2, 0).contiguous().to(torch.float32),
+        x.contiguous().to(torch.float32),
         w.contiguous().to(torch.float32),
     )
     return out.to(x.dtype)
