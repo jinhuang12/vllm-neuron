@@ -4969,7 +4969,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @classmethod
     def _glm5next_batch_pool_slot_mapping(
-        cls, requests, *, index_kpool: int, device
+        cls, requests, *, index_kpool: int, device, real_tokens=None
     ) -> torch.Tensor:
         """``[Σ tokens]`` int32: the pool id where a pool completes, in batch order.
 
@@ -4982,15 +4982,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         THE CONCATENATION HAPPENS ON THE HOST AND THE RESULT MOVES ONCE, which is the
         singular form's own rule (``_glm5next_pool_slot_mapping_host``): a per-request
         move followed by a device concatenation would break it N times over.
+
+        ``real_tokens`` IS PER REQUEST, one entry beside each row of ``requests``, or
+        ``None`` when every row of every request carries a token. A padded chunk's
+        real length belongs to the request it pads, so one number for a whole batch
+        would cut the wrong request's pools short.
         """
+        rows = list(requests)
+        lengths = [None] * len(rows) if real_tokens is None else list(real_tokens)
+        if len(lengths) != len(rows):
+            raise ValueError(
+                f"this batch names {len(rows)} request(s) and carries {len(lengths)} "
+                f"real length(s); the real length belongs to one request, so a count "
+                f"that disagrees would cut another request's pools short"
+            )
         return torch.cat(
             [
                 cls._glm5next_pool_slot_mapping_host(
                     tokens=int(tokens),
                     start_position=int(start),
                     index_kpool=int(index_kpool),
+                    real_tokens=real,
                 )
-                for tokens, start in requests
+                for (tokens, start), real in zip(rows, lengths)
             ]
         ).to(device)
 
@@ -5319,10 +5333,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         leading dimension counts KV blocks of the group; using it would allocate one
         set of per-sequence caches per block.
 
-        THE BANKS MUST STILL HOLD THE BOUND. A slot number addresses the recurrent
-        banks and the indexer's caches alike, so a stack whose banks hold fewer slots
-        than the engine admits sequences has no slot to hand the last of them, and it
-        refuses here rather than at a silent overwrite.
+        BANKS THAT HOLD STATE MUST HOLD THE BOUND. A slot number addresses the
+        recurrent banks and the indexer's caches alike, so a stack whose recurrent
+        banks hold fewer slots than the engine admits sequences has no slot to hand
+        the last of them, and it refuses here rather than at a silent overwrite. A
+        stack with NO recurrent bank is served rather than refused: it has no state
+        to provision, and the bound still sizes the indexer's own caches.
         """
         capacity = int(self.max_num_reqs)
         if capacity <= 0:
@@ -5331,7 +5347,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"so it must be positive; this runner reports {self.max_num_reqs!r}"
             )
         banked = self._glm5next_state_slot_count(banks)
-        if banked < capacity:
+        if banked and banked < capacity:
             raise ValueError(
                 f"the recurrent banks of this stack hold {banked} state slot(s) while "
                 f"the engine admits {capacity} concurrent sequence(s); one slot number "
@@ -5544,8 +5560,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             raise ValueError(
                 f"the decode leg advances each sequence's tail ring one position at a "
                 f"time, so a decode step carries exactly one token per request; this "
-                f"step carries {int(tokens)} token(s) for {int(requests)} request(s). "
-                f"Threading a multi-token decode, which is speculative decoding's "
+                f"step carries {int(tokens)} token(s) for {int(requests)} request(s), "
+                f"and threading a multi-token decode, which is speculative decoding's "
                 f"verify step, is not inc-glm53f-054b's work"
             )
         real = int(tokens) if real_tokens is None else int(real_tokens)
@@ -5765,7 +5781,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     [(tokens, start_position)],
                     index_kpool=index_kpool,
                     device=device,
-                    real_tokens=real,
+                    real_tokens=[real],
                 )
                 # THE RING IS ON BOTH LEGS NOW, under its own keyword. The prefill
                 # leg seeds this chunk's remainder into it (`model_fp8.py`'s

@@ -436,6 +436,7 @@ def _wide_written(root, *, width: int, ids, positions, call=None) -> list[torch.
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=WIDE_PADDED,
+        request_slots=e2e.E2E_MAX_NUM_SEQS,
     )
     carriers, input_ids = _wide_arm(
         width=width,
@@ -565,6 +566,7 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
         index_kpool=pool,
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=BUCKET_TOKENS,
+        request_slots=e2e.E2E_MAX_NUM_SEQS,
     )
     ring = next(entry["tail"] for entry in side if "tail" in entry)
     ring.zero_()

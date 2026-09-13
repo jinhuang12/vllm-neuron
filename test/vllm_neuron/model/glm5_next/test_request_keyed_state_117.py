@@ -980,6 +980,32 @@ def test_a2_banks_holding_fewer_slots_than_the_bound_refuse_by_name() -> None:
         runner._glm5next_request_slot_capacity(banks)
 
 
+def test_a2_a_stack_with_no_recurrent_bank_is_admitted_at_the_bound() -> None:
+    """A stack holding no recurrent bank has nothing to provision, so it must be served.
+
+    The refusal above compares the recurrent banks' slot count with the engine's bound.
+    A stack of sparse layers alone reports NO recurrent slot, and that zero is an
+    absence rather than an under-provisioned bank: there is no state to hand a slot, and
+    the bound still sizes the per-sequence caches every sparse layer holds. A refusal on
+    the zero takes the whole DSA-only stack out of service, which is the shape the tiny
+    fixture ships and the shape a served DSA-only model has.
+    """
+    _require_cpu_mode()
+    sparse_only = [bank for bank in _banks() if bank["family"] == "self_attn"]
+    runner = _runner(sparse_only)
+    banked = runner._glm5next_state_slot_count(sparse_only)
+    if banked:
+        raise VacuousControlError(
+            f"this item drives a stack with no recurrent bank, and the harness's "
+            f"sparse-only stack reports {banked} recurrent state slot(s)"
+        )
+
+    print(f"KEYED|a2|banked={banked}|bound={DECLARED_MAX_NUM_SEQS}")
+    assert (
+        runner._glm5next_request_slot_capacity(sparse_only) == DECLARED_MAX_NUM_SEQS
+    ), "a stack with no recurrent bank was not admitted at the engine's own bound"
+
+
 def test_a2_the_side_cache_slot_axis_is_the_engines_concurrency_bound() -> None:
     """The per-sequence caches are sized by ``max_num_seqs``, never by the block space.
 

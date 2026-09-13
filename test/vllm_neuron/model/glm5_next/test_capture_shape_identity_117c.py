@@ -229,6 +229,7 @@ def _carrier(bank: dict, text_config, *, position: int, geometry: dict,
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE,
+        request_slots=DECLARED_MAX_NUM_SEQS,
     )
     carriers = NeuronModelRunner._glm5next_layer_carriers(
         [bank],

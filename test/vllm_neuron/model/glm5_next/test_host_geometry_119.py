@@ -238,6 +238,7 @@ def _open_ring_at(runner, banks, position: int) -> None:
         index_kpool=int(_text_config().index_kpool),
         index_head_dim=int(_text_config().index_head_dim),
         max_seq_len=MAX_MODEL_LEN,
+        request_slots=DECLARED_MAX_NUM_SEQS,
     )
     runner._glm5next_side_cache_cursor = int(position)
 
@@ -564,10 +565,18 @@ def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
     NEITHER BUILDER NARROWS A ROW TO THE ONE SLOT A RECURRENT BANK USES. The warmup builder
     writes ``torch.arange(max_num_blocks_per_req)`` (``neuron_model_runner.py:4437-4442``) and
     the serving builder slices the group's own table (``neuron_model_runner.py:4246``), whose
-    width is ``max_model_len`` over the page size. The slot the scheduler allocated is the row's
-    first entry and the rest is the table's padding, so a converter that asked a recurrent row
-    to be one entry wide would refuse every hybrid step. Both shapes are driven here, each named
-    in its own failure message.
+    width is ``max_model_len`` over the page size, so a converter that asked a recurrent row to
+    be one entry wide would refuse every hybrid step. Both shapes are driven here, each named in
+    its own failure message.
+
+    RE-PINNED. The state slot no longer comes from the block table at all: it is the request's
+    own, handed out by the slot table the runner keys on request id, and the carrier holds one
+    view per request rather than one tensor. The reading this replaces, verbatim: "The slot the
+    scheduler allocated is the row's first entry and the rest is the table's padding" -- graded
+    as ``carrier["recurrent_state"].data_ptr() == state[row[0]].data_ptr()``. What survives is
+    the acceptance this item is named for: the full-width row is served rather than refused. What
+    replaces the slot clause is the property that made the change worth making -- the two rows
+    name different first entries, and both are now served from ONE slot, which is the request's.
     """
     cpu = torch.device("cpu")
     banks = [_linear_bank(cpu)]
@@ -581,6 +590,7 @@ def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
         ),
     }
 
+    served = {}
     for what, row in shapes.items():
         runner = _runner(banks)
         entry = _entry(
@@ -603,7 +613,18 @@ def test_b01_a_recurrent_row_at_the_tables_width_is_accepted() -> None:
             ) from refused
 
         carrier = translated["layer_carriers"][0]
-        state = banks[0]["recurrent_state"]
-        assert carrier["recurrent_state"].data_ptr() == state[row[0]].data_ptr(), (
-            f"{what} was served from a slot other than its first entry, {row[0]}"
+        assert len(carrier["recurrent_state"]) == 1, (
+            f"{what} names one request, and its carrier holds "
+            f"{len(carrier['recurrent_state'])} state view(s)"
         )
+        served[what] = carrier["recurrent_state"][0].data_ptr()
+
+    state = banks[0]["recurrent_state"]
+    assert len(set(served.values())) == 1, (
+        f"the two rows were served from different slots, so the slot still follows the "
+        f"block table: {served}"
+    )
+    assert set(served.values()) == {state[0].data_ptr()}, (
+        f"neither row was served from the slot the request table hands a step with no "
+        f"request of its own, which is slot 0: {served}"
+    )
