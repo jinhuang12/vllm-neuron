@@ -43,7 +43,7 @@ TRANSLATED_KEYS = sorted(
 )
 
 #: The values the root defaults the three arguments to, which the runner passes explicitly
-#: below expert-parallel degree 2.
+#: below expert-parallel degree 2; the rank travels as a tensor and is read back as an int.
 UNSHARDED = {"moe_group": None, "tp_degree": 1, "expert_parallel_rank": 0}
 
 #: The mesh the fork serves this model on: 64 ranks in 16 expert groups of 4.
@@ -136,10 +136,21 @@ def _translated_prompt(runner) -> dict:
     )
 
 
+def _rank_of(call: dict) -> int:
+    """The expert-parallel rank one call carries, read off the tensor or the int it holds."""
+    rank = call.get("expert_parallel_rank")
+    return -1 if rank is None else int(rank)
+
+
+def _as_ints(supplied: dict) -> dict:
+    """The resolver's mapping with its rank tensor read back as an int, for comparison."""
+    return {**supplied, "expert_parallel_rank": _rank_of(supplied)}
+
+
 def _served(call: dict, ep_rank: int, group: _StandInGroup) -> bool:
     """Whether one root call carries the stand-in state's values and not the defaults."""
     return (
-        call.get("expert_parallel_rank") == ep_rank
+        _rank_of(call) == ep_rank
         and call.get("tp_degree") == group.world_size
         and call.get("moe_group") is group
     )
@@ -158,11 +169,13 @@ def test_below_degree_two_the_defaults_are_handed_over_explicitly(monkeypatch):
     print(
         f"PAR|DEFAULTS|keys={sorted(supplied)} moe_group={supplied['moe_group']} "
         f"tp_degree={supplied['tp_degree']} "
-        f"expert_parallel_rank={supplied['expert_parallel_rank']} live_matches={live == supplied}"
+        f"expert_parallel_rank={_rank_of(supplied)} "
+        f"live_matches={_as_ints(live) == _as_ints(supplied)}"
     )
     assert sorted(supplied) == PARALLEL_KWARG_KEYS
-    assert supplied == UNSHARDED
-    assert live == UNSHARDED
+    assert isinstance(supplied["expert_parallel_rank"], torch.Tensor)
+    assert _as_ints(supplied) == UNSHARDED
+    assert _as_ints(live) == UNSHARDED
 
 
 def test_every_rank_reads_its_own_expert_rank_degree_and_group(monkeypatch):
@@ -176,10 +189,10 @@ def test_every_rank_reads_its_own_expert_rank_degree_and_group(monkeypatch):
             )
             supplied = _shell()._glm5next_parallel_kwargs()
             assert sorted(supplied) == PARALLEL_KWARG_KEYS
-            assert supplied["expert_parallel_rank"] == ep_rank, (rank, supplied)
+            assert _rank_of(supplied) == ep_rank, (rank, supplied)
             assert supplied["tp_degree"] == tp_degree, (rank, supplied)
             assert supplied["moe_group"] is group, (rank, supplied)
-            resolved.append(supplied["expert_parallel_rank"])
+            resolved.append(_rank_of(supplied))
         print(
             f"PAR|MESH|world={world_size} ep={ep_degree} tp_degree={tp_degree} "
             f"ranks={world_size} distinct_ep_ranks={len(set(resolved))} "
@@ -228,11 +241,11 @@ def test_the_translation_carries_the_three_arguments_and_the_root_binds_them(mon
     )
     print(
         f"PAR|TRANSLATION|keys={sorted(translated)} "
-        f"expert_parallel_rank={translated['expert_parallel_rank']} "
+        f"expert_parallel_rank={_rank_of(translated)} "
         f"tp_degree={translated['tp_degree']} "
         f"group_is_the_states={translated['moe_group'] is group}"
     )
-    assert ep_rank != 0 and translated["expert_parallel_rank"] == ep_rank
+    assert ep_rank != 0 and _rank_of(translated) == ep_rank
     assert translated["tp_degree"] == SERVE_WORLD_SIZE // SERVE_EP_DEGREE
     assert translated["moe_group"] is group
     inspect.signature(root.forward).bind(**translated)
