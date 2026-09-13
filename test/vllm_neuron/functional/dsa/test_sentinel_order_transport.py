@@ -143,6 +143,11 @@ def test_equal_to_the_frozen_order_at_8_by_16():
     _assert_equal_at(8, 16)
 
 
+def test_equal_to_the_frozen_order_at_4_by_1():
+    """The narrowest width the gate admits, padded on chip to eight, equals the frozen order."""
+    _assert_equal_at(4, 1)
+
+
 def test_no_host_scatter_on_the_nki_route():
     """The method's code holds no scatter, where or cumsum: nothing for the compiler to lay out."""
     code = _method_code()
@@ -249,3 +254,23 @@ def test_kernel_identity_after_dispatch_names_the_nki_kernel():
     identity = seam.sentinel_order_kernel_identity()
     _emit("IDENTITY_AFTER", identity=identity)
     assert identity == (_SEAM, "_sentinel_order_nki")
+
+
+def test_the_gate_ceiling_is_the_widest_row_whose_tiles_fit_one_partition():
+    """The ceiling is the largest width whose footprint fits, and 2048 sits under it."""
+    from vllm_neuron.functional.dsa.sentinel_order import (
+        SBUF_BYTES_PER_PARTITION, SEARCH_MAX_FREE, can_run_dsa_sentinel_order,
+        sentinel_order_sbuf_bytes)
+    fitting = [k for k in range(1, 16385)
+               if sentinel_order_sbuf_bytes(k) <= SBUF_BYTES_PER_PARTITION]
+    ceiling = max(fitting)
+    admits_2048 = can_run_dsa_sentinel_order(torch.zeros((1, 2048), dtype=torch.int32))
+    refuses_above = not can_run_dsa_sentinel_order(
+        torch.zeros((1, SEARCH_MAX_FREE + 1), dtype=torch.int32))
+    _emit("CEILING", ceiling=ceiling, gate=SEARCH_MAX_FREE, budget=SBUF_BYTES_PER_PARTITION,
+          bytes_at_ceiling=sentinel_order_sbuf_bytes(ceiling), admits_2048=admits_2048,
+          refuses_above=refuses_above)
+    assert SEARCH_MAX_FREE == ceiling
+    assert sentinel_order_sbuf_bytes(ceiling + 1) > SBUF_BYTES_PER_PARTITION
+    assert 2048 <= SEARCH_MAX_FREE and admits_2048
+    assert refuses_above

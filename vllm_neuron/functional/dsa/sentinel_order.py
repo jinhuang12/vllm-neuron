@@ -14,9 +14,11 @@ That is what lets the kernel pad a width that is not a multiple of eight (the se
 with trailing sentinel columns -- a pad lands after every real column and after every original
 sentinel, so the first ``k`` ordered columns are the unpadded answer and only those are stored.
 The order is exact for integer ids: the counts and the search key are fp32, and
-``can_run_dsa_sentinel_order`` admits only ``k <= SEARCH_MAX_FREE`` (16384) columns, so the padded
-width is at most 16384 as well and no value the kernel computes exceeds it, far below the 2**24 an
-fp32 holds exactly; a wider row takes the torch oracle.
+``can_run_dsa_sentinel_order`` admits at most ``SEARCH_MAX_FREE`` columns -- the widest row whose
+tiles fit one SBUF partition, derived from ``sentinel_order_sbuf_bytes`` and
+``SBUF_BYTES_PER_PARTITION`` rather than typed -- so neither the padded width nor any value the
+kernel computes exceeds a few thousand, far below the 2**24 an fp32 holds exactly; a wider row
+takes the torch oracle.
 """
 
 from __future__ import annotations
@@ -38,8 +40,27 @@ logger = logging.getLogger(__name__)
 
 PARTITION_MAX = 128
 SEARCH_WIDTH = 8
-SEARCH_MAX_FREE = 16384
+# The SBUF bytes one partition offers a kernel on trn2, as the vendor kernel library states them
+# (its ``MAX_AVAILABLE_SBUF_SIZE``): 224 KiB less the reserved head and tail.
+SBUF_BYTES_PER_PARTITION = 224 * 1024 - 16384 - 8 - 520
 _SUPPORTED_DTYPES = (torch.int32,)
+
+
+def sentinel_order_sbuf_bytes(k: int) -> int:
+    """SBUF bytes one partition needs for a ``k``-wide row: 12 padded tiles, 3 int32, 2 scalars."""
+    k_pad = -(-k // SEARCH_WIDTH) * SEARCH_WIDTH
+    return 48 * k_pad + 12 * k + 8
+
+
+def _widest_row_that_fits() -> int:
+    """The largest ``k`` whose tiles fit one partition; the footprint only grows with ``k``."""
+    k = SBUF_BYTES_PER_PARTITION // 60  # every row needs at least 60 bytes per column
+    while sentinel_order_sbuf_bytes(k) > SBUF_BYTES_PER_PARTITION:
+        k -= 1
+    return k
+
+
+SEARCH_MAX_FREE = _widest_row_that_fits()
 
 
 class SentinelOrderError(ValueError):
@@ -85,8 +106,9 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 def _sentinel_order_nki(pool_ids_hbm):
     """``[rows, k]`` int32 as stored -> the same ids, the negatives moved to the trailing columns.
 
-    Any width up to 16384: the counted width is padded to a multiple of eight with trailing sentinel
-    columns, which the stable partition places after every real and every original sentinel.
+    Any width up to ``SEARCH_MAX_FREE``: the counted width is padded to a multiple of eight with
+    trailing sentinel columns, which the stable partition places after every real and every
+    original sentinel.
     """
     rows = pool_ids_hbm.shape[0]
     k = pool_ids_hbm.shape[1]
@@ -173,9 +195,9 @@ def dsa_sentinel_order(pool_ids: Tensor) -> Tensor:
     """THE COUNTED SEAM. ``[rows, select_k]`` pool ids, the negatives moved to the trailing columns.
 
     Real ids keep their relative order and so do the sentinels; the multiset of every row is
-    unchanged. int32 with 1 to 16384 columns takes the NKI route, a width that is not a multiple
-    of 8 padded on chip with trailing sentinel columns; any other call is served by the torch
-    oracle. Raises ``SentinelOrderError`` for a tensor that is not 2-D.
+    unchanged. int32 with 1 to ``SEARCH_MAX_FREE`` columns takes the NKI route, a width that is
+    not a multiple of 8 padded on chip with trailing sentinel columns; any other call is served by
+    the torch oracle. Raises ``SentinelOrderError`` for a tensor that is not 2-D.
     """
     rows, k = _validate(pool_ids)
     if not can_run_dsa_sentinel_order(pool_ids):
