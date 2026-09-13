@@ -44,15 +44,6 @@ if TYPE_CHECKING:
     VLLM_NEURON_SKIP_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_PREFILL_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_ENCODER_WARMUP: bool = False
-    # How many ranks run warmup at the same time. Warmup traces and compiles in
-    # each rank's own process, so the peak is one compile times the wave size:
-    # 8 x 35.4 GiB is about 283 GiB over the ~131 GiB resident floor, well
-    # inside the ~1869 GiB of headroom a 2 TiB host has. 35.4 GiB is the
-    # largest resident size measured at the moment the kernel killed a rank, so
-    # it is a LOWER bound on the real peak; eight ranks stay inside the headroom
-    # even if the true peak is 230 GiB, where sixteen would need it under 117.
-    # At or above the world size, every rank after rank 0 warms up in one wave.
-    VLLM_NEURON_WARMUP_WAVE_SIZE: int = 8
     # Force the STATIC FP8 (non-MX) attention path on TRN3 even when STATIC_MX
     # kernels are available. Used by FP8 model factories as an escape hatch.
     VLLM_NEURON_FORCE_STATIC_FP8: bool = False
@@ -119,23 +110,6 @@ def maybe_convert_int(value: str | None) -> int | None:
     if value is None:
         return None
     return int(value)
-
-
-def require_positive_int(name: str, value: int) -> int:
-    """Return ``value`` when it is at least 1, else raise ValueError."""
-    if value < 1:
-        raise ValueError(f"{name} must be at least 1, got {value}")
-    return value
-
-
-def warmup_wave_size(default: int = 8) -> int:
-    """Read the warmup wave size: unset gives the default, a set value must be positive."""
-    raw = os.getenv("VLLM_NEURON_WARMUP_WAVE_SIZE")
-    if raw is None:
-        return default
-    # `or default` would read a set "0" as the default and warm every rank up at once, which
-    # is the state this knob exists to prevent, so the value is converted and then checked.
-    return require_positive_int("VLLM_NEURON_WARMUP_WAVE_SIZE", int(raw))
 
 
 def maybe_convert_float(value: str | None) -> float | None:
@@ -235,8 +209,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_SKIP_ENCODER_WARMUP": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_ENCODER_WARMUP")) or False
     ),
-    # Ranks warming up at once; see the field for the memory arithmetic.
-    "VLLM_NEURON_WARMUP_WAVE_SIZE": warmup_wave_size,
     # Skip decode warmup/compilation without requiring kv-transfer-config.
     # Useful for prefill-only profiling workflows.
     "VLLM_NEURON_SKIP_DECODE_WARMUP": lambda: (

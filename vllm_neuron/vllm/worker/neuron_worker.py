@@ -317,18 +317,6 @@ class _SuppressModelRegistryOverwrite(logging.Filter):
         return not self._PATTERN.search(record.getMessage())
 
 
-def warmup_rank_waves(world_size: int, wave: int) -> list[list[int]]:
-    """Partition TP ranks into warmup waves: rank 0 alone, then waves of ``wave``."""
-    if world_size < 1:
-        raise ValueError(f"world_size must be at least 1, got {world_size}")
-    if wave < 1:
-        raise ValueError(f"wave must be at least 1, got {wave}")
-    followers = list(range(1, world_size))
-    return [[0]] + [
-        followers[start : start + wave] for start in range(0, len(followers), wave)
-    ]
-
-
 def _exchange_warmup_status(phase: str, bucket: str, where: str, failure) -> None:
     """Sum the failed-rank count across the TP group, then raise if any rank failed."""
     # The exchange IS the barrier, and it carries how many ranks failed. A bare barrier would
@@ -341,52 +329,6 @@ def _exchange_warmup_status(phase: str, bucket: str, where: str, failure) -> Non
         raise RuntimeError(
             f"warmup {phase} bucket={bucket} {where}: {failed_total} rank(s) failed"
         )
-
-
-def run_warmup_in_waves(phase: str, bucket: str, work) -> None:
-    """Run ``work`` on this rank in its warmup wave, exchanging status after every wave.
-
-    The wave size bounds how many ranks compile at once, and what it protects is ONE HOST's
-    memory. The ranks come from the TP group, so the bound holds while that group is the set
-    of workers sharing a host: with several replicas on one host the size has to be divided by
-    their number, and with a TP group spread over nodes each host runs fewer than the size.
-    """
-    tp_group = get_tp_group()
-    waves = warmup_rank_waves(tp_group.world_size, envs.VLLM_NEURON_WARMUP_WAVE_SIZE)
-    rank = tp_group.rank_in_group
-    if rank == 0:
-        logger.info(
-            "warmup waves: %s waves, sizes %s",
-            len(waves),
-            [len(ranks) for ranks in waves],
-        )
-    for index, ranks in enumerate(waves, 1):
-        failure = None
-        if rank in ranks:
-            logger.info(
-                "warmup %s bucket=%s wave=%s/%s rank=%s start",
-                phase,
-                bucket,
-                index,
-                len(waves),
-                rank,
-            )
-            started = time.perf_counter()
-            try:
-                work()
-            except Exception as exc:  # the group is told before this rank re-raises
-                failure = exc
-            else:
-                logger.info(
-                    "warmup %s bucket=%s wave=%s/%s rank=%s done elapsed=%.1fs",
-                    phase,
-                    bucket,
-                    index,
-                    len(waves),
-                    rank,
-                    time.perf_counter() - started,
-                )
-        _exchange_warmup_status(phase, bucket, f"wave={index}/{len(waves)}", failure)
 
 
 def _rss_kib() -> int:

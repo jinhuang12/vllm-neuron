@@ -9,23 +9,23 @@ THE DECLARED ACCEPTANCE COMMAND, verbatim:
       -rA -s -p no:cacheprovider --timeout=5400
 
 A warmup call executes the model, and the model's forward carries collectives over the
-whole tensor-parallel group. So the ranks a wave leaves out wait in the status exchange
-while the ranks inside the wave wait for them in the collective, and neither side can
-move. What a wave CAN bound is a step that talks to no other rank.
+whole tensor-parallel group. A subset of the ranks therefore cannot run it: the ranks
+left out wait in the status exchange while the ranks inside wait for them in the
+collective, and neither side can move. Nothing in this warmup path talks to no other
+rank, so there is no step left to run on a subset.
 
 Six items, ONE test each, no ``parametrize``:
 
 * T01 -- the all-rank runner completes ``work`` that holds an all-rank collective.
-* T02 -- the wave runner completes that same ``work`` on NO rank.
-* T03 -- prefill graph capture never calls the model.
-* T04 -- the prefill warmup call does call it, which is what makes T03's zero a reading.
-* T05 -- prefill warmup drives the all-rank runner and not the wave runner.
-* T06 -- decode warmup does the same.
-* T07 -- every rank logs its resident size on both sides of the executing call.
+* T02 -- prefill graph capture never calls the model.
+* T03 -- the prefill warmup call does call it, which is what makes T02's zero a reading.
+* T04 -- prefill warmup drives the all-rank runner.
+* T05 -- decode warmup does the same.
+* T06 -- every rank logs its resident size on both sides of the executing call.
 
-T01 and T02 are one measurement in two arms and both print the ranks that finished, so
-the transcript carries the numbers rather than only a verdict. Run pytest with ``-s``.
-The collective in T02 is given a timeout, because an unbounded wait is the defect itself.
+T01 prints the ranks that finished, so the transcript carries the number rather than only
+a verdict, and its collective is given a timeout because an unbounded wait is the failure
+it guards against. Run pytest with ``-s``.
 """
 
 import re
@@ -98,7 +98,6 @@ def _run_group(monkeypatch, runner):
     monkeypatch.setattr(neuron_worker, "get_tp_group", lambda: _Group(WORLD))
     monkeypatch.setattr(neuron_worker, "tp_sum_int", exchange)
     monkeypatch.setattr(neuron_worker, "tp_barrier", exchange)
-    monkeypatch.setenv("VLLM_NEURON_WARMUP_WAVE_SIZE", "1")
 
     def work():
         collective.wait(timeout=COLLECTIVE_TIMEOUT)
@@ -171,13 +170,6 @@ def test_the_all_rank_runner_completes_an_all_rank_collective(monkeypatch):
     assert errors == {}
 
 
-def test_the_wave_runner_completes_it_on_no_rank(monkeypatch):
-    finished, errors = _run_group(monkeypatch, neuron_worker.run_warmup_in_waves)
-    print(f"warmup_waves|world={WORLD}|finished={finished}|errors={len(errors)}")
-    assert finished == []
-    assert len(errors) == WORLD
-
-
 def test_prefill_graph_capture_never_calls_the_model():
     from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
@@ -207,11 +199,6 @@ def test_prefill_warmup_drives_the_all_rank_runner(monkeypatch):
         "run_warmup_on_all_ranks",
         lambda phase, bucket, work: drivers.append(("all_ranks", phase)),
     )
-    monkeypatch.setattr(
-        neuron_worker,
-        "run_warmup_in_waves",
-        lambda phase, bucket, work: drivers.append(("waves", phase)),
-    )
     worker = types.SimpleNamespace(_prefill_buckets=lambda: ([2048], [2048]))
     NeuronWorker._warmup_prefill(worker)
     assert drivers == [("all_ranks", "prefill")]
@@ -223,11 +210,6 @@ def test_decode_warmup_drives_the_all_rank_runner(monkeypatch):
         neuron_worker,
         "run_warmup_on_all_ranks",
         lambda phase, bucket, work: drivers.append(("all_ranks", phase)),
-    )
-    monkeypatch.setattr(
-        neuron_worker,
-        "run_warmup_in_waves",
-        lambda phase, bucket, work: drivers.append(("waves", phase)),
     )
     worker = types.SimpleNamespace(_decode_compile_targets=lambda: [(1, 2048)])
     NeuronWorker._warmup_decode(worker)
