@@ -36,15 +36,19 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   (tripwire: the previous commit's walk refused a second row). The SPARSE arm: on a
   hybrid stack the same batch is refused by name at the sparse carrier, which takes
   one contiguous slice of the paged latent bank.
-* A2, TEN ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
+* A2, TEN ARMS -- a finished request's slot is reused and the state it hands over READS
+  zero, which is not the same as being written at hand-out: the side caches are rebuilt
+  rather than cleared in place, and nothing is written to the recurrent banks there at
+  all -- the zero is SELECTED where the state is read. The arm's reading is unchanged and
+  its name still says zeroed, which is a name left alone on purpose; an
   over-admission refuses by name; a synthetic step takes no claim; the prefill
   WARMUP's own shape, which has no request at all, is served from slot 0 and takes
   no claim either; the per-sequence side caches carry ONE set per admitted sequence
   and not one per bank slot; a live request the scheduler skips for one step
   keeps its slot and its state; and a stack whose recurrent banks hold FEWER slots
   than the engine admits sequences refuses by name. Tripwires: a table that never
-  frees cannot seat the later request, one that frees without zeroing fails the zero
-  read, a synthetic step that seated itself changes the table, a converter that
+  frees cannot seat the later request, one that frees without leaving a state that reads
+  zero fails that read, a synthetic step that seated itself changes the table, a converter that
   demands an identity from warmup raises where the base served it, an allocator sized
   by the block space reports the bank's slot count as its axis, a table that frees on
   absence loses the skipped request's slot and recurrence, and a capacity read that

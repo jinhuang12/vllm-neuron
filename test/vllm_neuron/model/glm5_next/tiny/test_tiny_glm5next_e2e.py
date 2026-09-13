@@ -2487,8 +2487,10 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     through.
 
     THE MUST-FAIL CONTROL is the same call one position lower. At position 0 it is served,
-    which is what shows the refusal is decided by the position rather than by something
-    incidental to the call. If both positions refused, the carve-out would be dead and
+    which is what shows the refusal is decided by what the step has already COMPUTED --
+    nothing at position 0, something above it -- rather than by anything incidental to the
+    call. The position is how this arm varies that count; the count is what the code reads.
+    If both positions refused, the carve-out would be dead and
     every warmup broken; if neither refused, the cursor would guard nothing.
 
     THE CONTROL READS THE REQUEST-LESS SHAPE, re-pinned. The refused call names a request,
