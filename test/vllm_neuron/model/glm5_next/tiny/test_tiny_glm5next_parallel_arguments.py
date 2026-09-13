@@ -14,6 +14,7 @@ reach the root at every site the CPU lane can drive, and the expert bank behind 
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +63,11 @@ NARROW_RANK = NARROW_WORLD_SIZE - 1
 #: The model call sites the runner declares: three warmups, execute, the idle dummy step and
 #: three graph captures.
 RUNNER_MODEL_CALL_SITES = 8
+
+#: The one row the first resolve on a runner logs, which a serve's log carries once per rank.
+LOG_ROW = re.compile(
+    r"glm5next parallel arguments rank=[0-9]+ ep_rank=[0-9]+ ep_degree=[0-9]+ tp_degree=[0-9]+"
+)
 
 _RUNNER_SOURCE = Path(runner_module.__file__)
 _MODEL_CALL = re.compile(r"self\.(?:capture_backend_)?model\(\*\*(?P<splat>[^)]*)\)")
@@ -181,6 +187,30 @@ def test_every_rank_reads_its_own_expert_rank_degree_and_group(monkeypatch):
         )
         assert sorted(set(resolved)) == list(range(ep_degree))
         assert all(resolved.count(ep_rank) == tp_degree for ep_rank in range(ep_degree))
+
+
+def test_the_first_resolve_logs_one_row_naming_the_rank(monkeypatch, caplog):
+    """One INFO row per runner names the rank's group and degrees; a second resolve adds none."""
+    ep_rank, group = _install_state(
+        monkeypatch,
+        world_size=SERVE_WORLD_SIZE,
+        ep_degree=SERVE_EP_DEGREE,
+        rank=SERVE_WORLD_SIZE - 1,
+    )
+    runner = _shell()
+    with caplog.at_level(logging.INFO, logger=runner_module.__name__):
+        runner._glm5next_parallel_kwargs()
+        runner._glm5next_parallel_kwargs()
+    rows = [record for record in caplog.records if LOG_ROW.search(record.getMessage())]
+    row = rows[0].getMessage() if rows else None
+    level = rows[0].levelname if rows else None
+    print(f"PAR|LOG|rows={len(rows)} level={level} row={row}")
+    assert len(rows) == 1
+    assert row == (
+        f"glm5next parallel arguments rank=0 ep_rank={ep_rank} ep_degree={SERVE_EP_DEGREE} "
+        f"tp_degree={group.world_size}"
+    )
+    assert level == "INFO" and "'" not in row and '"' not in row
 
 
 def test_the_translation_carries_the_three_arguments_and_the_root_binds_them(monkeypatch):

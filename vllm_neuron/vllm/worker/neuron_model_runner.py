@@ -6455,18 +6455,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         defaults are handed over EXPLICITLY, so every site passes the same six keys and a
         missing key cannot pass for degree 1. The state module is read through its
         attributes, the way ``factory._resolve_ep_degree`` reads it, so a test can stand in
-        for a collective it cannot initialise.
+        for a collective it cannot initialise. The first resolve on a runner logs ONE row --
+        ``glm5next parallel arguments rank= ep_rank= ep_degree= tp_degree=`` -- so a serve's log
+        carries one row per rank naming the expert group that rank read.
         """
         from vllm_neuron.parallel import neuron_parallel_state as parallel_state
 
-        if int(parallel_state.get_neuron_ep_degree()) < 2:
-            return {"moe_group": None, "tp_degree": 1, "expert_parallel_rank": 0}
-        moe_group = parallel_state.get_neuron_ep_tp_group()
-        return {
-            "moe_group": moe_group,
-            "tp_degree": int(moe_group.world_size),
-            "expert_parallel_rank": int(parallel_state.get_neuron_ep_rank()),
-        }
+        ep_degree = int(parallel_state.get_neuron_ep_degree())
+        if ep_degree < 2:
+            supplied = {"moe_group": None, "tp_degree": 1, "expert_parallel_rank": 0}
+        else:
+            moe_group = parallel_state.get_neuron_ep_tp_group()
+            supplied = {
+                "moe_group": moe_group,
+                "tp_degree": int(moe_group.world_size),
+                "expert_parallel_rank": int(parallel_state.get_neuron_ep_rank()),
+            }
+        if not getattr(self, "_glm5next_parallel_reported", False):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.info(
+                "glm5next parallel arguments rank=%d ep_rank=%d ep_degree=%d tp_degree=%d",
+                rank, supplied["expert_parallel_rank"], ep_degree, supplied["tp_degree"],
+            )
+            self._glm5next_parallel_reported = True
+        return supplied
 
     def _glm5next_position_arm(
         self, slot: int, start_position: int, *, side_caches, is_prefill: bool
