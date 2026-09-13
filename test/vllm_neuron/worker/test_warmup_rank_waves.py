@@ -63,9 +63,11 @@ def _run_on(monkeypatch, world_size, rank, wave, work=None, fail_on_wave=0):
     monkeypatch.setattr(
         neuron_worker, "get_tp_group", lambda: _Group(world_size, rank)
     )
-    monkeypatch.setattr(
-        neuron_worker.envs, "VLLM_NEURON_WARMUP_WAVE_SIZE", wave, raising=False
-    )
+    # The variable, never the module attribute. ``vllm_neuron.envs`` serves these names from a
+    # module ``__getattr__``, which Python consults only while the name is absent from the module
+    # dict; patching the attribute makes monkeypatch write the value it read back as a real
+    # attribute on undo, and that shadows the reader for every item after this one.
+    monkeypatch.setenv("VLLM_NEURON_WARMUP_WAVE_SIZE", str(wave))
 
     def _sum(value):
         exchanges.append(value)
