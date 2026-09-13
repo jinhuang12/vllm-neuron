@@ -38,8 +38,19 @@ the head dimension has to be the partition axis of both tiles on the way in. The
 turn itself: each slab is loaded exactly as the caller stores it and transposed on the PE through a
 PSUM tile of its own dtype, ``k`` once per call and ``q`` once per (token tile, head). The transpose
 destination has to match the input dtype on this generation, and a bf16 value written to a bf16 tile
-cannot round, so the operands the matmul sees are the ones the caller holds. Nothing stands between
-the indexer's ``q`` and ``k`` and this kernel.
+cannot round, so for FINITE operands the matmul sees exactly the values the caller holds and the
+scores are bit-identical to the host-relayout kernel (measured at four shapes in the simulator).
+
+WHERE THAT IDENTITY STOPS. The PE turn is a matmul against an identity matrix, and the vendor rules
+it not bit-accurate when the tile holds NaN or Inf (Kaena ``nki/isa/neuron_isa.py:221-224``,
+NeuronCore-v2): a non-finite element can reach every output of its partition column, so one bad
+query element can touch its whole 128-token tile for that head, and one bad key element its whole
+128-candidate tile for every token, where the host copy kept it to the one token or candidate.
+Outside that tile nothing changes, and the bad row itself changes in both kernels; the CPU items
+prove exactly that and record what the simulator emits inside the tile. No host-side finiteness
+scan stands on this path: the callers hand this seam a Hadamard-rotated query
+(``model_fp8.py:5141-5146``) and a normalised key (``:5153-5156``), neither of which removes a
+non-finite value, and a scan per call would cost more than the transport it replaces.
 
 WHAT THE OUTPUT DTYPE IS, AND WHY IT IS NOT NEGOTIABLE. fp32. Three independent reasons agree, so
 this is not a preference: ``nc_matmul`` writes an fp32 PSUM destination on this generation and always
@@ -232,10 +243,10 @@ def _transpose_tile(src_sb, rows, cols):
 
 
 def _keys_transposed(k_hbm, head_dim, cands):
-    """``k`` as stored, ``[cands, head_dim]`` -> ``[head_dim, cands]`` SBUF, one turn per 128 rows."""
+    """``k`` as stored, ``[cands, head_dim]`` -> ``[head_dim, cands]`` SBUF, one PE turn per 128 rows."""
     kt = nl.ndarray((head_dim, cands), dtype=k_hbm.dtype, buffer=nl.sbuf)
-    for c0 in range(0, cands, head_dim):
-        cw = min(head_dim, cands - c0)
+    for c0 in range(0, cands, CONTRACTION_TILE):
+        cw = min(CONTRACTION_TILE, cands - c0)
         k_sb = nl.ndarray((cw, head_dim), dtype=k_hbm.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(dst=k_sb, src=nl.load(k_hbm[c0:c0 + cw, :]))
         nisa.tensor_copy(dst=kt[:, c0:c0 + cw], src=_transpose_tile(k_sb, cw, head_dim))
@@ -258,6 +269,8 @@ def _score_gemm_nki(q_hbm, k_hbm, w_hbm):
     THE TRANSPORT IS ON CHIP. Every operand slab is a ``[rows, head_dim]`` tile, ``rows <= 128``,
     loaded as stored and turned by one PE ``nc_transpose`` into a PSUM tile of the same dtype, then
     copied to SBUF; ragged ``rows`` need no padding because the PE takes any tile up to (128, 128).
+    The turn is exact for finite values; a NaN or Inf in a slab is confined to that slab's tile and
+    is not bit-accurate through the PE (module docstring, "WHERE THAT IDENTITY STOPS").
     ``k`` is turned ONCE per call into ``[head_dim, cands]`` and each (token tile, candidate tile,
     head) reads a column range of it: at ``cands`` 1024 that tile is 2,048 bytes per partition,
     262,144 bytes of SBUF in all; at 512, half of that.

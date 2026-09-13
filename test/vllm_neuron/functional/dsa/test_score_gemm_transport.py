@@ -30,7 +30,15 @@ from vllm_neuron.functional.dsa.score_gemm import (
 
 _TOKEN_TILE = 128
 _CAND_TILE = 512
-_RELAYOUT_FORMS = (r"\.permute\([^)]*\)\.contiguous\(\)", r"\.t\(\)\.contiguous\(\)")
+_RELAYOUT_FORMS = (
+    r"(?<!torch)\.permute\([^)]*\)\.contiguous\(\)",
+    r"\.t\(\)\.contiguous\(\)",
+    r"\.transpose\([^)]*\)\.contiguous\(\)",
+    r"\.movedim\([^)]*\)\.contiguous\(\)",
+    r"torch\.permute\([^)]*\)\.contiguous\(\)",
+    r"\.m?T\.contiguous\(\)",
+)
+_NO_RELAYOUT = (0,) * len(_RELAYOUT_FORMS)
 
 
 def _emit(tag: str, **values: object) -> None:
@@ -129,20 +137,64 @@ def test_bit_identical_to_the_landed_kernel_at_2048_tokens_32_heads_512_cands():
 
 
 def test_no_host_relayout_on_the_nki_route():
-    """The module's own bytes carry neither host relayout form."""
+    """The module's own bytes carry none of the six host relayout spellings."""
     counts = _relayout_counts(pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
-    _emit("NO_HOST_RELAYOUT", permute_contiguous=counts[0], t_contiguous=counts[1])
-    assert counts == (0, 0)
+    _emit("NO_HOST_RELAYOUT", forms=len(counts), counts=counts)
+    assert counts == _NO_RELAYOUT
 
 
 def test_control_the_relayout_reader_fires_on_a_planted_form():
-    """The same reader counts one of each form in a planted text."""
+    """The same reader counts one of each spelling in a planted text."""
     planted = "".join(
-        ("qt = q", ".permute(1, 2, 0)", ".contiguous()\nkt = k", ".t()", ".contiguous()\n")
+        ("qt = q", ".permute(1, 2, 0)", ".contiguous()\nkt = k", ".t()", ".contiguous()\n",
+         "a = x", ".transpose(0, 1)", ".contiguous()\nb = x", ".movedim(0, 2)", ".contiguous()\n",
+         "c = torch", ".permute(x, 1, 0)", ".contiguous()\nd = x", ".T", ".contiguous()\n")
     )
     counts = _relayout_counts(planted)
-    _emit("CONTROL_RELAYOUT_READER_FIRES", permute_contiguous=counts[0], t_contiguous=counts[1])
-    assert counts == (1, 1)
+    _emit("CONTROL_RELAYOUT_READER_FIRES", forms=len(counts), counts=counts)
+    assert counts == (1,) * len(_RELAYOUT_FORMS)
+
+
+def _tile_rows(index: int) -> slice:
+    """The 128-row PE tile that holds ``index``."""
+    start = index - index % _TOKEN_TILE
+    return slice(start, start + _TOKEN_TILE)
+
+
+def test_a_non_finite_element_stays_inside_its_tile():
+    """A NaN or Inf in ``q`` or ``k`` changes nothing outside its own 128-row tile."""
+    tokens, heads, cands = 200, 2, 300
+    q_at, k_at = (5, 1, 7), (130, 3)
+    for operand, kind in (("q", "nan"), ("q", "inf"), ("k", "nan"), ("k", "inf")):
+        q, k, weights = _inputs(tokens, heads, cands)
+        clean = _landed_scores(q, k, weights)
+        if operand == "q":
+            q[q_at] = float(kind)
+        else:
+            k[k_at] = float(kind)
+        got, want = dsa_score_gemm(q, k, weights), _landed_scores(q, k, weights)
+        same = torch.eq(got.view(torch.int32), want.view(torch.int32))
+        if operand == "q":
+            inside = torch.zeros(tokens, dtype=torch.bool)
+            inside[_tile_rows(q_at[0])] = True
+            outside_differing = int((~same[~inside]).sum().item())
+            inside_rows_differing = int((~same[inside].all(dim=1)).sum().item())
+            planted_row = got[q_at[0]]
+            clean_row = clean[q_at[0]]
+        else:
+            inside = torch.zeros(cands, dtype=torch.bool)
+            inside[_tile_rows(k_at[0])] = True
+            outside_differing = int((~same[:, ~inside]).sum().item())
+            inside_rows_differing = int((~same[:, inside].all(dim=0)).sum().item())
+            planted_row = got[:, k_at[0]]
+            clean_row = clean[:, k_at[0]]
+        _emit("NONFINITE", operand=operand, kind=kind, outside_tile_differing=outside_differing,
+              inside_tile_rows_differing=inside_rows_differing,
+              planted_row_changed=not torch.equal(planted_row, clean_row),
+              planted_row_nonfinite=int((~torch.isfinite(planted_row)).sum().item()),
+              planted_row_len=int(planted_row.numel()))
+        assert outside_differing == 0
+        assert not torch.equal(planted_row, clean_row)
 
 
 def test_the_four_shapes_take_nki_with_zero_fallback():
