@@ -445,7 +445,9 @@ def dsa_score_gemm(q: Tensor, k: Tensor, weights: Tensor) -> Tensor:
     # pattern exists to avoid. The counter increment stays -- a plain int attribute store is a
     # recorded side effect, not a host call.
     _record_nki_dispatch(tokens, cands, heads, head_dim)
-    return wrap_nki(_score_gemm_nki)(q, k, weights.contiguous())
+    # Same layout in, same layout out: a contiguous caller gets its own storage back, a strided
+    # one gets a plain copy. Neither is a transposing relayout; the kernel turns the operands.
+    return wrap_nki(_score_gemm_nki)(q.contiguous(), k.contiguous(), weights.contiguous())
 
 
 # ---------------------------------------------------------------------------------------------
