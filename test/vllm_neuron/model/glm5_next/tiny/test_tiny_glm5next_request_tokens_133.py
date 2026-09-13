@@ -621,6 +621,12 @@ SEED_REAL = BUCKET_TOKENS - item.MLA_INDEX_KPOOL - 2
 #: the comparison against it can never be true and the reading says nothing.
 PADDING_MARKER = -1024.0
 
+#: The request slot whose ring this item seeds. The side caches hold one set PER REQUEST
+#: SLOT, so the ring an indexer is handed is one slot's row of that set, which is what
+#: the production path hands it (``side["tail"][state_slot]``). This item allocates one
+#: slot, so its request owns the first one.
+SEED_SLOT = 0
+
 
 def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
     """The open pool's rows are the sequence's last ones, not the operand's last ones.
@@ -657,6 +663,13 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
     )
     ring = next(entry["tail"] for entry in side if "tail" in entry)
     ring.zero_()
+    # RE-PINNED (D17.1). The ring set carries a leading REQUEST-SLOT axis, and an indexer
+    # is handed one request's row of it, never the whole set. The original reading,
+    # verbatim: "written = indexer.seed_tail(ring, ..." and "float(ring[0][slot][0])" --
+    # one ring for the process, seeded and read whole. The property is the same one: the
+    # remainder comes from the chunk's last real rows. This is a view, so every write
+    # below reaches the set the marker count reads.
+    request_ring = ring[SEED_SLOT]
 
     dim = int(text_config.index_head_dim)
     rows = torch.arange(1, BUCKET_TOKENS + 1, dtype=torch.float32).reshape(-1, 1)
@@ -674,7 +687,7 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
 
     indexer = root.model.layers[0].self_attn.indexer
     written = indexer.seed_tail(
-        ring,
+        request_ring,
         key,
         gate_score,
         torch.tensor(SEED_REAL, dtype=torch.int32),
@@ -683,7 +696,7 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
 
     open_rows = SEED_REAL % pool
     want = [float(SEED_REAL - open_rows + slot + 1) for slot in range(open_rows)]
-    got = [float(ring[0][slot][0]) for slot in range(open_rows)]
+    got = [float(request_ring[0][slot][0]) for slot in range(open_rows)]
     marker_hits = int((ring.to(torch.float32) == PADDING_MARKER).sum())
     print(
         f"INC133|seeded|real={SEED_REAL}|padded={BUCKET_TOKENS}|open_rows={open_rows}"
@@ -701,7 +714,7 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
         f"the ring holds the padding marker in {marker_hits} place(s), so the remainder "
         f"was read from rows that carry no token of this sequence"
     )
-    kept = [float(ring[0][slot][0]) for slot in range(open_rows, pool)]
+    kept = [float(request_ring[0][slot][0]) for slot in range(open_rows, pool)]
     print(f"INC133|seeded_untouched|slots={list(range(open_rows, pool))}|values={kept}")
     assert kept == [0.0] * (pool - open_rows), (
         "the slots above the open pool belong to no position of this chunk and must "
