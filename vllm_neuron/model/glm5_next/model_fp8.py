@@ -5862,13 +5862,25 @@ class Glm5NextDSAIndexer(nn.Module):
         may not see and blank them afterwards, instead of choosing among the pools it may
         see. That is a different seam, and it is not the seat's to redefine.
 
-        TORCH, NOT NKI, and the same P13 note as the int64-to-int32 cast in
-        :meth:`select_bounded_pools` covers it: this is index plumbing on already-selected
-        ids, not an indexer value. It reads no scores. The fork's NKI argsort could not take
-        this shape anyway -- ``argsort_unstable`` serves ``1D [N]`` or ``2D [1, N]`` only
-        (``vllm_neuron/functional/argsort_unstable.py:23``, refusal at ``:51-53``) -- and this
-        key is ``[rows, select_k]``, so an NKI route would be one call per row or a new 2-D
-        kernel. The lead has recorded that; the substrate argument belongs to the plan rev.
+        ON CHIP, IN ONE KERNEL. The ordering is a stable partition, and a stable partition is
+        countable rather than comparable: a real id's destination is the number of reals before
+        it, a sentinel's is the real total plus the number of sentinels before it. The first
+        spelling of that here was torch -- two prefix sums through the fork's own ``cumsum``, a
+        ``where`` and an out-of-place ``scatter`` -- and it was correct, but it handed the compiler
+        an HLO scatter whose source layout the compiler chose for itself: its
+        InsertOffloadedTransposes pass reports ``load non_local int32 (2, 128, 8, 512) ... # dl =
+        tensor_op_name: _scatter`` with the 128-wide axis moved LAST, one DMA transpose per DSA
+        layer on the prefill path. So the partition now runs in
+        :func:`vllm_neuron.functional.dsa.sentinel_order.dsa_sentinel_order`: the same two prefix
+        sums as scans, the destinations as a search key, ``nc_find_index8`` for the inverse
+        permutation and ``nc_n_gather`` for the ids, rows on partitions as stored, and no scatter
+        for the compiler to lay out. That is kernel-class work, which is where the substrate note
+        in :meth:`select_bounded_pools` now lands for this seam; the torch spelling survives as that
+        module's oracle and serves any call the gate refuses. The result is exact for integer ids:
+        every count is below 2**24, a bound ``can_run_dsa_sentinel_order`` enforces by admitting
+        at most 16384 columns and sending a wider row to the torch oracle. What only the device
+        can show is whether the prefill graph's
+        refused DMA transpose was this tensor's; the kernel removes the op either way.
 
         NO SORT: THE TARGET HAS NONE. An argsort spelled this ordering until the graph reached
         the compiler, which refused it by name -- ``Operation sort is not supported on trn2.
@@ -5878,54 +5890,15 @@ class Glm5NextDSAIndexer(nn.Module):
         operation set rather than about a shape or an option, and it leaves the substrate note
         above untouched: what belongs in a kernel is one question, and whether ``sort`` runs
         here at all is another.
-
-        THE SORT WAS NEVER SORTING, which is why a cheaper form is exact rather than merely
-        close. The ordering wanted is a stable PARTITION: real ids first in their own column
-        order, sentinels after them in theirs. So each id's destination is countable instead of
-        comparable -- a real id goes to the number of reals before it, and a sentinel to the
-        real total plus the number of sentinels before it. Both counts are exclusive prefix
-        sums of one boolean mask, and together they are a bijection on every row, which is
-        what makes the result the same permutation the argsort produced and not an
-        approximation of it.
-
-        SCATTER RATHER THAN GATHER, because the inverse permutation cannot be had for free.
-        Gathering needs, for each output column, the source column that lands there -- the
-        index of the n-th set bit of the mask -- and building that needs either a scatter or a
-        search over the prefix sums. A scatter of the forward destinations is the same work
-        without the second step, and it is out-of-place: nothing is written into a slice of a
-        traced buffer, which is the failure the two graphs before this one were spent on.
-
-        THE PREFIX SUMS GO THROUGH THE FORK'S OWN ``cumsum`` AND NOT ``torch.cumsum``, which
-        this package names unsupported in the same breath as ``torch.softmax`` and
-        ``torch.multinomial`` (``functional/sampling.py:6``). ``functional/cumsum.py`` is the
-        replacement it ships: 2-D, last dimension, the NKI kernel when ``can_run_kernel``
-        allows and an upper-triangular matmul otherwise. A raw ``torch.cumsum`` here would be
-        this fork's first one inside a compiled graph, in the very change whose purpose is
-        lowerability -- one refused operation traded for another.
-
-        THE COUNTS ARE ``int32``, WHICH IS THE DTYPE THIS FORK ALREADY HANDS THAT FUNCTION
-        (``functional/moe/build_all2all_dispatch_metadata.py:218`` and
-        ``build_all2all_combine_metadata.py:85`` both pass ``int32`` counts). It is exact by
-        construction, so no ceiling argument is needed at all, and the cast to ``int64``
-        happens once at the end because scatter's index must be that width. The row's real
-        total is read off the inclusive sum's LAST COLUMN rather than taken as a second
-        reduction, which is the same number with one less operation in the graph.
         """
         if pool_ids.ndim != 2:
             raise Glm5NextDSAIndexerError(
                 f"pool_ids must be [rows, select_k] from the sentinel; got "
                 f"{tuple(pool_ids.shape)}"
             )
-        from vllm_neuron.functional.cumsum import cumsum
+        from vllm_neuron.functional.dsa.sentinel_order import dsa_sentinel_order
 
-        real = (pool_ids >= 0).to(torch.int32)
-        sentinel = 1 - real
-        reals = cumsum(real, dim=-1)
-        sentinels = cumsum(sentinel, dim=-1)
-        destination = torch.where(
-            real.bool(), reals - real, reals[:, -1:] + sentinels - sentinel
-        ).to(torch.int64)
-        return torch.zeros_like(pool_ids).scatter(1, destination, pool_ids)
+        return dsa_sentinel_order(pool_ids)
 
     def expand_indices(
         self, pool_ids: torch.Tensor, seq_lens: torch.Tensor

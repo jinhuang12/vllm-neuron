@@ -110,13 +110,15 @@ def test_b_the_result_keeps_the_inputs_dtype_and_shape(ordering) -> None:
 
 
 def test_c_the_method_body_calls_no_unsupported_operation(ordering) -> None:
-    """Both refused operations are absent, and the fork's own cumsum is present.
+    """Both refused operations are absent, and the body hands the ordering to its kernel seam once.
 
     Read as a census over the method's own source rather than over the file, so an
     argsort elsewhere in the model does not answer for this one and a line moving
     changes nothing. The census counts METHOD calls, because that is what tells
-    ``x.cumsum(...)`` -- which this target has no lowering for -- apart from the
-    ``cumsum(x)`` this package ships to replace it.
+    ``x.cumsum(...)`` -- which this target has no lowering for -- apart from a free
+    ``cumsum(x)``. Before the kernel this item wanted the torch spelling's two free
+    ``cumsum(x)`` calls; the counts now run inside the seam, so it wants zero of them
+    beside one call into ``dsa_sentinel_order``.
     """
     source = textwrap.dedent(inspect.getsource(ordering))
     path = pathlib.Path(inspect.getsourcefile(ordering))
@@ -130,11 +132,15 @@ def test_c_the_method_body_calls_no_unsupported_operation(ordering) -> None:
             names.append(node.func.id)
     refused = [m for m in methods if m in FORBIDDEN_METHODS]
     say("body_census", f"file={path.name}", f"method={METHOD}",
-        f"forbidden_calls={refused}", f"free_cumsum_calls={names.count('cumsum')}")
+        f"forbidden_calls={refused}", f"free_cumsum_calls={names.count('cumsum')}",
+        f"seam_calls={names.count('dsa_sentinel_order')}")
     assert not refused, (
         f"{METHOD} still calls {refused} as a method; this target lowers none of them"
     )
-    assert names.count("cumsum") == 2, (
-        f"{METHOD} makes {names.count('cumsum')} free cumsum calls, not the two the "
-        f"partition needs -- the counts must go through the fork's own cumsum"
+    assert names.count("cumsum") == 0, (
+        f"{METHOD} makes {names.count('cumsum')} free cumsum calls; the counts run inside "
+        f"the kernel seam, and a host cumsum here hands the compiler a layout to choose"
+    )
+    assert names.count("dsa_sentinel_order") == 1, (
+        f"{METHOD} calls dsa_sentinel_order {names.count('dsa_sentinel_order')} times, not once"
     )
