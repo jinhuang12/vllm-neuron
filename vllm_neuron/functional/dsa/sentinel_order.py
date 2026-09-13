@@ -7,11 +7,16 @@ stored. The torch spelling this replaces (two cumsums, a ``where`` and a ``scatt
 compiler to choose the scatter source's layout, and it chose a transposed one: its
 InsertOffloadedTransposes pass reports ``load non_local int32 (2, 128, 8, 512) ... # dl =
 tensor_op_name: _scatter`` with the 128-wide axis moved last, one DMA transpose per DSA layer on
-the prefill path. The kernel emits no scatter, so there is nothing for that pass to lay out. The
-order is exact for integer ids: the counts and the search key are fp32, and
-``can_run_dsa_sentinel_order`` admits only ``k <= SEARCH_MAX_FREE`` (16384) columns, so no value the
-kernel computes exceeds 16384, far below the 2**24 an fp32 holds exactly; a wider row takes the
-torch oracle.
+the prefill path. The kernel emits no scatter, so there is nothing for that pass to lay out.
+
+The partition is position-stable on both sides: real ids keep their order and so do the sentinels.
+That is what lets the kernel pad a width that is not a multiple of eight (the search's granularity)
+with trailing sentinel columns -- a pad lands after every real column and after every original
+sentinel, so the first ``k`` ordered columns are the unpadded answer and only those are stored.
+The order is exact for integer ids: the counts and the search key are fp32, and
+``can_run_dsa_sentinel_order`` admits only ``k <= SEARCH_MAX_FREE`` (16384) columns, so the padded
+width is at most 16384 as well and no value the kernel computes exceeds it, far below the 2**24 an
+fp32 holds exactly; a wider row takes the torch oracle.
 """
 
 from __future__ import annotations
@@ -78,7 +83,11 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 
 @nki.jit
 def _sentinel_order_nki(pool_ids_hbm):
-    """``[rows, k]`` int32 as stored -> the same ids the negatives moved to the trailing columns."""
+    """``[rows, k]`` int32 as stored -> the same ids, the negatives moved to the trailing columns.
+
+    Any width up to 16384: the counted width is padded to a multiple of eight with trailing sentinel
+    columns, which the stable partition places after every real and every original sentinel.
+    """
     rows = pool_ids_hbm.shape[0]
     k = pool_ids_hbm.shape[1]
     # The search reads eight values at a time, so the counted width is padded to a multiple of
