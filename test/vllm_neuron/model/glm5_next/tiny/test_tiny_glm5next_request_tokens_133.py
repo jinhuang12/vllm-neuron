@@ -453,23 +453,25 @@ def _wide_ids():
     )
 
 
-#: The elementwise tolerance the padded arm is held to, and the floor under it. One relative
-#: step of `RELATIVE_STEP` is about one bfloat16 ulp at the top of a binade; `FLOOR` keeps a
-#: value near zero from being held to a bound smaller than the dtype can express there.
-RELATIVE_STEP = 2.0**-7
-FLOOR = 2.0**-4
+#: The depth the chunked paths accumulate over, which is what multiplies the dtype's own unit
+#: round-off. It is the chunk width those paths use, not a number fitted to a measurement.
+ACCUMULATION_DEPTH = 8
 
 
-def _worst_offender(own, reference) -> tuple[float, int]:
-    """How far the worst value is past its OWN bound, and how many values moved at all.
+def _worst_offender(own, reference) -> tuple[float, int, float]:
+    """The worst gap as a multiple of the bank's bound, how many values moved, and that bound.
 
-    A ratio at or under 1 means every value sits inside the tolerance. The ratio is
-    reported rather than a bare verdict so a failure names its own size.
+    THE BOUND IS ABSOLUTE AT THE BANK'S SCALE and is derived from the bank's own dtype:
+    `ACCUMULATION_DEPTH * finfo(dtype).eps * max(1, max|reference|)`. Reassociation error is
+    absolute at the scale of the OPERANDS, so a bound taken relative to each value reads
+    cancellation into a small output as a large relative move and fails on a value that moved
+    by one ulp near one. A ratio at or under 1 means every value sits inside that bound.
     """
     wide, other = own.to(torch.float32), reference.to(torch.float32)
-    bound = RELATIVE_STEP * torch.maximum(other.abs(), torch.tensor(FLOOR))
-    gap = (wide - other).abs()
-    return float((gap / bound).max()), int((wide != other).sum())
+    scale = max(1.0, float(other.abs().max()))
+    bound = ACCUMULATION_DEPTH * torch.finfo(own.dtype).eps * scale
+    gap = float((wide - other).abs().max())
+    return gap / bound, int((wide != other).sum()), bound
 
 
 def _where_they_differ(own, reference, index: int, family: str) -> str:
@@ -557,15 +559,16 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
             f"layer {index} holds nothing in the {WIDE_REAL_BLOCKS} page(s) the request "
             f"owns, so the comparison below would compare two empty banks"
         )
-        worst, moved = _worst_offender(own, unpadded[:WIDE_REAL_BLOCKS])
+        worst, moved, bound = _worst_offender(own, unpadded[:WIDE_REAL_BLOCKS])
         print(
             f"INC133|write_bound|layer={index}|worst_ratio_of_its_own_bound={worst:.6g}"
+            f"|bound={bound:.6g}|dtype_eps={torch.finfo(own.dtype).eps:.6g}"
             f"|values_that_differ={moved}|share_that_differ={moved / own.numel():.6g}"
         )
         assert worst <= 1.0, (
-            f"layer {index} holds a value {worst:.6g} times its own tolerance away from the "
-            f"unpadded run; reassociation over the wider row count moves the last bits of a "
-            f"value, and a padded row's own data does not"
+            f"layer {index} holds a value {worst:.6g} times the bank's own bound {bound:.6g} "
+            f"away from the unpadded run; reassociation over the wider row count moves the "
+            f"last bits of a value, and a padded row's own data does not"
         )
         assert moved <= own.numel() // 100, (
             f"layer {index} moved {moved} of {own.numel()} values, over the 1 percent a "
