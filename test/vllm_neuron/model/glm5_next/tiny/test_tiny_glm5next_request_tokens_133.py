@@ -462,6 +462,58 @@ def _wide_ids():
     )
 
 
+#: The elementwise tolerance the padded arm is held to, and the floor under it. One relative
+#: step of `RELATIVE_STEP` is about one bfloat16 ulp at the top of a binade; `FLOOR` keeps a
+#: value near zero from being held to a bound smaller than the dtype can express there.
+RELATIVE_STEP = 2.0**-7
+FLOOR = 2.0**-4
+
+
+def _worst_offender(own, reference) -> tuple[float, int]:
+    """How far the worst value is past its OWN bound, and how many values moved at all.
+
+    A ratio at or under 1 means every value sits inside the tolerance. The ratio is
+    reported rather than a bare verdict so a failure names its own size.
+    """
+    wide, other = own.to(torch.float32), reference.to(torch.float32)
+    bound = RELATIVE_STEP * torch.maximum(other.abs(), torch.tensor(FLOOR))
+    gap = (wide - other).abs()
+    return float((gap / bound).max()), int((wide != other).sum())
+
+
+def _where_they_differ(own, reference, index: int, family: str) -> str:
+    """How far apart two banks of one layer are, as a reading rather than a boolean.
+
+    THE SIZE OF THE DIFFERENCE IS THE READING, because two answers look identical to a
+    byte-equal oracle and are not the same finding: a spread at the last bits of the dtype
+    is a different arithmetic order over a different row count, while a large or clustered
+    difference is a value that came from a row the request does not own.
+
+    The first dimension is the page, the one axis that means the same thing in every bank
+    this fixture allocates; nothing here reads a slot, because a bank with two KV heads
+    interleaves them under the page and a slot number there names no one row.
+    """
+    wide, other = own.to(torch.float32).flatten(), reference.to(torch.float32).flatten()
+    delta = wide - other
+    moved = delta.nonzero().flatten()
+    scale = torch.maximum(wide.abs(), other.abs()).clamp(min=1e-30)
+    pages = (own != reference).flatten(start_dim=1).any(dim=1).nonzero().flatten()
+    first = [
+        (int(at), round(float(wide[at]), 6), round(float(other[at]), 6))
+        for at in moved[:5]
+    ]
+    return (
+        f"INC133|write_diff|layer={index}|family={family}|dtype={own.dtype}"
+        f"|shape={tuple(own.shape)}|pages={tuple(own.shape)[0]}"
+        f"|pages_that_differ={int(pages.numel())}|first_pages={[int(p) for p in pages[:8]]}"
+        f"|values={int(wide.numel())}|values_that_differ={int(moved.numel())}"
+        f"|max_abs_diff={float(delta.abs().max()):.6g}"
+        f"|max_rel_diff={float((delta.abs() / scale).max()):.6g}"
+        f"|deltas_above_zero={int((delta > 0).sum())}|deltas_below_zero={int((delta < 0).sum())}"
+        f"|first_values_that_moved={first}"
+    )
+
+
 def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     """Two runs of one prompt -- padded and not -- must leave the request's pages equal.
 
@@ -471,10 +523,14 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     that ban stated positively: every block past the request's own pages must still be
     zero after the padded arm.
 
-    WHY BYTE EQUALITY IS THE RIGHT BAR AND NOT A TOLERANCE. The padded rows are collapsed
-    onto the LAST REAL ROW and carry that row's own latent, so the repeated writes store
-    the value that row stores anyway. There is nothing to average and no order that could
-    change the result, which is what makes the duplicate indices safe.
+    WHY A TOLERANCE AND NOT BYTE EQUALITY. The write itself is exact: the padded rows are
+    collapsed onto the LAST REAL ROW and store the value that row stores anyway, so no
+    order of the repeated writes changes what is stored. What the two arms do NOT share is
+    the row count the layers above reduce over, and a sum reassociated over 256 rows
+    instead of 128 lands on a neighbouring representable value. A measured run moved 80 of
+    16384 values by one bfloat16 ulp of their own magnitude, in both directions; a padded
+    row's own data reaching this bank would move whole rows by a fraction of their size,
+    which is what the bound below separates.
 
     THE UNPADDED ARM IS THE REFERENCE, run on its own caches with the same ids, the same
     window and the same pooled store, so the only difference between the arms is the
@@ -491,6 +547,7 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
         for label, width in (("padded", WIDE_PADDED), ("unpadded", WIDE_REAL))
     }
 
+    families = [bank["family"] for bank in root.glm5next_layer_banks]
     for index, (padded, unpadded) in enumerate(zip(written["padded"], written["unpadded"])):
         own = padded[:WIDE_REAL_BLOCKS]
         beyond = padded[WIDE_REAL_BLOCKS:]
@@ -502,15 +559,26 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
             f"|blocks_beyond_the_request={tuple(beyond.shape)[0]}|nonzero_beyond={touched}"
             f"|values_in_its_own_pages={stored}"
         )
+        print(_where_they_differ(own, unpadded[:WIDE_REAL_BLOCKS], index, families[index]))
         # THE POSITIVE CONTROL FIRST. Two banks that were never written are equal to each
-        # other, so byte equality alone would pass on a run that stored nothing at all.
+        # other, so a tolerance alone would pass on a run that stored nothing at all.
         assert stored > 0, (
             f"layer {index} holds nothing in the {WIDE_REAL_BLOCKS} page(s) the request "
-            f"owns, so the equality below would compare two empty banks"
+            f"owns, so the comparison below would compare two empty banks"
         )
-        assert same, (
-            f"layer {index}'s own pages differ between the padded and the unpadded run; "
-            f"the padded rows changed what the sequence stored"
+        worst, moved = _worst_offender(own, unpadded[:WIDE_REAL_BLOCKS])
+        print(
+            f"INC133|write_bound|layer={index}|worst_ratio_of_its_own_bound={worst:.6g}"
+            f"|values_that_differ={moved}|share_that_differ={moved / own.numel():.6g}"
+        )
+        assert worst <= 1.0, (
+            f"layer {index} holds a value {worst:.6g} times its own tolerance away from the "
+            f"unpadded run; reassociation over the wider row count moves the last bits of a "
+            f"value, and a padded row's own data does not"
+        )
+        assert moved <= own.numel() // 100, (
+            f"layer {index} moved {moved} of {own.numel()} values, over the 1 percent a "
+            f"different arithmetic order accounts for"
         )
         assert touched == 0, (
             f"layer {index} wrote {touched} value(s) past the {WIDE_REAL_BLOCKS} page(s) "
@@ -683,3 +751,64 @@ def test_the_padded_write_traces_and_stores_what_the_eager_run_stored():
             f"layer {index} wrote {touched} value(s) past the {WIDE_REAL_BLOCKS} page(s) "
             f"the request holds while it was traced"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 9. the padded arm's selection stops at the request's own pools.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_padded_arm_selects_no_pool_beyond_the_requests_own_length(monkeypatch):
+    """No real query may select a pool the request's own length does not reach.
+
+    WHAT THIS ASKS THAT THE WRITE ITEM DOES NOT. The write item compares what was STORED,
+    and a selection that reached a padded pool would show up there only as whatever value
+    that pool happened to hold. This reads the selection itself: the pool ids the indexer
+    returns for the rows that carry real tokens, counted against the pools the request's
+    own length reaches. Zero is the whole reading.
+
+    WHY THE COUNT AND NOT A BOOLEAN. A count states how much of the axis leaked, so a
+    control that removes the bound reads a number rather than a flipped flag.
+
+    THE ROWS GRADED ARE THE REAL ONES. Rows at or past the real length carry no token of
+    the sequence and their outputs are discarded, so what they select is not this item's
+    subject.
+    """
+    e2e._require_cpu_mode()
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextDSAIndexer
+
+    root = e2e._fixture()["root"]
+    pool = int(item.MLA_INDEX_KPOOL)
+    reachable = -(-WIDE_REAL // pool)
+    seen: list[torch.Tensor] = []
+    original = Glm5NextDSAIndexer.select_bounded_pools
+
+    def recording(self, scores, seq_lens):
+        """The real method, with its answer kept."""
+        chosen = original(self, scores, seq_lens)
+        seen.append(chosen.detach().clone())
+        return chosen
+
+    monkeypatch.setattr(Glm5NextDSAIndexer, "select_bounded_pools", recording)
+    _wide_written(
+        root,
+        width=WIDE_PADDED,
+        ids=_wide_ids(),
+        positions=torch.tensor([WIDE_REAL - 1], dtype=torch.long),
+    )
+    assert seen, (
+        "the indexer's bounded selection was never called, so this item measured no "
+        "selection at all"
+    )
+    beyond = sum(int((chosen[:WIDE_REAL] >= reachable).sum()) for chosen in seen)
+    widths = sorted({tuple(chosen.shape) for chosen in seen})
+    print(
+        f"INC133|selection|calls={len(seen)}|shapes={widths}|pool={pool}"
+        f"|real_tokens={WIDE_REAL}|pools_the_request_reaches={reachable}"
+        f"|rows_graded={WIDE_REAL}|selected_beyond_the_request={beyond}"
+    )
+    assert beyond == 0, (
+        f"{beyond} selection(s) landed on a pool at or past {reachable}, which the "
+        f"request's {WIDE_REAL} real tokens never reach; a real query reading a padded "
+        f"pool attends keys that belong to no row of this sequence"
+    )
