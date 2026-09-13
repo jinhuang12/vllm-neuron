@@ -329,6 +329,20 @@ def warmup_rank_waves(world_size: int, wave: int) -> list[list[int]]:
     ]
 
 
+def _exchange_warmup_status(phase: str, bucket: str, where: str, failure) -> None:
+    """Sum the failed-rank count across the TP group, then raise if any rank failed."""
+    # The exchange IS the barrier, and it carries how many ranks failed. A bare barrier would
+    # leave every other rank waiting out the barrier timeout for a rank that had already raised,
+    # and a real fault would be recorded as a timeout.
+    failed_total = tp_sum_int(1 if failure is not None else 0)
+    if failure is not None:
+        raise failure
+    if failed_total:
+        raise RuntimeError(
+            f"warmup {phase} bucket={bucket} {where}: {failed_total} rank(s) failed"
+        )
+
+
 def run_warmup_in_waves(phase: str, bucket: str, work) -> None:
     """Run ``work`` on this rank in its warmup wave, exchanging status after every wave.
 
@@ -372,17 +386,34 @@ def run_warmup_in_waves(phase: str, bucket: str, work) -> None:
                     rank,
                     time.perf_counter() - started,
                 )
-        # The exchange IS this wave's barrier, and it carries how many ranks failed. A bare
-        # barrier would leave every other rank waiting out the barrier timeout for a rank that
-        # had already raised, and a real fault would be recorded as a timeout.
-        failed_total = tp_sum_int(1 if failure is not None else 0)
-        if failure is not None:
-            raise failure
-        if failed_total:
-            raise RuntimeError(
-                f"warmup {phase} bucket={bucket} wave={index}/{len(waves)}: "
-                f"{failed_total} rank(s) failed"
-            )
+        _exchange_warmup_status(phase, bucket, f"wave={index}/{len(waves)}", failure)
+
+
+def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
+    """Run ``work`` on every rank of the TP group at once, then exchange status.
+
+    A warmup call executes the model, and the model's forward carries collectives over the
+    whole TP group, so a subset of the ranks cannot run it: the ranks left out would wait in
+    the status exchange while the ranks inside waited for them in the collective.
+    """
+    rank = get_tp_group().rank_in_group
+    tp_barrier()
+    logger.info("warmup %s bucket=%s all ranks rank=%s start", phase, bucket, rank)
+    started = time.perf_counter()
+    failure = None
+    try:
+        work()
+    except Exception as exc:  # the group is told before this rank re-raises
+        failure = exc
+    else:
+        logger.info(
+            "warmup %s bucket=%s all ranks rank=%s done elapsed=%.1fs",
+            phase,
+            bucket,
+            rank,
+            time.perf_counter() - started,
+        )
+    _exchange_warmup_status(phase, bucket, "all ranks", failure)
 
 
 class NeuronWorker(WorkerBase):
@@ -1805,7 +1836,7 @@ class NeuronWorker(WorkerBase):
                     kv_seg_size,
                 )
                 try:
-                    run_warmup_in_waves(
+                    run_warmup_on_all_ranks(
                         "prefill",
                         f"{bucket_size}/kv{kv_seg_size}",
                         lambda: self.model_runner.warmup_prefill(
@@ -1949,7 +1980,7 @@ class NeuronWorker(WorkerBase):
                 ctx_bucket,
             )
             try:
-                run_warmup_in_waves(
+                run_warmup_on_all_ranks(
                     "decode",
                     f"b{batch_size}/s{ctx_bucket}",
                     lambda: self.model_runner.warmup_decode(
