@@ -4283,7 +4283,7 @@ class Glm5NextKDAAttention(nn.Module):
                     f"token, and this call carries {requests} requests. The loop below "
                     f"serves one request at a time and passes neither operand on, so "
                     f"the mask this caller asked for would be dropped without a word. "
-                    f"A concurrent decode passes neither operand"
+                    f"Pass one operand pair per request, or pass neither"
                 )
             return torch.cat(
                 [

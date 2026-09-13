@@ -144,13 +144,13 @@ def test_c01_a_many_request_decode_carrying_the_row_operands_is_refused(one_laye
     operands = _operands(one_layer.layer, DECLARED_REQUESTS, DECLARED_REQUESTS)
     assert operands, "the tree carries the row operands and the runner's builder"
     print(
-        f"MANYREQ|operands|real_tokens={int(operands['real_tokens'])}|"
+        f"MANYREQ|c01|operands=both|real_tokens={int(operands['real_tokens'])}|"
         f"row_mask={tuple(operands['row_mask'].shape)}|requests={DECLARED_REQUESTS}"
     )
     with pytest.raises(ValueError) as refusal:
         _decode(one_layer.layer, one_layer.rows, DECLARED_REQUESTS, operands)
     said = str(refusal.value)
-    print(f"MANYREQ|refusal|{said}")
+    print(f"MANYREQ|c01|refusal={said}")
     assert "real_tokens" in said and "row_mask" in said
     assert str(DECLARED_REQUESTS) in said
     # THE HALF-PASSED SPELLING IS REFUSED TOO. The check that reads the two operands
@@ -164,14 +164,23 @@ def test_c01_a_many_request_decode_carrying_the_row_operands_is_refused(one_laye
                 DECLARED_REQUESTS,
                 {name: operands[name]},
             )
-        print(f"MANYREQ|refusal_half|{name}|{str(half.value)}")
+        print(f"MANYREQ|c01|refusal_half={name}|said={str(half.value)}")
         assert "real_tokens" in str(half.value) and "row_mask" in str(half.value)
+    # THE ROUTE ROW, one per item and in one form, because the launcher counts the route each
+    # item took and reads a field off this row rather than parsing prose.
+    print(
+        f"MANYREQ|c01|route=refused|rows=0|hidden={one_layer.hidden}|"
+        f"requests={DECLARED_REQUESTS}"
+    )
 
 
 def test_c02_a_many_request_decode_without_the_row_operands_is_still_served(one_layer):
     """The refusal is the operands', not the concurrency's."""
     out = _decode(one_layer.layer, one_layer.rows, DECLARED_REQUESTS, {})
-    print(f"MANYREQ|served_without_operands|out={tuple(out.shape)}")
+    print(
+        f"MANYREQ|c02|route=served|rows={int(out.shape[0])}|hidden={int(out.shape[1])}|"
+        f"operands=none|requests={DECLARED_REQUESTS}"
+    )
     assert tuple(out.shape) == (DECLARED_REQUESTS, one_layer.hidden)
     assert torch.isfinite(out).all()
 
@@ -182,8 +191,8 @@ def test_c03_a_single_request_decode_with_the_row_operands_is_still_served(one_l
     assert operands, "the tree carries the row operands and the runner's builder"
     out = _decode(one_layer.layer, one_layer.rows[:1], 1, operands)
     print(
-        f"MANYREQ|served_with_operands|out={tuple(out.shape)}|"
-        f"real_tokens={int(operands['real_tokens'])}"
+        f"MANYREQ|c03|route=served|rows={int(out.shape[0])}|hidden={int(out.shape[1])}|"
+        f"operands=both|requests=1|real_tokens={int(operands['real_tokens'])}"
     )
     assert tuple(out.shape) == (1, one_layer.hidden)
     assert torch.isfinite(out).all()
