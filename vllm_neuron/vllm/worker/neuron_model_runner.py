@@ -5502,10 +5502,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # through the cursor's own gap. Clearing the owner alongside the rows leaves
             # the ring belonging to nobody, so a refused opening makes the next
             # non-opening step refuse by name instead of reading blanks.
+            # THE RING IS REPLACED, NOT EMPTIED IN PLACE. An eager in-place write on a
+            # device-resident buffer is refused by the runtime -- "Can't call ReserveSpace
+            # on shared storage" -- and the refusal lands in the input builder before any
+            # forward runs, so warmup never reaches its first bucket. A fresh allocation
+            # is the same allocation the ring was created with, and the carriers are built
+            # from these entries after this loop, so the step binds the new buffer.
             self._glm5next_side_cache_cursor = None
             for side in side_caches:
                 if "tail" in side:
-                    side["tail"].zero_()
+                    ring = side["tail"]
+                    side["tail"] = torch.zeros(
+                        ring.shape, dtype=ring.dtype, device=ring.device
+                    )
         elif not synthetic_step:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so
