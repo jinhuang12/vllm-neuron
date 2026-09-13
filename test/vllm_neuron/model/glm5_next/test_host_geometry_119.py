@@ -96,6 +96,10 @@ STATE_SLOTS = 8
 #: more slots than that on purpose: the two numbers are not the same axis.
 DECLARED_MAX_NUM_SEQS = 1
 
+#: The slot a step carrying no request id is served from, which is every step this file
+#: drives: the converter takes no claim for such a step and reads slot 0.
+SYNTHETIC_SLOT = 0
+
 #: A single-token step is a decode and anything longer is a prefill.
 DECODE_THRESHOLD = 1
 
@@ -229,9 +233,12 @@ def _open_ring_at(runner, banks, position: int) -> None:
     """Stand the live indexer ring up and declare which position it holds.
 
     A prefill at position 0 opens the ring inside the converter. A step that continues a
-    sequence is refused unless the ring already stands at its position
-    (``neuron_model_runner.py:5339-5346``), so an item at a non-zero position hands the
-    runner the same two attributes the previous step would have left.
+    sequence is refused unless the ring already stands at its position, so an item at a
+    non-zero position hands the runner the same two attributes the previous step would
+    have left. RE-PINNED: the ring is one position PER REQUEST SLOT, and a step this
+    shell drives carries no request id, so it is served from slot 0 and that is the slot
+    the position is recorded at. The original reading, verbatim:
+    ``runner._glm5next_side_cache_cursor = int(position)``.
     """
     runner._glm5next_side_cache_set = NeuronModelRunner._glm5next_side_caches(
         banks,
@@ -240,7 +247,7 @@ def _open_ring_at(runner, banks, position: int) -> None:
         max_seq_len=MAX_MODEL_LEN,
         request_slots=DECLARED_MAX_NUM_SEQS,
     )
-    runner._glm5next_side_cache_cursor = int(position)
+    runner._glm5next_side_cache_positions = {SYNTHETIC_SLOT: int(position)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -292,13 +299,18 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     assert sparse["start_position"].dtype == torch.int32
     assert sparse["start_position"].device.type == "meta"
     assert sparse["latent_cache"].device.type == "meta"
-    # The linear layer's carrier is the bank's slot, which the row's first id names.
-    assert tuple(linear["conv_state"].shape) == (4, 6)
+    # The linear layer's carrier is the bank's slot, which this request owns.
+    # RE-PINNED: the carrier holds ONE VIEW PER REQUEST rather than one tensor, because
+    # two requests' states are two rows of one bank. The reading this replaces, verbatim:
+    # `assert tuple(linear["conv_state"].shape) == (4, 6)`. The same claim is made here on
+    # this step's one request's own view.
+    assert len(linear["conv_state"]) == 1
+    assert tuple(linear["conv_state"][0].shape) == (4, 6)
     # RE-PINNED for the same reason -- a host number at this boundary is a captured
     # constant -- replacing `assert int(linear["start_position"]) == 0`.
-    # RE-PINNED AGAIN (D17.1): the linear carrier carries ONE ROW PER REQUEST
-    # (`inc-glm53f-117a`), so its position is a 1-D int32 tensor as long as the batch
-    # rather than a 0-d one. The reading this replaces, verbatim:
+    # RE-PINNED AGAIN: the linear carrier carries ONE ROW PER REQUEST, so its position is
+    # a 1-D int32 tensor as long as the batch rather than a 0-d one. The reading this
+    # replaces, verbatim:
     # `assert tuple(linear["start_position"].shape) == ()`. What that line claimed --
     # that the position reaches the layer as a tensor whose value no captured graph
     # holds -- is what these three lines claim, at this step's one request.

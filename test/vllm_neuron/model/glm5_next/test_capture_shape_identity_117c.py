@@ -98,6 +98,11 @@ DECLARED_MAX_NUM_SEQS = 1
 #: The first block this request is given, deliberately not block 0, so a window that
 #: started at the bank's own base rather than the request's would be visible.
 DECLARED_FIRST_BLOCK = 2
+#: This request's slot in the per-sequence caches. RE-PINNED: the state slot is now a
+#: request slot on an axis as wide as the engine's bound, so it is no longer a block id
+#: and no longer moves with the pages a request is given. The original reading, verbatim:
+#: "state_slot": DECLARED_FIRST_BLOCK -- the first block the request holds.
+DECLARED_STATE_SLOT = 0
 #: The two positions items 1 and 2 compare. They differ by enough to change how many
 #: BLOCKS the request occupies, which is what moved the base's window length.
 DECLARED_LOW_POSITION = 3
@@ -209,7 +214,7 @@ def _geometry(*, position: int, window_blocks: int = DECLARED_WINDOW_BLOCKS,
     used = max(1, -(-(position + tokens) // DECLARED_PAGE_SIZE))
     return {
         "block_ids": [DECLARED_FIRST_BLOCK + offset for offset in range(used)],
-        "state_slot": DECLARED_FIRST_BLOCK,
+        "state_slot": DECLARED_STATE_SLOT,
         "page_size": DECLARED_PAGE_SIZE,
         "window_blocks": int(window_blocks),
     }
@@ -602,13 +607,19 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
     opened = runner._glm5next_model_kwargs(_converter_kwargs(
         [bank], _prefill_metadata([bank]), DECLARED_PREFILL_TOKENS
     ))
-    cursor = getattr(runner, "_glm5next_side_cache_cursor", None)
-    say("I8_OPENED", f"carriers={len(opened['layer_carriers'])}", f"cursor={cursor}")
+    # RE-PINNED: the ring stands at one position PER REQUEST SLOT, so the premise is read
+    # off this request's own slot. The original reading, verbatim:
+    # `cursor = getattr(runner, "_glm5next_side_cache_cursor", None)`.
+    positions = dict(getattr(runner, "_glm5next_side_cache_positions", None) or {})
+    cursor = positions.get(DECLARED_STATE_SLOT)
+    say("I8_OPENED", f"carriers={len(opened['layer_carriers'])}",
+        f"slots={sorted(positions)}", f"cursor={cursor}")
     assert cursor == DECLARED_CONTINUED_POSITION, (
-        f"the opening prefill left the ring at {cursor} and this item's decode step "
-        f"carries position {DECLARED_CONTINUED_POSITION}; without a ring that continues "
-        f"this sequence the step below would be refused before any window is built, and "
-        f"the reading would be about the cursor and not about the window"
+        f"the opening prefill left slot {DECLARED_STATE_SLOT}'s ring at {cursor} of "
+        f"{sorted(positions)} and this item's decode step carries position "
+        f"{DECLARED_CONTINUED_POSITION}; without a ring that continues this sequence the "
+        f"step below would be refused before any window is built, and the reading would "
+        f"be about the cursor and not about the window"
     )
 
     converted = runner._glm5next_model_kwargs(_converter_kwargs(
@@ -692,7 +703,7 @@ def test_the_allocator_sizes_the_spare_window_the_carrier_builder_requires() -> 
     bank = _bank(DECLARED_HEAD_SIZE, blocks=schedulable_blocks + spare_blocks)
     geometry = {
         "block_ids": [last_block],
-        "state_slot": last_block,
+        "state_slot": DECLARED_STATE_SLOT,
         "page_size": DECLARED_PAGE_SIZE,
         "window_blocks": spare_blocks,
     }
@@ -735,7 +746,7 @@ def test_a_write_outside_the_requests_own_pages_is_refused_runner_side() -> None
     own_blocks = 1
     geometry = {
         "block_ids": [DECLARED_FIRST_BLOCK],
-        "state_slot": DECLARED_FIRST_BLOCK,
+        "state_slot": DECLARED_STATE_SLOT,
         "page_size": DECLARED_PAGE_SIZE,
         "window_blocks": DECLARED_WINDOW_BLOCKS,
     }

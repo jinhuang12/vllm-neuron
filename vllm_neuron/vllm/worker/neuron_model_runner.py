@@ -5643,7 +5643,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # boundary lives now. Its carrier is ONE CONTIGUOUS SLICE of the paged
                 # latent bank, and two requests' pages are not one run, so a second
                 # request cannot be expressed here at all -- the paged gather inside
-                # the kernel is what lifts it (`inc-glm53f-117b`). The linear family
+                # the kernel is what lifts it. The linear family
                 # above is already concurrent, so the refusal is the sparse family's
                 # rather than the whole forward's.
                 raise ValueError(
@@ -6344,7 +6344,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             stood_at = self._glm5next_side_cache_positions.get(int(slot))
             if stood_at is None:
                 raise ValueError(
-                    f"slot {slot}'s indexer ring holds no recorded position, so this "
+                    f"slot {slot}'s indexer ring holds no sequence cursor, so this "
                     f"step has no sequence to continue; a prefill at position 0 opens "
                     f"one, and this step is a {leg} at position "
                     f"{int(start_position)}. Serving it would read whatever the "
