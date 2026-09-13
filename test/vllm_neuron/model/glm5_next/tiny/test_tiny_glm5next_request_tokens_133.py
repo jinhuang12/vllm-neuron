@@ -31,10 +31,12 @@ HOW TO RUN IT, both variables from the process environment:
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+import torch._dynamo
 
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
@@ -88,6 +90,13 @@ def _runner():
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.model = root
     runner.max_model_len = e2e.E2E_MAX_SEQ_LEN
+    # THE STEP'S IDENTITY AND THE ENGINE'S CONCURRENCY BOUND. The converter keys a
+    # request's state by its id, so a real step served without one is refused by name,
+    # and it sizes the indexer's per-sequence caches by the bound. Both values are the
+    # sibling file's own, and this file's steps still carry the one request they always
+    # carried.
+    runner.input_batch = SimpleNamespace(req_ids=[REQUEST])
+    runner.max_num_reqs = e2e.E2E_MAX_NUM_SEQS
     return runner
 
 
@@ -412,6 +421,101 @@ def _wide_arm(*, width: int, text_config, banks, side, ids):
     return carriers, padded_ids
 
 
+def _wide_written(root, *, width: int, ids, positions, call=None) -> list[torch.Tensor]:
+    """One run of ``width`` rows on fresh caches; the banks' first slot afterwards.
+
+    ``call`` is the entry point, so a compiled forward can be handed in where the eager
+    one is the default and the two arms share every other operand.
+    """
+    text_config = root.text_config
+    caches = e2e._runner_shaped_caches(root)
+    root.bind_kv_cache(caches)
+    banks = root.glm5next_layer_banks
+    side = NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=int(text_config.index_kpool),
+        index_head_dim=int(text_config.index_head_dim),
+        max_seq_len=WIDE_PADDED,
+        request_slots=e2e.E2E_MAX_NUM_SEQS,
+    )
+    carriers, input_ids = _wide_arm(
+        width=width,
+        text_config=text_config,
+        banks=banks,
+        side=side,
+        ids=ids,
+    )
+    (call or root.forward)(
+        input_ids, layer_carriers=carriers, sampling_positions=positions
+    )
+    return [caches[bank["name"]][0].clone() for bank in banks]
+
+
+def _wide_ids():
+    """The one prompt both write items run, drawn from the sibling file's own seed."""
+    return torch.randint(
+        0,
+        item.STACK_VOCAB_SIZE,
+        (WIDE_REAL,),
+        generator=torch.Generator().manual_seed(item.SEED_STACK_IDS),
+        dtype=torch.int64,
+    )
+
+
+#: The depth the chunked paths accumulate over, which is what multiplies the dtype's own unit
+#: round-off. It is the chunk width those paths use, not a number fitted to a measurement.
+ACCUMULATION_DEPTH = 8
+
+
+def _worst_offender(own, reference) -> tuple[float, int, float]:
+    """The worst gap as a multiple of the bank's bound, how many values moved, and that bound.
+
+    THE BOUND IS ABSOLUTE AT THE BANK'S SCALE and is derived from the bank's own dtype:
+    `ACCUMULATION_DEPTH * finfo(dtype).eps * max(1, max|reference|)`. Reassociation error is
+    absolute at the scale of the OPERANDS, so a bound taken relative to each value reads
+    cancellation into a small output as a large relative move and fails on a value that moved
+    by one ulp near one. A ratio at or under 1 means every value sits inside that bound.
+    """
+    wide, other = own.to(torch.float32), reference.to(torch.float32)
+    scale = max(1.0, float(other.abs().max()))
+    bound = ACCUMULATION_DEPTH * torch.finfo(own.dtype).eps * scale
+    gap = float((wide - other).abs().max())
+    return gap / bound, int((wide != other).sum()), bound
+
+
+def _where_they_differ(own, reference, index: int, family: str) -> str:
+    """How far apart two banks of one layer are, as a reading rather than a boolean.
+
+    THE SIZE OF THE DIFFERENCE IS THE READING, because two answers look identical to a
+    byte-equal oracle and are not the same finding: a spread at the last bits of the dtype
+    is a different arithmetic order over a different row count, while a large or clustered
+    difference is a value that came from a row the request does not own.
+
+    The first dimension is the page, the one axis that means the same thing in every bank
+    this fixture allocates; nothing here reads a slot, because a bank with two KV heads
+    interleaves them under the page and a slot number there names no one row.
+    """
+    wide, other = own.to(torch.float32).flatten(), reference.to(torch.float32).flatten()
+    delta = wide - other
+    moved = delta.nonzero().flatten()
+    scale = torch.maximum(wide.abs(), other.abs()).clamp(min=1e-30)
+    pages = (own != reference).flatten(start_dim=1).any(dim=1).nonzero().flatten()
+    first = [
+        (int(at), round(float(wide[at]), 6), round(float(other[at]), 6))
+        for at in moved[:5]
+    ]
+    return (
+        f"INC133|write_diff|layer={index}|family={family}|dtype={own.dtype}"
+        f"|shape={tuple(own.shape)}|pages={tuple(own.shape)[0]}"
+        f"|pages_that_differ={int(pages.numel())}|first_pages={[int(p) for p in pages[:8]]}"
+        f"|values={int(wide.numel())}|values_that_differ={int(moved.numel())}"
+        f"|max_abs_diff={float(delta.abs().max()):.6g}"
+        f"|max_rel_diff={float((delta.abs() / scale).max()):.6g}"
+        f"|deltas_above_zero={int((delta > 0).sum())}|deltas_below_zero={int((delta < 0).sum())}"
+        f"|first_values_that_moved={first}"
+    )
+
+
 def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     """Two runs of one prompt -- padded and not -- must leave the request's pages equal.
 
@@ -421,10 +525,31 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     that ban stated positively: every block past the request's own pages must still be
     zero after the padded arm.
 
-    WHY BYTE EQUALITY IS THE RIGHT BAR AND NOT A TOLERANCE. The padded rows are collapsed
-    onto the LAST REAL ROW and carry that row's own latent, so the repeated writes store
-    the value that row stores anyway. There is nothing to average and no order that could
-    change the result, which is what makes the duplicate indices safe.
+    WHY A TOLERANCE AND NOT BYTE EQUALITY. The write itself is exact: the padded rows are
+    collapsed onto the LAST REAL ROW and store the value that row stores anyway, so no
+    order of the repeated writes changes what is stored. What the two arms do NOT share is
+    the row count the layers above reduce over, and a sum reassociated over 256 rows
+    instead of 128 lands on a neighbouring representable value. A measured run moved 80 of
+    16384 values by one bfloat16 ulp of their own magnitude, in both directions; a padded
+    row's own data reaching this bank would move whole rows by a fraction of their size,
+    which is what the bound below separates.
+
+    HOW MANY VALUES MOVE IS A READING, NOT A THRESHOLD, and the reason is what the measured
+    runs show: the share grows with DEPTH. Layer 0 moved nothing, layer 1 moved 80 of 16384
+    over 3 pages, and layer 2 moved 1164 over 12 pages -- 7 percent -- while every one of
+    those values stayed inside the absolute bound (worst 0.11 of it, largest gap two
+    bfloat16 steps). A later query reduces over more keys, so more of its sums cross a
+    blocking boundary and the moves compound through the layers above. A share ceiling
+    would therefore fail on arithmetic and would have to be raised each time the stack
+    grows a layer, which is a threshold measuring the wrong thing.
+
+    WHAT STILL CATCHES A LEAK, with the share gone as an assertion. A padded row's own data
+    reaching this bank moves at least a whole pool of values by a fraction of their
+    magnitude, so it cannot sit inside an eight-step bound: the bound is the first detector
+    and it is elementwise. The second is that nothing may be written past the pages the
+    request holds, which a leak into another sequence's slots fails outright. The third
+    lives in the selection item, which counts the pools a real query chose and requires
+    none past the request's own reach.
 
     THE UNPADDED ARM IS THE REFERENCE, run on its own caches with the same ids, the same
     window and the same pooled store, so the only difference between the arms is the
@@ -432,52 +557,48 @@ def test_the_padded_rows_write_the_last_real_slot_and_leave_the_bank_unpadded():
     """
     e2e._require_cpu_mode()
     assert WIDE_PADDED > WIDE_REAL, "the padded arm must be wider than the prompt"
-    fixture = e2e._fixture()
-    root = fixture["root"]
-    text_config = root.text_config
-    ids = torch.randint(
-        0,
-        item.STACK_VOCAB_SIZE,
-        (WIDE_REAL,),
-        generator=torch.Generator().manual_seed(item.SEED_STACK_IDS),
-        dtype=torch.int64,
-    )
+    root = e2e._fixture()["root"]
+    ids = _wide_ids()
     positions = torch.tensor([WIDE_REAL - 1], dtype=torch.long)
 
-    written = {}
-    for label, width in (("padded", WIDE_PADDED), ("unpadded", WIDE_REAL)):
-        caches = e2e._runner_shaped_caches(root)
-        root.bind_kv_cache(caches)
-        banks = root.glm5next_layer_banks
-        side = NeuronModelRunner._glm5next_side_caches(
-            banks,
-            index_kpool=int(text_config.index_kpool),
-            index_head_dim=int(text_config.index_head_dim),
-            max_seq_len=WIDE_PADDED,
-        )
-        carriers, input_ids = _wide_arm(
-            width=width,
-            text_config=text_config,
-            banks=banks,
-            side=side,
-            ids=ids,
-        )
-        root.forward(input_ids, layer_carriers=carriers, sampling_positions=positions)
-        written[label] = [caches[bank["name"]][0].clone() for bank in banks]
+    written = {
+        label: _wide_written(root, width=width, ids=ids, positions=positions)
+        for label, width in (("padded", WIDE_PADDED), ("unpadded", WIDE_REAL))
+    }
 
+    families = [bank["family"] for bank in root.glm5next_layer_banks]
     for index, (padded, unpadded) in enumerate(zip(written["padded"], written["unpadded"])):
         own = padded[:WIDE_REAL_BLOCKS]
         beyond = padded[WIDE_REAL_BLOCKS:]
         same = torch.equal(own, unpadded[:WIDE_REAL_BLOCKS])
         touched = int((beyond != 0).sum())
+        stored = int((own != 0).sum())
         print(
             f"INC133|write|layer={index}|own_pages_equal={same}"
             f"|blocks_beyond_the_request={tuple(beyond.shape)[0]}|nonzero_beyond={touched}"
+            f"|values_in_its_own_pages={stored}"
         )
-        assert same, (
-            f"layer {index}'s own pages differ between the padded and the unpadded run; "
-            f"the padded rows changed what the sequence stored"
+        print(_where_they_differ(own, unpadded[:WIDE_REAL_BLOCKS], index, families[index]))
+        # THE POSITIVE CONTROL FIRST. Two banks that were never written are equal to each
+        # other, so a tolerance alone would pass on a run that stored nothing at all.
+        assert stored > 0, (
+            f"layer {index} holds nothing in the {WIDE_REAL_BLOCKS} page(s) the request "
+            f"owns, so the comparison below would compare two empty banks"
         )
+        worst, moved, bound = _worst_offender(own, unpadded[:WIDE_REAL_BLOCKS])
+        print(
+            f"INC133|write_bound|layer={index}|worst_ratio_of_its_own_bound={worst:.6g}"
+            f"|bound={bound:.6g}|dtype_eps={torch.finfo(own.dtype).eps:.6g}"
+            f"|values_that_differ={moved}|share_that_differ={moved / own.numel():.6g}"
+        )
+        assert worst <= 1.0, (
+            f"layer {index} holds a value {worst:.6g} times the bank's own bound {bound:.6g} "
+            f"away from the unpadded run; reassociation over the wider row count moves the "
+            f"last bits of a value, and a padded row's own data does not"
+        )
+        # HOW MANY VALUES MOVED IS PRINTED ABOVE AND ASSERTED NOWHERE. It grows with depth
+        # because a later query reduces over more keys, so a ceiling here would fail on
+        # arithmetic; the docstring names the three detectors that catch a leak instead.
         assert touched == 0, (
             f"layer {index} wrote {touched} value(s) past the {WIDE_REAL_BLOCKS} page(s) "
             f"the request holds; those slots belong to other sequences"
@@ -495,8 +616,16 @@ SEED_REAL = BUCKET_TOKENS - item.MLA_INDEX_KPOOL - 2
 
 #: The value planted in every padded row. No real row can hold it: the real rows carry
 #: their own 1-based position, so the ring holding this number can only have read a row
-#: that is not the sequence's.
-PADDING_MARKER = -1234.0
+#: that is not the sequence's. It is EXACT IN BFLOAT16, which the item checks before it
+#: plants it: a value the bank's dtype rounds away is stored as something else, and then
+#: the comparison against it can never be true and the reading says nothing.
+PADDING_MARKER = -1024.0
+
+#: The request slot whose ring this item seeds. The side caches hold one set PER REQUEST
+#: SLOT, so the ring an indexer is handed is one slot's row of that set, which is what
+#: the production path hands it (``side["tail"][state_slot]``). This item allocates one
+#: slot, so its request owns the first one.
+SEED_SLOT = 0
 
 
 def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
@@ -530,19 +659,35 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
         index_kpool=pool,
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=BUCKET_TOKENS,
+        request_slots=e2e.E2E_MAX_NUM_SEQS,
     )
     ring = next(entry["tail"] for entry in side if "tail" in entry)
     ring.zero_()
+    # RE-PINNED (D17.1). The ring set carries a leading REQUEST-SLOT axis, and an indexer
+    # is handed one request's row of it, never the whole set. The original reading,
+    # verbatim: "written = indexer.seed_tail(ring, ..." and "float(ring[0][slot][0])" --
+    # one ring for the process, seeded and read whole. The property is the same one: the
+    # remainder comes from the chunk's last real rows. This is a view, so every write
+    # below reaches the set the marker count reads.
+    request_ring = ring[SEED_SLOT]
 
     dim = int(text_config.index_head_dim)
     rows = torch.arange(1, BUCKET_TOKENS + 1, dtype=torch.float32).reshape(-1, 1)
     key = rows.expand(BUCKET_TOKENS, dim).clone().to(torch.bfloat16)
+    # THE MARKER MUST SURVIVE THE DTYPE IT IS PLANTED IN. A value bfloat16 rounds away is
+    # stored as something else, and the comparison below could then never be true: the
+    # reading would pass on any tree, which is the same as no reading at all.
+    planted = float(torch.tensor(PADDING_MARKER, dtype=key.dtype))
+    assert planted == PADDING_MARKER, (
+        f"the marker {PADDING_MARKER} is stored as {planted} in {key.dtype}, so the row "
+        f"below would compare against a value the ring can never hold"
+    )
     key[SEED_REAL:] = PADDING_MARKER
     gate_score = key.clone()
 
     indexer = root.model.layers[0].self_attn.indexer
     written = indexer.seed_tail(
-        ring,
+        request_ring,
         key,
         gate_score,
         torch.tensor(SEED_REAL, dtype=torch.int32),
@@ -551,7 +696,7 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
 
     open_rows = SEED_REAL % pool
     want = [float(SEED_REAL - open_rows + slot + 1) for slot in range(open_rows)]
-    got = [float(ring[0][slot][0]) for slot in range(open_rows)]
+    got = [float(request_ring[0][slot][0]) for slot in range(open_rows)]
     marker_hits = int((ring.to(torch.float32) == PADDING_MARKER).sum())
     print(
         f"INC133|seeded|real={SEED_REAL}|padded={BUCKET_TOKENS}|open_rows={open_rows}"
@@ -569,9 +714,133 @@ def test_the_rings_remainder_comes_from_the_chunks_last_real_rows():
         f"the ring holds the padding marker in {marker_hits} place(s), so the remainder "
         f"was read from rows that carry no token of this sequence"
     )
-    kept = [float(ring[0][slot][0]) for slot in range(open_rows, pool)]
+    kept = [float(request_ring[0][slot][0]) for slot in range(open_rows, pool)]
     print(f"INC133|seeded_untouched|slots={list(range(open_rows, pool))}|values={kept}")
     assert kept == [0.0] * (pool - open_rows), (
         "the slots above the open pool belong to no position of this chunk and must "
         "keep what they held"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 8. the collapsed write TRACES: a compiler records the duplicate indices, and the
+# recorded graph stores what the eager run stored.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_padded_write_traces_and_stores_what_the_eager_run_stored():
+    """The collapsed write must survive being recorded, not only being executed.
+
+    WHY TRACING IS ITS OWN READING. The clamp makes several rows share one index and the
+    write goes in place through a view, so a compiler has to record a write whose indices
+    repeat. ``backend="eager"`` records the graph and then runs it eagerly, which asks the
+    tracing question on its own, without any backend's further limits.
+
+    WHAT IT GRADES. The recorded run's own pages equal the eager run's byte for byte, and
+    no block past the request's pages is written, so a trace that dropped a duplicate
+    write or reordered the writes into a different result cannot pass. The graph-break
+    count is PRINTED and not graded: a break elsewhere in this stack is not this reading.
+    """
+    e2e._require_cpu_mode()
+    root = e2e._fixture()["root"]
+    ids = _wide_ids()
+    positions = torch.tensor([WIDE_REAL - 1], dtype=torch.long)
+
+    eager = _wide_written(root, width=WIDE_PADDED, ids=ids, positions=positions)
+    torch._dynamo.reset()
+    counters = torch._dynamo.utils.counters
+    counters.clear()
+    traced = _wide_written(
+        root,
+        width=WIDE_PADDED,
+        ids=ids,
+        positions=positions,
+        call=torch.compile(root.forward, backend="eager", dynamic=False),
+    )
+    breaks = sum(counters["graph_break"].values())
+    print(f"INC133|traced|graph_breaks={breaks}|banks={len(traced)}")
+
+    for index, (one, two) in enumerate(zip(eager, traced)):
+        own = two[:WIDE_REAL_BLOCKS]
+        beyond = two[WIDE_REAL_BLOCKS:]
+        same = torch.equal(own, one[:WIDE_REAL_BLOCKS])
+        touched = int((beyond != 0).sum())
+        stored = int((own != 0).sum())
+        print(
+            f"INC133|traced_write|layer={index}|own_pages_equal={same}"
+            f"|nonzero_beyond={touched}|values_in_its_own_pages={stored}"
+        )
+        # THE SAME POSITIVE CONTROL AS THE EAGER ITEM: two banks nothing wrote are equal.
+        assert stored > 0, (
+            f"layer {index} holds nothing in the {WIDE_REAL_BLOCKS} page(s) the request "
+            f"owns, so the equality below would compare two empty banks"
+        )
+        assert same, (
+            f"layer {index}'s own pages differ between the recorded run and the eager "
+            f"one; the trace did not store what the writes store"
+        )
+        assert touched == 0, (
+            f"layer {index} wrote {touched} value(s) past the {WIDE_REAL_BLOCKS} page(s) "
+            f"the request holds while it was traced"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 9. the padded arm's selection stops at the request's own pools.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_padded_arm_selects_no_pool_beyond_the_requests_own_length(monkeypatch):
+    """No real query may select a pool the request's own length does not reach.
+
+    WHAT THIS ASKS THAT THE WRITE ITEM DOES NOT. The write item compares what was STORED,
+    and a selection that reached a padded pool would show up there only as whatever value
+    that pool happened to hold. This reads the selection itself: the pool ids the indexer
+    returns for the rows that carry real tokens, counted against the pools the request's
+    own length reaches. Zero is the whole reading.
+
+    WHY THE COUNT AND NOT A BOOLEAN. A count states how much of the axis leaked, so a
+    control that removes the bound reads a number rather than a flipped flag.
+
+    THE ROWS GRADED ARE THE REAL ONES. Rows at or past the real length carry no token of
+    the sequence and their outputs are discarded, so what they select is not this item's
+    subject.
+    """
+    e2e._require_cpu_mode()
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextDSAIndexer
+
+    root = e2e._fixture()["root"]
+    pool = int(item.MLA_INDEX_KPOOL)
+    reachable = -(-WIDE_REAL // pool)
+    seen: list[torch.Tensor] = []
+    original = Glm5NextDSAIndexer.select_bounded_pools
+
+    def recording(self, scores, seq_lens):
+        """The real method, with its answer kept."""
+        chosen = original(self, scores, seq_lens)
+        seen.append(chosen.detach().clone())
+        return chosen
+
+    monkeypatch.setattr(Glm5NextDSAIndexer, "select_bounded_pools", recording)
+    _wide_written(
+        root,
+        width=WIDE_PADDED,
+        ids=_wide_ids(),
+        positions=torch.tensor([WIDE_REAL - 1], dtype=torch.long),
+    )
+    assert seen, (
+        "the indexer's bounded selection was never called, so this item measured no "
+        "selection at all"
+    )
+    beyond = sum(int((chosen[:WIDE_REAL] >= reachable).sum()) for chosen in seen)
+    widths = sorted({tuple(chosen.shape) for chosen in seen})
+    print(
+        f"INC133|selection|calls={len(seen)}|shapes={widths}|pool={pool}"
+        f"|real_tokens={WIDE_REAL}|pools_the_request_reaches={reachable}"
+        f"|rows_graded={WIDE_REAL}|selected_beyond_the_request={beyond}"
+    )
+    assert beyond == 0, (
+        f"{beyond} selection(s) landed on a pool at or past {reachable}, which the "
+        f"request's {WIDE_REAL} real tokens never reach; a real query reading a padded "
+        f"pool attends keys that belong to no row of this sequence"
     )

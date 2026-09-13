@@ -79,6 +79,10 @@ def _runner(root) -> NeuronModelRunner:
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.model = root
     runner.max_model_len = landed.E2E_MAX_SEQ_LEN
+    # RE-PINNED: the converter now sizes its per-sequence caches by the engine's
+    # concurrent-sequence bound; the landed file this harness shares its shapes with
+    # declares that bound, so it is read from there rather than restated.
+    runner.max_num_reqs = landed.E2E_MAX_NUM_SEQS
     runner.device = torch.device("cpu")
     runner.rank_tensor = torch.zeros(1, dtype=torch.int32)
     runner.uses_mrope = False

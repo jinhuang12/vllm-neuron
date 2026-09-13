@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Acceptance for a KDA prefill that CONTINUES a segmented prompt.
 
-Six items, one per counted conjunct, no ``parametrize``. At the pinned serving
+Eight items, one per counted conjunct, no ``parametrize``. At the pinned serving
 shape a prompt longer than one batch of tokens is prefilled in segments, so the
 second segment must enter the recurrence with the state the first left. Every
 declared value and both comparator numbers are CARRIED from the landed KDA layer
@@ -26,7 +26,10 @@ lease::
    the same bank at a continuing position does NOT;
 5. the runner hands the position, the layer takes it, and an unknown carrier key
    still raises;
-6. the route predicate around item 1's drive.
+6. the route predicate around item 1's drive;
+7. a fresh prefill leaves ITS OWN state in the bank it ignored;
+8. a one-token step at position 0 -- the leg a whole one-token prompt arrives on --
+   ignores the bank too, and the same bank at a continuing position does NOT.
 """
 
 from __future__ import annotations
@@ -69,6 +72,12 @@ ALIGNED_TOKENS = ALIGNED_SEGMENT * 2
 SUB_FIRST = DECLARED_CHUNK * 2
 SUB_SECOND = 3
 SUB_TOKENS = SUB_FIRST + SUB_SECOND
+
+#: The value planted in a slot's CONVOLUTION history to stand for whatever the
+#: previous owner of that slot left there. It is exact in the state's dtype, which
+#: the item checks before it plants it: a value the dtype rounds away is stored as
+#: something else, and a comparison against it would then say nothing.
+DIRTY_CONV_ROW = 0.5
 
 #: Dispatches the sub-chunk continuing segment owes: none through either chunked
 #: seam, and one single-token dispatch per token per head per layer.
@@ -135,11 +144,23 @@ def _fresh_bank(layers) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return bank
 
 
-def _drive(layers, bank, tokens, *, start_position: int, reset: bool = True):
-    """One prefill call through the whole stack, with its own counter reading.
+def _drive(
+    layers,
+    bank,
+    tokens,
+    *,
+    start_position: int,
+    reset: bool = True,
+    is_prefill: bool = True,
+):
+    """One call through the whole stack, with its own counter reading.
 
     ``reset`` is off for the route item alone, which reads one window across
     both segments; every other caller wants the reading to be its own call's.
+
+    ``is_prefill`` is the leg, and only the last item hands the other one: a whole
+    one-token prompt is served on the decode leg, because the leg is the number of
+    tokens the step was given and one does not exceed the threshold of one.
     """
     if reset:
         layer_half._reset_counters()
@@ -149,7 +170,7 @@ def _drive(layers, bank, tokens, *, start_position: int, reset: bool = True):
             out,
             conv_state=conv_state,
             recurrent_state=recurrent_state,
-            is_prefill=True,
+            is_prefill=is_prefill,
             start_position=start_position,
             chunk_size=DECLARED_CHUNK,
         )
@@ -320,15 +341,33 @@ def test_kda_prefill_segments_c04_a_fresh_prefill_ignores_the_bank(
     A prefill at position 0 must be bit-identical over a dirty bank and a clean
     one, and the same dirty bank at a continuing position must not be -- so the
     gate is shown live in both directions.
+
+    BOTH STATES ARE DIRTIED, NOT ONE. RE-PINNED: the recurrent state alone used to
+    be planted here, and the slot's CONVOLUTION history reached the seam whatever it
+    held, because nothing empties the banks -- an eager write on a buffer whose
+    storage is shared is refused by the runtime. The original reading, verbatim:
+    "for (_, recurrent), source in zip(dirty, dirty_source): recurrent.copy_(source)".
+    The property is the same one this item always measured, over the whole entering
+    state instead of half of it.
     """
     _report("item4_fresh_leg_unchanged", "the gate on the entering state")
     clean_out, dirty_source, _ = _one_shot(stack, ALIGNED_SEGMENT)
 
     dirty = _fresh_bank(stack.layers)
-    for (_, recurrent), source in zip(dirty, dirty_source):
+    for (conv, recurrent), source in zip(dirty, dirty_source):
         recurrent.copy_(source)
+        planted = float(torch.tensor(DIRTY_CONV_ROW, dtype=conv.dtype))
+        assert planted == DIRTY_CONV_ROW, (
+            f"the planted history {DIRTY_CONV_ROW} is stored as {planted} in "
+            f"{conv.dtype}, so this item would plant a value it cannot name"
+        )
+        conv.fill_(DIRTY_CONV_ROW)
     assert float(max(r.abs().max() for _, r in dirty)) > 0.0, (
         "the dirty bank is all zeros, so this item cannot tell the two routes apart"
+    )
+    assert float(min(c.abs().min() for c, _ in dirty)) > 0.0, (
+        "the planted convolution history is zero somewhere, so a gate that read it "
+        "would still produce the fresh answer there"
     )
     fresh_out, _ = _drive(
         stack.layers, dirty, stack.tokens[:ALIGNED_SEGMENT], start_position=0
@@ -336,8 +375,9 @@ def test_kda_prefill_segments_c04_a_fresh_prefill_ignores_the_bank(
     identical = bool(torch.equal(fresh_out, clean_out))
 
     dirty_again = _fresh_bank(stack.layers)
-    for (_, recurrent), source in zip(dirty_again, dirty_source):
+    for (conv, recurrent), source in zip(dirty_again, dirty_source):
         recurrent.copy_(source)
+        conv.fill_(DIRTY_CONV_ROW)
     continued_out, _ = _drive(
         stack.layers,
         dirty_again,
@@ -358,6 +398,123 @@ def test_kda_prefill_segments_c04_a_fresh_prefill_ignores_the_bank(
     assert not continued_identical, (
         "the same bank at a continuing position produced the fresh result, so the "
         "position is not gating the entering state at all"
+    )
+
+
+def test_kda_prefill_segments_c07_a_fresh_prefill_leaves_its_own_state_in_the_bank(
+    stack: SimpleNamespace,
+) -> None:
+    """Item 7. Certifying component: the state write-back on the fresh leg.
+
+    Ignoring what a slot held is half of the property; the other half is that the
+    slot holds THIS sequence's state afterwards. The write-back goes into the state
+    the layer was handed, so a fresh sequence entering at zero must still leave its
+    own rows behind -- not the planted ones, and not zeros.
+    """
+    _report("item7_fresh_writeback", "the state write-back on the fresh leg")
+    clean = _fresh_bank(stack.layers)
+    _drive(stack.layers, clean, stack.tokens[:ALIGNED_SEGMENT], start_position=0)
+    clean_after = [(conv.clone(), recurrent.clone()) for conv, recurrent in clean]
+
+    dirty = _fresh_bank(stack.layers)
+    for conv, recurrent in dirty:
+        conv.fill_(DIRTY_CONV_ROW)
+        recurrent.fill_(DIRTY_CONV_ROW)
+    _drive(stack.layers, dirty, stack.tokens[:ALIGNED_SEGMENT], start_position=0)
+
+    same = [
+        bool(torch.equal(conv, want_conv)) and bool(torch.equal(rec, want_rec))
+        for (conv, rec), (want_conv, want_rec) in zip(dirty, clean_after)
+    ]
+    moved = [
+        bool((conv != DIRTY_CONV_ROW).any()) and bool(conv.abs().max() > 0.0)
+        for conv, _ in clean_after
+    ]
+    print(
+        f"SEGPREFILL|item7|banks={len(same)}|equal_to_the_clean_run={same}"
+        f"|clean_state_is_neither_the_marker_nor_zero={moved}",
+        flush=True,
+    )
+    if not all(moved):
+        raise AssertionError(
+            "a clean run left a convolution state that is the planted value or all "
+            "zeros, so this item could pass on a bank nothing wrote"
+        )
+    assert all(same), (
+        "after a fresh prefill over a dirty slot the bank does not hold what the same "
+        "prefill over a clean slot left; the write-back landed somewhere else"
+    )
+
+
+def test_kda_prefill_segments_c08_a_one_token_step_at_position_zero_ignores_the_bank(
+    stack: SimpleNamespace,
+) -> None:
+    """Item 8. Certifying component: the entering state on the DECODE leg.
+
+    A WHOLE ONE-TOKEN PROMPT ARRIVES ON THIS LEG, which is why the leg needs the
+    same gate. The leg is the number of tokens the step was given against the decode
+    threshold, and one token does not exceed a threshold of one, so a prompt of one
+    token is served here having computed nothing at all. A request resumed after
+    preemption arrives at position 0 the same way. Both must enter with a zero
+    state, and this item reads that on the leg rather than about it.
+
+    BOTH DIRECTIONS, as item 4 measures them on the other leg: the same dirty bank
+    must give the clean answer at position 0 and must NOT give it at a continuing
+    position, so a gate that ignored the position would fail the second reading.
+    """
+    _report("item8_decode_leg_fresh", "the entering state on the decode leg")
+    clean = _fresh_bank(stack.layers)
+    clean_out, _ = _drive(
+        stack.layers, clean, stack.tokens[:1], start_position=0, is_prefill=False
+    )
+
+    dirty = _fresh_bank(stack.layers)
+    for conv, recurrent in dirty:
+        planted = float(torch.tensor(DIRTY_CONV_ROW, dtype=conv.dtype))
+        assert planted == DIRTY_CONV_ROW, (
+            f"the planted state {DIRTY_CONV_ROW} is stored as {planted} in "
+            f"{conv.dtype}, so this item would plant a value it cannot name"
+        )
+        conv.fill_(DIRTY_CONV_ROW)
+        recurrent.fill_(DIRTY_CONV_ROW)
+    assert float(min(c.abs().min() for c, _ in dirty)) > 0.0, (
+        "the planted convolution history is zero somewhere, so a gate that read it "
+        "would still produce the fresh answer there"
+    )
+    assert float(min(r.abs().min() for _, r in dirty)) > 0.0, (
+        "the planted recurrent state is zero somewhere, so a gate that read it "
+        "would still produce the fresh answer there"
+    )
+    fresh_out, _ = _drive(
+        stack.layers, dirty, stack.tokens[:1], start_position=0, is_prefill=False
+    )
+    identical = bool(torch.equal(fresh_out, clean_out))
+
+    dirty_again = _fresh_bank(stack.layers)
+    for conv, recurrent in dirty_again:
+        conv.fill_(DIRTY_CONV_ROW)
+        recurrent.fill_(DIRTY_CONV_ROW)
+    continued_out, _ = _drive(
+        stack.layers,
+        dirty_again,
+        stack.tokens[:1],
+        start_position=ALIGNED_SEGMENT,
+        is_prefill=False,
+    )
+    continued_identical = bool(torch.equal(continued_out, clean_out))
+    print(
+        f"SEGPREFILL|item8|fresh_bit_identical={identical}|"
+        f"continuing_bit_identical={continued_identical}|"
+        f"worst_abs_error_continuing={_worst(continued_out, clean_out):.3e}",
+        flush=True,
+    )
+    assert identical, (
+        "a one-token step at position 0 read the bank; a sequence that has computed "
+        "nothing enters at zero whatever leg it arrives on"
+    )
+    assert not continued_identical, (
+        "the same bank at a continuing position produced the fresh result, so the "
+        "position is not gating the entering state on this leg at all"
     )
 
 
@@ -384,20 +541,27 @@ def test_kda_prefill_segments_c05_the_runner_hands_the_position_to_the_layer(
     continuing = runner_half._carriers(
         runner, banks, tokens=ALIGNED_SEGMENT, cached=ALIGNED_SEGMENT
     )
+    # RE-PINNED (D17.1): the linear carrier's position is a per-request TUPLE now,
+    # one entry per request in the batch's order, because each request continues its
+    # own sequence at its own position. ORIGINAL READING: `int(c["start_position"])`,
+    # one position for the whole carrier. NEW VALUE: entry `[0]`, this single
+    # request's position. The item's reading -- that the RUNNER decides the position
+    # and hands it to the layer -- is unchanged.
     print(
         f"SEGPREFILL|item5|keys={sorted(fresh[0])}|"
-        f"fresh_positions={[int(c['start_position']) for c in fresh]}|"
-        f"continuing_positions={[int(c['start_position']) for c in continuing]}",
+        f"fresh_positions={[int(c['start_position'][0]) for c in fresh]}|"
+        f"continuing_positions={[int(c['start_position'][0]) for c in continuing]}",
         flush=True,
     )
-    assert all(int(c["start_position"]) == 0 for c in fresh), (
-        f"a prefill at cached length 0 built {[int(c['start_position']) for c in fresh]}"
+    assert all(int(c["start_position"][0]) == 0 for c in fresh), (
+        f"a prefill at cached length 0 built "
+        f"{[int(c['start_position'][0]) for c in fresh]}"
     )
     assert all(
-        int(c["start_position"]) == ALIGNED_SEGMENT for c in continuing
+        int(c["start_position"][0]) == ALIGNED_SEGMENT for c in continuing
     ), (
         f"a prefill at cached length {ALIGNED_SEGMENT} built "
-        f"{[int(c['start_position']) for c in continuing]}"
+        f"{[int(c['start_position'][0]) for c in continuing]}"
     )
 
     hidden = stack.tokens[:ALIGNED_SEGMENT]
