@@ -6110,11 +6110,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # SAME requests -- not that the batch holds one.
             starts.add(tuple(request_starts))
         if len(legs) != 1 or len(starts) != 1:
+            # THE FIRST CLAUSE IS THE PHRASE ITS LANDED READERS MATCH, so what follows
+            # it says what changed rather than replacing it: the lengths are now one
+            # tuple per request instead of one number.
             raise ValueError(
                 f"the layers of one forward are stepped together, so their KV-cache "
-                f"groups must agree on the leg and on each request's cached length; "
-                f"this call site's entries carry prefill flags {sorted(legs)} and "
-                f"cached lengths {sorted(starts)}"
+                f"groups must agree on the leg and the cached length, which is one "
+                f"length per request in the batch's own row order; this call site's "
+                f"entries carry prefill flags {sorted(legs)} and cached lengths "
+                f"{sorted(starts)}"
             )
         is_prefill = legs.pop()
         request_starts = list(starts.pop())
