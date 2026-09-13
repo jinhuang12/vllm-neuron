@@ -4308,13 +4308,29 @@ class Glm5NextKDAAttention(nn.Module):
             self.g_b_proj_weight.to(torch.float32).t()
         )
 
+        # AN OPENING PREFILL ENTERS WITH A ZERO STATE, AND THIS IS THE ONE PREDICATE
+        # THAT SAYS SO. A sequence starting at position 0 carries no history, and the
+        # slot it was handed may still hold the bytes of whichever request held it
+        # before -- nothing empties the recurrent banks, because an eager write on a
+        # buffer whose storage is shared is refused by the runtime. So BOTH state
+        # reads below select zero here instead. It is computed ONCE, outside the head
+        # loop that used to compute it per head, and it is a TENSOR comparison: the
+        # leg is a python bool and may branch, but a python branch on the position
+        # would compile the choice made at capture time into every later step.
+        opening = (
+            _start_is_zero(start_position, conv_state.device) if is_prefill else None
+        )
+
         # --- seam 1: the short convolution, ONE dispatch for q, k and v ------
         # The three streams are convolved together as one channel block, which
         # is the same channel extent the state calculator reports
         # (``conv_dim = proj + 2 * proj_k``). Padding is carried by the state
         # rather than by the seam, which refuses non-zero width padding.
         conv_in = torch.cat((q_in, k_in, v_in), dim=-1)
-        padded = torch.cat((self._conv_history(conv_state), conv_in), dim=0)
+        history = self._conv_history(conv_state)
+        if opening is not None:
+            history = torch.where(opening, torch.zeros_like(history), history)
+        padded = torch.cat((history, conv_in), dim=0)
         channels = 3 * width
         img = (
             padded.t().contiguous().reshape(1, channels, 1, state_rows + tokens)
@@ -4395,18 +4411,14 @@ class Glm5NextKDAAttention(nn.Module):
 
             # THE ENTERING STATE, CHOSEN WITHOUT READING THE POSITION. A sequence
             # starting at 0 enters with a zero state and a continuation enters with
-            # its carried one. The leg is a python bool, so it may branch -- one
-            # graph per leg is captured anyway -- but the POSITION is a tensor, and
-            # a python branch on it would compile the choice made at capture time
-            # into every later step. ``torch.where`` makes the choice on device, so
-            # one graph serves position 0 and position N.
+            # its carried one, under the one predicate computed above the seams --
+            # the same one the convolution's history is selected with, because both
+            # states belong to one request and a second signal for one fact is a
+            # place for the two to disagree. ``torch.where`` makes the choice on
+            # device, so one graph serves position 0 and position N.
             carried = recurrent_state[h].to(torch.float32)
-            if is_prefill:
-                state = torch.where(
-                    _start_is_zero(start_position, carried.device),
-                    torch.zeros_like(carried),
-                    carried,
-                )
+            if opening is not None:
+                state = torch.where(opening, torch.zeros_like(carried), carried)
             else:
                 state = carried
 

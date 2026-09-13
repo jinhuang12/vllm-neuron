@@ -70,6 +70,12 @@ SUB_FIRST = DECLARED_CHUNK * 2
 SUB_SECOND = 3
 SUB_TOKENS = SUB_FIRST + SUB_SECOND
 
+#: The value planted in a slot's CONVOLUTION history to stand for whatever the
+#: previous owner of that slot left there. It is exact in the state's dtype, which
+#: the item checks before it plants it: a value the dtype rounds away is stored as
+#: something else, and a comparison against it would then say nothing.
+DIRTY_CONV_ROW = 0.5
+
 #: Dispatches the sub-chunk continuing segment owes: none through either chunked
 #: seam, and one single-token dispatch per token per head per layer.
 DECLARED_SUB_CHUNKED_DISPATCHES = 0
@@ -320,15 +326,33 @@ def test_kda_prefill_segments_c04_a_fresh_prefill_ignores_the_bank(
     A prefill at position 0 must be bit-identical over a dirty bank and a clean
     one, and the same dirty bank at a continuing position must not be -- so the
     gate is shown live in both directions.
+
+    BOTH STATES ARE DIRTIED, NOT ONE. RE-PINNED: the recurrent state alone used to
+    be planted here, and the slot's CONVOLUTION history reached the seam whatever it
+    held, because nothing empties the banks -- an eager write on a buffer whose
+    storage is shared is refused by the runtime. The original reading, verbatim:
+    "for (_, recurrent), source in zip(dirty, dirty_source): recurrent.copy_(source)".
+    The property is the same one this item always measured, over the whole entering
+    state instead of half of it.
     """
     _report("item4_fresh_leg_unchanged", "the gate on the entering state")
     clean_out, dirty_source, _ = _one_shot(stack, ALIGNED_SEGMENT)
 
     dirty = _fresh_bank(stack.layers)
-    for (_, recurrent), source in zip(dirty, dirty_source):
+    for (conv, recurrent), source in zip(dirty, dirty_source):
         recurrent.copy_(source)
+        planted = float(torch.tensor(DIRTY_CONV_ROW, dtype=conv.dtype))
+        assert planted == DIRTY_CONV_ROW, (
+            f"the planted history {DIRTY_CONV_ROW} is stored as {planted} in "
+            f"{conv.dtype}, so this item would plant a value it cannot name"
+        )
+        conv.fill_(DIRTY_CONV_ROW)
     assert float(max(r.abs().max() for _, r in dirty)) > 0.0, (
         "the dirty bank is all zeros, so this item cannot tell the two routes apart"
+    )
+    assert float(min(c.abs().min() for c, _ in dirty)) > 0.0, (
+        "the planted convolution history is zero somewhere, so a gate that read it "
+        "would still produce the fresh answer there"
     )
     fresh_out, _ = _drive(
         stack.layers, dirty, stack.tokens[:ALIGNED_SEGMENT], start_position=0
@@ -336,8 +360,9 @@ def test_kda_prefill_segments_c04_a_fresh_prefill_ignores_the_bank(
     identical = bool(torch.equal(fresh_out, clean_out))
 
     dirty_again = _fresh_bank(stack.layers)
-    for (_, recurrent), source in zip(dirty_again, dirty_source):
+    for (conv, recurrent), source in zip(dirty_again, dirty_source):
         recurrent.copy_(source)
+        conv.fill_(DIRTY_CONV_ROW)
     continued_out, _ = _drive(
         stack.layers,
         dirty_again,
@@ -358,6 +383,51 @@ def test_kda_prefill_segments_c04_a_fresh_prefill_ignores_the_bank(
     assert not continued_identical, (
         "the same bank at a continuing position produced the fresh result, so the "
         "position is not gating the entering state at all"
+    )
+
+
+def test_kda_prefill_segments_c07_a_fresh_prefill_leaves_its_own_state_in_the_bank(
+    stack: SimpleNamespace,
+) -> None:
+    """Item 7. Certifying component: the state write-back on the fresh leg.
+
+    Ignoring what a slot held is half of the property; the other half is that the
+    slot holds THIS sequence's state afterwards. The write-back goes into the state
+    the layer was handed, so a fresh sequence entering at zero must still leave its
+    own rows behind -- not the planted ones, and not zeros.
+    """
+    _report("item7_fresh_writeback", "the state write-back on the fresh leg")
+    clean = _fresh_bank(stack.layers)
+    _drive(stack.layers, clean, stack.tokens[:ALIGNED_SEGMENT], start_position=0)
+    clean_after = [(conv.clone(), recurrent.clone()) for conv, recurrent in clean]
+
+    dirty = _fresh_bank(stack.layers)
+    for conv, recurrent in dirty:
+        conv.fill_(DIRTY_CONV_ROW)
+        recurrent.fill_(DIRTY_CONV_ROW)
+    _drive(stack.layers, dirty, stack.tokens[:ALIGNED_SEGMENT], start_position=0)
+
+    same = [
+        bool(torch.equal(conv, want_conv)) and bool(torch.equal(rec, want_rec))
+        for (conv, rec), (want_conv, want_rec) in zip(dirty, clean_after)
+    ]
+    moved = [
+        bool((conv != DIRTY_CONV_ROW).any()) and bool(conv.abs().max() > 0.0)
+        for conv, _ in clean_after
+    ]
+    print(
+        f"SEGPREFILL|item7|banks={len(same)}|equal_to_the_clean_run={same}"
+        f"|clean_state_is_neither_the_marker_nor_zero={moved}",
+        flush=True,
+    )
+    if not all(moved):
+        raise AssertionError(
+            "a clean run left a convolution state that is the planted value or all "
+            "zeros, so this item could pass on a bank nothing wrote"
+        )
+    assert all(same), (
+        "after a fresh prefill over a dirty slot the bank does not hold what the same "
+        "prefill over a clean slot left; the write-back landed somewhere else"
     )
 
 

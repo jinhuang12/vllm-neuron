@@ -851,6 +851,16 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
     old form would now leave the slot held and this item would fail on the reuse read.
     The property under test did not move: a finished request's slot is reused, and it
     is zeroed at hand-out.
+
+    RE-PINNED AGAIN, AND THE TWO HALVES PART HERE. The INDEXER's two caches are still
+    emptied at hand-out, because the runner allocates them and no reader of theirs
+    takes a position. The RECURRENT BANKS are not: they are the engine's own cache
+    tensors, every one a view of a single allocation, and an eager write on such a
+    buffer is refused by the runtime wherever it sits. Their freshness is served where
+    the state is READ -- an opening prefill selects a zero state, which
+    `test_kda_prefill_segments_116.py`'s fresh-leg pair measures live, in both
+    directions and on the write-back too. So what this item reads of the banks is that
+    the hand-out left the previous owner's bytes ALONE.
     """
     _require_cpu_mode()
     banks = _banks()
@@ -876,6 +886,12 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
     for bank in _linear_banks(banks):
         bank["conv_state"][slot].fill_(3.0)
         bank["recurrent_state"][slot].fill_(-2.0)
+    # WHAT THE PREVIOUS OWNER LEFT, kept to compare against rather than re-typed as a
+    # literal below: the banks must come out of the hand-out holding exactly this.
+    planted = [
+        (bank["conv_state"][slot].clone(), bank["recurrent_state"][slot].clone())
+        for bank in _linear_banks(banks)
+    ]
     for entry in rings:
         entry["pool_cache"][slot].fill_(5.0)
         entry["tail"][slot].fill_(-7.0)
@@ -904,14 +920,23 @@ def test_a2_a_finished_requests_slot_is_reused_and_zeroed_on_hand_out() -> None:
         f"the finished request's slot {slot} was not handed to the next request, "
         f"which got {later}; a table that never frees leaks its slots"
     )
-    for bank in _linear_banks(banks):
-        assert not bank["conv_state"][slot].any(), (
-            f"bank {bank['name']}'s conv state at slot {slot} still holds the "
-            f"previous request's values on hand-out"
+    # RE-PINNED: THE RECURRENT BANKS ARE NOT WRITTEN AT HAND-OUT, and this reads that
+    # they are not. They are the engine's own cache tensors, every one a view of a
+    # single allocation, so an eager write on them is refused by the runtime; the
+    # freshness is served where the state is READ instead, and the layer item that
+    # measures it is `test_kda_prefill_segments_116.py`'s fresh-leg pair. What this
+    # item still owns is that the slot changes hands without a write. The original
+    # readings, verbatim: "assert not bank["conv_state"][slot].any(), ... still holds
+    # the previous request's values on hand-out" and the same for "recurrent_state".
+    for bank, (was_conv, was_recurrent) in zip(_linear_banks(banks), planted):
+        assert torch.equal(bank["conv_state"][slot], was_conv), (
+            f"bank {bank['name']}'s conv state at slot {slot} was written at hand-out; "
+            f"the banks are the engine's buffers and no eager write may reach them"
         )
-        assert not bank["recurrent_state"][slot].any(), (
-            f"bank {bank['name']}'s recurrent state at slot {slot} still holds the "
-            f"previous request's values on hand-out"
+        assert torch.equal(bank["recurrent_state"][slot], was_recurrent), (
+            f"bank {bank['name']}'s recurrent state at slot {slot} was written at "
+            f"hand-out; the banks are the engine's buffers and no eager write may "
+            f"reach them"
         )
     # THE INDEXER'S TWO CACHES ARE ZEROED AT THE SAME MOMENT. A slot handed over with
     # a fresh recurrence and the last owner's pooled keys would complete its next

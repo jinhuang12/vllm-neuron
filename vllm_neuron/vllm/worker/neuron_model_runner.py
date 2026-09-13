@@ -5463,11 +5463,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"{request_id!r} has no free slot; the engine admitted more "
                     f"concurrent requests than the cache was allocated for"
                 )
-            for bank in banks:
-                if bank["family"] == "self_attn":
-                    continue
-                bank["conv_state"][free].zero_()
-                bank["recurrent_state"][free].zero_()
+            # THE RECURRENT BANKS ARE NOT WRITTEN HERE, and this is the one place that
+            # could be tempted to. They are the ENGINE's own cache tensors, every one a
+            # view of a single allocation, so an eager write on them is refused by the
+            # runtime -- "Can't call ReserveSpace on shared storage" -- wherever the call
+            # sits. The freshness is served where it is READ instead: an opening prefill
+            # selects a zero state for both the convolution history and the recurrent
+            # state (``model_fp8.py``'s KDA forward), so a slot handed on still holding
+            # the last owner's bytes cannot carry them into this request's answer. The
+            # indexer's own two caches ARE emptied below, because those the runner
+            # allocates and no reader of theirs takes a position.
             # THE INDEXER'S TWO CACHES ARE EMPTIED AT THE SAME MOMENT, because they
             # hold the same request's state and a half-fresh slot is the defect
             # this table exists to close: the ring would still carry the previous
