@@ -33,12 +33,24 @@ axis cannot use it, because a nonlinearity and a per-token scale stand between e
 the sum. So each head gets its own matmul, its own rectify, its own scale, and one add into an SBUF
 accumulator. This is a property of the function, not a missed optimisation.
 
-WHY THE HOST OWNS THE TRANSPORT. ``nisa.nc_matmul`` contracts the PARTITION axis of both operands, so
-the head dimension has to be the partition axis of both tiles on the way in. The caller therefore
-hands over ``q`` already permuted to ``[H, D, M]`` and ``k`` already transposed to ``[D, N]``. This
-follows the reason ``mla_absorb.py:78-84`` records for taking its weight as ``[H, K, N]``: the
-orientation belongs to whoever can pay for it once, and a device-side transpose would route through
-``nc_matmul`` again for no gain.
+WHERE THE TRANSPORT HAPPENS. ``nisa.nc_matmul`` contracts the PARTITION axis of both operands, so
+the head dimension has to be the partition axis of both tiles on the way in. The kernel makes that
+turn itself: each slab is loaded exactly as the caller stores it and transposed on the PE through a
+PSUM tile of its own dtype, ``k`` once per call and ``q`` once per (token tile, head). The transpose
+destination has to match the input dtype on this generation, and a bf16 value written to a bf16 tile
+cannot round, so for FINITE operands the matmul sees exactly the values the caller holds and the
+scores are bit-identical to the host-relayout kernel (measured at four shapes in the simulator).
+
+WHERE THAT IDENTITY STOPS. The PE turn is a matmul against an identity matrix, and the vendor rules
+it not bit-accurate when the tile holds NaN or Inf (Kaena ``nki/isa/neuron_isa.py:221-224``,
+NeuronCore-v2): a non-finite element can reach every output of its partition column, so one bad
+query element can touch its whole 128-token tile for that head, and one bad key element its whole
+128-candidate tile for every token, where the host copy kept it to the one token or candidate.
+Outside that tile nothing changes, and the bad row itself changes in both kernels; the CPU items
+prove exactly that and record what the simulator emits inside the tile. No host-side finiteness
+scan stands on this path: the callers hand this seam a Hadamard-rotated query
+(``model_fp8.py:5141-5146``) and a normalised key (``:5153-5156``), neither of which removes a
+non-finite value, and a scan per call would cost more than the transport it replaces.
 
 WHAT THE OUTPUT DTYPE IS, AND WHY IT IS NOT NEGOTIABLE. fp32. Three independent reasons agree, so
 this is not a preference: ``nc_matmul`` writes an fp32 PSUM destination on this generation and always
@@ -221,18 +233,47 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 # ---------------------------------------------------------------------------------------------
 
 
+def _transpose_tile(src_sb, rows, cols):
+    """``[rows, cols]`` SBUF -> ``[cols, rows]`` SBUF, turned on the PE through same-dtype PSUM."""
+    ps = nl.ndarray((cols, rows), dtype=src_sb.dtype, buffer=nl.psum)
+    nisa.nc_transpose(dst=ps, data=src_sb)
+    tile = nl.ndarray((cols, rows), dtype=src_sb.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=tile, src=ps)
+    return tile
+
+
+def _keys_transposed(k_hbm, head_dim, cands):
+    """``k`` as stored, ``[cands, head_dim]`` -> ``[head_dim, cands]`` SBUF, one PE turn per 128 rows."""
+    kt = nl.ndarray((head_dim, cands), dtype=k_hbm.dtype, buffer=nl.sbuf)
+    for c0 in range(0, cands, CONTRACTION_TILE):
+        cw = min(CONTRACTION_TILE, cands - c0)
+        k_sb = nl.ndarray((cw, head_dim), dtype=k_hbm.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=k_sb, src=nl.load(k_hbm[c0:c0 + cw, :]))
+        nisa.tensor_copy(dst=kt[:, c0:c0 + cw], src=_transpose_tile(k_sb, cw, head_dim))
+    return kt
+
+
 @nki.jit
-def _score_gemm_nki(qt_hbm, kt_hbm, w_hbm):
+def _score_gemm_nki(q_hbm, k_hbm, w_hbm):
     """Rectified per-head scores, weighted and summed over heads.
 
     Args:
-        qt_hbm: ``[heads, head_dim, tokens]`` -- the query, ALREADY permuted so that the head
-            dimension is the partition axis the matmul contracts.
-        kt_hbm: ``[head_dim, cands]`` -- the key, ALREADY transposed, with no head axis (MQA).
+        q_hbm: ``[tokens, heads, head_dim]`` bf16 -- the query AS STORED; the kernel puts the head
+            dimension on the partition axis itself.
+        k_hbm: ``[cands, head_dim]`` bf16 -- the key AS STORED, with no head axis (MQA).
         w_hbm: ``[tokens, heads]`` fp32 -- the per-token per-head gate, fully pre-scaled.
 
     Returns:
         ``[tokens, cands]`` fp32.
+
+    THE TRANSPORT IS ON CHIP. Every operand slab is a ``[rows, head_dim]`` tile, ``rows <= 128``,
+    loaded as stored and turned by one PE ``nc_transpose`` into a PSUM tile of the same dtype, then
+    copied to SBUF; ragged ``rows`` need no padding because the PE takes any tile up to (128, 128).
+    The turn is exact for finite values; a NaN or Inf in a slab is confined to that slab's tile and
+    is not bit-accurate through the PE (module docstring, "WHERE THAT IDENTITY STOPS").
+    ``k`` is turned ONCE per call into ``[head_dim, cands]`` and each (token tile, candidate tile,
+    head) reads a column range of it: at ``cands`` 1024 that tile is 2,048 bytes per partition,
+    262,144 bytes of SBUF in all; at 512, half of that.
 
     THE TILE LOOP, and which bound each level answers to. ``tokens`` walks in ``TOKEN_TILE`` steps
     because it becomes the stationary free size (max 128); ``cands`` walks in ``CAND_TILE`` steps
@@ -244,12 +285,13 @@ def _score_gemm_nki(qt_hbm, kt_hbm, w_hbm):
     times the cycles by this ISA's own cost model. The bf16 round of the pre-authoring probe compiled
     exactly this, with an int32-operand refusal as its control.
     """
-    heads = qt_hbm.shape[0]
-    head_dim = qt_hbm.shape[1]
-    tokens = qt_hbm.shape[2]
-    cands = kt_hbm.shape[1]
+    tokens = q_hbm.shape[0]
+    heads = q_hbm.shape[1]
+    head_dim = q_hbm.shape[2]
+    cands = k_hbm.shape[0]
 
     out = nl.ndarray((tokens, cands), dtype=nl.float32, buffer=nl.shared_hbm)
+    kt = _keys_transposed(k_hbm, head_dim, cands)
 
     for m0 in range(0, tokens, TOKEN_TILE):
         mw = min(TOKEN_TILE, tokens - m0)
@@ -263,14 +305,14 @@ def _score_gemm_nki(qt_hbm, kt_hbm, w_hbm):
             nisa.memset(dst=acc, value=0.0)
 
             for h in range(heads):
-                # Stationary: [head_dim, mw]. Partition axis is head_dim, so it is what contracts;
-                # the free axis mw becomes the PSUM tile's partition axis.
-                q_tile = nl.ndarray((head_dim, mw), dtype=qt_hbm.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=q_tile, src=nl.load(qt_hbm[h, :, m0:m0 + mw]))
+                # Stationary: this head's [mw, head_dim] rows as stored, turned to [head_dim, mw] so
+                # head_dim is the partition axis that contracts and mw becomes PSUM's partition.
+                q_sb = nl.ndarray((mw, head_dim), dtype=q_hbm.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=q_sb, src=nl.load(q_hbm[m0:m0 + mw, h, :]))
+                q_tile = _transpose_tile(q_sb, mw, head_dim)
 
-                # Moving: [head_dim, nw]. Same partition axis; its free axis becomes PSUM's free axis.
-                k_tile = nl.ndarray((head_dim, nw), dtype=kt_hbm.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=k_tile, src=nl.load(kt_hbm[:, n0:n0 + nw]))
+                # Moving: [head_dim, nw], a column range of the keys turned once above.
+                k_tile = kt[:, n0:n0 + nw]
 
                 # dst = stationary.T @ moving = [mw, nw]. PSUM and fp32 are both forced here.
                 ps = nl.ndarray((mw, nw), dtype=nl.float32, buffer=nl.psum)
@@ -410,18 +452,15 @@ def dsa_score_gemm(q: Tensor, k: Tensor, weights: Tensor) -> Tensor:
         _COUNTERS.torch_fallback += 1
         return _dsa_score_gemm_torch(q, k, weights)
 
-    # The transport the device cannot pay for: put the contracted axis on the partition axis of both
-    # operands. `.contiguous()` is what makes each permute a real relayout rather than a stride view.
-    qt = q.permute(1, 2, 0).contiguous()
-    kt = k.t().contiguous()
-
     _COUNTERS.nki_dispatch += 1
     # The log and the identity read are FOLDED off the traced graph. The helper takes ints only and
     # reads the kernel as a module global; passing the kernel object is the measured defect that
     # pattern exists to avoid. The counter increment stays -- a plain int attribute store is a
     # recorded side effect, not a host call.
     _record_nki_dispatch(tokens, cands, heads, head_dim)
-    return wrap_nki(_score_gemm_nki)(qt, kt, weights.contiguous())
+    # Same layout in, same layout out: a contiguous caller gets its own storage back, a strided
+    # one gets a plain copy. Neither is a transposing relayout; the kernel turns the operands.
+    return wrap_nki(_score_gemm_nki)(q.contiguous(), k.contiguous(), weights.contiguous())
 
 
 # ---------------------------------------------------------------------------------------------
