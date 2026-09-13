@@ -16,7 +16,7 @@ integer across the group: the sum is the wave's barrier AND it carries how many
 ranks failed, so a rank that raises is reported to the others in that wave rather
 than left for them to wait out the barrier timeout.
 
-Fifteen items, ONE test each, no ``parametrize``:
+Sixteen items, ONE test each, no ``parametrize``:
 
 * T01 -- rank 0 is alone in the first wave.
 * T02 -- no wave after the first holds more than the wave size.
@@ -25,17 +25,19 @@ Fifteen items, ONE test each, no ``parametrize``:
 * T05 -- rank 0 exchanges once per wave, and works in the first wave only.
 * T06 -- a rank in the last wave exchanges once per wave too, and works once.
 * T07 -- a rank in a middle wave does the same.
-* T08 -- with the variable unset the wave size reads eight.
-* T09 -- a set value is read through, not defaulted.
-* T10 -- a set "0" is refused instead of read as the default.
-* T11 -- a negative value is refused.
-* T12 -- the rank that raises re-raises its own error.
-* T13 -- the rank that raises contributes its 1 to the exchange BEFORE it re-raises.
-* T14 -- rank 0 learns of that failure on the same wave and raises, naming the count.
-* T15 -- a rank whose own wave is later learns on that wave too, and never works.
+* T08 -- the loop partitions by the size the variable holds, at a size that is NOT the default.
+* T09 -- with the variable unset the wave size reads eight.
+* T10 -- a set value is read through, not defaulted.
+* T11 -- a set "0" is refused instead of read as the default.
+* T12 -- a negative value is refused.
+* T13 -- the rank that raises re-raises its own error.
+* T14 -- the rank that raises contributes its 1 to the exchange BEFORE it re-raises.
+* T15 -- rank 0 learns of that failure on the same wave and raises, naming the count.
+* T16 -- a rank whose own wave is later learns on that wave too, and never works.
 
-T02 and T05 print the numbers they measured, so the transcript carries the wave
-sizes and the exchange count rather than only a verdict. Run pytest with ``-s``.
+T02, T05 and T08 print the numbers they measured, so the transcript carries the wave
+sizes, the exchange count and the off-default partition rather than only a verdict.
+Run pytest with ``-s``.
 """
 
 import pytest
@@ -61,6 +63,7 @@ def _run_on(monkeypatch, world_size, rank, wave, work=None, fail_on_wave=0, exch
     to read what this rank contributed even when the run ends in a raise.
     """
     exchanges = [] if exchanges is None else exchanges
+    already = len(exchanges)
     works = []
     monkeypatch.setattr(
         neuron_worker, "get_tp_group", lambda: _Group(world_size, rank)
@@ -73,7 +76,9 @@ def _run_on(monkeypatch, world_size, rank, wave, work=None, fail_on_wave=0, exch
 
     def _sum(value):
         exchanges.append(value)
-        return value + (1 if len(exchanges) == fail_on_wave else 0)
+        # Counted from what THIS run exchanged, so a caller that passes a list already holding
+        # values does not shift the wave the planted failure lands on.
+        return value + (1 if len(exchanges) - already == fail_on_wave else 0)
 
     monkeypatch.setattr(neuron_worker, "tp_sum_int", _sum)
     neuron_worker.run_warmup_in_waves(
@@ -103,21 +108,34 @@ def test_wave_size_at_or_above_the_world_leaves_one_wave_after_rank_zero():
 
 
 def test_rank_zero_exchanges_once_per_wave_and_works_in_the_first(monkeypatch):
-    exchanges, works = _run_on(monkeypatch, world_size=64, rank=0, wave=8)
+    wave = 8
+    exchanges, works = _run_on(monkeypatch, world_size=64, rank=0, wave=wave)
     print(f"warmup_exchanges|rank=0|exchanges={len(exchanges)}|works={works}")
-    assert len(exchanges) == len(warmup_rank_waves(64, 8))
+    assert len(exchanges) == len(warmup_rank_waves(64, wave))
     assert works == [0]
 
 
 def test_a_rank_in_the_last_wave_exchanges_once_per_wave_and_works_once(monkeypatch):
-    exchanges, works = _run_on(monkeypatch, world_size=64, rank=63, wave=8)
-    assert len(exchanges) == len(warmup_rank_waves(64, 8))
+    wave = 8
+    exchanges, works = _run_on(monkeypatch, world_size=64, rank=63, wave=wave)
+    assert len(exchanges) == len(warmup_rank_waves(64, wave))
     assert works == [63]
 
 
 def test_a_rank_in_a_middle_wave_exchanges_once_per_wave_and_works_once(monkeypatch):
-    exchanges, works = _run_on(monkeypatch, world_size=64, rank=30, wave=8)
-    assert len(exchanges) == len(warmup_rank_waves(64, 8))
+    wave = 8
+    exchanges, works = _run_on(monkeypatch, world_size=64, rank=30, wave=wave)
+    assert len(exchanges) == len(warmup_rank_waves(64, wave))
+    assert works == [30]
+
+
+def test_the_loop_partitions_by_the_size_the_knob_holds(monkeypatch):
+    # A size the shipped default is not. Every other item runs at eight, so a loop that ignored the
+    # knob and partitioned by a literal eight would satisfy them all; this one it cannot satisfy.
+    wave = 4
+    exchanges, works = _run_on(monkeypatch, world_size=64, rank=30, wave=wave)
+    print(f"warmup_knob|wave={wave}|exchanges={len(exchanges)}|works={works}")
+    assert len(exchanges) == len(warmup_rank_waves(64, wave))
     assert works == [30]
 
 
