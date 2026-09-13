@@ -4832,18 +4832,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """``[tokens]`` int32: each score ROW's own causal length.
 
         ``seq_lens`` IS PER TOKEN, NOT PER REQUEST -- "one per PACKED row", guarded
-        at ``model_fp8.py:5648`` -- and it is the causal bound ``inc-glm53f-103``
-        consumes (``model_fp8.py:5021``). Row ``i`` of a chunk that starts at
-        ``start_position`` sees ``start_position + i + 1`` tokens including itself.
+        at ``model_fp8.py:6179`` and documented at ``:6095`` -- and it is the causal
+        bound ``inc-glm53f-103`` consumes (``model_fp8.py:5533``). Row ``i`` of a chunk
+        that starts at ``start_position`` sees ``start_position + i + 1`` tokens
+        including itself.
         The landed tiny operand is ``arange(1, tokens + 1)``
         (``test_tiny_glm5next_forward.py:2872``), which is this expression at
         ``start_position == 0``.
+
+        IT IS BUILT ON THE HOST IN int32 AND MOVED ONCE, like the pool-slot derivation
+        above. Adding to a tensor that already lives on the device is eager device
+        arithmetic, and the offset is a python int that the host can add for free.
         """
-        return (
-            torch.arange(int(tokens), dtype=torch.int32, device=device)
-            + int(start_position)
-            + 1
-        )
+        offset = int(start_position) + 1
+        return (torch.arange(int(tokens), dtype=torch.int32) + offset).to(device)
 
     @staticmethod
     def _glm5next_start_position(position: int, device) -> torch.Tensor:
@@ -4909,7 +4911,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         BOTH ARE LIVE ACROSS STEPS, which is why the caller allocates them ONCE and
         keeps them: the decode leg advances the ring in place (``tail.copy_``,
-        ``model_fp8.py:5477``) and the pooled store accumulates the prefill's rows.
+        ``model_fp8.py:5986``) and the pooled store accumulates the prefill's rows.
         Re-allocating per step would reset both and lose every pooled key.
 
         THE DTYPE IS THE LATENT BANK'S, so neither cache adds a second dtype
@@ -4962,7 +4964,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         new sequence would otherwise start on the previous sequence's partial pool,
         because every real token stashes into the ring
         (``vllm_neuron/functional/dsa/decode_tail_update.py``) and nothing here
-        empties it. :meth:`_glm5next_model_kwargs` clears the ring when a prefill
+        empties it. :meth:`_glm5next_model_kwargs` REPLACES the ring when a prefill
         starts at position 0, which is a new sequence by definition; the pooled
         store is left alone for the reason given there.
         """
@@ -5502,10 +5504,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # through the cursor's own gap. Clearing the owner alongside the rows leaves
             # the ring belonging to nobody, so a refused opening makes the next
             # non-opening step refuse by name instead of reading blanks.
+            # THE RING IS REPLACED, NOT EMPTIED IN PLACE. An eager ``zero_()`` on this
+            # buffer was refused on the device -- "Can't call ReserveSpace on shared
+            # storage" -- and the refusal landed in the input builder before any forward
+            # ran, so warmup never reached its first bucket. How far that refusal
+            # generalises to other in-place writes is not measured, and this comment does
+            # not claim it. A fresh allocation is the same allocation the ring was created
+            # with, and the carriers are built from these entries after this loop, so the
+            # step binds the new buffer.
             self._glm5next_side_cache_cursor = None
             for side in side_caches:
                 if "tail" in side:
-                    side["tail"].zero_()
+                    ring = side["tail"]
+                    side["tail"] = torch.zeros(
+                        ring.shape, dtype=ring.dtype, device=ring.device
+                    )
         elif not synthetic_step:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so
