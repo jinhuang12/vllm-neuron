@@ -65,15 +65,13 @@ the SEQUENCE axis as a slice and the HEAD axis as a scalar, and the kernel retur
 `[S, H, N]` with NO host permute on the output. The transcript is
 ``probe-097-store-form-host.out`` (`FORMS_ACCEPTED=A,B,C,D`, `CHOSEN_FORM=B`, 8/8).
 
-THE OPERANDS REACH HBM AS float32, and that is inherited rather than chosen. The
-seam upcasts on the host exactly as `mla_projection` does. Upcasting bf16 to
-float32 is lossless, so it costs no accuracy -- but it does double this seam's HBM
-traffic, and `nl.load` takes a `dtype` argument that could do the same cast on
-device from a bf16 tensor instead. That variant is NOT taken here: this block's
-acceptance measures correctness, the landed ADAPT source's transfer shape is the
-one already reviewed, and changing it would be an unmeasured performance change
-smuggled in under a correctness increment. It is recorded as a named follow-up
-rather than left for a reader to notice.
+`x` REACHES HBM IN THE CALLER'S DTYPE, and the cast is the kernel's. Every
+`nl.load` below names ``dtype=nl.float32``, so a bf16 tensor is widened on device as
+it lands in SBUF, which is the follow-up the earlier revision of this docstring
+named and left. Upcasting bf16 to float32 is lossless either way, so the values are
+the same; what changes is that `x` no longer crosses HBM at twice its width. `w` is
+still handed over as float32 because it already IS float32 where it is prepared, so
+its cast is a no-op and removing it would buy nothing.
 
 WHERE THE TRANSPORT HAPPENS. A `nc_matmul` contracts the PARTITION axis, so both
 operands must present the contraction extent there. The kernel makes that turn for
@@ -377,7 +375,7 @@ def mla_absorb(x: Tensor, w: Tensor) -> Tensor:
 
     _MLA_ABSORB_COUNTERS.nki_dispatch += 1
     out = wrap_nki(mla_absorb_kernel)(
-        x.contiguous().to(torch.float32),
+        x.contiguous(),
         w.contiguous().to(torch.float32),
     )
     return out.to(x.dtype)
