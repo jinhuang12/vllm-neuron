@@ -114,6 +114,14 @@ KEY_CHUNK = 128
 #: rides the stationary operand in both matmuls, so this bounds H.
 HEAD_MAX = 128
 
+#: Free-axis alignment, in float32 elements, for a tile that a ``dma_transpose``
+#: writes a SLICE of. The runtime refuses such a descriptor unless the destination
+#: byte offset is 32-byte aligned -- "transpose dest offset <n> must be 32B aligned"
+#: -- and a slice offset here is the head count times the tile index, so the head
+#: axis is padded to a whole 32 bytes and every slice then starts on one. Eight
+#: float32 elements are 32 bytes.
+DMA_TRANSPOSE_ALIGN = 8
+
 #: Moving free-axis extent, ``nl.tile_size.gemm_moving_fmax``. K rides the moving
 #: operand in MM1 and the latent rides it in MM2, so this bounds both -- and BOTH are
 #: now TILED to it rather than bounded by it: the latent by `inc-glm53f-041` and the
@@ -206,6 +214,12 @@ def mla_sparse_dispatch_counters() -> tuple[int, int]:
 # floor that captured in the same process.
 def _sbuf(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.float32, buffer=nl.sbuf)
+
+
+def _aligned(width: int) -> int:
+    """``width`` rounded up to a whole :data:`DMA_TRANSPOSE_ALIGN` block."""
+    blocks = (width + DMA_TRANSPOSE_ALIGN - 1) // DMA_TRANSPOSE_ALIGN
+    return blocks * DMA_TRANSPOSE_ALIGN
 
 
 def _sbuf_u32(*shape: int):
@@ -333,7 +347,7 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
 
     # ---- per-query working set, allocated once and reused across the loop -------
     idx_sb = _sbuf_u32(LATENT_TILE, topk)
-    q_lift_t = _sbuf(LATENT_TILE, n_latent, heads)
+    q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(heads))
     c_g = _sbuf(LATENT_TILE, n_latent, topk)
     c_g_t = _sbuf(KEY_CHUNK, n_chunks, latent)
     p_t = _sbuf(KEY_CHUNK, n_chunks, heads)
@@ -372,7 +386,7 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
         # ---- this query's Q latent, transposed onto partitions ------------------
         for li in range(n_latent):
             nisa.dma_transpose(
-                dst=q_lift_t[:, li, :],
+                dst=q_lift_t[:, li, 0:heads],
                 src=q_lift_hbm.ap(pattern=[[latent, heads], [1, LATENT_TILE]],
                                   offset=q_idx * heads * latent + li * LATENT_TILE),
             )
@@ -382,7 +396,7 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
         for li in range(n_latent):
             nisa.nc_matmul(
                 dst=scores_ps,
-                stationary=q_lift_t[:, li, :],
+                stationary=q_lift_t[:, li, 0:heads],
                 moving=c_g[:, li, :],
                 accumulate=(li > 0),
             )
@@ -1005,7 +1019,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # This is the point of tiling rather than widening: every buffer below is the size
     # `-040`'s was at `topk == MOVING_MAX`, whatever K the caller passes.
     idx_sb = _sbuf_u32(LATENT_TILE, tile_max)
-    q_lift_t = _sbuf(LATENT_TILE, n_latent, heads)
+    q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(heads))
     c_g = _sbuf(LATENT_TILE, n_latent, tile_max)
     c_g_t = _sbuf(KEY_CHUNK, chunk_max, latent)
     p_t = _sbuf(KEY_CHUNK, chunk_max, heads)
@@ -1066,7 +1080,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
         # per tile for no reading.
         for li in range(n_latent):
             nisa.dma_transpose(
-                dst=q_lift_t[:, li, :],
+                dst=q_lift_t[:, li, 0:heads],
                 src=q_lift_hbm.ap(pattern=[[latent, heads], [1, LATENT_TILE]],
                                   offset=q_idx * heads * latent + li * LATENT_TILE),
             )
@@ -1106,7 +1120,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
             for li in range(n_latent):
                 nisa.nc_matmul(
                     dst=scores_ps,
-                    stationary=q_lift_t[:, li, :],
+                    stationary=q_lift_t[:, li, 0:heads],
                     moving=c_g[:, li, 0:extent],
                     accumulate=(li > 0),
                 )
