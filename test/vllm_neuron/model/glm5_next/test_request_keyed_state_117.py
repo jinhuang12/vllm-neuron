@@ -407,9 +407,10 @@ def _two_request_step(runner, banks, *, tokens: int, cached):
     converted = runner._glm5next_model_kwargs(_generic(
         tokens=int(tokens), metadata=metadata
     ))
-    assert sorted(converted) == ["input_ids", "layer_carriers", "sampling_positions"], (
-        f"the converter returned {sorted(converted)}"
-    )
+    assert sorted(converted) == [
+        "expert_parallel_rank", "input_ids", "layer_carriers", "moe_group",
+        "sampling_positions", "tp_degree",
+    ], f"the converter returned {sorted(converted)}"
     return converted["layer_carriers"]
 
 
