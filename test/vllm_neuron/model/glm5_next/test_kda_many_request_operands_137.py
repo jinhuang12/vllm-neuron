@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Acceptance for the row operands meeting a call that carries several requests.
 
-Four items, no ``parametrize``. The layer serves a concurrent decode by recursing once per
+Five items, no ``parametrize``. The layer serves a concurrent decode by recursing once per
 request, and each request's recursion receives THAT request's own row operands. They
 arrive stacked on a leading request axis, which is one axis more than one sequence's pair
 carries and so is a form no one-sequence operand can be mistaken for; the runner's carrier
@@ -15,6 +15,11 @@ the states do is still refused -- and the last item below reads that refusal.
 Two items are the served path's scope guards and are unchanged: a concurrent decode
 WITHOUT the operands must still be served, and a single-request call WITH them must still
 be served.
+
+THE DECODE LEG IS THE ONLY LEG THESE ITEMS CAN READ. A prefill of several requests is
+refused by the layer -- its packed rows say nothing about where one request's tokens end --
+so several requests' masks never coexist on a prefill, and one request's own padded prefill
+is the landed acceptance of the other branch of this function.
 
 Run on the Tier N harness -- the NKI simulator on the host CPU, no device and no
 lease::
@@ -30,10 +35,12 @@ lease::
 3. a single-request decode WITH the operands is served;
 4. a two-request decode with per-request operands equals the two single-request decodes
     it is made of -- every output row, and both banks each request wrote;
-5. each request's own mask is the one applied to IT: masking one request's only row
-    leaves that request's state where it found it and advances the other's, and
-    exchanging the two masks exchanges which request stood still. One pair for two
-    requests names no request, and is refused.
+5. each request's own mask governs its own state: with one request's single decode row
+    marked padding, that request's conv and recurrent states are bit-identical before and
+    after the step while the other's advance, and exchanging the two masks exchanges which
+    request stood still;
+6. an operand set naming a different number of requests than the states do is refused, and
+    the message names that count rather than the concurrency.
 
 Every declared value is CARRIED from the landed KDA layer acceptance, imported rather
 than retyped.
@@ -60,6 +67,12 @@ SEED = layer_half.SEED
 
 #: Two requests, one token each: the shape a concurrent decode arrives in.
 DECLARED_REQUESTS = 2
+
+#: A position above zero, which is what makes a state a state the layer READS: at zero the
+#: layer enters with zero whatever the slot holds, so a step asked to leave a state alone
+#: has to be a step of a sequence already under way. Any positive value serves; this one is
+#: the conv history width plus one, so the history the step convolves with is full.
+DECLARED_CONTINUING_POSITION = DECLARED_KDA_CONV_KERNEL_SIZE
 
 
 def _layer() -> SimpleNamespace:
@@ -92,10 +105,15 @@ def one_layer() -> SimpleNamespace:
     return _layer()
 
 
-def _slots(layer, requests: int):
-    """One zeroed carrier pair per request, as views of one bank the way the runner
-    hands them: two requests' states are two rows of one bank and cannot be one
-    tensor without copying."""
+def _slots(layer, requests: int, *, position: int = 0):
+    """One carrier pair per request, as views of one bank the way the runner hands them:
+    two requests' states are two rows of one bank and cannot be one tensor without
+    copying.
+
+    A POSITION ABOVE ZERO FILLS THE SLOTS, and each request's fill is its own value, so a
+    request served with another's state is visible. At zero the slots stay zeroed, which
+    is what the layer enters an opening sequence with whatever the bank holds.
+    """
     attention = layer.attention
     conv_bank = torch.zeros(
         (requests, *attention.kda_conv_state_shape),
@@ -105,13 +123,17 @@ def _slots(layer, requests: int):
         (requests, *attention.kda_recurrent_state_shape),
         dtype=attention.kda_recurrent_state_dtype,
     )
+    if int(position) > 0:
+        for index in range(requests):
+            conv_bank[index].fill_(float(index + 1))
+            recurrent_bank[index].fill_(float(index + 1) / 8.0)
     # ONE ROW PER REQUEST AND ONE DIMENSION. The splitter unbinds a position tensor
     # only when it is 1-D with more than one row; a `[requests, 1]` tensor stays whole
     # and the call is refused for describing unequal numbers of requests instead.
     return (
         tuple(conv_bank[index] for index in range(requests)),
         tuple(recurrent_bank[index] for index in range(requests)),
-        torch.zeros((requests,), dtype=torch.int32),
+        torch.full((requests,), int(position), dtype=torch.int32),
         conv_bank,
         recurrent_bank,
     )
@@ -148,15 +170,16 @@ def _per_request_operands(layer, reals) -> dict:
     }
 
 
-def _decode(layer, rows, requests: int, extras: dict):
+def _decode(layer, rows, requests: int, extras: dict, *, position: int = 0):
     """One concurrent-decode call: one token per request, each its own carrier.
 
-    The two banks come back beside the output, because whose state advanced is not a
-    question the output rows answer.
+    The two banks come back beside the output, and beside the copy they held BEFORE the
+    call, because whose state advanced is not a question the output rows answer.
     """
     conv_state, recurrent_state, start_position, conv_bank, recurrent_bank = _slots(
-        layer, requests
+        layer, requests, position=position
     )
+    before = SimpleNamespace(conv=conv_bank.clone(), recurrent=recurrent_bank.clone())
     out = layer(
         rows,
         conv_state=conv_state if requests > 1 else conv_state[0],
@@ -165,7 +188,9 @@ def _decode(layer, rows, requests: int, extras: dict):
         start_position=start_position,
         **extras,
     )
-    return SimpleNamespace(out=out, conv=conv_bank, recurrent=recurrent_bank)
+    return SimpleNamespace(
+        out=out, conv=conv_bank, recurrent=recurrent_bank, before=before
+    )
 
 
 def test_c02_a_many_request_decode_without_the_row_operands_is_still_served(one_layer):
@@ -233,54 +258,76 @@ def test_c04_per_request_operands_equal_the_single_request_decodes_they_are_made
     )
 
 
-def test_c05_each_requests_own_mask_is_the_one_applied_to_that_request(one_layer):
-    """A padding row holds ITS request's state still, and only that request's."""
+def test_c05_each_requests_own_mask_governs_that_requests_own_state(one_layer):
+    """A padding row holds ITS request's states still, to the bit, and only its own."""
     layer = one_layer.layer
-    stood_still = {}
+    still = {}
     for masked in range(DECLARED_REQUESTS):
         reals = [1] * DECLARED_REQUESTS
         reals[masked] = 0
         operands = _per_request_operands(layer, reals)
         assert operands, "the tree carries the row operands and the runner's builder"
-        drive = _decode(layer, one_layer.rows, DECLARED_REQUESTS, operands)
-        moved = [
+        drive = _decode(
+            layer,
+            one_layer.rows,
+            DECLARED_REQUESTS,
+            operands,
+            position=DECLARED_CONTINUING_POSITION,
+        )
+        held = [
             (
-                float(drive.conv[index].abs().max()),
-                float(drive.recurrent[index].abs().max()),
+                torch.equal(drive.conv[index], drive.before.conv[index]),
+                torch.equal(drive.recurrent[index], drive.before.recurrent[index]),
             )
             for index in range(DECLARED_REQUESTS)
         ]
         print(
             f"MANYREQ|c05|masked_request={masked}|"
-            f"real_tokens={operands['real_tokens'].reshape(-1).tolist()}|moved={moved}"
+            f"real_tokens={operands['real_tokens'].reshape(-1).tolist()}|"
+            f"position={DECLARED_CONTINUING_POSITION}|unchanged={held}"
         )
-        stood_still[masked] = moved
-        assert moved[masked] == (0.0, 0.0), (
-            f"request {masked}'s only row is padding, so both of its states must stand "
-            f"where they were; they moved to {moved[masked]}"
+        still[masked] = held
+        assert held[masked] == (True, True), (
+            f"request {masked}'s only row is padding, so both of its states must be the "
+            f"bytes they were; conv and recurrent unchanged reads {held[masked]}"
         )
-        for other in (
-            index for index in range(DECLARED_REQUESTS) if index != masked
-        ):
-            assert moved[other][1] > 0.0, (
-                f"request {other} carries a real token and its recurrent state did not "
-                f"move, so this item could not tell one request's mask from another's"
+        for other in (index for index in range(DECLARED_REQUESTS) if index != masked):
+            assert held[other] == (False, False), (
+                f"request {other} carries a real token and its states {held[other]} did "
+                f"not both move, so this item could not tell one request's mask from "
+                f"another's"
             )
-    print(f"MANYREQ|c05|exchanged={[stood_still[key] for key in sorted(stood_still)]}")
-    # ONE PAIR FOR TWO REQUESTS NAMES NO REQUEST, and the count is what says so.
-    with pytest.raises(ValueError) as refusal:
-        _decode(
-            layer,
-            one_layer.rows,
-            DECLARED_REQUESTS,
-            _operands(layer, DECLARED_REQUESTS, DECLARED_REQUESTS),
-        )
-    said = str(refusal.value)
-    print(f"MANYREQ|c05|refusal={said}")
-    assert "real_tokens" in said or "row_mask" in said
-    assert str(DECLARED_REQUESTS) in said
+    print(f"MANYREQ|c05|exchanged={[still[key] for key in sorted(still)]}")
     print(
         f"MANYREQ|c05|route=served|rows={int(drive.out.shape[0])}|"
         f"hidden={int(drive.out.shape[1])}|operands=per_request|"
         f"requests={DECLARED_REQUESTS}"
+    )
+
+
+def test_c06_an_operand_set_naming_another_request_count_is_refused(one_layer):
+    """One pair for two requests names no request, and the count is what says so."""
+    layer = one_layer.layer
+    operands = _operands(layer, DECLARED_REQUESTS, DECLARED_REQUESTS)
+    assert operands, "the tree carries the row operands and the runner's builder"
+    print(
+        f"MANYREQ|c06|real_tokens={tuple(operands['real_tokens'].shape)}|"
+        f"row_mask={tuple(operands['row_mask'].shape)}|entries=1|"
+        f"requests={DECLARED_REQUESTS}"
+    )
+    with pytest.raises(ValueError) as refusal:
+        _decode(layer, one_layer.rows, DECLARED_REQUESTS, operands)
+    said = str(refusal.value)
+    print(f"MANYREQ|c06|refusal={said}")
+    # THE MESSAGE NAMES THE COUNT, which is what this item reads rather than the mere
+    # raise: the refusal this one replaced named the concurrency, and both refuse the
+    # same call.
+    assert "one entry per request" in said, (
+        f"the refusal must name the count it read; it said {said!r}"
+    )
+    assert "real_tokens" in said or "row_mask" in said
+    assert str(DECLARED_REQUESTS) in said
+    print(
+        f"MANYREQ|c06|route=refused|rows=0|hidden={one_layer.hidden}|"
+        f"operands=one_pair|requests={DECLARED_REQUESTS}"
     )
