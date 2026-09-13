@@ -454,19 +454,35 @@ def _wide_ids():
 
 
 def _where_they_differ(own, reference, index: int, family: str) -> str:
-    """Where two banks of one layer disagree, as a reading: the pages, not just a boolean.
+    """How far apart two banks of one layer are, as a reading rather than a boolean.
 
-    The first dimension is the page, which is the one axis that means the same thing in
-    every bank this fixture allocates; nothing below reads a slot, because a bank with two
-    KV heads interleaves them under the page and a slot number there names no one row.
+    THE SIZE OF THE DIFFERENCE IS THE READING, because two answers look identical to a
+    byte-equal oracle and are not the same finding: a spread at the last bits of the dtype
+    is a different arithmetic order over a different row count, while a large or clustered
+    difference is a value that came from a row the request does not own.
+
+    The first dimension is the page, the one axis that means the same thing in every bank
+    this fixture allocates; nothing here reads a slot, because a bank with two KV heads
+    interleaves them under the page and a slot number there names no one row.
     """
-    unequal = (own != reference).flatten(start_dim=1).any(dim=1).nonzero().flatten()
-    pages = [int(page) for page in unequal[:8]]
+    wide, other = own.to(torch.float32).flatten(), reference.to(torch.float32).flatten()
+    delta = wide - other
+    moved = delta.nonzero().flatten()
+    scale = torch.maximum(wide.abs(), other.abs()).clamp(min=1e-30)
+    pages = (own != reference).flatten(start_dim=1).any(dim=1).nonzero().flatten()
+    first = [
+        (int(at), round(float(wide[at]), 6), round(float(other[at]), 6))
+        for at in moved[:5]
+    ]
     return (
-        f"INC133|write_diff|layer={index}|family={family}|shape={tuple(own.shape)}"
-        f"|pages={tuple(own.shape)[0]}|pages_that_differ={int(unequal.numel())}"
-        f"|first_pages_that_differ={pages}"
-        f"|elements_that_differ={int((own != reference).sum())}"
+        f"INC133|write_diff|layer={index}|family={family}|dtype={own.dtype}"
+        f"|shape={tuple(own.shape)}|pages={tuple(own.shape)[0]}"
+        f"|pages_that_differ={int(pages.numel())}|first_pages={[int(p) for p in pages[:8]]}"
+        f"|values={int(wide.numel())}|values_that_differ={int(moved.numel())}"
+        f"|max_abs_diff={float(delta.abs().max()):.6g}"
+        f"|max_rel_diff={float((delta.abs() / scale).max()):.6g}"
+        f"|deltas_above_zero={int((delta > 0).sum())}|deltas_below_zero={int((delta < 0).sum())}"
+        f"|first_values_that_moved={first}"
     )
 
 
