@@ -1930,7 +1930,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.num_prompt_logprobs.pop(req_id, None)
         # The per-request cache-state table frees on this set and on nothing else,
         # because an unscheduled live request also leaves the persistent batch below.
-        # The acceptance check binding this line: the_finished_set_is_recorded_where_the_engine_reports_it.
+        # This method is copied from upstream verbatim, so this call is read by name in
+        # the tests: a refresh that drops it fails there rather than reverting in silence.
         self._glm5next_note_finished_requests(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -6199,8 +6200,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # class the refusal must keep catching.
         #
         # THE WARMUP BUILDERS ARE NOT TOUCHED TO SAY THIS, for a reason recorded rather
-        # than left: they are shared with paths this campaign does not own, and
-        # `inc-glm53f-054b` routes warmup surface changes to the lead. The absence of an
+        # than left: they are shared with paths this port does not own, so changing that
+        # surface is not a decision this file may take on its own. The absence of an
         # identity is a property of those steps that this converter can read where it
         # stands.
         synthetic_step = all(
