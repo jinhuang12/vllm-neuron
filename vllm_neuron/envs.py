@@ -51,8 +51,7 @@ if TYPE_CHECKING:
     # largest resident size measured at the moment the kernel killed a rank, so
     # it is a LOWER bound on the real peak; eight ranks stay inside the headroom
     # even if the true peak is 230 GiB, where sixteen would need it under 117.
-    # At or above the world size the ranks after rank 0 form a single wave,
-    # which is the old all-at-once behaviour.
+    # At or above the world size, every rank after rank 0 warms up in one wave.
     VLLM_NEURON_WARMUP_WAVE_SIZE: int = 8
     # Force the STATIC FP8 (non-MX) attention path on TRN3 even when STATIC_MX
     # kernels are available. Used by FP8 model factories as an escape hatch.
@@ -127,6 +126,16 @@ def require_positive_int(name: str, value: int) -> int:
     if value < 1:
         raise ValueError(f"{name} must be at least 1, got {value}")
     return value
+
+
+def warmup_wave_size(default: int = 8) -> int:
+    """Read the warmup wave size: unset gives the default, a set value must be positive."""
+    raw = os.getenv("VLLM_NEURON_WARMUP_WAVE_SIZE")
+    if raw is None:
+        return default
+    # `or default` would read a set "0" as the default and warm every rank up at once, which
+    # is the state this knob exists to prevent, so the value is converted and then checked.
+    return require_positive_int("VLLM_NEURON_WARMUP_WAVE_SIZE", int(raw))
 
 
 def maybe_convert_float(value: str | None) -> float | None:
@@ -227,10 +236,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_ENCODER_WARMUP")) or False
     ),
     # Ranks warming up at once; see the field for the memory arithmetic.
-    "VLLM_NEURON_WARMUP_WAVE_SIZE": lambda: require_positive_int(
-        "VLLM_NEURON_WARMUP_WAVE_SIZE",
-        maybe_convert_int(os.getenv("VLLM_NEURON_WARMUP_WAVE_SIZE")) or 8,
-    ),
+    "VLLM_NEURON_WARMUP_WAVE_SIZE": warmup_wave_size,
     # Skip decode warmup/compilation without requiring kv-transfer-config.
     # Useful for prefill-only profiling workflows.
     "VLLM_NEURON_SKIP_DECODE_WARMUP": lambda: (

@@ -43,7 +43,7 @@ from vllm_neuron.utils.hardware_config import (
     parse_range_list,
 )
 from vllm.utils.network_utils import get_open_port
-from vllm_neuron.parallel.neuron_parallel_state import tp_barrier
+from vllm_neuron.parallel.neuron_parallel_state import tp_barrier, tp_sum_int
 from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker.neuron_profiler import (
     NeuronProfilerConfig,
@@ -327,6 +327,62 @@ def warmup_rank_waves(world_size: int, wave: int) -> list[list[int]]:
     return [[0]] + [
         followers[start : start + wave] for start in range(0, len(followers), wave)
     ]
+
+
+def run_warmup_in_waves(phase: str, bucket: str, work) -> None:
+    """Run ``work`` on this rank in its warmup wave, exchanging status after every wave.
+
+    The wave size bounds how many ranks compile at once, and what it protects is ONE HOST's
+    memory. The ranks come from the TP group, so the bound holds while that group is the set
+    of workers sharing a host: with several replicas on one host the size has to be divided by
+    their number, and with a TP group spread over nodes each host runs fewer than the size.
+    """
+    tp_group = get_tp_group()
+    waves = warmup_rank_waves(tp_group.world_size, envs.VLLM_NEURON_WARMUP_WAVE_SIZE)
+    rank = tp_group.rank_in_group
+    if rank == 0:
+        logger.info(
+            "warmup waves: %s waves, sizes %s",
+            len(waves),
+            [len(ranks) for ranks in waves],
+        )
+    for index, ranks in enumerate(waves, 1):
+        failure = None
+        if rank in ranks:
+            logger.info(
+                "warmup %s bucket=%s wave=%s/%s rank=%s start",
+                phase,
+                bucket,
+                index,
+                len(waves),
+                rank,
+            )
+            started = time.perf_counter()
+            try:
+                work()
+            except Exception as exc:  # the group is told before this rank re-raises
+                failure = exc
+            else:
+                logger.info(
+                    "warmup %s bucket=%s wave=%s/%s rank=%s done elapsed=%.1fs",
+                    phase,
+                    bucket,
+                    index,
+                    len(waves),
+                    rank,
+                    time.perf_counter() - started,
+                )
+        # The exchange IS this wave's barrier, and it carries how many ranks failed. A bare
+        # barrier would leave every other rank waiting out the barrier timeout for a rank that
+        # had already raised, and a real fault would be recorded as a timeout.
+        failed_total = tp_sum_int(1 if failure is not None else 0)
+        if failure is not None:
+            raise failure
+        if failed_total:
+            raise RuntimeError(
+                f"warmup {phase} bucket={bucket} wave={index}/{len(waves)}: "
+                f"{failed_total} rank(s) failed"
+            )
 
 
 class NeuronWorker(WorkerBase):
@@ -1724,42 +1780,6 @@ class NeuronWorker(WorkerBase):
                 bucket,
             )
 
-    def _run_warmup_in_waves(self, phase: str, bucket: str, work) -> None:
-        """Run ``work`` on this rank in its warmup wave, barriering after every wave."""
-        tp_group = get_tp_group()
-        waves = warmup_rank_waves(
-            tp_group.world_size, envs.VLLM_NEURON_WARMUP_WAVE_SIZE
-        )
-        rank = tp_group.rank_in_group
-        if rank == 0:
-            logger.info(
-                "warmup waves: %s waves, sizes %s",
-                len(waves),
-                [len(ranks) for ranks in waves],
-            )
-        for index, ranks in enumerate(waves, 1):
-            if rank in ranks:
-                logger.info(
-                    "warmup %s bucket=%s wave=%s/%s start",
-                    phase,
-                    bucket,
-                    index,
-                    len(waves),
-                )
-                started = time.perf_counter()
-                work()
-                logger.info(
-                    "warmup %s bucket=%s wave=%s/%s done elapsed=%.1fs",
-                    phase,
-                    bucket,
-                    index,
-                    len(waves),
-                    time.perf_counter() - started,
-                )
-            # A rank that raises never reaches its barrier, so the ranks waiting
-            # here leave on the barrier timeout rather than on the failure.
-            tp_barrier()
-
     def _warmup_prefill(self) -> None:
         """Run prefill warmup for all bucket and KV segment size combinations."""
         num_batched_tokens_buckets, effective_kv_buckets = self._prefill_buckets()
@@ -1785,7 +1805,7 @@ class NeuronWorker(WorkerBase):
                     kv_seg_size,
                 )
                 try:
-                    self._run_warmup_in_waves(
+                    run_warmup_in_waves(
                         "prefill",
                         f"{bucket_size}/kv{kv_seg_size}",
                         lambda: self.model_runner.warmup_prefill(
@@ -1929,7 +1949,7 @@ class NeuronWorker(WorkerBase):
                 ctx_bucket,
             )
             try:
-                self._run_warmup_in_waves(
+                run_warmup_in_waves(
                     "decode",
                     f"b{batch_size}/s{ctx_bucket}",
                     lambda: self.model_runner.warmup_decode(
