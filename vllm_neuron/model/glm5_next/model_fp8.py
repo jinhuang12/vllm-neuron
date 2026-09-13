@@ -4308,18 +4308,25 @@ class Glm5NextKDAAttention(nn.Module):
             self.g_b_proj_weight.to(torch.float32).t()
         )
 
-        # AN OPENING PREFILL ENTERS WITH A ZERO STATE, AND THIS IS THE ONE PREDICATE
-        # THAT SAYS SO. A sequence starting at position 0 carries no history, and the
-        # slot it was handed may still hold the bytes of whichever request held it
-        # before -- nothing empties the recurrent banks, because an eager write on a
+        # A SEQUENCE THAT HAS COMPUTED NOTHING ENTERS WITH A ZERO STATE, AND THIS IS
+        # THE ONE PREDICATE THAT SAYS SO. A sequence at position 0 carries no history,
+        # and the slot it was handed may still hold the bytes of whichever request held
+        # it before -- nothing empties the recurrent banks, because an eager write on a
         # buffer whose storage is shared is refused by the runtime. So BOTH state
         # reads below select zero here instead. It is computed ONCE, outside the head
-        # loop that used to compute it per head, and it is a TENSOR comparison: the
-        # leg is a python bool and may branch, but a python branch on the position
-        # would compile the choice made at capture time into every later step.
-        opening = (
-            _start_is_zero(start_position, conv_state.device) if is_prefill else None
-        )
+        # loop that used to compute it per head, and it is a TENSOR comparison: a
+        # python branch on the position would compile the choice made at capture time
+        # into every later step.
+        #
+        # AND IT IS READ ON EVERY LEG, because the position is what says whether a
+        # sequence is opening and the number of tokens in the step is not. A one-token
+        # prompt computes its whole prompt in a step whose query length does not exceed
+        # the decode threshold, and a preempted request resumes at position 0 however
+        # many tokens it is given; both are opening, and a predicate the leg switched
+        # off would hand exactly those two the previous owner's history. The position
+        # arrives per request and this method serves one request per call, so what is
+        # read here is THIS sequence's own position.
+        opening = _start_is_zero(start_position, conv_state.device)
 
         # --- seam 1: the short convolution, ONE dispatch for q, k and v ------
         # The three streams are convolved together as one channel block, which
@@ -4328,8 +4335,7 @@ class Glm5NextKDAAttention(nn.Module):
         # rather than by the seam, which refuses non-zero width padding.
         conv_in = torch.cat((q_in, k_in, v_in), dim=-1)
         history = self._conv_history(conv_state)
-        if opening is not None:
-            history = torch.where(opening, torch.zeros_like(history), history)
+        history = torch.where(opening, torch.zeros_like(history), history)
         padded = torch.cat((history, conv_in), dim=0)
         channels = 3 * width
         img = (
@@ -4347,6 +4353,12 @@ class Glm5NextKDAAttention(nn.Module):
         conv_out = conv_out.reshape(channels, tokens).t()
         conv_out = torch.nn.functional.silu(conv_out)
         q_conv, k_conv, v_conv = conv_out.split(width, dim=-1)
+        # WHAT AN OPENING CHUNK SHORTER THAN THE WINDOW STORES, said here because the
+        # zero above is what makes it right. The stored rows are the tail of
+        # ``padded``, which on an opening chunk is zeros followed by this chunk's own
+        # rows, so a chunk of fewer than ``state_rows`` rows leaves a window whose
+        # leading rows are zero -- the padding a sequence with no history has -- rather
+        # than the previous owner's rows or this chunk's rows repeated.
         self._store_conv_history(conv_state, padded[padded.shape[0] - state_rows :])
 
         # --- seam 2: the gate clamp, one dispatch per head per token tile -----
@@ -4417,10 +4429,7 @@ class Glm5NextKDAAttention(nn.Module):
             # place for the two to disagree. ``torch.where`` makes the choice on
             # device, so one graph serves position 0 and position N.
             carried = recurrent_state[h].to(torch.float32)
-            if opening is not None:
-                state = torch.where(opening, torch.zeros_like(carried), carried)
-            else:
-                state = carried
+            state = torch.where(opening, torch.zeros_like(carried), carried)
 
             if chunked:
                 shape = (n_chunks, chunk, kdim)

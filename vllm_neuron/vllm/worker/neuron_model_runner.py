@@ -5291,6 +5291,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         whose batch names no request.
         """
         if synthetic:
+            # AND A STEP WITH A REQUEST CANNOT BE ONE, WHICH REFUSES HERE BY NAME. No
+            # caller reaches this: the classification above is the absence of an
+            # identity, so a step the engine scheduled a request for is never brought
+            # here as synthetic. The refusal stands because of what it would cost to be
+            # wrong -- a request served synthetically reads and writes slot 0's state
+            # while its own slot stands untouched, which destroys the state of whoever
+            # holds slot 0 and answers this request from that state. A rule that
+            # classified by the LEG did exactly that to a one-token prompt and to a
+            # preempted request, so this is the shape a later edit would reintroduce.
+            named = self._glm5next_batch_request_ids()
+            if named:
+                raise ValueError(
+                    f"this step was classified as having no request and the engine's "
+                    f"input batch names {len(named)} of them ({named[0]!r} first); a "
+                    f"scheduled request served without its identity would read and "
+                    f"write the state of whichever request holds slot 0"
+                )
             return [None]
         request_ids = self._glm5next_batch_request_ids()
         if not request_ids:
@@ -5388,6 +5405,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         WHY ONE ROW. The rows are per request slot, so emptying a fresh sequence's row
         must leave a concurrent request's row exactly as it was. A select rather than
         a product also keeps a stale non-finite value from surviving as one.
+
+        AND WHY THE SIDE CACHES ARE NOT MOVED TO A READ-SIDE SELECT, as the recurrent
+        and convolution states were. It is where each state is READ. Those two are read
+        at two seams of one python method that is already handed the position, so
+        selecting there covers every reader and costs one comparison. The indexer's ring
+        is consumed inside its own seams (`functional/dsa/decode_tail_update.py` and the
+        pooled selection), which are handed neither the position nor any per-request
+        predicate, so a select on the read side there is a change of KERNEL INPUTS
+        rather than a python-level choice. So this rebuild stays, and what it costs at
+        runtime is the disclosure it already carried: no CPU-mode run can read whether
+        the device accepts it, and it has not been read on a device.
         """
         keep = torch.ones(
             (int(held.shape[0]),) + (1,) * (held.dim() - 1), dtype=torch.bool
@@ -6139,48 +6167,45 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
         text_config = self.model.text_config
         side_caches = self._glm5next_live_side_caches(banks)
-        # A SYNTHETIC DECODE IS NOT A SEQUENCE STEP, AND WARMUP IS PART OF SERVING.
-        # The decode warmup and the idle-data-parallel dummy step reach this converter
-        # through `_build_decode_synthetic_inputs` and
-        # `_build_warmup_attention_metadata`, whose `cached_seq_len` is 0, so they
-        # arrive as a DECODE at position 0. A decode continues a sequence and therefore
-        # has at least one cached token; a decode with none has no sequence to continue
-        # and is not a real step. It is served with the cursor neither read nor written,
-        # so a warmup can never open, advance or destroy a real sequence's claim.
+        # A STEP THE ENGINE SCHEDULED NOTHING FOR IS NOT A SEQUENCE STEP, AND WARMUP IS
+        # PART OF SERVING. Three steps of this kind reach this converter: the decode
+        # warmup and the idle-data-parallel dummy step through
+        # `_build_decode_synthetic_inputs` and `_build_warmup_attention_metadata`, and
+        # the prefill warmup through `_build_prefill_synthetic_inputs`. All three carry
+        # `cached_seq_len = 0` and an input batch that names no request, because nothing
+        # has been scheduled when they run. A step with no request cannot be keyed by
+        # one, and there is no sequence of anybody's for it to open, advance or destroy,
+        # so it is served from slot 0 with the cursor neither read nor written. One rule
+        # covers all three, on either leg.
         #
-        # THIS IS THE POSITION RULE, chosen over threading an explicit synthetic flag
-        # through the warmup builders, for two reasons recorded here. Those builders are
-        # shared with paths this campaign does not own, and `inc-glm53f-054b` routes
-        # warmup surface changes to the lead rather than editing them. And the rule
-        # cannot hide the defect the cursor exists to refuse, because that defect is a
-        # fresh request arriving at a cached length ABOVE zero -- the opposite condition.
-        #
-        # THE RESIDUAL, STATED RATHER THAN LEFT TO BE FOUND: a one-token PROMPT also
-        # reads as a decode here, because the leg is decided by
-        # `max_query_len > decode_token_threshold` and one token does not exceed a
-        # threshold of one. Such a request is served with the cursor untouched too. That
-        # is exactly what `-054b` already did -- its fresh-sequence gate keys on
-        # `is_prefill`, so a one-token prompt never cleared the ring either -- so this
-        # rule preserves the existing behaviour instead of introducing it.
-        # THE PREFILL WARMUP IS THE SECOND REQUEST-LESS STEP, and the position rule
-        # above does not reach it. `warmup_prefill` builds its inputs with
-        # `cached_seq_len = 0`, one request and a whole bucket of tokens against a
-        # threshold of one (`_build_prefill_synthetic_inputs`), so it arrives as a
-        # PREFILL at position 0 and reads as a real step by leg and position alone.
-        # It has no request: the engine has scheduled nothing, so the input batch
-        # carries no id. A step with no request cannot be keyed by one, and there is
-        # no request whose state it could disturb, so it is served synthetically --
-        # from slot 0, taking no claim, exactly as the decode warmup is.
+        # THE CLASSIFICATION IS THE COMPUTED LENGTH AND THE IDENTITY, NEVER THE LEG.
+        # The leg is decided by `max_query_len > decode_token_threshold`, which is a
+        # count of the tokens this step was GIVEN; whether a request is opening is a
+        # count of the tokens it has already COMPUTED, and the two disagree on exactly
+        # the requests that matter. A one-token prompt computes its whole prompt in a
+        # step of one token, which does not exceed a threshold of one; a preempted
+        # request resumes from computed length 0 whatever it is given. Both are real
+        # requests with a state of their own to keep, so both are keyed by their own id
+        # here, take their own slot, and enter with a zero state -- the layer selects
+        # that on the position it is handed, so the leg they ride changes nothing they
+        # read. Reading the leg here, as this rule did until now, handed those two
+        # requests slot 0 and wrote over whoever holds it.
         #
         # WHY THE ABSENT IDENTITY IS READ ONLY AT POSITION 0 and not everywhere. A
         # step at a cached length ABOVE zero continues a sequence, and continuing one
         # without knowing whose it is is precisely the defect the slot table exists to
-        # close. Such a step still refuses by name below. So the two conditions here
-        # are the two request-less shapes the runner actually builds, and neither
-        # widens into the class the refusal must keep catching.
+        # close. Such a step still refuses by name below. So this condition is the
+        # request-less shape the runner actually builds, and it does not widen into the
+        # class the refusal must keep catching.
+        #
+        # THE WARMUP BUILDERS ARE NOT TOUCHED TO SAY THIS, for a reason recorded rather
+        # than left: they are shared with paths this campaign does not own, and
+        # `inc-glm53f-054b` routes warmup surface changes to the lead. The absence of an
+        # identity is a property of those steps that this converter can read where it
+        # stands.
         synthetic_step = all(
             int(position) == 0 for position in request_starts
-        ) and (not is_prefill or not self._glm5next_batch_request_ids())
+        ) and not self._glm5next_batch_request_ids()
         # THE STATE SLOT IS THE REQUEST'S, AND IT IS SETTLED HERE rather than in the
         # walk above, because a synthetic step must take no claim and whether this
         # step is synthetic is only known once the leg and the position are read.
@@ -6201,6 +6226,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # are read from different places, so a disagreement pairs one request's state
         # with another's position. A synthetic step is exempt: it has no request and is
         # served from slot 0 whatever the tables carry.
+        #
+        # AND A PADDED ROW IS WHAT THIS REFUSES, WHICH IS THE ANSWER KEPT RATHER THAN
+        # REPLACED. A decode bucket wider than the batch pads its rows, and a padded row
+        # has no request, so the identities are fewer than the cached lengths and this
+        # raises. The state seams are given no "not fresh, write nowhere" arm for such a
+        # row: the recurrent state's carrier is a bank ROW, and a row nobody owns has no
+        # harmless one to hand. Where padding does arrive -- the sparse family's latent
+        # slot mapping -- it is masked to a value outside the bank instead
+        # (`_glm5next_latent_slot_mapping`), because there the padding is an ADDRESS. At
+        # the serving bound this campaign measures, `--max-num-seqs 1`, the state
+        # converter never sees one: the batch is a single row and there is nothing to
+        # pad it to.
         if not synthetic_step and len(state_slots) != len(request_starts):
             raise ValueError(
                 f"this step names {len(state_slots)} request(s) and its block tables "
@@ -6316,13 +6353,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         THE TWO ARMS ARE ONE REQUEST'S, and they were one step's before a batch could
         hold more than one. Nothing about either arm changed; what changed is that the
         caller runs them per request.
+
+        WHICH ARM A REQUEST TAKES IS ITS COMPUTED LENGTH, AND THE LEG IS NOT READ. A
+        request that has computed nothing is opening whatever number of tokens it was
+        given, so a one-token prompt and a resumed request open the ring here as any
+        other opening does. Reading the leg as well sent both of them to the arm below,
+        which refuses a step whose slot holds no cursor -- so the two requests the
+        converter now keys by their own id would have been refused by name instead of
+        served. The leg is still carried, for the refusal below to name.
         """
-        if is_prefill and int(start_position) == 0:
+        if int(start_position) == 0:
             # A FRESH SEQUENCE MUST NOT INHERIT THE LAST ONE'S PARTIAL POOL. The
             # side caches live for the process (`_glm5next_live_side_caches`), so
             # the ring still holds whatever the previous sequence stashed, and
             # every real token stashes (`decode_tail_update.py`). Its next
-            # completion would pool those stale members. A prefill at position 0
+            # completion would pool those stale members. A step at position 0
             # is a new sequence, so the ring starts empty here.
             #
             # THE POOLED STORE IS LEFT ALONE, deliberately: the candidate gather is
@@ -6388,7 +6433,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if stood_at is None:
                 raise ValueError(
                     f"slot {slot}'s indexer ring holds no sequence cursor, so this "
-                    f"step has no sequence to continue; a prefill at position 0 opens "
+                    f"step has no sequence to continue; a step at position 0 opens "
                     f"one, and this step is a {leg} at position "
                     f"{int(start_position)}. Serving it would read whatever the "
                     f"previous owner of this slot left in the ring"

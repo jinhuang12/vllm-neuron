@@ -2386,6 +2386,14 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
     prefill, it would clear the ring and open the cursor, and this arm would be measuring
     the opening path instead. The carrier it produces is checked for the decode leg's own
     keyword, so a mis-classified call cannot pass quietly.
+
+    WHAT MAKES A STEP SYNTHETIC IS THE ABSENCE OF A REQUEST, and the call below is
+    re-pinned to that shape. A step at position 0 whose batch NAMES a request is a
+    request that has computed nothing, which is an opening sequence: it takes its own
+    slot and opens its own ring. Warmup is not that -- the engine has scheduled nothing
+    when it runs, so its batch names nobody -- and the batch is emptied for the one call
+    that models it. The property, the two readings and the control are the ones this
+    item always made.
     """
     _require_cpu_mode()
     root = _fixture()["root"]
@@ -2412,7 +2420,13 @@ def test_a_synthetic_decode_at_position_zero_is_served_and_leaves_the_cursor_alo
     step(prompt, 1)
     before = int(_slot_position(runner))
 
+    # RE-PINNED. ORIGINAL READING, VERBATIM: `synthetic = step(0, 1)`, with the batch
+    # above naming `req-0` for it. NEW VALUE: the same call with an EMPTY batch, which
+    # is what the engine hands a warmup.
+    scheduled = runner.input_batch
+    runner.input_batch = SimpleNamespace(req_ids=[])
     synthetic = step(0, 1)
+    runner.input_batch = scheduled
     after = _slot_position(runner)
     carrier = synthetic["layer_carriers"][0]
     print(f"TINYE2E|synthetic_decode|cursor_before={before}|cursor_after={after}"
@@ -2455,6 +2469,12 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     which is what shows the refusal is decided by the position rather than by something
     incidental to the call. If both positions refused, the carve-out would be dead and
     every warmup broken; if neither refused, the cursor would guard nothing.
+
+    THE CONTROL READS THE REQUEST-LESS SHAPE, re-pinned. The refused call names a request,
+    because a continuation with nobody to continue is the case being refused. The served
+    call must name none: a step at position 0 that names a request has computed nothing,
+    so it is an opening sequence and claims its ring, which the item above measures. The
+    reading here is the claim's absence, so it is the warmup's shape that carries it.
     """
     _require_cpu_mode()
     root = _fixture()["root"]
@@ -2496,6 +2516,12 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     )
 
     # ---- THE CONTROL: the same shape at position 0 is served, cursor untouched.
+    # RE-PINNED. ORIGINAL READING, VERBATIM: `served = step(0, 1)`, with the batch above
+    # naming `req-0` for it. NEW VALUE: the same call with an EMPTY batch. A step at
+    # position 0 that names a request has computed nothing, so it is an opening sequence
+    # and claims its ring; the step this control needs is the one with no request at all,
+    # which is what the engine hands a warmup. The reading below is unchanged.
+    runner.input_batch = SimpleNamespace(req_ids=[])
     served = step(0, 1)
     after = _slot_position(runner)
     print(f"TINYE2E|real_decode_without_a_sequence_control|at=0"

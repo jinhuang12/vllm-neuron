@@ -36,7 +36,7 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   (tripwire: the previous commit's walk refused a second row). The SPARSE arm: on a
   hybrid stack the same batch is refused by name at the sparse carrier, which takes
   one contiguous slice of the paged latent bank.
-* A2, SEVEN ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
+* A2, TEN ARMS -- a finished request's slot is reused and ZEROED at hand-out; an
   over-admission refuses by name; a synthetic step takes no claim; the prefill
   WARMUP's own shape, which has no request at all, is served from slot 0 and takes
   no claim either; the per-sequence side caches carry ONE set per admitted sequence
@@ -49,7 +49,14 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   by the block space reports the bank's slot count as its axis, a table that frees on
   absence loses the skipped request's slot and recurrence, and a capacity read that
   checks only that the bound is positive returns a slot number the banks cannot
-  address.
+  address. AND THE THREE ARMS OF THE COMPUTED-LENGTH RULE: a whole one-token prompt
+  -- which the leg test reads as a decode -- is keyed by its own request rather than
+  served from slot 0; it OPENS its own indexer ring rather than being refused for
+  want of a cursor; and a step the engine did schedule cannot be classified as
+  having no request at all. Tripwires: another request holds slot 0 across the first
+  two, so a converter reading the leg serves that request's row and empties that
+  request's ring, and the third's refusal is proved conditional in the same item by
+  the request-less call it must still serve.
 * A3 -- one request's pooled store and tail ring are byte-unchanged by a step of
   the other request, on both legs. Tripwire: the process-wide allocation, which
   made the two carriers one storage.
@@ -1251,6 +1258,201 @@ def test_a2_the_prefill_warmups_own_shape_is_served_and_takes_no_claim() -> None
     assert table == {}, (
         f"the prefill warmup left {table} in the slot table; it is not a sequence "
         f"step and must take no claim, or a warmup would evict a live request"
+    )
+
+
+def _one_token_step(runner, banks):
+    """One request's WHOLE one-token prompt, converted by the code under test.
+
+    THE SHAPE IS THE ONE THE LEG TEST MISREADS. One token against a decode
+    threshold of one is not a prefill by that test, and the request has computed
+    nothing, so this is the step where the leg and the computed length disagree.
+    """
+    metadata = _metadata(
+        banks,
+        tokens=1,
+        sparse_rows=(DECLARED_SPARSE_ROWS[0],),
+        state_rows=(DECLARED_SPARSE_ROWS[0],),
+        cached=(0,),
+    )
+    return runner._glm5next_model_kwargs(_generic(tokens=1, metadata=metadata))
+
+
+def _held_and_opening(banks):
+    """A runner whose batch names one opening request, with another already seated.
+
+    THE SIDE CACHES ARE ALLOCATED FIRST, and the reason is the allocator's own: it
+    discards the slot table along with the rows the table referred to, so a claim
+    taken before the first allocation would be thrown away by the converter's own
+    call. Allocating here means the converter finds this set and keeps the claim.
+    """
+    opening, held = "req-opening", "req-held"
+    runner = _runner(banks, request_ids=[opening])
+    live = runner._glm5next_live_side_caches(banks)
+    held_slot = runner._glm5next_request_slots(banks, [held], synthetic=False)[0]
+    if DECLARED_MAX_NUM_SEQS < 2:
+        raise VacuousControlError(
+            f"these items tell a request's own slot from slot 0 by their numbers, and "
+            f"the harness admits {DECLARED_MAX_NUM_SEQS} concurrent sequence(s)"
+        )
+    if held_slot != 0:
+        raise VacuousControlError(
+            f"the already-seated request holds slot {held_slot}; these items read "
+            f"whether the opening request was served from SLOT 0 instead of its own, "
+            f"so slot 0 has to be the one that is already taken"
+        )
+    return runner, live, opening, held, held_slot
+
+
+def test_a2_a_one_token_prompt_is_keyed_by_its_own_request_not_slot_zero() -> None:
+    """A prompt of one token is an opening sequence, not a step without a request.
+
+    WHY THIS IS THE STEP THAT DECIDES IT. Which requests a step serves used to be
+    read from the LEG as well as the position: a step at position 0 that was not a
+    prefill by the leg test was served as though the engine had scheduled nothing --
+    from slot 0, with no claim taken. A whole one-token prompt is exactly that step,
+    because one token does not exceed a decode threshold of one, and so is a request
+    resumed after preemption. Both are real requests, and both were handed the state
+    of whichever request holds slot 0.
+
+    THE TRIPWIRE IS A SLOT NUMBER. Another request holds slot 0 before the step, so
+    a converter that classified this one by its leg serves it from that request's row
+    and leaves no claim of its own. This item reads the row the carriers actually
+    bind, by storage, and the table afterwards.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner, _, opening, held, held_slot = _held_and_opening(banks)
+
+    carriers = _one_token_step(runner, banks)["layer_carriers"]
+
+    table = dict(runner._glm5next_request_slot_table)
+    linear = _linear_banks(banks)[0]
+    carrier = next(entry for entry in carriers if "conv_state" in entry)
+    served = [
+        index
+        for index in range(DECLARED_STATE_SLOTS)
+        if carrier["conv_state"][0].data_ptr()
+        == linear["conv_state"][index].data_ptr()
+    ]
+    print(f"KEYED|a2|one_token_prompt_table={table}|served_slot={served}"
+          f"|held_slot={held_slot}")
+    assert table.get(opening) is not None, (
+        f"the one-token prompt took no slot at all; the table holds {table}, so the "
+        f"step was served as though the engine had scheduled nothing"
+    )
+    assert table[opening] != held_slot, (
+        f"the one-token prompt was given slot {table[opening]}, which request "
+        f"{held!r} already holds"
+    )
+    assert served == [table[opening]], (
+        f"the one-token prompt's carrier binds slot(s) {served} and its own slot is "
+        f"{table[opening]}; a step served from another slot reads and writes that "
+        f"request's state"
+    )
+    assert table[held] == held_slot, (
+        f"request {held!r} held slot {held_slot} before the step and holds "
+        f"{table.get(held)} after it"
+    )
+
+
+def test_a2_a_one_token_prompt_opens_its_own_ring_instead_of_being_refused() -> None:
+    """The opening arm is the position's, so this step opens a sequence here.
+
+    WHY THIS ITEM EXISTS BESIDE THE ONE ABOVE. Keying the step by its request is
+    only half of serving it: the indexer's ring is opened for a sequence that starts
+    at position 0, and that arm read the LEG too. A one-token prompt reaching the
+    other arm is refused for want of a cursor -- ``holds no sequence cursor`` -- so a
+    legal request would have been turned away by name rather than served.
+
+    THE TWO READINGS. This request's ring row must be emptied and its cursor must
+    record the one token it consumed, while the ring row of the request holding slot
+    0 keeps the value planted in it -- so an arm that emptied the whole set, or the
+    wrong row, fails here.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner, live, opening, held, held_slot = _held_and_opening(banks)
+    #: Any non-zero value stands for what the previous owner stashed; this one is
+    #: exact in every dtype a ring can carry.
+    planted_ring = 3.0
+    rings = [entry for entry in live if entry and "tail" in entry]
+    if not rings:
+        raise VacuousControlError(
+            "no bank in this stack carries an indexer ring, so this item has no "
+            "opening to read"
+        )
+    for entry in rings:
+        entry["tail"].fill_(planted_ring)
+
+    carriers = _one_token_step(runner, banks)["layer_carriers"]
+    assert len(carriers) == len(banks)
+
+    table = dict(runner._glm5next_request_slot_table)
+    own_slot = int(table[opening])
+    emptied = [
+        float(entry["tail"][own_slot].abs().max()) for entry in rings
+    ]
+    kept = [float(entry["tail"][held_slot].abs().max()) for entry in rings]
+    stood_at = runner._glm5next_side_cache_positions.get(own_slot)
+    print(f"KEYED|a2|one_token_prompt_opened_slot={own_slot}|ring_max_own={emptied}"
+          f"|ring_max_held={kept}|cursor={stood_at}|planted={planted_ring}")
+    assert all(value == 0.0 for value in emptied), (
+        f"the one-token prompt's own ring row still holds {emptied}; a sequence "
+        f"starting at position 0 must not inherit what the last owner stashed"
+    )
+    assert all(value == planted_ring for value in kept), (
+        f"request {held!r}'s ring row reads {kept} rather than the planted "
+        f"{planted_ring}; the opening emptied a row that is not its own"
+    )
+    assert stood_at == 1, (
+        f"the one-token prompt's ring stands at {stood_at} after consuming its one "
+        f"token; a step that opened no sequence records no cursor at all"
+    )
+
+
+def test_a2_a_step_the_engine_scheduled_cannot_be_served_without_its_identity() -> None:
+    """The classification that has no legal caller, refused by name.
+
+    NO CALLER REACHES THIS. A step is classified as having no request BY the absence
+    of request ids, so the two can no longer disagree. The refusal stands for what it
+    would cost to be wrong: a scheduled request served without its identity reads and
+    writes slot 0 while its own slot stands untouched, which destroys the state of
+    whoever holds slot 0 and answers this request out of it. The rule that read the
+    LEG did exactly that to a one-token prompt, so this is the shape a later edit
+    would bring back.
+
+    THE CONTROL IS IN THE SAME ITEM, because a refusal that fired on every call
+    would break warmup instead of protecting it: with no request in the batch the
+    same call is served, which is the step warmup actually builds.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    scheduled = list(runner.input_batch.req_ids)
+    if not scheduled:
+        raise VacuousControlError(
+            "this item needs a batch that names a request, and the harness built one "
+            "that names none"
+        )
+
+    with pytest.raises(ValueError) as caught:
+        runner._glm5next_request_identities(synthetic=True)
+
+    message = str(caught.value)
+    served = _runner(banks, request_ids=[])._glm5next_request_identities(
+        synthetic=True
+    )
+    print(f"KEYED|a2|scheduled={scheduled}|refusal={message}|no_batch_served={served}")
+    assert "classified as having no request" in message, (
+        f"the call raised, but not the refusal this item names: {message}"
+    )
+    assert scheduled[0] in message, (
+        f"the refusal names no request of the batch it refused: {message}"
+    )
+    assert served == [None], (
+        f"a step whose batch names no request was refused too, and that is the step "
+        f"warmup builds; the call returned {served}"
     )
 
 
