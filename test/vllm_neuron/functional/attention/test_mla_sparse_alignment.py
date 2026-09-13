@@ -362,24 +362,35 @@ def test_bit_identical_at_1152_rows_with_a_narrower_last_tile():
 
 
 def _align(width: int) -> int:
-    """``width`` rounded up to a whole 32-byte block, retyped for the reader."""
+    """``width`` rounded up to a whole 32-byte block. The CRITERION, retyped."""
     return ((width + _ALIGN - 1) // _ALIGN) * _ALIGN
 
 
 #: The trace-time values the destination offsets are read at: ONE head, this
 #: checkpoint's latent rank, the prefill selected-row count.
 _AT_ONE_HEAD = {
-    "__builtins__": {}, "_aligned": _align, "LATENT_TILE": 128, "KEY_CHUNK": 128,
+    "__builtins__": {}, "LATENT_TILE": 128, "KEY_CHUNK": 128,
     "MOVING_MAX": 512, "heads": 1, "latent": 512, "n_latent": 4, "topk": 2048,
     "tile_max": 512, "chunk_max": 4, "s_kv": 4096, "rope": 0,
 }
 
+#: The names the module supplies to its OWN size expressions. They are read off the
+#: module and never retyped, so a size expression is evaluated with the arithmetic the
+#: kernel will trace and not with a copy of it: a module that rounded to four elements
+#: would be read as rounding to four and reddens the census. Absent names are left out
+#: rather than defaulted, because the tree before this change calls none of them.
+_MODULE_ARITHMETIC = ("_aligned", "DMA_TRANSPOSE_ALIGN")
+
 
 def _size(node: ast.expr) -> int | None:
     """One size expression's trace-time value, or ``None`` when it is not readable."""
+    names = dict(_AT_ONE_HEAD)
+    for name in _MODULE_ARITHMETIC:
+        if hasattr(mod, name):
+            names[name] = getattr(mod, name)
     try:
         code = compile(ast.Expression(body=node), "<size>", "eval")
-        return int(eval(code, dict(_AT_ONE_HEAD)))
+        return int(eval(code, names))
     except Exception:
         return None
 
