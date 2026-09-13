@@ -5372,6 +5372,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_finished_request_ids = noted
         noted.update(finished_req_ids or ())
 
+    @staticmethod
+    def _glm5next_emptied_at_slot(held: torch.Tensor, slot: int) -> torch.Tensor:
+        """A copy of `held` whose row `slot` is zero and whose other rows are its own.
+
+        WHY A COPY RATHER THAN AN IN-PLACE ZERO. An eager in-place write on a device
+        buffer whose storage is shared is REFUSED -- "Can't call ReserveSpace on
+        shared storage" -- and it was refused inside the input builder, before any
+        forward ran, so warmup never reached its first bucket. Every cache tensor
+        reaching this method is a view of one allocation, so the write is rebuilt as a
+        select: the mask is built on the host and moved once, and the caller replaces
+        its entry with the result. The carriers are built from those entries
+        afterwards, so the step binds the new buffer.
+
+        WHY ONE ROW. The rows are per request slot, so emptying a fresh sequence's row
+        must leave a concurrent request's row exactly as it was. A select rather than
+        a product also keeps a stale non-finite value from surviving as one.
+        """
+        keep = torch.ones(
+            (int(held.shape[0]),) + (1,) * (held.dim() - 1), dtype=torch.bool
+        )
+        keep[int(slot)] = False
+        return torch.where(keep.to(held.device), held, torch.zeros_like(held))
+
     def _glm5next_request_slots(
         self, banks, request_ids, *, synthetic: bool, side_caches=None
     ):
@@ -5445,15 +5468,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     continue
                 bank["conv_state"][free].zero_()
                 bank["recurrent_state"][free].zero_()
-            # THE INDEXER'S TWO CACHES ARE ZEROED AT THE SAME MOMENT, because they
+            # THE INDEXER'S TWO CACHES ARE EMPTIED AT THE SAME MOMENT, because they
             # hold the same request's state and a half-fresh slot is the defect
             # this table exists to close: the ring would still carry the previous
             # owner's pool and its next completion would pool those stale members.
+            # THEY ARE REBUILT WITHOUT THIS SLOT'S ROWS RATHER THAN EMPTIED IN PLACE,
+            # for the reason the helper's own docstring carries.
             for side in side_caches or ():
                 if not side:
                     continue
-                side["pool_cache"][free].zero_()
-                side["tail"][free].zero_()
+                for key in ("pool_cache", "tail"):
+                    side[key] = self._glm5next_emptied_at_slot(side[key], free)
             positions.pop(free, None)
             table[request_id] = free
         return [table[request_id] for request_id in request_ids]
@@ -6314,23 +6339,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # through the cursor's own gap. Clearing the owner alongside the rows leaves
             # the ring belonging to nobody, so a refused opening makes the next
             # non-opening step refuse by name instead of reading blanks.
-            # ONLY THIS REQUEST'S ROW IS CLEARED, AND THE RING IS REPLACED RATHER THAN
-            # EMPTIED IN PLACE. Two landed rules meet here. The rows are per slot, so a
-            # fresh sequence opening must not disturb a concurrent request's ring, which
-            # the process-wide zeroing this replaces did on every prefill. And an eager
-            # `zero_()` on the live ring was REFUSED on the device -- "Can't call
-            # ReserveSpace on shared storage" -- inside the input builder, before any
-            # forward ran, so warmup never reached its first bucket. A fresh copy
-            # satisfies both: the surviving rows come across untouched, this request's row
-            # is zero, the entry holds a new object, and the buffer it replaced keeps its
-            # own bytes. The carriers are built from these entries after this loop, so the
-            # step binds the new buffer.
-            #
-            # WHAT IS NOT MEASURED, and this comment does not claim it: the refusal was
-            # read on the ring the banks own, whose storage the bank shares. Whether an
-            # in-place write to a buffer allocated ON THIS LINE is refused too is
-            # unmeasured, and the serving run is where it is settled. A mask multiply is
-            # the alternative form, at the cost of one elementwise pass over the ring.
+            # ONLY THIS REQUEST'S ROW IS EMPTIED, AND THE RING IS REBUILT RATHER THAN
+            # WRITTEN IN PLACE. Two landed rules meet here, and the helper below serves
+            # both: the rows are per slot, so a fresh sequence opening must not disturb a
+            # concurrent request's ring, which the process-wide zeroing this replaces did
+            # on every prefill; and the in-place write it replaces was refused on the
+            # device. The same helper empties a freed slot's side caches at hand-out.
             self._glm5next_side_cache_positions.pop(int(slot), None)
             # AND THE SPARSE FAMILY'S OWN CURSOR IS CLEARED WITH THEM. That family serves
             # one sequence per forward and reads this single value, so an opening prefill
@@ -6339,10 +6353,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_side_cache_cursor = None
             for side in side_caches:
                 if "tail" in side:
-                    ring = side["tail"]
-                    fresh = ring.clone()
-                    fresh[int(slot)].zero_()
-                    side["tail"] = fresh
+                    side["tail"] = self._glm5next_emptied_at_slot(side["tail"], slot)
         else:
             # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
             # ring is keyed by absolute position and carries no sequence identity, so
