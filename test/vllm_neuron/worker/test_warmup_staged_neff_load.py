@@ -163,8 +163,12 @@ def _install(monkeypatch, tmp_path, wave_size, group, compiler, rows=None,
     return staged_neff_load.staged_compiler(compiler)
 
 
-def _run(staged, group, world_size, park_after=None):
-    """Call the staged compiler once per rank on its own thread; return threads and results."""
+def _run(staged, group, world_size, park_after=None, still_inside=()):
+    """Call the staged compiler once per rank on its own thread; return threads and results.
+
+    A rank named in ``still_inside`` is not waited for: it is parked inside the compiler, and the
+    reading it exists for is what the ranks behind it did while it was there.
+    """
     results: dict[int, object] = {}
     errors: dict[int, BaseException] = {}
 
@@ -181,6 +185,8 @@ def _run(staged, group, world_size, park_after=None):
     for thread in threads:
         thread.start()
     for rank, thread in enumerate(threads):
+        if rank in still_inside:
+            continue
         if park_after is None or rank != park_after[0]:
             thread.join(timeout=JOIN_TIMEOUT)
     return threads, results, errors
@@ -311,7 +317,7 @@ def test_a_wave_that_never_signals_costs_the_next_wave_one_bounded_wait(monkeypa
     staged = _install(
         monkeypatch, tmp_path, WAVE, group, compiler, rows, timeout=SHORT_WAIT_TIMEOUT
     )
-    threads, results, errors = _run(staged, group, SMALL_WORLD)
+    threads, results, errors = _run(staged, group, SMALL_WORLD, still_inside=(1,))
     timeouts = [row for row in rows.rows if row.startswith("neff_load_wait_timeout|")]
     waiting = [rank for rank in range(WAVE, SMALL_WORLD) if rank in results]
     print(
@@ -322,7 +328,8 @@ def test_a_wave_that_never_signals_costs_the_next_wave_one_bounded_wait(monkeypa
     assert waiting == list(range(WAVE, SMALL_WORLD))
     assert len(timeouts) == SMALL_WORLD - WAVE
     assert all("|missing=1" in row for row in timeouts)
-    assert threads[1].is_alive()
+    assert threads[1].is_alive()  # still inside the compiler, so its flag was never written
+    assert list(tmp_path.glob("prefill/*/rank_1.done")) == []
     never_returns.set()
     threads[1].join(timeout=JOIN_TIMEOUT)
 
