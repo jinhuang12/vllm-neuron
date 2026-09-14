@@ -39,6 +39,7 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     to_down_kernel_scale_operand,
     to_gate_up_kernel_scale_operand,
     down_kernel_scale_shape,
+    gate_up_kernel_scale_shape,
 )
 
 #: The constants the frozen copies read, RETYPED on purpose: a frozen reference that
@@ -638,11 +639,13 @@ def _transposed_by_block(source, marker):
     out = nl.ndarray((_FORM_ROWS, TILE_SIZE), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     out_b = out.reshape((_FORM_BLOCKS, _FORM_TILES * TILE_SIZE, TILE_SIZE))
     staged = nl.ndarray((_FORM_ROWS, TILE_SIZE), dtype=nl.bfloat16, buffer=nl.private_hbm)
-    nl.store(staged[0:_FORM_ROWS, 0:TILE_SIZE], value=nl.load(source[0:_FORM_ROWS, 0:TILE_SIZE]))
     staged_b = staged.reshape((_FORM_BLOCKS, _FORM_TILES * TILE_SIZE, TILE_SIZE))
     stamp = nl.load(marker[0:TILE_SIZE, 0:TILE_SIZE])
+    # ONE TILE AT A TIME, because a load takes at most TILE_SIZE partitions.
     for step in range(_FORM_BLOCKS * _FORM_TILES):
         r0 = step * TILE_SIZE
+        nl.store(staged[r0 : r0 + TILE_SIZE, 0:TILE_SIZE],
+                 value=nl.load(source[r0 : r0 + TILE_SIZE, 0:TILE_SIZE]))
         nl.store(out[r0 : r0 + TILE_SIZE, 0:TILE_SIZE], value=stamp)
 
     def body(at_block):
@@ -857,7 +860,9 @@ def _iota() -> torch.Tensor:
 def _frozen_gate_up(operands: dict, case: dict) -> torch.Tensor:
     """The frozen gate/up kernel on the operands the live seam hands the live one."""
     shape = _shape_of(case)
-    n_col_blocks = GATE_UP_FUSION * shape["i_extent"] // GATE_UP_SCALE_BLOCK
+    # THE SEAM'S OWN COLUMN COUNT, not one computed here: it counts a block per
+    # contraction block as well, so a hand-built count is right only at one block.
+    n_col_blocks = gate_up_kernel_scale_shape(shape["h_extent"], shape["i_extent"])[1]
     return wrap_nki(_landed_gate_up)(
         operands["hidden"].to(torch.bfloat16),
         operands["bank"].reshape(-1, GATE_UP_SCALE_BLOCK),
