@@ -357,6 +357,10 @@ _WIDTHS = (2,)
 #: that stepped 32 rows is read as stepping 32 and reddens the census.
 _DGE_ROWS = 16
 
+#: The SBUF tiles the kernel declares at each geometry, RETYPED: the census must read exactly
+#: this many, so a tile it can no longer see, or one added without a reading, reddens it.
+_TILES = 28
+
 
 def _arithmetic() -> dict:
     """The module's own arithmetic, by name; a module without a name leaves it out."""
@@ -399,8 +403,8 @@ def test_every_transpose_moves_sixteen_two_byte_rows_onto_a_readable_line():
     misaligned = tuple(s.line for s in sites if s.misaligned)
     shaped = tuple(s.line for s in sites if s.host_shaped(_DGE_ROWS))
     width = _handed_width(source)
-    _emit("DMA_TRANSPOSE_SITES", count=len(shaped), lines=shaped, unreadable=unreadable,
-          misaligned=misaligned, step=_DGE_ROWS, width=width, transposes=len(sites),
+    _emit("DMA_TRANSPOSE_SITES", count=len(shaped), unreadable=unreadable, misaligned=misaligned,
+          step=_DGE_ROWS, width=width, transposes=len(sites), lines=shaped,
           readings=[(s.line, s.source, s.rows, s.width, s.via) for s in sites])
     assert sites, "the census read no transpose site"
     assert unreadable == (), f"destinations the arithmetic cannot place: {unreadable}"
@@ -433,11 +437,11 @@ def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
         unreadable = tuple(sorted({(line, tile) for line, tile, size in rows if size is None}))
         narrow = tuple((line, tile, size) for line, tile, size in rows
                        if size is not None and size % LINE)
-        _emit("NARROW_TILES", geometry=name, count=len(narrow), lines=tuple(r[0] for r in narrow),
-              unreadable=unreadable, tiles=len(rows), width=_WIDTHS[0])
-        assert rows, f"the census read no SBUF tile at {name}"
+        _emit("NARROW_TILES", geometry=name, count=len(narrow), unreadable=unreadable, tiles=len(rows),
+              width=_WIDTHS[0], lines=tuple(r[0] for r in narrow))
         assert unreadable == (), f"tile rows the arithmetic cannot size: {unreadable}"
         assert narrow == (), f"tile rows that are not whole 32-byte lines: {narrow}"
+        assert len(rows) == _TILES, f"SBUF tiles the census reads at {name}: {len(rows)}, not {_TILES}"
 
 
 _PLANTED_WHOLE_TILE = _HELPER + """
@@ -479,7 +483,7 @@ def test_control_the_reader_finds_a_planted_whole_tile_transpose():
     """The same reader names the one site that moves a whole tile at once."""
     sites = _sites(_PLANTED_WHOLE_TILE)
     shaped = tuple(s.line for s in sites if s.host_shaped(_DGE_ROWS))
-    _emit("CONTROL_READER_FIRES", count=len(shaped), lines=shaped, rows=[s.rows for s in sites])
+    _emit("CONTROL_READER_FIRES", count=len(shaped), rows=[s.rows for s in sites], lines=shaped)
     assert len(sites) == 1 and len(shaped) == 1
 
 
@@ -487,8 +491,8 @@ def test_control_the_reader_finds_a_planted_off_line_caller():
     """The same reader names the one caller whose destination starts 6 bytes into a line."""
     sites = _sites(_PLANTED_OFF_LINE)
     misaligned = tuple(s.line for s in sites if s.misaligned)
-    _emit("CONTROL_LINE_READER_FIRES", count=len(misaligned), lines=misaligned,
-          offsets=[s.offsets for s in sites])
+    _emit("CONTROL_LINE_READER_FIRES", count=len(misaligned), offsets=[s.offsets for s in sites],
+          lines=misaligned)
     assert len(sites) == 1 and len(misaligned) == 1
 
 
@@ -530,8 +534,8 @@ def test_control_the_reader_finds_a_planted_caller_of_a_wide_stepping_helper():
     """The same reader names the one caller whose helper moves 32 rows per DMA."""
     sites = _sites(_PLANTED_WIDE_STEP)
     shaped = tuple(s.line for s in sites if s.host_shaped(_DGE_ROWS))
-    _emit("CONTROL_WIDE_STEP_READER_FIRES", count=len(shaped), lines=shaped,
-          rows=[s.rows for s in sites])
+    _emit("CONTROL_WIDE_STEP_READER_FIRES", count=len(shaped), rows=[s.rows for s in sites],
+          lines=shaped)
     assert len(sites) == 1 and len(shaped) == 1 and sites[0].rows == (32,)
 
 
