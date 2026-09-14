@@ -166,8 +166,16 @@ def _sentinel_order_nki(pool_ids_hbm):
     return out
 
 
+@torch._dynamo.assume_constant_result
 def _record_nki_dispatch(rows: int, k: int) -> None:
-    """Record which kernel the seam dispatched, and log it, off the compiled graph."""
+    """Record which kernel the seam dispatched, and log it, OFF the compiled graph.
+
+    The template is landed and measured: ``score_gemm.py:348-374`` by way of
+    ``kpool_hadamard.py:428-457``. Dynamo runs a folded call once at trace time, so the log record
+    is written on the host and the ``logging.Logger`` call never enters the graph the runner
+    compiles with ``fullgraph=True``. A folded helper takes ints only, so the kernel is read as a
+    module global rather than passed in.
+    """
     _COUNTERS.last_kernel = _kernel_identity_of(_sentinel_order_nki)
     logger.info("[dsa-sentinel-order] kernel=nki rows=%d select_k=%d", rows, k)
 
