@@ -31,7 +31,7 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.moe import moe_blockwise_fp8 as live
 from test.vllm_neuron.functional.dma_transpose_census import census, tile_rows
-from vllm_neuron.functional.moe.moe_blockwise_fp8 import MoeBlockwiseFp8Error, moe_gate_up_blockwise_fp8, to_gate_up_kernel_scale_operand
+from vllm_neuron.functional.moe.moe_blockwise_fp8 import MoeBlockwiseFp8Error, moe_down_blockwise_fp8, moe_gate_up_blockwise_fp8, to_down_kernel_scale_operand, to_gate_up_kernel_scale_operand, down_kernel_scale_shape
 
 #: The constants the frozen copies read, RETYPED on purpose: a frozen reference that
 #: imported them would follow the live module if one of them ever moved.
@@ -68,6 +68,7 @@ _EXPERTS = 2
 _G18 = {"name": "G18", "blocks": 2, "tiles": 9, "h_blocks": 1, "i_blocks": 1}
 _G16 = {"name": "G16", "blocks": 2, "tiles": 8, "h_blocks": 1, "i_blocks": 1}
 _GN = {"name": "GN", "blocks": 2, "tiles": 9, "h_blocks": 2, "i_blocks": 2}
+_TAIL_CASES = (_G18, _G16)
 _ALL_CASES = (_G18, _G16, _GN)
 
 
@@ -363,6 +364,128 @@ def _landed_gate_up(
     return out
 
 
+@nki.jit
+def _landed_down(
+    intermediate_t,
+    weight_bank,
+    scale_bank,
+    affinity_bank,
+    row_index,
+    expert_index,
+    iota,
+):
+    """Frozen at the base commit: moe_down_blockwise_fp8_kernel."""
+    i_extent, positions = intermediate_t.shape
+    n_i_blocks = i_extent // GATE_UP_SCALE_BLOCK
+    # One scale column per (I block, H block), so the width over the I blocks is H.
+    n_h_blocks = scale_bank.shape[1] // n_i_blocks
+    h_extent = n_h_blocks * GATE_UP_SCALE_BLOCK
+    # The scale operand stacks one ``TILE_SIZE``-tall operand per expert, so its
+    # height IS the affinity row stride.
+    n_experts = scale_bank.shape[0] // TILE_SIZE
+    block = positions // expert_index.shape[0]
+    tiles_per_block = block // TILE_SIZE
+    # The padding row is the appended one. The seam checks the affinity bank's length
+    # against ``T`` for exactly this reason, so the quotient cannot move it silently.
+    pad_row = affinity_bank.shape[0] // n_experts - 1
+
+    out = nl.ndarray((positions, h_extent), dtype=nl.float32, buffer=nl.shared_hbm)
+    ramp = _row_iota(iota, TILE_SIZE)
+
+    for m_tile in range(positions // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        expert = _broadcast_row(expert_index, m_tile // tiles_per_block, TILE_SIZE)
+        scale_sb = _gathered(
+            scale_bank,
+            _bank_rows(TILE_SIZE, expert, ramp, TILE_SIZE, 0, 1),
+            TILE_SIZE,
+            n_i_blocks * n_h_blocks,
+            nl.float32,
+        )
+        # LOADED PER TOKEN TILE, never hoisted out of this loop: a token is a
+        # PARTITION, the partition axis serves 128 of them, and a whole-column load
+        # would bound this kernel to one tile. The causal-bound kernel re-loads its
+        # per-row length column inside its own row loop for the same reason.
+        # ``row * E_local + expert``, both on device: the resolved row is the same
+        # padding-aware index the gate/up limb gathered its tokens with, and the
+        # expert is this block's scalar.
+        affinity_sb = _gathered(
+            affinity_bank,
+            _affinity_rows(
+                TILE_SIZE,
+                _padding_resolved(
+                    TILE_SIZE, _dense_column(row_index, TILE_SIZE, m0), pad_row
+                ),
+                expert,
+                n_experts,
+            ),
+            TILE_SIZE,
+            1,
+            nl.float32,
+        )
+        for h_block in range(n_h_blocks):
+            h0 = h_block * GATE_UP_SCALE_BLOCK
+            acc = _gate_up_sbuf()
+            for i_block in range(n_i_blocks):
+                i0 = i_block * GATE_UP_SCALE_BLOCK
+                psum = _gate_up_psum()
+                inter_tile = nl.load(
+                    intermediate_t[i0 : i0 + TILE_SIZE, m0 : m0 + TILE_SIZE],
+                    dtype=nl.bfloat16,
+                )
+                w_tile = _gathered(
+                    weight_bank,
+                    _bank_rows(
+                        TILE_SIZE,
+                        expert,
+                        ramp,
+                        i_extent * n_h_blocks,
+                        i0 * n_h_blocks + h_block,
+                        n_h_blocks,
+                    ),
+                    TILE_SIZE,
+                    GATE_UP_SCALE_BLOCK,
+                    nl.bfloat16,
+                )
+                nisa.nc_matmul(
+                    dst=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    stationary=inter_tile,
+                    moving=w_tile,
+                    accumulate=False,
+                )
+                flat = i_block * n_h_blocks + h_block
+                if i_block == 0:
+                    nisa.tensor_scalar(
+                        dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                    )
+                else:
+                    nisa.scalar_tensor_tensor(
+                        dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                        op1=nl.add,
+                        operand1=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    )
+            # The affinity is a per-partition column and the partition axis is the
+            # token axis, so one value per token is exactly this operand's shape.
+            scaled = _gate_up_sbuf()
+            nisa.tensor_scalar(
+                dst=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                data=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                op0=nl.multiply,
+                operand0=affinity_sb[0:TILE_SIZE, 0:1],
+            )
+            nl.store(
+                out[m0 : m0 + TILE_SIZE, h0 : h0 + GATE_UP_SCALE_BLOCK],
+                value=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+            )
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # The forms the change introduces, each against the route it replaces.        #
 # --------------------------------------------------------------------------- #
@@ -651,6 +774,68 @@ def test_the_gate_up_kernel_is_bit_identical_to_the_frozen_copy(case):
     _emit("GATE_UP_IDENTITY", case=case["name"], token_tiles=_shape_of(case)["token_tiles"],
           h_blocks=case["h_blocks"], i_blocks=case["i_blocks"], differing=differing,
           equal=torch.equal(got, want), shape=tuple(got.shape))
+    assert differing == 0
+    assert torch.equal(got, want)
+
+
+def _down_inputs(case: dict, seed: int = 41) -> dict:
+    """One case's down operands, with the flat affinity bank the mapping emits."""
+    shape = _shape_of(case)
+    generator = torch.Generator().manual_seed(seed)
+    intermediate_t = _eighths(seed, shape["i_extent"], shape["positions"])
+    bank = _eighths(seed + 1, _EXPERTS, shape["i_extent"], shape["h_extent"]).to(_FP8)
+    exponents = torch.randint(
+        -2, 2,
+        (_EXPERTS, shape["i_extent"] // GATE_UP_SCALE_BLOCK,
+         shape["h_extent"] // GATE_UP_SCALE_BLOCK),
+        generator=generator,
+    ).to(torch.float32)
+    grid = torch.pow(2.0, exponents)
+    scales = torch.stack([
+        to_down_kernel_scale_operand(grid[e], shape["i_extent"], shape["h_extent"])
+        for e in range(_EXPERTS)
+    ])
+    affinity = _eighths(seed + 2, (_TOKENS + 1) * _EXPERTS, 1)
+    affinity[_TOKENS * _EXPERTS :] = 0.0
+    row_index = torch.randint(
+        -1, _TOKENS, (shape["positions"], 1), generator=generator, dtype=torch.int32
+    )
+    expert_index = torch.randint(
+        0, _EXPERTS, (case["blocks"], 1), generator=generator, dtype=torch.int32
+    )
+    return {"intermediate_t": intermediate_t, "bank": bank, "scales": scales,
+            "affinity": affinity, "row_index": row_index, "expert_index": expert_index,
+            "block": shape["block"]}
+
+
+def _frozen_down(operands: dict, case: dict) -> torch.Tensor:
+    """The frozen down kernel on the operands the live seam hands the live one."""
+    shape = _shape_of(case)
+    expected = down_kernel_scale_shape(shape["i_extent"], shape["h_extent"])
+    return wrap_nki(_landed_down)(
+        operands["intermediate_t"].to(torch.float32),
+        operands["bank"].reshape(-1, GATE_UP_SCALE_BLOCK),
+        operands["scales"].to(torch.float32).reshape(-1, expected[1]),
+        operands["affinity"].to(torch.float32).reshape(-1, 1),
+        operands["row_index"].to(torch.int32).reshape(-1, 1),
+        operands["expert_index"].to(torch.int32).reshape(-1, 1),
+        _iota(),
+    )
+
+
+@pytest.mark.parametrize("case", _TAIL_CASES, ids=[c["name"] for c in _TAIL_CASES])
+def test_the_down_kernel_is_bit_identical_to_the_frozen_copy(case):
+    """The free-axis intermediate window is the one offset the down kernel adds."""
+    operands = _down_inputs(case)
+    got = moe_down_blockwise_fp8(
+        operands["intermediate_t"], operands["bank"], operands["scales"],
+        operands["affinity"], operands["row_index"], operands["expert_index"],
+        operands["block"], _TOKENS,
+    )
+    want = _frozen_down(operands, case)
+    differing = int(torch.ne(got, want).sum().item())
+    _emit("DOWN_IDENTITY", case=case["name"], token_tiles=_shape_of(case)["token_tiles"],
+          differing=differing, equal=torch.equal(got, want), shape=tuple(got.shape))
     assert differing == 0
     assert torch.equal(got, want)
 
