@@ -18,6 +18,8 @@ NEURON_PLATFORM_TARGET_OVERRIDE=trn2``; nothing here reads or sets an environmen
 """
 
 from __future__ import annotations
+
+import pytest
 import torch
 
 import nki
@@ -58,6 +60,9 @@ _EXPERTS = 2
 #: each: 18 tiles with a full last block, 16 tiles at a second quotient, and the same 18
 #: tiles over two contraction blocks per axis.
 _G18 = {"name": "G18", "blocks": 2, "tiles": 9, "h_blocks": 1, "i_blocks": 1}
+_G16 = {"name": "G16", "blocks": 2, "tiles": 8, "h_blocks": 1, "i_blocks": 1}
+_GN = {"name": "GN", "blocks": 2, "tiles": 9, "h_blocks": 2, "i_blocks": 2}
+_ALL_CASES = (_G18, _G16, _GN)
 
 
 def _emit(tag: str, **values: object) -> None:
@@ -82,6 +87,274 @@ def _eighths(seed: int, *shape: int) -> torch.Tensor:
     """Unsigned eighths, exact in fp8 and in bfloat16, so no contraction cancels."""
     generator = torch.Generator().manual_seed(seed)
     return torch.randint(1, 8, shape, generator=generator).to(torch.float32) / 8.0
+
+
+# --------------------------------------------------------------------------- #
+# FROZEN AT THE BASE COMMIT: the helpers and the three kernels as they stood   #
+# before the roll. Their bodies are the base's own; only the kernel names and   #
+# the docstrings differ, so the reference cannot drift with the live module.    #
+# --------------------------------------------------------------------------- #
+def _padded(width: int) -> int:
+    """Frozen at the base commit: _padded."""
+    return ((width + ROW_ALIGN - 1) // ROW_ALIGN) * ROW_ALIGN
+
+
+def _column(rows: int):
+    """Frozen at the base commit: _column."""
+    return nl.ndarray((rows, ROW_ALIGN), dtype=nl.int32, buffer=nl.sbuf)[:, 0:1]
+
+
+def _row_iota(iota_hbm, rows: int):
+    """Frozen at the base commit: _row_iota."""
+    tile = _column(rows)
+    nisa.dma_copy(dst=tile, src=iota_hbm.ap(pattern=[[1, rows], [1, 1]], offset=0))
+    return tile
+
+
+def _dense_column(hbm, rows: int, offset: int):
+    """Frozen at the base commit: _dense_column."""
+    tile = _column(rows)
+    nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[1, rows], [1, 1]], offset=offset))
+    return tile
+
+
+def _broadcast_row(hbm, row: int, rows: int):
+    """Frozen at the base commit: _broadcast_row."""
+    tile = _column(rows)
+    nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[0, rows], [1, 1]], offset=row))
+    return tile
+
+
+def _padding_resolved(rows: int, positions, pad_row: int):
+    """Frozen at the base commit: _padding_resolved."""
+    negative = _column(rows)
+    nisa.tensor_scalar(dst=negative, data=positions, op0=nl.less, operand0=0)
+    bumped = _column(rows)
+    nisa.tensor_scalar(
+        dst=bumped, data=negative, op0=nl.multiply, operand0=pad_row + 1
+    )
+    index = _column(rows)
+    nisa.tensor_tensor(dst=index, data1=positions, data2=bumped, op=nl.add)
+    return index
+
+
+def _bank_rows(rows: int, expert, iota, stride: int, offset: int, step: int):
+    """Frozen at the base commit: _bank_rows."""
+    base = _column(rows)
+    nisa.tensor_scalar(dst=base, data=expert, op0=nl.multiply, operand0=stride)
+    nisa.tensor_scalar(dst=base, data=base, op0=nl.add, operand0=offset)
+    ramp = _column(rows)
+    nisa.tensor_scalar(dst=ramp, data=iota, op0=nl.multiply, operand0=step)
+    index = _column(rows)
+    nisa.tensor_tensor(dst=index, data1=base, data2=ramp, op=nl.add)
+    return index
+
+
+def _affinity_rows(rows: int, resolved, expert, n_experts: int):
+    """Frozen at the base commit: _affinity_rows."""
+    scaled = _column(rows)
+    nisa.tensor_scalar(dst=scaled, data=resolved, op0=nl.multiply, operand0=n_experts)
+    index = _column(rows)
+    nisa.tensor_tensor(dst=index, data1=scaled, data2=expert, op=nl.add)
+    return index
+
+
+def _gathered(hbm, index, rows: int, width: int, dtype):
+    """Frozen at the base commit: _gathered."""
+    tile = nl.ndarray((rows, _padded(width)), dtype=dtype, buffer=nl.sbuf)[:, 0:width]
+    nisa.dma_copy(
+        dst=tile,
+        src=hbm.ap(
+            pattern=[[width, rows], [1, width]],
+            offset=0,
+            vector_offset=index,
+            indirect_dim=0,
+        ),
+    )
+    return tile
+
+
+def _transpose_rows(dst, src_hbm, row_stride: int, rows: int, width: int, offset: int):
+    """Frozen at the base commit: _transpose_rows."""
+    for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
+        n = min(DGE_TRANSPOSE_ROWS, rows - r0)
+        nisa.dma_transpose(
+            dst=dst[:, r0 : r0 + n],
+            src=src_hbm.ap(
+                pattern=[[row_stride, n], [1, width]], offset=offset + r0 * row_stride
+            ),
+        )
+
+
+def _gate_up_sbuf(rows: int = TILE_SIZE, cols: int = GATE_UP_SCALE_BLOCK):
+    """Frozen at the base commit: _gate_up_sbuf."""
+    return nl.ndarray((rows, cols), dtype=nl.float32, buffer=nl.sbuf)
+
+
+def _gate_up_psum(rows: int = TILE_SIZE, cols: int = GATE_UP_SCALE_BLOCK):
+    """Frozen at the base commit: _gate_up_psum."""
+    return nl.ndarray((rows, cols), dtype=nl.float32, buffer=nl.psum)
+
+
+@nki.jit
+def _landed_gate_up(
+    hidden, weight_bank, scale_bank, row_index, expert_index, iota
+):
+    """Frozen at the base commit: moe_gate_up_blockwise_fp8_kernel."""
+    positions = row_index.shape[0]
+    h_extent = hidden.shape[1]
+    n_h_blocks = h_extent // GATE_UP_SCALE_BLOCK
+    # ONE SCALE COLUMN PER (H BLOCK, FUSED COLUMN BLOCK), which the seam pins against
+    # :func:`gate_up_kernel_scale_shape`, so the width over the H blocks IS the fused
+    # column count in blocks -- and the fusion is even, which the seam also refuses.
+    n_col_blocks = scale_bank.shape[1] // n_h_blocks
+    fused_cols = n_col_blocks * GATE_UP_SCALE_BLOCK
+    i_extent = fused_cols // GATE_UP_FUSION
+    n_i_blocks = i_extent // GATE_UP_SCALE_BLOCK
+    # One expert per block: the routing operands' own lengths give the block length.
+    block = positions // expert_index.shape[0]
+    tiles_per_block = block // TILE_SIZE
+    pad_row = hidden.shape[0] - 1
+
+    out = nl.ndarray((positions, fused_cols), dtype=nl.float32, buffer=nl.shared_hbm)
+    # The routed rows land here first. Each token tile's hidden tiles are then
+    # transposed onto partitions once, 16 source rows per DMA, and read by every
+    # intermediate block. Kernel-internal, so ``private_hbm``.
+    staged = nl.ndarray((positions, h_extent), dtype=hidden.dtype, buffer=nl.private_hbm)
+    ramp = _row_iota(iota, TILE_SIZE)
+
+    for m_tile in range(positions // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        wanted = _padding_resolved(
+            TILE_SIZE, _dense_column(row_index, TILE_SIZE, m0), pad_row
+        )
+        nl.store(
+            staged[m0 : m0 + TILE_SIZE, 0:h_extent],
+            value=_gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
+        )
+
+    for m_tile in range(positions // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        expert = _broadcast_row(expert_index, m_tile // tiles_per_block, TILE_SIZE)
+        # The expert's own scale operand, one indirect gather of a tiny tensor.
+        scale_sb = _gathered(
+            scale_bank,
+            _bank_rows(TILE_SIZE, expert, ramp, TILE_SIZE, 0, 1),
+            TILE_SIZE,
+            n_h_blocks * n_col_blocks,
+            nl.float32,
+        )
+        # [H=TILE_SIZE partitions, B=TILE_SIZE free] per hidden tile, in the source dtype.
+        hidden_t = []
+        for h_tile in range(n_h_blocks * GATE_UP_H_TILES_PER_BLOCK):
+            tile = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=hidden.dtype, buffer=nl.sbuf)
+            _transpose_rows(
+                tile, staged, h_extent, TILE_SIZE, TILE_SIZE, m0 * h_extent + h_tile * TILE_SIZE
+            )
+            hidden_t.append(tile)
+        for i_block in range(n_i_blocks):
+            gate_col = i_block * GATE_UP_SCALE_BLOCK
+            up_col = i_extent + i_block * GATE_UP_SCALE_BLOCK
+            gate_acc = _gate_up_sbuf()
+            up_acc = _gate_up_sbuf()
+            for h_block in range(n_h_blocks):
+                gate_psum = _gate_up_psum()
+                up_psum = _gate_up_psum()
+                for h_sub in range(GATE_UP_H_TILES_PER_BLOCK):
+                    h0 = h_block * GATE_UP_SCALE_BLOCK + h_sub * TILE_SIZE
+                    hidden_tile = hidden_t[h0 // TILE_SIZE]
+                    # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free], each
+                    # addressed at ``expert * H * n_col_blocks + (h0 + i) *
+                    # n_col_blocks + column_block`` in the bank's own row units.
+                    gate_w = _gathered(
+                        weight_bank,
+                        _bank_rows(
+                            TILE_SIZE,
+                            expert,
+                            ramp,
+                            h_extent * n_col_blocks,
+                            h0 * n_col_blocks + i_block,
+                            n_col_blocks,
+                        ),
+                        TILE_SIZE,
+                        GATE_UP_SCALE_BLOCK,
+                        nl.bfloat16,
+                    )
+                    up_w = _gathered(
+                        weight_bank,
+                        _bank_rows(
+                            TILE_SIZE,
+                            expert,
+                            ramp,
+                            h_extent * n_col_blocks,
+                            h0 * n_col_blocks + n_i_blocks + i_block,
+                            n_col_blocks,
+                        ),
+                        TILE_SIZE,
+                        GATE_UP_SCALE_BLOCK,
+                        nl.bfloat16,
+                    )
+                    # dst = stationary.T @ moving = [B, I]. The accumulate flag is
+                    # explicit rather than inferred, so first-write-overwrites is
+                    # visible here.
+                    nisa.nc_matmul(
+                        dst=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        stationary=hidden_tile,
+                        moving=gate_w,
+                        accumulate=(h_sub > 0),
+                    )
+                    nisa.nc_matmul(
+                        dst=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        stationary=hidden_tile,
+                        moving=up_w,
+                        accumulate=(h_sub > 0),
+                    )
+                # The same flattening `gate_up_flat_scale_index` returns, written
+                # as the block walk that produces it: `h_block * n_col_blocks +
+                # (gate_or_up * n_i_blocks + i_block)`.
+                gate_flat = h_block * n_col_blocks + i_block
+                up_flat = h_block * n_col_blocks + n_i_blocks + i_block
+                if h_block == 0:
+                    # The first block initialises the accumulator, so there is no
+                    # zeroing pass over SBUF.
+                    nisa.tensor_scalar(
+                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                    )
+                    nisa.tensor_scalar(
+                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                    )
+                else:
+                    nisa.scalar_tensor_tensor(
+                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                        op1=nl.add,
+                        operand1=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    )
+                    nisa.scalar_tensor_tensor(
+                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        op0=nl.multiply,
+                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                        op1=nl.add,
+                        operand1=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    )
+            nl.store(
+                out[m0 : m0 + TILE_SIZE, gate_col : gate_col + GATE_UP_SCALE_BLOCK],
+                value=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+            )
+            nl.store(
+                out[m0 : m0 + TILE_SIZE, up_col : up_col + GATE_UP_SCALE_BLOCK],
+                value=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+            )
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -338,6 +611,42 @@ def _gate_up_inputs(case: dict, seed: int = 11) -> dict:
     )
     return {"hidden": hidden, "bank": bank, "scales": scales, "row_index": row_index,
             "expert_index": expert_index, "block": shape["block"]}
+
+
+def _iota() -> torch.Tensor:
+    """The partition ramp the kernels take as an operand."""
+    return torch.arange(TILE_SIZE, dtype=torch.int32).reshape(TILE_SIZE, 1)
+
+
+def _frozen_gate_up(operands: dict, case: dict) -> torch.Tensor:
+    """The frozen gate/up kernel on the operands the live seam hands the live one."""
+    shape = _shape_of(case)
+    n_col_blocks = GATE_UP_FUSION * shape["i_extent"] // GATE_UP_SCALE_BLOCK
+    return wrap_nki(_landed_gate_up)(
+        operands["hidden"].to(torch.bfloat16),
+        operands["bank"].reshape(-1, GATE_UP_SCALE_BLOCK),
+        operands["scales"].to(torch.float32).reshape(-1, n_col_blocks),
+        operands["row_index"].to(torch.int32).reshape(-1, 1),
+        operands["expert_index"].to(torch.int32).reshape(-1, 1),
+        _iota(),
+    )
+
+
+@pytest.mark.parametrize("case", _TAIL_CASES, ids=[c["name"] for c in _TAIL_CASES])
+def test_the_gate_up_kernel_is_bit_identical_to_the_frozen_copy(case):
+    """The staging loop, rolled, at both tail geometries."""
+    operands = _gate_up_inputs(case)
+    got = moe_gate_up_blockwise_fp8(
+        operands["hidden"], operands["bank"], operands["scales"],
+        operands["row_index"], operands["expert_index"], operands["block"],
+    )
+    want = _frozen_gate_up(operands, case)
+    differing = int(torch.ne(got, want).sum().item())
+    _emit("GATE_UP_IDENTITY", case=case["name"], token_tiles=_shape_of(case)["token_tiles"],
+          h_blocks=case["h_blocks"], i_blocks=case["i_blocks"], differing=differing,
+          equal=torch.equal(got, want), shape=tuple(got.shape))
+    assert differing == 0
+    assert torch.equal(got, want)
 
 
 def test_the_kernel_defaults_this_change_depends_on_are_the_ones_it_was_read_at():

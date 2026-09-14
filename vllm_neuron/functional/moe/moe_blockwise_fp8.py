@@ -1089,15 +1089,31 @@ def moe_gate_up_blockwise_fp8_kernel(
     # intermediate block. Kernel-internal, so ``private_hbm``.
     staged = nl.ndarray((positions, h_extent), dtype=hidden.dtype, buffer=nl.private_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
-    for m_tile in range(positions // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
-        wanted = _padding_resolved(
-            TILE_SIZE, _dense_column(row_index, TILE_SIZE, m0), pad_row
-        )
-        nl.store(
-            staged[m0 : m0 + TILE_SIZE, 0:h_extent],
-            value=_gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
-        )
+    # THE BLOCK IS THE DYNAMIC AXIS, so every tensor a body addresses by block leads with
+    # it and the tiles inside a body keep trace-time offsets. One body then serves every
+    # block, and the tile count of a body is the block's own quotient.
+    n_blocks = expert_index.shape[0]
+    row_index_b = row_index.reshape((n_blocks, block, 1))
+    staged_b = staged.reshape((n_blocks, block, h_extent))
+
+    def stage_block(at_block):
+        for tile in range(tiles_per_block):
+            t0 = tile * TILE_SIZE
+            wanted = _padding_resolved(
+                TILE_SIZE,
+                _dense_column(row_index_b, TILE_SIZE, t0, at_block=at_block),
+                pad_row,
+            )
+            _stored(
+                staged_b.ap(
+                    pattern=[[h_extent, TILE_SIZE], [1, h_extent]],
+                    offset=t0 * h_extent,
+                    **_block_offset(at_block),
+                ),
+                _gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
+            )
+
+    nl.fori_loop(0, n_blocks, stage_block)
 
     for m_tile in range(positions // TILE_SIZE):
         m0 = m_tile * TILE_SIZE
