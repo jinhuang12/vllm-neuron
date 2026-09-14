@@ -5,8 +5,9 @@ from a python number by ``torch.as_tensor`` is a REAL meta tensor even inside th
 the next operator refuses a real tensor beside fake ones; a factory op such as ``torch.full``
 is dispatched through the fake mode and comes back fake. The items here read torch's own
 behaviour on both forms, trace the indexer's prefill seam and its whole prefill leg on meta at
-2048 tokens -- with the kernel gate on, as the compile-only arm traces it, and off, through the
-torch fallbacks -- and require the int route and the tensor route of the seam to seed the same ring.
+2048 tokens with the kernel gate on, as the compile-only arm traces it, run the rotation's torch
+fallbacks on meta with the gate off, and require the int route and the tensor route of the seam to
+seed the same ring.
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 python -m pytest -s -rA \\
         test/vllm_neuron/model/glm5_next/test_traced_scalar_operands.py
@@ -21,6 +22,7 @@ import torch
 import torch._dynamo as dynamo
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
+from vllm_neuron.functional.dsa.kpool_hadamard import dsa_hadamard128, dsa_kpool_hadamard
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from test.vllm_neuron.model.glm5_next import test_dsa_layer as layer_half
@@ -255,22 +257,45 @@ def test_c_the_indexer_prefill_leg_traces_on_meta_at_2048_tokens() -> None:
     assert keep.nodes_targeting(torch.as_tensor) == 0, "the graph carries a torch.as_tensor node"
 
 
-def test_e_the_fallback_leg_traces_on_meta_with_its_constants_on_the_activations_device(
+def test_e_the_fallback_rotations_run_on_meta_with_their_matrix_on_the_activations_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same leg with the kernel gate off: every torch fallback builds its constants where the activation is."""
+    """The rotation's two torch fallbacks under the fake mode on meta: one device, meta outputs.
+
+    The fallback LEG is not traced here: the leg holds a logger call the tracer refuses, and the
+    served path never takes the fallbacks. What this reads is the fallbacks' own matrix, through
+    the same public entries the leg calls, where a matrix built on the default device meets the
+    activation on meta and the fake mode refuses the product.
+    """
     _require_cpu_mode()
     monkeypatch.setenv("VLLM_NEURON_DISABLE_NKI_KERNELS", "1")
     assert not can_run_kernel(), "the kernel gate still reads on with the disabling switch set"
-    keep, message, rows = _prefill_leg_on_meta()
-    say("fallback_prefill_trace", f"tokens={TOKENS}", f"pool_rows={rows}", "kernels=off",
-        f"refused={bool(message)}", f"graphs={len(keep.graphs)}",
-        f"two_devices={TWO_DEVICES in message}",
-        f"message={_refusal_reads(message)}")
-    assert not message, (
-        f"the trace of the fallback leg on meta was refused: {_refusal_reads(message)!r}"
+    indexer = _shape_only_indexer(TRACED_DEVICE)
+    head_dim = int(indexer.index_head_dim)
+    refused = {}
+    with FakeTensorMode():
+        rows = torch.zeros(TOKENS, head_dim, dtype=torch.bfloat16, device=TRACED_DEVICE)
+        slot_k = torch.zeros(TOKENS // POOL, POOL, head_dim, dtype=torch.bfloat16, device=TRACED_DEVICE)
+        ape = torch.zeros(POOL, head_dim, dtype=torch.float32, device=TRACED_DEVICE)
+        for form, call in (
+            ("stage", lambda: dsa_hadamard128(rows)),
+            ("fused", lambda: dsa_kpool_hadamard(slot_k, slot_k.clone(), ape)),
+        ):
+            try:
+                out = call()
+            except Exception as error:  # the fake mode's refusal is the reading
+                message = " ".join(str(error).split())
+                refused[form] = message
+                say("fallback_rotation", f"form={form}", "kernels=off", "refused=True",
+                    "out_device=none", f"two_devices={TWO_DEVICES in message}",
+                    f"message={_refusal_reads(message)}")
+                continue
+            say("fallback_rotation", f"form={form}", "kernels=off", "refused=False",
+                f"out_device={out.device.type}", "two_devices=False", "message=none")
+            assert out.device.type == TRACED_DEVICE, f"the {form} rotation came back on {out.device}"
+    assert not refused, (
+        f"the fallback rotations on meta were refused: {_refusal_reads(next(iter(refused.values())))!r}"
     )
-    assert len(keep.graphs) == 1, f"{len(keep.graphs)} graphs kept, not one"
 
 
 def test_d_the_int_route_and_the_tensor_route_seed_the_same_ring_for_padded_and_whole_chunks() -> None:
