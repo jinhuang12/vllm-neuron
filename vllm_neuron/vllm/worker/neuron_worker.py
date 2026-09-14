@@ -44,6 +44,7 @@ from vllm_neuron.utils.hardware_config import (
 )
 from vllm.utils.network_utils import get_open_port
 from vllm_neuron.parallel.neuron_parallel_state import tp_barrier, tp_sum_int
+from vllm_neuron.vllm.patches.staged_neff_load import forget_this_load, name_this_load
 from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker.neuron_profiler import (
     NeuronProfilerConfig,
@@ -349,8 +350,14 @@ def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
     A warmup call executes the model, and the model's forward carries collectives over the
     whole TP group, so a subset of the ranks cannot run it: the ranks left out would wait in
     the status exchange while the ranks inside waited for them in the collective.
+
+    The graph itself is compiled or loaded inside this call, before the forward. Which call it
+    belongs to is told to the loader here, because the loader stages the loads in waves and its
+    rows have to name the graph they loaded. The name is dropped again on the way out, so a
+    graph compiled outside a warmup call is never staged.
     """
     rank = get_tp_group().rank_in_group
+    name_this_load(phase, bucket)
     tp_barrier()
     # One row per rank on each side of the call. The compiled graph is loaded INSIDE this call,
     # so a sampler watching the process from outside cannot say whether the resident size grew
@@ -368,6 +375,8 @@ def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
         work()
     except Exception as exc:  # the group is told before this rank re-raises
         failure = exc
+    finally:
+        forget_this_load()
     logger.info(
         "warmup_execution_left|phase=%s|bucket=%s|rank=%s|rss_kib=%s|elapsed_s=%.1f",
         phase,
