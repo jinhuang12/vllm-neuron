@@ -1080,9 +1080,14 @@ def test_every_sbuf_tile_the_rolled_bodies_declare_keeps_whole_lines():
     """A rolled body allocates the same tiles; every one still ends on a 32-byte line."""
     source = pathlib.Path(live.__file__).read_text(encoding="utf-8")
     tiles = tile_rows(source, _CENSUS_AT, _arithmetic(), _WIDTHS)
-    ragged = tuple(name for _, name, per_partition in tiles if per_partition % _LINE)
-    _emit("SBUF_TILE_LINES", tiles=len(tiles), ragged=len(ragged), by_name=ragged, line=_LINE)
-    assert tiles, "the census read no SBUF tile"
+    # A tile inside a helper takes its width from a parameter, which these extents cannot
+    # place, so the count that cannot be placed is a reading and the placed ones are graded.
+    placed = tuple((name, row) for _, name, row in tiles if row is not None)
+    unplaced = tuple(name for _, name, row in tiles if row is None)
+    ragged = tuple(name for name, row in placed if row % _LINE)
+    _emit("SBUF_TILE_LINES", tiles=len(tiles), placed=len(placed), unplaced=len(unplaced),
+          ragged=len(ragged), by_name=ragged, line=_LINE)
+    assert placed, "the census placed no SBUF tile"
     assert len(ragged) == 0, f"tiles whose partition row is not whole lines: {ragged}"
 
 
