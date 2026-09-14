@@ -382,22 +382,23 @@ _OWNED_TILES = (
     ("moe_gate_up_blockwise_fp8_kernel", "up_acc", 512),
 )
 
-#: Every OTHER tile this shared module declares, by function and name: the ones the swiglu and down
-#: kernels declare, and the staging tiles the rolled token-tile loops add. This item does not grade
-#: their widths; naming them keeps the module's own tile count EXACT below, so a tile that nobody
-#: named -- an extra one anywhere in the module -- reddens this item instead of passing unread.
-_NAMED_FOREIGN_TILES = (
-    ("_loaded", "tile"),
-    ("_loaded", "tile"),
-    ("moe_down_blockwise_fp8_kernel", "acc"),
-    ("moe_down_blockwise_fp8_kernel", "scaled"),
-    ("moe_swiglu_transposed_kernel", "bounded"),
-    ("moe_swiglu_transposed_kernel", "bounded_up"),
-    ("moe_swiglu_transposed_kernel", "floored"),
-    ("moe_swiglu_transposed_kernel", "gated"),
-    ("moe_swiglu_transposed_kernel", "out_sb"),
-    ("moe_swiglu_transposed_kernel", "silu"),
-    ("moe_swiglu_transposed_kernel", "squashed"),
+#: Every OTHER tile this shared module declares, in the same shape and RETYPED: the ones the swiglu
+#: and down kernels declare, and the staging tiles the rolled token-tile loops add. Their widths are
+#: not graded here; counting them by name keeps the module's own tile count EXACT below, so a tile
+#: that nobody named -- an extra one anywhere in the module -- reddens this item instead of arriving
+#: unread. A change that adds a tile to this module names it here. Both geometries read these rows.
+_FOREIGN_TILES = (
+    ("_loaded", "tile", 256),
+    ("_loaded", "tile", 512),
+    ("moe_down_blockwise_fp8_kernel", "acc", 512),
+    ("moe_down_blockwise_fp8_kernel", "scaled", 512),
+    ("moe_swiglu_transposed_kernel", "bounded", 512),
+    ("moe_swiglu_transposed_kernel", "bounded_up", 512),
+    ("moe_swiglu_transposed_kernel", "floored", 512),
+    ("moe_swiglu_transposed_kernel", "gated", 512),
+    ("moe_swiglu_transposed_kernel", "out_sb", 512),
+    ("moe_swiglu_transposed_kernel", "silu", 512),
+    ("moe_swiglu_transposed_kernel", "squashed", 512),
 )
 
 #: The functions whose tiles are owned above, read off that list and not off the module.
@@ -496,16 +497,17 @@ def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
         owned = tuple(one for one in _tiles_by_owner(source, rows) if one[0] in _OWNER_FUNCTIONS)
         want = tuple(sorted(_OWNED_TILES))
         differing = tuple(sorted(set(owned) ^ set(want)))
-        whole = len(want) + len(_NAMED_FOREIGN_TILES)
-        _emit("NARROW_TILES", geometry=name, count=len(narrow), unreadable=unreadable, tiles=len(rows),
-              width=_WIDTHS[0], lines=tuple(r[0] for r in narrow))
-        _emit("OWNED_TILES", geometry=name, owned=len(owned), want=len(want), differing=differing,
-              total=len(rows), whole=whole, foreign=len(_NAMED_FOREIGN_TILES))
+        whole = len(want) + len(_FOREIGN_TILES)
+        _emit("NARROW_TILES", geometry=name, count=len(narrow), unreadable=unreadable,
+              tiles=len(rows), width=_WIDTHS[0], lines=tuple(r[0] for r in narrow))
+        _emit("OWN_TILES", geometry=name, functions=len(_OWNER_FUNCTIONS), tiles=len(owned),
+              foreign=len(_FOREIGN_TILES), total=len(rows), differing=differing)
         assert unreadable == (), f"tile rows the arithmetic cannot size: {unreadable}"
         assert narrow == (), f"tile rows that are not whole 32-byte lines: {narrow}"
         assert owned == want, (f"the tiles these functions declare at {name} moved: {differing} "
                                f"(read {len(owned)}, want {len(want)})")
-        assert len(rows) == whole, f"SBUF tiles the census reads at {name}: {len(rows)}, not {whole}"
+        assert len(rows) == whole, \
+            f"SBUF tiles the census reads at {name}: {len(rows)}, not {whole}"
 
 
 _PLANTED_WHOLE_TILE = _HELPER + """
