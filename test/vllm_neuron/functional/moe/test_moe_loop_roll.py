@@ -78,7 +78,6 @@ _EXPERTS = 2
 _G18 = {"name": "G18", "blocks": 2, "tiles": 9, "h_blocks": 1, "i_blocks": 1}
 _G16 = {"name": "G16", "blocks": 2, "tiles": 8, "h_blocks": 1, "i_blocks": 1}
 _GN = {"name": "GN", "blocks": 2, "tiles": 9, "h_blocks": 2, "i_blocks": 2}
-_TAIL_CASES = (_G18, _G16)
 _ALL_CASES = (_G18, _G16, _GN)
 
 
@@ -802,21 +801,24 @@ def test_a_block_that_is_not_whole_tiles_is_refused_before_any_loop_runs():
     case = dict(_G18)
     shape = _shape_of(case)
     operands = _gate_up_inputs(case)
+    declared = (("not_a_tile_multiple", shape["block"] + 1, "not a positive multiple"),
+                ("does_not_divide_positions", shape["block"] * 3, "not a multiple of block="),
+                ("one_expert_per_block", shape["block"] * 2, "one expert per block"))
     refused = []
-    for name, block in (("not_a_tile_multiple", shape["block"] + 1),
-                        ("does_not_divide_positions", shape["block"] * 2)):
+    for name, block, reason in declared:
         try:
             moe_gate_up_blockwise_fp8(
                 operands["hidden"], operands["bank"], operands["scales"],
                 operands["row_index"], operands["expert_index"], block,
             )
-        except MoeBlockwiseFp8Error:
-            refused.append(name)
+        except MoeBlockwiseFp8Error as refusal:
+            if reason in str(refusal):
+                refused.append(name)
     covered = case["blocks"] * case["tiles"] == shape["positions"] // TILE_SIZE
     _emit("COVERING_IDENTITY", refused=len(refused), by_cause=tuple(refused),
           blocks=case["blocks"], tiles_per_block=case["tiles"],
           token_tiles=shape["positions"] // TILE_SIZE, covered=covered)
-    assert len(refused) == 2
+    assert refused == [name for name, _, _ in declared], f"refused for its own reason: {refused}"
     assert covered
 
 
@@ -909,16 +911,18 @@ def _bounds(limit: float | None) -> torch.Tensor:
                       for value in (limit, -limit, limit)], dim=1)
 
 
-@pytest.mark.parametrize("case", _TAIL_CASES, ids=[c["name"] for c in _TAIL_CASES])
+@pytest.mark.parametrize("case", _ALL_CASES, ids=[c["name"] for c in _ALL_CASES])
 def test_the_activation_kernel_is_bit_identical_to_the_frozen_copy(case):
-    """Both bound configurations, because the bound is what the model's copy pins."""
+    """Both bound configurations, and both counts of intermediate block the store offsets by."""
     gate_up = _activation_inputs(case)
+    shape = _shape_of(case)
     for name, limit in (("bounded", _MODEL_SWIGLU_LIMIT), ("unbounded", None)):
         got = moe_swiglu_transposed(gate_up, limit, limit)
         want = _frozen_swiglu(gate_up, _bounds(limit))
         differing = int(torch.ne(got, want).sum().item())
         _emit("ACTIVATION_IDENTITY", case=case["name"], bounds=name,
-              token_tiles=_shape_of(case)["token_tiles"], differing=differing,
+              token_tiles=shape["token_tiles"], i_blocks=case["i_blocks"],
+              tokens=shape["positions"], differing=differing,
               equal=torch.equal(got, want), shape=tuple(got.shape))
         assert differing == 0
         assert torch.equal(got, want)
@@ -983,10 +987,11 @@ def _frozen_down(operands: dict, case: dict) -> torch.Tensor:
     )
 
 
-@pytest.mark.parametrize("case", _TAIL_CASES, ids=[c["name"] for c in _TAIL_CASES])
+@pytest.mark.parametrize("case", _ALL_CASES, ids=[c["name"] for c in _ALL_CASES])
 def test_the_down_kernel_is_bit_identical_to_the_frozen_copy(case):
-    """The free-axis intermediate window is the one offset the down kernel adds."""
+    """The free-axis window and the output store, at one and at two blocks on each axis."""
     operands = _down_inputs(case)
+    shape = _shape_of(case)
     got = moe_down_blockwise_fp8(
         operands["intermediate_t"], operands["bank"], operands["scales"],
         operands["affinity"], operands["row_index"], operands["expert_index"],
@@ -994,7 +999,10 @@ def test_the_down_kernel_is_bit_identical_to_the_frozen_copy(case):
     )
     want = _frozen_down(operands, case)
     differing = int(torch.ne(got, want).sum().item())
-    _emit("DOWN_IDENTITY", case=case["name"], token_tiles=_shape_of(case)["token_tiles"],
+    _emit("DOWN_IDENTITY", case=case["name"], token_tiles=shape["token_tiles"],
+          h_blocks=case["h_blocks"], i_blocks=case["i_blocks"],
+          positions=shape["positions"], h_extent=shape["h_extent"],
+          store_contiguous=shape["h_extent"] == GATE_UP_SCALE_BLOCK,
           differing=differing, equal=torch.equal(got, want), shape=tuple(got.shape))
     assert differing == 0
     assert torch.equal(got, want)
