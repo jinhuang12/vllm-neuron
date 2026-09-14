@@ -693,28 +693,74 @@ def _row_iota(iota_hbm, rows: int):
     return tile
 
 
-def _dense_column(hbm, rows: int, offset: int):
+def _block_offset(at_block=None, dim: int = 0):
+    """The access-pattern keywords that step one device block index along ``dim``.
+
+    A trace-time caller passes nothing and gets today's pattern unchanged. A caller
+    inside a dynamic loop passes that loop's own index, and the pattern then steps one
+    ``dim`` stride of the tensor as it was reshaped for the loop -- the spelling
+    ``nkilib``'s ``pack_tokens`` uses for its permuted-output store.
+    """
+    if at_block is None:
+        return {}
+    return {"scalar_offset": at_block, "indirect_dim": dim}
+
+
+def _loaded(source, rows: int, width: int, dtype):
+    """``rows`` by ``width`` of an HBM access pattern in SBUF, converted on the way in.
+
+    The DMA converts the element type, the same mechanism :func:`_gathered` already uses
+    to read an fp8 bank as bfloat16.
+    """
+    tile = nl.ndarray((rows, _padded(width)), dtype=dtype, buffer=nl.sbuf)[:, 0:width]
+    nisa.dma_copy(dst=tile, src=source)
+    return tile
+
+
+def _stored(destination, tile):
+    """Write one SBUF tile through an HBM access pattern, on device descriptors.
+
+    ``nl.store`` takes a slice, and a slice cannot carry a device offset, so a dynamic
+    body stores through the pattern instead.
+    """
+    nisa.dma_copy(destination, tile, dge_mode=nisa.dge_mode.hwdge)
+
+
+def _dense_column(hbm, rows: int, offset: int, at_block=None):
     """``rows`` consecutive int32 of an ``[n, 1]`` HBM tensor, one per partition.
 
     The dense counterpart of :func:`_gathered`: the slice is contiguous and its start
     is a trace-time integer, so no index tile is needed. ``dsa/ragged_pack.py`` loads
-    its position column with this same pattern.
+    its position column with this same pattern. ``at_block`` moves the start by one
+    device block on a tensor reshaped ``(blocks, block, 1)``.
     """
     tile = _column(rows)
-    nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[1, rows], [1, 1]], offset=offset))
+    nisa.dma_copy(
+        dst=tile,
+        src=hbm.ap(
+            pattern=[[1, rows], [1, 1]], offset=offset, **_block_offset(at_block)
+        ),
+    )
     return tile
 
 
-def _broadcast_row(hbm, row: int, rows: int):
+def _broadcast_row(hbm, row: int, rows: int, at_block=None):
     """One int32 of an ``[n, 1]`` HBM tensor, replicated into EVERY partition.
 
     A ZERO partition stride does the replication: the pattern advances 0 elements
     per partition step, so all ``rows`` partitions read one address. The landed form
     is ``dsa/ragged_pack.py``'s ``_broadcast_scalar``, itself the vendor's idiom at
-    ``nkilib/experimental/collectives/a2av_train/permute_a2av.py:139-150``.
+    ``nkilib/experimental/collectives/a2av_train/permute_a2av.py:139-150``. One row of
+    an ``[n, 1]`` tensor is one element, so ``at_block`` addresses the block itself and
+    needs no reshape.
     """
     tile = _column(rows)
-    nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[0, rows], [1, 1]], offset=row))
+    nisa.dma_copy(
+        dst=tile,
+        src=hbm.ap(
+            pattern=[[0, rows], [1, 1]], offset=row, **_block_offset(at_block)
+        ),
+    )
     return tile
 
 
@@ -800,14 +846,18 @@ def _gathered(hbm, index, rows: int, width: int, dtype):
     return tile
 
 
-def _transpose_rows(dst, src_hbm, row_stride: int, rows: int, width: int, offset: int):
+def _transpose_rows(
+    dst, src_hbm, row_stride: int, rows: int, width: int, offset: int, at_block=None
+):
     """Transpose ``rows`` source rows of ``width`` elements onto partitions, 16 rows per DMA."""
     for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
         n = min(DGE_TRANSPOSE_ROWS, rows - r0)
         nisa.dma_transpose(
             dst=dst[:, r0 : r0 + n],
             src=src_hbm.ap(
-                pattern=[[row_stride, n], [1, width]], offset=offset + r0 * row_stride
+                pattern=[[row_stride, n], [1, width]],
+                offset=offset + r0 * row_stride,
+                **_block_offset(at_block),
             ),
         )
 
@@ -1039,7 +1089,6 @@ def moe_gate_up_blockwise_fp8_kernel(
     # intermediate block. Kernel-internal, so ``private_hbm``.
     staged = nl.ndarray((positions, h_extent), dtype=hidden.dtype, buffer=nl.private_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
-
     for m_tile in range(positions // TILE_SIZE):
         m0 = m_tile * TILE_SIZE
         wanted = _padding_resolved(
@@ -1539,7 +1588,6 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
     out = nl.ndarray((i_extent, tokens), dtype=nl.float32, buffer=nl.shared_hbm)
     if bounded_config:
         bounds_sb = nl.load(bounds[0:TILE_SIZE, 0:_SWIGLU_BOUND_COLUMNS])
-
     for m_tile in range(tokens // TILE_SIZE):
         m0 = m_tile * TILE_SIZE
         for i_block in range(i_extent // GATE_UP_SCALE_BLOCK):
@@ -1729,7 +1777,6 @@ def moe_down_blockwise_fp8_kernel(
 
     out = nl.ndarray((positions, h_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
-
     for m_tile in range(positions // TILE_SIZE):
         m0 = m_tile * TILE_SIZE
         expert = _broadcast_row(expert_index, m_tile // tiles_per_block, TILE_SIZE)
