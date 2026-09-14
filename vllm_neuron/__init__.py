@@ -114,20 +114,20 @@ def _init_backend():
     from libtorch_neuronx_lite.compile.backend import compile
     from libtorch_neuronx_lite.compile.capture_backend import capture
 
+    # The compiler is registered inside the load stager, because compiling a graph loads it into
+    # host memory and a whole group loading at one instant exhausts the host. The stage is a
+    # pass-through until a caller names the load it is about to run.
+    from vllm_neuron.vllm.patches.staged_neff_load import staged_compiler
+
     if "neuron_libtorch" not in registry.list_backends():
-        registry.register_backend(compiler_fn=compile, name="neuron_libtorch")
+        registry.register_backend(
+            compiler_fn=staged_compiler(compile), name="neuron_libtorch"
+        )
 
     if "neuron_libtorch_graph_capture" not in registry.list_backends():
         registry.register_backend(
             compiler_fn=capture, name="neuron_libtorch_graph_capture"
         )
-
-    # The staged loader is installed here, before any graph is compiled, because the backend
-    # loads a graph inside the builder it calls and a whole group loading at once exhausts the
-    # host. It is a pass-through until a wave size and a signal directory are both set.
-    from vllm_neuron.vllm.patches.staged_neff_load import apply_staged_neff_load
-
-    apply_staged_neff_load()
 
     if not envs.VLLM_NEURON_CPU_MODE or _has_neuron_hw:
         try:

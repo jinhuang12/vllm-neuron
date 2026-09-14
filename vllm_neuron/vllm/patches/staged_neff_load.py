@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stages the compiled graph's load, so one wave of ranks loads at a time.
 
-The compiler backend builds the executable for a graph in one place, and building it loads the
-whole graph into host memory; the execution that follows holds far less. A tensor-parallel
-group that loads on every rank at one instant therefore exhausts the host long before it runs
-anything. This module wraps that builder and lets the ranks through it in waves.
+The compiler builds the executable for a graph in one place, and building it loads the whole
+graph into host memory; the execution that follows holds far less. A tensor-parallel group that
+loads on every rank at one instant therefore exhausts the host long before it runs anything.
+This module brackets the compiler the plugin registers with torch.compile and lets the ranks
+through it in waves. The bracket includes the compiler's own cache lookup, which is cheap on a
+hit; a miss inside it would serialize a compilation as well as a load.
 
 The signals between waves point FORWARD only: a wave waits for the wave before it and is never
 waited on again. By the time a wave has signalled, its own ranks are inside the forward's
-collectives, where a group-wide wait would deadlock.
+collectives, where a group-wide wait would deadlock. Each rank writes its flag after the
+compiler returns, so a rank that blocks on the way out holds nobody up, and a wave that never
+signals costs the next wave one bounded wait rather than the run.
+
+The stage is armed only for a load a caller has named. Anything else passes straight through.
 """
 
-import functools
 import math
 import os
 import re
 import time
 
+import torch.distributed as dist
 from vllm.logger import init_logger
 
 from vllm_neuron import envs
@@ -25,13 +31,18 @@ logger = init_logger(__name__)
 
 POLL_SECONDS = 0.2
 
-_LOAD_NAME = {"phase": "unknown", "bucket": "unknown"}
+_LOAD_NAME: dict[str, str] = {}
 
 
 def name_this_load(phase: str, bucket: str) -> None:
     """Tell the loader which warmup call the graph loads that follow belong to."""
     _LOAD_NAME["phase"] = phase
     _LOAD_NAME["bucket"] = bucket
+
+
+def forget_this_load() -> None:
+    """Disarm the stage, so a later compilation of any graph passes straight through."""
+    _LOAD_NAME.clear()
 
 
 def wave_plan(world_size: int) -> tuple[int, int]:
@@ -42,14 +53,26 @@ def wave_plan(world_size: int) -> tuple[int, int]:
     return wave_size, math.ceil(world_size / wave_size)
 
 
-def stage_load(build, *args, **kwargs):
-    """Run the graph builder inside this rank's own wave, then signal the next wave."""
-    rank, world_size = _rank_and_world(args, kwargs)
-    wave_size, waves = wave_plan(world_size)
-    phase, bucket = _LOAD_NAME["phase"], _LOAD_NAME["bucket"]
+def staged_compiler(compile_fn):
+    """Return the registered compiler, bracketed by this rank's own load wave."""
+
+    def staged(*args, **kwargs):
+        return stage_load(compile_fn, *args, **kwargs)
+
+    return staged
+
+
+def stage_load(compile_fn, *args, **kwargs):
+    """Run the compiler inside this rank's own wave, then signal the wave behind."""
+    rank, world_size = _rank_and_world()
+    phase = _LOAD_NAME.get("phase")
+    bucket = _LOAD_NAME.get("bucket")
     directory = _signal_directory(phase, bucket)
-    if waves == 1 or directory is None:
-        return build(*args, **kwargs)
+    reason = _gate_off_reason(rank, world_size, directory)
+    if reason is not None:
+        logger.info("neff_load_gate|off|reason=%s", reason)
+        return compile_fn(*args, **kwargs)
+    wave_size, _ = wave_plan(world_size)
     wave = rank // wave_size
     os.makedirs(directory, exist_ok=True)
     if wave:
@@ -64,10 +87,10 @@ def stage_load(build, *args, **kwargs):
     )
     started = time.perf_counter()
     try:
-        return build(*args, **kwargs)
+        return compile_fn(*args, **kwargs)
     finally:
-        # The row and the flag are written even when the build raises, because a wave that
-        # never signals leaves every later wave waiting out its whole timeout.
+        # The row and the flag are written even when the compilation raises, because a wave that
+        # never signals leaves the wave behind it waiting out its whole timeout.
         logger.info(
             "neff_load_left|rank=%s|wave=%s|rss_kib=%s|elapsed_s=%.1f|phase=%s|bucket=%s",
             rank,
@@ -80,39 +103,28 @@ def stage_load(build, *args, **kwargs):
         _signal_this_rank(directory, rank)
 
 
-def apply_staged_neff_load(backend=None) -> None:
-    """Wrap the compiler backend's graph builder with the staged load."""
-    # The builder's own module attribute is the only patchable point: the executable class it
-    # returns is defined inside its body, and the backend resolves the builder's name from
-    # module globals when it calls it.
-    if backend is None:
-        from libtorch_neuronx_lite.compile import backend as libtorch_backend
-
-        backend = libtorch_backend
-    original = backend.build_executable
-    if getattr(original, "staged_neff_load", False):
-        return
-
-    @functools.wraps(original)
-    def staged(*args, **kwargs):
-        return stage_load(original, *args, **kwargs)
-
-    staged.staged_neff_load = True
-    backend.build_executable = staged
-    logger.info("neff_load_staged|builder=%s", getattr(original, "__name__", "unknown"))
+def _rank_and_world() -> tuple[int | None, int | None]:
+    """Read this rank and the world size off the process group, as the compiler itself does."""
+    if not dist.is_available() or not dist.is_initialized():
+        return None, None
+    return dist.get_rank(), dist.get_world_size()
 
 
-def _rank_and_world(args, kwargs) -> tuple[int, int]:
-    """Read the rank and the world size out of the builder's own arguments."""
-    if "g_device_id" in kwargs and "g_device_count" in kwargs:
-        return int(kwargs["g_device_id"]), int(kwargs["g_device_count"])
-    return int(args[2]), int(args[3])
+def _gate_off_reason(rank, world_size, directory) -> str | None:
+    """Say why this call is not staged, or None when it is."""
+    if rank is None or world_size is None:
+        return "no_process_group"
+    if directory is None:
+        return "no_named_load"
+    if wave_plan(world_size)[1] == 1:
+        return "wave_size_covers_the_world"
+    return None
 
 
-def _signal_directory(phase: str, bucket: str) -> str | None:
-    """Return this call's rendezvous directory, or None when none is configured."""
+def _signal_directory(phase, bucket) -> str | None:
+    """Return this call's signal directory, or None when the load is unnamed or unconfigured."""
     root = envs.VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR
-    if not root:
+    if not root or phase is None or bucket is None:
         return None
     return os.path.join(root, _one_component(phase), _one_component(bucket))
 
@@ -125,7 +137,7 @@ def _one_component(name: str) -> str:
 def _wait_for_previous_wave(
     directory: str, rank: int, wave: int, wave_size: int, world_size: int
 ) -> None:
-    """Wait until every rank of the wave before this one has signalled."""
+    """Wait until every rank of the wave before this one has signalled, or give up and proceed."""
     first = (wave - 1) * wave_size
     wanted = [
         os.path.join(directory, f"rank_{other}.done")
@@ -151,7 +163,7 @@ def _wait_for_previous_wave(
 
 
 def _signal_this_rank(directory: str, rank: int) -> None:
-    """Write this rank's flag, which is the only signal the next wave waits for."""
+    """Write this rank's flag, which is the only signal the wave behind it waits for."""
     with open(os.path.join(directory, f"rank_{rank}.done"), "w", encoding="utf-8") as flag:
         flag.write(f"{os.getpid()}\n")
 
