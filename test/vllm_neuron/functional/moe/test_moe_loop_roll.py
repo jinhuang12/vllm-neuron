@@ -19,6 +19,8 @@ NEURON_PLATFORM_TARGET_OVERRIDE=trn2``; nothing here reads or sets an environmen
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 import torch
 
@@ -28,6 +30,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.moe import moe_blockwise_fp8 as live
+from test.vllm_neuron.functional.dma_transpose_census import census, tile_rows
 from vllm_neuron.functional.moe.moe_blockwise_fp8 import MoeBlockwiseFp8Error, moe_gate_up_blockwise_fp8, to_gate_up_kernel_scale_operand
 
 #: The constants the frozen copies read, RETYPED on purpose: a frozen reference that
@@ -46,6 +49,9 @@ _MODEL_SWIGLU_LIMIT = 10.0
 
 #: The source rows per DMA the device generates its own descriptors for, RETYPED.
 _DGE_ROWS = 16
+
+#: The destination line the runtime requires, RETYPED.
+_LINE = 32
 
 _FP8 = torch.float8_e4m3fn
 
@@ -632,9 +638,9 @@ def _frozen_gate_up(operands: dict, case: dict) -> torch.Tensor:
     )
 
 
-@pytest.mark.parametrize("case", _TAIL_CASES, ids=[c["name"] for c in _TAIL_CASES])
+@pytest.mark.parametrize("case", _ALL_CASES, ids=[c["name"] for c in _ALL_CASES])
 def test_the_gate_up_kernel_is_bit_identical_to_the_frozen_copy(case):
-    """The staging loop, rolled, at both tail geometries."""
+    """The staging loop and the projection nest, both rolled, at all three geometries."""
     operands = _gate_up_inputs(case)
     got = moe_gate_up_blockwise_fp8(
         operands["hidden"], operands["bank"], operands["scales"],
@@ -647,6 +653,97 @@ def test_the_gate_up_kernel_is_bit_identical_to_the_frozen_copy(case):
           equal=torch.equal(got, want), shape=tuple(got.shape))
     assert differing == 0
     assert torch.equal(got, want)
+
+
+# --------------------------------------------------------------------------- #
+# What the roll is for: the per-block operands are gathered once per block.   #
+# --------------------------------------------------------------------------- #
+def _counting(module, name: str, log: list):
+    """Replace ``module.name`` with a wrapper that logs its call, and return the original."""
+    original = getattr(module, name)
+
+    def wrapper(*args, **kwargs):
+        log.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    setattr(module, name, wrapper)
+    return original
+
+
+def test_the_expert_operands_are_gathered_once_per_block():
+    """The broadcast and the scale gather leave the tile loop, which is the roll's own saving."""
+    case = _G18
+    shape = _shape_of(case)
+    operands = _gate_up_inputs(case)
+    broadcasts: list = []
+    rows: list = []
+    original_broadcast = _counting(live, "_broadcast_row", broadcasts)
+    original_rows = _counting(live, "_bank_rows", rows)
+    try:
+        moe_gate_up_blockwise_fp8(
+            operands["hidden"], operands["bank"], operands["scales"],
+            operands["row_index"], operands["expert_index"], operands["block"],
+        )
+    finally:
+        setattr(live, "_broadcast_row", original_broadcast)
+        setattr(live, "_bank_rows", original_rows)
+    scale_gathers = [call for call in rows
+                     if call[0][3] == TILE_SIZE and call[0][4] == 0 and call[0][5] == 1]
+    token_tiles = shape["positions"] // TILE_SIZE
+    _emit("PER_BLOCK_GATHERS", blocks=case["blocks"], token_tiles=token_tiles,
+          broadcasts=len(broadcasts), scale_gathers=len(scale_gathers),
+          per_tile_before=token_tiles)
+    assert len(broadcasts) == case["blocks"]
+    assert len(scale_gathers) == case["blocks"]
+    assert case["blocks"] < token_tiles
+
+
+# --------------------------------------------------------------------------- #
+# The transposes and the SBUF tiles, through the shared census.               #
+# --------------------------------------------------------------------------- #
+#: The trace-time values the transpose sites are read at: one case's own extents, so the
+#: census reads the arithmetic the rolled body will trace.
+_CENSUS_AT = {"positions": 2304, "h_extent": 128, "n_h_blocks": 1, "n_col_blocks": 2,
+              "i_extent": 128, "n_i_blocks": 1, "block": 1152, "tiles_per_block": 9,
+              "n_blocks": 2, "tokens": 2304, "fused_cols": 256}
+
+#: The names the module supplies to its own size and loop expressions, read off the module.
+_MODULE_ARITHMETIC = ("DGE_TRANSPOSE_ROWS", "TILE_SIZE", "GATE_UP_SCALE_BLOCK",
+                      "GATE_UP_H_TILES_PER_BLOCK", "GATE_UP_FUSION", "ROW_ALIGN", "_padded")
+
+#: The element width the seam hands the kernel: it casts the routed rows to bfloat16.
+_WIDTHS = (2,)
+
+
+def _arithmetic() -> dict:
+    """The module's own arithmetic, by name; a module without a name leaves it out."""
+    return {name: getattr(live, name) for name in _MODULE_ARITHMETIC if hasattr(live, name)}
+
+
+def test_every_transpose_still_moves_sixteen_two_byte_rows_onto_a_readable_line():
+    """The rolled body keeps every property the shared census reads, by count and by cause."""
+    source = pathlib.Path(live.__file__).read_text(encoding="utf-8")
+    sites = census(source, _CENSUS_AT, _arithmetic(), _WIDTHS)
+    unreadable = tuple(s.source for s in sites if s.misaligned is None)
+    misaligned = tuple(s.source for s in sites if s.misaligned)
+    host_shaped = tuple(s.source for s in sites if s.host_shaped(_DGE_ROWS))
+    _emit("TRANSPOSE_CENSUS", transposes=len(sites), unreadable=len(unreadable),
+          misaligned=len(misaligned), host_shaped=len(host_shaped),
+          by_source=tuple(sorted({s.source for s in sites})), step=_DGE_ROWS, line=_LINE)
+    assert sites, "the census read no transpose site"
+    assert len(unreadable) == 0, f"destinations the arithmetic cannot place: {unreadable}"
+    assert len(host_shaped) == 0, f"transposes the device cannot shape: {host_shaped}"
+    assert len(misaligned) == 0, f"destinations off a 32-byte line: {misaligned}"
+
+
+def test_every_sbuf_tile_the_rolled_bodies_declare_keeps_whole_lines():
+    """A rolled body allocates the same tiles; every one still ends on a 32-byte line."""
+    source = pathlib.Path(live.__file__).read_text(encoding="utf-8")
+    tiles = tile_rows(source, _CENSUS_AT, _arithmetic(), _WIDTHS)
+    ragged = tuple(name for _, name, per_partition in tiles if per_partition % _LINE)
+    _emit("SBUF_TILE_LINES", tiles=len(tiles), ragged=len(ragged), by_name=ragged, line=_LINE)
+    assert tiles, "the census read no SBUF tile"
+    assert len(ragged) == 0, f"tiles whose partition row is not whole lines: {ragged}"
 
 
 def test_the_kernel_defaults_this_change_depends_on_are_the_ones_it_was_read_at():

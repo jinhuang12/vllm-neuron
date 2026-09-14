@@ -1095,6 +1095,7 @@ def moe_gate_up_blockwise_fp8_kernel(
     n_blocks = expert_index.shape[0]
     row_index_b = row_index.reshape((n_blocks, block, 1))
     staged_b = staged.reshape((n_blocks, block, h_extent))
+    out_b = out.reshape((n_blocks, block, fused_cols))
 
     def stage_block(at_block):
         for tile in range(tiles_per_block):
@@ -1115,9 +1116,10 @@ def moe_gate_up_blockwise_fp8_kernel(
 
     nl.fori_loop(0, n_blocks, stage_block)
 
-    for m_tile in range(positions // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
-        expert = _broadcast_row(expert_index, m_tile // tiles_per_block, TILE_SIZE)
+    def project_block(at_block):
+        # ONCE PER BLOCK, not once per tile: the expert is a property of the block, so its
+        # broadcast and the scale gather that reads it leave the tile loop entirely.
+        expert = _broadcast_row(expert_index, 0, TILE_SIZE, at_block=at_block)
         # The expert's own scale operand, one indirect gather of a tiny tensor.
         scale_sb = _gathered(
             scale_bank,
@@ -1126,116 +1128,134 @@ def moe_gate_up_blockwise_fp8_kernel(
             n_h_blocks * n_col_blocks,
             nl.float32,
         )
-        # [H=TILE_SIZE partitions, B=TILE_SIZE free] per hidden tile, in the source dtype.
-        hidden_t = []
-        for h_tile in range(n_h_blocks * GATE_UP_H_TILES_PER_BLOCK):
-            tile = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=hidden.dtype, buffer=nl.sbuf)
-            _transpose_rows(
-                tile, staged, h_extent, TILE_SIZE, TILE_SIZE, m0 * h_extent + h_tile * TILE_SIZE
-            )
-            hidden_t.append(tile)
-        for i_block in range(n_i_blocks):
-            gate_col = i_block * GATE_UP_SCALE_BLOCK
-            up_col = i_extent + i_block * GATE_UP_SCALE_BLOCK
-            gate_acc = _gate_up_sbuf()
-            up_acc = _gate_up_sbuf()
-            for h_block in range(n_h_blocks):
-                gate_psum = _gate_up_psum()
-                up_psum = _gate_up_psum()
-                for h_sub in range(GATE_UP_H_TILES_PER_BLOCK):
-                    h0 = h_block * GATE_UP_SCALE_BLOCK + h_sub * TILE_SIZE
-                    hidden_tile = hidden_t[h0 // TILE_SIZE]
-                    # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free], each
-                    # addressed at ``expert * H * n_col_blocks + (h0 + i) *
-                    # n_col_blocks + column_block`` in the bank's own row units.
-                    gate_w = _gathered(
-                        weight_bank,
-                        _bank_rows(
+        for token_tile in range(tiles_per_block):
+            t0 = token_tile * TILE_SIZE
+            # [H=TILE_SIZE partitions, B=TILE_SIZE free] per hidden tile, in the source dtype.
+            hidden_t = []
+            for h_tile in range(n_h_blocks * GATE_UP_H_TILES_PER_BLOCK):
+                tile = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=hidden.dtype, buffer=nl.sbuf)
+                _transpose_rows(
+                    tile,
+                    staged_b,
+                    h_extent,
+                    TILE_SIZE,
+                    TILE_SIZE,
+                    t0 * h_extent + h_tile * TILE_SIZE,
+                    at_block=at_block,
+                )
+                hidden_t.append(tile)
+            for i_block in range(n_i_blocks):
+                gate_col = i_block * GATE_UP_SCALE_BLOCK
+                up_col = i_extent + i_block * GATE_UP_SCALE_BLOCK
+                gate_acc = _gate_up_sbuf()
+                up_acc = _gate_up_sbuf()
+                for h_block in range(n_h_blocks):
+                    gate_psum = _gate_up_psum()
+                    up_psum = _gate_up_psum()
+                    for h_sub in range(GATE_UP_H_TILES_PER_BLOCK):
+                        h0 = h_block * GATE_UP_SCALE_BLOCK + h_sub * TILE_SIZE
+                        hidden_tile = hidden_t[h0 // TILE_SIZE]
+                        # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free], each
+                        # addressed at ``expert * H * n_col_blocks + (h0 + i) *
+                        # n_col_blocks + column_block`` in the bank's own row units.
+                        gate_w = _gathered(
+                            weight_bank,
+                            _bank_rows(
+                                TILE_SIZE,
+                                expert,
+                                ramp,
+                                h_extent * n_col_blocks,
+                                h0 * n_col_blocks + i_block,
+                                n_col_blocks,
+                            ),
                             TILE_SIZE,
-                            expert,
-                            ramp,
-                            h_extent * n_col_blocks,
-                            h0 * n_col_blocks + i_block,
-                            n_col_blocks,
-                        ),
-                        TILE_SIZE,
-                        GATE_UP_SCALE_BLOCK,
-                        nl.bfloat16,
-                    )
-                    up_w = _gathered(
-                        weight_bank,
-                        _bank_rows(
+                            GATE_UP_SCALE_BLOCK,
+                            nl.bfloat16,
+                        )
+                        up_w = _gathered(
+                            weight_bank,
+                            _bank_rows(
+                                TILE_SIZE,
+                                expert,
+                                ramp,
+                                h_extent * n_col_blocks,
+                                h0 * n_col_blocks + n_i_blocks + i_block,
+                                n_col_blocks,
+                            ),
                             TILE_SIZE,
-                            expert,
-                            ramp,
-                            h_extent * n_col_blocks,
-                            h0 * n_col_blocks + n_i_blocks + i_block,
-                            n_col_blocks,
-                        ),
-                        TILE_SIZE,
-                        GATE_UP_SCALE_BLOCK,
-                        nl.bfloat16,
-                    )
-                    # dst = stationary.T @ moving = [B, I]. The accumulate flag is
-                    # explicit rather than inferred, so first-write-overwrites is
-                    # visible here.
-                    nisa.nc_matmul(
-                        dst=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        stationary=hidden_tile,
-                        moving=gate_w,
-                        accumulate=(h_sub > 0),
-                    )
-                    nisa.nc_matmul(
-                        dst=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        stationary=hidden_tile,
-                        moving=up_w,
-                        accumulate=(h_sub > 0),
-                    )
-                # The same flattening `gate_up_flat_scale_index` returns, written
-                # as the block walk that produces it: `h_block * n_col_blocks +
-                # (gate_or_up * n_i_blocks + i_block)`.
-                gate_flat = h_block * n_col_blocks + i_block
-                up_flat = h_block * n_col_blocks + n_i_blocks + i_block
-                if h_block == 0:
-                    # The first block initialises the accumulator, so there is no
-                    # zeroing pass over SBUF.
-                    nisa.tensor_scalar(
-                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
-                    )
-                    nisa.tensor_scalar(
-                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
-                    )
-                else:
-                    nisa.scalar_tensor_tensor(
-                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
-                        op1=nl.add,
-                        operand1=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                    )
-                    nisa.scalar_tensor_tensor(
-                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
-                        op1=nl.add,
-                        operand1=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                    )
-            nl.store(
-                out[m0 : m0 + TILE_SIZE, gate_col : gate_col + GATE_UP_SCALE_BLOCK],
-                value=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-            )
-            nl.store(
-                out[m0 : m0 + TILE_SIZE, up_col : up_col + GATE_UP_SCALE_BLOCK],
-                value=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-            )
+                            GATE_UP_SCALE_BLOCK,
+                            nl.bfloat16,
+                        )
+                        # dst = stationary.T @ moving = [B, I]. The accumulate flag is
+                        # explicit rather than inferred, so first-write-overwrites is
+                        # visible here.
+                        nisa.nc_matmul(
+                            dst=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            stationary=hidden_tile,
+                            moving=gate_w,
+                            accumulate=(h_sub > 0),
+                        )
+                        nisa.nc_matmul(
+                            dst=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            stationary=hidden_tile,
+                            moving=up_w,
+                            accumulate=(h_sub > 0),
+                        )
+                    # The same flattening `gate_up_flat_scale_index` returns, written
+                    # as the block walk that produces it: `h_block * n_col_blocks +
+                    # (gate_or_up * n_i_blocks + i_block)`.
+                    gate_flat = h_block * n_col_blocks + i_block
+                    up_flat = h_block * n_col_blocks + n_i_blocks + i_block
+                    if h_block == 0:
+                        # The first block initialises the accumulator, so there is no
+                        # zeroing pass over SBUF.
+                        nisa.tensor_scalar(
+                            dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                        )
+                        nisa.tensor_scalar(
+                            dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                        )
+                    else:
+                        nisa.scalar_tensor_tensor(
+                            dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                            op1=nl.add,
+                            operand1=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        )
+                        nisa.scalar_tensor_tensor(
+                            dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                            op1=nl.add,
+                            operand1=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        )
+                _stored(
+                    out_b.ap(
+                        pattern=[[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
+                        offset=t0 * fused_cols + gate_col,
+                        **_block_offset(at_block),
+                    ),
+                    gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                )
+                _stored(
+                    out_b.ap(
+                        pattern=[[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
+                        offset=t0 * fused_cols + up_col,
+                        **_block_offset(at_block),
+                    ),
+                    up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                )
+
+    nl.fori_loop(0, n_blocks, project_block)
     return out
 
 
