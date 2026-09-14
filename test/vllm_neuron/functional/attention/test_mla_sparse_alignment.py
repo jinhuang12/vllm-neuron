@@ -443,17 +443,15 @@ _MODULE_ARITHMETIC = ("_aligned", "DMA_TRANSPOSE_ALIGN", "STAGE_ALIGN", "DGE_TRA
 #: and widens anything else to float32.
 _WIDTHS = (2, 4)
 
-
-def _step() -> int:
-    """The module's own rows-per-DMA bound, or 16 where the module has none yet."""
-    return int(getattr(mod, "DGE_TRANSPOSE_ROWS", 16))
+#: The source rows per DMA the device generates its own descriptors for, RETYPED: the
+#: criterion the module's rows are graded against, never read off the module, so a module
+#: that stepped 32 rows is read as stepping 32 and reddens the census.
+_DGE_ROWS = 16
 
 
 def _arithmetic() -> dict:
-    """The module's own arithmetic, by name; the step is present even where the module has none."""
-    found = {name: getattr(mod, name) for name in _MODULE_ARITHMETIC if hasattr(mod, name)}
-    found.setdefault("DGE_TRANSPOSE_ROWS", _step())
-    return found
+    """The module's own arithmetic, by name; a module without a name leaves it out."""
+    return {name: getattr(mod, name) for name in _MODULE_ARITHMETIC if hasattr(mod, name)}
 
 
 def _module_source() -> str:
@@ -491,12 +489,12 @@ def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
     float32_only: tuple[int, ...] = ()
     for name, at in _GEOMETRIES_READ:
         sites = _sites(source, at)
-        shaped = [s for s in sites if s.host_shaped(_step())]
+        shaped = [s for s in sites if s.host_shaped(_DGE_ROWS)]
         found[name] = dict(sorted(Counter(s.source for s in shaped).items()))
         if name == "prefill":
             float32_only = tuple(s.line for s in sites if set(s.offsets) == {4})
         _emit("HOST_SHAPED_SITES", geometry=name, count=len(shaped),
-              lines=tuple(s.line for s in shaped), step=_step(), by_source=found[name],
+              lines=tuple(s.line for s in shaped), step=_DGE_ROWS, by_source=found[name],
               transposes=len(sites),
               readings=[(s.line, s.source, s.rows, s.width, s.via) for s in sites])
         assert sites, f"the census read no transpose site at {name}"
@@ -526,11 +524,12 @@ def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
         assert narrow == (), f"tile rows that are not whole 32-byte lines: {narrow}"
 
 
-#: The staged form the controls below call, so a control reads a caller and not the helper.
+#: The staged form the controls below call, stepping the device's 16 rows as a literal so a
+#: control reads the same in a tree whose module has no step constant.
 _HELPER = """
 def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
-    for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
-        n = min(DGE_TRANSPOSE_ROWS, rows - r0)
+    for r0 in range(0, rows, 16):
+        n = min(16, rows - r0)
         nisa.dma_transpose(dst=dst[:, r0:r0 + n],
                            src=src_hbm.ap(pattern=[[row_stride, n], [1, width]], offset=offset))
 """
@@ -552,6 +551,21 @@ def body(c_kv_hbm, s_kv):
     _transpose_rows(c_stage, c_kv_hbm, latent, 3, LATENT_TILE, 0)
 """
 
+#: A caller of a helper that steps 32 rows per DMA, twice the device's shape, the module's own
+#: constant notwithstanding: the reader must grade rows against the retyped criterion, not the
+#: module's.
+_PLANTED_WIDE_STEP = """
+def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
+    for r0 in range(0, rows, 32):
+        n = min(32, rows - r0)
+        nisa.dma_transpose(dst=dst[:, r0:r0 + n],
+                           src=src_hbm.ap(pattern=[[row_stride, n], [1, width]], offset=offset))
+
+def body(c_kv_hbm, s_kv):
+    c_stage = _stage(c_kv_hbm, LATENT_TILE, s_kv)
+    _transpose_rows(c_stage, c_kv_hbm, latent, LATENT_TILE, LATENT_TILE, 0)
+"""
+
 #: A caller whose destination the body never declared, which no arithmetic can place.
 _PLANTED_UNREADABLE = _HELPER + """
 def body(c_kv_hbm, s_kv):
@@ -571,7 +585,7 @@ def test_control_the_reader_finds_a_planted_off_line_caller():
 def test_control_the_reader_finds_a_planted_three_row_caller():
     """The same reader names the one caller that moves three rows per DMA."""
     sites = _sites(_PLANTED_THREE_ROWS, _PREFILL)
-    shaped = tuple(s.line for s in sites if s.host_shaped(_step()))
+    shaped = tuple(s.line for s in sites if s.host_shaped(_DGE_ROWS))
     _emit("CONTROL_STEP_READER_FIRES", count=len(shaped), lines=shaped,
           rows=[s.rows for s in sites])
     assert len(sites) == 1 and len(shaped) == 1
@@ -609,6 +623,15 @@ def test_control_an_unsized_tile_is_never_a_pass():
     rows = _tile_rows(_PLANTED_UNSIZED, _PREFILL)
     _emit("CONTROL_UNSIZED_TILE_FIRES", count=len(rows), rows=rows)
     assert rows == [(3, "scratch", None)]
+
+
+def test_control_the_reader_finds_a_planted_caller_of_a_wide_stepping_helper():
+    """The same reader names the one caller whose helper moves 32 rows per DMA."""
+    sites = _sites(_PLANTED_WIDE_STEP, _PREFILL)
+    shaped = tuple(s.line for s in sites if s.host_shaped(_DGE_ROWS))
+    _emit("CONTROL_WIDE_STEP_READER_FIRES", count=len(shaped), lines=shaped,
+          rows=[s.rows for s in sites])
+    assert len(sites) == 1 and len(shaped) == 1 and sites[0].rows == (32,)
 
 
 def test_control_an_unreadable_destination_is_never_a_pass():
