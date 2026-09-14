@@ -221,9 +221,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_ENCODER_WARMUP")) or False
     ),
     # Ranks that load their compiled graph at the same time.
-    # A value at or above the world size loads every rank at once.
+    # A value at or above the world size loads every rank at once, and zero turns the
+    # staging off, so the default applies only when the variable is unset.
     "VLLM_NEURON_NEFF_LOAD_WAVE_SIZE": lambda: (
-        maybe_convert_int(os.getenv("VLLM_NEURON_NEFF_LOAD_WAVE_SIZE")) or 8
+        8
+        if os.getenv("VLLM_NEURON_NEFF_LOAD_WAVE_SIZE") is None
+        else maybe_convert_int(os.getenv("VLLM_NEURON_NEFF_LOAD_WAVE_SIZE"))
     ),
     # Directory the ranks signal each other through while they load in waves.
     # Empty means no staging: every rank loads as soon as it reaches the loader.
@@ -231,10 +234,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR", ""
     ),
     # Seconds a wave waits for the wave before it, defaulting to the barrier timeout.
+    # Zero waits for nothing, so the fall-through applies only when the variable is unset.
     "VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT"))
-        or maybe_convert_int(os.getenv("VLLM_NEURON_BARRIER_TIMEOUT"))
-        or 3600
+        if os.getenv("VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT") is not None
+        else (maybe_convert_int(os.getenv("VLLM_NEURON_BARRIER_TIMEOUT")) or 3600)
     ),
     # Skip decode warmup/compilation without requiring kv-transfer-config.
     # Useful for prefill-only profiling workflows.
