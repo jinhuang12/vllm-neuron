@@ -19,7 +19,7 @@ The real compiler returns the traced forward unchanged in CPU mode, so it never 
 here. A fake compiler stands in for it, and the stage brackets that fake exactly as the plugin
 brackets the real one at registration.
 
-Seven items, ONE test each, no ``parametrize``:
+Twelve items, ONE test each, no ``parametrize``:
 
 * T01 -- the compilations run in waves of the declared width, in wave order.
 * T02 -- a rank that never returns from the call after it does not stall the waves behind it.
@@ -28,9 +28,14 @@ Seven items, ONE test each, no ``parametrize``:
 * T05 -- the stage calls the compiler once per call and returns its object.
 * T06 -- a wave that never signals costs the wave behind one bounded wait, not the run.
 * T07 -- the gate is off, with its reason, when the context is incomplete.
+* T08 -- a second load in one named window waves as well, on flags of its own.
+* T09 -- flags an earlier attempt left behind do not satisfy this run's wait.
+* T10 -- the backend name torch.compile resolves carries the stage, around the vendor's compiler.
+* T11 -- the control: wave size zero stages nothing and says so.
+* T12 -- a wait timeout of zero costs one row per waiting rank and no waiting.
 
-T01 and T04 print the largest number of ranks inside the compiler at once, so the transcript
-carries that number and not only a verdict. Run pytest with ``-s``.
+T01, T04, T08 and T11 print the largest number of ranks inside the compiler at once, so the
+transcript carries that number and not only a verdict. Run pytest with ``-s``.
 """
 
 import math
@@ -46,6 +51,8 @@ CALL_TOGETHER_TIMEOUT = 5.0
 WAIT_TIMEOUT = 5
 SHORT_WAIT_TIMEOUT = 1
 JOIN_TIMEOUT = 30.0
+RUN = "run_under_test"
+STALE_RUN = "run_that_already_ended"
 
 
 class _Rows:
@@ -154,7 +161,10 @@ def _install(monkeypatch, tmp_path, wave_size, group, compiler, rows=None,
     monkeypatch.setenv("VLLM_NEURON_NEFF_LOAD_WAVE_SIZE", str(wave_size))
     monkeypatch.setenv("VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR", str(tmp_path) if signal_dir else "")
     monkeypatch.setenv("VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT", str(timeout))
+    monkeypatch.setenv(staged_neff_load.RUN_TOKEN_ENV, RUN)
     monkeypatch.setattr(staged_neff_load, "dist", group)
+    monkeypatch.setattr(staged_neff_load, "_LOAD_ORDINAL", {})
+    monkeypatch.setattr(staged_neff_load, "_ROOTS_LOGGED", set())
     if rows is not None:
         monkeypatch.setattr(staged_neff_load, "logger", rows)
     staged_neff_load.forget_this_load()
@@ -163,11 +173,17 @@ def _install(monkeypatch, tmp_path, wave_size, group, compiler, rows=None,
     return staged_neff_load.staged_compiler(compiler)
 
 
-def _run(staged, group, world_size, park_after=None, still_inside=()):
+def _flags(tmp_path, run=RUN, load="load_*", rank="rank_*"):
+    """Return the flag files one run left behind, newest layout: run/phase/bucket/load/rank."""
+    return sorted(str(path) for path in tmp_path.glob(f"{run}/*/*/{load}/{rank}.done"))
+
+
+def _run(staged, group, world_size, park_after=None, still_inside=(), loads=1):
     """Call the staged compiler once per rank on its own thread; return threads and results.
 
     A rank named in ``still_inside`` is not waited for: it is parked inside the compiler, and the
-    reading it exists for is what the ranks behind it did while it was there.
+    reading it exists for is what the ranks behind it did while it was there. ``loads`` calls the
+    staged compiler that many times per rank, as one warmup window does for the graphs it builds.
     """
     results: dict[int, object] = {}
     errors: dict[int, BaseException] = {}
@@ -175,7 +191,8 @@ def _run(staged, group, world_size, park_after=None, still_inside=()):
     def body(rank):
         group.take_rank(rank)
         try:
-            results[rank] = staged(object(), [], options=None)
+            for _ in range(loads):
+                results[rank] = staged(object(), [], options=None)
         except BaseException as exc:  # every rank's own end is part of the reading
             errors[rank] = exc
         if park_after is not None and rank == park_after[0]:
@@ -247,7 +264,7 @@ def test_every_rank_writes_a_row_on_each_side_of_its_own_call(monkeypatch, tmp_p
         if rank and row.startswith(("neff_load_entered|", "neff_load_left|")):
             by_rank.setdefault(int(rank.group(1)), []).append(row)
     written = [row for rank_rows in by_rank.values() for row in rank_rows]
-    flags = sorted(path.name for path in tmp_path.glob("prefill/*/rank_*.done"))
+    flags = sorted(path.rsplit("/", 1)[1] for path in _flags(tmp_path))
     print(f"neff_load_rows|ranks={len(by_rank)}|rows={len(written)}|flags={len(flags)}")
     print(f"neff_load_sample|{by_rank[0][0]}")
     print(f"neff_load_left_sample|{by_rank[0][1]}")
@@ -290,7 +307,7 @@ def test_the_control_with_the_wave_size_at_the_world_size_stages_nothing(
     assert not _waves_in_order(compiler.events, WORLD, WAVE)
     assert staged_rows == []
     assert len(gate_off) == WORLD
-    assert list(tmp_path.glob("prefill/*/rank_*.done")) == []
+    assert _flags(tmp_path) == []
 
 
 def test_the_stage_calls_the_compiler_once_and_returns_its_object(monkeypatch, tmp_path):
@@ -329,7 +346,7 @@ def test_a_wave_that_never_signals_costs_the_next_wave_one_bounded_wait(monkeypa
     assert len(timeouts) == SMALL_WORLD - WAVE
     assert all("|missing=1" in row for row in timeouts)
     assert threads[1].is_alive()  # still inside the compiler, so its flag was never written
-    assert list(tmp_path.glob("prefill/*/rank_1.done")) == []
+    assert _flags(tmp_path, rank="rank_1") == []
     never_returns.set()
     threads[1].join(timeout=JOIN_TIMEOUT)
 
@@ -356,4 +373,141 @@ def test_the_gate_is_off_with_its_reason_when_the_context_is_incomplete(monkeypa
     assert staged_rows == []
     assert unnamed.calls == WAVE
     assert alone.calls == WAVE
-    assert list(tmp_path.glob("*/*/rank_*.done")) == []
+    assert _flags(tmp_path) == []
+def test_a_second_load_in_the_same_window_waves_as_well(monkeypatch, tmp_path):
+    rows = _Rows()
+    group = _FakeDist(WORLD)
+    compiler = _FakeCompile(group, width=WAVE)
+    staged = _install(monkeypatch, tmp_path, WAVE, group, compiler, rows)
+    threads, results, errors = _run(staged, group, WORLD, loads=2)
+    first = _flags(tmp_path, load="load_0")
+    second = _flags(tmp_path, load="load_1")
+    roots = [row for row in rows.rows if row.startswith("neff_load_root|")]
+    loads = sorted({row.split("|load=")[1] for row in rows.rows if "|load=" in row})
+    print(
+        f"neff_load_two_loads|calls={compiler.calls}|peak_inside={compiler.peak_inside}"
+        f"|first_load_flags={len(first)}|second_load_flags={len(second)}"
+        f"|loads_in_rows={','.join(loads)}|root_rows={len(roots)}"
+    )
+    assert errors == {}
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert compiler.timed_out == 0
+    assert compiler.calls == WORLD * 2
+    assert compiler.peak_inside == WAVE
+    assert _waves_in_order(compiler.events[: 2 * WORLD], WORLD, WAVE)
+    assert _waves_in_order(compiler.events[2 * WORLD :], WORLD, WAVE)
+    assert len(first) == WORLD
+    assert len(second) == WORLD
+    assert loads == ["0", "1"]
+    assert len(roots) == 1
+
+
+def test_flags_from_an_earlier_attempt_do_not_satisfy_this_runs_wait(monkeypatch, tmp_path):
+    rows = _Rows()
+    group = _FakeDist(WORLD)
+    compiler = _FakeCompile(group, width=WAVE)
+    staged = _install(monkeypatch, tmp_path, WAVE, group, compiler, rows)
+    ended = tmp_path / STALE_RUN / "prefill" / "2048_kv2048" / "load_0"
+    ended.mkdir(parents=True)
+    for rank in range(WORLD):
+        (ended / f"rank_{rank}.done").write_text("an attempt that already ended\n")
+    monkeypatch.delenv(staged_neff_load.RUN_TOKEN_ENV)
+    token = staged_neff_load.pin_this_run()
+    named_again = staged_neff_load.pin_this_run()
+    threads, results, errors = _run(staged, group, WORLD)
+    mine = _flags(tmp_path, run=token)
+    left_behind = sorted(path.name for path in ended.glob("rank_*.done"))
+    timeouts = [row for row in rows.rows if row.startswith("neff_load_wait_timeout|")]
+    print(
+        f"neff_load_stale_flags|flags_left_behind={len(left_behind)}"
+        f"|peak_inside={compiler.peak_inside}|my_flags={len(mine)}"
+        f"|my_run_is_its_own={token != STALE_RUN}|named_once={named_again == token}"
+        f"|timeout_rows={len(timeouts)}"
+    )
+    assert errors == {}
+    assert token.startswith("run_")
+    assert named_again == token
+    assert compiler.peak_inside == WAVE
+    assert compiler.timed_out == 0
+    assert len(mine) == WORLD
+    assert timeouts == []
+    assert left_behind == sorted(f"rank_{rank}.done" for rank in range(WORLD))
+
+
+def test_the_backend_name_torch_compile_resolves_carries_the_stage(monkeypatch):
+    import torch._dynamo.backends.registry as registry
+
+    import vllm_neuron  # noqa: F401  importing the plugin is what installs the bracket
+
+    entry = registry.lookup_backend("neuron_libtorch")
+    wrapped = getattr(entry, "__wrapped__", None)
+    rows = _Rows()
+    monkeypatch.setattr(staged_neff_load, "logger", rows)
+    monkeypatch.setattr(staged_neff_load, "dist", _FakeDist(WORLD, initialized=False))
+    try:
+        entry(object(), [], options=None)
+    except BaseException:  # the vendor's compiler refuses a bare object; the row is the reading
+        pass
+    gate = [row for row in rows.rows if row == "neff_load_gate|off|reason=no_process_group"]
+    print(
+        f"neff_load_registry|name={getattr(entry, '__name__', 'none')}"
+        f"|staged={getattr(entry, 'staged_neff_load', False)}"
+        f"|wraps={getattr(wrapped, '__module__', 'none')}.{getattr(wrapped, '__name__', 'none')}"
+        f"|wrapped_is_a_stage={getattr(wrapped, 'staged_neff_load', False)}"
+        f"|reached_the_stage={len(gate)}"
+    )
+    assert getattr(entry, "staged_neff_load", False)
+    assert not getattr(wrapped, "staged_neff_load", False)
+    assert getattr(wrapped, "__module__", "").startswith("libtorch_neuronx_lite")
+    assert len(gate) == 1
+
+
+def test_the_control_with_the_wave_size_at_zero_stages_nothing(monkeypatch, tmp_path):
+    rows = _Rows()
+    group = _FakeDist(WORLD)
+    compiler = _FakeCompile(group, width=WORLD)
+    staged = _install(monkeypatch, tmp_path, 0, group, compiler, rows)
+    threads, results, errors = _run(staged, group, WORLD)
+    gate_off = [row for row in rows.rows if row == "neff_load_gate|off|reason=wave_size_zero"]
+    staged_rows = [
+        row for row in rows.rows if row.startswith(("neff_load_entered|", "neff_load_left|"))
+    ]
+    print(
+        f"neff_load_off_switch|wave_size=0"
+        f"|knob={staged_neff_load.envs.VLLM_NEURON_NEFF_LOAD_WAVE_SIZE}"
+        f"|peak_inside={compiler.peak_inside}|gate_off_rows={len(gate_off)}"
+        f"|staged_rows={len(staged_rows)}"
+    )
+    assert errors == {}
+    assert staged_neff_load.envs.VLLM_NEURON_NEFF_LOAD_WAVE_SIZE == 0
+    assert compiler.timed_out == 0
+    assert compiler.peak_inside == WORLD
+    assert len(gate_off) == WORLD
+    assert staged_rows == []
+    assert _flags(tmp_path) == []
+
+
+def test_a_wait_timeout_of_zero_costs_one_row_and_no_waiting(monkeypatch, tmp_path):
+    rows = _Rows()
+    group = _FakeDist(SMALL_WORLD)
+    never_returns = threading.Event()
+    compiler = _FakeCompile(group, park={1: never_returns})
+    staged = _install(monkeypatch, tmp_path, WAVE, group, compiler, rows, timeout=0)
+    threads, results, errors = _run(staged, group, SMALL_WORLD, still_inside=(1,))
+    timeouts = [row for row in rows.rows if row.startswith("neff_load_wait_timeout|")]
+    waits = [float(row.split("|waited_s=")[1].split("|")[0]) for row in timeouts]
+    behind = [rank for rank in range(WAVE, SMALL_WORLD) if rank in results]
+    print(
+        f"neff_load_timeout_zero"
+        f"|knob={staged_neff_load.envs.VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT}"
+        f"|timeout_rows={len(timeouts)}|longest_wait_s={max(waits) if waits else 'none'}"
+        f"|finished={len(behind)}"
+    )
+    assert errors == {}
+    assert staged_neff_load.envs.VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT == 0
+    assert len(timeouts) == SMALL_WORLD - WAVE
+    assert max(waits) < 1.0
+    assert behind == list(range(WAVE, SMALL_WORLD))
+    assert threads[1].is_alive()
+    never_returns.set()
+    threads[1].join(timeout=JOIN_TIMEOUT)
