@@ -4,12 +4,14 @@
 The kernel transposes its operands in the dtype the seam hands it -- the model's
 2-byte floats as stored -- sixteen source rows per DMA into a staging tile, then widens
 to float32 once per tile. A destination slice therefore starts every 16 columns, 32
-bytes apart for a 2-byte source and 64 for float32. Three things are read here: that no
+bytes apart for a 2-byte source and 64 for float32. Four things are read here: that no
 destination in the module can start off 32 bytes at either operand width, from the
 module's own offset arithmetic; that every transpose lands in the source dtype and moves
-at most 16 source rows; and that the values did not move, against a frozen copy of the
-kernel as it stood before, exactly rather than within a tolerance -- with float32
-operands through the entry point, and with bfloat16 operands through the seam.
+at most 16 source rows; that every SBUF tile the module declares has a per-partition row
+of whole 32-byte lines, so the allocator packing tiles back to back leaves every tile
+base on a line; and that the values did not move, against a frozen copy of the kernel as
+it stood before, exactly rather than within a tolerance -- with float32 operands through
+the entry point, and with bfloat16 operands through the seam.
 
 Run under ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1
 NEURON_PLATFORM_TARGET_OVERRIDE=trn2``; nothing here reads or sets an environment
@@ -29,7 +31,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention import mla_sparse as mod
-from test.vllm_neuron.functional.dma_transpose_census import census, narrow_tiles
+from test.vllm_neuron.functional.dma_transpose_census import LINE, census, narrow_tiles, tile_rows
 
 #: The constants the frozen copy below reads, RETYPED on purpose: a frozen reference
 #: that imported them would follow the live module if they ever moved.
@@ -434,7 +436,7 @@ _DECLARED_HOST_EXPANDED = {
 #: The names the module supplies to its OWN size and loop expressions. They are read off
 #: the module and never retyped, so an expression is evaluated with the arithmetic the
 #: kernel will trace and not with a copy of it. Absent names are left out.
-_MODULE_ARITHMETIC = ("_aligned", "DMA_TRANSPOSE_ALIGN", "DGE_TRANSPOSE_ROWS",
+_MODULE_ARITHMETIC = ("_aligned", "DMA_TRANSPOSE_ALIGN", "STAGE_ALIGN", "DGE_TRANSPOSE_ROWS",
                       "_queries_per_block", "_score_tiles", "_latent_tiles", "_output_tiles")
 
 #: The element widths a staged destination can have: the seam hands 2-byte floats through
@@ -461,6 +463,11 @@ def _module_source() -> str:
 def _sites(source: str, at: dict) -> list:
     """Every transpose site of ``source`` at geometry ``at``, read with the module's arithmetic."""
     return census(source, at, _arithmetic(), _WIDTHS)
+
+
+def _tile_rows(source: str, at: dict) -> list:
+    """Every SBUF tile ``source`` declares at ``at``, as ``(line, name, bytes per partition)``."""
+    return tile_rows(source, at, _arithmetic(), _WIDTHS)
 
 
 def test_no_transpose_destination_starts_off_a_32_byte_boundary():
@@ -497,6 +504,26 @@ def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
     assert float32_only == (), f"destinations only float32 can land in: {float32_only}"
     assert found == _DECLARED_HOST_EXPANDED, \
         f"host-shaped sites by source {found} are not the declared {_DECLARED_HOST_EXPANDED}"
+
+
+def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
+    """At each geometry every declared SBUF tile is sized and its row is whole 32-byte lines.
+
+    The allocator packs tiles back to back per partition, so one tile whose row is not a whole
+    number of lines moves every later tile's base off the line; this reads the tiles the
+    transposes above land beside, through the helpers that make them and per caller.
+    """
+    source = _module_source()
+    for name, at in _GEOMETRIES_READ:
+        rows = _tile_rows(source, at)
+        unreadable = tuple(sorted({(line, tile) for line, tile, size in rows if size is None}))
+        narrow = tuple((line, tile, size) for line, tile, size in rows
+                       if size is not None and size % LINE)
+        _emit("NARROW_TILES", geometry=name, count=len(narrow), lines=tuple(r[0] for r in narrow),
+              unreadable=unreadable, tiles=len(rows), widths=_WIDTHS)
+        assert rows, f"the census read no SBUF tile at {name}"
+        assert unreadable == (), f"tile rows the arithmetic cannot size: {unreadable}"
+        assert narrow == (), f"tile rows that are not whole 32-byte lines: {narrow}"
 
 
 #: The staged form the controls below call, so a control reads a caller and not the helper.
@@ -548,6 +575,40 @@ def test_control_the_reader_finds_a_planted_three_row_caller():
     _emit("CONTROL_STEP_READER_FIRES", count=len(shaped), lines=shaped,
           rows=[s.rows for s in sites])
     assert len(sites) == 1 and len(shaped) == 1
+
+
+#: Three tiles: a 4-byte row, an 8-byte row made through a helper, and one whole line.
+_PLANTED_NARROW = """
+def _pair(parts):
+    return _sbuf(parts, 2)
+
+def body(q_lift_hbm, heads):
+    row_sum = _sbuf(heads, 1)
+    both = _pair(heads)
+    line = _sbuf(heads, 8)
+"""
+
+#: One tile sized by a name the arithmetic never has.
+_PLANTED_UNSIZED = """
+def body(q_lift_hbm, heads):
+    scratch = _sbuf(heads, somewhere)
+"""
+
+
+def test_control_the_tile_census_finds_a_planted_narrow_row():
+    """The same reader names the 4-byte tile and the 8-byte one made through a helper, not the line."""
+    rows = _tile_rows(_PLANTED_NARROW, _PREFILL)
+    narrow = tuple((line, tile, size) for line, tile, size in rows
+                   if size is not None and size % LINE)
+    _emit("CONTROL_TILE_READER_FIRES", count=len(narrow), rows=narrow, tiles=len(rows))
+    assert len(rows) == 3 and narrow == ((6, "row_sum", 4), (7, "both", 8))
+
+
+def test_control_an_unsized_tile_is_never_a_pass():
+    """A tile the arithmetic cannot size reads ``None``, which the census refuses."""
+    rows = _tile_rows(_PLANTED_UNSIZED, _PREFILL)
+    _emit("CONTROL_UNSIZED_TILE_FIRES", count=len(rows), rows=rows)
+    assert rows == [(3, "scratch", None)]
 
 
 def test_control_an_unreadable_destination_is_never_a_pass():

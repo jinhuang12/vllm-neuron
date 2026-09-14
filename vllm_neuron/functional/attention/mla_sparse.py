@@ -118,6 +118,8 @@ HEAD_MAX = 128
 #: read one query at a time: their width is kept at a whole 32 bytes. Eight float32
 #: elements are 32 bytes.
 DMA_TRANSPOSE_ALIGN = 8
+#: Elements per staged row block: 16 rows of a 2-byte or a 4-byte dtype are whole 32-byte lines.
+STAGE_ALIGN = 16
 
 #: Source rows per DMA transpose. The hardware descriptor generator takes a transpose
 #: whose source is 16 rows of a 2-byte dtype, at most 128 wide, so every transpose
@@ -221,15 +223,20 @@ def _sbuf(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.float32, buffer=nl.sbuf)
 
 
-def _aligned(width: int) -> int:
-    """``width`` rounded up to a whole :data:`DMA_TRANSPOSE_ALIGN` block."""
-    blocks = (width + DMA_TRANSPOSE_ALIGN - 1) // DMA_TRANSPOSE_ALIGN
-    return blocks * DMA_TRANSPOSE_ALIGN
+def _aligned(width: int, block: int = DMA_TRANSPOSE_ALIGN) -> int:
+    """``width`` rounded up to a whole ``block``: :data:`DMA_TRANSPOSE_ALIGN` elements by default."""
+    blocks = (width + block - 1) // block
+    return blocks * block
 
 
 def _stage(hbm, parts: int, width: int):
-    """A ``[parts, width]`` SBUF tile in ``hbm``'s own dtype: where a transpose lands."""
-    return nl.ndarray((parts, width), dtype=hbm.dtype, buffer=nl.sbuf)
+    """A ``[parts, width]`` view of an SBUF tile in ``hbm``'s own dtype, its row padded to whole 32-byte lines."""
+    return nl.ndarray((parts, _aligned(width, STAGE_ALIGN)), dtype=hbm.dtype, buffer=nl.sbuf)[:, 0:width]
+
+
+def _scalar(parts: int):
+    """A ``[parts, 1]`` float32 view of a tile whose row is one whole 32-byte line."""
+    return _sbuf(parts, DMA_TRANSPOSE_ALIGN)[:, 0:1]
 
 
 def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
@@ -381,12 +388,12 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(block))
     c_g = _sbuf(LATENT_TILE, n_latent, topk)
     c_g_t = _sbuf(KEY_CHUNK, n_chunks, latent)
-    p_t = _sbuf(KEY_CHUNK, n_chunks, heads)
+    p_t = _sbuf(KEY_CHUNK, n_chunks, _aligned(heads))
     p = _sbuf(heads, topk)
-    neg_row_max = _sbuf(heads, 1)
-    exp_bias = _sbuf(heads, 1)
-    row_sum = _sbuf(heads, 1)
-    recip = _sbuf(heads, 1)
+    neg_row_max = _scalar(heads)
+    exp_bias = _scalar(heads)
+    row_sum = _scalar(heads)
+    recip = _scalar(heads)
     out_sb = _sbuf(heads, latent)
     q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
@@ -498,11 +505,11 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                 ks = ck * KEY_CHUNK
                 p_t_ps = _psum(KEY_CHUNK, heads)
                 nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
-                nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
+                nisa.tensor_copy(dst=p_t[:, ck, 0:heads], src=p_t_ps)
 
             pv_ps = _psum(heads, latent)
             for ck in range(n_chunks):
-                nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
+                nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
                                moving=c_g_t[:, ck, :], accumulate=(ck > 0))
 
             # The softmax denominator is applied HERE rather than to `p`, so it costs one
@@ -725,12 +732,12 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     for li in range(len(lat_tiles)):
         c_g.append(_sbuf(lat_tiles[li][1], topk))
     c_g_t = _sbuf(KEY_CHUNK, n_chunks, latent)
-    p_t = _sbuf(KEY_CHUNK, n_chunks, heads)
+    p_t = _sbuf(KEY_CHUNK, n_chunks, _aligned(heads))
     p = _sbuf(heads, topk)
-    neg_row_max = _sbuf(heads, 1)
-    exp_bias = _sbuf(heads, 1)
-    row_sum = _sbuf(heads, 1)
-    recip = _sbuf(heads, 1)
+    neg_row_max = _scalar(heads)
+    exp_bias = _scalar(heads)
+    row_sum = _scalar(heads)
+    recip = _scalar(heads)
     out_sb = _sbuf(heads, latent)
     q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
@@ -828,7 +835,7 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
                 ks = ck * KEY_CHUNK
                 p_t_ps = _psum(KEY_CHUNK, heads)
                 nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
-                nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
+                nisa.tensor_copy(dst=p_t[:, ck, 0:heads], src=p_t_ps)
 
             # THE SECOND TILING, and the one `-040`'s bound was really about: the latent
             # is MM2's moving free axis, so the output is produced 512 columns at a time
@@ -842,7 +849,7 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
                 extent = otile[1]
                 pv_ps = _psum(heads, extent)
                 for ck in range(n_chunks):
-                    nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
+                    nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
                                    moving=c_g_t[:, ck, offset:offset + extent],
                                    accumulate=(ck > 0))
                 nisa.tensor_scalar(dst=out_sb[:, offset:offset + extent], data=pv_ps,
@@ -1064,12 +1071,12 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(block))
     c_g = _sbuf(LATENT_TILE, n_latent, tile_max)
     c_g_t = _sbuf(KEY_CHUNK, chunk_max, latent)
-    p_t = _sbuf(KEY_CHUNK, chunk_max, heads)
+    p_t = _sbuf(KEY_CHUNK, chunk_max, _aligned(heads))
     p = _sbuf(heads, tile_max)
-    neg_row_max = _sbuf(heads, 1)
-    exp_bias = _sbuf(heads, 1)
-    tile_sum = _sbuf(heads, 1)
-    recip = _sbuf(heads, 1)
+    neg_row_max = _scalar(heads)
+    exp_bias = _scalar(heads)
+    tile_sum = _scalar(heads)
+    recip = _scalar(heads)
     out_sb = _sbuf(heads, latent)
     q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
@@ -1080,20 +1087,20 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # merging two maxima needs `maximum` and this image's landed kernels use
     # `tensor_tensor(op=nl.maximum)`. `-040`'s chain produces the NEGATED max, so this
     # block negates it once per tile with a scalar multiply.
-    run_pos = _sbuf(heads, 1)
-    run_sum = _sbuf(heads, 1)
+    run_pos = _scalar(heads)
+    run_sum = _scalar(heads)
     acc = _sbuf(heads, latent)
     # Merge scratch. FRESH DESTINATIONS, never a write back onto an operand -- the idiom
     # the landed `kda/decode_state.py` records as the reviewed one for this file family.
-    tile_pos = _sbuf(heads, 1)
-    new_pos = _sbuf(heads, 1)
-    d_acc = _sbuf(heads, 1)
-    d_tile = _sbuf(heads, 1)
-    c_acc = _sbuf(heads, 1)
-    c_tile = _sbuf(heads, 1)
-    sum_kept = _sbuf(heads, 1)
-    sum_added = _sbuf(heads, 1)
-    sum_new = _sbuf(heads, 1)
+    tile_pos = _scalar(heads)
+    new_pos = _scalar(heads)
+    d_acc = _scalar(heads)
+    d_tile = _scalar(heads)
+    c_acc = _scalar(heads)
+    c_tile = _scalar(heads)
+    sum_kept = _scalar(heads)
+    sum_added = _scalar(heads)
+    sum_new = _scalar(heads)
     acc_kept = _sbuf(heads, latent)
     pv_added = _sbuf(heads, latent)
     acc_new = _sbuf(heads, latent)
@@ -1206,10 +1213,10 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                     cs = ck * KEY_CHUNK
                     p_t_ps = _psum(KEY_CHUNK, heads)
                     nisa.nc_transpose(dst=p_t_ps, data=p_m[:, cs:cs + KEY_CHUNK])
-                    nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
+                    nisa.tensor_copy(dst=p_t[:, ck, 0:heads], src=p_t_ps)
                 pv_ps = _psum(heads, latent)
                 for ck in range(n_chunks):
-                    nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
+                    nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
                                    moving=c_g_t[:, ck, :], accumulate=(ck > 0))
 
                 # ---- THE MERGE ------------------------------------------------------

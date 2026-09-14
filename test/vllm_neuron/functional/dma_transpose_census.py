@@ -12,6 +12,7 @@ evaluated at the geometry the caller names; a value that arithmetic cannot produ
 from __future__ import annotations
 
 import ast
+import copy
 import itertools
 from dataclasses import dataclass
 
@@ -151,53 +152,113 @@ def _itemsizes(dtype: ast.expr | None, source_itemsizes: tuple[int, ...]) -> tup
     return (size,) if size else None
 
 
-def _tile_of(call: ast.expr, names: dict, source_itemsizes: tuple[int, ...]):
-    """``(slices, width, itemsizes)`` for a tile-making call, or ``None`` when it is not one."""
-    if isinstance(call, ast.IfExp):
-        call = call.body
-    if not isinstance(call, ast.Call):
+#: Element widths per SBUF tile maker of the kernels read here.
+_MAKERS = {"_sbuf": (4,), "_sbuf_u32": (4,), "_sbuf_i32": (4,)}
+
+
+def _helpers(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    """The module's functions by name: a tile made through one is read through its body."""
+    return {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+
+class _Inline(ast.NodeTransformer):
+    """Put a caller's argument expressions in place of a helper's parameter names."""
+
+    def __init__(self, binding: dict[str, ast.expr]):
+        self.binding = binding
+
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        return copy.deepcopy(self.binding.get(node.id, node))
+
+
+def _returned(fn: ast.FunctionDef, call: ast.Call) -> ast.expr | None:
+    """What a single-return helper returns for ``call``, with the call's arguments in place."""
+    returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None]
+    params = [a.arg for a in fn.args.args]
+    if len(returns) != 1 or len(call.args) > len(params):
         return None
-    maker = getattr(call.func, "id", "") or getattr(call.func, "attr", "")
-    if maker == "_sbuf" and len(call.args) in (2, 3):
-        width = _eval(call.args[-1], names)
-        slices = _eval(call.args[1], names) if len(call.args) == 3 else 1
-        sizes: tuple[int, ...] | None = (4,)
-    elif maker in ("_sbuf_u32", "_sbuf_i32") and len(call.args) == 2:
-        width, slices, sizes = _eval(call.args[1], names), 1, (4,)
-    elif maker == "_stage" and len(call.args) == 3:
-        width, slices, sizes = _eval(call.args[2], names), 1, source_itemsizes
-    elif maker == "ndarray":
-        shape = call.args[0] if call.args else None
+    binding: dict[str, ast.expr] = dict(zip(params, call.args))
+    binding.update({kw.arg: kw.value for kw in call.keywords if kw.arg})
+    return _Inline(binding).visit(copy.deepcopy(returns[0].value))
+
+
+def _from_base(sub: ast.Subscript) -> bool:
+    """Whether a subscript's every slice starts at its tile's own base."""
+    parts = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
+    return all(isinstance(p, ast.Slice) and (p.lower is None or _eval(p.lower, {}) == 0) for p in parts)
+
+
+def _shape(expr: ast.expr, helpers: dict, depth: int = 0):
+    """``(slice-count node or None, width node, element widths or dtype node)`` of an SBUF tile expression.
+
+    ``None`` when the expression makes no SBUF tile. A base-anchored view of a tile is the
+    tile; a helper that returns one is read through its body with the caller's arguments in
+    place of its parameters, so a tile's row is read where the tile is made.
+    """
+    while isinstance(expr, (ast.Subscript, ast.IfExp)):
+        if isinstance(expr, ast.Subscript) and not _from_base(expr):
+            return None
+        expr = expr.value if isinstance(expr, ast.Subscript) else expr.body
+    if not isinstance(expr, ast.Call) or depth > 8:
+        return None
+    maker = getattr(expr.func, "id", "") or getattr(expr.func, "attr", "")
+    if maker in _MAKERS and len(expr.args) in (2, 3):
+        return (expr.args[1] if len(expr.args) == 3 else None, expr.args[-1], _MAKERS[maker])
+    if maker == "ndarray":
+        shape = expr.args[0] if expr.args else None
+        buffer = next((kw.value for kw in expr.keywords if kw.arg == "buffer"), None)
         if not isinstance(shape, ast.Tuple) or len(shape.elts) < 2:
             return None
-        width = _eval(shape.elts[-1], names)
-        slices = _eval(shape.elts[1], names) if len(shape.elts) == 3 else 1
-        dtype = next((kw.value for kw in call.keywords if kw.arg == "dtype"), None)
-        sizes = _itemsizes(dtype, source_itemsizes)
-    else:
+        if buffer is not None and getattr(buffer, "attr", "") != "sbuf":
+            return None
+        dtype = next((kw.value for kw in expr.keywords if kw.arg == "dtype"), None)
+        return (shape.elts[1] if len(shape.elts) == 3 else None, shape.elts[-1], dtype)
+    if maker in helpers and maker not in _MAKERS:
+        inlined = _returned(helpers[maker], expr)
+        return None if inlined is None else _shape(inlined, helpers, depth + 1)
+    return None
+
+
+def _sizes(kind, source_itemsizes: tuple[int, ...]) -> tuple[int, ...] | None:
+    """The element widths behind a shape reading: a maker's own, or those of a dtype node."""
+    return kind if isinstance(kind, tuple) else _itemsizes(kind, source_itemsizes)
+
+
+def _tile_of(call: ast.expr, names: dict, source_itemsizes: tuple[int, ...], helpers: dict):
+    """``(slices, width, itemsizes)`` for a tile-making expression, or ``None`` when it is not one."""
+    shape = _shape(call, helpers)
+    if shape is None:
         return None
+    slices = 1 if shape[0] is None else _eval(shape[0], names)
+    width, sizes = _eval(shape[1], names), _sizes(shape[2], source_itemsizes)
     if width is None or slices is None or sizes is None:
         return None
     return (slices, width, sizes)
 
 
-def _tiles(fn: ast.FunctionDef, names: dict, source_itemsizes: tuple[int, ...]) -> dict:
+def _declarations(fn: ast.FunctionDef) -> list[tuple[int, str, ast.expr]]:
+    """Every ``name = <expr>`` and ``name.append(<expr>)`` in a body, as ``(line, name, expr)``."""
+    found = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            found.append((node.lineno, node.targets[0].id, node.value))
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) \
+                and getattr(node.value.func, "attr", "") == "append" and node.value.args \
+                and isinstance(node.value.func.value, ast.Name):
+            found.append((node.lineno, node.value.func.value.id, node.value.args[0]))
+    return found
+
+
+def _tiles(fn: ast.FunctionDef, names: dict, source_itemsizes: tuple[int, ...], helpers: dict) -> dict:
     """Per tile name in a body: slice count, slice width and the element widths it can have.
 
     A name built by ``name.append(<tile>)`` is a list of such tiles; ``name[i]`` is one of them.
     """
     found: dict = {}
-    for node in ast.walk(fn):
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            tile = _tile_of(node.value, names, source_itemsizes)
-            if tile is not None:
-                found[node.targets[0].id] = tile
-        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) \
-                and getattr(node.value.func, "attr", "") == "append" and node.value.args \
-                and isinstance(node.value.func.value, ast.Name):
-            tile = _tile_of(node.value.args[0], names, source_itemsizes)
-            if tile is not None:
-                found[node.value.func.value.id] = tile
+    for _, name, expr in _declarations(fn):
+        tile = _tile_of(expr, names, source_itemsizes, helpers)
+        if tile is not None:
+            found[name] = tile
     return found
 
 
@@ -396,7 +457,9 @@ def _step_target(dst: ast.expr, loops: dict) -> str | None:
 
 def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int, ...] = (2, 4)) -> list[Site]:
     """Every transpose site of ``source`` read at geometry ``at`` with the module's own ``arithmetic``."""
-    functions = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)]
+    tree = ast.parse(source)
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    makers = _helpers(tree)
     base = {"__builtins__": {"min": min, "max": max, "len": len, "range": range}, **arithmetic, **at}
     sites: list[Site] = []
     helpers: dict[str, tuple[ast.FunctionDef, ast.Call, ast.expr, int]] = {}
@@ -404,7 +467,7 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
         params = [a.arg for a in fn.args.args]
         names = _names(fn, base)
         names["__assigns__"] = _assigns(fn)
-        loops, tiles = _loops(fn, names), _tiles(fn, names, source_itemsizes)
+        loops, tiles = _loops(fn, names), _tiles(fn, names, source_itemsizes, makers)
         for node in _calls(fn, names):
             op = getattr(node.func, "attr", "")
             if op == "load_transpose2d" and node.args and isinstance(node.args[0], ast.Subscript):
@@ -437,7 +500,7 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
     for fn in functions:
         names = _names(fn, base)
         names["__assigns__"] = _assigns(fn)
-        loops, tiles = _loops(fn, names), _tiles(fn, names, source_itemsizes)
+        loops, tiles = _loops(fn, names), _tiles(fn, names, source_itemsizes, makers)
         for node in _calls(fn, names):
             if getattr(node.func, "id", "") not in helpers:
                 continue
@@ -491,27 +554,66 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
     return sorted(sites, key=lambda s: s.line)
 
 
-def narrow_tiles(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int, ...] = (2, 4)) -> list[tuple[int, str, int]]:
-    """Every SBUF tile whose per-partition byte size is not a whole line, as ``(line, name, bytes)``.
+def _bindings(fn: ast.FunctionDef, functions: list, base: dict) -> list[dict]:
+    """The name sets a body is read under: one per call of it in the module, else the base alone."""
+    params = [a.arg for a in fn.args.args]
+    found = []
+    for caller in functions:
+        if caller is fn:
+            continue
+        caller_names = None
+        for node in ast.walk(caller):
+            if not isinstance(node, ast.Call) or getattr(node.func, "id", "") != fn.name:
+                continue
+            caller_names = _names(caller, base) if caller_names is None else caller_names
+            bound = dict(base)
+            pairs = list(zip(params, node.args)) + [(kw.arg, kw.value) for kw in node.keywords if kw.arg]
+            for param, arg in pairs:
+                value = _eval(arg, caller_names)
+                if value is not None:
+                    bound[param] = value
+            found.append(bound)
+    return found or [base]
+
+
+def tile_rows(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int, ...] = (2, 4)) -> list[tuple[int, str, int | None]]:
+    """Every SBUF tile a module declares, as ``(line, name, bytes per partition)``, at geometry ``at``.
+
+    A body with parameters is read once per call of it in the module, its parameters bound to the
+    caller's values; a helper that only returns a tile is read at its callers instead. A row the
+    arithmetic cannot size reads ``None``. A tile declared in a loop reads once per row size it takes.
+    """
+    tree = ast.parse(source)
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    makers = _helpers(tree)
+    base = {"__builtins__": {"min": min, "max": max, "len": len, "range": range}, **arithmetic, **at}
+    found: set = set()
+    for fn in functions:
+        returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None]
+        if len(returns) == 1 and _shape(returns[0].value, makers) is not None:
+            continue
+        for bound in _bindings(fn, functions, base):
+            names = _names(fn, bound)
+            loops = _loops(fn, names)
+            for line, name, expr in _declarations(fn):
+                shape = _shape(expr, makers)
+                if shape is None:
+                    continue
+                slices = (1,) if shape[0] is None else _values(shape[0], names, loops)
+                widths = _values(shape[1], names, loops)
+                sizes = _sizes(shape[2], source_itemsizes)
+                if slices is None or widths is None or sizes is None:
+                    found.add((line, name, None))
+                    continue
+                found.update((line, name, sl * w * s) for sl in slices for w in widths for s in sizes)
+    return sorted(found, key=lambda row: (row[0], row[1], -1 if row[2] is None else row[2]))
+
+
+def narrow_tiles(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int, ...] = (2, 4)) -> list[tuple[int, str, int | None]]:
+    """The rows of :func:`tile_rows` that are not a whole line, or that the arithmetic cannot size.
 
     A reading for the allocator's placement, which no arithmetic here controls: packed tile
     bases stay on the line only when every earlier tile's row is a whole number of lines.
     """
-    base = {"__builtins__": {"min": min, "max": max, "len": len, "range": range}, **arithmetic, **at}
-    found = []
-    for fn in ast.walk(ast.parse(source)):
-        if not isinstance(fn, ast.FunctionDef):
-            continue
-        names = _names(fn, base)
-        for node in ast.walk(fn):
-            if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                continue
-            tile = _tile_of(node.value, names, source_itemsizes)
-            if tile is None:
-                continue
-            slices, width, sizes = tile
-            for s in sizes:
-                row_bytes = slices * width * s
-                if row_bytes % LINE:
-                    found.append((node.lineno, node.targets[0].id, row_bytes))
-    return found
+    return [row for row in tile_rows(source, at, arithmetic, source_itemsizes)
+            if row[2] is None or row[2] % LINE]
