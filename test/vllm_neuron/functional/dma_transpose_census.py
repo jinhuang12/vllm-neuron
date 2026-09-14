@@ -38,6 +38,12 @@ class Site:
     rows: tuple[int, ...] | None
     width: tuple[int, ...] | None
     offsets: dict[int, tuple[int, ...] | None]
+    sizes: tuple[int, ...]
+
+    @property
+    def float32_only(self) -> bool:
+        """Whether only a 4-byte element can land in the destination: its tile is float32-made."""
+        return self.sizes == (4,)
 
     @property
     def misaligned(self) -> bool | None:
@@ -155,6 +161,9 @@ def _itemsizes(dtype: ast.expr | None, source_itemsizes: tuple[int, ...]) -> tup
 #: Element widths per SBUF tile maker of the kernels read here.
 _MAKERS = {"_sbuf": (4,), "_sbuf_u32": (4,), "_sbuf_i32": (4,)}
 
+#: The language's own tile allocators (``nl.``); one this module cannot shape is still a tile, and reads unsized.
+_ALLOCATORS = ("ndarray", "zeros", "ones", "full", "empty", "zeros_like", "ones_like", "full_like", "empty_like")
+
 
 def _helpers(tree: ast.Module) -> dict[str, ast.FunctionDef]:
     """The module's functions by name: a tile made through one is read through its body."""
@@ -217,6 +226,26 @@ def _shape(expr: ast.expr, helpers: dict, depth: int = 0):
         inlined = _returned(helpers[maker], expr)
         return None if inlined is None else _shape(inlined, helpers, depth + 1)
     return None
+
+
+def _tile_like(expr: ast.expr, helpers: dict, depth: int = 0) -> bool:
+    """Whether an expression allocates an SBUF tile at all, whether or not :func:`_shape` can read it."""
+    while isinstance(expr, (ast.Subscript, ast.IfExp)):
+        expr = expr.value if isinstance(expr, ast.Subscript) else expr.body
+    if not isinstance(expr, ast.Call) or depth > 8:
+        return False
+    maker = getattr(expr.func, "id", "") or getattr(expr.func, "attr", "")
+    buffer = next((kw.value for kw in expr.keywords if kw.arg == "buffer"), None)
+    if buffer is not None:
+        return getattr(buffer, "attr", "") == "sbuf"
+    if maker in _MAKERS:
+        return True
+    if maker in _ALLOCATORS and getattr(getattr(expr.func, "value", None), "id", "") == "nl":
+        return True                                      # the language's allocator; a torch one is host code
+    if maker in helpers:
+        inlined = _returned(helpers[maker], expr)
+        return inlined is not None and _tile_like(inlined, helpers, depth + 1)
+    return False
 
 
 def _sizes(kind, source_itemsizes: tuple[int, ...]) -> tuple[int, ...] | None:
@@ -445,6 +474,19 @@ def _assigns(fn: ast.FunctionDef) -> dict[str, ast.expr]:
             if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}
 
 
+def _targets(fn: ast.FunctionDef) -> dict[int, ast.expr]:
+    """Per call (by id) the expression its result is stored to: an assignment target or an appended-to list."""
+    found: dict[int, ast.expr] = {}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.value, ast.Call):
+            found[id(node.value)] = node.targets[0]
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) \
+                and getattr(node.value.func, "attr", "") == "append" and node.value.args \
+                and isinstance(node.value.args[0], ast.Call) and isinstance(node.value.func.value, ast.Name):
+            found[id(node.value.args[0])] = node.value.func.value
+    return found
+
+
 def _step_target(dst: ast.expr, loops: dict) -> str | None:
     """The loop target a destination slice is stepped by, if any."""
     if not isinstance(dst, ast.Subscript):
@@ -468,6 +510,7 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
         names = _names(fn, base)
         names["__assigns__"] = _assigns(fn)
         loops, tiles = _loops(fn, names), _tiles(fn, names, source_itemsizes, makers)
+        targets = _targets(fn)
         for node in _calls(fn, names):
             op = getattr(node.func, "attr", "")
             if op == "load_transpose2d" and node.args and isinstance(node.args[0], ast.Subscript):
@@ -482,8 +525,20 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
                     ast.copy_location(span, p)
                     extents.append(_values(ast.fix_missing_locations(span), names, loops))
                 source = getattr(_base(sub), "id", "")
+                # The result lands where it is stored: a fresh tile starts at its own base, a slice of a
+                # declared tile starts where the slice does, and a result stored nowhere readable is unreadable.
+                target = targets.get(id(node))
+                src_tile = tiles.get(source)
+                sizes = src_tile[2] if src_tile else source_itemsizes
+                if target is None:
+                    offsets = None
+                elif isinstance(target, ast.Name):
+                    offsets = (0,)
+                else:
+                    offsets, target_sizes = _elements(target, tiles, names, loops)
+                    sizes = target_sizes or sizes
                 sites.append(Site(node.lineno, "", source, extents[0], extents[1] if len(extents) > 1 else None,
-                                  {s: (0,) for s in source_itemsizes}))
+                                  {s: (None if offsets is None else tuple(o * s for o in offsets)) for s in sizes}, sizes))
             elif op == "dma_transpose":
                 dst = next((kw.value for kw in node.keywords if kw.arg == "dst"), None)
                 if dst is None:
@@ -496,7 +551,7 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
                 offsets, sizes = _elements(dst, tiles, names, loops)
                 sizes = sizes or source_itemsizes
                 sites.append(Site(node.lineno, "", _source_name(node), rows, width,
-                                  {s: (None if offsets is None else tuple(o * s for o in offsets)) for s in sizes}))
+                                  {s: (None if offsets is None else tuple(o * s for o in offsets)) for s in sizes}, sizes))
     for fn in functions:
         names = _names(fn, base)
         names["__assigns__"] = _assigns(fn)
@@ -550,7 +605,7 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
             src_index = next((i for i, a in enumerate(helper.args.args) if a.arg == _source_param(inner)), None)
             source = getattr(_base(node.args[src_index]), "id", "") if src_index is not None and src_index < len(node.args) else ""
             sites.append(Site(node.lineno, node.func.id, source, rows, width,
-                              {s: (None if combined is None else tuple(c * s for c in combined)) for s in sizes}))
+                              {s: (None if combined is None else tuple(c * s for c in combined)) for s in sizes}, sizes))
     return sorted(sites, key=lambda s: s.line)
 
 
@@ -598,6 +653,8 @@ def tile_rows(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[i
             for line, name, expr in _declarations(fn):
                 shape = _shape(expr, makers)
                 if shape is None:
+                    if _tile_like(expr, makers):
+                        found.add((line, name, None))      # a tile this module cannot shape is never a pass
                     continue
                 slices = (1,) if shape[0] is None else _values(shape[0], names, loops)
                 widths = _values(shape[1], names, loops)

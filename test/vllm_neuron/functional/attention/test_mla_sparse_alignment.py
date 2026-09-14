@@ -31,7 +31,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention import mla_sparse as mod
-from test.vllm_neuron.functional.dma_transpose_census import LINE, census, narrow_tiles, tile_rows
+from test.vllm_neuron.functional.dma_transpose_census import LINE, census, tile_rows
 
 #: The constants the frozen copy below reads, RETYPED on purpose: a frozen reference
 #: that imported them would follow the live module if they ever moved.
@@ -469,17 +469,17 @@ def _tile_rows(source: str, at: dict) -> list:
 
 
 def test_no_transpose_destination_starts_off_a_32_byte_boundary():
-    """At one head and either operand width, every destination is read and none starts off 32 bytes."""
+    """At each geometry, one head and either operand width, every destination is read and none starts off 32 bytes."""
     source = _module_source()
-    sites = _sites(source, _PREFILL)
-    unreadable = tuple(s.line for s in sites if s.misaligned is None)
-    misaligned = tuple(s.line for s in sites if s.misaligned)
-    narrow = narrow_tiles(source, _PREFILL, _arithmetic(), _WIDTHS)
-    _emit("MISALIGNED_SITES", count=len(misaligned), lines=misaligned, unreadable=unreadable,
-          at_heads=1, widths=_WIDTHS, transposes=len(sites), narrow_tiles=len(narrow))
-    assert sites, "the census read no transpose site"
-    assert unreadable == (), f"destinations the arithmetic cannot place: {unreadable}"
-    assert misaligned == ()
+    for name, at in _GEOMETRIES_READ:
+        sites = _sites(source, at)
+        unreadable = tuple(s.line for s in sites if s.misaligned is None)
+        misaligned = tuple(s.line for s in sites if s.misaligned)
+        _emit("MISALIGNED_SITES", geometry=name, count=len(misaligned), unreadable=unreadable,
+              at_heads=1, widths=_WIDTHS, transposes=len(sites), lines=misaligned)
+        assert sites, f"the census read no transpose site at {name}"
+        assert unreadable == (), f"destinations the arithmetic cannot place at {name}: {unreadable}"
+        assert misaligned == (), f"destinations off a 32-byte line at {name}: {misaligned}"
 
 
 def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
@@ -492,10 +492,9 @@ def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
         shaped = [s for s in sites if s.host_shaped(_DGE_ROWS)]
         found[name] = dict(sorted(Counter(s.source for s in shaped).items()))
         if name == "prefill":
-            float32_only = tuple(s.line for s in sites if set(s.offsets) == {4})
-        _emit("HOST_SHAPED_SITES", geometry=name, count=len(shaped),
-              lines=tuple(s.line for s in shaped), step=_DGE_ROWS, by_source=found[name],
-              transposes=len(sites),
+            float32_only = tuple(s.line for s in sites if s.float32_only)
+        _emit("HOST_SHAPED_SITES", geometry=name, count=len(shaped), step=_DGE_ROWS,
+              by_source=found[name], transposes=len(sites), lines=tuple(s.line for s in shaped),
               readings=[(s.line, s.source, s.rows, s.width, s.via) for s in sites])
         assert sites, f"the census read no transpose site at {name}"
     _emit("FLOAT32_DESTINATIONS", count=len(float32_only), lines=float32_only)
@@ -517,8 +516,8 @@ def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
         unreadable = tuple(sorted({(line, tile) for line, tile, size in rows if size is None}))
         narrow = tuple((line, tile, size) for line, tile, size in rows
                        if size is not None and size % LINE)
-        _emit("NARROW_TILES", geometry=name, count=len(narrow), lines=tuple(r[0] for r in narrow),
-              unreadable=unreadable, tiles=len(rows), widths=_WIDTHS)
+        _emit("NARROW_TILES", geometry=name, count=len(narrow), unreadable=unreadable,
+              tiles=len(rows), widths=_WIDTHS, lines=tuple(r[0] for r in narrow))
         assert rows, f"the census read no SBUF tile at {name}"
         assert unreadable == (), f"tile rows the arithmetic cannot size: {unreadable}"
         assert narrow == (), f"tile rows that are not whole 32-byte lines: {narrow}"
@@ -577,17 +576,57 @@ def test_control_the_reader_finds_a_planted_off_line_caller():
     """The same reader names the one caller whose destination starts 12 bytes into a line."""
     sites = _sites(_PLANTED_OFF_LINE, _PREFILL)
     misaligned = tuple(s.line for s in sites if s.misaligned)
-    _emit("CONTROL_READER_FIRES", count=len(misaligned), lines=misaligned,
-          offsets=[s.offsets for s in sites])
+    _emit("CONTROL_READER_FIRES", count=len(misaligned), offsets=[s.offsets for s in sites],
+          lines=misaligned)
     assert len(sites) == 1 and len(misaligned) == 1
+
+
+#: Two callers: one transposes into a float32-made tile, the other into a tile of the source's
+#: own dtype through the staging helper. Only the first can take a 4-byte element alone.
+_PLANTED_FLOAT32 = _HELPER + """
+def body(q_lift_hbm, c_kv_hbm, heads, latent, s_kv):
+    block = 16 * heads
+    q_lift_t = _sbuf(LATENT_TILE, block)
+    _transpose_rows(q_lift_t, q_lift_hbm, latent, block, LATENT_TILE, 0)
+    c_stage = _stage(c_kv_hbm, LATENT_TILE, s_kv)
+    _transpose_rows(c_stage, c_kv_hbm, latent, LATENT_TILE, LATENT_TILE, 0)
+"""
+
+#: Two whole-tile transposes: one stored three elements into a declared tile, one stored nowhere
+#: the reader can place. Neither may read as on the line by assumption.
+_PLANTED_WHOLE_TILE = """
+def body(staged, hidden, other):
+    tile = nl.ndarray((128, 136), dtype=hidden.dtype, buffer=nl.sbuf)
+    tile[:, 3:131] = nl.load_transpose2d(staged[0:128, 0:128])
+    total = nl.add(nl.load_transpose2d(staged[0:128, 128:256]), other)
+"""
+
+
+def test_control_the_reader_finds_a_planted_float32_only_destination():
+    """The same reader names the float32-made destination and not the one in the source's dtype."""
+    sites = _sites(_PLANTED_FLOAT32, _PREFILL)
+    float32_only = tuple(s.line for s in sites if s.float32_only)
+    _emit("CONTROL_FLOAT32_READER_FIRES", count=len(float32_only), sizes=[s.sizes for s in sites],
+          lines=float32_only)
+    assert len(sites) == 2 and len(float32_only) == 1 and [s.sizes for s in sites] == [(4,), (2, 4)]
+
+
+def test_control_a_whole_tile_transpose_is_read_where_its_result_lands():
+    """A whole-tile transpose stored off the line is misaligned; one stored nowhere readable is unreadable."""
+    sites = _sites(_PLANTED_WHOLE_TILE, _PREFILL)
+    misaligned = tuple(s.line for s in sites if s.misaligned)
+    unreadable = tuple(s.line for s in sites if s.misaligned is None)
+    _emit("CONTROL_WHOLE_TILE_READER_FIRES", count=len(misaligned), unreadable=unreadable,
+          offsets=[s.offsets for s in sites], lines=misaligned)
+    assert len(sites) == 2 and len(misaligned) == 1 and len(unreadable) == 1
 
 
 def test_control_the_reader_finds_a_planted_three_row_caller():
     """The same reader names the one caller that moves three rows per DMA."""
     sites = _sites(_PLANTED_THREE_ROWS, _PREFILL)
     shaped = tuple(s.line for s in sites if s.host_shaped(_DGE_ROWS))
-    _emit("CONTROL_STEP_READER_FIRES", count=len(shaped), lines=shaped,
-          rows=[s.rows for s in sites])
+    _emit("CONTROL_STEP_READER_FIRES", count=len(shaped), rows=[s.rows for s in sites],
+          lines=shaped)
     assert len(sites) == 1 and len(shaped) == 1
 
 
@@ -608,6 +647,13 @@ def body(q_lift_hbm, heads):
     scratch = _sbuf(heads, somewhere)
 """
 
+#: One tile made by an allocator this census cannot shape, beside one it can.
+_PLANTED_UNKNOWN_MAKER = """
+def body(q_lift_hbm, heads):
+    line = _sbuf(heads, 8)
+    scratch = nl.zeros((heads, 8), dtype=nl.float32, buffer=nl.sbuf)
+"""
+
 
 def test_control_the_tile_census_finds_a_planted_narrow_row():
     """The same reader names the 4-byte tile and the 8-byte one made through a helper, not the line."""
@@ -625,12 +671,19 @@ def test_control_an_unsized_tile_is_never_a_pass():
     assert rows == [(3, "scratch", None)]
 
 
+def test_control_an_unrecognised_tile_maker_is_never_a_pass():
+    """A tile made by an allocator the census cannot shape reads ``None`` beside the line it can size."""
+    rows = _tile_rows(_PLANTED_UNKNOWN_MAKER, _PREFILL)
+    _emit("CONTROL_UNKNOWN_MAKER_FIRES", count=sum(1 for r in rows if r[2] is None), rows=rows)
+    assert rows == [(3, "line", 32), (4, "scratch", None)]
+
+
 def test_control_the_reader_finds_a_planted_caller_of_a_wide_stepping_helper():
     """The same reader names the one caller whose helper moves 32 rows per DMA."""
     sites = _sites(_PLANTED_WIDE_STEP, _PREFILL)
     shaped = tuple(s.line for s in sites if s.host_shaped(_DGE_ROWS))
-    _emit("CONTROL_WIDE_STEP_READER_FIRES", count=len(shaped), lines=shaped,
-          rows=[s.rows for s in sites])
+    _emit("CONTROL_WIDE_STEP_READER_FIRES", count=len(shaped), rows=[s.rows for s in sites],
+          lines=shaped)
     assert len(sites) == 1 and len(shaped) == 1 and sites[0].rows == (32,)
 
 
