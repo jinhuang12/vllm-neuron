@@ -146,6 +146,10 @@ GATE_UP_H_TILES_PER_BLOCK = GATE_UP_SCALE_BLOCK // TILE_SIZE
 #: axis. Named rather than written as ``2`` at four sites.
 GATE_UP_FUSION = 2
 
+#: Source rows per DMA transpose: the count the DMA engine generates its own
+#: descriptors for, with a 2-byte operand and a 128-wide row.
+DGE_TRANSPOSE_ROWS = 16
+
 #: ``GATE_UP`` and ``DOWN`` are re-exported from the producer rather than
 #: re-declared: the two modules must agree on the selector string, and one
 #: definition cannot drift from itself.
@@ -783,6 +787,18 @@ def _gathered(hbm, index, rows: int, width: int, dtype):
     return tile
 
 
+def _transpose_rows(dst, src_hbm, row_stride: int, rows: int, width: int, offset: int):
+    """Transpose ``rows`` source rows of ``width`` elements onto partitions, 16 rows per DMA."""
+    for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
+        n = min(DGE_TRANSPOSE_ROWS, rows - r0)
+        nisa.dma_transpose(
+            dst=dst[:, r0 : r0 + n],
+            src=src_hbm.ap(
+                pattern=[[row_stride, n], [1, width]], offset=offset + r0 * row_stride
+            ),
+        )
+
+
 def gate_up_flat_scale_index(
     h_block: int, gate_or_up: int, i_block: int, n_i_blocks: int
 ) -> int:
@@ -1005,14 +1021,9 @@ def moe_gate_up_blockwise_fp8_kernel(
     pad_row = hidden.shape[0] - 1
 
     out = nl.ndarray((positions, fused_cols), dtype=nl.float32, buffer=nl.shared_hbm)
-    # The routed rows land here first, so the contraction loop below keeps reading
-    # them through ``nl.load_transpose2d`` -- the free DMA transpose the landed form
-    # already used. Transposing on chip instead would save this staging buffer and
-    # cost an unmeasured bf16 ``nc_transpose`` feeding a matmul's stationary operand;
-    # the campaign's rule is that the mechanism is measured at its own dtype and
-    # width before the file that uses it is authored, and that one is not. The
-    # staging is kernel-internal, so it is ``private_hbm``: only a RETURNED tensor
-    # is ``shared_hbm``, which is the convention this package's landed kernels use.
+    # The routed rows land here first. Each token tile's hidden tiles are then
+    # transposed onto partitions once, 16 source rows per DMA, and read by every
+    # intermediate block. Kernel-internal, so ``private_hbm``.
     staged = nl.ndarray((positions, h_extent), dtype=hidden.dtype, buffer=nl.private_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
 
@@ -1037,6 +1048,14 @@ def moe_gate_up_blockwise_fp8_kernel(
             n_h_blocks * n_col_blocks,
             nl.float32,
         )
+        # [H=TILE_SIZE partitions, B=TILE_SIZE free] per hidden tile, in the source dtype.
+        hidden_t = []
+        for h_tile in range(n_h_blocks * GATE_UP_H_TILES_PER_BLOCK):
+            tile = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=hidden.dtype, buffer=nl.sbuf)
+            _transpose_rows(
+                tile, staged, h_extent, TILE_SIZE, TILE_SIZE, m0 * h_extent + h_tile * TILE_SIZE
+            )
+            hidden_t.append(tile)
         for i_block in range(n_i_blocks):
             gate_col = i_block * GATE_UP_SCALE_BLOCK
             up_col = i_extent + i_block * GATE_UP_SCALE_BLOCK
@@ -1047,10 +1066,7 @@ def moe_gate_up_blockwise_fp8_kernel(
                 up_psum = _gate_up_psum()
                 for h_sub in range(GATE_UP_H_TILES_PER_BLOCK):
                     h0 = h_block * GATE_UP_SCALE_BLOCK + h_sub * TILE_SIZE
-                    # [H=TILE_SIZE partitions, B=TILE_SIZE free]
-                    hidden_t = nl.load_transpose2d(
-                        staged[m0 : m0 + TILE_SIZE, h0 : h0 + TILE_SIZE]
-                    )
+                    hidden_tile = hidden_t[h0 // TILE_SIZE]
                     # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free], each
                     # addressed at ``expert * H * n_col_blocks + (h0 + i) *
                     # n_col_blocks + column_block`` in the bank's own row units.
@@ -1087,13 +1103,13 @@ def moe_gate_up_blockwise_fp8_kernel(
                     # visible here.
                     nisa.nc_matmul(
                         dst=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        stationary=hidden_t,
+                        stationary=hidden_tile,
                         moving=gate_w,
                         accumulate=(h_sub > 0),
                     )
                     nisa.nc_matmul(
                         dst=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        stationary=hidden_t,
+                        stationary=hidden_tile,
                         moving=up_w,
                         accumulate=(h_sub > 0),
                     )
