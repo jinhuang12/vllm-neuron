@@ -418,7 +418,12 @@ def test_the_mla_read_no_longer_depends_on_the_position() -> None:
 
     say("I5_WRITES_BY_INDEX", "index_copy_" in source)
     assert "index_copy_" in source
-    assert "torch.as_tensor(" in source
+
+    say("I5_BUILDS_THE_START_AS_A_DEVICE_SCALAR", "_int64_scalar(start_position" in source)
+    assert "_int64_scalar(start_position" in source
+    assert "torch.as_tensor(" not in source and "torch.tensor(" not in source, (
+        "the start is built from python data, which a meta trace keeps real"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

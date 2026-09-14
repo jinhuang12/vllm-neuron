@@ -20,10 +20,10 @@ pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
 SENT = "FAKEIDX"
 
-#: Both build from python data, so both are real even under a fake trace. ``as_tensor`` is
-#: NOT here: it passes a tensor argument straight through, and the two call sites that can
-#: reach it with an int are out of this file's scope by decision.
-DATA_BUILDERS = ("tensor", "new_tensor")
+#: All three build from python data, so all three are real even under a fake trace.
+#: ``as_tensor`` passes a tensor argument straight through, but handed a number on the meta
+#: device it returns a real tensor too, so a traced path may not spell it either.
+DATA_BUILDERS = ("tensor", "new_tensor", "as_tensor")
 
 #: The published routed-expert count and the expert-parallel degree the serving run uses.
 EXPERTS, EP_DEGREE = 288, 16
@@ -102,32 +102,46 @@ def test_a_the_model_file_builds_no_tensor_from_python_data_outside_init() -> No
 
 
 def test_b_a_data_built_tensor_is_refused_where_a_factory_built_one_is_not() -> None:
-    """The refusal is reproduced on the form that was replaced, and absent on its successor."""
+    """The refusal is reproduced on the two forms that were replaced, and absent on their successors."""
     with FakeTensorMode():
         mask = torch.zeros(2048, dtype=torch.bool, device=TRACED_DEVICE)
         index = torch.zeros(2048, dtype=torch.int64, device=TRACED_DEVICE)
         data_built = torch.tensor(7, dtype=torch.int64, device=TRACED_DEVICE)
+        as_tensor_built = torch.as_tensor(7, dtype=torch.int64, device=TRACED_DEVICE)
         factory_built = index.new_full((), 7, dtype=torch.int64)
+        full_built = torch.full((), 7, dtype=torch.int64, device=TRACED_DEVICE)
         ranged = torch.arange(3, dtype=torch.int64, device=TRACED_DEVICE)
 
         say("kinds",
             f"data_built_is_fake={isinstance(data_built, FakeTensor)}",
+            f"as_tensor_built_is_fake={isinstance(as_tensor_built, FakeTensor)}",
             f"factory_built_is_fake={isinstance(factory_built, FakeTensor)}",
+            f"full_built_is_fake={isinstance(full_built, FakeTensor)}",
             f"arange_is_fake={isinstance(ranged, FakeTensor)}")
 
         old_refused, old_message = where_refuses(mask, index, data_built)
+        as_tensor_refused, as_tensor_message = where_refuses(mask, index, as_tensor_built)
         new_refused, new_message = where_refuses(mask, index, factory_built)
+        full_refused, full_message = where_refuses(mask, index, full_built)
 
     say("refusal",
         f"data_built_refused={old_refused}",
         f"carries_the_text={REFUSAL in old_message}",
+        f"as_tensor_built_refused={as_tensor_refused}",
+        f"as_tensor_carries_the_text={REFUSAL in as_tensor_message}",
         f"factory_built_refused={new_refused}",
-        f"message={new_message or 'none'}")
+        f"full_built_refused={full_refused}",
+        f"message={new_message or full_message or 'none'}")
     assert old_refused and REFUSAL in old_message, (
         f"the data-built form was expected to be refused with {REFUSAL!r}; "
         f"read refused={old_refused} message={old_message!r}"
     )
+    assert as_tensor_refused and REFUSAL in as_tensor_message, (
+        f"the as_tensor form was expected to be refused with {REFUSAL!r}; "
+        f"read refused={as_tensor_refused} message={as_tensor_message!r}"
+    )
     assert not new_refused, f"the factory-built form was refused: {new_message!r}"
+    assert not full_refused, f"the torch.full form was refused: {full_message!r}"
 
 
 def test_c_every_expert_rank_owns_a_contiguous_ascending_run() -> None:

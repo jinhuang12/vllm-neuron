@@ -581,15 +581,16 @@ def dsa_hadamard128(x: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------------------------
 
 
-def hadamard_matrix(head_dim: int = INDEX_HEAD_DIM, dtype=torch.float32) -> Tensor:
+def hadamard_matrix(head_dim: int = INDEX_HEAD_DIM, dtype=torch.float32, device=None) -> Tensor:
     """The UNNORMALISED Sylvester ``H_n``, built by doubling. ``H @ H.T == n * I``.
 
     Used by the oracle and by the identity case's expectation. Built rather than transcribed so
-    that no 128x128 literal has to be trusted, and asserted orthogonal by the test.
+    that no 128x128 literal has to be trusted, and asserted orthogonal by the test. ``device`` is
+    the activation's when a fallback builds it, so a trace on one device meets no second one.
     """
     if head_dim <= 0 or head_dim & (head_dim - 1):
         raise KpoolHadamardError(f"head_dim must be a positive power of two; got {head_dim}")
-    h = torch.ones((1, 1), dtype=dtype)
+    h = torch.ones((1, 1), dtype=dtype, device=device)
     while h.shape[0] < head_dim:
         h = torch.cat((torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)), dim=0)
     return h
@@ -607,12 +608,12 @@ def _dsa_kpool_hadamard_torch(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -
     _COUNTERS.torch_fallback += 1
     weights = torch.softmax(slot_score.float() + ape.float().unsqueeze(0), dim=1)
     pooled = (weights * slot_k.float()).sum(dim=1)
-    rotated = pooled @ hadamard_matrix(int(slot_k.shape[2])).t()
+    rotated = pooled @ hadamard_matrix(int(slot_k.shape[2]), device=slot_k.device).t()
     return (rotated * HADAMARD_SCALE).to(slot_k.dtype)
 
 
 def _dsa_hadamard128_torch(x: Tensor) -> Tensor:
     """The rotation alone, in torch. THE ORACLE, and the fallback path."""
     _COUNTERS.torch_fallback += 1
-    rotated = x.float() @ hadamard_matrix(int(x.shape[1])).t()
+    rotated = x.float() @ hadamard_matrix(int(x.shape[1]), device=x.device).t()
     return (rotated * HADAMARD_SCALE).to(x.dtype)

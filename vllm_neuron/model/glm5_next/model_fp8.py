@@ -3962,12 +3962,18 @@ def _per_request_row_entries(part, one_sequence_dim: int):
     return (part,)
 
 
+def _int64_scalar(value: torch.Tensor | int, device: torch.device) -> torch.Tensor:
+    """``value`` as a 0-d int64 tensor on ``device``; a number is factory-built so a trace keeps it fake."""
+    if torch.is_tensor(value):
+        return value.to(device=device, dtype=torch.int64).reshape(())
+    # A number handed to ``as_tensor`` on the meta device comes back as a REAL tensor under a
+    # fake trace, and the next operator refuses it beside fake ones; ``full`` is dispatched.
+    return torch.full((), int(value), dtype=torch.int64, device=device)
+
+
 def _start_is_zero(start_position: torch.Tensor | int, device: torch.device):
     """``start_position == 0`` as a 0-d bool tensor, never as a python bool."""
-    return (
-        torch.as_tensor(start_position, device=device, dtype=torch.int64).reshape(())
-        == 0
-    )
+    return _int64_scalar(start_position, device) == 0
 
 
 class Glm5NextKDAAttention(nn.Module):
@@ -4464,11 +4470,9 @@ class Glm5NextKDAAttention(nn.Module):
         # ``state_rows`` rows leaves a window whose leading rows are zero, the padding a
         # sequence with no history has, rather than the previous owner's rows or this
         # chunk's rows repeated.
-        real_length = torch.as_tensor(
-            tokens if real_tokens is None else real_tokens,
-            device=padded.device,
-            dtype=torch.int64,
-        ).reshape(())
+        real_length = _int64_scalar(
+            tokens if real_tokens is None else real_tokens, padded.device
+        )
         history_index = torch.arange(state_rows, device=padded.device) + real_length
         self._store_conv_history(conv_state, padded.index_select(0, history_index))
 
@@ -5530,22 +5534,12 @@ class Glm5NextDSAIndexer(nn.Module):
         """
         pool = self.index_kpool
         device = tail.device
-        rows = torch.remainder(
-            torch.as_tensor(end_position, device=device, dtype=torch.int64).reshape(()),
-            pool,
-        )
+        rows = torch.remainder(_int64_scalar(end_position, device), pool)
         slots = torch.arange(pool, device=device)
-        real = torch.as_tensor(tokens, device=device, dtype=torch.int64).reshape(())
+        real = _int64_scalar(tokens, device)
         if start_position is not None:
-            began = torch.as_tensor(
-                start_position, device=device, dtype=torch.int64
-            ).reshape(())
-            real = (
-                torch.as_tensor(
-                    end_position, device=device, dtype=torch.int64
-                ).reshape(())
-                - began
-            )
+            began = _int64_scalar(start_position, device)
+            real = _int64_scalar(end_position, device) - began
         write = ((slots >= (rows - real).clamp_min(0)) & (slots < rows))[:, None]
         source = (slots - rows + real).clamp_min(0).minimum(real - 1)
         tail[0].copy_(
@@ -7351,9 +7345,7 @@ class Glm5NextMLAAttention(nn.Module):
                 f"slot(s); the window's length is fixed for the bucket and the "
                 f"runner sizes it, so a window this short is the caller's error"
             )
-        start = torch.as_tensor(
-            start_position, device=latent_cache.device, dtype=torch.int64
-        ).reshape(())
+        start = _int64_scalar(start_position, latent_cache.device)
 
         query, kv_latent = self.project_query_and_latent(hidden_states)
 
@@ -7383,9 +7375,7 @@ class Glm5NextMLAAttention(nn.Module):
         # dtype-converting copy of a tensor already on the device, so a selection
         # that cannot promote at all is the one that stays safe as the arms change.
         if prefill_end_position is not None:
-            end = torch.as_tensor(
-                prefill_end_position, device=latent_cache.device, dtype=torch.int64
-            ).reshape(())
+            end = _int64_scalar(prefill_end_position, latent_cache.device)
             offsets = torch.minimum(offsets, end - start - 1)
             kv_latent = kv_latent.index_select(0, offsets)
         rows = start + offsets
