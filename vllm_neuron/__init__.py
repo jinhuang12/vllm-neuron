@@ -122,6 +122,13 @@ def _init_backend():
             compiler_fn=capture, name="neuron_libtorch_graph_capture"
         )
 
+    # The staged loader is installed here, before any graph is compiled, because the backend
+    # loads a graph inside the builder it calls and a whole group loading at once exhausts the
+    # host. It is a pass-through until a wave size and a signal directory are both set.
+    from vllm_neuron.vllm.patches.staged_neff_load import apply_staged_neff_load
+
+    apply_staged_neff_load()
+
     if not envs.VLLM_NEURON_CPU_MODE or _has_neuron_hw:
         try:
             from libtorch_neuronx_lite.overrides import neuron_collectives  # noqa: F401

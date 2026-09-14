@@ -44,11 +44,17 @@ if TYPE_CHECKING:
     VLLM_NEURON_SKIP_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_PREFILL_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_ENCODER_WARMUP: bool = False
-    # Ranks that load their compiled graph at the same time during warmup. A load
-    # is a per-process step, so the group loads in waves of this many ranks and
-    # then runs the warmup call on all ranks. A value at or above the world size
-    # loads every rank at once.
+    # Ranks that load their compiled graph at the same time. A load holds far more
+    # host memory than the execution after it, so the group goes through the
+    # loader in waves of this many ranks. A value at or above the world size, or
+    # an unset signal directory, loads every rank at once.
     VLLM_NEURON_NEFF_LOAD_WAVE_SIZE: int = 8
+    # Directory the ranks signal each other through while they load in waves. Each
+    # rank writes one flag file after its own load and never reads a later wave's.
+    VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR: str = ""
+    # Seconds a wave waits for the wave before it. On expiry it logs and PROCEEDS,
+    # because a load that hangs the group is worse than one that overlaps.
+    VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT: int = 3600
     # Force the STATIC FP8 (non-MX) attention path on TRN3 even when STATIC_MX
     # kernels are available. Used by FP8 model factories as an escape hatch.
     VLLM_NEURON_FORCE_STATIC_FP8: bool = False
@@ -214,10 +220,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_SKIP_ENCODER_WARMUP": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_ENCODER_WARMUP")) or False
     ),
-    # Ranks that load their compiled graph at the same time during warmup.
+    # Ranks that load their compiled graph at the same time.
     # A value at or above the world size loads every rank at once.
     "VLLM_NEURON_NEFF_LOAD_WAVE_SIZE": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_NEFF_LOAD_WAVE_SIZE")) or 8
+    ),
+    # Directory the ranks signal each other through while they load in waves.
+    # Empty means no staging: every rank loads as soon as it reaches the loader.
+    "VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR": lambda: os.getenv(
+        "VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR", ""
+    ),
+    # Seconds a wave waits for the wave before it, defaulting to the barrier timeout.
+    "VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT"))
+        or maybe_convert_int(os.getenv("VLLM_NEURON_BARRIER_TIMEOUT"))
+        or 3600
     ),
     # Skip decode warmup/compilation without requiring kv-transfer-config.
     # Useful for prefill-only profiling workflows.
