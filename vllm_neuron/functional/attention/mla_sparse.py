@@ -114,13 +114,18 @@ KEY_CHUNK = 128
 #: rides the stationary operand in both matmuls, so this bounds H.
 HEAD_MAX = 128
 
-#: Free-axis alignment, in float32 elements, for a tile that a ``dma_transpose``
-#: writes a SLICE of. The runtime refuses such a descriptor unless the destination
-#: byte offset is 32-byte aligned -- "transpose dest offset <n> must be 32B aligned"
-#: -- and a slice offset here is the head count times the tile index, so the head
-#: axis is padded to a whole 32 bytes and every slice then starts on one. Eight
-#: float32 elements are 32 bytes.
+#: Free-axis alignment, in float32 elements, of the per-block Q tiles the matmuls
+#: read one query at a time: their width is kept at a whole 32 bytes. Eight float32
+#: elements are 32 bytes.
 DMA_TRANSPOSE_ALIGN = 8
+
+#: Source rows per DMA transpose. The hardware descriptor generator takes a transpose
+#: whose source is 16 rows of a 2-byte dtype, at most 128 wide, so every transpose
+#: here lands 16 source rows and its destination slice starts every 16 columns --
+#: 32 bytes apart for a 2-byte source, 64 for float32. The runtime refuses a
+#: host-expanded transpose descriptor whose destination offset is not 32-byte
+#: aligned ("transpose dest offset <n> must be 32B aligned").
+DGE_TRANSPOSE_ROWS = 16
 
 #: Moving free-axis extent, ``nl.tile_size.gemm_moving_fmax``. K rides the moving
 #: operand in MM1 and the latent rides it in MM2, so this bounds both -- and BOTH are
@@ -222,6 +227,29 @@ def _aligned(width: int) -> int:
     return blocks * DMA_TRANSPOSE_ALIGN
 
 
+def _stage(hbm, parts: int, width: int):
+    """A ``[parts, width]`` SBUF tile in ``hbm``'s own dtype: where a transpose lands."""
+    return nl.ndarray((parts, width), dtype=hbm.dtype, buffer=nl.sbuf)
+
+
+def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
+    """Transpose ``rows`` source rows of ``width`` elements onto partitions, 16 rows per DMA."""
+    for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
+        n = min(DGE_TRANSPOSE_ROWS, rows - r0)
+        nisa.dma_transpose(
+            dst=dst[:, r0:r0 + n],
+            src=src_hbm.ap(pattern=[[row_stride, n], [1, width]],
+                           offset=offset + r0 * row_stride),
+        )
+
+
+def _queries_per_block(seq: int, heads: int) -> int:
+    """Queries whose Q rows fill one 16-row transpose, when the head count and sequence allow."""
+    if DGE_TRANSPOSE_ROWS % heads == 0 and seq % (DGE_TRANSPOSE_ROWS // heads) == 0:
+        return DGE_TRANSPOSE_ROWS // heads
+    return 1
+
+
 def _sbuf_u32(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.uint32, buffer=nl.sbuf)
 
@@ -321,9 +349,10 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     rope = 0 if q_pe_hbm is None else q_pe_hbm.shape[2]
 
     # ---- the cache, transposed onto partitions ONCE for the whole call ----------
-    # HBM holds it [S_kv, L]; MM1 and the gather both want [L_partition, S_kv]. One
-    # `dma_transpose` per latent tile does it, and the cache is read-only for the
-    # rest of the call, so this cost is per call and not per query.
+    # HBM holds it [S_kv, L]; MM1 and the gather both want [L_partition, S_kv]. The
+    # transposes land in the source dtype, 16 rows per DMA, and one copy per latent
+    # tile widens to float32; the cache is read-only for the rest of the call, so
+    # this cost is per call and not per query.
     #
     # Built by a loop and not by a comprehension: a comprehension inside a traced
     # kernel is refused at SPECIALIZATION with "unsupported expression". Same tiles,
@@ -331,23 +360,25 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     c_sb = []
     for _ in range(n_latent):
         c_sb.append(_sbuf(LATENT_TILE, s_kv))
+    c_stage = _stage(c_kv_hbm, LATENT_TILE, s_kv)
     for li in range(n_latent):
-        nisa.dma_transpose(
-            dst=c_sb[li],
-            src=c_kv_hbm.ap(pattern=[[latent, s_kv], [1, LATENT_TILE]],
-                            offset=li * LATENT_TILE),
-        )
+        _transpose_rows(c_stage, c_kv_hbm, latent, s_kv, LATENT_TILE, li * LATENT_TILE)
+        nisa.tensor_copy(dst=c_sb[li], src=c_stage)
     k_pe_sb = None
     if rope > 0:
         k_pe_sb = _sbuf(rope, s_kv)
-        nisa.dma_transpose(
-            dst=k_pe_sb,
-            src=k_pe_hbm.ap(pattern=[[rope, s_kv], [1, rope]], offset=0),
-        )
+        k_pe_stage = _stage(k_pe_hbm, rope, s_kv)
+        _transpose_rows(k_pe_stage, k_pe_hbm, rope, s_kv, rope, 0)
+        nisa.tensor_copy(dst=k_pe_sb, src=k_pe_stage)
 
     # ---- per-query working set, allocated once and reused across the loop -------
+    qpb = _queries_per_block(seq, heads)
+    block = qpb * heads
     idx_sb = _sbuf_u32(LATENT_TILE, topk)
-    q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(heads))
+    q_stage = []
+    for _ in range(n_latent):
+        q_stage.append(_stage(q_lift_hbm, LATENT_TILE, block))
+    q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(block))
     c_g = _sbuf(LATENT_TILE, n_latent, topk)
     c_g_t = _sbuf(KEY_CHUNK, n_chunks, latent)
     p_t = _sbuf(KEY_CHUNK, n_chunks, heads)
@@ -357,7 +388,8 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     row_sum = _sbuf(heads, 1)
     recip = _sbuf(heads, 1)
     out_sb = _sbuf(heads, latent)
-    q_pe_t = _sbuf(rope, heads) if rope > 0 else None
+    q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
+    q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
     k_pe_g = _sbuf(rope, topk) if rope > 0 else None
 
     # `inc-glm53f-098`'s sentinel working set. In EXPONENT units divided by the scale,
@@ -371,116 +403,118 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     p_m = sen[7]
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
 
-    for q_idx in nl.affine_range(seq):
-        # ---- this query's selected rows, replicated to every partition ----------
-        # `nc_n_gather` gathers within a partition and reads its offsets from the
-        # SAME partition, so all 128 latent partitions need the same K offsets. A
-        # zero-stride partition read is one DMA and replicates them for free; the
-        # alternative is a shuffle plus a fan-out copy.
-        _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
-
-        # ---- gather the latent cache rows: one instruction per latent tile ------
+    # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
+    # One transpose per latent tile lands the block's Q rows in the source dtype and
+    # one copy widens them; each query then reads its own columns of the block tile.
+    for qb in nl.affine_range(seq // qpb):
+        q0 = qb * qpb
         for li in range(n_latent):
-            nisa.nc_n_gather(dst=c_g[:, li, :], data=c_sb[li], indices=idx_sb)
-
-        # ---- this query's Q latent, transposed onto partitions ------------------
-        for li in range(n_latent):
-            nisa.dma_transpose(
-                dst=q_lift_t[:, li, 0:heads],
-                src=q_lift_hbm.ap(pattern=[[latent, heads], [1, LATENT_TILE]],
-                                  offset=q_idx * heads * latent + li * LATENT_TILE),
-            )
-
-        # ---- MM1: scores[H, K] = sum over latent tiles of q_lift_t.T @ c_g ------
-        scores_ps = _psum(heads, topk)
-        for li in range(n_latent):
-            nisa.nc_matmul(
-                dst=scores_ps,
-                stationary=q_lift_t[:, li, 0:heads],
-                moving=c_g[:, li, :],
-                accumulate=(li > 0),
-            )
+            _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
+                            q0 * heads * latent + li * LATENT_TILE)
+            nisa.tensor_copy(dst=q_lift_t[:, li, 0:block], src=q_stage[li])
         if rope > 0:
-            nisa.nc_n_gather(dst=k_pe_g, data=k_pe_sb, indices=idx_sb[0:rope, :])
-            nisa.dma_transpose(
-                dst=q_pe_t,
-                src=q_pe_hbm.ap(pattern=[[rope, heads], [1, rope]],
-                                offset=q_idx * heads * rope),
-            )
-            nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t, moving=k_pe_g,
-                           accumulate=True)
+            _transpose_rows(q_pe_stage, q_pe_hbm, rope, block, rope, q0 * heads * rope)
+            nisa.tensor_copy(dst=q_pe_t[:, 0:block], src=q_pe_stage)
+        for qi in range(qpb):
+            q_idx = q0 + qi
+            h0 = qi * heads
+            # ---- this query's selected rows, replicated to every partition ----------
+            # `nc_n_gather` gathers within a partition and reads its offsets from the
+            # SAME partition, so all 128 latent partitions need the same K offsets. A
+            # zero-stride partition read is one DMA and replicates them for free; the
+            # alternative is a shuffle plus a fan-out copy.
+            _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
 
-        # ---- the gathered cache, transposed for MM2 -----------------------------
-        # Hoisted above the softmax on purpose: it depends only on the gather, so it
-        # is work the engines can overlap with the softmax chain rather than wait on.
-        for ck in range(n_chunks):
-            ks = ck * KEY_CHUNK
+            # ---- gather the latent cache rows: one instruction per latent tile ------
             for li in range(n_latent):
-                c_g_t_ps = _psum(KEY_CHUNK, LATENT_TILE)
-                nisa.nc_transpose(dst=c_g_t_ps, data=c_g[:, li, ks:ks + KEY_CHUNK])
-                nisa.tensor_copy(
-                    dst=c_g_t[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE],
-                    src=c_g_t_ps,
+                nisa.nc_n_gather(dst=c_g[:, li, :], data=c_sb[li], indices=idx_sb)
+
+            # ---- MM1: scores[H, K] = sum over latent tiles of q_lift_t.T @ c_g ------
+            scores_ps = _psum(heads, topk)
+            for li in range(n_latent):
+                nisa.nc_matmul(
+                    dst=scores_ps,
+                    stationary=q_lift_t[:, li, h0:h0 + heads],
+                    moving=c_g[:, li, :],
+                    accumulate=(li > 0),
                 )
+            if rope > 0:
+                nisa.nc_n_gather(dst=k_pe_g, data=k_pe_sb, indices=idx_sb[0:rope, :])
+                nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t[:, h0:h0 + heads],
+                               moving=k_pe_g,
+                               accumulate=True)
 
-        # ---- the sentinel columns leave the softmax, BEFORE the max -------------
-        # `inc-glm53f-098`, and the ORDER is the content. On the RAW scores because
-        # `activation` scales its data, which is what caps a masked column's exponent at
-        # -`_SENTINEL_EXP_FLOOR` whatever scale the caller passed; and BEFORE the max,
-        # because a max taken over unmasked scores could be a sentinel column's and would
-        # drag every real column's exponent down with it.
-        #
-        # WITH NO SENTINEL BOTH MASKING STEPS ARE IDENTITIES -- `mask_bias` is exactly
-        # 0.0 and `valid_f` exactly 1.0, and ``x + 0.0`` and ``x * 1.0`` are exact in
-        # fp32. That is why the acceptance claims BIT-IDENTITY there, not a tolerance.
-        nisa.tensor_tensor(dst=scores_m, data1=scores_ps, data2=mask_bias, op=nl.add)
+            # ---- the gathered cache, transposed for MM2 -----------------------------
+            # Hoisted above the softmax on purpose: it depends only on the gather, so it
+            # is work the engines can overlap with the softmax chain rather than wait on.
+            for ck in range(n_chunks):
+                ks = ck * KEY_CHUNK
+                for li in range(n_latent):
+                    c_g_t_ps = _psum(KEY_CHUNK, LATENT_TILE)
+                    nisa.nc_transpose(dst=c_g_t_ps, data=c_g[:, li, ks:ks + KEY_CHUNK])
+                    nisa.tensor_copy(
+                        dst=c_g_t[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                        src=c_g_t_ps,
+                    )
 
-        # ---- softmax over K, per head row --------------------------------------
-        # The max is taken NEGATED and then scaled, so `activation` can fold the
-        # subtraction into its bias and produce the row sum in the same pass. The
-        # scale multiplies the raw scores, so the bias must carry the same factor --
-        # that is why the negated max is scaled here and not left raw.
-        nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
-                           negate=True)
-        nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
-                           operand0=softmax_scale, engine=nisa.engine.vector)
-        nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
-                        scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
-                        reduce_cmd=nisa.reduce_cmd.reset_reduce)
-        nisa.reciprocal(dst=recip, data=row_sum)
+            # ---- the sentinel columns leave the softmax, BEFORE the max -------------
+            # `-098`, and the ORDER is the content. On the RAW scores because
+            # `activation` scales its data, which is what caps a masked column's exponent at
+            # -`_SENTINEL_EXP_FLOOR` whatever scale the caller passed; and BEFORE the max,
+            # because a max taken over unmasked scores could be a sentinel column's and would
+            # drag every real column's exponent down with it.
+            #
+            # WITH NO SENTINEL BOTH MASKING STEPS ARE IDENTITIES -- `mask_bias` is exactly
+            # 0.0 and `valid_f` exactly 1.0, and ``x + 0.0`` and ``x * 1.0`` are exact in
+            # fp32. That is why the acceptance claims BIT-IDENTITY there, not a tolerance.
+            nisa.tensor_tensor(dst=scores_m, data1=scores_ps, data2=mask_bias, op=nl.add)
 
-        # AND EXACTLY ZERO, not merely small. The bias alone underflows the exp for a row
-        # holding at least one real column, but a WHOLLY sentinel row's own maximum
-        # rebases its exponent back to 0 and the exp returns 1, so the zero is multiplied
-        # in. That is also what makes that row's output exactly zeros with NO
-        # divide-by-zero: its numerator is exactly 0 while `row_sum` stays at least 1
-        # (the row's argmax column contributes ``exp(0)``), and ``0 * finite`` is 0. `p`
-        # is left alone and MM2 reads `p_m` -- writing back onto an operand is the idiom
-        # `kda/decode_state.py` records as the one to avoid.
-        nisa.tensor_tensor(dst=p_m, data1=p, data2=valid_f, op=nl.multiply)
+            # ---- softmax over K, per head row --------------------------------------
+            # The max is taken NEGATED and then scaled, so `activation` can fold the
+            # subtraction into its bias and produce the row sum in the same pass. The
+            # scale multiplies the raw scores, so the bias must carry the same factor --
+            # that is why the negated max is scaled here and not left raw.
+            nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
+                               negate=True)
+            nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
+                               operand0=softmax_scale, engine=nisa.engine.vector)
+            nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
+                            scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
+                            reduce_cmd=nisa.reduce_cmd.reset_reduce)
+            nisa.reciprocal(dst=recip, data=row_sum)
 
-        # ---- MM2: out[H, L] = p[H, K] @ c_g[K, L], K contracted on partitions ---
-        for ck in range(n_chunks):
-            ks = ck * KEY_CHUNK
-            p_t_ps = _psum(KEY_CHUNK, heads)
-            nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
-            nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
+            # AND EXACTLY ZERO, not merely small. The bias alone underflows the exp for a row
+            # holding at least one real column, but a WHOLLY sentinel row's own maximum
+            # rebases its exponent back to 0 and the exp returns 1, so the zero is multiplied
+            # in. That is also what makes that row's output exactly zeros with NO
+            # divide-by-zero: its numerator is exactly 0 while `row_sum` stays at least 1
+            # (the row's argmax column contributes ``exp(0)``), and ``0 * finite`` is 0. `p`
+            # is left alone and MM2 reads `p_m` -- writing back onto an operand is the idiom
+            # `kda/decode_state.py` records as the one to avoid.
+            nisa.tensor_tensor(dst=p_m, data1=p, data2=valid_f, op=nl.multiply)
 
-        pv_ps = _psum(heads, latent)
-        for ck in range(n_chunks):
-            nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
-                           moving=c_g_t[:, ck, :], accumulate=(ck > 0))
+            # ---- MM2: out[H, L] = p[H, K] @ c_g[K, L], K contracted on partitions ---
+            for ck in range(n_chunks):
+                ks = ck * KEY_CHUNK
+                p_t_ps = _psum(KEY_CHUNK, heads)
+                nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
+                nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
 
-        # The softmax denominator is applied HERE rather than to `p`, so it costs one
-        # pass over [H, L] instead of one over [H, K] plus the precision of dividing
-        # before the accumulation.
-        nisa.tensor_scalar(dst=out_sb, data=pv_ps, op0=nl.multiply, operand0=recip,
-                           engine=nisa.engine.vector)
-        nl.store(
-            out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                       offset=q_idx * heads * latent),
-            value=out_sb,
-        )
+            pv_ps = _psum(heads, latent)
+            for ck in range(n_chunks):
+                nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
+                               moving=c_g_t[:, ck, :], accumulate=(ck > 0))
+
+            # The softmax denominator is applied HERE rather than to `p`, so it costs one
+            # pass over [H, L] instead of one over [H, K] plus the precision of dividing
+            # before the accumulation.
+            nisa.tensor_scalar(dst=out_sb, data=pv_ps, op0=nl.multiply, operand0=recip,
+                               engine=nisa.engine.vector)
+            nl.store(
+                out_hbm.ap(pattern=[[latent, heads], [1, latent]],
+                           offset=q_idx * heads * latent),
+                value=out_sb,
+            )
 
 
 @nki.jit
@@ -643,7 +677,7 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     out_tiles = _output_tiles(latent)
 
     # ---- the cache, transposed onto partitions ONCE for the whole call ----------
-    # One `dma_transpose` per latent tile, exactly as `-040`, except the last tile's
+    # One staged transpose per latent tile, exactly as `-040`, except the last tile's
     # extent is the remainder. The tail transpose was measured on its own before this
     # was written, because it was the reading least likely to be legal.
     #
@@ -664,26 +698,29 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     for li in range(len(lat_tiles)):
         offset = lat_tiles[li][0]
         extent = lat_tiles[li][1]
-        nisa.dma_transpose(
-            dst=c_sb[li],
-            src=c_kv_hbm.ap(pattern=[[latent, s_kv], [1, extent]], offset=offset),
-        )
+        c_stage = _stage(c_kv_hbm, extent, s_kv)
+        _transpose_rows(c_stage, c_kv_hbm, latent, s_kv, extent, offset)
+        nisa.tensor_copy(dst=c_sb[li], src=c_stage)
     k_pe_sb = None
     if rope > 0:
         k_pe_sb = _sbuf(rope, s_kv)
-        nisa.dma_transpose(
-            dst=k_pe_sb,
-            src=k_pe_hbm.ap(pattern=[[rope, s_kv], [1, rope]], offset=0),
-        )
+        k_pe_stage = _stage(k_pe_hbm, rope, s_kv)
+        _transpose_rows(k_pe_stage, k_pe_hbm, rope, s_kv, rope, 0)
+        nisa.tensor_copy(dst=k_pe_sb, src=k_pe_stage)
 
     # ---- per-query working set, allocated once and reused across the loop -------
     # `c_g_t` and `out_sb` stay single buffers with the latent on their FREE axis,
     # where a ragged extent needs no special case; only the partition-axis buffers
     # become lists.
+    qpb = _queries_per_block(seq, heads)
+    block = qpb * heads
     idx_sb = _sbuf_u32(LATENT_TILE, topk)
+    q_stage = []
+    for li in range(len(lat_tiles)):
+        q_stage.append(_stage(q_lift_hbm, lat_tiles[li][1], block))
     q_lift_t = []
     for li in range(len(lat_tiles)):
-        q_lift_t.append(_sbuf(lat_tiles[li][1], heads))
+        q_lift_t.append(_sbuf(lat_tiles[li][1], _aligned(block)))
     c_g = []
     for li in range(len(lat_tiles)):
         c_g.append(_sbuf(lat_tiles[li][1], topk))
@@ -695,7 +732,8 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     row_sum = _sbuf(heads, 1)
     recip = _sbuf(heads, 1)
     out_sb = _sbuf(heads, latent)
-    q_pe_t = _sbuf(rope, heads) if rope > 0 else None
+    q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
+    q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
     k_pe_g = _sbuf(rope, topk) if rope > 0 else None
 
     # `inc-glm53f-098`'s sentinel working set, `-040`'s exactly and for a reason: the
@@ -709,110 +747,112 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     p_m = sen[7]
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
 
-    for q_idx in nl.affine_range(seq):
-        # ---- this query's selected rows, replicated to every partition ----------
-        _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
-
-        # ---- gather the latent cache rows: one instruction per latent tile ------
-        # The index tile is SLICED to the data tile's extent. `nc_n_gather` reads its
-        # offsets from the same partition it writes, so a 3-deep data tile needs a
-        # 3-deep index tile and not the full 128.
-        for li in range(len(lat_tiles)):
-            extent = lat_tiles[li][1]
-            nisa.nc_n_gather(dst=c_g[li], data=c_sb[li], indices=idx_sb[0:extent, :])
-
-        # ---- this query's Q latent, transposed onto partitions ------------------
+    # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
+    # One transpose per latent tile lands the block's Q rows in the source dtype and
+    # one copy widens them; each query then reads its own columns of the block tile.
+    for qb in nl.affine_range(seq // qpb):
+        q0 = qb * qpb
         for li in range(len(lat_tiles)):
             offset = lat_tiles[li][0]
             extent = lat_tiles[li][1]
-            nisa.dma_transpose(
-                dst=q_lift_t[li],
-                src=q_lift_hbm.ap(pattern=[[latent, heads], [1, extent]],
-                                  offset=q_idx * heads * latent + offset),
-            )
-
-        # ---- MM1: scores[H, K] = sum over latent tiles of q_lift_t.T @ c_g ------
-        # The ragged tail tile contributes a 3-deep contraction to the same
-        # accumulation as the 16 full ones. Nothing is masked and nothing is padded:
-        # a shorter contraction is a shorter contraction.
-        scores_ps = _psum(heads, topk)
-        for li in range(len(lat_tiles)):
-            nisa.nc_matmul(
-                dst=scores_ps,
-                stationary=q_lift_t[li],
-                moving=c_g[li],
-                accumulate=(li > 0),
-            )
+            _transpose_rows(q_stage[li], q_lift_hbm, latent, block, extent,
+                            q0 * heads * latent + offset)
+            nisa.tensor_copy(dst=q_lift_t[li][:, 0:block], src=q_stage[li])
         if rope > 0:
-            nisa.nc_n_gather(dst=k_pe_g, data=k_pe_sb, indices=idx_sb[0:rope, :])
-            nisa.dma_transpose(
-                dst=q_pe_t,
-                src=q_pe_hbm.ap(pattern=[[rope, heads], [1, rope]],
-                                offset=q_idx * heads * rope),
-            )
-            nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t, moving=k_pe_g,
-                           accumulate=True)
+            _transpose_rows(q_pe_stage, q_pe_hbm, rope, block, rope, q0 * heads * rope)
+            nisa.tensor_copy(dst=q_pe_t[:, 0:block], src=q_pe_stage)
+        for qi in range(qpb):
+            q_idx = q0 + qi
+            h0 = qi * heads
+            # ---- this query's selected rows, replicated to every partition ----------
+            _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
 
-        # ---- the gathered cache, transposed for MM2 -----------------------------
-        # Each latent tile transposes into its own slice of the latent free axis, so
-        # the ragged tail lands as a 3-wide slice rather than a padded 128-wide one.
-        for ck in range(n_chunks):
-            ks = ck * KEY_CHUNK
+            # ---- gather the latent cache rows: one instruction per latent tile ------
+            # The index tile is SLICED to the data tile's extent. `nc_n_gather` reads its
+            # offsets from the same partition it writes, so a 3-deep data tile needs a
+            # 3-deep index tile and not the full 128.
             for li in range(len(lat_tiles)):
-                offset = lat_tiles[li][0]
                 extent = lat_tiles[li][1]
-                c_g_t_ps = _psum(KEY_CHUNK, extent)
-                nisa.nc_transpose(dst=c_g_t_ps, data=c_g[li][:, ks:ks + KEY_CHUNK])
-                nisa.tensor_copy(
-                    dst=c_g_t[:, ck, offset:offset + extent],
-                    src=c_g_t_ps,
+                nisa.nc_n_gather(dst=c_g[li], data=c_sb[li], indices=idx_sb[0:extent, :])
+
+            # ---- MM1: scores[H, K] = sum over latent tiles of q_lift_t.T @ c_g ------
+            # The ragged tail tile contributes a 3-deep contraction to the same
+            # accumulation as the 16 full ones. Nothing is masked and nothing is padded:
+            # a shorter contraction is a shorter contraction.
+            scores_ps = _psum(heads, topk)
+            for li in range(len(lat_tiles)):
+                nisa.nc_matmul(
+                    dst=scores_ps,
+                    stationary=q_lift_t[li][:, h0:h0 + heads],
+                    moving=c_g[li],
+                    accumulate=(li > 0),
                 )
+            if rope > 0:
+                nisa.nc_n_gather(dst=k_pe_g, data=k_pe_sb, indices=idx_sb[0:rope, :])
+                nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t[:, h0:h0 + heads],
+                               moving=k_pe_g,
+                               accumulate=True)
 
-        # ---- softmax over K, per head row --------------------------------------
-        # Untouched by the tiling: the scores tile is [H, K] whatever the latent rank
-        # was, so this is `-040`'s chain verbatim -- including `-098`'s two masking
-        # steps, which are also facts about K and not about the latent.
-        nisa.tensor_tensor(dst=scores_m, data1=scores_ps, data2=mask_bias, op=nl.add)
-        nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
-                           negate=True)
-        nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
-                           operand0=softmax_scale, engine=nisa.engine.vector)
-        nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
-                        scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
-                        reduce_cmd=nisa.reduce_cmd.reset_reduce)
-        nisa.reciprocal(dst=recip, data=row_sum)
-        nisa.tensor_tensor(dst=p_m, data1=p, data2=valid_f, op=nl.multiply)
-
-        # ---- MM2: out[H, L] = p[H, K] @ c_g[K, L], K contracted on partitions ---
-        for ck in range(n_chunks):
-            ks = ck * KEY_CHUNK
-            p_t_ps = _psum(KEY_CHUNK, heads)
-            nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
-            nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
-
-        # THE SECOND TILING, and the one `-040`'s bound was really about: the latent
-        # is MM2's moving free axis, so the output is produced 512 columns at a time
-        # and the last tile is 3 wide. The denominator is applied per output tile, for
-        # `-040`'s reason -- one pass over [H, L] rather than one over [H, K].
-        # A simple target plus subscripts, the smaller of the two measured repairs: the
-        # iteration survives and only the unpacking goes. This one carries no
-        # `enumerate`, so it needs no index. Evidence: probe-096-loop-host.out arm H4.
-        for otile in out_tiles:
-            offset = otile[0]
-            extent = otile[1]
-            pv_ps = _psum(heads, extent)
+            # ---- the gathered cache, transposed for MM2 -----------------------------
+            # Each latent tile transposes into its own slice of the latent free axis, so
+            # the ragged tail lands as a 3-wide slice rather than a padded 128-wide one.
             for ck in range(n_chunks):
-                nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
-                               moving=c_g_t[:, ck, offset:offset + extent],
-                               accumulate=(ck > 0))
-            nisa.tensor_scalar(dst=out_sb[:, offset:offset + extent], data=pv_ps,
-                               op0=nl.multiply, operand0=recip,
-                               engine=nisa.engine.vector)
-        nl.store(
-            out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                       offset=q_idx * heads * latent),
-            value=out_sb,
-        )
+                ks = ck * KEY_CHUNK
+                for li in range(len(lat_tiles)):
+                    offset = lat_tiles[li][0]
+                    extent = lat_tiles[li][1]
+                    c_g_t_ps = _psum(KEY_CHUNK, extent)
+                    nisa.nc_transpose(dst=c_g_t_ps, data=c_g[li][:, ks:ks + KEY_CHUNK])
+                    nisa.tensor_copy(
+                        dst=c_g_t[:, ck, offset:offset + extent],
+                        src=c_g_t_ps,
+                    )
+
+            # ---- softmax over K, per head row --------------------------------------
+            # Untouched by the tiling: the scores tile is [H, K] whatever the latent rank
+            # was, so this is `-040`'s chain verbatim -- including `-098`'s two masking
+            # steps, which are also facts about K and not about the latent.
+            nisa.tensor_tensor(dst=scores_m, data1=scores_ps, data2=mask_bias, op=nl.add)
+            nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
+                               negate=True)
+            nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
+                               operand0=softmax_scale, engine=nisa.engine.vector)
+            nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
+                            scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
+                            reduce_cmd=nisa.reduce_cmd.reset_reduce)
+            nisa.reciprocal(dst=recip, data=row_sum)
+            nisa.tensor_tensor(dst=p_m, data1=p, data2=valid_f, op=nl.multiply)
+
+            # ---- MM2: out[H, L] = p[H, K] @ c_g[K, L], K contracted on partitions ---
+            for ck in range(n_chunks):
+                ks = ck * KEY_CHUNK
+                p_t_ps = _psum(KEY_CHUNK, heads)
+                nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
+                nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
+
+            # THE SECOND TILING, and the one `-040`'s bound was really about: the latent
+            # is MM2's moving free axis, so the output is produced 512 columns at a time
+            # and the last tile is 3 wide. The denominator is applied per output tile, for
+            # `-040`'s reason -- one pass over [H, L] rather than one over [H, K].
+            # A simple target plus subscripts, the smaller of the two measured repairs: the
+            # iteration survives and only the unpacking goes. This one carries no
+            # `enumerate`, so it needs no index. Evidence: probe-096-loop-host.out arm H4.
+            for otile in out_tiles:
+                offset = otile[0]
+                extent = otile[1]
+                pv_ps = _psum(heads, extent)
+                for ck in range(n_chunks):
+                    nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
+                                   moving=c_g_t[:, ck, offset:offset + extent],
+                                   accumulate=(ck > 0))
+                nisa.tensor_scalar(dst=out_sb[:, offset:offset + extent], data=pv_ps,
+                                   op0=nl.multiply, operand0=recip,
+                                   engine=nisa.engine.vector)
+            nl.store(
+                out_hbm.ap(pattern=[[latent, heads], [1, latent]],
+                           offset=q_idx * heads * latent),
+                value=out_sb,
+            )
 
 
 @nki.jit
@@ -1001,25 +1041,27 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     c_sb = []
     for _ in range(n_latent):
         c_sb.append(_sbuf(LATENT_TILE, s_kv))
+    c_stage = _stage(c_kv_hbm, LATENT_TILE, s_kv)
     for li in range(n_latent):
-        nisa.dma_transpose(
-            dst=c_sb[li],
-            src=c_kv_hbm.ap(pattern=[[latent, s_kv], [1, LATENT_TILE]],
-                            offset=li * LATENT_TILE),
-        )
+        _transpose_rows(c_stage, c_kv_hbm, latent, s_kv, LATENT_TILE, li * LATENT_TILE)
+        nisa.tensor_copy(dst=c_sb[li], src=c_stage)
     k_pe_sb = None
     if rope > 0:
         k_pe_sb = _sbuf(rope, s_kv)
-        nisa.dma_transpose(
-            dst=k_pe_sb,
-            src=k_pe_hbm.ap(pattern=[[rope, s_kv], [1, rope]], offset=0),
-        )
+        k_pe_stage = _stage(k_pe_hbm, rope, s_kv)
+        _transpose_rows(k_pe_stage, k_pe_hbm, rope, s_kv, rope, 0)
+        nisa.tensor_copy(dst=k_pe_sb, src=k_pe_stage)
 
     # ---- the working set, sized to ONE SCORE TILE and reused by every tile -------
     # This is the point of tiling rather than widening: every buffer below is the size
     # `-040`'s was at `topk == MOVING_MAX`, whatever K the caller passes.
+    qpb = _queries_per_block(seq, heads)
+    block = qpb * heads
     idx_sb = _sbuf_u32(LATENT_TILE, tile_max)
-    q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(heads))
+    q_stage = []
+    for _ in range(n_latent):
+        q_stage.append(_stage(q_lift_hbm, LATENT_TILE, block))
+    q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(block))
     c_g = _sbuf(LATENT_TILE, n_latent, tile_max)
     c_g_t = _sbuf(KEY_CHUNK, chunk_max, latent)
     p_t = _sbuf(KEY_CHUNK, chunk_max, heads)
@@ -1029,7 +1071,8 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     tile_sum = _sbuf(heads, 1)
     recip = _sbuf(heads, 1)
     out_sb = _sbuf(heads, latent)
-    q_pe_t = _sbuf(rope, heads) if rope > 0 else None
+    q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
+    q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
     k_pe_g = _sbuf(rope, tile_max) if rope > 0 else None
 
     # ---- the running state carried ACROSS score tiles ----------------------------
@@ -1073,168 +1116,165 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     p_m = sen[7]
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
 
-    for q_idx in nl.affine_range(seq):
-        # ---- this query's Q latent, transposed onto partitions ONCE --------------
-        # HOISTED ABOVE THE TILE LOOP on purpose: Q does not depend on which selected
-        # rows are being scored, so transposing it per tile would repeat the work once
-        # per tile for no reading.
+    # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
+    # One transpose per latent tile lands the block's Q rows in the source dtype and
+    # one copy widens them; each query then reads its own columns of the block tile.
+    for qb in nl.affine_range(seq // qpb):
+        q0 = qb * qpb
         for li in range(n_latent):
-            nisa.dma_transpose(
-                dst=q_lift_t[:, li, 0:heads],
-                src=q_lift_hbm.ap(pattern=[[latent, heads], [1, LATENT_TILE]],
-                                  offset=q_idx * heads * latent + li * LATENT_TILE),
-            )
+            _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
+                            q0 * heads * latent + li * LATENT_TILE)
+            nisa.tensor_copy(dst=q_lift_t[:, li, 0:block], src=q_stage[li])
         if rope > 0:
-            nisa.dma_transpose(
-                dst=q_pe_t,
-                src=q_pe_hbm.ap(pattern=[[rope, heads], [1, rope]],
-                                offset=q_idx * heads * rope),
-            )
+            _transpose_rows(q_pe_stage, q_pe_hbm, rope, block, rope, q0 * heads * rope)
+            nisa.tensor_copy(dst=q_pe_t[:, 0:block], src=q_pe_stage)
+        for qi in range(qpb):
+            q_idx = q0 + qi
+            h0 = qi * heads
+            # NOT ``for ti, (ks, extent) in enumerate(tiles)``. That line held TWO
+            # refusals of its own: the tuple target is refused with "expecting simple
+            # variable", and `enumerate` is refused separately with "failed to resolve
+            # name 'builtins.enumerate'". Evidence: increments/probe-096-loop-host.out,
+            # arms H2 and H5. Indexing by range avoids both, and `ti`, `ks` and `extent`
+            # are bound to exactly what they were before, in the same order.
+            for ti in range(len(tiles)):
+                ks = tiles[ti][0]
+                extent = tiles[ti][1]
+                n_chunks = extent // KEY_CHUNK
 
-        # NOT ``for ti, (ks, extent) in enumerate(tiles)``. That line held TWO
-        # refusals of its own: the tuple target is refused with "expecting simple
-        # variable", and `enumerate` is refused separately with "failed to resolve
-        # name 'builtins.enumerate'". Evidence: increments/probe-096-loop-host.out,
-        # arms H2 and H5. Indexing by range avoids both, and `ti`, `ks` and `extent`
-        # are bound to exactly what they were before, in the same order.
-        for ti in range(len(tiles)):
-            ks = tiles[ti][0]
-            extent = tiles[ti][1]
-            n_chunks = extent // KEY_CHUNK
+                # ---- THIS TILE's selected rows, replicated to every partition --------
+                # The offset is where the tiling shows: `-040` loaded all K rows of the
+                # query, this loads the tile's slice of them.
+                # Loaded SIGNED and clamped before the gather reads it, per `-098`. The
+                # offset carries the tile's `ks` for the same reason the load below it does.
+                _mask_sentinel(topk_hbm, q_idx * topk + ks, extent, heads, sentinel_bias,
+                               sen, idx_sb)
 
-            # ---- THIS TILE's selected rows, replicated to every partition --------
-            # The offset is where the tiling shows: `-040` loaded all K rows of the
-            # query, this loads the tile's slice of them.
-            # Loaded SIGNED and clamped before the gather reads it, per `-098`. The
-            # offset carries the tile's `ks` for the same reason the load below it does.
-            _mask_sentinel(topk_hbm, q_idx * topk + ks, extent, heads, sentinel_bias,
-                           sen, idx_sb)
-
-            # ---- gather this tile's cache rows: one instruction per latent tile ---
-            for li in range(n_latent):
-                nisa.nc_n_gather(dst=c_g[:, li, 0:extent], data=c_sb[li],
-                                 indices=idx_sb[:, 0:extent])
-
-            # ---- MM1 over this tile: scores[H, extent] ---------------------------
-            scores_ps = _psum(heads, extent)
-            for li in range(n_latent):
-                nisa.nc_matmul(
-                    dst=scores_ps,
-                    stationary=q_lift_t[:, li, 0:heads],
-                    moving=c_g[:, li, 0:extent],
-                    accumulate=(li > 0),
-                )
-            if rope > 0:
-                nisa.nc_n_gather(dst=k_pe_g[:, 0:extent], data=k_pe_sb,
-                                 indices=idx_sb[0:rope, 0:extent])
-                nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t,
-                               moving=k_pe_g[:, 0:extent], accumulate=True)
-
-            # ---- the gathered cache, transposed for MM2 --------------------------
-            for ck in range(n_chunks):
-                cs = ck * KEY_CHUNK
+                # ---- gather this tile's cache rows: one instruction per latent tile ---
                 for li in range(n_latent):
-                    c_g_t_ps = _psum(KEY_CHUNK, LATENT_TILE)
-                    nisa.nc_transpose(dst=c_g_t_ps,
-                                      data=c_g[:, li, cs:cs + KEY_CHUNK])
-                    nisa.tensor_copy(
-                        dst=c_g_t[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE],
-                        src=c_g_t_ps,
+                    nisa.nc_n_gather(dst=c_g[:, li, 0:extent], data=c_sb[li],
+                                     indices=idx_sb[:, 0:extent])
+
+                # ---- MM1 over this tile: scores[H, extent] ---------------------------
+                scores_ps = _psum(heads, extent)
+                for li in range(n_latent):
+                    nisa.nc_matmul(
+                        dst=scores_ps,
+                        stationary=q_lift_t[:, li, h0:h0 + heads],
+                        moving=c_g[:, li, 0:extent],
+                        accumulate=(li > 0),
                     )
+                if rope > 0:
+                    nisa.nc_n_gather(dst=k_pe_g[:, 0:extent], data=k_pe_sb,
+                                     indices=idx_sb[0:rope, 0:extent])
+                    nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t[:, h0:h0 + heads],
+                                   moving=k_pe_g[:, 0:extent], accumulate=True)
 
-            # ---- softmax over THIS TILE's keys -- `-040`'s chain, verbatim -------
-            # Against the TILE's own max, which is the only max available yet. The
-            # merge below is what makes that legitimate. `-098`'s two masking steps sit
-            # exactly where they sit in `-040`: the bias before the tile's max, the
-            # zeroing before the tile's MM2.
-            nisa.tensor_tensor(dst=scores_m[:, 0:extent], data1=scores_ps,
-                               data2=mask_bias[:, 0:extent], op=nl.add)
-            nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum,
-                               data=scores_m[:, 0:extent], axis=1, negate=True)
-            nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
-                               operand0=softmax_scale, engine=nisa.engine.vector)
-            nisa.activation(dst=p[:, 0:extent], op=nl.exp,
-                            data=scores_m[:, 0:extent],
-                            bias=exp_bias, scale=softmax_scale, reduce_op=nl.add,
-                            reduce_res=tile_sum,
-                            reduce_cmd=nisa.reduce_cmd.reset_reduce)
-            nisa.tensor_tensor(dst=p_m[:, 0:extent], data1=p[:, 0:extent],
-                               data2=valid_f[:, 0:extent], op=nl.multiply)
+                # ---- the gathered cache, transposed for MM2 --------------------------
+                for ck in range(n_chunks):
+                    cs = ck * KEY_CHUNK
+                    for li in range(n_latent):
+                        c_g_t_ps = _psum(KEY_CHUNK, LATENT_TILE)
+                        nisa.nc_transpose(dst=c_g_t_ps,
+                                          data=c_g[:, li, cs:cs + KEY_CHUNK])
+                        nisa.tensor_copy(
+                            dst=c_g_t[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                            src=c_g_t_ps,
+                        )
 
-            # ---- MM2 over this tile: pv[H, L] = p[H, extent] @ c_g[extent, L] ----
-            for ck in range(n_chunks):
-                cs = ck * KEY_CHUNK
-                p_t_ps = _psum(KEY_CHUNK, heads)
-                nisa.nc_transpose(dst=p_t_ps, data=p_m[:, cs:cs + KEY_CHUNK])
-                nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
-            pv_ps = _psum(heads, latent)
-            for ck in range(n_chunks):
-                nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
-                               moving=c_g_t[:, ck, :], accumulate=(ck > 0))
+                # ---- softmax over THIS TILE's keys -- `-040`'s chain, verbatim -------
+                # Against the TILE's own max, which is the only max available yet. The
+                # merge below is what makes that legitimate. `-098`'s two masking steps sit
+                # exactly where they sit in `-040`: the bias before the tile's max, the
+                # zeroing before the tile's MM2.
+                nisa.tensor_tensor(dst=scores_m[:, 0:extent], data1=scores_ps,
+                                   data2=mask_bias[:, 0:extent], op=nl.add)
+                nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum,
+                                   data=scores_m[:, 0:extent], axis=1, negate=True)
+                nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
+                                   operand0=softmax_scale, engine=nisa.engine.vector)
+                nisa.activation(dst=p[:, 0:extent], op=nl.exp,
+                                data=scores_m[:, 0:extent],
+                                bias=exp_bias, scale=softmax_scale, reduce_op=nl.add,
+                                reduce_res=tile_sum,
+                                reduce_cmd=nisa.reduce_cmd.reset_reduce)
+                nisa.tensor_tensor(dst=p_m[:, 0:extent], data1=p[:, 0:extent],
+                                   data2=valid_f[:, 0:extent], op=nl.multiply)
 
-            # ---- THE MERGE ------------------------------------------------------
-            if single:
-                # ONE TILE: no merge is emitted at all. This arm is what makes the
-                # acceptance's bit-identity claim against `-040` a claim about the same
-                # arithmetic rather than about two implementations that agree closely.
-                nisa.tensor_copy(dst=acc, src=pv_ps)
-                nisa.tensor_copy(dst=run_sum, src=tile_sum)
-                continue
+                # ---- MM2 over this tile: pv[H, L] = p[H, extent] @ c_g[extent, L] ----
+                for ck in range(n_chunks):
+                    cs = ck * KEY_CHUNK
+                    p_t_ps = _psum(KEY_CHUNK, heads)
+                    nisa.nc_transpose(dst=p_t_ps, data=p_m[:, cs:cs + KEY_CHUNK])
+                    nisa.tensor_copy(dst=p_t[:, ck, :], src=p_t_ps)
+                pv_ps = _psum(heads, latent)
+                for ck in range(n_chunks):
+                    nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, :],
+                                   moving=c_g_t[:, ck, :], accumulate=(ck > 0))
 
-            nisa.tensor_scalar(dst=tile_pos, data=exp_bias, op0=nl.multiply,
-                               operand0=-1.0, engine=nisa.engine.vector)
-            if ti == 0:
-                # The first tile INITIALISES the running state; there is nothing to
-                # rescale against yet.
-                nisa.tensor_copy(dst=run_pos, src=tile_pos)
-                nisa.tensor_copy(dst=acc, src=pv_ps)
-                nisa.tensor_copy(dst=run_sum, src=tile_sum)
-                continue
+                # ---- THE MERGE ------------------------------------------------------
+                if single:
+                    # ONE TILE: no merge is emitted at all. This arm is what makes the
+                    # acceptance's bit-identity claim against `-040` a claim about the same
+                    # arithmetic rather than about two implementations that agree closely.
+                    nisa.tensor_copy(dst=acc, src=pv_ps)
+                    nisa.tensor_copy(dst=run_sum, src=tile_sum)
+                    continue
 
-            # The running max, and the two rescale factors it implies. Both are `exp` of
-            # a non-positive number: `run_pos - new_pos` is <= 0 because `new_pos` is
-            # the maximum of the two, and so is `tile_pos - new_pos`. So neither can
-            # overflow, whatever the score spread.
-            nisa.tensor_tensor(dst=new_pos, data1=run_pos, data2=tile_pos,
-                               op=nl.maximum)
-            nisa.tensor_tensor(dst=d_acc, data1=run_pos, data2=new_pos, op=nl.subtract)
-            nisa.activation(dst=c_acc, op=nl.exp, data=d_acc)
-            nisa.tensor_tensor(dst=d_tile, data1=tile_pos, data2=new_pos,
-                               op=nl.subtract)
-            nisa.activation(dst=c_tile, op=nl.exp, data=d_tile)
+                nisa.tensor_scalar(dst=tile_pos, data=exp_bias, op0=nl.multiply,
+                                   operand0=-1.0, engine=nisa.engine.vector)
+                if ti == 0:
+                    # The first tile INITIALISES the running state; there is nothing to
+                    # rescale against yet.
+                    nisa.tensor_copy(dst=run_pos, src=tile_pos)
+                    nisa.tensor_copy(dst=acc, src=pv_ps)
+                    nisa.tensor_copy(dst=run_sum, src=tile_sum)
+                    continue
 
-            # The denominator: what was already summed, rebased, plus this tile's sum,
-            # rebased. Two multiplies and an add, all on [H, 1].
-            nisa.tensor_tensor(dst=sum_kept, data1=run_sum, data2=c_acc,
-                               op=nl.multiply)
-            nisa.tensor_tensor(dst=sum_added, data1=tile_sum, data2=c_tile,
-                               op=nl.multiply)
-            nisa.tensor_tensor(dst=sum_new, data1=sum_kept, data2=sum_added,
-                               op=nl.add)
+                # The running max, and the two rescale factors it implies. Both are `exp` of
+                # a non-positive number: `run_pos - new_pos` is <= 0 because `new_pos` is
+                # the maximum of the two, and so is `tile_pos - new_pos`. So neither can
+                # overflow, whatever the score spread.
+                nisa.tensor_tensor(dst=new_pos, data1=run_pos, data2=tile_pos,
+                                   op=nl.maximum)
+                nisa.tensor_tensor(dst=d_acc, data1=run_pos, data2=new_pos, op=nl.subtract)
+                nisa.activation(dst=c_acc, op=nl.exp, data=d_acc)
+                nisa.tensor_tensor(dst=d_tile, data1=tile_pos, data2=new_pos,
+                                   op=nl.subtract)
+                nisa.activation(dst=c_tile, op=nl.exp, data=d_tile)
 
-            # The output accumulator, rebased the same way. The denominator is applied
-            # ONCE after the last tile, not per tile -- `-040`'s reason, one pass over
-            # [H, L] instead of one over [H, K], and here it also keeps the accumulator
-            # in the numerator's scale so a rescale is a single multiply.
-            nisa.tensor_scalar(dst=acc_kept, data=acc, op0=nl.multiply, operand0=c_acc,
+                # The denominator: what was already summed, rebased, plus this tile's sum,
+                # rebased. Two multiplies and an add, all on [H, 1].
+                nisa.tensor_tensor(dst=sum_kept, data1=run_sum, data2=c_acc,
+                                   op=nl.multiply)
+                nisa.tensor_tensor(dst=sum_added, data1=tile_sum, data2=c_tile,
+                                   op=nl.multiply)
+                nisa.tensor_tensor(dst=sum_new, data1=sum_kept, data2=sum_added,
+                                   op=nl.add)
+
+                # The output accumulator, rebased the same way. The denominator is applied
+                # ONCE after the last tile, not per tile -- `-040`'s reason, one pass over
+                # [H, L] instead of one over [H, K], and here it also keeps the accumulator
+                # in the numerator's scale so a rescale is a single multiply.
+                nisa.tensor_scalar(dst=acc_kept, data=acc, op0=nl.multiply, operand0=c_acc,
+                                   engine=nisa.engine.vector)
+                nisa.tensor_scalar(dst=pv_added, data=pv_ps, op0=nl.multiply,
+                                   operand0=c_tile, engine=nisa.engine.vector)
+                nisa.tensor_tensor(dst=acc_new, data1=acc_kept, data2=pv_added, op=nl.add)
+
+                nisa.tensor_copy(dst=run_pos, src=new_pos)
+                nisa.tensor_copy(dst=run_sum, src=sum_new)
+                nisa.tensor_copy(dst=acc, src=acc_new)
+
+            # ---- one normalisation per query, after the last tile --------------------
+            nisa.reciprocal(dst=recip, data=run_sum)
+            nisa.tensor_scalar(dst=out_sb, data=acc, op0=nl.multiply, operand0=recip,
                                engine=nisa.engine.vector)
-            nisa.tensor_scalar(dst=pv_added, data=pv_ps, op0=nl.multiply,
-                               operand0=c_tile, engine=nisa.engine.vector)
-            nisa.tensor_tensor(dst=acc_new, data1=acc_kept, data2=pv_added, op=nl.add)
-
-            nisa.tensor_copy(dst=run_pos, src=new_pos)
-            nisa.tensor_copy(dst=run_sum, src=sum_new)
-            nisa.tensor_copy(dst=acc, src=acc_new)
-
-        # ---- one normalisation per query, after the last tile --------------------
-        nisa.reciprocal(dst=recip, data=run_sum)
-        nisa.tensor_scalar(dst=out_sb, data=acc, op0=nl.multiply, operand0=recip,
-                           engine=nisa.engine.vector)
-        nl.store(
-            out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                       offset=q_idx * heads * latent),
-            value=out_sb,
-        )
+            nl.store(
+                out_hbm.ap(pattern=[[latent, heads], [1, latent]],
+                           offset=q_idx * heads * latent),
+                value=out_sb,
+            )
 
 
 @nki.jit
@@ -1337,6 +1377,16 @@ def can_run_mla_sparse_attention(reference: Tensor, seq: int, heads: int, latent
     except MlaSparseAttentionError:
         return False
     return True
+
+
+def _kernel_operand(t: Tensor) -> Tensor:
+    """The dtype the kernel reads: a 2-byte float as stored, FP8 widened to bfloat16 (exact), else float32."""
+    t = t.contiguous()
+    if t.dtype in (torch.bfloat16, torch.float16):
+        return t
+    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return t.to(torch.bfloat16)
+    return t.to(torch.float32)
 
 
 def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
@@ -1470,18 +1520,18 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
         nope_entry = mla_sparse_attention_nope_kernel
         rope_entry = mla_sparse_attention_rope_kernel
 
-    q_lift_f32 = q_lift.contiguous().to(torch.float32)
-    c_kv_f32 = c_kv.contiguous().to(torch.float32)
+    q_lift_in = _kernel_operand(q_lift)
+    c_kv_in = _kernel_operand(c_kv)
     topk_i32 = topk_indices.contiguous().to(torch.int32)
     if rope == 0:
         return wrap_nki(nope_entry)(
-            q_lift_f32, c_kv_f32, topk_i32, float(softmax_scale)
+            q_lift_in, c_kv_in, topk_i32, float(softmax_scale)
         )
     return wrap_nki(rope_entry)(
-        q_lift_f32,
-        q_pe.contiguous().to(torch.float32),
-        c_kv_f32,
-        k_pe.contiguous().to(torch.float32),
+        q_lift_in,
+        _kernel_operand(q_pe),
+        c_kv_in,
+        _kernel_operand(k_pe),
         topk_i32,
         float(softmax_scale),
     )
