@@ -149,6 +149,9 @@ GATE_UP_FUSION = 2
 #: Source rows per DMA transpose: the count the DMA engine generates its own
 #: descriptors for, with a 2-byte operand and a 128-wide row.
 DGE_TRANSPOSE_ROWS = 16
+#: Elements per padded SBUF row: 16 of a 2-byte or a 4-byte dtype are whole 32-byte lines, so
+#: the tiles packed after a narrow index or gather tile keep their bases on a line.
+ROW_ALIGN = 16
 
 #: ``GATE_UP`` and ``DOWN`` are re-exported from the producer rather than
 #: re-declared: the two modules must agree on the selector string, and one
@@ -665,6 +668,16 @@ def _gate_up_psum(rows: int = TILE_SIZE, cols: int = GATE_UP_SCALE_BLOCK):
 #: ``(rows, 1)`` int32 in SBUF and never a ``(1, 1)`` tile: as
 #: ``nisa.tensor_scalar``'s ``operand0`` that form does not compile at all, and
 #: ``dsa/ragged_pack.py`` at ``_add_tile`` records the verifier's own words for it.
+def _padded(width: int) -> int:
+    """``width`` rounded up to a whole :data:`ROW_ALIGN` block."""
+    return ((width + ROW_ALIGN - 1) // ROW_ALIGN) * ROW_ALIGN
+
+
+def _column(rows: int):
+    """An int32 ``(rows, 1)`` view of an SBUF tile whose row is whole 32-byte lines."""
+    return nl.ndarray((rows, ROW_ALIGN), dtype=nl.int32, buffer=nl.sbuf)[:, 0:1]
+
+
 def _row_iota(iota_hbm, rows: int):
     """The partition ramp ``0..rows-1``, as an int32 ``(rows, 1)`` SBUF tile.
 
@@ -675,7 +688,7 @@ def _row_iota(iota_hbm, rows: int):
     on this image. A caller-supplied ramp is the screened answer to the same missing
     primitive at ``dsa/ragged_pack.py:94-95``.
     """
-    tile = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    tile = _column(rows)
     nisa.dma_copy(dst=tile, src=iota_hbm.ap(pattern=[[1, rows], [1, 1]], offset=0))
     return tile
 
@@ -687,7 +700,7 @@ def _dense_column(hbm, rows: int, offset: int):
     is a trace-time integer, so no index tile is needed. ``dsa/ragged_pack.py`` loads
     its position column with this same pattern.
     """
-    tile = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    tile = _column(rows)
     nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[1, rows], [1, 1]], offset=offset))
     return tile
 
@@ -700,7 +713,7 @@ def _broadcast_row(hbm, row: int, rows: int):
     is ``dsa/ragged_pack.py``'s ``_broadcast_scalar``, itself the vendor's idiom at
     ``nkilib/experimental/collectives/a2av_train/permute_a2av.py:139-150``.
     """
-    tile = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    tile = _column(rows)
     nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[0, rows], [1, 1]], offset=row))
     return tile
 
@@ -717,13 +730,13 @@ def _padding_resolved(rows: int, positions, pad_row: int):
     swallow it. A real appended row is better: it is a value the torch oracle can
     compute too, so the padded lanes are compared rather than excused.
     """
-    negative = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    negative = _column(rows)
     nisa.tensor_scalar(dst=negative, data=positions, op0=nl.less, operand0=0)
-    bumped = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    bumped = _column(rows)
     nisa.tensor_scalar(
         dst=bumped, data=negative, op0=nl.multiply, operand0=pad_row + 1
     )
-    index = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    index = _column(rows)
     nisa.tensor_tensor(dst=index, data1=positions, data2=bumped, op=nl.add)
     return index
 
@@ -740,12 +753,12 @@ def _bank_rows(rows: int, expert, iota, stride: int, offset: int, step: int):
     adjacent. A bank viewed as ``[E * rows * n_col_blocks, block]`` walks
     ``n_col_blocks`` rows per source row, and that number is ``step``.
     """
-    base = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    base = _column(rows)
     nisa.tensor_scalar(dst=base, data=expert, op0=nl.multiply, operand0=stride)
     nisa.tensor_scalar(dst=base, data=base, op0=nl.add, operand0=offset)
-    ramp = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    ramp = _column(rows)
     nisa.tensor_scalar(dst=ramp, data=iota, op0=nl.multiply, operand0=step)
-    index = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    index = _column(rows)
     nisa.tensor_tensor(dst=index, data1=base, data2=ramp, op=nl.add)
     return index
 
@@ -759,9 +772,9 @@ def _affinity_rows(rows: int, resolved, expert, n_experts: int):
     3 of the `-113` probe measured exactly this: an index vector computed on device
     out of a device scalar.
     """
-    scaled = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    scaled = _column(rows)
     nisa.tensor_scalar(dst=scaled, data=resolved, op0=nl.multiply, operand0=n_experts)
-    index = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
+    index = _column(rows)
     nisa.tensor_tensor(dst=index, data1=scaled, data2=expert, op=nl.add)
     return index
 
@@ -774,7 +787,7 @@ def _gathered(hbm, index, rows: int, width: int, dtype):
     address per partition, taken from ``index``. Arm 1 of the `-113` probe read this
     exact shape MATCH under lease event 229.
     """
-    tile = nl.ndarray((rows, width), dtype=dtype, buffer=nl.sbuf)
+    tile = nl.ndarray((rows, _padded(width)), dtype=dtype, buffer=nl.sbuf)[:, 0:width]
     nisa.dma_copy(
         dst=tile,
         src=hbm.ap(

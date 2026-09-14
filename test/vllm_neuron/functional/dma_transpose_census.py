@@ -186,7 +186,8 @@ def _returned(fn: ast.FunctionDef, call: ast.Call) -> ast.expr | None:
     params = [a.arg for a in fn.args.args]
     if len(returns) != 1 or len(call.args) > len(params):
         return None
-    binding: dict[str, ast.expr] = dict(zip(params, call.args))
+    defaults = dict(zip(params[len(params) - len(fn.args.defaults):], fn.args.defaults))
+    binding: dict[str, ast.expr] = {**defaults, **dict(zip(params, call.args))}
     binding.update({kw.arg: kw.value for kw in call.keywords if kw.arg})
     return _Inline(binding).visit(copy.deepcopy(returns[0].value))
 
@@ -248,9 +249,13 @@ def _tile_like(expr: ast.expr, helpers: dict, depth: int = 0) -> bool:
     return False
 
 
-def _sizes(kind, source_itemsizes: tuple[int, ...]) -> tuple[int, ...] | None:
-    """The element widths behind a shape reading: a maker's own, or those of a dtype node."""
-    return kind if isinstance(kind, tuple) else _itemsizes(kind, source_itemsizes)
+def _sizes(kind, source_itemsizes: tuple[int, ...], names: dict | None = None) -> tuple[int, ...] | None:
+    """The element widths behind a shape reading: a maker's own, a dtype node's, or a bound dtype parameter's."""
+    if isinstance(kind, tuple):
+        return kind
+    if isinstance(kind, ast.Name) and names is not None and isinstance(names.get(kind.id), tuple):
+        return names[kind.id]
+    return _itemsizes(kind, source_itemsizes)
 
 
 def _tile_of(call: ast.expr, names: dict, source_itemsizes: tuple[int, ...], helpers: dict):
@@ -259,7 +264,7 @@ def _tile_of(call: ast.expr, names: dict, source_itemsizes: tuple[int, ...], hel
     if shape is None:
         return None
     slices = 1 if shape[0] is None else _eval(shape[0], names)
-    width, sizes = _eval(shape[1], names), _sizes(shape[2], source_itemsizes)
+    width, sizes = _eval(shape[1], names), _sizes(shape[2], source_itemsizes, names)
     if width is None or slices is None or sizes is None:
         return None
     return (slices, width, sizes)
@@ -609,8 +614,11 @@ def census(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[int,
     return sorted(sites, key=lambda s: s.line)
 
 
-def _bindings(fn: ast.FunctionDef, functions: list, base: dict) -> list[dict]:
-    """The name sets a body is read under: one per call of it in the module, else the base alone."""
+def _bindings(fn: ast.FunctionDef, functions: list, base: dict, source_itemsizes: tuple[int, ...]) -> list[dict]:
+    """The name sets a body is read under: one per call of it in the module, else the base alone.
+
+    An integer argument binds its value; a dtype argument binds the element widths it names.
+    """
     params = [a.arg for a in fn.args.args]
     found = []
     for caller in functions:
@@ -625,6 +633,8 @@ def _bindings(fn: ast.FunctionDef, functions: list, base: dict) -> list[dict]:
             pairs = list(zip(params, node.args)) + [(kw.arg, kw.value) for kw in node.keywords if kw.arg]
             for param, arg in pairs:
                 value = _eval(arg, caller_names)
+                if value is None and isinstance(arg, ast.Attribute):
+                    value = _itemsizes(arg, source_itemsizes)
                 if value is not None:
                     bound[param] = value
             found.append(bound)
@@ -647,7 +657,7 @@ def tile_rows(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[i
         returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None]
         if len(returns) == 1 and _shape(returns[0].value, makers) is not None:
             continue
-        for bound in _bindings(fn, functions, base):
+        for bound in _bindings(fn, functions, base, source_itemsizes):
             names = _names(fn, bound)
             loops = _loops(fn, names)
             for line, name, expr in _declarations(fn):
@@ -658,7 +668,7 @@ def tile_rows(source: str, at: dict, arithmetic: dict, source_itemsizes: tuple[i
                     continue
                 slices = (1,) if shape[0] is None else _values(shape[0], names, loops)
                 widths = _values(shape[1], names, loops)
-                sizes = _sizes(shape[2], source_itemsizes)
+                sizes = _sizes(shape[2], source_itemsizes, names)
                 if slices is None or widths is None or sizes is None:
                     found.add((line, name, None))
                     continue

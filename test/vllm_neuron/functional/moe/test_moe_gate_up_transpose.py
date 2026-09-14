@@ -2,12 +2,14 @@
 """Every DMA transpose in the routed gate/up kernel moves 16 two-byte source rows.
 
 The kernel transposes each token tile's hidden tiles onto partitions once per token tile,
-16 source rows per DMA, and reads them for every intermediate block. Two things are read
+16 source rows per DMA, and reads them for every intermediate block. Three things are read
 here: that every transpose in the module, read at its call site through the helper that
 issues the DMAs, lands a readable destination on a 32-byte line, moves 16 source rows per
-DMA, and is handed two-byte rows, all from the module's own arithmetic; and that the
-values did not move, against a frozen copy of the kernel as it stood before the change,
-exactly rather than within a tolerance, at the served token-tile counts.
+DMA, and is handed two-byte rows, all from the module's own arithmetic; that every SBUF
+tile the module declares has a per-partition row of whole 32-byte lines, so the allocator
+packing tiles back to back leaves every tile base on a line; and that the values did not
+move, against a frozen copy of the kernel as it stood before the change, exactly rather
+than within a tolerance, at the served token-tile counts.
 
 Run under ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1
 NEURON_PLATFORM_TARGET_OVERRIDE=trn2``; nothing here reads or sets an environment variable.
@@ -26,7 +28,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.moe import moe_blockwise_fp8 as mod
-from test.vllm_neuron.functional.dma_transpose_census import census
+from test.vllm_neuron.functional.dma_transpose_census import LINE, census, tile_rows
 from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
     moe_gate_up_blockwise_fp8,
     to_gate_up_kernel_scale_operand,
@@ -333,14 +335,19 @@ def test_bit_identical_at_the_decode_token_tiles():
     _assert_bit_identical(*_CASES[1])
 
 #: The trace-time values the transpose sites are read at: the served geometry, one expert
-#: block of 256 positions, the prefill position count.
-_SERVED = {"positions": 20736, "h_extent": 4096, "n_h_blocks": 32}
+#: block of 256 positions, the prefill position count; hidden 4096, the intermediate shard
+#: 512 wide (four scale blocks, eight fused column blocks).
+_SERVED = {"positions": 20736, "h_extent": 4096, "n_h_blocks": 32, "n_col_blocks": 8,
+           "i_extent": 512, "n_i_blocks": 4}
+
+#: The decode geometry traces the same widths over 2,048 positions.
+_TILE_GEOMETRIES = (("prefill", _SERVED), ("decode", {**_SERVED, "positions": 2048}))
 
 #: The names the module supplies to its OWN size and loop expressions, read off the module
 #: and never retyped, so an expression is read with the arithmetic the kernel will trace.
 #: Absent names are left out.
 _MODULE_ARITHMETIC = ("DGE_TRANSPOSE_ROWS", "TILE_SIZE", "GATE_UP_SCALE_BLOCK",
-                      "GATE_UP_H_TILES_PER_BLOCK", "GATE_UP_FUSION")
+                      "GATE_UP_H_TILES_PER_BLOCK", "GATE_UP_FUSION", "ROW_ALIGN", "_padded")
 
 #: The element width the seam hands the kernel: it casts the routed rows to bfloat16.
 _WIDTHS = (2,)
@@ -365,6 +372,11 @@ def _module_source() -> str:
 def _sites(source: str) -> list:
     """Every transpose site of ``source`` at the served geometry, read with the module's arithmetic."""
     return census(source, _SERVED, _arithmetic(), _WIDTHS)
+
+
+def _tile_rows(source: str, at: dict) -> list:
+    """Every SBUF tile ``source`` declares at ``at``, as ``(line, name, bytes per partition)``."""
+    return tile_rows(source, at, _arithmetic(), _WIDTHS)
 
 
 def _handed_width(source: str) -> int | None:
@@ -409,6 +421,26 @@ def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
 """
 
 #: A body that transposes a whole token tile in one DMA, the form this change retires.
+def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
+    """At the prefill and decode geometries every declared SBUF tile is sized and is whole lines.
+
+    The allocator packs tiles back to back per partition, so one tile whose row is not a whole
+    number of lines moves every later tile's base off the line; this reads the tiles the
+    transposes above land beside, through the helpers that make them and per caller.
+    """
+    source = _module_source()
+    for name, at in _TILE_GEOMETRIES:
+        rows = _tile_rows(source, at)
+        unreadable = tuple(sorted({(line, tile) for line, tile, size in rows if size is None}))
+        narrow = tuple((line, tile, size) for line, tile, size in rows
+                       if size is not None and size % LINE)
+        _emit("NARROW_TILES", geometry=name, count=len(narrow), lines=tuple(r[0] for r in narrow),
+              unreadable=unreadable, tiles=len(rows), width=_WIDTHS[0])
+        assert rows, f"the census read no SBUF tile at {name}"
+        assert unreadable == (), f"tile rows the arithmetic cannot size: {unreadable}"
+        assert narrow == (), f"tile rows that are not whole 32-byte lines: {narrow}"
+
+
 _PLANTED_WHOLE_TILE = _HELPER + """
 def body(staged, h_extent):
     for h_tile in range(n_h_blocks):
@@ -444,6 +476,40 @@ def test_control_the_reader_finds_a_planted_off_line_caller():
     _emit("CONTROL_LINE_READER_FIRES", count=len(misaligned), lines=misaligned,
           offsets=[s.offsets for s in sites])
     assert len(sites) == 1 and len(misaligned) == 1
+
+
+#: Three tiles: a 4-byte row, an 8-byte row made through a helper, and one whole line.
+_PLANTED_NARROW = """
+def _pair(rows):
+    return nl.ndarray((rows, 2), dtype=nl.int32, buffer=nl.sbuf)
+
+def body(hbm):
+    column = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
+    both = _pair(TILE_SIZE)
+    line = nl.ndarray((TILE_SIZE, 8), dtype=nl.int32, buffer=nl.sbuf)
+"""
+
+#: One tile sized by a name the arithmetic never has.
+_PLANTED_UNSIZED = """
+def body(hbm):
+    scratch = nl.ndarray((TILE_SIZE, somewhere), dtype=nl.int32, buffer=nl.sbuf)
+"""
+
+
+def test_control_the_tile_census_finds_a_planted_narrow_row():
+    """The same reader names the 4-byte tile and the 8-byte one made through a helper, not the line."""
+    rows = _tile_rows(_PLANTED_NARROW, _SERVED)
+    narrow = tuple((line, tile, size) for line, tile, size in rows
+                   if size is not None and size % LINE)
+    _emit("CONTROL_TILE_READER_FIRES", count=len(narrow), rows=narrow, tiles=len(rows))
+    assert len(rows) == 3 and narrow == ((6, "column", 4), (7, "both", 8))
+
+
+def test_control_an_unsized_tile_is_never_a_pass():
+    """A tile the arithmetic cannot size reads ``None``, which the census refuses."""
+    rows = _tile_rows(_PLANTED_UNSIZED, _SERVED)
+    _emit("CONTROL_UNSIZED_TILE_FIRES", count=len(rows), rows=rows)
+    assert rows == [(3, "scratch", None)]
 
 
 def test_control_an_unreadable_destination_is_never_a_pass():
