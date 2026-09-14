@@ -31,7 +31,15 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.moe import moe_blockwise_fp8 as live
 from test.vllm_neuron.functional.dma_transpose_census import census, tile_rows
-from vllm_neuron.functional.moe.moe_blockwise_fp8 import MoeBlockwiseFp8Error, moe_down_blockwise_fp8, moe_gate_up_blockwise_fp8, to_down_kernel_scale_operand, to_gate_up_kernel_scale_operand, down_kernel_scale_shape
+from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+    MoeBlockwiseFp8Error,
+    moe_down_blockwise_fp8,
+    moe_gate_up_blockwise_fp8,
+    moe_swiglu_transposed,
+    to_down_kernel_scale_operand,
+    to_gate_up_kernel_scale_operand,
+    down_kernel_scale_shape,
+)
 
 #: The constants the frozen copies read, RETYPED on purpose: a frozen reference that
 #: imported them would follow the live module if one of them ever moved.
@@ -41,6 +49,7 @@ GATE_UP_H_TILES_PER_BLOCK = 1
 GATE_UP_FUSION = 2
 DGE_TRANSPOSE_ROWS = 16
 ROW_ALIGN = 16
+_SWIGLU_BOUND_COLUMNS = 3
 
 #: The activation bound the model passes, RETYPED from the MODEL's own copy
 #: (``glm5_next/config.py`` ``swiglu_limit``, handed to both halves at
@@ -360,6 +369,104 @@ def _landed_gate_up(
             nl.store(
                 out[m0 : m0 + TILE_SIZE, up_col : up_col + GATE_UP_SCALE_BLOCK],
                 value=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+            )
+    return out
+
+
+@nki.jit
+def _landed_swiglu(gate_up, bounds):
+    """Frozen at the base commit: moe_swiglu_transposed_kernel."""
+    tokens, fused_cols = gate_up.shape
+    i_extent = fused_cols // GATE_UP_FUSION
+    # A ONE-COLUMN OPERAND IS AN UNBOUNDED CONFIGURATION, and then no bound
+    # instruction is emitted at all -- the trace-time elision the landed form had
+    # when the two limits arrived as ``None``.
+    bounded_config = bounds.shape[1] == _SWIGLU_BOUND_COLUMNS
+    out = nl.ndarray((i_extent, tokens), dtype=nl.float32, buffer=nl.shared_hbm)
+    if bounded_config:
+        bounds_sb = nl.load(bounds[0:TILE_SIZE, 0:_SWIGLU_BOUND_COLUMNS])
+
+    for m_tile in range(tokens // TILE_SIZE):
+        m0 = m_tile * TILE_SIZE
+        for i_block in range(i_extent // GATE_UP_SCALE_BLOCK):
+            i0 = i_block * GATE_UP_SCALE_BLOCK
+            gate = nl.load(
+                gate_up[m0 : m0 + TILE_SIZE, i0 : i0 + GATE_UP_SCALE_BLOCK],
+                dtype=nl.float32,
+            )
+            up = nl.load(
+                gate_up[
+                    m0 : m0 + TILE_SIZE,
+                    i_extent + i0 : i_extent + i0 + GATE_UP_SCALE_BLOCK,
+                ],
+                dtype=nl.float32,
+            )
+            # THE BOUNDS, on the tiles just loaded. ``maximum`` and ``minimum`` are
+            # the closed-form pair this campaign already uses for a bound
+            # (``dsa/causal_fill.py``), and the two-scalar chain is the landed shape
+            # of that call. A ``None`` limit removes its own line at trace time, so
+            # an unbounded configuration emits no instruction rather than a bound at
+            # infinity. A configured limit is a per-partition column for the reason
+            # :func:`_swiglu_bound_operand` records.
+            if bounded_config:
+                bounded = _gate_up_sbuf()
+                nisa.tensor_scalar(
+                    dst=bounded,
+                    data=gate,
+                    op0=nl.minimum,
+                    operand0=bounds_sb[0:TILE_SIZE, 0:1],
+                )
+                gate = bounded
+                # TWO CALLS AND NOT ONE FUSED PAIR. A ``[P, 1]`` column is the
+                # landed form for ``operand0`` in this package and no landed call
+                # passes one as ``operand1``; only the compiler's verifier could settle
+                # that, and a maximum followed by a minimum is the same closed form.
+                floored = _gate_up_sbuf()
+                nisa.tensor_scalar(
+                    dst=floored,
+                    data=up,
+                    op0=nl.maximum,
+                    operand0=bounds_sb[0:TILE_SIZE, 1:2],
+                )
+                bounded_up = _gate_up_sbuf()
+                nisa.tensor_scalar(
+                    dst=bounded_up,
+                    data=floored,
+                    op0=nl.minimum,
+                    operand0=bounds_sb[0:TILE_SIZE, 2:3],
+                )
+                up = bounded_up
+            # sigmoid is one activation-engine op on this image, not a composition.
+            squashed = _gate_up_sbuf()
+            nisa.activation(dst=squashed, data=gate, op=nl.sigmoid)
+            # SiLU(gate) = gate * sigmoid(gate). ``1.0`` is the identity scalar the
+            # three-operand form needs; see the section comment on tensor_tensor.
+            silu = _gate_up_sbuf()
+            nisa.scalar_tensor_tensor(
+                dst=silu,
+                data=gate,
+                op0=nl.multiply,
+                operand0=1.0,
+                op1=nl.multiply,
+                operand1=squashed,
+            )
+            gated = _gate_up_sbuf()
+            nisa.scalar_tensor_tensor(
+                dst=gated,
+                data=silu,
+                op0=nl.multiply,
+                operand0=1.0,
+                op1=nl.multiply,
+                operand1=up,
+            )
+            # [B, I] -> [I, B], the orientation the down projection contracts on.
+            transposed = _gate_up_psum()
+            nisa.nc_transpose(dst=transposed, data=gated)
+            out_sb = _gate_up_sbuf()
+            nisa.tensor_copy(dst=out_sb, src=transposed)
+            nl.store(
+                out[i0 : i0 + GATE_UP_SCALE_BLOCK, m0 : m0 + TILE_SIZE],
+                value=out_sb,
             )
     return out
 
@@ -776,6 +883,54 @@ def test_the_gate_up_kernel_is_bit_identical_to_the_frozen_copy(case):
           equal=torch.equal(got, want), shape=tuple(got.shape))
     assert differing == 0
     assert torch.equal(got, want)
+
+
+def _activation_inputs(case: dict, seed: int = 23) -> torch.Tensor:
+    """The pre-activation tensor: ``[B, 2*I]`` fp32 eighths, both halves distinct."""
+    shape = _shape_of(case)
+    return _eighths(seed, shape["positions"], GATE_UP_FUSION * shape["i_extent"])
+
+
+def _frozen_swiglu(gate_up: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+    """The frozen activation kernel on the operands the live seam builds."""
+    return wrap_nki(_landed_swiglu)(gate_up.to(torch.float32), bounds)
+
+
+def _bounds(limit: float | None) -> torch.Tensor:
+    """The bound operand the seam builds: gate, ``-up``, ``up``, or one neutral column."""
+    if limit is None:
+        return torch.full((TILE_SIZE, 1), 0.0, dtype=torch.float32)
+    return torch.cat([torch.full((TILE_SIZE, 1), value, dtype=torch.float32)
+                      for value in (limit, -limit, limit)], dim=1)
+
+
+@pytest.mark.parametrize("case", _TAIL_CASES, ids=[c["name"] for c in _TAIL_CASES])
+def test_the_activation_kernel_is_bit_identical_to_the_frozen_copy(case):
+    """Both bound configurations, because the bound is what the model's copy pins."""
+    gate_up = _activation_inputs(case)
+    for name, limit in (("bounded", _MODEL_SWIGLU_LIMIT), ("unbounded", None)):
+        got = moe_swiglu_transposed(gate_up, limit, limit)
+        want = _frozen_swiglu(gate_up, _bounds(limit))
+        differing = int(torch.ne(got, want).sum().item())
+        _emit("ACTIVATION_IDENTITY", case=case["name"], bounds=name,
+              token_tiles=_shape_of(case)["token_tiles"], differing=differing,
+              equal=torch.equal(got, want), shape=tuple(got.shape))
+        assert differing == 0
+        assert torch.equal(got, want)
+
+
+def test_the_activation_bound_the_model_passes_changes_the_result():
+    """The failing control for the bound: an unbounded arm must not equal a bounded one."""
+    case = _G18
+    shape = _shape_of(case)
+    over_the_limit = _eighths(31, shape["positions"], GATE_UP_FUSION * shape["i_extent"])
+    over_the_limit = over_the_limit + 2.0 * _MODEL_SWIGLU_LIMIT
+    bounded = moe_swiglu_transposed(over_the_limit, _MODEL_SWIGLU_LIMIT, _MODEL_SWIGLU_LIMIT)
+    unbounded = moe_swiglu_transposed(over_the_limit, None, None)
+    differing = int(torch.ne(bounded, unbounded).sum().item())
+    _emit("ACTIVATION_BOUND_CONTROL", limit=_MODEL_SWIGLU_LIMIT, differing=differing,
+          equal=torch.equal(bounded, unbounded))
+    assert differing > 0
 
 
 def _down_inputs(case: dict, seed: int = 41) -> dict:

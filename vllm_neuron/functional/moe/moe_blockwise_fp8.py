@@ -1624,20 +1624,31 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
     out = nl.ndarray((i_extent, tokens), dtype=nl.float32, buffer=nl.shared_hbm)
     if bounded_config:
         bounds_sb = nl.load(bounds[0:TILE_SIZE, 0:_SWIGLU_BOUND_COLUMNS])
-    for m_tile in range(tokens // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
+    # THE TOKEN TILE IS THE DYNAMIC AXIS. The pre-activation input leads with it; the
+    # result carries it on the FREE axis, because this kernel returns ``[I, B]``.
+    n_tiles = tokens // TILE_SIZE
+    gate_up_b = gate_up.reshape((n_tiles, TILE_SIZE, fused_cols))
+    out_b = out.reshape((i_extent, n_tiles, TILE_SIZE))
+    column = [[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]]
+
+    def activate_tile(at_tile):
         for i_block in range(i_extent // GATE_UP_SCALE_BLOCK):
             i0 = i_block * GATE_UP_SCALE_BLOCK
-            gate = nl.load(
-                gate_up[m0 : m0 + TILE_SIZE, i0 : i0 + GATE_UP_SCALE_BLOCK],
-                dtype=nl.float32,
+            gate = _loaded(
+                gate_up_b.ap(
+                    pattern=column, offset=i0, **_block_offset(at_tile)
+                ),
+                TILE_SIZE,
+                GATE_UP_SCALE_BLOCK,
+                nl.float32,
             )
-            up = nl.load(
-                gate_up[
-                    m0 : m0 + TILE_SIZE,
-                    i_extent + i0 : i_extent + i0 + GATE_UP_SCALE_BLOCK,
-                ],
-                dtype=nl.float32,
+            up = _loaded(
+                gate_up_b.ap(
+                    pattern=column, offset=i_extent + i0, **_block_offset(at_tile)
+                ),
+                TILE_SIZE,
+                GATE_UP_SCALE_BLOCK,
+                nl.float32,
             )
             # THE BOUNDS, on the tiles just loaded. ``maximum`` and ``minimum`` are
             # the closed-form pair this campaign already uses for a bound
@@ -1702,10 +1713,16 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
             nisa.nc_transpose(dst=transposed, data=gated)
             out_sb = _gate_up_sbuf()
             nisa.tensor_copy(dst=out_sb, src=transposed)
-            nl.store(
-                out[i0 : i0 + GATE_UP_SCALE_BLOCK, m0 : m0 + TILE_SIZE],
-                value=out_sb,
+            _stored(
+                out_b.ap(
+                    pattern=[[tokens, GATE_UP_SCALE_BLOCK], [1, TILE_SIZE]],
+                    offset=i0 * tokens,
+                    **_block_offset(at_tile, 1),
+                ),
+                out_sb,
             )
+
+    nl.fori_loop(0, n_tiles, activate_tile)
     return out
 
 
