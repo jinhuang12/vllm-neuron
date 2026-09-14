@@ -343,14 +343,68 @@ def _rss_kib() -> int:
     return 0
 
 
-def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
+def _neff_load_wave_plan(world_size: int) -> tuple[int, int]:
+    """Return the number of ranks that load together, and how many waves that takes."""
+    wave_size = min(max(1, envs.VLLM_NEURON_NEFF_LOAD_WAVE_SIZE), world_size)
+    return wave_size, math.ceil(world_size / wave_size)
+
+
+def load_neff_in_waves(phase: str, bucket: str, load) -> None:
+    """Run ``load`` on this rank inside its own wave, with a barrier between waves.
+
+    Loading the compiled graph is a per-process step that talks to no other rank, and it
+    holds the larger part of the host memory the warmup call needs. Ranks outside the
+    running wave wait in the barrier, which the load never enters, so waves are safe here
+    although the execution that follows them must run on every rank at once.
+    """
+    group = get_tp_group()
+    rank = group.rank_in_group
+    wave_size, waves = _neff_load_wave_plan(group.world_size)
+    failure = None
+    for wave in range(waves):
+        if rank // wave_size == wave:
+            # One row per rank on each side of its own load, so the reader can place the
+            # resident size the load leaves behind wave by wave.
+            logger.info(
+                "neff_load_entered|rank=%s|wave=%s|rss_kib=%s|phase=%s|bucket=%s",
+                rank,
+                wave,
+                _rss_kib(),
+                phase,
+                bucket,
+            )
+            started = time.perf_counter()
+            try:
+                load()
+            except Exception as exc:  # every wave still runs; the group is told at the end
+                failure = exc
+            logger.info(
+                "neff_load_left|rank=%s|wave=%s|rss_kib=%s|elapsed_s=%.1f|phase=%s|bucket=%s",
+                rank,
+                wave,
+                _rss_kib(),
+                time.perf_counter() - started,
+                phase,
+                bucket,
+            )
+        tp_barrier()
+    _exchange_warmup_status(phase, bucket, f"neff load in {waves} wave(s)", failure)
+
+
+def run_warmup_on_all_ranks(phase: str, bucket: str, work, load=None) -> None:
     """Run ``work`` on every rank of the TP group at once, then exchange status.
 
     A warmup call executes the model, and the model's forward carries collectives over the
     whole TP group, so a subset of the ranks cannot run it: the ranks left out would wait in
     the status exchange while the ranks inside waited for them in the collective.
+
+    ``load`` loads this rank's compiled graph without executing it. When it is given, the
+    group loads in waves before the call, so the host holds one wave of loads at a time
+    instead of one per rank.
     """
     rank = get_tp_group().rank_in_group
+    if load is not None:
+        load_neff_in_waves(phase, bucket, load)
     tp_barrier()
     # One row per rank on each side of the call. The compiled graph is loaded INSIDE this call,
     # so a sampler watching the process from outside cannot say whether the resident size grew
