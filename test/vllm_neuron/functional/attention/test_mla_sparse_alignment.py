@@ -18,8 +18,8 @@ variable.
 
 from __future__ import annotations
 
-import ast
 import pathlib
+from collections import Counter
 
 import torch
 
@@ -29,6 +29,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention import mla_sparse as mod
+from test.vllm_neuron.functional.dma_transpose_census import census, narrow_tiles
 
 #: The constants the frozen copy below reads, RETYPED on purpose: a frozen reference
 #: that imported them would follow the live module if they ever moved.
@@ -409,24 +410,32 @@ def _align(width: int) -> int:
     return ((width + _ALIGN - 1) // _ALIGN) * _ALIGN
 
 
-#: The trace-time values the size expressions are read at: ONE head, this checkpoint's
+#: The trace-time values the transpose sites are read at: one head, this checkpoint's
 #: latent rank, the prefill selected-row count and sequence.
-_AT_ONE_HEAD = {
-    "__builtins__": {"min": min, "max": max, "len": len, "range": range},
-    "LATENT_TILE": 128, "KEY_CHUNK": 128, "MOVING_MAX": 512, "heads": 1,
-    "latent": 512, "n_latent": 4, "topk": 2048, "tile_max": 512, "chunk_max": 4,
-    "s_kv": 4096, "rope": 0, "seq": 2048,
+_PREFILL = {
+    "LATENT_TILE": 128, "KEY_CHUNK": 128, "MOVING_MAX": 512, "heads": 1, "latent": 512,
+    "n_latent": 4, "topk": 2048, "tile_max": 512, "chunk_max": 4, "s_kv": 4096, "rope": 0,
+    "seq": 2048,
+}
+
+#: Decode traces one query; the rope geometry traces the rotary sites at their served width.
+_GEOMETRIES_READ = (("prefill", _PREFILL), ("decode", {**_PREFILL, "seq": 1}),
+                    ("rope", {**_PREFILL, "rope": 64}))
+
+#: What each geometry legitimately leaves to the host, by the source tensor a site reads and
+#: how many bodies read it: decode moves one query row per block, so each body's Q transpose
+#: misses the sixteen-row shape; the rotary width is 64, half a tile, in each body.
+_DECLARED_HOST_EXPANDED = {
+    "prefill": {},
+    "decode": {"q_lift_hbm": 3},
+    "rope": {"k_pe_hbm": 3, "q_pe_hbm": 3},
 }
 
 #: The names the module supplies to its OWN size and loop expressions. They are read off
 #: the module and never retyped, so an expression is evaluated with the arithmetic the
-#: kernel will trace and not with a copy of it. Absent names are left out, so a module
-#: without a name simply cannot evaluate an expression that uses it.
+#: kernel will trace and not with a copy of it. Absent names are left out.
 _MODULE_ARITHMETIC = ("_aligned", "DMA_TRANSPOSE_ALIGN", "DGE_TRANSPOSE_ROWS",
                       "_queries_per_block", "_score_tiles", "_latent_tiles", "_output_tiles")
-
-#: 32 bytes, the runtime's rule for a transpose destination.
-_LINE = 32
 
 #: The element widths a staged destination can have: the seam hands 2-byte floats through
 #: and widens anything else to float32.
@@ -438,262 +447,112 @@ def _step() -> int:
     return int(getattr(mod, "DGE_TRANSPOSE_ROWS", 16))
 
 
-def _eval(node: ast.expr, names: dict) -> int | None:
-    """One expression's trace-time value, or ``None`` when it is not readable."""
-    try:
-        return int(eval(compile(ast.Expression(body=node), "<size>", "eval"), names))
-    except Exception:
-        return None
-
-
-def _names(fn: ast.FunctionDef) -> dict:
-    """The census values, the module's arithmetic, then the body's own simple assignments."""
-    names = dict(_AT_ONE_HEAD)
-    for name in _MODULE_ARITHMETIC:
-        if hasattr(mod, name):
-            names[name] = getattr(mod, name)
-    for node in ast.walk(fn):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not isinstance(target, ast.Name) or target.id in names:
-            continue
-        value = _eval(node.value, names)
-        if value is None and isinstance(node.value, ast.Call) \
-                and getattr(node.value.func, "id", "") == "min":
-            bounds = [v for v in (_eval(a, names) for a in node.value.args) if v is not None]
-            value = min(bounds) if bounds else None
-        if value is not None:
-            names[target.id] = value
-    return names
-
-
-def _loops(fn: ast.FunctionDef, names: dict) -> dict[str, tuple[int, ...]]:
-    """Per ``for NAME in range(...)`` target, the values it takes; an unreadable stop keeps eight."""
-    found: dict[str, tuple[int, ...]] = {}
-    for node in ast.walk(fn):
-        if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
-            continue
-        call = node.iter
-        if not isinstance(call, ast.Call) or getattr(call.func, "id", "") != "range":
-            continue
-        args = [_eval(a, names) for a in call.args]
-        start, stop, step = 0, None, 1
-        if len(args) == 1:
-            stop = args[0]
-        elif len(args) >= 2:
-            start, stop = args[0] or 0, args[1]
-            step = args[2] if len(args) == 3 and args[2] else 1
-        if stop is None:
-            found[node.target.id] = tuple(start + k * step for k in range(8))
-        else:
-            found[node.target.id] = tuple(range(start, stop, step))[:4096] or (start,)
+def _arithmetic() -> dict:
+    """The module's own arithmetic, by name; the step is present even where the module has none."""
+    found = {name: getattr(mod, name) for name in _MODULE_ARITHMETIC if hasattr(mod, name)}
+    found.setdefault("DGE_TRANSPOSE_ROWS", _step())
     return found
 
 
-def _tiles(fn: ast.FunctionDef, names: dict) -> dict[str, tuple[int, int, tuple[int, ...]]]:
-    """Per SBUF tile name: slice count, slice width and the element widths it can have."""
-    found: dict[str, tuple[int, int, tuple[int, ...]]] = {}
-    for node in ast.walk(fn):
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target, call = node.targets[0], node.value
-            if isinstance(call, ast.IfExp):
-                call = call.body
-        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)                 and getattr(node.value.func, "attr", "") == "append" and len(node.value.args) == 1:
-            target, call = node.value.func.value, node.value.args[0]
-        else:
-            continue
-        if not isinstance(target, ast.Name) or not isinstance(call, ast.Call):
-            continue
-        maker = getattr(call.func, "id", "")
-        if maker == "_sbuf" and len(call.args) == 3:
-            tiles, width = _eval(call.args[1], names), _eval(call.args[2], names)
-            widths = (4,)
-        elif maker == "_sbuf" and len(call.args) == 2:
-            tiles, width = 1, _eval(call.args[1], names)
-            widths = (4,)
-        elif maker == "_stage" and len(call.args) == 3:
-            tiles, width = 1, _eval(call.args[2], names)
-            widths = _WIDTHS
-        else:
-            continue
-        if tiles is not None and width is not None:
-            found[target.id] = (tiles, width, widths)
-    return found
+def _module_source() -> str:
+    return pathlib.Path(mod.__file__).read_text(encoding="utf-8")
 
 
-def _lower(node: ast.expr | None, names: dict, loops: dict) -> tuple[int, ...]:
-    """The values a slice's lower bound takes: a constant, a loop target, or an expression of one."""
-    if node is None:
-        return (0,)
-    loop_names = sorted({n.id for n in ast.walk(node) if isinstance(n, ast.Name) and n.id in loops})
-    if not loop_names:
-        value = _eval(node, names)
-        return (value,) if value is not None else ()
-    values = []
-    for v in loops[loop_names[0]]:
-        value = _eval(node, {**names, loop_names[0]: v})
-        if value is not None:
-            values.append(value)
-    return tuple(values)
-
-
-def _dest_bytes(dst: ast.expr, tiles: dict, names: dict, loops: dict,
-                itemsize: int) -> tuple[int, ...] | None:
-    """Every byte offset one destination can start at, or ``None`` when unreadable."""
-    if not isinstance(dst, ast.Subscript) or not isinstance(dst.slice, ast.Tuple):
-        return (0,)
-    base = dst.value
-    parts = dst.slice.elts
-    count, width = 1, 1
-    if isinstance(base, ast.Name) and base.id in tiles:
-        count, width, _ = tiles[base.id]
-    offsets = set()
-    if len(parts) == 3:
-        index_values = _lower(parts[1], names, loops) if not isinstance(parts[1], ast.Slice) \
-            else tuple(range(count))
-        lowers = _lower(parts[2].lower, names, loops) if isinstance(parts[2], ast.Slice) else (0,)
-        if not index_values or not lowers:
-            return None
-        for index in index_values:
-            for lower in lowers:
-                offsets.add((index * width + lower) * itemsize)
-    elif len(parts) == 2:
-        lowers = _lower(parts[1].lower, names, loops) if isinstance(parts[1], ast.Slice) else (0,)
-        if not lowers:
-            return None
-        for lower in lowers:
-            offsets.add(lower * itemsize)
-    else:
-        return None
-    return tuple(sorted(offsets))
-
-
-def _rows_per_dma(call: ast.Call, names: dict) -> int | None:
-    """The source rows one transpose moves: the row count of ``src.ap(pattern=[[stride, ROWS], ...])``."""
-    src = next((kw.value for kw in call.keywords if kw.arg == "src"), None)
-    if not isinstance(src, ast.Call) or getattr(src.func, "attr", "") != "ap":
-        return None
-    pattern = next((kw.value for kw in src.keywords if kw.arg == "pattern"), None)
-    if not isinstance(pattern, ast.List) or not pattern.elts:
-        return None
-    first = pattern.elts[0]
-    if not isinstance(first, ast.List) or len(first.elts) != 2:
-        return None
-    return _eval(first.elts[1], names)
-
-
-def _base(node: ast.expr) -> ast.expr:
-    """The name under a chain of subscripts."""
-    while isinstance(node, ast.Subscript):
-        node = node.value
-    return node
-
-
-def _reading(line: int, dst: ast.expr, tiles: dict, names: dict, loops: dict,
-             rows: int | None, via: str = "") -> dict:
-    """One destination's reading: the byte offsets it can start at, per element width."""
-    base = _base(dst)
-    widths = tiles[base.id][2] if isinstance(base, ast.Name) and base.id in tiles else _WIDTHS
-    offsets = {w: _dest_bytes(dst, tiles, names, loops, w) for w in widths}
-    misaligned = any(o is None or any(b % _LINE for b in o) for o in offsets.values())
-    return {"line": line, "widths": widths, "offsets": offsets, "misaligned": misaligned,
-            "rows": rows, "float32_destination": widths == (4,), "via": via}
-
-
-def _transpose_sites(source: str) -> list[dict]:
-    """One reading per ``dma_transpose`` in the module, and one per call of a helper that
-    transposes into a parameter -- the caller's tile is what that destination really is."""
-    functions = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)]
-    sites, helpers = [], {}
-    for fn in functions:
-        names = _names(fn)
-        tiles, loops = _tiles(fn, names), _loops(fn, names)
-        params = [a.arg for a in fn.args.args]
-        for node in ast.walk(fn):
-            if not isinstance(node, ast.Call) or getattr(node.func, "attr", "") != "dma_transpose":
-                continue
-            dst = next((kw.value for kw in node.keywords if kw.arg == "dst"), None)
-            if dst is None:
-                continue
-            rows = _rows_per_dma(node, names)
-            sites.append(_reading(node.lineno, dst, tiles, names, loops, rows))
-            base = _base(dst)
-            if isinstance(base, ast.Name) and base.id in params:
-                helpers[fn.name] = (params.index(base.id), rows)
-    for fn in functions:
-        names = _names(fn)
-        tiles, loops = _tiles(fn, names), _loops(fn, names)
-        for node in ast.walk(fn):
-            if not isinstance(node, ast.Call) or getattr(node.func, "id", "") not in helpers:
-                continue
-            index, rows = helpers[node.func.id]
-            if index < len(node.args):
-                sites.append(_reading(node.lineno, node.args[index], tiles, names, loops, rows,
-                                      via=node.func.id))
-    return sites
-
-
-def _misaligned_transpose_sites(source: str) -> tuple[int, ...]:
-    """The line of every ``dma_transpose`` a destination offset can start off 32 bytes on."""
-    return tuple(sorted(s["line"] for s in _transpose_sites(source) if s["misaligned"]))
-
-
-def _host_shaped_transpose_sites(source: str) -> tuple[int, ...]:
-    """The line of every ``dma_transpose`` that lands in a float32 tile or moves over 16 source rows."""
-    step = _step()
-    return tuple(sorted(s["line"] for s in _transpose_sites(source)
-                        if s["float32_destination"] or s["rows"] is None or s["rows"] > step))
+def _sites(source: str, at: dict) -> list:
+    """Every transpose site of ``source`` at geometry ``at``, read with the module's arithmetic."""
+    return census(source, at, _arithmetic(), _WIDTHS)
 
 
 def test_no_transpose_destination_starts_off_a_32_byte_boundary():
-    """At one head and either operand width, no destination offset in the module is off 32 bytes."""
-    source = pathlib.Path(mod.__file__).read_text(encoding="utf-8")
-    sites = _misaligned_transpose_sites(source)
-    _emit("MISALIGNED_SITES", count=len(sites), lines=sites, at_heads=1, widths=_WIDTHS,
-          transposes=len(_transpose_sites(source)))
-    assert sites == ()
+    """At one head and either operand width, every destination is read and none starts off 32 bytes."""
+    source = _module_source()
+    sites = _sites(source, _PREFILL)
+    unreadable = tuple(s.line for s in sites if s.misaligned is None)
+    misaligned = tuple(s.line for s in sites if s.misaligned)
+    narrow = narrow_tiles(source, _PREFILL, _arithmetic(), _WIDTHS)
+    _emit("MISALIGNED_SITES", count=len(misaligned), lines=misaligned, unreadable=unreadable,
+          at_heads=1, widths=_WIDTHS, transposes=len(sites), narrow_tiles=len(narrow))
+    assert sites, "the census read no transpose site"
+    assert unreadable == (), f"destinations the arithmetic cannot place: {unreadable}"
+    assert misaligned == ()
 
 
 def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
-    """No transpose in the module lands in a float32 tile or moves more than 16 source rows."""
-    source = pathlib.Path(mod.__file__).read_text(encoding="utf-8")
-    sites = _host_shaped_transpose_sites(source)
-    readings = [(s["line"], s["rows"], s["float32_destination"], s["via"])
-                for s in _transpose_sites(source)]
-    _emit("HOST_SHAPED_SITES", count=len(sites), lines=sites, step=_step(), readings=readings)
-    assert sites == ()
+    """No destination is float32-only; at each geometry the host-shaped sites are the declared ones."""
+    source = _module_source()
+    found = {}
+    float32_only: tuple[int, ...] = ()
+    for name, at in _GEOMETRIES_READ:
+        sites = _sites(source, at)
+        shaped = [s for s in sites if s.host_shaped(_step())]
+        found[name] = dict(sorted(Counter(s.source for s in shaped).items()))
+        if name == "prefill":
+            float32_only = tuple(s.line for s in sites if set(s.offsets) == {4})
+        _emit("HOST_SHAPED_SITES", geometry=name, count=len(shaped),
+              lines=tuple(s.line for s in shaped), step=_step(), by_source=found[name],
+              transposes=len(sites),
+              readings=[(s.line, s.source, s.rows, s.width, s.via) for s in sites])
+        assert sites, f"the census read no transpose site at {name}"
+    _emit("FLOAT32_DESTINATIONS", count=len(float32_only), lines=float32_only)
+    assert float32_only == (), f"destinations only float32 can land in: {float32_only}"
+    assert found == _DECLARED_HOST_EXPANDED, \
+        f"host-shaped sites by source {found} are not the declared {_DECLARED_HOST_EXPANDED}"
 
 
-#: A body whose head axis is NOT padded, so the reader has one misaligned site to find.
-_PLANTED = """
-def body(q_lift_hbm, heads, n_latent):
-    q_lift_t = _sbuf(LATENT_TILE, n_latent, heads)
-    for li in range(n_latent):
-        nisa.dma_transpose(dst=q_lift_t[:, li, :], src=q_lift_hbm)
-"""
-
-#: A staged helper stepping FOUR rows, so a float32 destination starts 16 bytes in.
-_PLANTED_STEP = """
-def helper(dst, src_hbm, rows, width, offset):
-    for r0 in range(0, rows, 4):
-        n = min(4, rows - r0)
+#: The staged form the controls below call, so a control reads a caller and not the helper.
+_HELPER = """
+def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
+    for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
+        n = min(DGE_TRANSPOSE_ROWS, rows - r0)
         nisa.dma_transpose(dst=dst[:, r0:r0 + n],
-                           src=src_hbm.ap(pattern=[[width, n], [1, width]], offset=offset))
+                           src=src_hbm.ap(pattern=[[row_stride, n], [1, width]], offset=offset))
+"""
+
+#: A caller whose per-query slice starts three elements in: 12 bytes at float32. Its block
+#: is a literal so the control reads the same in a tree that has no block arithmetic.
+_PLANTED_OFF_LINE = _HELPER + """
+def body(q_lift_hbm, heads, latent, n_latent):
+    block = 16 * heads
+    q_lift_t = _sbuf(LATENT_TILE, n_latent, block + 8)
+    for li in range(n_latent):
+        _transpose_rows(q_lift_t[:, li, 3:3 + block], q_lift_hbm, latent, block, LATENT_TILE, 0)
+"""
+
+#: A caller moving three source rows, which the device cannot shape.
+_PLANTED_THREE_ROWS = _HELPER + """
+def body(c_kv_hbm, s_kv):
+    c_stage = _stage(c_kv_hbm, LATENT_TILE, s_kv)
+    _transpose_rows(c_stage, c_kv_hbm, latent, 3, LATENT_TILE, 0)
+"""
+
+#: A caller whose destination the body never declared, which no arithmetic can place.
+_PLANTED_UNREADABLE = _HELPER + """
+def body(c_kv_hbm, s_kv):
+    _transpose_rows(somewhere, c_kv_hbm, latent, s_kv, LATENT_TILE, 0)
 """
 
 
-def test_control_the_reader_finds_a_planted_misaligned_destination():
-    """The same reader counts one site in a planted body with an unpadded axis."""
-    sites = _misaligned_transpose_sites(_PLANTED)
-    _emit("CONTROL_READER_FIRES", count=len(sites), lines=sites)
-    assert len(sites) == 1
+def test_control_the_reader_finds_a_planted_off_line_caller():
+    """The same reader names the one caller whose destination starts 12 bytes into a line."""
+    sites = _sites(_PLANTED_OFF_LINE, _PREFILL)
+    misaligned = tuple(s.line for s in sites if s.misaligned)
+    _emit("CONTROL_READER_FIRES", count=len(misaligned), lines=misaligned,
+          offsets=[s.offsets for s in sites])
+    assert len(sites) == 1 and len(misaligned) == 1
 
 
-def test_control_the_reader_finds_a_planted_four_row_step():
-    """The same reader counts one site in a planted helper whose slices step 16 bytes at float32."""
-    sites = _misaligned_transpose_sites(_PLANTED_STEP)
-    shaped = _host_shaped_transpose_sites(_PLANTED_STEP)
-    _emit("CONTROL_STEP_READER_FIRES", count=len(sites), lines=sites, host_shaped=shaped)
-    assert len(sites) == 1
-    assert shaped == ()
+def test_control_the_reader_finds_a_planted_three_row_caller():
+    """The same reader names the one caller that moves three rows per DMA."""
+    sites = _sites(_PLANTED_THREE_ROWS, _PREFILL)
+    shaped = tuple(s.line for s in sites if s.host_shaped(_step()))
+    _emit("CONTROL_STEP_READER_FIRES", count=len(shaped), lines=shaped,
+          rows=[s.rows for s in sites])
+    assert len(sites) == 1 and len(shaped) == 1
+
+
+def test_control_an_unreadable_destination_is_never_a_pass():
+    """A destination the arithmetic cannot place reads as unreadable, which the census refuses."""
+    sites = _sites(_PLANTED_UNREADABLE, _PREFILL)
+    unreadable = tuple(s.line for s in sites if s.misaligned is None)
+    _emit("CONTROL_UNREADABLE_FIRES", count=len(unreadable), lines=unreadable)
+    assert len(sites) == 1 and len(unreadable) == 1
