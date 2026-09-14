@@ -357,9 +357,52 @@ _WIDTHS = (2,)
 #: that stepped 32 rows is read as stepping 32 and reddens the census.
 _DGE_ROWS = 16
 
-#: The SBUF tiles the kernel declares at each geometry, RETYPED: the census must read exactly
-#: this many, so a tile it can no longer see, or one added without a reading, reddens it.
-_TILES = 28
+#: The SBUF tiles the functions read here declare, as (function, tile name, bytes per partition),
+#: RETYPED: a tile one of them drops, renames or gives another row width reddens this item, which is
+#: the property it exists for. The list is typed here and never read back off the module it grades.
+_OWNED_TILES = (
+    ("_affinity_rows", "index", 64),
+    ("_affinity_rows", "scaled", 64),
+    ("_bank_rows", "base", 64),
+    ("_bank_rows", "index", 64),
+    ("_bank_rows", "ramp", 64),
+    ("_broadcast_row", "tile", 64),
+    ("_dense_column", "tile", 64),
+    ("_gathered", "tile", 64),
+    ("_gathered", "tile", 256),
+    ("_gathered", "tile", 512),
+    ("_gathered", "tile", 1024),
+    ("_gathered", "tile", 8192),
+    ("_padding_resolved", "bumped", 64),
+    ("_padding_resolved", "index", 64),
+    ("_padding_resolved", "negative", 64),
+    ("_row_iota", "tile", 64),
+    ("moe_gate_up_blockwise_fp8_kernel", "gate_acc", 512),
+    ("moe_gate_up_blockwise_fp8_kernel", "tile", 256),
+    ("moe_gate_up_blockwise_fp8_kernel", "up_acc", 512),
+)
+
+#: Every OTHER tile this shared module declares, in the same shape and RETYPED: the ones the swiglu
+#: and down kernels declare, and the staging tiles the rolled token-tile loops add. Their widths are
+#: not graded here; counting them by name keeps the module's own tile count EXACT below, so a tile
+#: that nobody named -- an extra one anywhere in the module -- reddens this item instead of arriving
+#: unread. A change that adds a tile to this module names it here. Both geometries read these rows.
+_FOREIGN_TILES = (
+    ("_loaded", "tile", 256),
+    ("_loaded", "tile", 512),
+    ("moe_down_blockwise_fp8_kernel", "acc", 512),
+    ("moe_down_blockwise_fp8_kernel", "scaled", 512),
+    ("moe_swiglu_transposed_kernel", "bounded", 512),
+    ("moe_swiglu_transposed_kernel", "bounded_up", 512),
+    ("moe_swiglu_transposed_kernel", "floored", 512),
+    ("moe_swiglu_transposed_kernel", "gated", 512),
+    ("moe_swiglu_transposed_kernel", "out_sb", 512),
+    ("moe_swiglu_transposed_kernel", "silu", 512),
+    ("moe_swiglu_transposed_kernel", "squashed", 512),
+)
+
+#: The functions whose tiles are owned above, read off that list and not off the module.
+_OWNER_FUNCTIONS = tuple(sorted({owner for owner, _name, _size in _OWNED_TILES}))
 
 
 def _arithmetic() -> dict:
@@ -379,6 +422,18 @@ def _sites(source: str) -> list:
 def _tile_rows(source: str, at: dict) -> list:
     """Every SBUF tile ``source`` declares at ``at``, as ``(line, name, bytes per partition)``."""
     return tile_rows(source, at, _arithmetic(), _WIDTHS)
+
+
+def _tiles_by_owner(source: str, rows: list) -> tuple:
+    """Every tile row of ``rows`` as ``(top-level function, name, bytes per partition)``, sorted."""
+    owner: dict[int, str] = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef):
+            # A tile a nested loop body declares belongs to the function the body is written in.
+            for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                owner[line] = node.name
+    found = [(owner.get(line, "<module>"), tile, size) for line, tile, size in rows]
+    return tuple(sorted(found, key=lambda one: (one[0], one[1], -1 if one[2] is None else one[2])))
 
 
 def _handed_width(source: str) -> int | None:
@@ -429,7 +484,9 @@ def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
 
     The allocator packs tiles back to back per partition, so one tile whose row is not a whole
     number of lines moves every later tile's base off the line; this reads the tiles the
-    transposes above land beside, through the helpers that make them and per caller.
+    transposes above land beside, through the helpers that make them and per caller. The tiles
+    these functions own are read by name AND row width; every other tile this shared module
+    declares is named and counted, so its whole tile count stays exact.
     """
     source = _module_source()
     for name, at in _TILE_GEOMETRIES:
@@ -437,11 +494,20 @@ def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
         unreadable = tuple(sorted({(line, tile) for line, tile, size in rows if size is None}))
         narrow = tuple((line, tile, size) for line, tile, size in rows
                        if size is not None and size % LINE)
-        _emit("NARROW_TILES", geometry=name, count=len(narrow), unreadable=unreadable, tiles=len(rows),
-              width=_WIDTHS[0], lines=tuple(r[0] for r in narrow))
+        owned = tuple(one for one in _tiles_by_owner(source, rows) if one[0] in _OWNER_FUNCTIONS)
+        want = tuple(sorted(_OWNED_TILES))
+        differing = tuple(sorted(set(owned) ^ set(want)))
+        whole = len(want) + len(_FOREIGN_TILES)
+        _emit("NARROW_TILES", geometry=name, count=len(narrow), unreadable=unreadable,
+              tiles=len(rows), width=_WIDTHS[0], lines=tuple(r[0] for r in narrow))
+        _emit("OWN_TILES", geometry=name, functions=len(_OWNER_FUNCTIONS), tiles=len(owned),
+              foreign=len(_FOREIGN_TILES), total=len(rows), differing=differing)
         assert unreadable == (), f"tile rows the arithmetic cannot size: {unreadable}"
         assert narrow == (), f"tile rows that are not whole 32-byte lines: {narrow}"
-        assert len(rows) == _TILES, f"SBUF tiles the census reads at {name}: {len(rows)}, not {_TILES}"
+        assert owned == want, (f"the tiles these functions declare at {name} moved: {differing} "
+                               f"(read {len(owned)}, want {len(want)})")
+        assert len(rows) == whole, \
+            f"SBUF tiles the census reads at {name}: {len(rows)}, not {whole}"
 
 
 _PLANTED_WHOLE_TILE = _HELPER + """

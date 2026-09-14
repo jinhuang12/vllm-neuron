@@ -693,28 +693,74 @@ def _row_iota(iota_hbm, rows: int):
     return tile
 
 
-def _dense_column(hbm, rows: int, offset: int):
+def _block_offset(at_block=None, dim: int = 0):
+    """The access-pattern keywords that step one device block index along ``dim``.
+
+    A trace-time caller passes nothing and gets today's pattern unchanged. A caller
+    inside a dynamic loop passes that loop's own index, and the pattern then steps one
+    ``dim`` stride of the tensor as it was reshaped for the loop -- the spelling
+    ``nkilib``'s ``pack_tokens`` uses for its permuted-output store.
+    """
+    if at_block is None:
+        return {}
+    return {"scalar_offset": at_block, "indirect_dim": dim}
+
+
+def _loaded(source, rows: int, width: int, dtype):
+    """``rows`` by ``width`` of an HBM access pattern in SBUF, converted on the way in.
+
+    The DMA converts the element type, the same mechanism :func:`_gathered` already uses
+    to read an fp8 bank as bfloat16.
+    """
+    tile = nl.ndarray((rows, _padded(width)), dtype=dtype, buffer=nl.sbuf)[:, 0:width]
+    nisa.dma_copy(dst=tile, src=source)
+    return tile
+
+
+def _stored(destination, tile):
+    """Write one SBUF tile through an HBM access pattern, on device descriptors.
+
+    ``nl.store`` takes a slice, and a slice cannot carry a device offset, so a dynamic
+    body stores through the pattern instead.
+    """
+    nisa.dma_copy(destination, tile, dge_mode=nisa.dge_mode.hwdge)
+
+
+def _dense_column(hbm, rows: int, offset: int, at_block=None):
     """``rows`` consecutive int32 of an ``[n, 1]`` HBM tensor, one per partition.
 
     The dense counterpart of :func:`_gathered`: the slice is contiguous and its start
     is a trace-time integer, so no index tile is needed. ``dsa/ragged_pack.py`` loads
-    its position column with this same pattern.
+    its position column with this same pattern. ``at_block`` moves the start by one
+    device block on a tensor reshaped ``(blocks, block, 1)``.
     """
     tile = _column(rows)
-    nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[1, rows], [1, 1]], offset=offset))
+    nisa.dma_copy(
+        dst=tile,
+        src=hbm.ap(
+            pattern=[[1, rows], [1, 1]], offset=offset, **_block_offset(at_block)
+        ),
+    )
     return tile
 
 
-def _broadcast_row(hbm, row: int, rows: int):
+def _broadcast_row(hbm, row: int, rows: int, at_block=None):
     """One int32 of an ``[n, 1]`` HBM tensor, replicated into EVERY partition.
 
     A ZERO partition stride does the replication: the pattern advances 0 elements
     per partition step, so all ``rows`` partitions read one address. The landed form
     is ``dsa/ragged_pack.py``'s ``_broadcast_scalar``, itself the vendor's idiom at
-    ``nkilib/experimental/collectives/a2av_train/permute_a2av.py:139-150``.
+    ``nkilib/experimental/collectives/a2av_train/permute_a2av.py:139-150``. One row of
+    an ``[n, 1]`` tensor is one element, so ``at_block`` addresses the block itself and
+    needs no reshape.
     """
     tile = _column(rows)
-    nisa.dma_copy(dst=tile, src=hbm.ap(pattern=[[0, rows], [1, 1]], offset=row))
+    nisa.dma_copy(
+        dst=tile,
+        src=hbm.ap(
+            pattern=[[0, rows], [1, 1]], offset=row, **_block_offset(at_block)
+        ),
+    )
     return tile
 
 
@@ -800,14 +846,18 @@ def _gathered(hbm, index, rows: int, width: int, dtype):
     return tile
 
 
-def _transpose_rows(dst, src_hbm, row_stride: int, rows: int, width: int, offset: int):
+def _transpose_rows(
+    dst, src_hbm, row_stride: int, rows: int, width: int, offset: int, at_block=None
+):
     """Transpose ``rows`` source rows of ``width`` elements onto partitions, 16 rows per DMA."""
     for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
         n = min(DGE_TRANSPOSE_ROWS, rows - r0)
         nisa.dma_transpose(
             dst=dst[:, r0 : r0 + n],
             src=src_hbm.ap(
-                pattern=[[row_stride, n], [1, width]], offset=offset + r0 * row_stride
+                pattern=[[row_stride, n], [1, width]],
+                offset=offset + r0 * row_stride,
+                **_block_offset(at_block),
             ),
         )
 
@@ -1039,20 +1089,37 @@ def moe_gate_up_blockwise_fp8_kernel(
     # intermediate block. Kernel-internal, so ``private_hbm``.
     staged = nl.ndarray((positions, h_extent), dtype=hidden.dtype, buffer=nl.private_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
+    # THE BLOCK IS THE DYNAMIC AXIS, so every tensor a body addresses by block leads with
+    # it and the tiles inside a body keep trace-time offsets. One body then serves every
+    # block, and the tile count of a body is the block's own quotient.
+    n_blocks = expert_index.shape[0]
+    row_index_b = row_index.reshape((n_blocks, block, 1))
+    staged_b = staged.reshape((n_blocks, block, h_extent))
+    out_b = out.reshape((n_blocks, block, fused_cols))
 
-    for m_tile in range(positions // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
-        wanted = _padding_resolved(
-            TILE_SIZE, _dense_column(row_index, TILE_SIZE, m0), pad_row
-        )
-        nl.store(
-            staged[m0 : m0 + TILE_SIZE, 0:h_extent],
-            value=_gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
-        )
+    def stage_block(at_block):
+        for tile in range(tiles_per_block):
+            t0 = tile * TILE_SIZE
+            wanted = _padding_resolved(
+                TILE_SIZE,
+                _dense_column(row_index_b, TILE_SIZE, t0, at_block=at_block),
+                pad_row,
+            )
+            _stored(
+                staged_b.ap(
+                    pattern=[[h_extent, TILE_SIZE], [1, h_extent]],
+                    offset=t0 * h_extent,
+                    **_block_offset(at_block),
+                ),
+                _gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
+            )
 
-    for m_tile in range(positions // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
-        expert = _broadcast_row(expert_index, m_tile // tiles_per_block, TILE_SIZE)
+    nl.fori_loop(0, n_blocks, stage_block)
+
+    def project_block(at_block):
+        # ONCE PER BLOCK, not once per tile: the expert is a property of the block, so its
+        # broadcast and the scale gather that reads it leave the tile loop entirely.
+        expert = _broadcast_row(expert_index, 0, TILE_SIZE, at_block=at_block)
         # The expert's own scale operand, one indirect gather of a tiny tensor.
         scale_sb = _gathered(
             scale_bank,
@@ -1061,116 +1128,134 @@ def moe_gate_up_blockwise_fp8_kernel(
             n_h_blocks * n_col_blocks,
             nl.float32,
         )
-        # [H=TILE_SIZE partitions, B=TILE_SIZE free] per hidden tile, in the source dtype.
-        hidden_t = []
-        for h_tile in range(n_h_blocks * GATE_UP_H_TILES_PER_BLOCK):
-            tile = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=hidden.dtype, buffer=nl.sbuf)
-            _transpose_rows(
-                tile, staged, h_extent, TILE_SIZE, TILE_SIZE, m0 * h_extent + h_tile * TILE_SIZE
-            )
-            hidden_t.append(tile)
-        for i_block in range(n_i_blocks):
-            gate_col = i_block * GATE_UP_SCALE_BLOCK
-            up_col = i_extent + i_block * GATE_UP_SCALE_BLOCK
-            gate_acc = _gate_up_sbuf()
-            up_acc = _gate_up_sbuf()
-            for h_block in range(n_h_blocks):
-                gate_psum = _gate_up_psum()
-                up_psum = _gate_up_psum()
-                for h_sub in range(GATE_UP_H_TILES_PER_BLOCK):
-                    h0 = h_block * GATE_UP_SCALE_BLOCK + h_sub * TILE_SIZE
-                    hidden_tile = hidden_t[h0 // TILE_SIZE]
-                    # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free], each
-                    # addressed at ``expert * H * n_col_blocks + (h0 + i) *
-                    # n_col_blocks + column_block`` in the bank's own row units.
-                    gate_w = _gathered(
-                        weight_bank,
-                        _bank_rows(
+        for token_tile in range(tiles_per_block):
+            t0 = token_tile * TILE_SIZE
+            # [H=TILE_SIZE partitions, B=TILE_SIZE free] per hidden tile, in the source dtype.
+            hidden_t = []
+            for h_tile in range(n_h_blocks * GATE_UP_H_TILES_PER_BLOCK):
+                tile = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=hidden.dtype, buffer=nl.sbuf)
+                _transpose_rows(
+                    tile,
+                    staged_b,
+                    h_extent,
+                    TILE_SIZE,
+                    TILE_SIZE,
+                    t0 * h_extent + h_tile * TILE_SIZE,
+                    at_block=at_block,
+                )
+                hidden_t.append(tile)
+            for i_block in range(n_i_blocks):
+                gate_col = i_block * GATE_UP_SCALE_BLOCK
+                up_col = i_extent + i_block * GATE_UP_SCALE_BLOCK
+                gate_acc = _gate_up_sbuf()
+                up_acc = _gate_up_sbuf()
+                for h_block in range(n_h_blocks):
+                    gate_psum = _gate_up_psum()
+                    up_psum = _gate_up_psum()
+                    for h_sub in range(GATE_UP_H_TILES_PER_BLOCK):
+                        h0 = h_block * GATE_UP_SCALE_BLOCK + h_sub * TILE_SIZE
+                        hidden_tile = hidden_t[h0 // TILE_SIZE]
+                        # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free], each
+                        # addressed at ``expert * H * n_col_blocks + (h0 + i) *
+                        # n_col_blocks + column_block`` in the bank's own row units.
+                        gate_w = _gathered(
+                            weight_bank,
+                            _bank_rows(
+                                TILE_SIZE,
+                                expert,
+                                ramp,
+                                h_extent * n_col_blocks,
+                                h0 * n_col_blocks + i_block,
+                                n_col_blocks,
+                            ),
                             TILE_SIZE,
-                            expert,
-                            ramp,
-                            h_extent * n_col_blocks,
-                            h0 * n_col_blocks + i_block,
-                            n_col_blocks,
-                        ),
-                        TILE_SIZE,
-                        GATE_UP_SCALE_BLOCK,
-                        nl.bfloat16,
-                    )
-                    up_w = _gathered(
-                        weight_bank,
-                        _bank_rows(
+                            GATE_UP_SCALE_BLOCK,
+                            nl.bfloat16,
+                        )
+                        up_w = _gathered(
+                            weight_bank,
+                            _bank_rows(
+                                TILE_SIZE,
+                                expert,
+                                ramp,
+                                h_extent * n_col_blocks,
+                                h0 * n_col_blocks + n_i_blocks + i_block,
+                                n_col_blocks,
+                            ),
                             TILE_SIZE,
-                            expert,
-                            ramp,
-                            h_extent * n_col_blocks,
-                            h0 * n_col_blocks + n_i_blocks + i_block,
-                            n_col_blocks,
-                        ),
-                        TILE_SIZE,
-                        GATE_UP_SCALE_BLOCK,
-                        nl.bfloat16,
-                    )
-                    # dst = stationary.T @ moving = [B, I]. The accumulate flag is
-                    # explicit rather than inferred, so first-write-overwrites is
-                    # visible here.
-                    nisa.nc_matmul(
-                        dst=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        stationary=hidden_tile,
-                        moving=gate_w,
-                        accumulate=(h_sub > 0),
-                    )
-                    nisa.nc_matmul(
-                        dst=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        stationary=hidden_tile,
-                        moving=up_w,
-                        accumulate=(h_sub > 0),
-                    )
-                # The same flattening `gate_up_flat_scale_index` returns, written
-                # as the block walk that produces it: `h_block * n_col_blocks +
-                # (gate_or_up * n_i_blocks + i_block)`.
-                gate_flat = h_block * n_col_blocks + i_block
-                up_flat = h_block * n_col_blocks + n_i_blocks + i_block
-                if h_block == 0:
-                    # The first block initialises the accumulator, so there is no
-                    # zeroing pass over SBUF.
-                    nisa.tensor_scalar(
-                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
-                    )
-                    nisa.tensor_scalar(
-                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
-                    )
-                else:
-                    nisa.scalar_tensor_tensor(
-                        dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
-                        op1=nl.add,
-                        operand1=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                    )
-                    nisa.scalar_tensor_tensor(
-                        dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
-                        op1=nl.add,
-                        operand1=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                    )
-            nl.store(
-                out[m0 : m0 + TILE_SIZE, gate_col : gate_col + GATE_UP_SCALE_BLOCK],
-                value=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-            )
-            nl.store(
-                out[m0 : m0 + TILE_SIZE, up_col : up_col + GATE_UP_SCALE_BLOCK],
-                value=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-            )
+                            GATE_UP_SCALE_BLOCK,
+                            nl.bfloat16,
+                        )
+                        # dst = stationary.T @ moving = [B, I]. The accumulate flag is
+                        # explicit rather than inferred, so first-write-overwrites is
+                        # visible here.
+                        nisa.nc_matmul(
+                            dst=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            stationary=hidden_tile,
+                            moving=gate_w,
+                            accumulate=(h_sub > 0),
+                        )
+                        nisa.nc_matmul(
+                            dst=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            stationary=hidden_tile,
+                            moving=up_w,
+                            accumulate=(h_sub > 0),
+                        )
+                    # The same flattening `gate_up_flat_scale_index` returns, written
+                    # as the block walk that produces it: `h_block * n_col_blocks +
+                    # (gate_or_up * n_i_blocks + i_block)`.
+                    gate_flat = h_block * n_col_blocks + i_block
+                    up_flat = h_block * n_col_blocks + n_i_blocks + i_block
+                    if h_block == 0:
+                        # The first block initialises the accumulator, so there is no
+                        # zeroing pass over SBUF.
+                        nisa.tensor_scalar(
+                            dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                        )
+                        nisa.tensor_scalar(
+                            dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                        )
+                    else:
+                        nisa.scalar_tensor_tensor(
+                            dst=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=gate_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, gate_flat : gate_flat + 1],
+                            op1=nl.add,
+                            operand1=gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        )
+                        nisa.scalar_tensor_tensor(
+                            dst=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=up_psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, up_flat : up_flat + 1],
+                            op1=nl.add,
+                            operand1=up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        )
+                _stored(
+                    out_b.ap(
+                        pattern=[[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
+                        offset=t0 * fused_cols + gate_col,
+                        **_block_offset(at_block),
+                    ),
+                    gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                )
+                _stored(
+                    out_b.ap(
+                        pattern=[[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
+                        offset=t0 * fused_cols + up_col,
+                        **_block_offset(at_block),
+                    ),
+                    up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                )
+
+    nl.fori_loop(0, n_blocks, project_block)
     return out
 
 
@@ -1539,21 +1624,31 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
     out = nl.ndarray((i_extent, tokens), dtype=nl.float32, buffer=nl.shared_hbm)
     if bounded_config:
         bounds_sb = nl.load(bounds[0:TILE_SIZE, 0:_SWIGLU_BOUND_COLUMNS])
+    # THE TOKEN TILE IS THE DYNAMIC AXIS. The pre-activation input leads with it; the
+    # result carries it on the FREE axis, because this kernel returns ``[I, B]``.
+    n_tiles = tokens // TILE_SIZE
+    gate_up_b = gate_up.reshape((n_tiles, TILE_SIZE, fused_cols))
+    out_b = out.reshape((i_extent, n_tiles, TILE_SIZE))
+    column = [[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]]
 
-    for m_tile in range(tokens // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
+    def activate_tile(at_tile):
         for i_block in range(i_extent // GATE_UP_SCALE_BLOCK):
             i0 = i_block * GATE_UP_SCALE_BLOCK
-            gate = nl.load(
-                gate_up[m0 : m0 + TILE_SIZE, i0 : i0 + GATE_UP_SCALE_BLOCK],
-                dtype=nl.float32,
+            gate = _loaded(
+                gate_up_b.ap(
+                    pattern=column, offset=i0, **_block_offset(at_tile)
+                ),
+                TILE_SIZE,
+                GATE_UP_SCALE_BLOCK,
+                nl.float32,
             )
-            up = nl.load(
-                gate_up[
-                    m0 : m0 + TILE_SIZE,
-                    i_extent + i0 : i_extent + i0 + GATE_UP_SCALE_BLOCK,
-                ],
-                dtype=nl.float32,
+            up = _loaded(
+                gate_up_b.ap(
+                    pattern=column, offset=i_extent + i0, **_block_offset(at_tile)
+                ),
+                TILE_SIZE,
+                GATE_UP_SCALE_BLOCK,
+                nl.float32,
             )
             # THE BOUNDS, on the tiles just loaded. ``maximum`` and ``minimum`` are
             # the closed-form pair this campaign already uses for a bound
@@ -1618,10 +1713,16 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
             nisa.nc_transpose(dst=transposed, data=gated)
             out_sb = _gate_up_sbuf()
             nisa.tensor_copy(dst=out_sb, src=transposed)
-            nl.store(
-                out[i0 : i0 + GATE_UP_SCALE_BLOCK, m0 : m0 + TILE_SIZE],
-                value=out_sb,
+            _stored(
+                out_b.ap(
+                    pattern=[[tokens, GATE_UP_SCALE_BLOCK], [1, TILE_SIZE]],
+                    offset=i0 * tokens,
+                    **_block_offset(at_tile, 1),
+                ),
+                out_sb,
             )
+
+    nl.fori_loop(0, n_tiles, activate_tile)
     return out
 
 
@@ -1729,10 +1830,18 @@ def moe_down_blockwise_fp8_kernel(
 
     out = nl.ndarray((positions, h_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     ramp = _row_iota(iota, TILE_SIZE)
+    # THE BLOCK IS THE DYNAMIC AXIS here too. The output and the routing column lead with
+    # it; the intermediate carries it on the FREE axis, because the activation before this
+    # kernel returns ``[I, B]``.
+    n_blocks = expert_index.shape[0]
+    row_index_b = row_index.reshape((n_blocks, block, 1))
+    intermediate_b = intermediate_t.reshape((i_extent, n_blocks, block))
+    out_b = out.reshape((n_blocks, block, h_extent))
 
-    for m_tile in range(positions // TILE_SIZE):
-        m0 = m_tile * TILE_SIZE
-        expert = _broadcast_row(expert_index, m_tile // tiles_per_block, TILE_SIZE)
+    def project_block(at_block):
+        # ONCE PER BLOCK: the expert is the block's own property, so its broadcast and the
+        # scale gather that reads it leave the tile loop.
+        expert = _broadcast_row(expert_index, 0, TILE_SIZE, at_block=at_block)
         scale_sb = _gathered(
             scale_bank,
             _bank_rows(TILE_SIZE, expert, ramp, TILE_SIZE, 0, 1),
@@ -1740,87 +1849,103 @@ def moe_down_blockwise_fp8_kernel(
             n_i_blocks * n_h_blocks,
             nl.float32,
         )
-        # LOADED PER TOKEN TILE, never hoisted out of this loop: a token is a
-        # PARTITION, the partition axis serves 128 of them, and a whole-column load
-        # would bound this kernel to one tile. The causal-bound kernel re-loads its
-        # per-row length column inside its own row loop for the same reason.
-        # ``row * E_local + expert``, both on device: the resolved row is the same
-        # padding-aware index the gate/up limb gathered its tokens with, and the
-        # expert is this block's scalar.
-        affinity_sb = _gathered(
-            affinity_bank,
-            _affinity_rows(
-                TILE_SIZE,
-                _padding_resolved(
-                    TILE_SIZE, _dense_column(row_index, TILE_SIZE, m0), pad_row
-                ),
-                expert,
-                n_experts,
-            ),
-            TILE_SIZE,
-            1,
-            nl.float32,
-        )
-        for h_block in range(n_h_blocks):
-            h0 = h_block * GATE_UP_SCALE_BLOCK
-            acc = _gate_up_sbuf()
-            for i_block in range(n_i_blocks):
-                i0 = i_block * GATE_UP_SCALE_BLOCK
-                psum = _gate_up_psum()
-                inter_tile = nl.load(
-                    intermediate_t[i0 : i0 + TILE_SIZE, m0 : m0 + TILE_SIZE],
-                    dtype=nl.bfloat16,
-                )
-                w_tile = _gathered(
-                    weight_bank,
-                    _bank_rows(
-                        TILE_SIZE,
-                        expert,
-                        ramp,
-                        i_extent * n_h_blocks,
-                        i0 * n_h_blocks + h_block,
-                        n_h_blocks,
-                    ),
+        for token_tile in range(tiles_per_block):
+            t0 = token_tile * TILE_SIZE
+            # LOADED PER TOKEN TILE, never hoisted out of this loop: a token is a
+            # PARTITION, the partition axis serves 128 of them, and a whole-column load
+            # would bound this kernel to one tile. The causal-bound kernel re-loads its
+            # per-row length column inside its own row loop for the same reason.
+            # ``row * E_local + expert``, both on device: the resolved row is the same
+            # padding-aware index the gate/up limb gathered its tokens with, and the
+            # expert is this block's scalar.
+            affinity_sb = _gathered(
+                affinity_bank,
+                _affinity_rows(
                     TILE_SIZE,
-                    GATE_UP_SCALE_BLOCK,
-                    nl.bfloat16,
-                )
-                nisa.nc_matmul(
-                    dst=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                    stationary=inter_tile,
-                    moving=w_tile,
-                    accumulate=False,
-                )
-                flat = i_block * n_h_blocks + h_block
-                if i_block == 0:
-                    nisa.tensor_scalar(
-                        dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
-                    )
-                else:
-                    nisa.scalar_tensor_tensor(
-                        dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                        op0=nl.multiply,
-                        operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
-                        op1=nl.add,
-                        operand1=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                    )
-            # The affinity is a per-partition column and the partition axis is the
-            # token axis, so one value per token is exactly this operand's shape.
-            scaled = _gate_up_sbuf()
-            nisa.tensor_scalar(
-                dst=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                data=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-                op0=nl.multiply,
-                operand0=affinity_sb[0:TILE_SIZE, 0:1],
+                    _padding_resolved(
+                        TILE_SIZE,
+                        _dense_column(row_index_b, TILE_SIZE, t0, at_block=at_block),
+                        pad_row,
+                    ),
+                    expert,
+                    n_experts,
+                ),
+                TILE_SIZE,
+                1,
+                nl.float32,
             )
-            nl.store(
-                out[m0 : m0 + TILE_SIZE, h0 : h0 + GATE_UP_SCALE_BLOCK],
-                value=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
-            )
+            for h_block in range(n_h_blocks):
+                h0 = h_block * GATE_UP_SCALE_BLOCK
+                acc = _gate_up_sbuf()
+                for i_block in range(n_i_blocks):
+                    i0 = i_block * GATE_UP_SCALE_BLOCK
+                    psum = _gate_up_psum()
+                    inter_tile = _loaded(
+                        intermediate_b.ap(
+                            pattern=[[positions, TILE_SIZE], [1, TILE_SIZE]],
+                            offset=i0 * positions + t0,
+                            **_block_offset(at_block, 1),
+                        ),
+                        TILE_SIZE,
+                        TILE_SIZE,
+                        nl.bfloat16,
+                    )
+                    w_tile = _gathered(
+                        weight_bank,
+                        _bank_rows(
+                            TILE_SIZE,
+                            expert,
+                            ramp,
+                            i_extent * n_h_blocks,
+                            i0 * n_h_blocks + h_block,
+                            n_h_blocks,
+                        ),
+                        TILE_SIZE,
+                        GATE_UP_SCALE_BLOCK,
+                        nl.bfloat16,
+                    )
+                    nisa.nc_matmul(
+                        dst=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        stationary=inter_tile,
+                        moving=w_tile,
+                        accumulate=False,
+                    )
+                    flat = i_block * n_h_blocks + h_block
+                    if i_block == 0:
+                        nisa.tensor_scalar(
+                            dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                        )
+                    else:
+                        nisa.scalar_tensor_tensor(
+                            dst=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            data=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                            op0=nl.multiply,
+                            operand0=scale_sb[0:TILE_SIZE, flat : flat + 1],
+                            op1=nl.add,
+                            operand1=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                        )
+                # The affinity is a per-partition column and the partition axis is the
+                # token axis, so one value per token is exactly this operand's shape.
+                scaled = _gate_up_sbuf()
+                nisa.tensor_scalar(
+                    dst=scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    data=acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                    op0=nl.multiply,
+                    operand0=affinity_sb[0:TILE_SIZE, 0:1],
+                )
+                _stored(
+                    out_b.ap(
+                        pattern=[[h_extent, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
+                        offset=t0 * h_extent + h0,
+                        **_block_offset(at_block),
+                    ),
+                    scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
+                )
+
+    nl.fori_loop(0, n_blocks, project_block)
     return out
 
 
