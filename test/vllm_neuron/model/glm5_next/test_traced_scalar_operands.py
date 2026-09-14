@@ -5,7 +5,8 @@ from a python number by ``torch.as_tensor`` is a REAL meta tensor even inside th
 the next operator refuses a real tensor beside fake ones; a factory op such as ``torch.full``
 is dispatched through the fake mode and comes back fake. The items here read torch's own
 behaviour on both forms, trace the indexer's prefill seam and its whole prefill leg on meta at
-2048 tokens, and require the int route and the tensor route of the seam to seed the same ring.
+2048 tokens -- with the kernel gate on, as the compile-only arm traces it, and off, through the
+torch fallbacks -- and require the int route and the tensor route of the seam to seed the same ring.
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 python -m pytest -s -rA \\
         test/vllm_neuron/model/glm5_next/test_traced_scalar_operands.py
@@ -20,6 +21,8 @@ import torch
 import torch._dynamo as dynamo
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
+from vllm_neuron.utils.neuron_utils import can_run_kernel
+
 from test.vllm_neuron.model.glm5_next import test_dsa_layer as layer_half
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
@@ -30,6 +33,9 @@ TRACED_DEVICE = "meta"
 #: The text the fake mode refuses a real tensor with.
 REFUSAL = "convert all Tensors to FakeTensors"
 
+#: The text the fake mode refuses an operator with when its operands sit on two devices.
+TWO_DEVICES = "found two different devices"
+
 #: The prefill bucket the serving run extracts, and the geometry both traces are read at.
 TOKENS = 2048
 
@@ -37,9 +43,10 @@ TOKENS = 2048
 POOL = layer_half.POOL_SIZE
 PAGE_SIZE = layer_half.PAGE_SIZE
 
-#: ``(end_position, start_position)`` pairs item D compares the two routes at: a whole
-#: chunk, an end that divides evenly, an end one short, and two padded chunks.
-ROUTE_CASES = ((7, None), (8, None), (5, None), (11, 3), (10, 2))
+#: ``(end_position, start_position)`` pairs item D compares the two routes at. A whole chunk's
+#: end is at least its own length (the int route's own rule): one past a pool boundary, one
+#: short of the next, exactly on one; then two padded chunks, whose real length is ``end - start``.
+ROUTE_CASES = ((13, None), (15, None), (16, None), (11, 3), (10, 2))
 CHUNK_ROWS = 12
 
 
@@ -76,15 +83,28 @@ def _chunk(indexer, *, tokens: int, device: str) -> dict:
     }
 
 
+class _Captured(Exception):
+    """Raised in place of running the graph once it is kept, as the runner's capture backend does."""
+
+
 class _Keep:
-    """A compile backend that keeps every graph and runs none."""
+    """A compile backend that keeps every graph and runs none.
+
+    The runner's capture backend keeps the graph and raises ``CaptureComplete`` instead of
+    running it (``neuron_model_runner.py`` swallows that as the success signal); the same
+    contract here means nothing is ever executed on meta, kernels included.
+    """
 
     def __init__(self) -> None:
         self.graphs: list = []
 
     def __call__(self, graph_module, _example_inputs):
         self.graphs.append(graph_module)
-        return graph_module.forward
+        return self._stop
+
+    @staticmethod
+    def _stop(*_args, **_kwargs):
+        raise _Captured()
 
     def nodes_targeting(self, *targets) -> int:
         return sum(
@@ -102,6 +122,8 @@ def _traced(fn, *args, **kwargs) -> tuple[_Keep, str]:
     compiled = torch.compile(fn, backend=keep, fullgraph=True, dynamic=False)
     try:
         compiled(*args, **kwargs)
+    except _Captured:
+        return keep, ""
     except Exception as error:  # the trace's refusal is the reading, not a failure here
         return keep, " ".join(str(error).split())
     return keep, ""
@@ -175,16 +197,8 @@ def test_b_the_prefill_seam_traces_on_meta_with_the_chunk_end_as_a_tensor() -> N
     )
 
 
-def test_c_the_indexer_prefill_leg_traces_on_meta_at_2048_tokens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The whole prefill leg through the indexer's forward, on meta, the kernel gate off.
-
-    The simulator computes values and a meta trace has none, so the gate is turned off the
-    way the runner's own switch does it; the seams' torch forms are what the trace reads.
-    """
-    _require_cpu_mode()
-    monkeypatch.setenv("VLLM_NEURON_DISABLE_NKI_KERNELS", "1")
+def _prefill_leg_on_meta() -> tuple[_Keep, str, int]:
+    """The fixture indexer's whole prefill leg traced on meta at 2048 tokens; ``(keep, message, pool rows)``."""
     stack, cfg, _gen = layer_half.build_layer_stack(layers=1)
     indexer = stack[0].attention.indexer.to(TRACED_DEVICE)
     head_dim = int(indexer.index_head_dim)
@@ -216,7 +230,19 @@ def test_c_the_indexer_prefill_leg_traces_on_meta_at_2048_tokens(
         prefill_tail=ring,
         prefill_end_position=end,
     )
-    say("indexer_prefill_trace", f"tokens={TOKENS}", f"pool_rows={rows}",
+    return keep, message, rows
+
+
+def test_c_the_indexer_prefill_leg_traces_on_meta_at_2048_tokens() -> None:
+    """The whole prefill leg through the indexer's forward, on meta, the kernel gate on.
+
+    This is the compile-only arm's own form: the kernels are custom ops the fake mode
+    propagates without running, and the backend stops the run once the graph is in hand.
+    """
+    _require_cpu_mode()
+    assert can_run_kernel(), "the kernel gate reads off under the declared acceptance environment"
+    keep, message, rows = _prefill_leg_on_meta()
+    say("indexer_prefill_trace", f"tokens={TOKENS}", f"pool_rows={rows}", "kernels=on",
         f"refused={bool(message)}", f"graphs={len(keep.graphs)}",
         f"as_tensor_nodes={keep.nodes_targeting(torch.as_tensor)}",
         f"full_nodes={keep.nodes_targeting(torch.full)}",
@@ -227,6 +253,24 @@ def test_c_the_indexer_prefill_leg_traces_on_meta_at_2048_tokens(
     )
     assert len(keep.graphs) == 1, f"{len(keep.graphs)} graphs kept, not one"
     assert keep.nodes_targeting(torch.as_tensor) == 0, "the graph carries a torch.as_tensor node"
+
+
+def test_e_the_fallback_leg_traces_on_meta_with_its_constants_on_the_activations_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same leg with the kernel gate off: every torch fallback builds its constants where the activation is."""
+    _require_cpu_mode()
+    monkeypatch.setenv("VLLM_NEURON_DISABLE_NKI_KERNELS", "1")
+    assert not can_run_kernel(), "the kernel gate still reads on with the disabling switch set"
+    keep, message, rows = _prefill_leg_on_meta()
+    say("fallback_prefill_trace", f"tokens={TOKENS}", f"pool_rows={rows}", "kernels=off",
+        f"refused={bool(message)}", f"graphs={len(keep.graphs)}",
+        f"two_devices={TWO_DEVICES in message}",
+        f"message={_refusal_reads(message)}")
+    assert not message, (
+        f"the trace of the fallback leg on meta was refused: {_refusal_reads(message)!r}"
+    )
+    assert len(keep.graphs) == 1, f"{len(keep.graphs)} graphs kept, not one"
 
 
 def test_d_the_int_route_and_the_tensor_route_seed_the_same_ring_for_padded_and_whole_chunks() -> None:
