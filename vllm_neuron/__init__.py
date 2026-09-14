@@ -116,13 +116,17 @@ def _init_backend():
 
     # The compiler is registered inside the load stager, because compiling a graph loads it into
     # host memory and a whole group loading at one instant exhausts the host. The stage is a
-    # pass-through until a caller names the load it is about to run.
-    from vllm_neuron.vllm.patches.staged_neff_load import staged_compiler
+    # pass-through until a caller names the load it is about to run. The install takes the name
+    # whether lite's import already holds it or not, wrapping what it finds, because a stage that
+    # loses the name silently stages nothing. The run is named here, before this process starts
+    # any worker, so every rank of one attempt signals in one directory.
+    from vllm_neuron.vllm.patches.staged_neff_load import (
+        install_staged_compiler,
+        pin_this_run,
+    )
 
-    if "neuron_libtorch" not in registry.list_backends():
-        registry.register_backend(
-            compiler_fn=staged_compiler(compile), name="neuron_libtorch"
-        )
+    pin_this_run()
+    install_staged_compiler(registry, "neuron_libtorch", compile)
 
     if "neuron_libtorch_graph_capture" not in registry.list_backends():
         registry.register_backend(
