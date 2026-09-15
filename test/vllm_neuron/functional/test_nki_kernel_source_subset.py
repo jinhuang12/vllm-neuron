@@ -38,10 +38,11 @@ def _kernel_functions(tree: ast.Module) -> list[ast.FunctionDef]:
     }
     for name, node in functions.items():
         for decorator in node.decorator_list:
+            marked = decorator.func if isinstance(decorator, ast.Call) else decorator
             named = (
-                decorator.attr
-                if isinstance(decorator, ast.Attribute)
-                else getattr(decorator, "id", "")
+                marked.attr
+                if isinstance(marked, ast.Attribute)
+                else getattr(marked, "id", "")
             )
             if named == "jit":
                 entries.add(name)
@@ -103,4 +104,8 @@ def test_no_kernel_call_expands_a_mapping_into_keywords():
     assert expansions == (), (
         f"kernel calls that expand a mapping into keywords, which the front end "
         f"refuses: {expansions}"
+    )
+    assert stars == (), (
+        f"kernel calls that expand a sequence into arguments, which the front end "
+        f"refuses as well: {stars}"
     )

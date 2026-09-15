@@ -90,7 +90,7 @@ def _compile_each_kernel() -> None:
             with FakeTensorMode():
                 call()
         except Exception as refusal:  # the front end's refusal is the reading
-            message = _flat(refusal)
+            message = _flat(refusal, 4000)  # room for a refusal that names every site
         multiplicity = re.search(r"\[x(\d+)\]", message)
         _emit(f"kernel={name}", f"refused={bool(message)}",
               f"x={multiplicity.group(1) if multiplicity else 0}",
@@ -116,16 +116,25 @@ def _rows_from_a_child() -> list[str]:
 
 def _kernel_rows(printed: list[str]) -> list[dict[str, str]]:
     """One dictionary per kernel row, keyed by the field names the child printed."""
-    return [
-        dict(field.split("=", 1) for field in line.split("|")[1:])
-        for line in printed if line.startswith(ROW + "|kernel=")
-    ]
+    rows = []
+    for line in printed:
+        if not line.startswith(ROW + "|kernel="):
+            continue
+        # THE DIAGNOSTIC IS THE LAST FIELD AND IT IS THE COMPILER'S OWN TEXT, which may hold a
+        # pipe of its own. So it is cut off whole before the fields in front of it are split.
+        head, _, diagnostic = line.partition("|diagnostic=")
+        fields = dict(one.split("=", 1) for one in head.split("|")[1:])
+        rows.append({**fields, "diagnostic": diagnostic})
+    return rows
 
 
 def test_the_front_end_accepts_every_shipped_moe_kernel():
     """The front end compiles the gate-up, activation and down kernels of this tree."""
     printed = _rows_from_a_child()
     rows = _kernel_rows(printed)
+    child = [line for line in printed if line.startswith(ROW + "|child|")]
+    assert child and "|rc=0|" in child[0], (
+        f"the compile child did not come back clean, so its rows are not a reading: {child}")
     venue = [line for line in printed if line.startswith(ROW + "|venue|")]
     assert venue and f"|module={_ROOT}/" in venue[0], (
         f"the child compiled another tree than {_ROOT}: {venue}")
