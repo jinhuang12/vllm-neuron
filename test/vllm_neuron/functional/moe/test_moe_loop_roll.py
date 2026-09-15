@@ -28,6 +28,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe import moe_blockwise_fp8 as live
 from test.vllm_neuron.functional.dma_transpose_census import census, tile_rows
@@ -78,7 +79,12 @@ _EXPERTS = 2
 _G18 = {"name": "G18", "blocks": 2, "tiles": 9, "h_blocks": 1, "i_blocks": 1}
 _G16 = {"name": "G16", "blocks": 2, "tiles": 8, "h_blocks": 1, "i_blocks": 1}
 _GN = {"name": "GN", "blocks": 2, "tiles": 9, "h_blocks": 2, "i_blocks": 2}
-_ALL_CASES = (_G18, _G16, _GN)
+#: Two more geometries for the two-program launch: ONE block of one tile, which both
+#: programs run whole and write identically, and THREE blocks of three tiles, where the
+#: programs share the middle block and the middle token tile.
+_G1 = {"name": "G1", "blocks": 1, "tiles": 1, "h_blocks": 1, "i_blocks": 1}
+_G3 = {"name": "G3", "blocks": 3, "tiles": 3, "h_blocks": 1, "i_blocks": 1}
+_ALL_CASES = (_G18, _G16, _GN, _G1, _G3)
 
 
 def _emit(tag: str, **values: object) -> None:
@@ -1122,3 +1128,55 @@ def test_the_kernel_defaults_this_change_depends_on_are_the_ones_it_was_read_at(
     _emit("KERNEL_DEFAULTS", read_at=retyped, live=live_values, moved=len(moved),
           by_name=moved, model_swiglu_limit=_MODEL_SWIGLU_LIMIT)
     assert len(moved) == 0, f"defaults that moved under the reading: {moved}"
+
+
+# --------------------------------------------------------------------------- #
+# The two-program launch: which program walks which blocks.                    #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("count", (1, 2, 3, 81, 162))
+def test_each_program_range_covers_the_blocks_in_equal_trips(count):
+    """Two programs run equal trips that together cover every block and share at most one."""
+    ranges = [live._program_block_range(count, 2, prg_id) for prg_id in (0, 1)]
+    covered = [at for first, end in ranges for at in range(first, end)]
+    lengths = [end - first for first, end in ranges]
+    _emit("PROGRAM_RANGE", blocks=count, ranges=ranges, lengths=lengths)
+    assert lengths[0] == lengths[1] == -(-count // 2)
+    assert sorted(set(covered)) == list(range(count))
+    assert len(covered) - count == count % 2
+    if count < 2:
+        assert ranges == [(0, count), (0, count)]
+    assert live._program_block_range(count, 1, 0) == (0, count)
+
+
+@nki.jit
+def _mark_blocks_by_program(blocks):
+    """Mark, in this program's own rows, every block its range covers."""
+    count = blocks.shape[0]
+    out = nl.ndarray((2 * count, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+    _ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "test_mark_blocks_by_program", (0, 1), 2
+    )
+    first, end = live._program_block_range(count, n_prgs, prg_id)
+    marks = nl.ndarray((count, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=marks, value=0.0)
+    for at_block in range(first, end):
+        marks[at_block, 0] = 1.0
+    nl.store(out[prg_id * count : (prg_id + 1) * count, :], value=marks)
+    return out
+
+
+@pytest.mark.parametrize(
+    "count, want",
+    ((2, [1, 0, 0, 1]), (3, [1, 1, 0, 0, 1, 1]), (1, [1, 1])),
+    ids=["two-blocks-one-each", "three-blocks-two-each-sharing-the-middle", "one-block-run-by-both"],
+)
+def test_two_programs_mark_the_blocks_their_ranges_cover(count, want):
+    """Read from inside a two-program launch: program 0's rows first, program 1's after.
+
+    A block in both programs' rows is written twice. The identity items at G1 and G3
+    are what prove those two writes carry the same values.
+    """
+    marks = wrap_nki(_mark_blocks_by_program)[2](torch.zeros(count, 1, dtype=torch.float32))
+    got = [int(v) for v in marks.to(torch.float32).flatten().tolist()]
+    _emit("PROGRAM_MARKS", blocks=count, marks=got, want=want)
+    assert got == want

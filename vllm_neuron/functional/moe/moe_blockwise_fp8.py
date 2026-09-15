@@ -99,6 +99,7 @@ from nkilib.core.moe.moe_cte.moe_cte import (
     ExpertAffinityScaleMode,
     SkipMode,
 )
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import (
     BLOCK_QUANT_SIZE,
@@ -115,8 +116,27 @@ logger = logging.getLogger(__name__)
 #: (``bwmm_shard_on_I.py:80``), i.e. from the SPMD launch grid, and
 #: ``:628`` refuses anything but ``2`` on the dynamic-control-flow path
 #: ("shard-on-I with dynamic control flow only work on TRN2"). The campaign's
-#: target is trn2 at LNC2, so the grid is fixed here rather than exposed.
+#: target is trn2 at LNC2, so the grid is fixed here rather than exposed. The three
+#: routed kernels below launch on the same grid: a kernel with a device loop
+#: reaches both physical cores only through it, and each program then runs the same
+#: number of trips over its own share of the loop (:func:`_program_block_range`).
 NUM_SHARDS = 2
+
+
+def _program_block_range(count: int, n_prgs: int, prg_id: int) -> tuple[int, int]:
+    """This program's half-open range of loop indices out of ``count``.
+
+    Every program runs the same number of trips, ``ceil(count / n_prgs)``, so the cores
+    carry one loop structure. Program ``p`` starts at ``p * trips`` and the last program
+    is pulled back to end at ``count``, so when the trips do not divide ``count`` two
+    programs share one index and write the same values to its rows, the rule the vendor's
+    ``pack_tokens`` applies to a single tile.
+    """
+    if n_prgs <= 1:
+        return 0, count
+    trips = -(-count // n_prgs)
+    start = min(prg_id * trips, count - trips)
+    return start, start + trips
 
 #: ``H`` bounds, from the kernel's own compatibility asserts at
 #: ``bwmm_shard_on_I.py:668`` (``512 <= H <= 8192``).
