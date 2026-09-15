@@ -623,7 +623,8 @@ def _stored_by_block(source, marker):
                 out_b.ap(
                     pattern=[[TILE_SIZE, TILE_SIZE], [1, TILE_SIZE]],
                     offset=t0 * TILE_SIZE,
-                    **live._block_offset(at_block),
+                    scalar_offset=at_block,
+                    indirect_dim=0,
                 ),
                 tile,
             )
@@ -664,7 +665,8 @@ def _transposed_by_block(source, marker):
                 out_b.ap(
                     pattern=[[TILE_SIZE, TILE_SIZE], [1, TILE_SIZE]],
                     offset=t0 * TILE_SIZE,
-                    **live._block_offset(at_block),
+                    scalar_offset=at_block,
+                    indirect_dim=0,
                 ),
                 tile,
             )
@@ -688,7 +690,8 @@ def _broadcast_by_block(index_hbm, marker):
             out_b.ap(
                 pattern=[[1, TILE_SIZE], [1, 1]],
                 offset=0,
-                **live._block_offset(at_block),
+                scalar_offset=at_block,
+                indirect_dim=0,
             ),
             live._broadcast_row(index_hbm, 0, TILE_SIZE, at_block=at_block),
         )
@@ -715,7 +718,8 @@ def _cast_by_block(source, marker):
                 source_b.ap(
                     pattern=[[TILE_SIZE, TILE_SIZE], [1, TILE_SIZE]],
                     offset=t0 * TILE_SIZE,
-                    **live._block_offset(at_block),
+                    scalar_offset=at_block,
+                    indirect_dim=0,
                 ),
                 TILE_SIZE,
                 TILE_SIZE,
@@ -725,7 +729,8 @@ def _cast_by_block(source, marker):
                 out_b.ap(
                     pattern=[[TILE_SIZE, TILE_SIZE], [1, TILE_SIZE]],
                     offset=t0 * TILE_SIZE,
-                    **live._block_offset(at_block),
+                    scalar_offset=at_block,
+                    indirect_dim=0,
                 ),
                 tile,
             )
