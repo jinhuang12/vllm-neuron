@@ -1107,6 +1107,10 @@ def moe_gate_up_blockwise_fp8_kernel(
     # it and the tiles inside a body keep trace-time offsets. One body then serves every
     # block, and the tile count of a body is the block's own quotient.
     n_blocks = expert_index.shape[0]
+    _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "moe_gate_up_blockwise_fp8", (0, 1), NUM_SHARDS
+    )
+    first_block, end_block = _program_block_range(n_blocks, n_prgs, prg_id)
     row_index_b = row_index.reshape((n_blocks, block, 1))
     staged_b = staged.reshape((n_blocks, block, h_extent))
     out_b = out.reshape((n_blocks, block, fused_cols))
@@ -1129,7 +1133,7 @@ def moe_gate_up_blockwise_fp8_kernel(
                 _gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
             )
 
-    nl.fori_loop(0, n_blocks, stage_block)
+    nl.fori_loop(first_block, end_block, stage_block)
 
     def project_block(at_block):
         # ONCE PER BLOCK, not once per tile: the expert is a property of the block, so its
@@ -1272,7 +1276,7 @@ def moe_gate_up_blockwise_fp8_kernel(
                     up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 )
 
-    nl.fori_loop(0, n_blocks, project_block)
+    nl.fori_loop(first_block, end_block, project_block)
     return out
 
 
@@ -1483,7 +1487,7 @@ def moe_gate_up_blockwise_fp8(
         )
 
     _GATE_UP_COUNTERS.nki_dispatch += 1
-    return wrap_nki(moe_gate_up_blockwise_fp8_kernel)(
+    return wrap_nki(moe_gate_up_blockwise_fp8_kernel)[NUM_SHARDS](
         hidden_states.to(torch.bfloat16),
         # The bank's own rows, one ``128``-column block each. ``[E, H, 2*I]`` is
         # contiguous, so this is a view and the kernel's addressing is exact.
