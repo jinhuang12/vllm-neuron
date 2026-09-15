@@ -1154,6 +1154,23 @@ def test_a_one_program_launch_is_refused_before_any_loop_runs(count):
         live._program_block_range("control-item", count, 1, 0)
 
 
+def test_a_shipped_kernel_launched_with_one_program_is_refused_by_the_simulator():
+    """The refusal is seen at a real launch: ``wrap_nki(kernel)[1]`` builds no loop and raises."""
+    gate_up = _activation_inputs(_G1).to(torch.float32)
+    with pytest.raises(Exception) as caught:
+        wrap_nki(live.moe_swiglu_transposed_kernel)[1](gate_up, _bounds(_MODEL_SWIGLU_LIMIT))
+    chain, error = [], caught.value
+    while error is not None:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    message = " ".join(str(error) for error in chain)
+    value_error = any(isinstance(error, ValueError) for error in chain)
+    _emit("WRONG_DEGREE_LAUNCH", kernel="moe_swiglu_transposed", programs=1,
+          value_error=value_error, message=message[:160])
+    assert value_error
+    assert "moe_swiglu_transposed: traced with 1 programs, the kernel wants 2" in message
+
+
 @nki.jit
 def _mark_blocks_by_program(blocks):
     """Mark, in this program's own rows, every block its range covers."""
