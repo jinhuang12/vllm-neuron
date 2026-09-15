@@ -99,6 +99,7 @@ from nkilib.core.moe.moe_cte.moe_cte import (
     ExpertAffinityScaleMode,
     SkipMode,
 )
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import (
     BLOCK_QUANT_SIZE,
@@ -115,8 +116,36 @@ logger = logging.getLogger(__name__)
 #: (``bwmm_shard_on_I.py:80``), i.e. from the SPMD launch grid, and
 #: ``:628`` refuses anything but ``2`` on the dynamic-control-flow path
 #: ("shard-on-I with dynamic control flow only work on TRN2"). The campaign's
-#: target is trn2 at LNC2, so the grid is fixed here rather than exposed.
+#: target is trn2 at LNC2, so the grid is fixed here rather than exposed. The three
+#: routed kernels below launch on the same grid: a kernel with a device loop
+#: reaches both physical cores only through it, and each program then runs the same
+#: number of trips over its own share of the loop (:func:`_program_block_range`).
 NUM_SHARDS = 2
+
+
+def _program_block_range(kernel: str, count: int, n_prgs: int, prg_id: int) -> tuple[int, int]:
+    """This program's half-open range of loop indices out of ``count``.
+
+    Every program runs the same number of trips, ``ceil(count / NUM_SHARDS)``, so the cores
+    carry one loop structure. Program ``p`` starts at ``p * trips`` and the last program
+    is pulled back to end at ``count``, so when the trips do not divide ``count`` two
+    programs share one index and write the same values to its rows, the rule the vendor's
+    ``pack_tokens`` applies to a single tile.
+
+    ``n_prgs`` is the launch degree the kernel was traced with. The vendor's
+    ``get_verified_program_sharding_info`` reports it and verifies nothing, so this is the
+    check: any other degree is refused before a loop is built, because a one-program
+    launch would run the whole range on one core and still compile. It is an ``assert``,
+    the fatal-error form the NKI front end accepts inside a kernel; the front end refuses
+    ``raise`` (its diagnostic names both forms).
+    """
+    assert n_prgs == NUM_SHARDS, (
+        f"{kernel}: traced with {n_prgs} programs, the kernel wants {NUM_SHARDS} "
+        f"(launch it as wrap_nki(kernel)[NUM_SHARDS])"
+    )
+    trips = -(-count // n_prgs)
+    start = min(prg_id * trips, count - trips)
+    return start, start + trips
 
 #: ``H`` bounds, from the kernel's own compatibility asserts at
 #: ``bwmm_shard_on_I.py:668`` (``512 <= H <= 8192``).
@@ -1062,6 +1091,13 @@ def moe_gate_up_blockwise_fp8_kernel(
     the partial sum it belongs to. Every loop bound is a trace-time int, which is
     why these are ``range`` loops and not ``nl.affine_range``.
     """
+    n_blocks = expert_index.shape[0]
+    _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "moe_gate_up_blockwise_fp8", (0, 1), NUM_SHARDS
+    )
+    first_block, end_block = _program_block_range(
+        "moe_gate_up_blockwise_fp8", n_blocks, n_prgs, prg_id
+    )
     positions = row_index.shape[0]
     h_extent = hidden.shape[1]
     n_h_blocks = h_extent // GATE_UP_SCALE_BLOCK
@@ -1086,7 +1122,6 @@ def moe_gate_up_blockwise_fp8_kernel(
     # THE BLOCK IS THE DYNAMIC AXIS, so every tensor a body addresses by block leads with
     # it and the tiles inside a body keep trace-time offsets. One body then serves every
     # block, and the tile count of a body is the block's own quotient.
-    n_blocks = expert_index.shape[0]
     row_index_b = row_index.reshape((n_blocks, block, 1))
     staged_b = staged.reshape((n_blocks, block, h_extent))
     out_b = out.reshape((n_blocks, block, fused_cols))
@@ -1109,7 +1144,7 @@ def moe_gate_up_blockwise_fp8_kernel(
                 _gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
             )
 
-    nl.fori_loop(0, n_blocks, stage_block)
+    nl.fori_loop(first_block, end_block, stage_block)
 
     def project_block(at_block):
         # ONCE PER BLOCK, not once per tile: the expert is a property of the block, so its
@@ -1252,7 +1287,7 @@ def moe_gate_up_blockwise_fp8_kernel(
                     up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 )
 
-    nl.fori_loop(0, n_blocks, project_block)
+    nl.fori_loop(first_block, end_block, project_block)
     return out
 
 
@@ -1463,7 +1498,7 @@ def moe_gate_up_blockwise_fp8(
         )
 
     _GATE_UP_COUNTERS.nki_dispatch += 1
-    return wrap_nki(moe_gate_up_blockwise_fp8_kernel)(
+    return wrap_nki(moe_gate_up_blockwise_fp8_kernel)[NUM_SHARDS](
         hidden_states.to(torch.bfloat16),
         # The bank's own rows, one ``128``-column block each. ``[E, H, 2*I]`` is
         # contiguous, so this is a view and the kernel's addressing is exact.
@@ -1613,6 +1648,13 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
     four clamp arguments to do this same work in this same place.
     """
     tokens, fused_cols = gate_up.shape
+    n_tiles = tokens // TILE_SIZE
+    _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "moe_swiglu_transposed", (0, 1), NUM_SHARDS
+    )
+    first_tile, end_tile = _program_block_range(
+        "moe_swiglu_transposed", n_tiles, n_prgs, prg_id
+    )
     i_extent = fused_cols // GATE_UP_FUSION
     # A ONE-COLUMN OPERAND IS AN UNBOUNDED CONFIGURATION, and then no bound
     # instruction is emitted at all -- the trace-time elision the landed form had
@@ -1623,7 +1665,6 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
         bounds_sb = nl.load(bounds[0:TILE_SIZE, 0:_SWIGLU_BOUND_COLUMNS])
     # THE TOKEN TILE IS THE DYNAMIC AXIS. The pre-activation input leads with it; the
     # result carries it on the FREE axis, because this kernel returns ``[I, B]``.
-    n_tiles = tokens // TILE_SIZE
     gate_up_b = gate_up.reshape((n_tiles, TILE_SIZE, fused_cols))
     out_b = out.reshape((i_extent, n_tiles, TILE_SIZE))
     column = [[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]]
@@ -1726,7 +1767,7 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
                 out_sb,
             )
 
-    nl.fori_loop(0, n_tiles, activate_tile)
+    nl.fori_loop(first_tile, end_tile, activate_tile)
     return out
 
 
@@ -1770,7 +1811,7 @@ def moe_swiglu_transposed(
     _refuse_gate_up(problems)
 
     _SWIGLU_COUNTERS.nki_dispatch += 1
-    return wrap_nki(moe_swiglu_transposed_kernel)(
+    return wrap_nki(moe_swiglu_transposed_kernel)[NUM_SHARDS](
         gate_up.to(torch.float32),
         _swiglu_bound_operand(gate_upper, up_upper, gate_up.device),
     )
@@ -1816,6 +1857,13 @@ def moe_down_blockwise_fp8_kernel(
     it belongs to. The seam refuses the geometry if that quotient ever stops being
     one.
     """
+    n_blocks = expert_index.shape[0]
+    _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "moe_down_blockwise_fp8", (0, 1), NUM_SHARDS
+    )
+    first_block, end_block = _program_block_range(
+        "moe_down_blockwise_fp8", n_blocks, n_prgs, prg_id
+    )
     # ONLY TENSORS CROSS THE WRAPPER; the gate/up kernel above records why, and each
     # shape read here is a relationship the seam has already refused to break.
     i_extent, positions = intermediate_t.shape
@@ -1837,7 +1885,6 @@ def moe_down_blockwise_fp8_kernel(
     # THE BLOCK IS THE DYNAMIC AXIS here too. The output and the routing column lead with
     # it; the intermediate carries it on the FREE axis, because the activation before this
     # kernel returns ``[I, B]``.
-    n_blocks = expert_index.shape[0]
     row_index_b = row_index.reshape((n_blocks, block, 1))
     intermediate_b = intermediate_t.reshape((i_extent, n_blocks, block))
     out_b = out.reshape((n_blocks, block, h_extent))
@@ -1951,7 +1998,7 @@ def moe_down_blockwise_fp8_kernel(
                     scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 )
 
-    nl.fori_loop(0, n_blocks, project_block)
+    nl.fori_loop(first_block, end_block, project_block)
     return out
 
 
@@ -2023,7 +2070,7 @@ def moe_down_blockwise_fp8(
         )
 
     _DOWN_COUNTERS.nki_dispatch += 1
-    return wrap_nki(moe_down_blockwise_fp8_kernel)(
+    return wrap_nki(moe_down_blockwise_fp8_kernel)[NUM_SHARDS](
         intermediate_t.to(torch.float32),
         weight_bank.reshape(-1, GATE_UP_SCALE_BLOCK),
         scale_bank.to(torch.float32).reshape(-1, expected[1]),
