@@ -19,7 +19,10 @@ import sys
 ROW = "nki_frontend"
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
 _DROP = ("NKI_SIMULATOR", "NKI_PRECISE_FP", "VLLM_NEURON_CPU_MODE", "NEURON_RT_VISIBLE_CORES")
-_PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2"}
+# The child writes no bytecode: it is the first thing to import the compiler in an environment,
+# and a cache file left in a shared installation is a change to it that this item does not intend.
+_PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
+        "PYTHONDONTWRITEBYTECODE": "1"}
 
 
 def _emit(*fields: object) -> None:
