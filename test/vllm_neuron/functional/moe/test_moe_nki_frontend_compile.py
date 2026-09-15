@@ -109,9 +109,11 @@ def _rows_from_a_child() -> list[str]:
     printed = [line for line in done.stdout.splitlines() if line.startswith(ROW + "|")]
     for line in printed:
         print(line, flush=True)
-    _emit("child", f"rc={done.returncode}", f"rows={len(printed)}",
-          "stderr_tail=" + _flat(done.stderr.splitlines()[-1] if done.stderr.strip() else "none"))
-    return printed
+    child = "|".join((
+        ROW, "child", f"rc={done.returncode}", f"rows={len(printed)}",
+        "stderr_tail=" + _flat(done.stderr.splitlines()[-1] if done.stderr.strip() else "none")))
+    print(child, flush=True)
+    return [*printed, child]
 
 
 def _kernel_rows(printed: list[str]) -> list[dict[str, str]]:
