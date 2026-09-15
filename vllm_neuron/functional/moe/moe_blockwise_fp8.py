@@ -1866,6 +1866,10 @@ def moe_down_blockwise_fp8_kernel(
     # it; the intermediate carries it on the FREE axis, because the activation before this
     # kernel returns ``[I, B]``.
     n_blocks = expert_index.shape[0]
+    _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "moe_down_blockwise_fp8", (0, 1), NUM_SHARDS
+    )
+    first_block, end_block = _program_block_range(n_blocks, n_prgs, prg_id)
     row_index_b = row_index.reshape((n_blocks, block, 1))
     intermediate_b = intermediate_t.reshape((i_extent, n_blocks, block))
     out_b = out.reshape((n_blocks, block, h_extent))
@@ -1979,7 +1983,7 @@ def moe_down_blockwise_fp8_kernel(
                     scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 )
 
-    nl.fori_loop(0, n_blocks, project_block)
+    nl.fori_loop(first_block, end_block, project_block)
     return out
 
 
@@ -2051,7 +2055,7 @@ def moe_down_blockwise_fp8(
         )
 
     _DOWN_COUNTERS.nki_dispatch += 1
-    return wrap_nki(moe_down_blockwise_fp8_kernel)(
+    return wrap_nki(moe_down_blockwise_fp8_kernel)[NUM_SHARDS](
         intermediate_t.to(torch.float32),
         weight_bank.reshape(-1, GATE_UP_SCALE_BLOCK),
         scale_bank.to(torch.float32).reshape(-1, expected[1]),
