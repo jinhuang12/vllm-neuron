@@ -43,7 +43,8 @@ from vllm_neuron.utils.hardware_config import (
     parse_range_list,
 )
 from vllm.utils.network_utils import get_open_port
-from vllm_neuron.parallel.neuron_parallel_state import tp_barrier
+from vllm_neuron.parallel.neuron_parallel_state import tp_barrier, tp_sum_int
+from vllm_neuron.vllm.patches.staged_neff_load import forget_this_load, name_this_load
 from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker.neuron_profiler import (
     NeuronProfilerConfig,
@@ -315,6 +316,76 @@ class _SuppressModelRegistryOverwrite(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         """Return False to suppress matching messages, True to allow them through."""
         return not self._PATTERN.search(record.getMessage())
+
+
+def _exchange_warmup_status(phase: str, bucket: str, where: str, failure) -> None:
+    """Sum the failed-rank count across the TP group, then raise if any rank failed."""
+    # The exchange IS the barrier, and it carries how many ranks failed. A bare barrier would
+    # leave every other rank waiting out the barrier timeout for a rank that had already raised,
+    # and a real fault would be recorded as a timeout.
+    failed_total = tp_sum_int(1 if failure is not None else 0)
+    if failure is not None:
+        raise failure
+    if failed_total:
+        raise RuntimeError(
+            f"warmup {phase} bucket={bucket} {where}: {failed_total} rank(s) failed"
+        )
+
+
+def _rss_kib() -> int:
+    """Read this process's resident size in KiB, or zero where /proc is not readable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        return 0
+    return 0
+
+
+def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
+    """Run ``work`` on every rank of the TP group at once, then exchange status.
+
+    A warmup call executes the model, and the model's forward carries collectives over the
+    whole TP group, so a subset of the ranks cannot run it: the ranks left out would wait in
+    the status exchange while the ranks inside waited for them in the collective.
+
+    The graph itself is compiled or loaded inside this call, before the forward. Which call it
+    belongs to is told to the loader here, because the loader stages the loads in waves and its
+    rows have to name the graph they loaded. The name is dropped again on the way out, so a
+    graph compiled outside a warmup call is never staged.
+    """
+    rank = get_tp_group().rank_in_group
+    name_this_load(phase, bucket)
+    tp_barrier()
+    # One row per rank on each side of the call. The compiled graph is loaded INSIDE this call,
+    # so a sampler watching the process from outside cannot say whether the resident size grew
+    # in the load or in the execution; a reading on each side of the call can.
+    logger.info(
+        "warmup_execution_entered|phase=%s|bucket=%s|rank=%s|rss_kib=%s",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+    )
+    started = time.perf_counter()
+    failure = None
+    try:
+        work()
+    except Exception as exc:  # the group is told before this rank re-raises
+        failure = exc
+    finally:
+        forget_this_load()
+    logger.info(
+        "warmup_execution_left|phase=%s|bucket=%s|rank=%s|rss_kib=%s|elapsed_s=%.1f",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+        time.perf_counter() - started,
+    )
+    _exchange_warmup_status(phase, bucket, "all ranks", failure)
 
 
 class NeuronWorker(WorkerBase):
@@ -1737,7 +1808,13 @@ class NeuronWorker(WorkerBase):
                     kv_seg_size,
                 )
                 try:
-                    self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
+                    run_warmup_on_all_ranks(
+                        "prefill",
+                        f"{bucket_size}/kv{kv_seg_size}",
+                        lambda: self.model_runner.warmup_prefill(
+                            bucket_size, kv_seg_size
+                        ),
+                    )
                     logger.info(
                         "  Successfully warmed up for prefill bucket %s "
                         "with kv_segment_size %s",
@@ -1875,7 +1952,13 @@ class NeuronWorker(WorkerBase):
                 ctx_bucket,
             )
             try:
-                self.model_runner.warmup_decode(batch_size, ctx_bucket=ctx_bucket)
+                run_warmup_on_all_ranks(
+                    "decode",
+                    f"b{batch_size}/s{ctx_bucket}",
+                    lambda: self.model_runner.warmup_decode(
+                        batch_size, ctx_bucket=ctx_bucket
+                    ),
+                )
                 logger.info(
                     "  Warmed up decode (batch=%s, seq=%s)",
                     batch_size,

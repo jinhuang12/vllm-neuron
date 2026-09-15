@@ -3,6 +3,7 @@ import math
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch._subclasses.fake_tensor import FakeTensor
 from typing import TYPE_CHECKING, Optional
 import logging
 
@@ -124,7 +125,29 @@ def build_blockwise_mapping(
         tensor=expert_mask,
         f_len=f_len,
     )
-    use_kernel_flow = can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel
+    # UNDER CAPTURE THE VENDOR SUBKERNELS ARE NOT ELIGIBLE. Both reach the device
+    # through the HOP wrapper, whose non-tensor arguments are replaced with ``None``
+    # once the graph is captured, so a traced prefill dies inside a subkernel instead
+    # of serving. The torch construction below is static-shape -- every extent is a
+    # trace-time int and every write is a fixed-shape index_put -- so it is what a
+    # captured graph gets, and it is the flow that already traced at one token. The
+    # THREE READINGS, BECAUSE NO ONE OF THEM FIRES EVERYWHERE. Dynamo answers
+    # ``is_compiling()`` True while it traces, and it folds an ``isinstance`` against a
+    # tensor class to a trace-time constant -- so the fake-tensor test ALONE reads
+    # False under the runner's capture, which is the reading this gate first shipped
+    # with and the reason it never fired. The fake test still catches a propagation
+    # raised outside dynamo, and the device test catches a shape-only pass, which is
+    # why ``attention_decode.py`` needs a device clause of its own beside the same
+    # construct. Eager answers all three False, so it keeps the subkernels and they
+    # stay the reference the equality item measures this construction against.
+    capturing = (
+        torch.compiler.is_compiling()
+        or isinstance(expert_mask, FakeTensor)
+        or expert_mask.device.type == "meta"
+    )
+    use_kernel_flow = (
+        can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel and not capturing
+    )
 
     if use_kernel_flow:
         token_position_to_id, block_to_expert, num_blocks = (
@@ -530,6 +553,10 @@ def _can_use_indexed_flatten_kernel(
 ) -> bool:
     """Check if indexed_flatten kernel can be used."""
     if not can_run_kernel(tensor):
+        return False
+
+    # T < 16 makes f_len 0 upstream; a routing predicate answers, never divides (-054g).
+    if f_len < 1:
         return False
 
     # T must be divisible by f_len

@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1926,6 +1928,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+        # The per-request cache-state table frees on this set and on nothing else,
+        # because an unscheduled live request also leaves the persistent batch below.
+        # This method is copied from upstream verbatim, so this call is read by name in
+        # the tests: a refresh that drops it fails there rather than reverting in silence.
+        self._glm5next_note_finished_requests(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -2768,6 +2775,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # _pool() (called from sample_tokens) needs them to build the pooling
         # cursor's gather indices over the flattened [T, H] buffer.
         self._pooling_num_scheduled_tokens_per_seq = actual_num_tokens
+        # The GLM-5.3-Flash geometry converter reads its block run and its cursor
+        # from these lengths. The tensors it is handed carry the padded bucket, so
+        # the real lengths cannot be recovered below and travel as their own array.
+        self._glm5next_request_tokens = self._glm5next_request_token_counts(
+            req_ids, scheduler_output.num_scheduled_tokens
+        )
 
         logger.debug(
             "Token counts: scheduled=%s, actual=%s",
@@ -4232,6 +4245,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     padded_num_reqs, dtype=torch.int32, device=self.device
                 )
 
+            # The host's own arrays, carried beside the device tensors for the
+            # geometry a step decides before its traced call. ``num_reqs`` rows and
+            # not the padded count: a padding row names no request, and its cached
+            # length is the previous occupant's. Both are CPU TENSORS rather than
+            # the numpy view beside them, because this mapping is an input to the
+            # compiled model for every other family in this tree: a tensor entry
+            # guards on dtype and shape, while a value that changes every step
+            # would guard on its contents and recompile.
+            num_reqs = self.input_batch.num_reqs
+            host_block_table = blk_table.get_cpu_tensor()[:num_reqs]
+            host_num_computed_tokens = self.input_batch.num_computed_tokens_cpu_tensor[
+                :num_reqs
+            ]
+
             attn_metadata_i = {
                 "block_table_tensor": blk_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4240,6 +4267,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "max_blocks_per_seq": blk_table_tensor.shape[1],
                 "decode_token_threshold": decode_token_threshold,
                 "cached_seq_len": cached_seq_len_tensor,
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 # Full (untrimmed) block_table_tensor for use cases that
                 # need to compute slot indices into the *full* KV cache,
@@ -4256,6 +4285,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata
+
+    def _aligned_table_width(self, *, context_length: int, block_size: int) -> int:
+        """The block-table width a group of ``block_size`` reports for a context length.
+
+        It is the whole blocks the context needs, divided across the context-parallel
+        ranks, and then rounded up again to a multiple of ``128 // block_size`` to match
+        upstream's InputBatch width. This is the width the warmup builder hands over and
+        the width a prefill graph is captured with, since a prefill never trims it back.
+
+        ONE ARITHMETIC, TWO READERS. The KV allocator sizes each latent bank's spare
+        window from this same number, and a spare that disagreed with the width actually
+        handed over would be the wrong size in exactly the case it exists for.
+        """
+        dcp_block_size = int(block_size) * max(self._dcp_size, 1)
+        blocks = -(-int(context_length) // dcp_block_size)
+        alignment = 128 // int(block_size) if int(block_size) <= 128 else 1
+        return -(-blocks // alignment) * alignment
 
     def _build_warmup_attention_metadata(
         self,
@@ -4313,16 +4359,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ctx_bucket if ctx_bucket is not None else self.max_model_len
             )
             dcp_block_size = block_size * max(self._dcp_size, 1)
-            max_num_blocks_per_req = (
-                ctx_for_blocks + dcp_block_size - 1
-            ) // dcp_block_size
             # Match upstream's TRTLLM alignment (vLLM PR #39324): InputBatch
             # block_table width is rounded up to a multiple of 128/block_size.
             # Prefill doesn't trim at runtime so warmup must use the aligned
             # width. Decode with ctx-length buckets trims back below.
-            alignment = 128 // block_size if block_size <= 128 else 1
-            max_num_blocks_per_req = (
-                (max_num_blocks_per_req + alignment - 1) // alignment * alignment
+            max_num_blocks_per_req = self._aligned_table_width(
+                context_length=ctx_for_blocks, block_size=block_size
             )
             # Untrimmed block-table seq dim — used by the on-device
             # ``correct_spec_decode_positions_and_slot_mapping`` correction
@@ -4413,6 +4455,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.neuron_config.kv_segment_size_buckets is not None:
                 kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
 
+            # The same host-side geometry the serving builder carries, so a capture
+            # reads its numbers the one way and needs no case of its own: this
+            # bucket's own blocks, and the cached length warmup declares.
+            host_block_table = (
+                torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(num_reqs, -1)
+                .contiguous()
+            )
+            host_num_computed_tokens = torch.full(
+                (num_reqs,), int(cached_seq_len), dtype=torch.int32
+            )
+
             attn_metadata_i = {
                 "block_table_tensor": block_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4423,6 +4478,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "cached_seq_len": torch.tensor(
                     [[cached_seq_len]], dtype=torch.int32, device=device
                 ),
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 "full_block_table_tensor": full_block_table_tensor,
             }
@@ -4570,7 +4627,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size, kv_segment_size, device=device
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            # ``kwargs`` stays bound to the generic mapping: the drafter branch
+            # below reads its attention metadata after this call returns.
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
@@ -4642,7 +4701,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             set_active_context(
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
-        model_output = self.model(**warmup_kwargs)
+        model_output = self.model(**self._glm5next_model_kwargs(warmup_kwargs))
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -4732,6 +4791,1808 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+
+    # ── GLM-5.3-Flash carrier threading (inc-glm53f-054b) ────────────────
+    # This family takes its caches as forward ARGUMENTS -- one mapping per layer,
+    # splatted at `model_fp8.py:7024` and refused on a count mismatch at `:7009` --
+    # while every other family in this tree reads them off attributes. The helpers
+    # below build those mappings out of what `bind_kv_cache` kept and nothing else.
+    # Only `_glm5next_model_kwargs` is called from a model call site, and it returns
+    # its argument unchanged for a model that kept no banks, so the other five
+    # families run exactly the code they ran before.
+
+    @classmethod
+    def _glm5next_pool_slot_mapping(
+        cls,
+        *,
+        tokens: int,
+        start_position: int,
+        index_kpool: int,
+        device,
+        real_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """``[tokens]`` int32: the POOL id where a pool completes, ``-1`` elsewhere.
+
+        THE RULE IS THE CONSUMER'S OWN, quoted from it: "only the LAST token of each
+        complete pool carries a non-negative slot and intra-pool positions carry
+        ``-1``" (``model_fp8.py:4624-4627``), and the id is the pool number the
+        decode leg writes with, ``int(position) // pool`` (``model_fp8.py:5482``).
+
+        ``start_position`` IS WHAT MAKES THE POSITION ABSOLUTE, and it matters: a
+        chunked prefill's later chunk pools on the sequence's own boundaries, not on
+        the chunk's, so a derivation from ``0`` would put its rows in the wrong pool
+        and the mask would let the wrong ones through.
+
+        The tiny acceptance's landed operand is built by the same two lines
+        (``test_tiny_glm5next_forward.py:2853-2856``) and
+        ``test_tiny_glm5next_e2e.py`` asserts this function equals it, so the two
+        derivations cannot drift apart unnoticed.
+
+        ``real_tokens`` IS THE CHUNK'S OWN LENGTH INSIDE A PADDED WIDTH, and no pool
+        completes past it. A padded row carries no token of the sequence, so a pool
+        that counted one would pool a padding member and the sequence's next
+        completion would read it. ``None`` says every row of the chunk is real,
+        which is what a caller with nothing to pad hands.
+
+        IT IS BUILT ON THE HOST IN int32 AND MOVED ONCE. The eager Neuron backend
+        refuses a dtype-converting copy of a tensor that already lives on the device,
+        so nothing here may construct on ``device`` and cast afterwards. The host half
+        is its own function, so a batch's rows can be concatenated before the move.
+        """
+        return cls._glm5next_pool_slot_mapping_host(
+            tokens=int(tokens),
+            start_position=int(start_position),
+            index_kpool=int(index_kpool),
+            real_tokens=real_tokens,
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_pool_slot_mapping_host(
+        *,
+        tokens: int,
+        start_position: int,
+        index_kpool: int,
+        real_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """``[tokens]`` int32 ON THE HOST: the pool id where a pool completes.
+
+        The rule and the arithmetic are the public form's, including the real length no
+        pool may complete past; only the move is missing, which is what lets a batch
+        concatenate several of these and move once.
+        """
+        pool = int(index_kpool)
+        if pool <= 0:
+            raise ValueError(f"index_kpool must be positive; got {index_kpool!r}")
+        real = int(tokens) if real_tokens is None else int(real_tokens)
+        rows = torch.arange(int(tokens), dtype=torch.int32)
+        positions = rows + int(start_position)
+        completes = (((positions + 1) % pool) == 0) & (rows < real)
+        return torch.where(
+            completes, positions // pool, torch.full_like(positions, -1)
+        )
+
+    @classmethod
+    def _glm5next_row_seq_lens(
+        cls, *, tokens: int, start_position: int, device
+    ) -> torch.Tensor:
+        """``[tokens]`` int32: each score ROW's own causal length.
+
+        ``seq_lens`` IS PER TOKEN, NOT PER REQUEST -- "one per PACKED row", guarded
+        at ``model_fp8.py:6179`` and documented at ``:6095`` -- and it is the causal
+        bound ``inc-glm53f-103`` consumes (``model_fp8.py:5533``). Row ``i`` of a chunk
+        that starts at ``start_position`` sees ``start_position + i + 1`` tokens
+        including itself.
+        The landed tiny operand is ``arange(1, tokens + 1)``
+        (``test_tiny_glm5next_forward.py:2872``), which is this expression at
+        ``start_position == 0``.
+
+        IT IS BUILT ON THE HOST IN int32 AND MOVED ONCE, the rule the pool mapping
+        states, so a batch of requests can concatenate their rows before anything
+        reaches the device.
+        """
+        return cls._glm5next_row_seq_lens_host(
+            tokens=int(tokens), start_position=int(start_position)
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_row_seq_lens_host(*, tokens: int, start_position: int) -> torch.Tensor:
+        """``[tokens]`` int32 ON THE HOST: each score row's own causal length.
+
+        The public form moves this to the device; a batch's forms concatenate several
+        of these first, so the whole batch travels in one copy.
+        """
+        return torch.arange(int(tokens), dtype=torch.int32) + int(start_position) + 1
+
+    @staticmethod
+    def _glm5next_latent_slot_mapping(
+        *, rows, starts, tokens: int, block_size: int, padded_rows: int = 0, device
+    ) -> torch.Tensor:
+        """``[Σ tokens + padded_rows]`` int64: each token's PHYSICAL latent slot.
+
+        THE FORMULA IS THE RUNNER'S OWN, not a second derivation: at one
+        context-parallel rank a slot is ``block_number * block_size +
+        block_offset`` (``:330-334``), and that number is also the row index of the
+        bank's flattened sequence view (``model_fp8.py:9135``), which is why the
+        latent write can consume it instead of deriving a contiguous run.
+
+        NO PRODUCT PATH CONSUMES THIS YET. The latent write that takes it arrives with
+        the paged sparse gather that lifts the carrier's contiguity refusal; until then
+        the sparse carrier hands the layer one contiguous window. It is kept rather
+        than deleted because the equality it must satisfy is asserted today.
+
+        THE PADDED ROWS CARRY ``PAD_SLOT_ID`` AND NOT THE PADDING VALUE THE KV
+        MACHINERY WRITES. That value is ``NULL_BLOCK_ID``, which is ZERO (``:95``),
+        and zero is a REAL slot -- block 0, offset 0 -- not a sentinel. A decode
+        batch padded up to its bucket carries such rows (``:3571-3574``), so a
+        write consuming the mapping unmasked would land a padded row's latent in a
+        slot a live request can own. A negative sentinel cannot be mistaken for an
+        address, so the mask is legible to the consumer rather than trusted.
+        """
+        slots: list[int] = []
+        for row, start in zip(rows, starts):
+            for offset in range(int(tokens)):
+                position = int(start) + offset
+                block = int(row[position // int(block_size)])
+                slots.append(block * int(block_size) + position % int(block_size))
+        slots.extend([PAD_SLOT_ID] * int(padded_rows))
+        # BUILT ON THE HOST AND MOVED ONCE, the rule the pool mapping states:
+        # the eager Neuron backend refuses a dtype-converting copy of a tensor
+        # that already lives on the device. The dtype is the runner's own
+        # ``slot_mapping`` dtype, int64, because the two are asserted equal.
+        return torch.tensor(slots, dtype=torch.int64).to(device)
+
+    @classmethod
+    def _glm5next_batch_row_seq_lens(cls, requests, *, device) -> torch.Tensor:
+        """``[Σ tokens]`` int32: every token's own causal length, in batch order.
+
+        ONE DERIVATION PER REQUEST, CONCATENATED, because the causal length of a
+        token is a fact about ITS OWN sequence: row ``i`` of a request that starts
+        at ``start`` sees ``start + i + 1`` tokens. Deriving the whole batch from a
+        single start position -- which is what a one-sequence converter could get
+        away with -- gives the second request the first one's positions and the
+        indexer's causal bound then admits pools that do not exist for it.
+
+        THE ORDER IS THE BATCH'S OWN and is the caller's to supply: it must be the
+        order the block tables are indexed in, or a token's length belongs to
+        another request.
+
+        EVERY REQUEST'S ROWS ARE BUILT ON THE HOST AND THE WHOLE BATCH MOVES ONCE, so
+        the property the singular form holds for one request holds for N: nothing is
+        constructed on the device and cast afterwards.
+        """
+        return torch.cat(
+            [
+                cls._glm5next_row_seq_lens_host(
+                    tokens=int(tokens), start_position=int(start)
+                )
+                for tokens, start in requests
+            ]
+        ).to(device)
+
+    @classmethod
+    def _glm5next_batch_pool_slot_mapping(
+        cls, requests, *, index_kpool: int, device, real_tokens=None
+    ) -> torch.Tensor:
+        """``[Σ tokens]`` int32: the pool id where a pool completes, in batch order.
+
+        PER REQUEST FOR THE REASON THE SINGULAR FORM ALREADY RECORDS: a pool
+        completes on the SEQUENCE's own boundaries, not on the batch's, so the id
+        is derived from each request's absolute position and the results are
+        concatenated. A batch-wide derivation would put a second request's rows in
+        the first one's pools and the mask would let the wrong ones through.
+
+        THE CONCATENATION HAPPENS ON THE HOST AND THE RESULT MOVES ONCE, which is the
+        singular form's own rule (``_glm5next_pool_slot_mapping_host``): a per-request
+        move followed by a device concatenation would break it N times over.
+
+        ``real_tokens`` IS PER REQUEST, one entry beside each row of ``requests``, or
+        ``None`` when every row of every request carries a token. A padded chunk's
+        real length belongs to the request it pads, so one number for a whole batch
+        would cut the wrong request's pools short.
+        """
+        rows = list(requests)
+        lengths = [None] * len(rows) if real_tokens is None else list(real_tokens)
+        if len(lengths) != len(rows):
+            raise ValueError(
+                f"this batch names {len(rows)} request(s) and carries {len(lengths)} "
+                f"real length(s); the real length belongs to one request, so a count "
+                f"that disagrees would cut another request's pools short"
+            )
+        return torch.cat(
+            [
+                cls._glm5next_pool_slot_mapping_host(
+                    tokens=int(tokens),
+                    start_position=int(start),
+                    index_kpool=int(index_kpool),
+                    real_tokens=real,
+                )
+                for (tokens, start), real in zip(rows, lengths)
+            ]
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_start_position(position: int, device) -> torch.Tensor:
+        """A host position number, as a tensor for the traced boundary.
+
+        The runner keeps the host int for its own arithmetic -- it sizes the window
+        and checks the pages with it -- and hands the layers this tensor, because a
+        python int reaching a traced region is baked into the captured graph and
+        pins it to the position it was captured at. Three numbers go through here:
+        this step's first slot, this decode step's own position, and the sequence
+        length after a prefill chunk. All three are host numbers when this runs.
+        """
+        return torch.tensor(int(position), dtype=torch.int32, device=device)
+
+    @staticmethod
+    def _glm5next_real_row_extent(
+        tokens: int, real_tokens: int, device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A step's real length and its row mask, both from ONE host number.
+
+        A padded step's operands keep the bucket's width, so the recurrent layers are
+        told which of those rows carry a token of the sequence. The two operands are
+        built here in one call because two calls could disagree, and a mask that
+        disagreed with the length would mask one set of rows and cut the convolution's
+        history at another. Both values are the host's, and the construction is the
+        only crossing.
+        """
+        rows = [1.0] * int(real_tokens) + [0.0] * (int(tokens) - int(real_tokens))
+        return (
+            torch.tensor([int(real_tokens)], dtype=torch.int32, device=device),
+            torch.tensor(rows, dtype=torch.float32, device=device).reshape(-1, 1),
+        )
+
+    @staticmethod
+    def _glm5next_host_geometry(metadata: dict, key: str, name: str) -> list:
+        """One metadata entry's host-side geometry, as plain Python integers.
+
+        A device tensor is refused by name rather than read: this runs before the
+        traced call, where reading a value off a ``meta`` or device tensor is the
+        thing a captured graph cannot do.
+        """
+        if key not in metadata:
+            raise ValueError(
+                f"KV layer '{name}' has no '{key}' entry; the runner writes the "
+                f"host-side geometry beside the device tensors of every KV-cache "
+                f"group, and this call site handed {sorted(metadata)}"
+            )
+        value = metadata[key]
+        if torch.is_tensor(value) and value.device.type != "cpu":
+            raise ValueError(
+                f"KV layer '{name}'s '{key}' is a {value.device.type} tensor; the "
+                f"geometry of a step is decided on the host, so it comes from the "
+                f"runner's own host arrays and never from a device or meta tensor"
+            )
+        return value.tolist() if hasattr(value, "tolist") else list(value)
+
+    @staticmethod
+    def _glm5next_start_positions(positions, device) -> torch.Tensor:
+        """``[requests]`` int32: every request's own position, one row each.
+
+        ONE TENSOR, NOT A TUPLE OF PYTHON INTS. Each request stands at its own point
+        of its own sequence, and the layer reads the row belonging to the request it
+        is serving. A python int reaching a traced region is baked into the captured
+        graph and pins it to the position it was captured at, which a tuple would do
+        once per request.
+
+        IT IS BUILT ON THE HOST IN int32 AND MOVED ONCE, for the reason the pool
+        mapping records: the eager Neuron backend refuses a dtype-converting copy of a
+        tensor that already lives on the device.
+        """
+        return torch.tensor(
+            [int(position) for position in positions], dtype=torch.int32
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_request_token_counts(
+        req_ids, num_scheduled_tokens: dict
+    ) -> np.ndarray:
+        """Per request, in batch order: one host int32 entry, its real length."""
+        return np.array(
+            [int(num_scheduled_tokens[req_id]) for req_id in req_ids], dtype=np.int32
+        )
+
+    def _glm5next_take_request_tokens(self) -> tuple[int, ...]:
+        """Each request's real token count for this step, from the builder's own array.
+
+        THE ARRAY IS ONE STEP'S, so it is taken and not merely read: a warmup or a
+        capture step is built without one, and the width of the tensor such a step
+        carries IS its real length. Leaving a used array in place would hand the
+        next unprepared step the previous request's length, so an unprepared step
+        gets an empty tuple and the caller divides the width it was handed.
+
+        RE-PINNED, WITH THE READING THIS REPLACES RECORDED VERBATIM: "this half
+        threads ONE request per step until the request-keyed slot table lands, and
+        the input builder left N request length(s); the geometry below reads one
+        sequence's own length." That table is what this candidate lands, so the
+        lengths now travel one per request, in the order the builder wrote them.
+        """
+        counts = getattr(self, "_glm5next_request_tokens", None)
+        self._glm5next_request_tokens = None
+        if counts is None:
+            return ()
+        return tuple(int(value) for value in counts)
+
+    @staticmethod
+    def _glm5next_resolve_request_tokens(
+        real_counts, requests: int, tokens: int, *, name: str = "this step"
+    ) -> list[int]:
+        """Each request's real token count, in the batch's order.
+
+        The builder's array is taken when it describes this batch. An UNPREPARED step
+        -- a warmup or a capture -- left no array and carries no padding either, so
+        its rows divide evenly among the requests it serves. Anything else is a
+        disagreement between the builder and the block tables, and it refuses by
+        name: a length matched to the wrong request would page another sequence's
+        blocks and stand its cursor at a position it never reached.
+        """
+        if requests <= 0:
+            raise ValueError(f"{name} serves no request; there is nothing to size")
+        if not real_counts:
+            return [max(1, int(tokens) // requests)] * requests
+        if len(real_counts) != requests:
+            raise ValueError(
+                f"{name} carries {requests} block-table row(s) and the input builder "
+                f"left {len(real_counts)} real length(s); both are the batch's own "
+                f"rows, so there is one of each per request"
+            )
+        return [int(value) for value in real_counts]
+
+    @staticmethod
+    def _glm5next_side_caches(
+        banks,
+        *,
+        index_kpool: int,
+        index_head_dim: int,
+        max_seq_len: int,
+        request_slots: int,
+    ) -> list[dict]:
+        """The two DSA caches NO ``LayerSpec`` declares, one set per sparse layer.
+
+        ONE SET PER REQUEST SLOT, NOT ONE PER PROCESS. Both caches carry a leading
+        request-slot axis, because each holds ONE sequence's indexer state: the
+        pooled store accumulates that sequence's keys and the ring holds its most
+        recent pool. Sharing them across requests is what made a second request
+        read the first one's rows, and no shape disagreed while it happened.
+
+        THE SLOT AXIS IS THE CONCURRENCY BOUND, NOT THE BLOCK SPACE, and the caller
+        derives it. Both of these tensors are per SEQUENCE, so their axis is how many
+        sequences may hold state at once. The recurrent banks' leading dimension is a
+        paging geometry -- one entry per KV block of the group -- and sizing a
+        per-sequence cache by it asks for thousands of sets: at the serving shape that
+        is gigabytes per layer, allocated outside the engine's KV budget on a rank
+        whose memory is already committed. RE-PINNED; the reading this replaces,
+        verbatim: "The slot axis is the recurrent banks' own slot count, so a request's
+        recurrent state and its indexer state live at ONE slot number." The second half
+        of that sentence still holds and is why the caller checks the two against each
+        other: a slot number addresses both, so the banks must hold at least as many
+        slots as the engine admits concurrent sequences.
+
+        WHY THE KV MACHINERY DOES NOT ALLOCATE THESE. A sparse-attention layer needs
+        a pooled-key store and a decode tail ring besides its latent cache, and
+        ``get_kv_spec`` reports neither: a ``LayerSpec`` carries one
+        ``num_kv_heads``/``head_size``/``dtype`` triple and both of these are the
+        INDEXER's width, ``index_head_dim``, a different number from the latent
+        width. So the cache manager never sees them and this runner allocates them.
+
+        THE ROW COUNT IS THE INDEXER'S OWN STATED MINIMUM: ``pool_cache`` must leave
+        one trash row above every addressable candidate pool -- "allocate at least
+        ``candidates + 1``" where ``candidates = max_seq_len // index_kpool``
+        (``model_fp8.py:5288-5295``). Passing the longest sequence the engine admits
+        therefore covers every batch that can be scheduled, and the carrier now
+        carries THAT SAME number rather than a shorter one of its own: the value is
+        a python int, so a shorter one would be a different int per step and each
+        step would want its own captured graph. RE-PINNED; the reading this replaces,
+        verbatim: "a batch's own shorter ``max_seq_len`` rides in the carrier".
+        ``tail`` is ``[2,
+        index_kpool, index_head_dim]``, half 0 keys and half 1 gate scores
+        (``model_fp8.py:4735``).
+
+        BOTH ARE LIVE ACROSS STEPS, which is why the caller allocates them ONCE and
+        keeps them: the decode leg advances the ring in place (``tail.copy_``,
+        ``model_fp8.py:5986``) and the pooled store accumulates the prefill's rows.
+        Re-allocating per step would reset both and lose every pooled key.
+
+        THE DTYPE IS THE LATENT BANK'S, so neither cache adds a second dtype
+        authority; both of the layer's own checks are shape checks and both writes
+        cast on the way in (``model_fp8.py:5485``, ``:5281-5285``).
+        """
+        pool = int(index_kpool)
+        width = int(index_head_dim)
+        if pool <= 0 or width <= 0:
+            raise ValueError(
+                f"index_kpool and index_head_dim must be positive; got "
+                f"{index_kpool!r} and {index_head_dim!r}"
+            )
+        if int(max_seq_len) <= 0:
+            raise ValueError(f"max_seq_len must be positive; got {max_seq_len!r}")
+        slots = int(request_slots)
+        if slots <= 0:
+            raise ValueError(
+                f"the side caches are allocated one set per request slot, so the "
+                f"slot count must be positive; got {request_slots!r}"
+            )
+        rows = int(max_seq_len) // pool + 1
+        side: list[dict] = []
+        for bank in banks:
+            if bank["family"] != "self_attn":
+                side.append({})
+                continue
+            reference = bank["latent_cache"]
+            side.append(
+                {
+                    "pool_cache": torch.zeros(
+                        (slots, rows, width),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                    "tail": torch.zeros(
+                        (slots, 2, pool, width),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                }
+            )
+        return side
+
+    def _glm5next_live_side_caches(self, banks) -> list[dict]:
+        """The one live set of side caches for this process, allocated on first use.
+
+        THE ALLOCATION BOUND IS ``max_model_len``, and so is the carrier's, which is
+        why the two cannot disagree about how many candidate pools the indexer may
+        address. RE-PINNED; the clause this replaces, verbatim: "while the carrier
+        carries the batch's own ``max_seq_len`` so the indexer's candidate count stays
+        the batch's" -- the candidate count is now the ENGINE's, and each row is still
+        bounded to its own length before selection.
+
+        ONE SET FOR THE PROCESS IS ALSO A HAZARD, and the converter answers it. A
+        new sequence would otherwise start on the previous sequence's partial pool,
+        because every real token stashes into the ring
+        (``vllm_neuron/functional/dsa/decode_tail_update.py``) and nothing here
+        empties it. :meth:`_glm5next_model_kwargs` REPLACES the ring when a prefill
+        starts at position 0, which is a new sequence by definition; the pooled
+        store is left alone for the reason given there.
+        """
+        live = getattr(self, "_glm5next_side_cache_set", None)
+        if live is not None and len(live) == len(banks):
+            return live
+        text_config = self.model.text_config
+        live = self._glm5next_side_caches(
+            banks,
+            index_kpool=int(text_config.index_kpool),
+            index_head_dim=int(text_config.index_head_dim),
+            max_seq_len=int(self.max_model_len),
+            request_slots=self._glm5next_request_slot_capacity(banks),
+        )
+        self._glm5next_side_cache_set = live
+        # A FRESHLY ALLOCATED SET IS OWNED BY NOBODY, and the ownership record goes
+        # with it. The slot table names which request holds which slot; allocating a
+        # new set discards the rows those claims referred to, so a surviving table
+        # would let a live request keep reading a slot whose contents no longer
+        # exist. Both are cleared together, which is the same invariant the retired
+        # scalar cursor carried, now keyed per request.
+        self._glm5next_request_slot_table = {}
+        self._glm5next_side_cache_positions = {}
+        return live
+
+    def _glm5next_batch_request_ids(self) -> list:
+        """The engine's request ids for this step, as this runner's batch carries them.
+
+        ONE READ OF THE SOURCE. Both the identity below and the caller's reading of
+        whether this step has any request at all come through here, so the source
+        cannot be named in two places and drift.
+        """
+        batch = getattr(self, "input_batch", None)
+        return list(getattr(batch, "req_ids", None) or ())
+
+    def _glm5next_request_identities(self, *, synthetic: bool) -> list:
+        """The requests this step serves, in the batch order the tables use.
+
+        THE IDENTITY IS THE ENGINE'S OWN AND IS NOT DERIVED HERE. ``req_ids`` is
+        batch-ordered (``:1126``) and the block table's row ``i`` is appended by
+        the same request index (``:2108``), so identity and paging come from one
+        ordering and cannot fall out of step.
+
+        WHY THIS IS ONE METHOD. It is the only place the identity's SOURCE is
+        named, so a change of source is a change here and nowhere else; the slot
+        table below takes whatever this returns and never asks what it is.
+
+        A SYNTHETIC STEP HAS NO REQUEST. Warmup and the idle data-parallel dummy
+        step are not sequence steps, so they are served without an identity rather
+        than borrowing a live request's; the caller passes them through with no
+        claim taken.
+
+        A MISSING BATCH ON A REAL STEP REFUSES BY NAME. Serving a real step with no
+        identity is what the block-id slot did, and it is the defect this method
+        exists to close, so it raises instead of inventing one. The request-less step
+        the runner does build -- warmup, on either leg -- is classified synthetic by
+        the caller and never arrives here as a real one, so what this refuses is a
+        CONTINUATION with nobody to continue: a step at a cached length above zero
+        whose batch names no request.
+        """
+        if synthetic:
+            # AND A STEP WITH A REQUEST CANNOT BE ONE, WHICH REFUSES HERE BY NAME. No
+            # caller reaches this: the classification above is the absence of an
+            # identity, so a step the engine scheduled a request for is never brought
+            # here as synthetic. The refusal stands because of what it would cost to be
+            # wrong -- a request served synthetically reads and writes slot 0's state
+            # while its own slot stands untouched, which destroys the state of whoever
+            # holds slot 0 and answers this request from that state. A rule that
+            # classified by the LEG did exactly that to a one-token prompt and to a
+            # preempted request, so this is the shape a later edit would reintroduce.
+            named = self._glm5next_batch_request_ids()
+            if named:
+                raise ValueError(
+                    f"this step was classified as having no request and the engine's "
+                    f"input batch names {len(named)} of them ({named[0]!r} first); a "
+                    f"scheduled request served without its identity would read and "
+                    f"write the state of whichever request holds slot 0"
+                )
+            return [None]
+        request_ids = self._glm5next_batch_request_ids()
+        if not request_ids:
+            raise ValueError(
+                "a GLM-5.3-Flash step needs the engine's request ids to key its "
+                "per-request cache state, and this runner's input batch carries "
+                "none; a real step served without an identity would read whichever "
+                "state the last request left"
+            )
+        return request_ids
+
+    def _glm5next_state_slot_count(self, banks) -> int:
+        """How many recurrent state slots this stack holds, refusing a disagreement.
+
+        Every linear layer's bank was allocated with the same leading slot
+        dimension, because one request's states across the stack live at one slot
+        number. A stack whose banks disagree has no single slot to hand a request,
+        so it refuses here rather than handing different layers different slots.
+        """
+        counts = {
+            int(bank["state_slots"])
+            for bank in banks
+            if bank["family"] != "self_attn"
+        }
+        if not counts:
+            return 0
+        if len(counts) != 1:
+            raise ValueError(
+                f"the recurrent banks of one stack report {sorted(counts)} state "
+                f"slot(s); a request's states across the stack live at one slot "
+                f"number, so a disagreement has no slot to hand it"
+            )
+        return counts.pop()
+
+    def _glm5next_request_slot_capacity(self, banks) -> int:
+        """How many sequences may hold cache state at once: the engine's own bound.
+
+        THE BOUND IS ``max_num_seqs`` AND NOT THE BANKS' LEADING DIMENSION. A slot is
+        a place for one SEQUENCE's state, so the axis it needs is the scheduler's
+        concurrency limit, which this runner reads once at construction. The banks'
+        leading dimension counts KV blocks of the group; using it would allocate one
+        set of per-sequence caches per block.
+
+        BANKS THAT HOLD STATE MUST HOLD THE BOUND. A slot number addresses the
+        recurrent banks and the indexer's caches alike, so a stack whose recurrent
+        banks hold fewer slots than the engine admits sequences has no slot to hand
+        the last of them, and it refuses here rather than at a silent overwrite. A
+        stack with NO recurrent bank is served rather than refused: it has no state
+        to provision, and the bound still sizes the indexer's own caches.
+        """
+        capacity = int(self.max_num_reqs)
+        if capacity <= 0:
+            raise ValueError(
+                f"the request slot axis is the engine's concurrent-sequence bound, "
+                f"so it must be positive; this runner reports {self.max_num_reqs!r}"
+            )
+        banked = self._glm5next_state_slot_count(banks)
+        if banked and banked < capacity:
+            raise ValueError(
+                f"the recurrent banks of this stack hold {banked} state slot(s) while "
+                f"the engine admits {capacity} concurrent sequence(s); one slot number "
+                f"addresses the recurrent banks and the indexer's caches together, so "
+                f"there is no slot to hand the last sequence"
+            )
+        return capacity
+
+    def _glm5next_note_finished_requests(self, finished_req_ids) -> None:
+        """Record the engine's FINISHED request ids for the slot table to free.
+
+        The slot table cannot derive "finished" from the batch it is handed: this
+        runner also removes a live request from the persistent batch when the
+        scheduler gives it no tokens in a step, and that request keeps its state and
+        comes back. So the engine's own finished set is recorded here, at the one
+        place that receives it, and the table frees against it.
+        """
+        noted = getattr(self, "_glm5next_finished_request_ids", None)
+        if noted is None:
+            noted = set()
+            self._glm5next_finished_request_ids = noted
+        noted.update(finished_req_ids or ())
+
+    @staticmethod
+    def _glm5next_emptied_at_slot(held: torch.Tensor, slot: int) -> torch.Tensor:
+        """A copy of `held` whose row `slot` is zero and whose other rows are its own.
+
+        WHY A COPY RATHER THAN AN IN-PLACE ZERO. An eager in-place write on a device
+        buffer whose storage is shared is REFUSED -- "Can't call ReserveSpace on
+        shared storage" -- and it was refused inside the input builder, before any
+        forward ran, so warmup never reached its first bucket. Every cache tensor
+        reaching this method is a view of one allocation, so the write is rebuilt as a
+        select: the mask is built on the host and moved once, and the caller replaces
+        its entry with the result. The carriers are built from those entries
+        afterwards, so the step binds the new buffer.
+
+        WHY ONE ROW. The rows are per request slot, so emptying a fresh sequence's row
+        must leave a concurrent request's row exactly as it was. A select rather than
+        a product also keeps a stale non-finite value from surviving as one.
+
+        AND WHY THE SIDE CACHES ARE NOT MOVED TO A READ-SIDE SELECT, as the recurrent
+        and convolution states were. It is where each state is READ. Those two are read
+        at two seams of one python method that is already handed the position, so
+        selecting there covers every reader and costs one comparison. The indexer's ring
+        is consumed inside its own seams (`functional/dsa/decode_tail_update.py` and the
+        pooled selection), which are handed neither the position nor any per-request
+        predicate, so a select on the read side there is a change of KERNEL INPUTS
+        rather than a python-level choice. So this rebuild stays, and what it costs at
+        runtime is the disclosure it already carried: no CPU-mode run can read whether
+        the device accepts it, and it has not been read on a device.
+        """
+        keep = torch.ones(
+            (int(held.shape[0]),) + (1,) * (held.dim() - 1), dtype=torch.bool
+        )
+        keep[int(slot)] = False
+        return torch.where(keep.to(held.device), held, torch.zeros_like(held))
+
+    def _glm5next_request_slots(
+        self, banks, request_ids, *, synthetic: bool, side_caches=None
+    ):
+        """One recurrent-state slot per request, keyed by the request's own id.
+
+        WHY THE SLOT IS NOT READ OFF THE BLOCK TABLE ANY MORE. It used to be the
+        row's FIRST BLOCK ID, which is a paging artefact and not a request
+        identity: two requests are two rows of one table, and nothing about a
+        block number says whose state it holds. This table is the identity, so a
+        step is served from the slot its own request owns or from no slot at all.
+
+        ALLOCATION ZEROES, AND THAT IS THE POINT rather than tidiness. The banks
+        live for the process, so a freed slot still holds the last owner's
+        recurrence. Its next owner would continue a sequence it never ran. Zeroing
+        on hand-out is what a fresh sequence means, and it happens here -- at the
+        moment ownership changes -- rather than on release, where a crash between
+        the two would leave a dirty slot looking clean.
+
+        A FINISHED REQUEST IS ONE THE ENGINE CALLED FINISHED. Only the ids this
+        runner recorded from the scheduler's finished set release a slot. RE-PINNED;
+        the rule this replaces, verbatim: "A FINISHED REQUEST IS ONE THAT STOPPED
+        APPEARING. The engine hands this runner the batch it scheduled and nothing
+        else, so a request absent from it is done and its slot returns to the pool."
+        Absence is NOT finishing: a running request that gets no tokens in a step is
+        removed from the persistent batch and keeps its cached state, so freeing on
+        absence would take that request's recurrence away and hand its slot, zeroed,
+        to somebody else while it was still alive.
+
+        A SYNTHETIC STEP TAKES NO CLAIM. Warmup and the idle data-parallel dummy
+        step reach this converter too, and they are not sequence steps: they are
+        served from slot 0 with the table neither read nor written, so a warmup
+        between two real steps of one sequence cannot evict it.
+        """
+        # A SYNTHETIC STEP NEEDS NO CAPACITY: it takes slot 0 and no claim, so the
+        # bound is read only where a claim is about to be taken.
+        if synthetic:
+            return [0 for _ in request_ids]
+        slots = self._glm5next_request_slot_capacity(banks)
+        table = getattr(self, "_glm5next_request_slot_table", None)
+        if table is None:
+            table = {}
+            self._glm5next_request_slot_table = table
+        positions = getattr(self, "_glm5next_side_cache_positions", None)
+        if positions is None:
+            positions = {}
+            self._glm5next_side_cache_positions = positions
+        noted = getattr(self, "_glm5next_finished_request_ids", None)
+        if noted:
+            for finished in [key for key in table if key in noted]:
+                positions.pop(table[finished], None)
+                del table[finished]
+            # An id the engine finished that never held a slot has nothing to release,
+            # so the record is emptied whole and cannot grow for the process's life.
+            noted.clear()
+        for request_id in request_ids:
+            if request_id in table:
+                continue
+            taken = set(table.values())
+            free = next(
+                (slot for slot in range(slots) if slot not in taken), None
+            )
+            if free is None:
+                raise ValueError(
+                    f"this stack keys {slots} concurrent sequence(s) and all of "
+                    f"those slots are owned by live requests, so request "
+                    f"{request_id!r} has no free slot; the engine admitted more "
+                    f"concurrent requests than the cache was allocated for"
+                )
+            # THE RECURRENT BANKS ARE NOT WRITTEN HERE, and this is the one place that
+            # could be tempted to. They are the ENGINE's own cache tensors, every one a
+            # view of a single allocation, so an eager write on them is refused by the
+            # runtime -- "Can't call ReserveSpace on shared storage" -- wherever the call
+            # sits. The freshness is served where it is READ instead: an opening prefill
+            # selects a zero state for both the convolution history and the recurrent
+            # state (``model_fp8.py``'s KDA forward), so a slot handed on still holding
+            # the last owner's bytes cannot carry them into this request's answer. The
+            # indexer's own two caches ARE emptied below, because those the runner
+            # allocates and no reader of theirs takes a position.
+            # THE INDEXER'S TWO CACHES ARE EMPTIED AT THE SAME MOMENT, because they
+            # hold the same request's state and a half-fresh slot is the defect
+            # this table exists to close: the ring would still carry the previous
+            # owner's pool and its next completion would pool those stale members.
+            # THEY ARE REBUILT WITHOUT THIS SLOT'S ROWS RATHER THAN EMPTIED IN PLACE,
+            # for the reason the helper's own docstring carries.
+            for side in side_caches or ():
+                if not side:
+                    continue
+                for key in ("pool_cache", "tail"):
+                    side[key] = self._glm5next_emptied_at_slot(side[key], free)
+            positions.pop(free, None)
+            table[request_id] = free
+        return [table[request_id] for request_id in request_ids]
+
+    @classmethod
+    def _glm5next_layer_carriers(
+        cls,
+        banks,
+        side_caches,
+        *,
+        geometries,
+        is_prefill: bool,
+        tokens: int,
+        start_position: int,
+        softmax_scale: float,
+        max_seq_len: int,
+        index_kpool: int,
+        requests: int = 1,
+        request_starts=None,
+        real_tokens: int | None = None,
+        request_real_tokens=None,
+    ) -> list[dict]:
+        """One mapping per layer, in stack order, each holding THAT layer's own state.
+
+        ``Glm5NextModel.forward`` splats these and refuses a count that disagrees
+        with the stack (``model_fp8.py:7009-7024``), so this walks the banks
+        ``bind_kv_cache`` kept -- the spec's own layer order -- and never names a
+        layer.
+
+        THE KEYS ARE EACH FAMILY'S OWN DECLARED KEYWORDS. A sparse (DSA) layer takes
+        ``latent_cache``, ``pool_cache``, ``seq_lens``, ``start_position``,
+        ``softmax_scale``, ``max_seq_len`` and ``page_size``, plus ``slot_mapping``
+        and the ring it seeds -- ``prefill_tail`` with ``prefill_end_position`` --
+        on the prefill leg, or ``tail`` and ``position`` on the decode leg
+        (``model_fp8.py:6696-6713``); a linear (KDA) layer takes ``conv_state``,
+        ``recurrent_state``, ``is_prefill`` and ``start_position`` (``:4149``).
+        Which leg is running is the caller's reading of the batch, passed in
+        rather than guessed here.
+
+        THE LINEAR FAMILY'S FIVE PER-REQUEST VALUES ARRIVE ONE PER REQUEST, in the
+        batch's order, in the two forms those values allow. The two state carriers are
+        TUPLES OF VIEWS, because two requests' states are two rows of one bank and
+        stacking them would copy -- and a copy would leave the bank holding the state of
+        a step that already ran, since the recurrence advances in place. The positions
+        are ONE int32 TENSOR with a row per request, because a python int at this
+        boundary is baked into the graph it was captured with, and the two row operands
+        are ONE TENSOR EACH on a leading request axis, for that same reason and because
+        nothing about a mask built for this step forbids the copy a stack makes. The key
+        NAMES are unchanged, and every form is used at ONE request too, so the concurrent
+        shape and the pinned one-sequence shape share one derivation.
+
+        BOTH FAMILIES READ THE POSITION FROM ONE VARIABLE. The linear family
+        needs it for the same reason the sparse one does: a prompt longer than one
+        batch of tokens arrives in segments, and a later segment continues state
+        the earlier one wrote, which the receiving layer can only know from how
+        many tokens are already computed.
+
+        ONE SEQUENCE PER CALL, REFUSED RATHER THAN MIS-SLICED. The latent cache a
+        DSA layer takes is one sequence's slots in position order, and
+        ``inc-glm53f-051``'s interface record states that nothing below this point
+        detects a wrong or shared cache set. So the paged bank is sliced by ONE
+        ascending run of blocks and anything else refuses by name: gathering a
+        scattered block table is not this increment's work, and a wrong slice would
+        write this sequence's latents into another sequence's slots.
+
+        ONE GEOMETRY PER BANK, NOT ONE FOR THE WHOLE STACK. ``geometries`` pairs with
+        ``banks`` positionally and each entry carries THAT layer's own ``block_ids``,
+        ``state_slot`` and ``page_size``. The runner builds one block table per
+        KV-CACHE GROUP (``:4115-4121``) and this stack is hybrid -- its sparse layers
+        report a ``FullAttentionSpec`` and its linear ones a ``MambaSpec``, so there
+        are two groups and two tables. A stack-wide row would slice one family out of
+        the other family's table; review r1 of commit 1 found exactly that.
+
+        EACH SPARSE BANK'S OWN PAGING IS CROSS-CHECKED against the page its group
+        reports, because the two are sourced independently -- the bank's from the
+        tensor the runner allocated, the group's from the KV-cache spec -- and a slice
+        computed in the wrong page would be silently short or long.
+
+        THE SCALE IS THE CALLER'S BY THE MODEL'S OWN INSTRUCTION -- "THE SOFTMAX
+        SCALE IS THE CALLER'S, NOT THIS METHOD'S", the registered value being
+        ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``
+        (``model_fp8.py:6972-6978``). It arrives as an argument so this function
+        holds no copy of the constant.
+
+        ``tokens`` IS THE OPERAND WIDTH AND ``real_tokens`` IS THE CHUNK'S LENGTH.
+        A prefill arrives padded up to its bucket, so every operand built here keeps
+        the padded width -- that width is what a captured graph was compiled for --
+        while the SEQUENCE reaches only the real length. The slots the request holds,
+        the position the chunk ends at and the pools it completes are therefore read
+        from ``real_tokens``; ``None`` says the whole chunk is real, which is what a
+        warmup or capture caller hands. THE RECURRENT LAYERS ARE HANDED EACH REQUEST'S
+        OWN LENGTH, as a tensor beside a row mask, because their scan is over the rows
+        themselves: an unmasked padding row would decay the state and update it with
+        a row that carries no token, and the state is what the next step continues
+        from. ``request_real_tokens`` carries the batch's own reading of those lengths, one
+        entry per request, the way ``request_starts`` carries the positions; absent, they
+        are derived from the leg. The sparse layers read the singular
+        one, which is the FIRST request's: that family serves one sequence per forward and
+        refuses a second by name below, so the scalar cannot reach a request it does not
+        describe. The sparse layers need no mask -- their window is the slots
+        ``real_tokens`` already sizes.
+        """
+        if len(banks) != len(side_caches) or len(banks) != len(geometries):
+            raise ValueError(
+                f"{len(banks)} bank(s) against {len(side_caches)} side-cache "
+                f"entry(ies) and {len(geometries)} geometry(ies); the three come "
+                f"from one walk and must pair"
+            )
+        if not is_prefill and int(tokens) != int(requests):
+            # THE REFUSAL IS SHARPENED, NOT LIFTED. It used to read "one token", which
+            # conflated two different things: one token PER REQUEST, which is what a
+            # decode step is, and one token in the batch, which is only true when the
+            # batch holds one request. The ring still advances one position at a time
+            # per sequence -- its seam takes a single [1, index_head_dim] key row and
+            # a single position (model_fp8.py:4741-4744, :5474) -- so what is refused
+            # is a step carrying MORE tokens than it has requests, which is
+            # speculative decoding's verify step and is not this increment's work.
+            raise ValueError(
+                f"the decode leg advances each sequence's tail ring one position at a "
+                f"time, so a decode step carries exactly one token per request; this "
+                f"step carries {int(tokens)} token(s) for {int(requests)} request(s), "
+                f"and threading a multi-token decode, which is speculative decoding's "
+                f"verify step, is not inc-glm53f-054b's work"
+            )
+        real = int(tokens) if real_tokens is None else int(real_tokens)
+        if real <= 0 or real > int(tokens):
+            raise ValueError(
+                f"this step's operands are {int(tokens)} row(s) wide and its chunk was "
+                f"handed {real} real token(s); the real length is at least one token "
+                f"and never more than the width it was padded into"
+            )
+
+        # THE REQUESTS ARE A LIST OF (SLOT, POSITION) PAIRS, and the singular
+        # arguments are the one-request case of it rather than a separate path. A
+        # geometry may carry `state_slots` for a batch; when it carries only
+        # `state_slot` this is one request, and `request_starts` defaults to the one
+        # position the caller passed. So the concurrent form and the pinned
+        # one-sequence form share this derivation and cannot drift apart.
+        starts = (
+            [int(value) for value in request_starts]
+            if request_starts is not None
+            else [int(start_position)]
+        )
+        if request_starts is not None and len(starts) != int(requests):
+            raise ValueError(
+                f"this call declares {int(requests)} request(s) and hands "
+                f"{len(starts)} cached length(s); the count and the per-request "
+                f"positions come from one batch and must agree"
+            )
+        # EACH REQUEST'S OWN REAL LENGTH, AND ITS OWN OPERAND WIDTH. A pair built from the
+        # first request's length hands every other request the first one's padding, which
+        # is a scan over rows that carry no token of its own sequence.
+        #
+        # THE OPERAND WIDTH IS THE ROWS ONE REQUEST BRINGS, and it is derived rather than
+        # assumed. One request brings the whole padded step. Several bring one row each,
+        # because the recurrent layer refuses a decode step carrying more tokens than it
+        # has requests. And a PREFILL of several requests brings no per-request width at
+        # all: its rows carry several requests' tokens packed together and the carrier says
+        # nothing about where one request's end, which is why that layer refuses such a call
+        # by name. So the operands stay the batch's there, exactly as they were, and the
+        # refusal keeps reading the whole call instead of a width invented here.
+        #
+        # ``request_real_tokens`` IS THE BATCH'S OWN READING of the lengths, taken from the
+        # block tables rather than from this derivation, so the two are sourced
+        # independently -- the same reason each bank's paging is checked against its
+        # group's -- and the bound below is where they meet.
+        if bool(is_prefill) and len(starts) > 1:
+            reals = [real]
+            request_width = int(tokens)
+        else:
+            request_width = int(tokens) if len(starts) == 1 else 1
+            if request_real_tokens is not None:
+                reals = [int(value) for value in request_real_tokens]
+            elif len(starts) == 1:
+                reals = [real]
+            else:
+                reals = [1] * len(starts)
+            if len(reals) != len(starts):
+                raise ValueError(
+                    f"this step carries {len(starts)} request(s) and hands {len(reals)} "
+                    f"real token count(s); the positions and the per-request lengths come "
+                    f"from one batch and must describe the same requests"
+                )
+        for index, one_real in enumerate(reals):
+            if one_real <= 0 or one_real > request_width:
+                raise ValueError(
+                    f"request {index} of this step was handed {one_real} real token(s) "
+                    f"against operands {request_width} row(s) wide; a request holds at "
+                    f"least one token and never more than the width it was padded into"
+                )
+        carriers: list[dict] = []
+        for bank, side, geometry in zip(banks, side_caches, geometries):
+            state_slots = [
+                int(value)
+                for value in geometry.get("state_slots", [geometry["state_slot"]])
+            ]
+            state_slot = state_slots[0]
+            if len(state_slots) != len(starts):
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {len(state_slots)} state "
+                    f"slot(s) against {len(starts)} cached length(s); each request "
+                    f"contributes one of each, so a disagreement pairs one request's "
+                    f"state with another's position"
+                )
+            if bank["family"] != "self_attn":
+                slots = int(bank["state_slots"])
+                for one_slot in state_slots:
+                    if not 0 <= int(one_slot) < slots:
+                        raise ValueError(
+                            f"KV layer '{bank['name']}' holds {slots} recurrent state "
+                            f"slot(s) and this request was given slot "
+                            f"{int(one_slot)}"
+                        )
+                # ONE PAIR PER REQUEST, STACKED ON A LEADING REQUEST AXIS -- ``[requests,
+                # 1]`` and ``[requests, width, 1]``. The layer splits them beside the
+                # states and each entry it takes out has the one-sequence shape, so one
+                # request's stack of one is the pinned shape and no second form exists.
+                extents = [
+                    cls._glm5next_real_row_extent(
+                        request_width, one_real, bank["recurrent_state"].device
+                    )
+                    for one_real in reals
+                ]
+                # ONE ENTRY PER REQUEST, UNDER THE LANDED KEY NAMES. The states of two
+                # requests are two rows of one bank, so they cannot be one tensor; the
+                # layer takes the tuple and serves the requests one at a time. VIEWS,
+                # never copies: the recurrence advances its state in place, and a copy
+                # would leave the bank holding the state of a step that already ran.
+                # THE POSITIONS ARE ONE TENSOR, not a tuple of ints, for the reason
+                # `_glm5next_start_positions` records: the layer reads the row of the
+                # request it is serving, and no host number reaches the graph.
+                # Both forms are used at ONE request too, so the pinned one-sequence
+                # shape runs the same derivation the concurrent shape does.
+                carriers.append(
+                    {
+                        "conv_state": tuple(
+                            bank["conv_state"][one_slot] for one_slot in state_slots
+                        ),
+                        "recurrent_state": tuple(
+                            bank["recurrent_state"][one_slot]
+                            for one_slot in state_slots
+                        ),
+                        "is_prefill": bool(is_prefill),
+                        "start_position": cls._glm5next_start_positions(
+                            starts, bank["recurrent_state"].device
+                        ),
+                        "real_tokens": torch.stack([part[0] for part in extents]),
+                        "row_mask": torch.stack([part[1] for part in extents]),
+                    }
+                )
+                continue
+            if len(state_slots) != 1:
+                # THE SPARSE FAMILY STILL THREADS ONE SEQUENCE, and this is where that
+                # boundary lives now. Its carrier is ONE CONTIGUOUS SLICE of the paged
+                # latent bank, and two requests' pages are not one run, so a second
+                # request cannot be expressed here at all -- the paged gather inside
+                # the kernel is what lifts it. The linear family
+                # above is already concurrent, so the refusal is the sparse family's
+                # rather than the whole forward's.
+                raise ValueError(
+                    f"KV layer '{bank['name']}' is a sparse-attention layer and takes "
+                    f"ONE contiguous slice of the paged latent bank, so it serves one "
+                    f"sequence per forward; this call carries {len(state_slots)} "
+                    f"request(s). The paged gather inside the kernel is what lifts "
+                    f"this, not the runner"
+                )
+            ids = [int(value) for value in geometry["block_ids"]]
+            if not ids:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed an empty block-table row; "
+                    f"a GLM-5.3-Flash request needs at least one KV block"
+                )
+            if any(later - earlier != 1 for earlier, later in zip(ids, ids[1:])):
+                raise ValueError(
+                    f"this half slices one sequence out of the paged latent bank by a "
+                    f"single ascending run of blocks, and KV layer '{bank['name']}' "
+                    f"was handed {ids}, which is not one run; gathering scattered "
+                    f"blocks is not inc-glm53f-054b's work and a wrong slice would "
+                    f"write this sequence's latents into another sequence's slots"
+                )
+            block_size = int(bank["block_size"])
+            if int(geometry["page_size"]) != block_size:
+                raise ValueError(
+                    f"KV layer '{bank['name']}'s bank is paged {block_size} slot(s) to "
+                    f"the block and the KV-cache group it belongs to reports page "
+                    f"{int(geometry['page_size'])}; the slice and the layer's own page "
+                    f"are one number or the slice is wrong"
+                )
+            # THE SIDE CACHES ARE INDEXED BY THE SAME SLOT as the recurrent states,
+            # so an out-of-range slot is refused BY NAME here rather than reaching a
+            # bare IndexError from the row lookup below.
+            side_slots = int(side["pool_cache"].shape[0])
+            if not 0 <= state_slot < side_slots:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' holds {side_slots} indexer side-cache "
+                    f"slot(s) and this request was given slot {state_slot}; a "
+                    f"request's recurrent state and its indexer state live at one "
+                    f"slot number"
+                )
+            latent = bank["latent_cache"][
+                ids[0] * block_size : (ids[-1] + 1) * block_size
+            ]
+            # THE WRITE HAS TO LAND IN THE REQUEST'S OWN PAGES, AND THIS IS WHERE THAT
+            # IS DECIDED NOW. The layer writes rows `start_position` through
+            # `start_position + tokens` of the window it is handed. It used to refuse a
+            # write past the end of what it was given, because what it was given WAS the
+            # request's pages; the window is longer than those pages by design, so the
+            # same check inside the layer can no longer see the difference -- a write
+            # past the request's last page lands on a neighbour's rows, inside the
+            # window, in silence.
+            #
+            # IT CANNOT MOVE ANY FURTHER IN THAN HERE. The check is arithmetic on the
+            # position's VALUE, and past this point the position is a tensor whose value
+            # a captured graph cannot read; here it is still the host integer this
+            # function was handed, beside the block run it was handed for the same step.
+            # The converter derives one from the other, so a step it built satisfies this
+            # by construction and the refusal speaks to a caller that does not.
+            own_slots = len(ids) * block_size
+            if int(start_position) < 0 or int(start_position) + real > own_slots:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {real} real token(s) at "
+                    f"position {int(start_position)} against {len(ids)} block(s) of "
+                    f"{block_size} slot(s), which is {own_slots} slot(s) of this "
+                    f"request's own pages; the window this layer reads is longer than "
+                    f"those pages, so a write outside them would land on another "
+                    f"sequence's rows without shortening anything"
+                )
+            # THE WINDOW SLICE. Its LENGTH is the bucket's, so one captured graph
+            # serves every position; the request's own pages sit at the front of it
+            # and the position bounds what is written. Two refusals guard the form.
+            if "window_blocks" not in geometry:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed a geometry with no "
+                    f"'window_blocks'; the window this layer reads has a length that is "
+                    f"fixed for the bucket, and a caller that does not state that length "
+                    f"cannot be given a window one captured graph can serve"
+                )
+            window_blocks = int(geometry["window_blocks"])
+            if len(ids) > window_blocks:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {len(ids)} block(s) for one "
+                    f"sequence and the bucket's block table holds {window_blocks} per "
+                    f"sequence; a request longer than its bucket cannot be served by "
+                    f"this window"
+                )
+            base = ids[0] * block_size
+            window = window_blocks * block_size
+            bank_slots = int(bank["latent_cache"].shape[0])
+            if base + window > bank_slots:
+                # THE ALLOCATION IS SHORT, AND CLAMPING THE BASE IS NOT THE REMEDY. A
+                # torch slice past the end does not raise: it returns a SHORTER view,
+                # which is how a bucket-constant length silently becomes a per-request
+                # one where a captured graph cannot see it. Clamping the base instead
+                # would keep the length and move every write onto another sequence's
+                # rows. So the bank owes a spare window of blocks past the last one a
+                # request can be given, and the runner's allocator is where
+                # that headroom is added -- not here.
+                raise ValueError(
+                    f"KV layer '{bank['name']}'s bank holds {bank_slots} slot(s) and a "
+                    f"window of {window} slot(s) from block {ids[0]} would end at "
+                    f"{base + window}; the bank needs a spare {window_blocks} block(s) "
+                    f"past the last block a request can be given, and neither a "
+                    f"shortened view nor a clamped base is a substitute"
+                )
+            latent = bank["latent_cache"][base : base + window]
+            if int(latent.shape[0]) != window:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' produced a window of "
+                    f"{int(latent.shape[0])} slot(s) where {window} was asked for; the "
+                    f"window's length is what one captured graph depends on"
+                )
+            device = latent.device
+            carrier = {
+                "latent_cache": latent,
+                # THE REQUEST'S OWN ROW OF EACH SIDE CACHE. The slot is the one
+                # the request table assigned, so two requests in one batch reach
+                # two disjoint views and neither can see the other's pool.
+                "pool_cache": side["pool_cache"][state_slot],
+                # THE BATCH FORM IS USED EVEN AT ONE REQUEST, so the single-request
+                # path and the concurrent one share one derivation and cannot
+                # drift. At one request it is the singular form's own output.
+                "seq_lens": cls._glm5next_batch_row_seq_lens(
+                    [(tokens, start_position)], device=device
+                ),
+                "start_position": cls._glm5next_start_position(start_position, device),
+                "softmax_scale": float(softmax_scale),
+                "max_seq_len": int(max_seq_len),
+                "page_size": int(geometry["page_size"]),
+            }
+            if is_prefill:
+                carrier["slot_mapping"] = cls._glm5next_batch_pool_slot_mapping(
+                    [(tokens, start_position)],
+                    index_kpool=index_kpool,
+                    device=device,
+                    real_tokens=[real],
+                )
+                # THE RING IS ON BOTH LEGS NOW, under its own keyword. The prefill
+                # leg seeds this chunk's remainder into it (`model_fp8.py`'s
+                # `seed_tail`), because the keys for those positions exist only
+                # inside that forward. The end position is passed rather than
+                # inferred: the indexer's `max_seq_len` is the BATCH's longest
+                # sequence, equal to this sequence's end only while the batch is
+                # one request -- which this half refuses to exceed, but the model
+                # must not depend on that.
+                # THE END POSITION RIDES AS A TENSOR, built here from two host ints.
+                # It decides which ring slots this chunk's remainder occupies, so an
+                # int would bake those slots into the captured graph and pin it to
+                # the length this chunk happened to end at. The seam's int route
+                # refuses an end position shorter than the chunk, and that refusal
+                # cannot run on a tensor -- it is made above instead, where the
+                # position is still a number and a negative one is rejected.
+                # AND THE END IS THE CHUNK'S REAL END, not the width it was padded
+                # into: the ring slots past it hold no token of this sequence, and a
+                # remainder seeded into them would be pooled by the next completion.
+                carrier["prefill_tail"] = side["tail"][state_slot]
+                carrier["prefill_end_position"] = cls._glm5next_start_position(
+                    int(start_position) + real, device
+                )
+            else:
+                # AND SO DOES THE DECODE POSITION, for the same reason: it chooses
+                # the ring slot this token's key is written to.
+                carrier["tail"] = side["tail"][state_slot]
+                carrier["position"] = cls._glm5next_start_position(
+                    start_position, device
+                )
+            carriers.append(carrier)
+        return carriers
+
+    def _glm5next_model_kwargs(self, kwargs: dict) -> dict:
+        """The generic model kwargs, translated for a carrier-passing model family.
+
+        RETURNS ITS ARGUMENT UNCHANGED unless the loaded model kept cache banks,
+        which only ``Glm5NextForConditionalGeneration.bind_kv_cache`` does. That is
+        what lets all eight call sites -- three warmup calls, the execute path, the
+        idle dummy step and the three graph-capture calls -- go through one
+        function: for llama3, qwen3, gpt_oss, qwen3_vl and synthetic this is one
+        ``getattr`` and a return of the same object.
+
+        WHAT IT DROPS, AND WHY THAT IS NOT SILENT. This model's root forward declares
+        ``input_ids``, ``layer_carriers``, ``sampling_positions``, ``block_size`` and
+        three parallelism arguments (``model_fp8.py:9877-9888``), so the generic
+        mapping's ``positions``, ``sampling_params``, ``spec_decode_metadata``,
+        ``rank``, ``logit_mask`` and ``rotary_position_ids`` have no parameter to
+        land on -- they belong to features this campaign has not ported. The batch
+        geometry is READ out of ``attn_metadata`` before it is dropped, and a key
+        this function needs and cannot find refuses by name with what the site did
+        hand it.
+
+        THE THREE PARALLELISM ARGUMENTS ARE SUPPLIED HERE, ON EVERY CALL. The root
+        defaults ``moe_group``, ``tp_degree`` and ``expert_parallel_rank`` to the
+        unsharded values and leaves the served values to its caller
+        (``model_fp8.py:7936-7939``); a translation that omitted them made every
+        rank of an expert-parallel serve run expert group 0. They come from
+        ``_glm5next_parallel_kwargs`` below, which reads the parallel state the
+        worker initialised, and they are passed explicitly at degree 1 too. The rank
+        travels as an int64 device tensor built on ``input_ids``'s device, so the
+        captured graph reads it as an input and one graph serves every expert group.
+
+        EVERY GEOMETRY NUMBER COMES FROM THE HOST, AND A DEVICE TENSOR IS REFUSED.
+        The cached length and the block-table row are read from the entry's
+        ``host_num_computed_tokens`` and ``host_block_table``, which both builders
+        fill from the runner's own host arrays. The device tensors beside them carry
+        the same numbers for the kernels, but reading a value off one costs a
+        ``Tensor.item()``, which a graph capture cannot do at all: under
+        ``VLLM_NEURON_CPU_COMPILE`` the whole batch is on ``meta``, where a value
+        does not exist. ``_glm5next_host_geometry`` therefore refuses a non-CPU
+        tensor by name instead of converting it, so the rule holds for a call site
+        that has not been written yet.
+
+        ``block_size`` IS NOT PASSED EITHER, AND THAT IS THE POINT. The root's
+        parameter of that name is the FP8 WEIGHT-QUANT block, "tokens per block,
+        forwarded to the expert bank unread" (``model_fp8.py:8386``), and the bank
+        refuses it unless it is a positive multiple of ``BLOCK_QUANT_SIZE``
+        (``model_fp8.py:1775-1780``). A KV page size is a different number entirely --
+        4 in the tiny fixture -- so handing it over raises
+        ``Glm5NextBlockQuantRouteError`` on the first routed layer. Left unset, the
+        bank uses its own declared block, which is the value ``inc-glm53f-054a``'s
+        landed acceptance asserts the root forwards to its stack
+        (``test_tiny_glm5next_forward.py:5392-5393``). The KV page reaches the layers
+        where it belongs, on each carrier's ``page_size``.
+
+        ONE METADATA ENTRY PER LAYER, LOOKED UP BY THAT LAYER'S NAME. The runner
+        builds one block table per KV-CACHE GROUP and writes that group's entry under
+        every layer name in the group (``:4115-4121``, ``:4256-4257``). A hybrid stack
+        has two groups, so reading one entry for the whole stack slices one family out
+        of the other family's table -- what review r1 of commit 1 found. The names are
+        the same names the banks carry: both sides come from ``get_kv_spec``
+        (``:9186-9187``).
+
+        THE LEG IS READ THE FILE'S OWN WAY, ``max_query_len`` against
+        ``decode_token_threshold``, which is the decode test this runner already
+        makes at ``:7524-7527``, so the two cannot disagree. It is read PER GROUP and
+        a disagreement refuses, because the layers of one forward are stepped
+        together or not at all.
+
+        THE BLOCK RUN IS DERIVED FROM THE SEQUENCE, not from the row's length: the
+        request holds ``start_position + real_tokens`` slots, so it occupies that
+        many slots rounded up to whole blocks IN THAT GROUP'S PAGE, and the trailing
+        entries of a padded block-table row are not read.
+
+        AND THE SEQUENCE'S LENGTH IS THE REQUEST'S, NOT THE TENSOR'S. The input
+        builder pads a prefill up to its bucket (``:3402-3428``) AFTER the scheduler
+        has allocated blocks for the real count (``scheduler.py:794-803``), so a run
+        taken from the padded width would name row entries this request was never
+        given. The slots it holds, the position it ends at and the pools it completes
+        are therefore read from the real length the builder leaves beside the
+        tensors, while every traced operand keeps the padded width, which is the
+        width the captured graph was compiled for.
+        """
+        banks = getattr(self.model, "glm5next_layer_banks", None)
+        if not banks:
+            return kwargs
+        missing = [
+            key
+            for key in ("input_ids", "attn_metadata", "sampling_positions")
+            if key not in kwargs
+        ]
+        if missing:
+            raise ValueError(
+                f"a GLM-5.3-Flash forward needs {missing} to build its per-layer "
+                f"carriers; this call site handed {sorted(kwargs)}"
+            )
+        metadata_map = kwargs["attn_metadata"]
+        if not metadata_map:
+            raise ValueError(
+                "a GLM-5.3-Flash forward needs attention metadata to slice its "
+                "paged latent cache, and this call site handed none"
+            )
+        input_ids = kwargs["input_ids"]
+        tokens = int(input_ids.shape[0])
+        # THE OPERAND WIDTH AND THE SEQUENCE'S END ARE TWO NUMBERS HERE. Every
+        # tensor below is as wide as the bucket this step was padded to, and that
+        # width is what a captured graph carries; the pages each request holds and
+        # the position it reaches are its REAL length, one per request in the
+        # batch's own order.
+        real_counts = self._glm5next_take_request_tokens()
+        geometries: list[dict] = []
+        legs: set[bool] = set()
+        # THE CACHED LENGTHS TRAVEL AS A TUPLE PER GROUP, one entry per request in the
+        # batch's own row order, and the GROUPS must agree on that tuple. The check
+        # that used to stand here required ONE length for the whole call, which is a
+        # restriction on the BATCH rather than an agreement between the groups: two
+        # requests at different points of their sequences is the ordinary concurrent
+        # case. What must still agree is what the groups say about the SAME requests,
+        # because the layers of one forward are stepped together.
+        starts: set[tuple] = set()
+        for bank in banks:
+            name = bank["name"]
+            if name not in metadata_map:
+                raise ValueError(
+                    f"KV layer '{name}' has no attention-metadata entry; the runner "
+                    f"writes one entry per layer of every KV-cache group "
+                    f"(:4256-4257) and this call site handed {sorted(metadata_map)}"
+                )
+            metadata = metadata_map[name]
+            block_size = int(metadata["block_size"])
+            rows = self._glm5next_host_geometry(metadata, "host_block_table", name)
+            positions = self._glm5next_host_geometry(
+                metadata, "host_num_computed_tokens", name
+            )
+            if len(rows) != len(positions):
+                raise ValueError(
+                    f"KV layer '{name}' was handed {len(rows)} block-table row(s) "
+                    f"against {len(positions)} cached length(s); both are the "
+                    f"batch's own rows, so there is one of each per request"
+                )
+            if not rows:
+                raise ValueError(
+                    f"KV layer '{name}' was handed no block-table row at all; every "
+                    f"step this converter serves carries at least one request"
+                )
+            # ONE ROW AND ONE CACHED LENGTH PER REQUEST, in the batch's own order. The
+            # refusal that stood here -- one sequence per forward -- has moved to the
+            # SPARSE family's carrier, where the contiguous slice is actually taken: the
+            # linear family serves a batch, and a walk that turned every two-request
+            # step away before either family was reached could not deliver one.
+            #
+            # EACH REQUEST ADVANCES BY ITS OWN REAL TOKENS, which the input builder
+            # wrote down one per request: a step arrives padded up to its bucket, so
+            # dividing the padded width would hand every request the padding as well
+            # and page blocks the scheduler never allocated. The width is still what
+            # every operand carries; only the pages and the positions read the array.
+            request_rows = [[int(value) for value in row] for row in rows]
+            request_starts = [int(value) for value in positions]
+            request_tokens = self._glm5next_resolve_request_tokens(
+                real_counts, len(request_rows), tokens, name=f"KV layer '{name}'"
+            )
+            for index, row in enumerate(request_rows):
+                if not row:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed an empty block-table row for "
+                        f"request {index}; a row names either the pages a paged bank "
+                        f"steps through or the one slot a recurrent bank keeps its "
+                        f"state in, and an empty row names neither"
+                    )
+            blocks_used = [
+                -(-(start + count) // block_size)
+                for start, count in zip(request_starts, request_tokens)
+            ]
+            # A PAGED ROW ADDRESSES PAGES; A RECURRENT ROW NAMES ONE SLOT. The difference is
+            # not the table: a recurrent group's spec carries the ATTENTION block size
+            # (:9458-9459), so its table is as wide as the paged one. What differs is what the
+            # layer reads out of the row -- a paged layer walks the pages its step covers,
+            # and a recurrent layer keeps one sequence's state in the one slot at the row's
+            # head however many tokens the step covers. So the width a paged row needs says
+            # nothing about a recurrent one.
+            #
+            # AND IT IS ASKED OF EVERY REQUEST'S ROW, because each request stands at its own
+            # position: a row wide enough for the request that has computed least is not
+            # wide enough for the one that has computed most.
+            if bank["family"] == "self_attn":
+                for index, row in enumerate(request_rows):
+                    if blocks_used[index] > len(row):
+                        raise ValueError(
+                            f"KV layer '{name}' holds "
+                            f"{request_starts[index] + request_tokens[index]} slot(s) of "
+                            f"request {index}'s sequence, which occupy "
+                            f"{blocks_used[index]} page(s), and that request's "
+                            f"block-table row is {len(row)} entry(ies) wide; a row that "
+                            f"cannot address the step would slice another sequence's pages"
+                        )
+            # A RECURRENT ROW'S WIDTH BELONGS TO ITS TABLE, not to this layer, so nothing is
+            # asked of it here: every row arrives at its cache group's full padded width,
+            # whether the builder wrote ``torch.arange(max_num_blocks_per_req)``
+            # (:4437-4442) or sliced the served table (:4246). The one slot the scheduler
+            # allocated is the row's first entry, and THAT is what has to name a slot the
+            # bank holds -- checked once, where the slot is used to take the view (:5041),
+            # rather than a second time here.
+            # THE WINDOW THE LAYER IS HANDED IS THE LEG'S BUCKET SPAN, not this step's
+            # span and not the row's width. A length derived from the cached position
+            # would change with every decode step and a captured graph would fit only
+            # the position it was captured at; a length taken from the block table's
+            # width would be the whole model length on the prefill leg, because that
+            # width falls back to `max_model_len` when a group has no context bucket
+            # (`:4325-4344`). The seam copies every row of the window into on-chip
+            # memory, so that width is not merely wasteful -- it does not fit.
+            #
+            # Both numbers below are python ints the metadata already carries, so the
+            # window is constant per captured graph without reading a tensor value:
+            # a decode step's span IS the context bucket, which is what
+            # `max_blocks_per_seq` holds for a decode group, and a prefill chunk's span
+            # is the segment it may carry plus the chunk itself.
+            #
+            # THE WIDTH IS THE DECLARED ONE, NOT THE HOST ROW'S. `max_blocks_per_seq` is
+            # the block-table dim the graph was compiled with (`:4256`, `:4452`), so it
+            # is the number that stays put across the steps of one captured graph, while
+            # the host row arrives at its group's full padded width and stays that wide
+            # even when the served table is trimmed to a decode bucket (`:4214-4232`,
+            # `:4246`). The row is the ADDRESSABILITY ceiling instead: a declared width
+            # past its end would name entries the row does not carry -- and it is every
+            # request's row, since one declared width serves the whole batch.
+            table_width = int(metadata.get("max_blocks_per_seq", len(request_rows[0])))
+            for index, row in enumerate(request_rows):
+                if table_width > len(row):
+                    raise ValueError(
+                        f"KV layer '{name}' declares {table_width} block(s) per sequence "
+                        f"against request {index}'s host block-table row {len(row)} "
+                        f"entry(ies) wide; the window handed to the layer is read out of "
+                        f"that row, so a width past its end names blocks this step "
+                        f"cannot address"
+                    )
+            leg_is_prefill = int(metadata["max_query_len"]) > int(
+                metadata["decode_token_threshold"]
+            )
+            segment = int(metadata.get("kv_segment_size", 0))
+            if not leg_is_prefill:
+                # A DECODE STEP'S SPAN IS ITS CONTEXT BUCKET, which for a decode group
+                # is the whole block table: the bucket was chosen so the longest
+                # sequence in it fits, so its table is not the model length.
+                span_blocks = table_width
+            elif segment > 0:
+                span_blocks = -(
+                    -(segment + int(metadata["max_query_len"])) // block_size
+                )
+            else:
+                # A PREFILL CHUNK WITH NO SEGMENT BUCKET STATED. Nothing here says how
+                # much context this chunk may carry, so the table's width is the only
+                # honest ceiling left -- and on this leg that width is the fallback
+                # above, the expensive case. It is taken rather than guessed, and a
+                # serving configuration that reaches it has to be measured first.
+                span_blocks = table_width
+            window_blocks = min(table_width, max(1, span_blocks))
+            geometries.append(
+                {
+                    # THE FIRST REQUEST'S PAGES ARE WHAT THE SPARSE FAMILY SLICES, and it
+                    # refuses a second request by name in the carrier builder, so this
+                    # entry can never answer for a request it does not describe.
+                    "block_ids": request_rows[0][: blocks_used[0]],
+                    "state_slot": request_rows[0][0],
+                    "page_size": block_size,
+                    "window_blocks": window_blocks,
+                }
+            )
+            # ONE READING OF THE LEG PER GROUP, the one the window was sized from. Two
+            # evaluations of the same test are two things that can drift apart, and the
+            # window would then be sized for a leg this step is not on.
+            legs.add(leg_is_prefill)
+            # THE CACHED LENGTHS TRAVEL AS A TUPLE, one entry per request in the batch's
+            # own row order, so what the groups must agree on is what they say about the
+            # SAME requests -- not that the batch holds one.
+            starts.add(tuple(request_starts))
+        if len(legs) != 1 or len(starts) != 1:
+            # THE FIRST CLAUSE IS THE PHRASE ITS LANDED READERS MATCH, so what follows
+            # it says what changed rather than replacing it: the lengths are now one
+            # tuple per request instead of one number.
+            raise ValueError(
+                f"the layers of one forward are stepped together, so their KV-cache "
+                f"groups must agree on the leg and the cached length, which is one "
+                f"length per request in the batch's own row order; this call site's "
+                f"entries carry prefill flags {sorted(legs)} and cached lengths "
+                f"{sorted(starts)}"
+            )
+        is_prefill = legs.pop()
+        request_starts = list(starts.pop())
+        # THE SCALAR IS THE FIRST REQUEST'S, and it is what the sparse family reads.
+        # That family still serves one sequence per forward -- its carrier is one
+        # contiguous slice of the paged latent bank -- and refuses a second request BY
+        # NAME in the carrier builder, so the scalar can never reach an answer for a
+        # request it does not describe.
+        start_position = request_starts[0]
+        # AND SO IS THE REAL LENGTH THE SPARSE FAMILY PAGES AND POOLS BY. The counts are
+        # derived once more here, from the agreed cached lengths rather than from
+        # whichever group the walk above ended on, so the number the carriers and the
+        # cursor read cannot depend on the order the banks were visited in. The
+        # derivation is a pure function of the builder's array and the batch's width, so
+        # this second reading agrees with every group's by construction.
+        request_tokens = self._glm5next_resolve_request_tokens(
+            real_counts, len(request_starts), tokens
+        )
+        text_config = self.model.text_config
+        side_caches = self._glm5next_live_side_caches(banks)
+        # A STEP THE ENGINE SCHEDULED NOTHING FOR IS NOT A SEQUENCE STEP, AND WARMUP IS
+        # PART OF SERVING. Three steps of this kind reach this converter: the decode
+        # warmup and the idle-data-parallel dummy step through
+        # `_build_decode_synthetic_inputs` and `_build_warmup_attention_metadata`, and
+        # the prefill warmup through `_build_prefill_synthetic_inputs`. All three carry
+        # `cached_seq_len = 0` and an input batch that names no request, because nothing
+        # has been scheduled when they run. A step with no request cannot be keyed by
+        # one, and there is no sequence of anybody's for it to open, advance or destroy,
+        # so it is served from slot 0 with the cursor neither read nor written. One rule
+        # covers all three, on either leg.
+        #
+        # THE CLASSIFICATION IS THE COMPUTED LENGTH AND THE IDENTITY, NEVER THE LEG.
+        # The leg is decided by `max_query_len > decode_token_threshold`, which is a
+        # count of the tokens this step was GIVEN; whether a request is opening is a
+        # count of the tokens it has already COMPUTED, and the two disagree on exactly
+        # the requests that matter. A one-token prompt computes its whole prompt in a
+        # step of one token, which does not exceed a threshold of one; a preempted
+        # request resumes from computed length 0 whatever it is given. Both are real
+        # requests with a state of their own to keep, so both are keyed by their own id
+        # here, take their own slot, and enter with a zero state -- the layer selects
+        # that on the position it is handed, so the leg they ride changes nothing they
+        # read. Reading the leg here, as this rule did until now, handed those two
+        # requests slot 0 and wrote over whoever holds it.
+        #
+        # WHY THE ABSENT IDENTITY IS READ ONLY AT POSITION 0 and not everywhere. A
+        # step at a cached length ABOVE zero continues a sequence, and continuing one
+        # without knowing whose it is is precisely the defect the slot table exists to
+        # close. Such a step still refuses by name below. So this condition is the
+        # request-less shape the runner actually builds, and it does not widen into the
+        # class the refusal must keep catching.
+        #
+        # THE WARMUP BUILDERS ARE NOT TOUCHED TO SAY THIS, for a reason recorded rather
+        # than left: they are shared with paths this port does not own, so changing that
+        # surface is not a decision this file may take on its own. The absence of an
+        # identity is a property of those steps that this converter can read where it
+        # stands.
+        synthetic_step = all(
+            int(position) == 0 for position in request_starts
+        ) and not self._glm5next_batch_request_ids()
+        # THE STATE SLOT IS THE REQUEST'S, AND IT IS SETTLED HERE rather than in the
+        # walk above, because a synthetic step must take no claim and whether this
+        # step is synthetic is only known once the leg and the position are read.
+        # The slot used to be the block table's FIRST BLOCK ID, which is a paging
+        # artefact: it forced the bank to be as large as the block space and said
+        # nothing about whose state a row held.
+        request_ids = self._glm5next_request_identities(synthetic=synthetic_step)
+        state_slots = self._glm5next_request_slots(
+            banks, request_ids, synthetic=synthetic_step, side_caches=side_caches
+        )
+        # THE SLOTS TRAVEL AS A LIST, one entry per request, and the singular key
+        # stays beside it because landed readers name it.
+        for geometry in geometries:
+            geometry["state_slot"] = int(state_slots[0])
+            geometry["state_slots"] = [int(value) for value in state_slots]
+        # IDENTITY AND PAGING MUST DESCRIBE THE SAME REQUESTS. The slots come from the
+        # engine's request ids and the positions from the block tables, and the two
+        # are read from different places, so a disagreement pairs one request's state
+        # with another's position. A synthetic step is exempt: it has no request and is
+        # served from slot 0 whatever the tables carry.
+        #
+        # AND A PADDED ROW IS WHAT THIS REFUSES, WHICH IS THE ANSWER KEPT RATHER THAN
+        # REPLACED. A decode bucket wider than the batch pads its rows, and a padded row
+        # has no request, so the identities are fewer than the cached lengths and this
+        # raises. The state seams are given no "not fresh, write nowhere" arm for such a
+        # row: the recurrent state's carrier is a bank ROW, and a row nobody owns has no
+        # harmless one to hand. Where padding does arrive -- the sparse family's latent
+        # slot mapping -- it is masked to a value outside the bank instead
+        # (`_glm5next_latent_slot_mapping`), because there the padding is an ADDRESS. At
+        # the serving bound this campaign measures, `--max-num-seqs 1`, the state
+        # converter never sees one: the batch is a single row and there is nothing to
+        # pad it to.
+        if not synthetic_step and len(state_slots) != len(request_starts):
+            raise ValueError(
+                f"this step names {len(state_slots)} request(s) and its block tables "
+                f"carry {len(request_starts)} cached length(s); identity and paging "
+                f"come from one batch and must describe the same requests"
+            )
+        if synthetic_step:
+            # A SYNTHETIC STEP LEAVES THE RING AND ITS RECORDED POSITION ALONE, and
+            # this branch exists to say so in one place rather than by omission. A
+            # warmup is not a sequence: it opens nothing, so it must close nothing.
+            # A request-less PREFILL at position 0 reaches here, and clearing slot 0's
+            # ring on its way through would destroy the ring of whichever request
+            # happens to own that slot -- the same cross-request clearing the slot axis
+            # was introduced to end. At start-up, where the warmup actually runs, the
+            # rows are freshly allocated zeros, so leaving them is also the value the
+            # process-wide clearing this replaces produced.
+            pass
+        else:
+            # EACH REQUEST IS CLASSIFIED ON ITS OWN POSITION. A batch's requests are at
+            # different points of their own sequences: one may be opening while another
+            # continues. Reading the batch's first position for all of them would open
+            # a ring that a live request is standing in, or refuse a request that is
+            # legitimately fresh, so the two arms below are taken per request.
+            for one_slot, one_start in zip(state_slots, request_starts):
+                self._glm5next_position_arm(
+                    int(one_slot),
+                    int(one_start),
+                    side_caches=side_caches,
+                    is_prefill=is_prefill,
+                )
+        carriers = self._glm5next_layer_carriers(
+            banks,
+            side_caches,
+            geometries=geometries,
+            is_prefill=is_prefill,
+            tokens=tokens,
+            start_position=start_position,
+            softmax_scale=float(
+                (
+                    int(text_config.qk_nope_head_dim)
+                    + int(text_config.qk_rope_head_dim)
+                )
+                ** -0.5
+            ),
+            # THE INDEXER'S BOUND IS THE ENGINE'S LONGEST SEQUENCE, NOT THIS STEP'S END.
+            # It stays a python int, because the indexer's own docstring records why: the
+            # obvious `int(seq_lens.max())` is a host read of tensor data inside a traced
+            # region. An int is therefore baked into every graph captured with it -- and
+            # a step's own end position is a DIFFERENT int at every decode step, so each
+            # step wanted its own graph. This value is the same at every step of the
+            # process, so one graph serves them all, and it serves a batch of requests
+            # for the same reason: it does not depend on where any of them stands.
+            #
+            # NOTHING BEYOND THE SEQUENCE BECOMES VISIBLE. The number sizes the candidate
+            # pool count, and each row is bounded to its own length by `seq_lens` before
+            # selection (`model_fp8.py`'s `select_bounded_pools`), so raising it adds
+            # candidates that the causal bound then removes.
+            #
+            # AND IT IS THE ENGINE'S LENGTH RATHER THAN THE WINDOW'S, because the pooled
+            # store is allocated from exactly this number (`:4967`, rows
+            # `max_seq_len // pool + 1`).
+            max_seq_len=int(self.max_model_len),
+            index_kpool=int(text_config.index_kpool),
+            requests=len(state_slots),
+            request_starts=request_starts,
+            # THE FIRST REQUEST'S REAL LENGTH, which is the sparse family's: that family
+            # serves one sequence per forward and refuses a second by name, and its ring
+            # and its pool mask must stop where the sequence stops rather than where the
+            # bucket does.
+            real_tokens=request_tokens[0],
+            # AND EVERY REQUEST'S OWN LENGTH, which is the recurrent family's: its mask is
+            # per row, so a second request handed the first one's padding would scan rows
+            # that carry no token of its own sequence into its own state.
+            request_real_tokens=request_tokens,
+        )
+        # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
+        # several shapes of its own -- a multi-token decode, a bank whose paging
+        # disagrees with its group, a state slot out of range -- and each of those
+        # raises after this converter has already decided the step is well positioned.
+        # Advancing before the call returns would leave the ring's recorded position
+        # ahead of the work actually done, so the NEXT step would be refused for a
+        # mismatch this one caused. A refused step must leave no trace.
+        # A SYNTHETIC STEP LEAVES NO CLAIM. It never read the cursor above and it does
+        # not write one here, so a warmup between two real steps of one sequence is
+        # invisible to that sequence.
+        # EACH REQUEST ADVANCES BY ITS OWN REAL TOKENS, not by the batch's total and not
+        # by the bucket's width: the first would record every sequence as if it had
+        # consumed the whole batch, and the second would stand a padded request's cursor
+        # past the tokens it actually holds, so its next step would be refused for a
+        # mismatch this one wrote.
+        if not synthetic_step:
+            for one_slot, one_start, one_count in zip(
+                state_slots, request_starts, request_tokens
+            ):
+                self._glm5next_side_cache_positions[int(one_slot)] = (
+                    int(one_start) + one_count
+                )
+            # THE SPARSE FAMILY'S OWN CURSOR, WRITTEN FROM THE SAME NUMBER. That family
+            # serves one sequence per forward, so its cursor is the first request's
+            # position and nothing else; the per-slot record above is what this
+            # converter reads back. One assignment, from the value already computed, so
+            # the two cannot say different things about the same request.
+            self._glm5next_side_cache_cursor = (
+                int(request_starts[0]) + request_tokens[0]
+            )
+        return {
+            "input_ids": kwargs["input_ids"],
+            "layer_carriers": carriers,
+            "sampling_positions": kwargs["sampling_positions"],
+            **self._glm5next_parallel_kwargs(device=input_ids.device),
+        }
+
+    def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
+        """The root's three parallelism arguments, read from the parallel state on every call.
+
+        The root's forward leaves ``moe_group``, ``tp_degree`` and ``expert_parallel_rank``
+        to its caller and defaults them to the unsharded values (``model_fp8.py:9885-9888``,
+        ``:7936-7939``): the rank selects which expert slice this rank's bank holds
+        (``:2072``), and the degree with the group name the ranks that shard each expert's
+        intermediate width (``moe_blockwise.py:46-68``). Below expert-parallel degree 2 the
+        defaults are handed over EXPLICITLY, so every site passes the same six keys and a
+        missing key cannot pass for degree 1.
+
+        THE RANK IS HANDED OVER AS A TENSOR: int64, shape ``[1]``, on ``device`` -- the
+        batch's device, ``meta`` under a CPU capture -- built here, outside the trace, so
+        it is an input of the captured graph and the expert group is not a constant of it.
+        The bank adds it to an ``arange`` from zero (``model_fp8.py:2067-2100``), so one
+        graph serves every rank; the mapping's own ``rank`` tensor
+        (``moe_blockwise.py:66-69``) is the precedent. A python int at the bank would bake
+        the group into the trace and compile one graph per expert group. The log row below
+        keeps the host int. The state module is read through its
+        attributes, the way ``factory._resolve_ep_degree`` reads it, so a test can stand in
+        for a collective it cannot initialise. The first resolve on a runner logs ONE row --
+        ``glm5next parallel arguments rank= ep_rank= ep_degree= tp_degree=`` -- so a serve's log
+        carries one row per rank naming the expert group that rank read.
+        """
+        from vllm_neuron.parallel import neuron_parallel_state as parallel_state
+
+        ep_degree = int(parallel_state.get_neuron_ep_degree())
+        if ep_degree < 2:
+            moe_group, tp_degree, ep_rank = None, 1, 0
+        else:
+            moe_group = parallel_state.get_neuron_ep_tp_group()
+            tp_degree = int(moe_group.world_size)
+            ep_rank = int(parallel_state.get_neuron_ep_rank())
+        if not getattr(self, "_glm5next_parallel_reported", False):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.info(
+                "glm5next parallel arguments rank=%d ep_rank=%d ep_degree=%d tp_degree=%d",
+                rank, ep_rank, ep_degree, tp_degree,
+            )
+            self._glm5next_parallel_reported = True
+        return {
+            "moe_group": moe_group,
+            "tp_degree": tp_degree,
+            "expert_parallel_rank": torch.full((1,), ep_rank, dtype=torch.int64, device=device),
+        }
+
+    def _glm5next_position_arm(
+        self, slot: int, start_position: int, *, side_caches, is_prefill: bool
+    ) -> None:
+        """One request's ring: opened at position 0, or required to continue.
+
+        THE TWO ARMS ARE ONE REQUEST'S, and they were one step's before a batch could
+        hold more than one. Nothing about either arm changed; what changed is that the
+        caller runs them per request.
+
+        WHICH ARM A REQUEST TAKES IS ITS COMPUTED LENGTH, AND THE LEG IS NOT READ. A
+        request that has computed nothing is opening whatever number of tokens it was
+        given, so a one-token prompt and a resumed request open the ring here as any
+        other opening does. Reading the leg as well sent both of them to the arm below,
+        which refuses a step whose slot holds no cursor -- so the two requests the
+        converter now keys by their own id would have been refused by name instead of
+        served. The leg is still carried, for the refusal below to name.
+        """
+        if int(start_position) == 0:
+            # A FRESH SEQUENCE MUST NOT INHERIT THE LAST ONE'S PARTIAL POOL. The
+            # side caches live for the process (`_glm5next_live_side_caches`), so
+            # the ring still holds whatever the previous sequence stashed, and
+            # every real token stashes (`decode_tail_update.py`). Its next
+            # completion would pool those stale members. A step at position 0
+            # is a new sequence, so the ring starts empty here.
+            #
+            # THE POOLED STORE IS LEFT ALONE, deliberately: the candidate gather is
+            # bounded by this sequence's own `max_seq_len`
+            # (`model_fp8.py:5288-5295`), and every complete pool below that bound
+            # is written by this prefill, so a stale row above it is unreachable.
+            # Clearing it would also hide a bound defect rather than expose one.
+            #
+            # THE PREFILL'S REMAINDER IS SEEDED BY THE MODEL, NOT HERE. The positions
+            # past the last complete pool exist only inside the prefill branch
+            # (`model_fp8.py:5486-5500`), so that branch writes them into the ring this
+            # converter binds -- `prefill_tail` with `prefill_end_position` -- using
+            # `seed_tail` (`model_fp8.py:4631-4638`). Commit 6 of `inc-glm53f-054b`, on
+            # the lead's ruling; item 11 of the tiny end-to-end file measures it.
+            # THE RING AND ITS OWNER ARE CLEARED TOGETHER, AND BOTH BEFORE THE CARRIERS
+            # ARE BUILT. Commit 1 zeroed the ring here and opened the cursor only after
+            # the builder returned, which left one step in between where the two
+            # disagreed: if the builder refused this opening -- a paging disagreement or
+            # a state slot out of range, both reachable -- the ring was empty while the
+            # cursor still named the PREVIOUS sequence's position, so that sequence's
+            # next step passed the check below and was served from an emptied ring in
+            # silence. That is the exact class this cursor exists to refuse, reached
+            # through the cursor's own gap. Clearing the owner alongside the rows leaves
+            # the ring belonging to nobody, so a refused opening makes the next
+            # non-opening step refuse by name instead of reading blanks.
+            # ONLY THIS REQUEST'S ROW IS EMPTIED, AND THE RING IS REBUILT RATHER THAN
+            # WRITTEN IN PLACE. Two landed rules meet here, and the helper below serves
+            # both: the rows are per slot, so a fresh sequence opening must not disturb a
+            # concurrent request's ring, which the process-wide zeroing this replaces did
+            # on every prefill; and the in-place write it replaces was refused on the
+            # device. The same helper empties a freed slot's side caches at hand-out.
+            self._glm5next_side_cache_positions.pop(int(slot), None)
+            # AND THE SPARSE FAMILY'S OWN CURSOR IS CLEARED WITH THEM. That family serves
+            # one sequence per forward and reads this single value, so an opening prefill
+            # must leave it owned by nobody for the same reason the per-slot record is
+            # popped.
+            self._glm5next_side_cache_cursor = None
+            for side in side_caches:
+                if "tail" in side:
+                    side["tail"] = self._glm5next_emptied_at_slot(side["tail"], slot)
+        else:
+            # EVERY OTHER STEP MUST CONTINUE THE SEQUENCE THE RING ALREADY HOLDS. The
+            # ring is keyed by absolute position and carries no sequence identity, so
+            # a step belonging to a DIFFERENT request would be served from the last
+            # one's rows silently -- no shape disagrees, no assertion trips, and the
+            # answer is simply wrong. The cursor supplies the missing identity: it is
+            # the position this ring has been advanced to, and a step that does not
+            # continue it is refused BY NAME rather than served.
+            #
+            # WHY THIS IS A REFUSAL AND NOT A REPAIR. Reaching it needs a fresh request
+            # admitted at a non-zero cached length, which is what an automatic
+            # prefix-cache hit produces. `inc-glm53f-054b`'s acceptance runs one
+            # sequence and cannot reach it, so the honest move is to refuse the step
+            # this half does not implement instead of guessing which rows are whose.
+            # WHAT THE SLOT AXIS ALREADY CLOSED, so this refusal is NARROWER than the
+            # scalar one it replaces: a step of a DIFFERENT request can no longer be
+            # served from this request's rows at all, because the two hold different
+            # slots. What stays reachable is ONE request arriving at a position its
+            # own slot was never advanced to -- which is what an automatic
+            # prefix-cache hit produces -- and that is refused, not guessed.
+            leg = "prefill" if is_prefill else "decode"
+            stood_at = self._glm5next_side_cache_positions.get(int(slot))
+            if stood_at is None:
+                raise ValueError(
+                    f"slot {slot}'s indexer ring holds no sequence cursor, so this "
+                    f"step has no sequence to continue; a step at position 0 opens "
+                    f"one, and this step is a {leg} at position "
+                    f"{int(start_position)}. Serving it would read whatever the "
+                    f"previous owner of this slot left in the ring"
+                )
+            if int(start_position) != int(stood_at):
+                raise ValueError(
+                    f"this step is a {leg} at position {int(start_position)} and slot "
+                    f"{slot}'s indexer ring stands at position {int(stood_at)}; the "
+                    f"rows carry no position of their own, so serving a step that does "
+                    f"not continue this slot's sequence would read another point of it "
+                    f"silently"
+                )
 
     def _build_decode_synthetic_inputs(
         self,
@@ -4916,7 +6777,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             compiled_graph_input=True,
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for decode completed: batch size=%s", batch_size
@@ -4938,7 +6799,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 compiled_graph_input=True,
             )
             try:
-                _ = self.capture_backend_model(**kwargs)
+                _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
             except CaptureComplete:
                 logger.debug(
                     "Graph capture for target model decode completed: batch size=%s",
@@ -5012,7 +6873,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kwargs["input_ids"].shape[0], self.device
                 )
             )
-        model_output = self.model(**kwargs)
+        model_output = self.model(**self._glm5next_model_kwargs(kwargs))
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -5056,7 +6917,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         kwargs["input_ids"].shape[0], self.device
                     )
                 )
-            model_output = self.model(**kwargs)
+            model_output = self.model(**self._glm5next_model_kwargs(kwargs))
             if self.use_async_scheduling:
                 self._materialize_warmup_output(model_output)
             if self._tensor_replacer is not None:
@@ -7122,7 +8983,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         with self._snapshot_capture_context(positions, spec_decode_metadata):
             with model_forward_context(self.vllm_config):
-                model_output = self.model(**model_kwargs)
+                model_output = self.model(**self._glm5next_model_kwargs(model_kwargs))
         if self._tensor_replacer is not None:
             set_active_context(None)
         if self._target_tensor_capture is not None:
@@ -7805,7 +9666,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Execute model forward pass directly (same as warmup_decode) to
         # match the exact traced graph signature including all kwargs.
         with model_forward_context(self.vllm_config):
-            model_output = self.model(**decode_kwargs)
+            model_output = self.model(**self._glm5next_model_kwargs(decode_kwargs))
         if self.use_async_scheduling:
             # The dummy batch produces no token consumed by anyone; its only
             # purpose is to make this idle DP rank participate in the
@@ -8181,14 +10042,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def _update_states_after_model_execute(
         self,
-        scheduler_output: "SchedulerOutput",
         sampled_token_ids: list[list[int]],
+        scheduler_output: "SchedulerOutput",
     ) -> None:
         """Update the cached states after model execution.
 
         On GPU this handles MTP/EAGLE for hybrid models (linear attention
         state shifting). Neuron does not support hybrid models yet, so this
         is a no-op.
+
+        THE PARAMETER ORDER IS THE CALL SITE'S ORDER. This fork's only caller
+        passes ``(sampler_output.sampled_token_ids, scheduler_output)``
+        positionally at ``neuron_model_runner.py:6456-6458`` of this tree, and
+        upstream is self-consistent: it declares ``(output_token_ids,
+        scheduler_output)`` and calls in that same order at
+        ``vllm/v1/worker/gpu_model_runner.py:1497`` and ``:4473``, tag
+        ``v0.24.0``, the version this fork pins. The declaration was the one
+        side that disagreed, so the declaration moved; the name stays this
+        fork's ``sampled_token_ids``. Any body written here before this repair
+        would have read both arguments swapped.
         """
         pass
 
@@ -8453,6 +10325,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return (num_blocks, num_kv_heads, block_size // 2, head_size, 2)
         return (num_blocks, num_kv_heads, block_size, head_size)
 
+    def _latent_spare_bytes(self, kv_cache_config: KVCacheConfig) -> dict[str, int]:
+        """Extra bytes each latent layer's bank needs, keyed by layer name.
+
+        The names come from the KV-cache GROUPS rather than from a model attribute,
+        because the groups are what carry each layer's spec and the spec class is what
+        says a bank is latent. A stack with two families therefore grows its latent group
+        and leaves its recurrent group at the size the engine budgeted.
+
+        The spare is ONE WINDOW: the aligned block-table width, which is the widest window
+        the converter can hand a layer of this group, times that group's page in bytes.
+        """
+        spare: dict[str, int] = {}
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not isinstance(spec, MLAAttentionSpec):
+                continue
+            blocks = self._aligned_table_width(
+                context_length=self.max_model_len, block_size=spec.block_size
+            )
+            for layer_name in group.layer_names:
+                spare[layer_name] = blocks * spec.page_size_bytes
+        return spare
+
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -8499,10 +10394,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             is_pooling_model=self.is_pooling_model,
         )
 
+        # A LATENT BANK IS ALLOCATED WITH A SPARE WINDOW PAST THE SCHEDULER'S BLOCKS.
+        # A layer of this family is handed a WINDOW of its bank whose length is fixed
+        # for the bucket, not the pages this step happens to occupy, so one captured
+        # graph serves every position. A request placed at the last block the scheduler
+        # can give it then needs slots past that block, and a torch slice past the end
+        # of a bank does not raise -- it returns a SHORTER view, which turns the
+        # bucket-constant length back into a per-request one where a captured graph
+        # cannot see it. The remedy is space, and it belongs here: the carrier builder
+        # refuses the short bank by name rather than shortening the view or clamping the
+        # window's base onto a neighbour's rows.
+        #
+        # THE SCHEDULER'S BLOCK COUNT IS UNTOUCHED. ``kv_cache_config.num_blocks`` is
+        # what hands out blocks and it is not read here; only the bytes behind each
+        # latent tensor grow, so the spare blocks exist and are never allocated to a
+        # request. The whole cost is HBM: one window per latent layer.
+        spare_bytes = self._latent_spare_bytes(kv_cache_config)
+
         # Initialize the KV Cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for tensor in kv_cache_config.kv_cache_tensors:
-            raw_tensor = torch.zeros(tensor.size, dtype=torch.int8, device=self.device)
+            spare = max(
+                (spare_bytes.get(layer_name, 0) for layer_name in tensor.shared_by),
+                default=0,
+            )
+            raw_tensor = torch.zeros(
+                tensor.size + spare, dtype=torch.int8, device=self.device
+            )
             # Case where the KV cache is shared across layers
             for layer_name in tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
@@ -8535,6 +10453,40 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     block_size = kv_cache_spec.block_size
                     num_kv_heads = kv_cache_spec.num_kv_heads
                     head_size = kv_cache_spec.head_size
+
+                    # A latent cache holds ONE compressed vector per token and no
+                    # value half, so it gets one buffer and the whole page is it.
+                    # The spec class carries that fact, which is why the page
+                    # above already budgeted one buffer; allocating a pair here
+                    # would hand the layer a second buffer no reader touches and
+                    # leave half of every page dead.
+                    if isinstance(kv_cache_spec, MLAAttentionSpec):
+                        if self._kv_cache_is_fp8_packed(kv_cache_spec.dtype):
+                            raise NotImplementedError(
+                                f"KV layer '{layer_name}' has a latent cache and "
+                                "an FP8-packed key layout; the swizzle is defined "
+                                "for a key/value pair, so this refuses rather "
+                                "than guessing a packed latent layout"
+                            )
+                        latent_shape = (
+                            num_blocks,
+                            num_kv_heads,
+                            block_size,
+                            head_size,
+                        )
+                        kv_caches[layer_name] = [
+                            _shared_dtype_view(
+                                raw_tensor, kv_cache_spec.dtype
+                            ).view(latent_shape)
+                        ]
+                        # Deliberately NOT registered in `_kv_cache_full_tensors`:
+                        # that dict feeds the KV-transfer connector's full
+                        # (2, num_blocks, ...) K/V view, and a latent cache has no
+                        # K/V pair to hand it. The connector's own MLA branch
+                        # wants this layout instead, and the registration helper
+                        # falls back to the per-layer dict when nothing is
+                        # registered.
+                        continue
 
                     # Packed FP8 K cache: store K swizzled as
                     # [num_blocks, num_kv_heads, block_size // 2, head_size, 2]
@@ -8595,6 +10547,70 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            # A linear-attention (KDA) layer holds no key/value pair: it holds a
+            # short-convolution state plus a recurrent state, and its spec
+            # reports BOTH on two positional carriers -- shapes[0]/dtypes[0] the
+            # conv state, shapes[1]/dtypes[1] the recurrent state. That is the
+            # order `get_kv_cache_spec` constructs them in and the order the
+            # vendor's own page formula pairs them in, so the allocation below
+            # walks the carriers rather than naming a state.
+            #
+            # THE PAGE COMES FROM THE SPEC, never from a number derived here:
+            # `page_size_bytes` is the sum over the declared carriers, so
+            # `num_blocks` and every stride below are functions of what the spec
+            # reports. `inc-glm53f-086` now passes `page_size_padded`, so this
+            # reads the padded DSA page, not that sum; strides scale with it.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    page_size_bytes = kv_cache_spec.page_size_bytes
+                    assert raw_tensor.numel() % page_size_bytes == 0
+
+                    num_blocks = raw_tensor.numel() // page_size_bytes
+
+                    # Both states live side by side INSIDE each page, so each
+                    # state is a block-strided view of the same raw buffer: the
+                    # block stride is the whole page and the within-block
+                    # strides are contiguous for that state's own shape.
+                    # `strict=True` is deliberate -- the vendor pairs the two
+                    # carriers with a non-strict zip, so a short `dtypes` tuple
+                    # would shorten the page and silently under-allocate here.
+                    state_tensors = []
+                    state_offset_bytes = 0
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
+                    ):
+                        dtype_size = dtype.itemsize
+                        # The page must be a whole number of this state's
+                        # elements, or the block stride below would truncate.
+                        assert page_size_bytes % dtype_size == 0
+                        target_shape = (num_blocks, *shape)
+                        # Contiguous strides for the target shape, read off a
+                        # meta tensor: correct by construction and allocating
+                        # no storage for a reading used only as arithmetic.
+                        contiguous = torch.empty(target_shape, device="meta").stride()
+                        assert state_offset_bytes % dtype_size == 0
+                        state_tensors.append(
+                            torch.as_strided(
+                                _shared_dtype_view(raw_tensor, dtype),
+                                size=target_shape,
+                                stride=(
+                                    page_size_bytes // dtype_size,
+                                    *contiguous[1:],
+                                ),
+                                storage_offset=state_offset_bytes // dtype_size,
+                            )
+                        )
+                        # Advance by this state's own per-block footprint, so the
+                        # next carrier starts where this one ends inside a page.
+                        state_offset_bytes += contiguous[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+                    # Deliberately NOT registered in `_kv_cache_full_tensors`:
+                    # that dict feeds the KV-transfer connector's full
+                    # (2, num_blocks, ...) K/V view, and a recurrent state has
+                    # no K/V pair to hand it.
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
@@ -8648,10 +10664,82 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
+            # A linear-attention (KDA) layer holds no key/value history: it holds
+            # a short-convolution state plus a recurrent state, reported on
+            # LayerSpec's four recurrent-state fields. The layer is recognised
+            # BY THE FIELDS IT CARRIES, never by its name.
+            recurrent_state = (
+                layer.kda_conv_state_shape,
+                layer.kda_recurrent_state_shape,
+                layer.kda_conv_state_dtype,
+                layer.kda_recurrent_state_dtype,
+            )
+            if any(value is not None for value in recurrent_state):
+                if None in recurrent_state:
+                    raise ValueError(
+                        f"KV layer '{layer_name}' declares recurrent-state "
+                        "geometry but leaves part of it unset; the conv and "
+                        "recurrent carriers are paired positionally, so a "
+                        "missing member would shorten the reported page."
+                    )
+                # ONE order shared by both carriers: position 0 conv, position 1
+                # recurrent, the order the vendor's page formula pairs them in.
+                # Dtypes come from the MODEL, per state -- the global KV cache
+                # dtype describes a key/value cache and would mistype an fp32
+                # recurrent state. page_size_padded IS now passed, below the
+                # loop (`inc-glm53f-086`): it reverses this comment's premise so
+                # the KDA page matches the DSA page this same call builds.
+                spec = MambaSpec(
+                    block_size=block_size,
+                    shapes=(
+                        tuple(layer.kda_conv_state_shape),
+                        tuple(layer.kda_recurrent_state_shape),
+                    ),
+                    dtypes=(
+                        layer.kda_conv_state_dtype,
+                        layer.kda_recurrent_state_dtype,
+                    ),
+                )
+            # A latent-attention layer caches ONE compressed vector per token and
+            # has no value half, so its page must carry one buffer and not two.
+            # `MLAAttentionSpec` is the vendor's own name for that page: its
+            # `real_page_size_bytes` has no second term, where the plain
+            # attention page hardcodes a factor 2 for the key/value pair
+            # (`vllm/v1/kv_cache_interface.py`). Reporting the plain class here
+            # bought every latent layer a second buffer nothing reads and halved
+            # the blocks a byte budget holds -- and it could not be corrected
+            # downstream, because `page_size_padded` only ever pads a page UP.
+            #
+            # The LAYER declares this, never a name test here: the field comes
+            # from the model's own spec, on the same ground as the recurrent
+            # geometry above. Subclassing is what keeps the change local --
+            # `MLAAttentionSpec` IS a `FullAttentionSpec`, so the allocation
+            # branch below and the page unification further down still admit it
+            # unchanged, and the vendor's own exact-type gates already name it
+            # beside its parent.
+            elif layer.latent_kv:
+                # A windowed latent cache is REFUSED rather than silently
+                # stripped of its window: this branch is taken before the sliding
+                # one, so a layer declaring both would otherwise lose it here.
+                if layer.sliding_window_size is not None:
+                    raise NotImplementedError(
+                        f"KV layer '{layer_name}' declares a latent cache and a "
+                        f"sliding window of {layer.sliding_window_size}; no "
+                        "windowed latent page is implemented, so this refuses "
+                        "rather than dropping the window"
+                    )
+                spec = MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=layer.num_kv_heads,
+                    head_size=layer.head_size,
+                    dtype=kv_cache_dtype,
+                    sliding_window=None,
+                    attention_chunk_size=layer.chunk_size,
+                )
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
             # this enables block clipping in the NiXL connector.
-            if layer.sliding_window_size is None:
+            elif layer.sliding_window_size is None:
                 spec = FullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
@@ -8669,6 +10757,70 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        # THE PADDED PAGE IS SET HERE, AFTER THE LOOP, NOT IN THE ARM ABOVE.
+        # `inc-glm53f-086`. The KDA arm builds its `MambaSpec` inside the loop,
+        # before any attention layer has necessarily been seen, so the attention
+        # page is not yet known there. Both pages are known only once every layer
+        # has a spec, which is here.
+        #
+        # WHY THE SPEC AND NOT A PATCH: upstream's own unification refuses a
+        # `MambaSpec` whose page neither divides the largest page nor belongs to
+        # an attention spec it can pad. Setting the field at construction makes
+        # that unification succeed on its own terms, so nothing downstream has to
+        # widen anything. `inc-glm53f-018`'s patch stays in place and goes inert
+        # on this path, because it only ever fills the field when it is None.
+        #
+        # Scoped to the layers this loop built. The drafter's spec set below is
+        # deliberately NOT padded here; the patch still covers it.
+        # The spec classes are RE-IMPORTED here instead of read off this module's
+        # globals. A landed control replaces this module's `MambaSpec` name with a
+        # factory FUNCTION to revert a dtype assignment
+        # (`test_get_kv_cache_spec_hybrid.py`, C02), and `isinstance` against a
+        # function raises TypeError. Reading the classes from their own module
+        # keeps that control measuring the dtype it is about, not this padding.
+        from dataclasses import replace
+
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec as _FullAttnSpec,
+        )
+        from vllm.v1.kv_cache_interface import MambaSpec as _MambaSpec
+        from vllm.v1.kv_cache_interface import (
+            SlidingWindowSpec as _SlidingWindowSpec,
+        )
+
+        kda_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, _MambaSpec)
+        }
+        attention_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, (_FullAttnSpec, _SlidingWindowSpec))
+        }
+        if kda_specs and attention_specs:
+            kda_page = max(spec.page_size_bytes for spec in kda_specs.values())
+            attention_page = max(
+                spec.page_size_bytes for spec in attention_specs.values()
+            )
+            if attention_page < kda_page:
+                # REFUSED BY NAME rather than padded downward. The vendor's own
+                # hook only ever raises the attention page to meet the state
+                # page, never the reverse, because a page smaller than the state
+                # it must hold cannot describe that state.
+                raise ValueError(
+                    "Cannot unify KV cache pages: the attention page is "
+                    f"{attention_page} B and the recurrent-state page is "
+                    f"{kda_page} B. Padding a recurrent state down to a "
+                    "smaller page would report a page its own geometry does "
+                    "not fit, so this refuses instead of narrowing it."
+                )
+            if attention_page > kda_page:
+                for name, spec in kda_specs.items():
+                    all_kv_cache_specs[name] = replace(
+                        spec, page_size_padded=attention_page
+                    )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

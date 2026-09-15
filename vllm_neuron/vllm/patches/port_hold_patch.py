@@ -143,6 +143,7 @@ def _rank0_create_store(host: str, port: int, world_size: int, timeout: timedelt
         is_master=True,
         master_listen_fd=fd,
         use_libuv=False,
+        timeout=timeout,
     )
 
     logger.info(
