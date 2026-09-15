@@ -135,13 +135,14 @@ def _program_block_range(kernel: str, count: int, n_prgs: int, prg_id: int) -> t
     ``n_prgs`` is the launch degree the kernel was traced with. The vendor's
     ``get_verified_program_sharding_info`` reports it and verifies nothing, so this is the
     check: any other degree is refused before a loop is built, because a one-program
-    launch would run the whole range on one core and still compile.
+    launch would run the whole range on one core and still compile. It is an ``assert``,
+    the fatal-error form the NKI front end accepts inside a kernel; the front end refuses
+    ``raise`` (its diagnostic names both forms).
     """
-    if n_prgs != NUM_SHARDS:
-        raise ValueError(
-            f"{kernel}: traced with {n_prgs} programs, the kernel wants {NUM_SHARDS} "
-            f"(launch it as wrap_nki(kernel)[NUM_SHARDS])"
-        )
+    assert n_prgs == NUM_SHARDS, (
+        f"{kernel}: traced with {n_prgs} programs, the kernel wants {NUM_SHARDS} "
+        f"(launch it as wrap_nki(kernel)[NUM_SHARDS])"
+    )
     trips = -(-count // n_prgs)
     start = min(prg_id * trips, count - trips)
     return start, start + trips
@@ -1090,11 +1091,12 @@ def moe_gate_up_blockwise_fp8_kernel(
     the partial sum it belongs to. Every loop bound is a trace-time int, which is
     why these are ``range`` loops and not ``nl.affine_range``.
     """
+    n_blocks = expert_index.shape[0]
     _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
         "moe_gate_up_blockwise_fp8", (0, 1), NUM_SHARDS
     )
     first_block, end_block = _program_block_range(
-        "moe_gate_up_blockwise_fp8", expert_index.shape[0], n_prgs, prg_id
+        "moe_gate_up_blockwise_fp8", n_blocks, n_prgs, prg_id
     )
     positions = row_index.shape[0]
     h_extent = hidden.shape[1]
@@ -1120,7 +1122,6 @@ def moe_gate_up_blockwise_fp8_kernel(
     # THE BLOCK IS THE DYNAMIC AXIS, so every tensor a body addresses by block leads with
     # it and the tiles inside a body keep trace-time offsets. One body then serves every
     # block, and the tile count of a body is the block's own quotient.
-    n_blocks = expert_index.shape[0]
     row_index_b = row_index.reshape((n_blocks, block, 1))
     staged_b = staged.reshape((n_blocks, block, h_extent))
     out_b = out.reshape((n_blocks, block, fused_cols))
@@ -1646,13 +1647,14 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
     than in a torch pass over the whole pre-activation tensor: the vendor kernel took
     four clamp arguments to do this same work in this same place.
     """
+    tokens, fused_cols = gate_up.shape
+    n_tiles = tokens // TILE_SIZE
     _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
         "moe_swiglu_transposed", (0, 1), NUM_SHARDS
     )
     first_tile, end_tile = _program_block_range(
-        "moe_swiglu_transposed", gate_up.shape[0] // TILE_SIZE, n_prgs, prg_id
+        "moe_swiglu_transposed", n_tiles, n_prgs, prg_id
     )
-    tokens, fused_cols = gate_up.shape
     i_extent = fused_cols // GATE_UP_FUSION
     # A ONE-COLUMN OPERAND IS AN UNBOUNDED CONFIGURATION, and then no bound
     # instruction is emitted at all -- the trace-time elision the landed form had
@@ -1663,7 +1665,6 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
         bounds_sb = nl.load(bounds[0:TILE_SIZE, 0:_SWIGLU_BOUND_COLUMNS])
     # THE TOKEN TILE IS THE DYNAMIC AXIS. The pre-activation input leads with it; the
     # result carries it on the FREE axis, because this kernel returns ``[I, B]``.
-    n_tiles = tokens // TILE_SIZE
     gate_up_b = gate_up.reshape((n_tiles, TILE_SIZE, fused_cols))
     out_b = out.reshape((i_extent, n_tiles, TILE_SIZE))
     column = [[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]]
@@ -1856,11 +1857,12 @@ def moe_down_blockwise_fp8_kernel(
     it belongs to. The seam refuses the geometry if that quotient ever stops being
     one.
     """
+    n_blocks = expert_index.shape[0]
     _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
         "moe_down_blockwise_fp8", (0, 1), NUM_SHARDS
     )
     first_block, end_block = _program_block_range(
-        "moe_down_blockwise_fp8", expert_index.shape[0], n_prgs, prg_id
+        "moe_down_blockwise_fp8", n_blocks, n_prgs, prg_id
     )
     # ONLY TENSORS CROSS THE WRAPPER; the gate/up kernel above records why, and each
     # shape read here is a relationship the seam has already refused to break.
@@ -1883,7 +1885,6 @@ def moe_down_blockwise_fp8_kernel(
     # THE BLOCK IS THE DYNAMIC AXIS here too. The output and the routing column lead with
     # it; the intermediate carries it on the FREE axis, because the activation before this
     # kernel returns ``[I, B]``.
-    n_blocks = expert_index.shape[0]
     row_index_b = row_index.reshape((n_blocks, block, 1))
     intermediate_b = intermediate_t.reshape((i_extent, n_blocks, block))
     out_b = out.reshape((n_blocks, block, h_extent))

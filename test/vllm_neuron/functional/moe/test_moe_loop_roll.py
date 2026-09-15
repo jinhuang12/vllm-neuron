@@ -1150,7 +1150,7 @@ def test_each_program_range_covers_the_blocks_in_equal_trips(count):
 @pytest.mark.parametrize("count", (1, 3))
 def test_a_one_program_launch_is_refused_before_any_loop_runs(count):
     """A launch of one program cannot pass as a split: the range refuses it by name and degree."""
-    with pytest.raises(ValueError, match="control-item: traced with 1 programs, the kernel wants 2"):
+    with pytest.raises(AssertionError, match="control-item: traced with 1 programs, the kernel wants 2"):
         live._program_block_range("control-item", count, 1, 0)
 
 
@@ -1164,10 +1164,10 @@ def test_a_shipped_kernel_launched_with_one_program_is_refused_by_the_simulator(
         chain.append(error)
         error = error.__cause__ or error.__context__
     message = " ".join(str(error) for error in chain)
-    value_error = any(isinstance(error, ValueError) for error in chain)
+    assertion_error = any(isinstance(error, AssertionError) for error in chain)
     _emit("WRONG_DEGREE_LAUNCH", kernel="moe_swiglu_transposed", programs=1,
-          value_error=value_error, message=message[:160])
-    assert value_error
+          assertion_error=assertion_error, message=message[:160])
+    assert assertion_error
     assert "moe_swiglu_transposed: traced with 1 programs, the kernel wants 2" in message
 
 
