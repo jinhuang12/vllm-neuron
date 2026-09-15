@@ -1648,6 +1648,10 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
     # THE TOKEN TILE IS THE DYNAMIC AXIS. The pre-activation input leads with it; the
     # result carries it on the FREE axis, because this kernel returns ``[I, B]``.
     n_tiles = tokens // TILE_SIZE
+    _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+        "moe_swiglu_transposed", (0, 1), NUM_SHARDS
+    )
+    first_tile, end_tile = _program_block_range(n_tiles, n_prgs, prg_id)
     gate_up_b = gate_up.reshape((n_tiles, TILE_SIZE, fused_cols))
     out_b = out.reshape((i_extent, n_tiles, TILE_SIZE))
     column = [[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]]
@@ -1750,7 +1754,7 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
                 out_sb,
             )
 
-    nl.fori_loop(0, n_tiles, activate_tile)
+    nl.fori_loop(first_tile, end_tile, activate_tile)
     return out
 
 
@@ -1794,7 +1798,7 @@ def moe_swiglu_transposed(
     _refuse_gate_up(problems)
 
     _SWIGLU_COUNTERS.nki_dispatch += 1
-    return wrap_nki(moe_swiglu_transposed_kernel)(
+    return wrap_nki(moe_swiglu_transposed_kernel)[NUM_SHARDS](
         gate_up.to(torch.float32),
         _swiglu_bound_operand(gate_upper, up_upper, gate_up.device),
     )
