@@ -693,19 +693,6 @@ def _row_iota(iota_hbm, rows: int):
     return tile
 
 
-def _block_offset(at_block=None, dim: int = 0):
-    """The access-pattern keywords that step one device block index along ``dim``.
-
-    A trace-time caller passes nothing and gets today's pattern unchanged. A caller
-    inside a dynamic loop passes that loop's own index, and the pattern then steps one
-    ``dim`` stride of the tensor as it was reshaped for the loop -- the spelling
-    ``nkilib``'s ``pack_tokens`` uses for its permuted-output store.
-    """
-    if at_block is None:
-        return {}
-    return {"scalar_offset": at_block, "indirect_dim": dim}
-
-
 def _loaded(source, rows: int, width: int, dtype):
     """``rows`` by ``width`` of an HBM access pattern in SBUF, converted on the way in.
 
@@ -726,7 +713,7 @@ def _stored(destination, tile):
     nisa.dma_copy(destination, tile, dge_mode=nisa.dge_mode.hwdge)
 
 
-def _dense_column(hbm, rows: int, offset: int, at_block=None):
+def _dense_column(hbm, rows: int, offset: int, at_block):
     """``rows`` consecutive int32 of an ``[n, 1]`` HBM tensor, one per partition.
 
     The dense counterpart of :func:`_gathered`: the slice is contiguous and its start
@@ -738,13 +725,16 @@ def _dense_column(hbm, rows: int, offset: int, at_block=None):
     nisa.dma_copy(
         dst=tile,
         src=hbm.ap(
-            pattern=[[1, rows], [1, 1]], offset=offset, **_block_offset(at_block)
+            pattern=[[1, rows], [1, 1]],
+            offset=offset,
+            scalar_offset=at_block,
+            indirect_dim=0,
         ),
     )
     return tile
 
 
-def _broadcast_row(hbm, row: int, rows: int, at_block=None):
+def _broadcast_row(hbm, row: int, rows: int, at_block):
     """One int32 of an ``[n, 1]`` HBM tensor, replicated into EVERY partition.
 
     A ZERO partition stride does the replication: the pattern advances 0 elements
@@ -758,7 +748,10 @@ def _broadcast_row(hbm, row: int, rows: int, at_block=None):
     nisa.dma_copy(
         dst=tile,
         src=hbm.ap(
-            pattern=[[0, rows], [1, 1]], offset=row, **_block_offset(at_block)
+            pattern=[[0, rows], [1, 1]],
+            offset=row,
+            scalar_offset=at_block,
+            indirect_dim=0,
         ),
     )
     return tile
@@ -847,7 +840,7 @@ def _gathered(hbm, index, rows: int, width: int, dtype):
 
 
 def _transpose_rows(
-    dst, src_hbm, row_stride: int, rows: int, width: int, offset: int, at_block=None
+    dst, src_hbm, row_stride: int, rows: int, width: int, offset: int, at_block
 ):
     """Transpose ``rows`` source rows of ``width`` elements onto partitions, 16 rows per DMA."""
     for r0 in range(0, rows, DGE_TRANSPOSE_ROWS):
@@ -857,7 +850,8 @@ def _transpose_rows(
             src=src_hbm.ap(
                 pattern=[[row_stride, n], [1, width]],
                 offset=offset + r0 * row_stride,
-                **_block_offset(at_block),
+                scalar_offset=at_block,
+                indirect_dim=0,
             ),
         )
 
@@ -1109,7 +1103,8 @@ def moe_gate_up_blockwise_fp8_kernel(
                 staged_b.ap(
                     pattern=[[h_extent, TILE_SIZE], [1, h_extent]],
                     offset=t0 * h_extent,
-                    **_block_offset(at_block),
+                    scalar_offset=at_block,
+                    indirect_dim=0,
                 ),
                 _gathered(hidden, wanted, TILE_SIZE, h_extent, hidden.dtype),
             )
@@ -1242,7 +1237,8 @@ def moe_gate_up_blockwise_fp8_kernel(
                     out_b.ap(
                         pattern=[[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
                         offset=t0 * fused_cols + gate_col,
-                        **_block_offset(at_block),
+                        scalar_offset=at_block,
+                        indirect_dim=0,
                     ),
                     gate_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 )
@@ -1250,7 +1246,8 @@ def moe_gate_up_blockwise_fp8_kernel(
                     out_b.ap(
                         pattern=[[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
                         offset=t0 * fused_cols + up_col,
-                        **_block_offset(at_block),
+                        scalar_offset=at_block,
+                        indirect_dim=0,
                     ),
                     up_acc[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 )
@@ -1636,7 +1633,10 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
             i0 = i_block * GATE_UP_SCALE_BLOCK
             gate = _loaded(
                 gate_up_b.ap(
-                    pattern=column, offset=i0, **_block_offset(at_tile)
+                    pattern=column,
+                    offset=i0,
+                    scalar_offset=at_tile,
+                    indirect_dim=0,
                 ),
                 TILE_SIZE,
                 GATE_UP_SCALE_BLOCK,
@@ -1644,7 +1644,10 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
             )
             up = _loaded(
                 gate_up_b.ap(
-                    pattern=column, offset=i_extent + i0, **_block_offset(at_tile)
+                    pattern=column,
+                    offset=i_extent + i0,
+                    scalar_offset=at_tile,
+                    indirect_dim=0,
                 ),
                 TILE_SIZE,
                 GATE_UP_SCALE_BLOCK,
@@ -1717,7 +1720,8 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
                 out_b.ap(
                     pattern=[[tokens, GATE_UP_SCALE_BLOCK], [1, TILE_SIZE]],
                     offset=i0 * tokens,
-                    **_block_offset(at_tile, 1),
+                    scalar_offset=at_tile,
+                    indirect_dim=1,
                 ),
                 out_sb,
             )
@@ -1884,7 +1888,8 @@ def moe_down_blockwise_fp8_kernel(
                         intermediate_b.ap(
                             pattern=[[positions, TILE_SIZE], [1, TILE_SIZE]],
                             offset=i0 * positions + t0,
-                            **_block_offset(at_block, 1),
+                            scalar_offset=at_block,
+                            indirect_dim=1,
                         ),
                         TILE_SIZE,
                         TILE_SIZE,
@@ -1940,7 +1945,8 @@ def moe_down_blockwise_fp8_kernel(
                     out_b.ap(
                         pattern=[[h_extent, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]],
                         offset=t0 * h_extent + h0,
-                        **_block_offset(at_block),
+                        scalar_offset=at_block,
+                        indirect_dim=0,
                     ),
                     scaled[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
                 )
