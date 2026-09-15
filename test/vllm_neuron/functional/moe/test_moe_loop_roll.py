@@ -1136,7 +1136,7 @@ def test_the_kernel_defaults_this_change_depends_on_are_the_ones_it_was_read_at(
 @pytest.mark.parametrize("count", (1, 2, 3, 81, 162))
 def test_each_program_range_covers_the_blocks_in_equal_trips(count):
     """Two programs run equal trips that together cover every block and share at most one."""
-    ranges = [live._program_block_range(count, 2, prg_id) for prg_id in (0, 1)]
+    ranges = [live._program_block_range("range-item", count, 2, prg_id) for prg_id in (0, 1)]
     covered = [at for first, end in ranges for at in range(first, end)]
     lengths = [end - first for first, end in ranges]
     _emit("PROGRAM_RANGE", blocks=count, ranges=ranges, lengths=lengths)
@@ -1145,7 +1145,13 @@ def test_each_program_range_covers_the_blocks_in_equal_trips(count):
     assert len(covered) - count == count % 2
     if count < 2:
         assert ranges == [(0, count), (0, count)]
-    assert live._program_block_range(count, 1, 0) == (0, count)
+
+
+@pytest.mark.parametrize("count", (1, 3))
+def test_a_one_program_launch_is_refused_before_any_loop_runs(count):
+    """A launch of one program cannot pass as a split: the range refuses it by name and degree."""
+    with pytest.raises(ValueError, match="control-item: traced with 1 programs, the kernel wants 2"):
+        live._program_block_range("control-item", count, 1, 0)
 
 
 @nki.jit
@@ -1156,7 +1162,7 @@ def _mark_blocks_by_program(blocks):
     _ndim, n_prgs, prg_id = get_verified_program_sharding_info(
         "test_mark_blocks_by_program", (0, 1), 2
     )
-    first, end = live._program_block_range(count, n_prgs, prg_id)
+    first, end = live._program_block_range("test_mark_blocks_by_program", count, n_prgs, prg_id)
     marks = nl.ndarray((count, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=marks, value=0.0)
     for at_block in range(first, end):

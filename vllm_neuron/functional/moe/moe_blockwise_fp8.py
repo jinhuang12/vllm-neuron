@@ -123,17 +123,25 @@ logger = logging.getLogger(__name__)
 NUM_SHARDS = 2
 
 
-def _program_block_range(count: int, n_prgs: int, prg_id: int) -> tuple[int, int]:
+def _program_block_range(kernel: str, count: int, n_prgs: int, prg_id: int) -> tuple[int, int]:
     """This program's half-open range of loop indices out of ``count``.
 
-    Every program runs the same number of trips, ``ceil(count / n_prgs)``, so the cores
+    Every program runs the same number of trips, ``ceil(count / NUM_SHARDS)``, so the cores
     carry one loop structure. Program ``p`` starts at ``p * trips`` and the last program
     is pulled back to end at ``count``, so when the trips do not divide ``count`` two
     programs share one index and write the same values to its rows, the rule the vendor's
     ``pack_tokens`` applies to a single tile.
+
+    ``n_prgs`` is the launch degree the kernel was traced with. The vendor's
+    ``get_verified_program_sharding_info`` reports it and verifies nothing, so this is the
+    check: any other degree is refused before a loop is built, because a one-program
+    launch would run the whole range on one core and still compile.
     """
-    if n_prgs <= 1:
-        return 0, count
+    if n_prgs != NUM_SHARDS:
+        raise ValueError(
+            f"{kernel}: traced with {n_prgs} programs, the kernel wants {NUM_SHARDS} "
+            f"(launch it as wrap_nki(kernel)[NUM_SHARDS])"
+        )
     trips = -(-count // n_prgs)
     start = min(prg_id * trips, count - trips)
     return start, start + trips
@@ -1110,7 +1118,9 @@ def moe_gate_up_blockwise_fp8_kernel(
     _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
         "moe_gate_up_blockwise_fp8", (0, 1), NUM_SHARDS
     )
-    first_block, end_block = _program_block_range(n_blocks, n_prgs, prg_id)
+    first_block, end_block = _program_block_range(
+        "moe_gate_up_blockwise_fp8", n_blocks, n_prgs, prg_id
+    )
     row_index_b = row_index.reshape((n_blocks, block, 1))
     staged_b = staged.reshape((n_blocks, block, h_extent))
     out_b = out.reshape((n_blocks, block, fused_cols))
@@ -1651,7 +1661,7 @@ def moe_swiglu_transposed_kernel(gate_up, bounds):
     _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
         "moe_swiglu_transposed", (0, 1), NUM_SHARDS
     )
-    first_tile, end_tile = _program_block_range(n_tiles, n_prgs, prg_id)
+    first_tile, end_tile = _program_block_range("moe_swiglu_transposed", n_tiles, n_prgs, prg_id)
     gate_up_b = gate_up.reshape((n_tiles, TILE_SIZE, fused_cols))
     out_b = out.reshape((i_extent, n_tiles, TILE_SIZE))
     column = [[fused_cols, TILE_SIZE], [1, GATE_UP_SCALE_BLOCK]]
@@ -1869,7 +1879,9 @@ def moe_down_blockwise_fp8_kernel(
     _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
         "moe_down_blockwise_fp8", (0, 1), NUM_SHARDS
     )
-    first_block, end_block = _program_block_range(n_blocks, n_prgs, prg_id)
+    first_block, end_block = _program_block_range(
+        "moe_down_blockwise_fp8", n_blocks, n_prgs, prg_id
+    )
     row_index_b = row_index.reshape((n_blocks, block, 1))
     intermediate_b = intermediate_t.reshape((i_extent, n_blocks, block))
     out_b = out.reshape((n_blocks, block, h_extent))
