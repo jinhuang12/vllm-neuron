@@ -84,6 +84,10 @@ class NeuronScheduler(Scheduler):
     - Token padding for compiled model bucket sizes
     """
 
+    def _log_initialized(self) -> None:
+        """Log the scheduler class that finished initializing, by its own name."""
+        logger.info("Initialized %s for Neuron platform", type(self).__name__)
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -264,7 +268,7 @@ class NeuronScheduler(Scheduler):
                 max_concurrent,
             )
 
-        logger.info("Initialized NeuronAsyncScheduler for Neuron platform")
+        self._log_initialized()
         logger.info("Max prefills per batch: %d", self.max_prefills_per_batch)
 
         # Maps mm_hash -> encoder-cache locator dict, carrying the locator from
