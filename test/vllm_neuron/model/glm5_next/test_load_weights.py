@@ -602,13 +602,15 @@ def single_rank_process_group(tmp_path):
         torch.distributed.destroy_process_group()
 
 
-@pytest.fixture(autouse=True)
-def _keep_the_loaded_tensors(monkeypatch):
+@pytest.fixture
+def keep_the_loaded_tensors(monkeypatch):
     """Hold the post-prep release off, so the tensors the loaders delivered stay readable.
 
-    Every item in this file measures what the loaders and the preps DELIVER, and reads
-    the delivered tensors after ``load_weights`` returns. The release that follows the
-    preps in production is measured by ``test_prepared_weight_release.py``.
+    Requested by name by the items that read a delivered weight or scale grid of the
+    routed bank, the MLA projections or the indexer after ``load_weights`` returns --
+    the tensors production releases once their prepared operands exist. Every other
+    item runs with the release on, as production does. The release itself is measured
+    by ``test_prepared_weight_release.py``.
     """
     from vllm_neuron.model.glm5_next import model_fp8
 
@@ -623,7 +625,7 @@ def _keep_the_loaded_tensors(monkeypatch):
 
 
 def test_every_declared_parameter_is_materialised_and_loaded(
-    tmp_path, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, single_rank_process_group
 ) -> None:
     """(1) The load DELIVERS every element it claimed, or it REFUSES by name.
 
@@ -1380,7 +1382,9 @@ def _source_with_the_scale_prep_moved_out(source: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def test_the_scale_grids_stay_fp32(tmp_path, single_rank_process_group) -> None:
+def test_the_scale_grids_stay_fp32(
+    keep_the_loaded_tensors, tmp_path, single_rank_process_group
+) -> None:
     """(4) Five readings in one item, per the block's rev 137 bullet.
 
     CERTIFYING COMPONENT (D1.4): ``load_weights``'s out-of-band scale read --
@@ -1644,7 +1648,7 @@ class _WholeTensorSlice:
 
 
 def test_the_load_time_preps_run_after_the_device_by_name(
-    tmp_path, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, single_rank_process_group
 ) -> None:
     """(8) An ordering read by position, plus both refusal cases by name.
 
@@ -1839,7 +1843,7 @@ def test_the_load_time_preps_run_after_the_device_by_name(
 
 
 def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
-    tmp_path, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, single_rank_process_group
 ) -> None:
     """The placeholder rule types a lone fp8 weight key fp8, not the config dtype.
 
@@ -2232,7 +2236,7 @@ def _stacked_bank_geometry(experts: int, per_rank: int):
 
 
 def test_the_stacked_bank_delivers_every_expert_or_refuses_by_name(
-    tmp_path, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, single_rank_process_group
 ) -> None:
     """(1) EVERY EXPERT ARRIVES, or the bank refuses and leaves nothing.
 
@@ -2704,7 +2708,7 @@ def _bank_owner_paths(banks: dict[str, list[str]]) -> list[str]:
 
 
 def test_bankscale_grids_arrive_on_the_bank_as_plain_attributes(
-    tmp_path, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, single_rank_process_group
 ) -> None:
     """(1) THE BANK'S SCALE GRIDS ARRIVE, as plain attributes, row per expert.
 
@@ -2989,7 +2993,7 @@ def test_bankscale_leaf_derivation_reads_presence_not_declaration(
 
 
 def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
-    tmp_path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """(3) THE LOOP'S BEHAVIOUR IS UNCHANGED for every landed module.
 
@@ -3763,7 +3767,7 @@ def _in_the_loader_frame(
 
 
 def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
-    tmp_path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """Conjunct (1), counted N/N, with the world-size-1 load as the moving control.
 
@@ -3865,7 +3869,7 @@ def test_shard_every_sharded_family_lands_at_its_declared_per_rank_shape(
 
 
 def test_shard_the_two_ranks_reassemble_every_family_bit_identically(
-    tmp_path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """Conjunct (2). Rank 0 then rank 1 along the shard dim, max abs diff == 0.0.
 
@@ -4213,7 +4217,7 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
 
 
 def test_shard_the_unsharded_families_are_untouched_both_directions(
-    tmp_path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """Conjunct (4), both directions: the set that MOVED between world sizes is
     exactly the set this file declares sharded, and the set that stayed identical
@@ -5059,7 +5063,7 @@ def _deferred_leaves(
 
 
 def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
-    tmp_path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """Conjunct (1), counted N/N, with the world-size-1 load as the moving control.
 
@@ -5318,7 +5322,7 @@ def test_deferredwidth_the_mla_three_take_their_other_extent_from_the_table() ->
 
 
 def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically(
-    tmp_path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """Conjunct (2), bit for bit, plus the two refusals the design names.
 
@@ -5953,7 +5957,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
 
 
 def test_sharedshard_the_six_families_left_the_replicated_set_both_directions(
-    tmp_path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
     """Conjunct (4) re-read at this candidate, both directions and both non-empty.
 
@@ -6510,7 +6514,7 @@ def _mla_grids(
 
 
 def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
-    tmp_path: Path, monkeypatch, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path: Path, monkeypatch, single_rank_process_group
 ) -> None:
     """inc-glm53f-105. A sharded FP8 weight's grid describes THIS RANK's blocks.
 

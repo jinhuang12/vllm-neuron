@@ -2307,6 +2307,18 @@ class Glm5NextRoutedExperts(nn.Module):
     #: spell it twice.
     PREPARED_KERNEL_OPERANDS_ATTR = "_prepared_kernel_operands"
 
+    #: The checkpoint tensors the forward stops reading once
+    #: :meth:`prepare_scale_operands` has copied them into the kernel operands:
+    #: the three weights and their three scale grids. The load releases these.
+    RELEASED_AFTER_PREP: tuple[str, ...] = (
+        "gate_proj_weight",
+        "up_proj_weight",
+        "down_proj_weight",
+        f"gate_proj_{FP8_SCALE_SUFFIX}",
+        f"up_proj_{FP8_SCALE_SUFFIX}",
+        f"down_proj_{FP8_SCALE_SUFFIX}",
+    )
+
     #: Where the producer's three health counts are left, for the acceptance to
     #: read. Recorded rather than refused on -- see the method's Raises note.
     RETILE_HEALTH_ATTR = "_retile_health"
@@ -2841,6 +2853,11 @@ class Glm5NextSharedExperts(nn.Module):
     #: projections section: the name is part of the contract between the builder
     #: and the reader, and neither should spell it twice.
     PREPARED_SCALE_OPERANDS_ATTR = "_prepared_scale_operands"
+
+    #: Nothing. :meth:`prepare_scale_operands` builds scale operands only, and
+    #: :meth:`scale_route_operands` reads the raw weights and grids on every
+    #: forward, so the load releases no tensor of this class.
+    RELEASED_AFTER_PREP: tuple[str, ...] = ()
 
     #: Where :meth:`retile_checkpoint_scale_grids` records what it published per
     #: projection, and which projections it left alone. It recorded what the
@@ -4898,6 +4915,11 @@ class Glm5NextDSAIndexer(nn.Module):
         "index_kpool_compress_gate": "index_kpool_compress_gate",
     }
 
+    #: The checkpoint tensors the forward stops reading once
+    #: :meth:`prepare_projection_weights` has transposed them: the four
+    #: projection weights, which carry no scale grid. The load releases these.
+    RELEASED_AFTER_PREP: tuple[str, ...] = tuple(PROJECTION_PARAMETERS.values())
+
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
         # The four dials this class computes with, each read from the config
@@ -6659,6 +6681,19 @@ class Glm5NextMLAAttention(nn.Module):
     #: attribute and NOT a buffer on purpose: a buffer enters ``state_dict()``,
     #: which would double every projection weight in a saved checkpoint.
     PREPARED_WEIGHTS_ATTR = "_prepared_projection_weights"
+
+    #: The checkpoint tensors the forward stops reading once
+    #: :meth:`prepare_projection_weights` has transposed them: the five
+    #: projection weights and the four scale grids of the quantised ones
+    #: (``kv_b_proj`` is bf16 and has none). The load releases these.
+    RELEASED_AFTER_PREP: tuple[str, ...] = (
+        "q_a_proj_weight",
+        "q_b_proj_weight",
+        "kv_a_proj_with_mqa_weight",
+        "kv_b_proj_weight",
+        "o_proj_weight",
+        *(f"{leaf}_{FP8_SCALE_SUFFIX}" for leaf in DSA_SCALED_PROJECTIONS),
+    )
 
     def projection_widths(self) -> tuple[tuple[str, int, int], ...]:
         """The five sites as ``(name, in_features, out_features)``, closed form.
@@ -9478,12 +9513,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         Returns ``(projection prep calls, scale prep calls)``.
 
-        Once a prep has stored its operands, the checkpoint tensors it copied
-        from are released: the forward reads the prepared operands only, so the
-        originals would otherwise sit on the device beside them for the life of
-        the process. Each module records what it released under
-        :data:`RELEASED_PARAMETERS_ATTR`, and :meth:`released_parameters` reads
-        those records back by tree path.
+        Once every prep on a module has run, the checkpoint tensors its class
+        declares under ``RELEASED_AFTER_PREP`` are released: that class's forward
+        reads the prepared operands in their place, so the originals would
+        otherwise sit on the device beside them for the life of the process. A
+        class whose forward still reads what it loaded declares nothing. Each
+        module records what it released under :data:`RELEASED_PARAMETERS_ATTR`,
+        and :meth:`released_parameters` reads those records back by tree path.
 
         THE SINGLE PRODUCTION CALLER. Before this method
         ``prepare_projection_weights`` and ``prepare_scale_operands`` had ZERO
@@ -9527,12 +9563,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # module. So the signature stays exactly as it landed.
                 if hasattr(type(module), "prepare_absorb_weights"):
                     module.prepare_absorb_weights()
-                attributes = getattr(type(module), "PROJECTION_PARAMETERS", {})
-                replaced = []
-                for name in names:
-                    weight = attributes.get(name, f"{name}{_WEIGHT_LEAF_SUFFIX}")
-                    replaced += [weight, self._sibling_scale_grid_name(weight)]
-                _release_replaced_parameters(module, *filter(None, replaced))
             # ``inc-glm53f-054a`` hand-off item (iv). The checkpoint's grids are at
             # 128-tile granularity and arrive in the loader's frame, so the bridge
             # runs HERE -- on the load path, after the shards are attached and
@@ -9570,16 +9600,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 ]
                 self._require_prep_operands_on_device(path, module, names, device)
                 operands = {}
-                replaced = []
                 for name in names:
                     leaf = f"{name}{_WEIGHT_LEAF_SUFFIX}"
-                    grid = self._sibling_scale_grid_name(leaf)
                     operands[leaf] = getattr(module, leaf)
-                    operands[f"{name}_scale"] = getattr(module, grid)
-                    replaced += [leaf, grid]
+                    operands[f"{name}_scale"] = getattr(
+                        module, self._sibling_scale_grid_name(leaf)
+                    )
                 module.prepare_scale_operands(**operands)
                 scale_calls += 1
-                _release_replaced_parameters(module, *replaced)
+            # The release reads the class's own declaration and nothing else: a
+            # class whose forward still reads a loaded tensor declares nothing
+            # and keeps everything, whichever preps it defines.
+            released = getattr(type(module), "RELEASED_AFTER_PREP", ())
+            if released:
+                _release_replaced_parameters(module, *released)
             # ``inc-glm53f-030d`` part (c), THE mHC BIND, on the same
             # ``hasattr`` gate the three steps above use. It fires on the two
             # decoder layer classes, and those two declare none of the three
