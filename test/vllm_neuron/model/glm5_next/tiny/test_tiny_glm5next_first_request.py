@@ -67,8 +67,9 @@ def _parallel_state(tmp_path, vllm_config):
 
 def _engine_config(*, async_scheduling: bool, on_device_sampling: bool):
     """The engine config the worker builds for this root, with the two knobs under test."""
+    # The last prefill bucket must equal max_num_batched_tokens; the prompt picks the first.
     neuron_config: dict = {
-        "num_batched_tokens_buckets": [PREFILL_BUCKET],
+        "num_batched_tokens_buckets": [PREFILL_BUCKET, landed.E2E_MAX_SEQ_LEN],
         "num_seqs_buckets": [DECODE_BATCH],
     }
     if not on_device_sampling:
