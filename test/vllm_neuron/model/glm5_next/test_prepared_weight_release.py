@@ -298,7 +298,7 @@ def test_the_forward_reads_the_operands_the_prep_stored(
 def test_nothing_in_the_tree_references_a_released_tensor(
     tmp_path, single_rank_process_group, monkeypatch
 ) -> None:
-    """(t3) No parameter, buffer or attribute anywhere in the tree still holds a freed tensor."""
+    """(t3) Nothing in the tree still holds a freed tensor, and the dense MLP keeps its raw weights."""
     impl = _impl()
     directory = _written_checkpoint(tmp_path)
     recorder = _Recorder(impl._release_replaced_parameters)
@@ -333,12 +333,38 @@ def test_nothing_in_the_tree_references_a_released_tensor(
         if getattr(reference.get_submodule(path), leaf) is not None:
             bound_in_reference += 1
 
+    dense = [
+        (path, module)
+        for path, module in model.named_modules()
+        if hasattr(type(module), "retile_checkpoint_scale_grids")
+        and not hasattr(type(module), "prepare_scale_operands")
+    ]
+    raw_names = [f"{name}_weight" for name in BANK_PROJECTIONS]
+    dense_released = [path for path, _ in dense if any(f"{path}.{n}" in released for n in raw_names)]
+    dense_unbound = [
+        path for path, module in dense if any(getattr(module, n) is None for n in raw_names)
+    ]
+    twin_dense = reference.get_submodule(dense[0][0]) if dense else None
+    if twin_dense is not None:
+        recorder.original(twin_dense, "gate_proj_weight")
+    control_reads_unbound = twin_dense is not None and twin_dense.gate_proj_weight is None
+
     say(
         "references",
         f"freed={len(freed)}|released={len(released)}|referencing={len(referencing)}",
         f"still_named={len(still_named)}|still_bound={len(still_bound)}",
         f"control_bound_without_the_release={bound_in_reference}",
     )
+    say(
+        "dense_mlp",
+        f"modules={len(dense)}|released={len(dense_released)}|unbound={len(dense_unbound)}",
+        f"control_release_on_the_twin_reads_unbound={control_reads_unbound}",
+    )
+    assert dense and dense_released == [] and dense_unbound == [], (
+        f"the dense MLP reads its raw weights in the forward and must keep them: "
+        f"released={dense_released} unbound={dense_unbound}"
+    )
+    assert control_reads_unbound, "the control did not move: a release on the twin's dense MLP was not read"
     assert freed and len(freed) == len(released)
     assert (referencing, still_named, still_bound) == ([], [], []), (
         f"referencing={referencing[:4]} still_named={still_named[:4]} still_bound={still_bound[:4]}"
