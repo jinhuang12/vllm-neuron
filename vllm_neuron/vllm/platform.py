@@ -631,6 +631,8 @@ class NeuronPlatform(Platform):
                 merge_factor = get_vision_token_merge_factor(model_config.hf_config)
                 cls._max_embeds_per_image = max(buckets) // max(merge_factor, 1)
 
+        cls._resolve_sampling_from_the_model_class(vllm_config)
+
         if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
             # Capture copies a forward's inputs to host via a standalone op run
             # just before a plain execute. Under async scheduling the input
@@ -669,6 +671,46 @@ class NeuronPlatform(Platform):
                 "scheduler_cls already set to non-default: %s, "
                 "NOT overriding with custom Neuron scheduler",
                 scheduler_config.scheduler_cls,
+            )
+
+    @classmethod
+    def _resolve_sampling_from_the_model_class(cls, vllm_config: "VllmConfig") -> None:
+        """Turn on-device sampling and async scheduling off for a model class that declares no sampler.
+
+        Such a class returns logits, which the async runner cannot read as token ids. An explicit
+        on-device sampling config for it is refused. vLLM resolves the async-scheduling default
+        before this hook runs, so an explicit ``--async-scheduling`` is not told apart from the
+        default here; both are turned off, and the runner refuses the pair as a backstop.
+        """
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        model_config = vllm_config.model_config
+        model_cls, arch = ModelRegistry.resolve_model_cls(
+            model_config.architectures, model_config=model_config
+        )
+        if getattr(model_cls, "supports_on_device_sampling", True):
+            return
+        neuron_config = vllm_config.additional_config.get("neuron_config", {})
+        if neuron_config.get("on_device_sampling_config") is not None:
+            raise ValueError(
+                f"{arch} has no on-device sampler: additional_config.neuron_config."
+                "on_device_sampling_config must be null or absent, got "
+                f"{neuron_config['on_device_sampling_config']!r}"
+            )
+        neuron_config["on_device_sampling_config"] = None
+        vllm_config.additional_config["neuron_config"] = neuron_config
+        logger.info(
+            "On-device sampling is off: %s has no on-device sampler; the vLLM Sampler "
+            "on the host samples its logits",
+            arch,
+        )
+        scheduler_config = vllm_config.scheduler_config
+        if scheduler_config.async_scheduling:
+            scheduler_config.async_scheduling = False
+            logger.info(
+                "Async scheduling is off: %s has no on-device sampler, and the async "
+                "runner reads token ids from the device; NeuronScheduler runs synchronously",
+                arch,
             )
 
     @classmethod

@@ -4,16 +4,20 @@
         python -m pytest -s -rA test/vllm_neuron/model/glm5_next/tiny/test_tiny_glm5next_first_request.py
 
 The serving path the item tests never drove: a real ``NeuronModelRunner`` built from an engine
-config, its two warmups, then ``execute_model`` on a scheduler output, the way the worker calls
-it. Readings: warmup leaves no async-execution state; the first request returns integer token ids
-on the sampler path, each the argmax of the model's own logits; the spec-to-non-spec transition is
-read from the recorded fact and never taken without a speculative config; a sampled-token future
-that holds logits is refused by name, where it used to reach ``numpy``.
+config with no sampling or scheduling knob set, its two warmups, then ``execute_model`` on a
+scheduler output, the way the worker calls it. Readings: the platform resolves on-device sampling
+and async scheduling off from the model class, by name; warmup leaves no async-execution state;
+the first request returns integer token ids from the vLLM Sampler over the full vocabulary, each
+the argmax of the model's own logits; the spec-to-non-spec transition is read from the recorded
+fact and never taken without a speculative config; a sampled-token future that holds logits is
+refused by name, where it used to reach ``numpy``. The controls re-create the class as it stood,
+declaring a sampler it does not have.
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import pathlib
 import traceback
 
@@ -27,6 +31,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 import vllm_neuron.vllm.worker.neuron_model_runner as runner_module
+from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as landed
@@ -44,6 +49,8 @@ DECODE_BATCH = 1
 FIRST_BLOCK = 1
 #: The tolerance the end-to-end file compares the root's logits at.
 LOGITS_RTOL, LOGITS_ATOL = 1e-2, 1e-5
+ARCH = "Glm5NextForConditionalGeneration"
+PLATFORM_LOGGER = "vllm_neuron.vllm.platform"
 
 
 @contextlib.contextmanager
@@ -65,15 +72,15 @@ def _parallel_state(tmp_path, vllm_config):
             dist_state.destroy_distributed_environment()
 
 
-def _engine_config(*, async_scheduling: bool, on_device_sampling: bool):
-    """The engine config the worker builds for this root, with the two knobs under test."""
+def _engine_config(*, async_scheduling: bool | None = None, on_device_sampling: bool | None = None):
+    """The engine config the worker builds for this root; ``None`` leaves a knob unset, as a serve does."""
     # The last prefill bucket must equal max_num_batched_tokens; the prompt picks the first.
     neuron_config: dict = {
         "num_batched_tokens_buckets": [PREFILL_BUCKET, landed.E2E_MAX_SEQ_LEN],
         "num_seqs_buckets": [DECODE_BATCH],
     }
-    if not on_device_sampling:
-        neuron_config["on_device_sampling_config"] = None
+    if on_device_sampling is not None:
+        neuron_config["on_device_sampling_config"] = {} if on_device_sampling else None
     return EngineArgs(
         model=str(FIXTURE),
         skip_tokenizer_init=True,
@@ -86,6 +93,43 @@ def _engine_config(*, async_scheduling: bool, on_device_sampling: bool):
         async_scheduling=async_scheduling,
         additional_config={"neuron_config": neuron_config},
     ).create_engine_config()
+
+
+def _declaring_a_sampler(monkeypatch) -> None:
+    """The class as it stood: declaring an on-device sampler it does not have, so both knobs stay on."""
+    monkeypatch.setattr(Glm5NextForConditionalGeneration, "supports_on_device_sampling", True)
+
+
+@contextlib.contextmanager
+def _platform_rows():
+    """Collect the platform's INFO rows while an engine config is built; yields the message list."""
+    rows: list[str] = []
+
+    class _Rows(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            rows.append(record.getMessage())
+
+    handler = _Rows(level=logging.INFO)
+    platform_logger = logging.getLogger(PLATFORM_LOGGER)
+    level = platform_logger.level
+    platform_logger.addHandler(handler)
+    platform_logger.setLevel(logging.INFO)
+    try:
+        yield rows
+    finally:
+        platform_logger.removeHandler(handler)
+        platform_logger.setLevel(level)
+
+
+def _resolution(config) -> dict:
+    """What the engine config resolved the two knobs and the scheduler to."""
+    return {
+        "on_device_sampling_config": config.additional_config["neuron_config"].get(
+            "on_device_sampling_config", "absent"
+        ),
+        "async_scheduling": config.scheduler_config.async_scheduling,
+        "scheduler_cls": str(config.scheduler_config.scheduler_cls).rsplit(".", 1)[-1],
+    }
 
 
 def _kv_cache_config(runner: NeuronModelRunner) -> KVCacheConfig:
@@ -220,29 +264,88 @@ def _frames(raised) -> list[str]:
     return [frame.name for frame in traceback.extract_tb(raised.tb)]
 
 
-def test_warmup_leaves_no_async_execution_state(tmp_path):
-    """Under async scheduling, both warmups leave the buffer empty and no step pending."""
+def test_sampling_and_scheduling_resolve_from_the_model_class():
+    """No knob set: the platform reads the class, turns both off, and says so by name."""
+    landed._require_cpu_mode()
+    with _platform_rows() as rows:
+        config = _engine_config()
+    resolved = _resolution(config)
+    named = [row for row in rows if ARCH in row and "no on-device sampler" in row]
+    print(f"FIRSTREQ|resolution|declared={Glm5NextForConditionalGeneration.supports_on_device_sampling}"
+          f"|{resolved}|rows={named}")
+    assert Glm5NextForConditionalGeneration.supports_on_device_sampling is False
+    assert resolved == {"on_device_sampling_config": None, "async_scheduling": False,
+                        "scheduler_cls": "NeuronScheduler"}, resolved
+    kinds = sorted({("On-device sampling is off" in row, "Async scheduling is off" in row) for row in named})
+    assert kinds == [(False, True), (True, False)], named
+
+
+def test_an_explicit_sampler_config_for_the_class_is_refused_by_name():
+    """An on-device sampling config for a class without a sampler is refused, naming both."""
+    landed._require_cpu_mode()
+    with pytest.raises(ValueError) as raised:
+        _engine_config(on_device_sampling=True)
+    message = str(raised.value)
+    print(f"FIRSTREQ|explicit_sampler|message={message[:200]}")
+    assert ARCH in message and "on_device_sampling_config" in message and "no on-device sampler" in message
+
+
+def test_an_explicit_async_request_is_turned_off_by_name():
+    """vLLM resolves the async default before the platform hook, so an explicit request is turned off the same way."""
+    landed._require_cpu_mode()
+    with _platform_rows() as rows:
+        config = _engine_config(async_scheduling=True)
+    resolved = _resolution(config)
+    named = [row for row in rows if ARCH in row and "Async scheduling is off" in row]
+    print(f"FIRSTREQ|explicit_async|{resolved}|rows={named}")
+    assert resolved["async_scheduling"] is False and resolved["scheduler_cls"] == "NeuronScheduler", resolved
+    assert named, rows
+
+
+def test_the_runner_refuses_async_without_a_sampler_by_name(tmp_path, monkeypatch):
+    """Backstop: the class declaring a sampler, sampling off and async on, the runner refuses naming the class."""
+    landed._require_cpu_mode()
+    _declaring_a_sampler(monkeypatch)
+    config = _engine_config(async_scheduling=True, on_device_sampling=False)
+    with _parallel_state(tmp_path, config), pytest.raises(RuntimeError) as raised:
+        NeuronModelRunner(config, device=torch.device("cpu"))
+    message = str(raised.value)
+    print(f"FIRSTREQ|runner_backstop|{_resolution(config)}|message={message[:200]}")
+    assert config.scheduler_config.async_scheduling is True
+    assert ARCH in message and "synchronous scheduling" in message
+
+
+def test_warmup_leaves_no_async_execution_state(tmp_path, monkeypatch):
+    """Both warmups leave the buffer empty and no step pending, under the resolved config and the class as it stood."""
     landed._require_cpu_mode()
     root = landed._fixture()["root"]
-    config = _engine_config(async_scheduling=True, on_device_sampling=True)
-    with _parallel_state(tmp_path, config):
+    readings = {}
+    for label, config in (("resolved", _engine_config()),):
+        with _parallel_state(tmp_path / label, config):
+            runner = _runner(config, root)
+            _warm(runner)
+            readings[label] = (runner.use_async_scheduling, dict(runner.async_execution_buffer),
+                               runner.execute_model_state is not None)
+    _declaring_a_sampler(monkeypatch)
+    config = _engine_config(async_scheduling=True)
+    with _parallel_state(tmp_path / "as_it_stood", config):
         runner = _runner(config, root)
         _warm(runner)
-        buffer = dict(runner.async_execution_buffer)
-    print(f"FIRSTREQ|warmup|async={runner.use_async_scheduling}|buffer_keys={sorted(buffer)}"
-          f"|pending={runner.execute_model_state is not None}")
-    assert runner.use_async_scheduling
-    assert buffer == {}, buffer
-    assert runner.execute_model_state is None
+        readings["as_it_stood"] = (runner.use_async_scheduling, dict(runner.async_execution_buffer),
+                                   runner.execute_model_state is not None)
+    for label, (is_async, buffer, pending) in readings.items():
+        print(f"FIRSTREQ|warmup|{label}|async={is_async}|buffer_keys={sorted(buffer)}|pending={pending}")
+    assert readings["resolved"][0] is False and readings["as_it_stood"][0] is True
+    assert all(buffer == {} and not pending for _, buffer, pending in readings.values()), readings
 
 
 def test_the_first_request_returns_integer_token_ids(tmp_path):
-    """Synchronous scheduling, no on-device sampler: prefill then decode return one int each, the model's argmax."""
+    """No knob set: prefill then decode return one int each, the argmax of the model's full-vocabulary logits."""
     landed._require_cpu_mode()
     fixture = landed._fixture()
     root = fixture["root"]
     prompt = _prompt()
-    config = _engine_config(async_scheduling=False, on_device_sampling=False)
+    config = _engine_config()
     with _parallel_state(tmp_path, config):
         runner = _runner(config, root)
         _warm(runner)
@@ -253,14 +356,16 @@ def test_the_first_request_returns_integer_token_ids(tmp_path):
         )
         second = decode.sampled_token_ids
     print(f"FIRSTREQ|tokens|async={runner.use_async_scheduling}|ods={runner.on_device_sampling}"
-          f"|prefill={first}|decode={second}|logits={tuple(prefill_logits.shape)},{prefill_logits.dtype}")
-    assert not runner.use_async_scheduling and not runner.on_device_sampling
+          f"|prefill={first}|decode={second}|logits={tuple(prefill_logits.shape)},{prefill_logits.dtype}"
+          f"|vocab={runner.vocab_size}")
+    assert runner.use_async_scheduling is False and runner.on_device_sampling is False
+    assert type(prefill).__name__ == "ModelRunnerOutput" and type(decode).__name__ == "ModelRunnerOutput"
     for label, ids, logits, sequence in (
         ("prefill", first, prefill_logits, prompt),
         ("decode", second, decode_logits, prompt + first[0]),
     ):
         assert ids == [[int(ids[0][0])]] and type(ids[0][0]) is int, (label, ids)
-        assert tuple(logits.shape) == (1, item.STACK_VOCAB_SIZE), (label, logits.shape)
+        assert tuple(logits.shape) == (1, runner.vocab_size) == (1, item.STACK_VOCAB_SIZE), (label, logits.shape)
         assert ids[0][0] == int(logits[0].float().argmax()), (label, ids)
         want = landed._reference_logits(fixture, torch.tensor(sequence, dtype=torch.int64))[0].float()
         spread = float((logits[0].float() - want).abs().max())
@@ -274,9 +379,10 @@ def test_the_first_request_returns_integer_token_ids(tmp_path):
 def test_the_transition_is_read_from_the_recorded_fact(tmp_path, monkeypatch):
     """After a real step the fact is recorded False; a planted True is not read without a speculative config."""
     landed._require_cpu_mode()
+    _declaring_a_sampler(monkeypatch)
     root = landed._fixture()["root"]
     prompt = _prompt()
-    config = _engine_config(async_scheduling=True, on_device_sampling=True)
+    config = _engine_config(async_scheduling=True)
     with _parallel_state(tmp_path, config):
         runner = _runner(config, root)
         _warm(runner)
@@ -294,14 +400,16 @@ def test_the_transition_is_read_from_the_recorded_fact(tmp_path, monkeypatch):
     assert reasons and all("spec" not in reason for reason in reasons), reasons
 
 
-def test_a_future_that_holds_logits_is_refused_by_name(tmp_path):
-    """Async scheduling with the default on-device sampler on a root that returns logits: refused, naming what it holds."""
+def test_a_future_that_holds_logits_is_refused_by_name(tmp_path, monkeypatch):
+    """Control 1 with the refusal: the class as it stood, async on, the first decode is refused naming what the future holds."""
     landed._require_cpu_mode()
+    _declaring_a_sampler(monkeypatch)
     root = landed._fixture()["root"]
     prompt = _prompt()
-    config = _engine_config(async_scheduling=True, on_device_sampling=True)
+    config = _engine_config(async_scheduling=True)
     with _parallel_state(tmp_path, config):
         runner = _runner(config, root)
+        assert runner.use_async_scheduling and runner.on_device_sampling
         _warm(runner)
         _step(runner, _prefill_step(prompt, _groups(runner)))
         future = runner.async_execution_buffer["futures_sampled_token_ids"]
@@ -321,12 +429,13 @@ def test_a_future_that_holds_logits_is_refused_by_name(tmp_path):
 
 
 def test_without_the_refusal_the_same_future_reaches_numpy(tmp_path, monkeypatch):
-    """Control: with the refusal removed, the same step raises the bf16 TypeError from the rejection parser."""
+    """Control 1 as it stood: with the refusal removed, the same step raises the bf16 TypeError from the rejection parser."""
     landed._require_cpu_mode()
+    _declaring_a_sampler(monkeypatch)
     monkeypatch.setattr(runner_module, "_refuse_non_integer_future", lambda *args: None)
     root = landed._fixture()["root"]
     prompt = _prompt()
-    config = _engine_config(async_scheduling=True, on_device_sampling=True)
+    config = _engine_config(async_scheduling=True)
     with _parallel_state(tmp_path, config):
         runner = _runner(config, root)
         _warm(runner)

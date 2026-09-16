@@ -276,6 +276,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     ``Glm5NextConfig.from_configs`` already models.
     """
 
+    #: The forward returns logits; the host's vLLM Sampler turns them into tokens.
+    supports_on_device_sampling = False
+
     def __init__(
         self,
         hf_config: PretrainedConfig,

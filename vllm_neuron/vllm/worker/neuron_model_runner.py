@@ -726,7 +726,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if self.use_async_scheduling:
             if not self.on_device_sampling:
                 raise RuntimeError(
-                    "On-device sampling must be enabled for async execution"
+                    "On-device sampling must be enabled for async execution: "
+                    f"{list(vllm_config.model_config.architectures)} runs without an "
+                    "on-device sampler, so serve it with synchronous scheduling"
                 )
             # The buffer to facilitate async execution.
             self.async_execution_buffer = dict()
