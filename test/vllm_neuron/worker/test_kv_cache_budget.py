@@ -7,7 +7,7 @@ The declared acceptance command:
       test/vllm_neuron/worker/test_kv_cache_budget.py -s -rA --timeout 120 \\
       -p no:cacheprovider
 
-Seven items, one per declared conjunct. The KV cache layout is the registered one
+Eight items, one per declared conjunct. The KV cache layout is the registered one
 for this stack -- 11 latent-attention layers and 34 recurrent-state layers at
 block size 128, bfloat16, tensor-parallel degree 64 -- and every expected number
 below is arithmetic over those registered values, never a copy of what the code
@@ -152,18 +152,24 @@ def _worker(
     """A fake worker carrying the real methods and stubbed memory readings."""
     from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 
+    # num_gpu_blocks_override and the fields below it are read by vLLM's own
+    # allocator, which one item drives with the budget this worker returns.
     cache_config = SimpleNamespace(
         block_size=BLOCK_SIZE_TOKENS,
         cache_dtype="auto",
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         mamba_cache_mode="none",
+        num_gpu_blocks_override=None,
+        enable_prefix_caching=False,
     )
     worker = SimpleNamespace(
         cache_config=cache_config,
         vllm_config=SimpleNamespace(
             cache_config=cache_config,
             model_config=SimpleNamespace(
-                max_model_len=MAX_MODEL_LEN, dtype=torch.bfloat16
+                max_model_len=MAX_MODEL_LEN,
+                original_max_model_len=MAX_MODEL_LEN,
+                dtype=torch.bfloat16,
             ),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=MAX_NUM_SEQS,
@@ -174,9 +180,11 @@ def _worker(
             # tokens a rank keeps. Neither degree is engaged on this stack.
             parallel_config=SimpleNamespace(
                 tensor_parallel_size=TP_WORLD_SIZE,
+                pipeline_parallel_size=1,
                 decode_context_parallel_size=1,
                 prefill_context_parallel_size=1,
             ),
+            kv_transfer_config=None,
         ),
         model_runner=SimpleNamespace(
             get_kv_cache_spec=_registered_specs,
@@ -289,6 +297,38 @@ def test_cpu_compilation_and_execution_agree_on_the_bytes(monkeypatch) -> None:
     )
     assert table_gib * GIB == TOTAL_HBM_BYTES
     assert device_bytes == compile_bytes == EXPECTED_NEED_BYTES
+
+
+def test_vllm_accepts_the_budget_and_one_request_fits(monkeypatch) -> None:
+    """vLLM's own allocator accepts the budget and holds the served tokens."""
+    from vllm.v1.core.kv_cache_utils import (
+        check_enough_kv_cache_memory,
+        get_kv_cache_capacity,
+        get_kv_cache_configs,
+    )
+
+    monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    worker = _worker()
+    available = worker.determine_available_memory()
+
+    # Raises ValueError when the budget cannot hold one max_model_len request.
+    check_enough_kv_cache_memory(worker.vllm_config, _registered_specs(), available)
+    config = get_kv_cache_configs(
+        worker.vllm_config, [_registered_specs()], [available]
+    )[0]
+    num_tokens, max_concurrency = get_kv_cache_capacity(worker.vllm_config, config)
+
+    print(
+        f"vllm accepted {available} B: blocks={config.num_blocks} "
+        f"(needs {BLOCKS_PER_REQUEST} + 1 null) tokens={num_tokens} "
+        f"concurrency={max_concurrency:.2f}x groups={len(config.kv_cache_groups)} "
+        f"tensors={len(config.kv_cache_tensors)}"
+    )
+    assert config.num_blocks >= BLOCKS_PER_REQUEST + 1
+    assert num_tokens >= MAX_MODEL_LEN * MAX_NUM_SEQS
+    assert max_concurrency >= MAX_NUM_SEQS
 
 
 def test_prepared_operands_count_once_towards_residency(monkeypatch) -> None:
