@@ -19,6 +19,7 @@ import traceback
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.distributed import parallel_state as dist_state
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import SamplingParams
@@ -46,21 +47,22 @@ LOGITS_RTOL, LOGITS_ATOL = 1e-2, 1e-5
 
 
 @contextlib.contextmanager
-def _parallel_state(tmp_path):
-    """One rank over gloo with a file rendezvous: the state the runner's constructor reads."""
-    dist_state.init_distributed_environment(
-        world_size=1,
-        rank=0,
-        distributed_init_method=f"file://{tmp_path / 'rendezvous'}",
-        local_rank=0,
-        backend="gloo",
-    )
-    dist_state.ensure_model_parallel_initialized(1, 1)
-    try:
-        yield
-    finally:
-        dist_state.destroy_model_parallel()
-        dist_state.destroy_distributed_environment()
+def _parallel_state(tmp_path, vllm_config):
+    """One rank over gloo with a file rendezvous, under the config vLLM's parallel state and op layer read."""
+    with set_current_vllm_config(vllm_config, check_compile=False):
+        dist_state.init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{tmp_path / 'rendezvous'}",
+            local_rank=0,
+            backend="gloo",
+        )
+        dist_state.ensure_model_parallel_initialized(1, 1)
+        try:
+            yield
+        finally:
+            dist_state.destroy_model_parallel()
+            dist_state.destroy_distributed_environment()
 
 
 def _engine_config(*, async_scheduling: bool, on_device_sampling: bool):
@@ -221,8 +223,9 @@ def test_warmup_leaves_no_async_execution_state(tmp_path):
     """Under async scheduling, both warmups leave the buffer empty and no step pending."""
     landed._require_cpu_mode()
     root = landed._fixture()["root"]
-    with _parallel_state(tmp_path):
-        runner = _runner(_engine_config(async_scheduling=True, on_device_sampling=True), root)
+    config = _engine_config(async_scheduling=True, on_device_sampling=True)
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root)
         _warm(runner)
         buffer = dict(runner.async_execution_buffer)
     print(f"FIRSTREQ|warmup|async={runner.use_async_scheduling}|buffer_keys={sorted(buffer)}"
@@ -238,8 +241,9 @@ def test_the_first_request_returns_integer_token_ids(tmp_path):
     fixture = landed._fixture()
     root = fixture["root"]
     prompt = _prompt()
-    with _parallel_state(tmp_path):
-        runner = _runner(_engine_config(async_scheduling=False, on_device_sampling=False), root)
+    config = _engine_config(async_scheduling=False, on_device_sampling=False)
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root)
         _warm(runner)
         prefill_logits, prefill = _step(runner, _prefill_step(prompt, _groups(runner)))
         first = prefill.sampled_token_ids
@@ -269,8 +273,9 @@ def test_the_transition_is_read_from_the_recorded_fact(tmp_path, monkeypatch):
     landed._require_cpu_mode()
     root = landed._fixture()["root"]
     prompt = _prompt()
-    with _parallel_state(tmp_path):
-        runner = _runner(_engine_config(async_scheduling=True, on_device_sampling=True), root)
+    config = _engine_config(async_scheduling=True, on_device_sampling=True)
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root)
         _warm(runner)
         _, prefill = _step(runner, _prefill_step(prompt, _groups(runner)))
         recorded = runner.async_execution_buffer.get("prev_step_was_spec", "absent")
@@ -291,8 +296,9 @@ def test_a_future_that_holds_logits_is_refused_by_name(tmp_path):
     landed._require_cpu_mode()
     root = landed._fixture()["root"]
     prompt = _prompt()
-    with _parallel_state(tmp_path):
-        runner = _runner(_engine_config(async_scheduling=True, on_device_sampling=True), root)
+    config = _engine_config(async_scheduling=True, on_device_sampling=True)
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root)
         _warm(runner)
         _step(runner, _prefill_step(prompt, _groups(runner)))
         future = runner.async_execution_buffer["futures_sampled_token_ids"]
@@ -317,8 +323,9 @@ def test_without_the_refusal_the_same_future_reaches_numpy(tmp_path, monkeypatch
     monkeypatch.setattr(runner_module, "_refuse_non_integer_future", lambda *args: None)
     root = landed._fixture()["root"]
     prompt = _prompt()
-    with _parallel_state(tmp_path):
-        runner = _runner(_engine_config(async_scheduling=True, on_device_sampling=True), root)
+    config = _engine_config(async_scheduling=True, on_device_sampling=True)
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root)
         _warm(runner)
         _step(runner, _prefill_step(prompt, _groups(runner)))
         with pytest.raises(TypeError) as raised:
