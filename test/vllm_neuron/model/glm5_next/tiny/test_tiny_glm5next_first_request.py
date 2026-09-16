@@ -8,7 +8,7 @@ config with no sampling or scheduling knob set, its two warmups, then ``execute_
 scheduler output, the way the worker calls it. Readings: the platform resolves on-device sampling
 and async scheduling off from the model class, by name; warmup leaves no async-execution state;
 the first request returns integer token ids from the vLLM Sampler over the full vocabulary, each
-the argmax of the model's own logits; the spec-to-non-spec transition is read from the recorded
+the strict argmax of the model's logits under a per-vocabulary bias the item adds outside the model; the spec-to-non-spec transition is read from the recorded
 fact, never taken without a speculative config and taken when the fact and the config agree; a
 sampled-token future that holds logits is refused by name, where it used to reach ``numpy``. The controls re-create the class as it stood,
 declaring a sampler it does not have.
@@ -50,6 +50,9 @@ DECODE_BATCH = 1
 FIRST_BLOCK = 1
 #: The tolerance the end-to-end file compares the root's logits at.
 LOGITS_RTOL, LOGITS_ATOL = 1e-2, 1e-5
+#: The per-vocabulary bias the first-request item adds to the root's logits, in steps exact in bf16: the
+#: seeded head scores two ids equally, and the ramp sets them apart so the argmax is one id with a margin.
+HEAD_BIAS_STEP = 1 / 64
 ARCH = "Glm5NextForConditionalGeneration"
 PLATFORM_LOGGER = "vllm_neuron.vllm.platform"
 
@@ -159,6 +162,19 @@ def _runner(vllm_config, root) -> NeuronModelRunner:
     runner.vocab_size = item.STACK_VOCAB_SIZE
     runner.initialize_kv_cache(_kv_cache_config(runner))
     return runner
+
+
+def _head_bias(root) -> torch.Tensor:
+    """Add a per-vocabulary ramp to the root's logits outside the model; returns the ramp the reference adds too."""
+    ramp = torch.arange(item.STACK_VOCAB_SIZE, dtype=torch.float32) * HEAD_BIAS_STEP
+    forward = root.forward
+
+    def biased(*args, **kwargs):
+        logits = forward(*args, **kwargs)
+        return logits + ramp.to(logits.dtype)
+
+    root.forward = biased
+    return ramp
 
 
 def _warm(runner: NeuronModelRunner) -> None:
@@ -348,10 +364,11 @@ def test_warmup_left_no_async_execution_state_as_it_stood(tmp_path, monkeypatch)
 
 
 def test_the_first_request_returns_integer_token_ids(tmp_path):
-    """No knob set: prefill then decode return one int each, the argmax of the model's full-vocabulary logits."""
+    """No knob set: prefill then decode return one int each, the strict argmax of the biased full-vocabulary logits."""
     landed._require_cpu_mode()
     fixture = landed._fixture()
     root = fixture["root"]
+    ramp = _head_bias(root)
     prompt = _prompt()
     config = _engine_config()
     with _parallel_state(tmp_path, config):
@@ -375,13 +392,15 @@ def test_the_first_request_returns_integer_token_ids(tmp_path):
         assert ids == [[int(ids[0][0])]] and type(ids[0][0]) is int, (label, ids)
         assert tuple(logits.shape) == (1, runner.vocab_size) == (1, item.STACK_VOCAB_SIZE), (label, logits.shape)
         assert ids[0][0] == int(logits[0].float().argmax()), (label, ids)
-        want = landed._reference_logits(fixture, torch.tensor(sequence, dtype=torch.int64))[0].float()
+        want = landed._reference_logits(fixture, torch.tensor(sequence, dtype=torch.int64))[0].float() + ramp
         spread = float((logits[0].float() - want).abs().max())
         top = logits[0].float().topk(2)
+        margin = float(top.values[0] - top.values[1])
         ties = int((logits[0].float() == logits[0].float().max()).sum())
         print(f"FIRSTREQ|logits|{label}|tokens={len(sequence)}|max_abs_delta={spread:.6g}"
               f"|reference_argmax={int(want.argmax())}|top2={top.indices.tolist()}"
-              f"|margin={float(top.values[0] - top.values[1]):.6g}|ties_at_the_max={ties}")
+              f"|margin={margin:.6g}|ties_at_the_max={ties}|bias_step={HEAD_BIAS_STEP}")
+        assert ties == 1 and margin > 0, (label, top.indices.tolist(), margin)
         torch.testing.assert_close(logits[0].float(), want, rtol=LOGITS_RTOL, atol=LOGITS_ATOL)
 
 
