@@ -7,7 +7,7 @@ The declared acceptance command:
       test/vllm_neuron/worker/test_kv_cache_budget.py -s -rA --timeout 120 \\
       -p no:cacheprovider
 
-Nine items, one per declared conjunct. The KV cache layout is the registered one
+Ten items, one per declared conjunct. The KV cache layout is the registered one
 for this stack -- 11 latent-attention layers and 34 recurrent-state layers at
 block size 128, bfloat16, tensor-parallel degree 64 -- and every expected number
 below is arithmetic over those registered values, never a copy of what the code
@@ -60,12 +60,18 @@ PAGE_SIZE_BYTES = BLOCK_SIZE_TOKENS * LATENT_KV_HEADS * LATENT_WIDTH * BF16_BYTE
 LAYERS_PER_POOL = LATENT_LAYERS
 RECURRENT_GROUPS = -(-RECURRENT_LAYERS // LATENT_LAYERS)
 TOTAL_GROUPS = 1 + RECURRENT_GROUPS
-# A request fills whole blocks of latent cache and keeps one state block in each
-# recurrent group; one further block is the pool's null block.
-LATENT_BLOCKS_PER_REQUEST = -(-MAX_MODEL_LEN // BLOCK_SIZE_TOKENS)
-BLOCKS_PER_REQUEST = LATENT_BLOCKS_PER_REQUEST + RECURRENT_GROUPS
+# The allocator takes a block per block_size tokens in EVERY group, recurrent
+# groups included, because this stack registers 128-token recurrent blocks. One
+# further block is the pool's null block, which no request can be given.
+BLOCKS_PER_GROUP_PER_SEQUENCE = -(-MAX_MODEL_LEN // BLOCK_SIZE_TOKENS)
+BLOCKS_PER_REQUEST = TOTAL_GROUPS * BLOCKS_PER_GROUP_PER_SEQUENCE
 EXPECTED_BLOCKS = BLOCKS_PER_REQUEST * MAX_NUM_SEQS + 1
 EXPECTED_NEED_BYTES = EXPECTED_BLOCKS * PAGE_SIZE_BYTES * LAYERS_PER_POOL
+
+# The pool this increment first shipped, priced at one block per recurrent group:
+# the allocator refuses a full-length request in it, which one item measures.
+UNDERPRICED_BLOCKS = BLOCKS_PER_GROUP_PER_SEQUENCE + RECURRENT_GROUPS + 1
+UNDERPRICED_BYTES = UNDERPRICED_BLOCKS * PAGE_SIZE_BYTES * LAYERS_PER_POOL
 
 # The pre-change budget: the cap fraction applied to the whole logical core.
 PARENT_CAP_FRACTION = 0.30
@@ -160,7 +166,10 @@ def _worker(
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         mamba_cache_mode="none",
         num_gpu_blocks_override=None,
-        enable_prefix_caching=False,
+        # Prefix caching is on in the served configuration, so the allocator this
+        # fixture drives hashes blocks exactly as the served run does.
+        enable_prefix_caching=True,
+        prefix_caching_hash_algo="sha256",
     )
     worker = SimpleNamespace(
         cache_config=cache_config,
@@ -175,6 +184,9 @@ def _worker(
                 max_num_seqs=MAX_NUM_SEQS,
                 max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
                 disable_hybrid_kv_cache_manager=False,
+                # The served default: admission reserves the whole input length
+                # rather than only the first chunk.
+                scheduler_reserve_full_isl=True,
             ),
             # A latent page is per-rank, so context parallelism would divide the
             # tokens a rank keeps. Neither degree is engaged on this stack.
@@ -272,8 +284,17 @@ def test_the_graph_reserve_is_overridable_and_validated(monkeypatch) -> None:
         assert "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB" in str(refusal.value)
 
 
+def _pool_blocks(worker, budget_bytes: int) -> int:
+    """The block count vLLM's allocator builds from a budget."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+
+    return get_kv_cache_configs(
+        worker.vllm_config, [_registered_specs()], [budget_bytes]
+    )[0].num_blocks
+
+
 def test_cpu_compilation_and_execution_agree_on_the_bytes(monkeypatch) -> None:
-    """Both modes return the same bytes, so the block count survives the cache."""
+    """Both modes return the same bytes AND the same block count."""
     from libtorch_neuronx_lite.compile.platform import get_total_available_memory
 
     monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
@@ -287,16 +308,22 @@ def test_cpu_compilation_and_execution_agree_on_the_bytes(monkeypatch) -> None:
     device_worker = _worker(total_hbm=TOTAL_HBM_BYTES - 3 * 1024**2)
     device_bytes = device_worker.determine_available_memory()
 
+    device_blocks = _pool_blocks(device_worker, device_bytes)
+
     monkeypatch.setenv("VLLM_NEURON_CPU_COMPILE", "1")
-    compile_bytes = _worker().determine_available_memory()
+    compile_worker = _worker()
+    compile_bytes = compile_worker.determine_available_memory()
+    compile_blocks = _pool_blocks(compile_worker, compile_bytes)
 
     print(
         f"platform table={table_gib} GiB per logical core; "
-        f"device={device_bytes} B compile={compile_bytes} B "
-        f"need={EXPECTED_NEED_BYTES} B"
+        f"device={device_bytes} B / {device_blocks} blocks, "
+        f"compile={compile_bytes} B / {compile_blocks} blocks, "
+        f"need={EXPECTED_NEED_BYTES} B / {EXPECTED_BLOCKS} blocks"
     )
     assert table_gib * GIB == TOTAL_HBM_BYTES
     assert device_bytes == compile_bytes == EXPECTED_NEED_BYTES
+    assert device_blocks == compile_blocks == EXPECTED_BLOCKS
 
 
 def test_vllm_accepts_the_budget_and_one_request_fits(monkeypatch) -> None:
@@ -329,6 +356,78 @@ def test_vllm_accepts_the_budget_and_one_request_fits(monkeypatch) -> None:
     assert config.num_blocks >= BLOCKS_PER_REQUEST + 1
     assert num_tokens >= MAX_MODEL_LEN * MAX_NUM_SEQS
     assert max_concurrency >= MAX_NUM_SEQS
+
+
+def _admit_one_full_length_request(worker, budget_bytes: int):
+    """Drive vLLM's own KV cache manager over one max_model_len request.
+
+    Returns the pool's block count and what ``allocate_slots`` decided. Prefix
+    caching, the hash algorithm, the block sizes, the batched-token chunk and the
+    full-input-length admission gate are the served configuration's.
+    """
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_configs,
+        get_request_block_hasher,
+        init_none_hash,
+    )
+    from vllm.v1.request import Request
+
+    config = get_kv_cache_configs(
+        worker.vllm_config, [_registered_specs()], [budget_bytes]
+    )[0]
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=MAX_MODEL_LEN,
+        scheduler_block_size=BLOCK_SIZE_TOKENS,
+        hash_block_size=BLOCK_SIZE_TOKENS,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        enable_caching=True,
+    )
+    hash_fn = get_hash_fn_by_name("sha256")
+    init_none_hash(hash_fn)
+    request = Request(
+        request_id="one-full-length-request",
+        prompt_token_ids=list(range(MAX_MODEL_LEN)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE_TOKENS, hash_fn),
+    )
+    allocated = manager.allocate_slots(
+        request,
+        MAX_NUM_BATCHED_TOKENS,
+        full_sequence_must_fit=True,
+    )
+    return config.num_blocks, allocated
+
+
+def test_the_allocator_admits_one_full_length_request(monkeypatch) -> None:
+    """The allocator admits a max_model_len request; the underpriced pool refuses.
+
+    This is the only path that prices what is ALLOCATED rather than what is
+    admitted, so it is what stops a pool the admission arithmetic accepts and the
+    allocator cannot serve.
+    """
+    monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    worker = _worker()
+    available = worker.determine_available_memory()
+
+    blocks, allocated = _admit_one_full_length_request(worker, available)
+    control_blocks, control = _admit_one_full_length_request(worker, UNDERPRICED_BYTES)
+
+    print(
+        f"shipped pool={blocks} blocks -> allocated={allocated is not None}; "
+        f"underpriced pool={control_blocks} blocks -> allocated="
+        f"{control is not None} (needs {BLOCKS_PER_REQUEST} + 1 null)"
+    )
+    assert blocks == EXPECTED_BLOCKS
+    assert allocated is not None
+    assert control_blocks == UNDERPRICED_BLOCKS
+    assert control is None
 
 
 def test_prepared_operands_count_once_towards_residency(monkeypatch) -> None:
@@ -433,4 +532,5 @@ def test_control_the_logical_core_budget_over_allocates(monkeypatch) -> None:
     )
     assert parent == PARENT_BUDGET_BYTES
     assert shipped == EXPECTED_NEED_BYTES
-    assert parent >= 100 * shipped
+    # 29.97x on these figures; the pre-change budget is an order of magnitude out.
+    assert parent >= 25 * shipped

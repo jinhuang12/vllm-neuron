@@ -1138,22 +1138,29 @@ class NeuronWorker(WorkerBase):
         # from the same pool, which is why the group count multiplies the blocks
         # a request needs and the layer count multiplies their cost.
         layers_per_pool = max(len(group.layer_names) for group in groups)
-        blocks_per_request = sum(
-            cdiv(
-                group.kv_cache_spec.max_memory_usage_bytes(self.vllm_config),
-                page_size,
-            )
-            for group in groups
-        )
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         max_model_len = self.vllm_config.model_config.max_model_len
+        # EVERY group is priced as the ALLOCATOR prices it: a block per
+        # ``block_size`` tokens of the sequence, in a recurrent group as much as in
+        # an attention one. The specs' own ``max_memory_usage_bytes`` prices a
+        # recurrent group at a single block, which holds only where a recurrent
+        # block spans a whole sequence; a fork that registers short recurrent
+        # blocks gets a block per page from the allocator and a pool sized on the
+        # single-block premise can then hold a request vLLM's admission arithmetic
+        # said would fit. Where a recurrent block does span the sequence this
+        # reads one block, so the formula is right in both conventions. Context
+        # parallelism, which would let a rank keep fewer tokens, takes no discount
+        # here.
+        blocks_per_request = sum(
+            cdiv(max_model_len, group.kv_cache_spec.block_size) for group in groups
+        )
         # Plus the pool's null block, which no request can be given.
         num_blocks = blocks_per_request * max_num_seqs + 1
         need_bytes = num_blocks * page_size * layers_per_pool
 
         logger.info(
             "KV cache need: %.3f GiB for %d sequence(s) of %d tokens "
-            "(%d blocks of %d B, %d block(s) per request, %d group(s), "
+            "(%d blocks of %d B, %d allocator block(s) per request, %d group(s), "
             "%d layer(s) per pool)",
             need_bytes / (1024**3),
             max_num_seqs,
