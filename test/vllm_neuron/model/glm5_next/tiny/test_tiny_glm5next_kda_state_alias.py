@@ -8,7 +8,8 @@ vLLM's hybrid allocator hands one raw tensor to one layer of every KV cache grou
 two recurrent layers over one raw tensor need distinct storage offsets, or the slot one layer
 writes is the slot its sharer reads. Two readings over the first shared tensor of the KV cache
 configuration vLLM builds from the runner's own specs: the storage identity of every recurrent
-state view, and a write through one layer's slot 0 read back through its sharer's slot 0.
+state view, and a write through one layer's slot 0 read back through its sharer's slot 0. The
+tiny root declares its first two layers recurrent, the way the e2e item substitutes specs.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
+from vllm_neuron.model.kv_cache import KVSpec
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as landed
@@ -39,19 +41,29 @@ def _production_kv_cache_config(runner: NeuronModelRunner, vllm_config, specs) -
     return get_kv_cache_config_from_groups(vllm_config, groups, page_size * group_size * (landed.E2E_BLOCKS + 1))
 
 
+def _two_recurrent_then_attention(root) -> KVSpec:
+    """The tiny root's spec with its first two layers declared recurrent, so the recurrent layers outnumber the attention layer and land in separate groups."""
+    recurrent = landed._recurrent_spec(root).layers
+    original = root.get_kv_spec().layers
+    return KVSpec(layers=list(recurrent[:2]) + list(original[2:]))
+
+
 def _identity(view: torch.Tensor) -> tuple[int, int]:
     """Where a view's bytes start: its storage address and its element offset into that storage."""
     return view.untyped_storage().data_ptr(), view.storage_offset()
 
 
 @pytest.fixture
-def shared_tensor(tmp_path):
+def shared_tensor(tmp_path, monkeypatch):
     """The recurrent sharers of the first raw tensor and the state views the runner bound for them."""
     landed._require_cpu_mode()
     config = first._engine_config()
+    root = landed._fixture()["root"]
+    spec = _two_recurrent_then_attention(root)
+    monkeypatch.setattr(root, "get_kv_spec", lambda: spec)
     with first._parallel_state(tmp_path, config):
         runner = NeuronModelRunner(config, device=torch.device("cpu"))
-        runner.model = landed._fixture()["root"]
+        runner.model = root
         runner.vocab_size = item.STACK_VOCAB_SIZE
         specs = runner.get_kv_cache_spec()
         kv_cache_config = _production_kv_cache_config(runner, config, specs)
