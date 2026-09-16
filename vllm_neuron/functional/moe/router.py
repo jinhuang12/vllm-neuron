@@ -1019,6 +1019,18 @@ def noaux_tc_dispatch_counters() -> Tuple[int, int]:
     return _NOAUX_TC_COUNTERS.nki_dispatch, _NOAUX_TC_COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _NOAUX_TC_COUNTERS.nki_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _NOAUX_TC_COUNTERS.torch_fallback += 1
+
+
 def _require_noaux_tc_extents(num_experts: int, top_k: int) -> None:
     """Refuse, by name, every extent the reused members cannot serve.
 
@@ -1534,7 +1546,7 @@ def noaux_tc_correct(
     bias = _legalize_correction_bias(correction_bias, num_experts)
 
     if not can_run_noaux_tc_router(router_logits, num_experts, top_k):
-        _NOAUX_TC_COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         return noaux_tc_correct_torch_oracle(
             router_logits, bias, norm_topk_prob, routed_scaling_factor
         )
@@ -1544,7 +1556,7 @@ def noaux_tc_correct(
     # loop consumes whole `NOAUX_TC_TILE` rows. 128, not the fused entry's 256.
     t_pad = _noaux_tc_pad_target(num_tokens, NOAUX_TC_TILE)
 
-    _NOAUX_TC_COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     index, affinities = wrap_nki(_noaux_tc_correct_nki)(
         router_logits=_noaux_tc_pad_tokens(router_logits.to(torch.float32), t_pad),
         correction_bias=bias,
@@ -1649,7 +1661,7 @@ def noaux_tc_rmsnorm_router_topk(
     )
     seam_admits = can_run_noaux_tc_router(hidden_padded, num_experts, top_k)
     if not (substrate_admits and seam_admits):
-        _NOAUX_TC_COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         return noaux_tc_rmsnorm_router_topk_torch_oracle(
             hidden_states,
             gamma,
@@ -1661,7 +1673,7 @@ def noaux_tc_rmsnorm_router_topk(
             router_mm_dtype,
         )
 
-    _NOAUX_TC_COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     # `[2]` is the SPMD launch grid, not an output arity: the reused subkernels
     # shard over the two logical cores, and the substrate enters its own kernel
     # the same way (`rmsnorm_router_topk_tkg.py:97-98`, docstring `:378`
