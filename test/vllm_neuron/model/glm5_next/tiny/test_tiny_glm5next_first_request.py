@@ -316,11 +316,15 @@ def test_the_runner_refuses_async_without_a_sampler_by_name(tmp_path, monkeypatc
 
 
 def _warmed_state(tmp_path, config, root) -> tuple[bool, dict, bool]:
-    """Build the runner, run both warmups, and read the async flag, the buffer, and whether a step is pending."""
+    """Build the runner, run both warmups, and read the async flag, the buffer, and whether a step is pending.
+
+    A synchronous runner never creates the buffer; an absent buffer reads as empty.
+    """
     with _parallel_state(tmp_path, config):
         runner = _runner(config, root)
         _warm(runner)
-        return runner.use_async_scheduling, dict(runner.async_execution_buffer), runner.execute_model_state is not None
+        buffer = dict(getattr(runner, "async_execution_buffer", {}))
+        return runner.use_async_scheduling, buffer, runner.execute_model_state is not None
 
 
 def test_warmup_leaves_no_async_execution_state(tmp_path):
