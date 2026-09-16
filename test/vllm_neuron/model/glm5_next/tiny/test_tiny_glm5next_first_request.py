@@ -285,8 +285,8 @@ def test_an_explicit_sampler_config_for_the_class_is_refused_by_name():
     landed._require_cpu_mode()
     with pytest.raises(ValueError) as raised:
         _engine_config(on_device_sampling=True)
-    message = str(raised.value)
-    print(f"FIRSTREQ|explicit_sampler|message={message[:200]}")
+    message = " ".join(str(raised.value).split())
+    print(f"FIRSTREQ|explicit_sampler|message={message[:300]}")
     assert ARCH in message and "on_device_sampling_config" in message and "no on-device sampler" in message
 
 
@@ -315,28 +315,31 @@ def test_the_runner_refuses_async_without_a_sampler_by_name(tmp_path, monkeypatc
     assert ARCH in message and "synchronous scheduling" in message
 
 
-def test_warmup_leaves_no_async_execution_state(tmp_path, monkeypatch):
-    """Both warmups leave the buffer empty and no step pending, under the resolved config and the class as it stood."""
-    landed._require_cpu_mode()
-    root = landed._fixture()["root"]
-    readings = {}
-    for label, config in (("resolved", _engine_config()),):
-        with _parallel_state(tmp_path / label, config):
-            runner = _runner(config, root)
-            _warm(runner)
-            readings[label] = (runner.use_async_scheduling, dict(runner.async_execution_buffer),
-                               runner.execute_model_state is not None)
-    _declaring_a_sampler(monkeypatch)
-    config = _engine_config(async_scheduling=True)
-    with _parallel_state(tmp_path / "as_it_stood", config):
+def _warmed_state(tmp_path, config, root) -> tuple[bool, dict, bool]:
+    """Build the runner, run both warmups, and read the async flag, the buffer, and whether a step is pending."""
+    with _parallel_state(tmp_path, config):
         runner = _runner(config, root)
         _warm(runner)
-        readings["as_it_stood"] = (runner.use_async_scheduling, dict(runner.async_execution_buffer),
-                                   runner.execute_model_state is not None)
-    for label, (is_async, buffer, pending) in readings.items():
-        print(f"FIRSTREQ|warmup|{label}|async={is_async}|buffer_keys={sorted(buffer)}|pending={pending}")
-    assert readings["resolved"][0] is False and readings["as_it_stood"][0] is True
-    assert all(buffer == {} and not pending for _, buffer, pending in readings.values()), readings
+        return runner.use_async_scheduling, dict(runner.async_execution_buffer), runner.execute_model_state is not None
+
+
+def test_warmup_leaves_no_async_execution_state(tmp_path):
+    """No knob set: both warmups leave the buffer empty and no step pending."""
+    landed._require_cpu_mode()
+    is_async, buffer, pending = _warmed_state(tmp_path, _engine_config(), landed._fixture()["root"])
+    print(f"FIRSTREQ|warmup|resolved|async={is_async}|buffer_keys={sorted(buffer)}|pending={pending}")
+    assert is_async is False and buffer == {} and pending is False
+
+
+def test_warmup_left_no_async_execution_state_as_it_stood(tmp_path, monkeypatch):
+    """The class as it stood, async on: both warmups still leave the buffer empty, so there was nothing to clear."""
+    landed._require_cpu_mode()
+    _declaring_a_sampler(monkeypatch)
+    is_async, buffer, pending = _warmed_state(
+        tmp_path, _engine_config(async_scheduling=True), landed._fixture()["root"]
+    )
+    print(f"FIRSTREQ|warmup|as_it_stood|async={is_async}|buffer_keys={sorted(buffer)}|pending={pending}")
+    assert is_async is True and buffer == {} and pending is False
 
 
 def test_the_first_request_returns_integer_token_ids(tmp_path):
@@ -370,9 +373,10 @@ def test_the_first_request_returns_integer_token_ids(tmp_path):
         want = landed._reference_logits(fixture, torch.tensor(sequence, dtype=torch.int64))[0].float()
         spread = float((logits[0].float() - want).abs().max())
         top = logits[0].float().topk(2)
+        ties = int((logits[0].float() == logits[0].float().max()).sum())
         print(f"FIRSTREQ|logits|{label}|tokens={len(sequence)}|max_abs_delta={spread:.6g}"
               f"|reference_argmax={int(want.argmax())}|top2={top.indices.tolist()}"
-              f"|margin={float(top.values[0] - top.values[1]):.6g}")
+              f"|margin={float(top.values[0] - top.values[1]):.6g}|ties_at_the_max={ties}")
         torch.testing.assert_close(logits[0].float(), want, rtol=LOGITS_RTOL, atol=LOGITS_ATOL)
 
 
