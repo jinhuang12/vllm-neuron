@@ -889,6 +889,17 @@ def test_cte_128_a_lossy_256_retile_must_not_reach_exactness() -> None:
 # --------------------------------------------------------------------------- #
 # ROUTE CONTROL: the zero above is armed, and there is no torch route to take.   #
 # --------------------------------------------------------------------------- #
+def _is_wrap_nki_dispatch(callee: ast.AST) -> bool:
+    """``wrap_nki(kernel)`` or ``wrap_nki(kernel)[shards]``: the callee of the seam's one dispatch."""
+    if isinstance(callee, ast.Subscript):
+        callee = callee.value
+    return (
+        isinstance(callee, ast.Call)
+        and isinstance(callee.func, ast.Name)
+        and callee.func.id == "wrap_nki"
+    )
+
+
 def test_cte_128_route_control_the_gate_up_limb_has_no_torch_route() -> None:
     """With the simulator off the gate reads False and the call RAISES.
 
@@ -949,13 +960,7 @@ def test_cte_128_route_control_the_gate_up_limb_has_no_torch_route() -> None:
     call_returns = [
         node for node in returns if isinstance(node.value, ast.Call)
     ]
-    wrap_returns = [
-        node
-        for node in call_returns
-        if isinstance(node.value.func, ast.Call)
-        and isinstance(node.value.func.func, ast.Name)
-        and node.value.func.func.id == "wrap_nki"
-    ]
+    wrap_returns = [node for node in call_returns if _is_wrap_nki_dispatch(node.value.func)]
     _emit_128(
         "route-control",
         f"seam_returns={len(returns)} call_returns={len(call_returns)} "
