@@ -824,14 +824,19 @@ def _padding_resolved(rows: int, positions, pad_row: int):
 def _bank_rows(rows: int, expert, iota, stride: int, offset: int, step: int):
     """Row addresses of one expert's slab: ``expert * stride + offset + step * i``.
 
+    The engine forms this int32 in float32 (``nisa.tensor_scalar`` casts its data
+    to float32 and casts the result back), so every address must stay below 2**24
+    or its low bits round away. :func:`gate_up_bank_address` and
+    :func:`down_bank_address` keep it there: a weight bank is addressed in
+    contraction rows (``expert * H + h``), never in 128-wide column blocks.
+
     THE PER-BLOCK DEVICE SCALAR AS A WEIGHT-BUFFER OFFSET -- the mechanism arm 4 of
     the `-113` probe read MATCH on (run 229). The expert never becomes a Python int,
     so no host read stands between the mapping and the weight this kernel reads, and
     no expert slab is ever copied to make one contiguous.
 
-    ``step`` is the ramp's own stride, which is 1 only when the addressed rows are
-    adjacent. A bank viewed as ``[E * rows * n_col_blocks, block]`` walks
-    ``n_col_blocks`` rows per source row, and that number is ``step``.
+    ``step`` is the ramp's own stride: 1 when the addressed rows are adjacent, as
+    they are for a bank viewed ``[E * rows, cols]``.
     """
     base = _column(rows)
     nisa.tensor_scalar(dst=base, data=expert, op0=nl.multiply, operand0=stride)
@@ -859,25 +864,49 @@ def _affinity_rows(rows: int, resolved, expert, n_experts: int):
     return index
 
 
-def _gathered(hbm, index, rows: int, width: int, dtype):
-    """``rows`` rows of an ``[n, width]`` HBM tensor, addressed by a device index tile.
+def _gathered(
+    hbm, index, rows: int, width: int, dtype, row_width: int = 0, column: int = 0
+):
+    """``rows`` by ``width`` of an ``[n, row_width]`` HBM tensor, addressed by a device index tile.
 
     `-045`'s landed indirect-DMA form (``dsa/ragged_pack.py:384-392``,
     ``:466-474``): the access pattern's partition dimension is replaced by one
-    address per partition, taken from ``index``. Arm 1 of the `-113` probe read this
-    exact shape MATCH under lease event 229.
+    address per partition, taken from ``index``, in whole rows of the tensor.
+    ``column`` is the static element offset of the tile inside its row, so one
+    call reads one column block of a row wider than the tile; ``row_width`` is
+    the tensor's own row and defaults to ``width``. Arm 1 of the `-113` probe
+    read this exact shape MATCH under lease event 229.
     """
     tile = nl.ndarray((rows, _padded(width)), dtype=dtype, buffer=nl.sbuf)[:, 0:width]
     nisa.dma_copy(
         dst=tile,
         src=hbm.ap(
-            pattern=[[width, rows], [1, width]],
-            offset=0,
+            pattern=[[row_width or width, rows], [1, width]],
+            offset=column,
             vector_offset=index,
             indirect_dim=0,
         ),
     )
     return tile
+
+
+def gate_up_bank_address(
+    h_extent: int, h0: int, column_block: int
+) -> tuple[int, int, int, int]:
+    """``(stride, offset, step, column)`` of one gate/up weight tile in the ``[E * H, 2 * I]`` bank.
+
+    The row address is ``expert * h_extent + h0 + i`` (``stride, offset, step``), the
+    column block a static element offset; the largest row is ``E * H - 1``, below 2**24
+    for every served or single-rank geometry of this model.
+    """
+    return h_extent, h0, 1, column_block * GATE_UP_SCALE_BLOCK
+
+
+def down_bank_address(
+    i_extent: int, i0: int, h_block: int
+) -> tuple[int, int, int, int]:
+    """``(stride, offset, step, column)`` of one down weight tile in the ``[E * I, H]`` bank."""
+    return i_extent, i0, 1, h_block * GATE_UP_SCALE_BLOCK
 
 
 def _transpose_rows(
@@ -1203,36 +1232,33 @@ def moe_gate_up_blockwise_fp8_kernel(
                     for h_sub in range(GATE_UP_H_TILES_PER_BLOCK):
                         h0 = h_block * GATE_UP_SCALE_BLOCK + h_sub * TILE_SIZE
                         hidden_tile = hidden_t[h0 // TILE_SIZE]
-                        # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free], each
-                        # addressed at ``expert * H * n_col_blocks + (h0 + i) *
-                        # n_col_blocks + column_block`` in the bank's own row units.
+                        # [H=TILE_SIZE partitions, I=GATE_UP_SCALE_BLOCK free]: row
+                        # ``expert * H + h0 + i`` of the ``[E * H, 2 * I]`` bank, the
+                        # gate or up column block as a static offset into that row.
+                        stride, row0, step, gate_column = gate_up_bank_address(
+                            h_extent, h0, i_block
+                        )
+                        up_column = gate_up_bank_address(
+                            h_extent, h0, n_i_blocks + i_block
+                        )[3]
+                        h_rows = _bank_rows(TILE_SIZE, expert, ramp, stride, row0, step)
                         gate_w = _gathered(
                             weight_bank,
-                            _bank_rows(
-                                TILE_SIZE,
-                                expert,
-                                ramp,
-                                h_extent * n_col_blocks,
-                                h0 * n_col_blocks + i_block,
-                                n_col_blocks,
-                            ),
+                            h_rows,
                             TILE_SIZE,
                             GATE_UP_SCALE_BLOCK,
                             nl.bfloat16,
+                            fused_cols,
+                            gate_column,
                         )
                         up_w = _gathered(
                             weight_bank,
-                            _bank_rows(
-                                TILE_SIZE,
-                                expert,
-                                ramp,
-                                h_extent * n_col_blocks,
-                                h0 * n_col_blocks + n_i_blocks + i_block,
-                                n_col_blocks,
-                            ),
+                            h_rows,
                             TILE_SIZE,
                             GATE_UP_SCALE_BLOCK,
                             nl.bfloat16,
+                            fused_cols,
+                            up_column,
                         )
                         # dst = stationary.T @ moving = [B, I]. The accumulate flag is
                         # explicit rather than inferred, so first-write-overwrites is
@@ -1520,7 +1546,7 @@ def moe_gate_up_blockwise_fp8(
         hidden_states.to(torch.bfloat16),
         # The bank's own rows, one ``128``-column block each. ``[E, H, 2*I]`` is
         # contiguous, so this is a view and the kernel's addressing is exact.
-        weight_bank.reshape(-1, GATE_UP_SCALE_BLOCK),
+        weight_bank.reshape(-1, fused_cols),
         scale_bank.to(torch.float32).reshape(-1, expected[1]),
         row_index.to(torch.int32).reshape(-1, 1),
         expert_index.to(torch.int32).reshape(-1, 1),
@@ -1972,19 +1998,15 @@ def moe_down_blockwise_fp8_kernel(
                         TILE_SIZE,
                         nl.bfloat16,
                     )
+                    stride, row0, step, column = down_bank_address(i_extent, i0, h_block)
                     w_tile = _gathered(
                         weight_bank,
-                        _bank_rows(
-                            TILE_SIZE,
-                            expert,
-                            ramp,
-                            i_extent * n_h_blocks,
-                            i0 * n_h_blocks + h_block,
-                            n_h_blocks,
-                        ),
+                        _bank_rows(TILE_SIZE, expert, ramp, stride, row0, step),
                         TILE_SIZE,
                         GATE_UP_SCALE_BLOCK,
                         nl.bfloat16,
+                        h_extent,
+                        column,
                     )
                     nisa.nc_matmul(
                         dst=psum[0:TILE_SIZE, 0:GATE_UP_SCALE_BLOCK],
@@ -2102,7 +2124,7 @@ def moe_down_blockwise_fp8(
     _count_down_nki_dispatch()
     return wrap_nki(moe_down_blockwise_fp8_kernel)[NUM_SHARDS](
         intermediate_t.to(torch.float32),
-        weight_bank.reshape(-1, GATE_UP_SCALE_BLOCK),
+        weight_bank.reshape(-1, cols),
         scale_bank.to(torch.float32).reshape(-1, expected[1]),
         affinity_bank.to(torch.float32).reshape(-1, 1),
         row_index.to(torch.int32).reshape(-1, 1),
