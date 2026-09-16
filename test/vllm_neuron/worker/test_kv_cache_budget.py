@@ -7,7 +7,7 @@ The declared acceptance command:
       test/vllm_neuron/worker/test_kv_cache_budget.py -s -rA --timeout 120 \\
       -p no:cacheprovider
 
-Four items, one per declared conjunct. The KV cache layout is the registered one
+Seven items, one per declared conjunct. The KV cache layout is the registered one
 for this stack -- 11 latent-attention layers and 34 recurrent-state layers at
 block size 128, bfloat16, tensor-parallel degree 64 -- and every expected number
 below is arithmetic over those registered values, never a copy of what the code
@@ -78,11 +78,23 @@ _WORKER_METHODS = (
     "_compute_kv_budget",
     "_kv_cache_need_bytes",
     "_physical_core_kv_bound",
+    "_prepared_operand_bytes",
     "_get_graph_reserve_bytes",
     "_get_kv_cap_fraction",
     "_determine_available_memory_cpu",
     "_determine_available_memory_neuron",
+    "_estimate_available_memory_neuron",
 )
+
+
+class _FakeModel(torch.nn.Module):
+    """One parameter, plus whatever prepared attributes an item needs."""
+
+    def __init__(self, prepared: dict | None = None) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+        for name, value in (prepared or {}).items():
+            setattr(self, name, value)
 
 
 def _recurrent_state() -> tuple[tuple, tuple, tuple]:
@@ -130,7 +142,13 @@ def _registered_specs() -> dict:
     return specs
 
 
-def _worker(*, bytes_used: int = MEASURED_BYTES_USED, host_bytes: int = 1024 * GIB):
+def _worker(
+    *,
+    bytes_used: int = MEASURED_BYTES_USED,
+    host_bytes: int = 1024 * GIB,
+    total_hbm: int = TOTAL_HBM_BYTES,
+    model: torch.nn.Module | None = None,
+):
     """A fake worker carrying the real methods and stubbed memory readings."""
     from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 
@@ -160,14 +178,18 @@ def _worker(*, bytes_used: int = MEASURED_BYTES_USED, host_bytes: int = 1024 * G
                 prefill_context_parallel_size=1,
             ),
         ),
-        model_runner=SimpleNamespace(get_kv_cache_spec=_registered_specs),
+        model_runner=SimpleNamespace(
+            get_kv_cache_spec=_registered_specs,
+            model=model if model is not None else _FakeModel(),
+            drafter=None,
+        ),
     )
     for name in _WORKER_METHODS:
         setattr(worker, name, types.MethodType(getattr(NeuronWorker, name), worker))
     worker._query_host_runtime_memory = lambda: host_bytes
     worker._query_runtime_memory_stats = lambda: (
         bytes_used,
-        TOTAL_HBM_BYTES - bytes_used,
+        total_hbm - bytes_used,
     )
     worker._get_byte_used_from_model = lambda: bytes_used
     return worker
@@ -206,7 +228,8 @@ def test_the_heuristic_is_bounded_by_one_physical_core(monkeypatch) -> None:
     available = worker.determine_available_memory()
 
     print(
-        f"bound={bound / GIB:.4f} GiB room_on_one_core={room_on_one_core / GIB:.4f} GiB "
+        f"bound={bound / GIB:.4f} GiB "
+        f"room_on_one_core={room_on_one_core / GIB:.4f} GiB "
         f"heuristic={heuristic / GIB:.4f} GiB available={available / GIB:.4f} GiB "
         f"need={EXPECTED_NEED_BYTES / GIB:.4f} GiB"
     )
@@ -239,6 +262,87 @@ def test_the_graph_reserve_is_overridable_and_validated(monkeypatch) -> None:
             worker._get_graph_reserve_bytes()
         print(f"refused {offending!r}: {refusal.value}")
         assert "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB" in str(refusal.value)
+
+
+def test_cpu_compilation_and_execution_agree_on_the_bytes(monkeypatch) -> None:
+    """Both modes return the same bytes, so the block count survives the cache."""
+    from libtorch_neuronx_lite.compile.platform import get_total_available_memory
+
+    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    table_gib = get_total_available_memory()
+
+    # The runtime's own footprint makes the device total a few MiB short of the
+    # static table the compile path reads. The need is what closes that gap.
+    monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
+    device_worker = _worker(total_hbm=TOTAL_HBM_BYTES - 3 * 1024**2)
+    device_bytes = device_worker.determine_available_memory()
+
+    monkeypatch.setenv("VLLM_NEURON_CPU_COMPILE", "1")
+    compile_bytes = _worker().determine_available_memory()
+
+    print(
+        f"platform table={table_gib} GiB per logical core; "
+        f"device={device_bytes} B compile={compile_bytes} B "
+        f"need={EXPECTED_NEED_BYTES} B"
+    )
+    assert table_gib * GIB == TOTAL_HBM_BYTES
+    assert device_bytes == compile_bytes == EXPECTED_NEED_BYTES
+
+
+def test_prepared_operands_count_once_towards_residency(monkeypatch) -> None:
+    """Operands kept on module attributes are counted, and counted once."""
+    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    operand_a = torch.zeros(1024, 512, dtype=torch.bfloat16)
+    operand_b = torch.zeros(256, dtype=torch.float32)
+    model = _FakeModel(
+        {
+            # The two shapes of holder the model uses: a dict of operands and a
+            # single tensor.
+            "_prepared_kernel_operands": {"gate_up": operand_a, "down": operand_b},
+            # Already a parameter, so residency must not count it twice.
+            "_prepared_alias": None,
+            # Not tensors, and not prepared: both ignored.
+            "_prepared_retile_health": {"gate": (0, 0, 0)},
+            "cached_host_copy": torch.zeros(4096, dtype=torch.float32),
+        }
+    )
+    model._prepared_alias = model.weight.data
+    worker = _worker(model=model)
+
+    prepared_bytes = worker._prepared_operand_bytes()
+    bound_with = worker._physical_core_kv_bound(
+        TOTAL_HBM_BYTES, MEASURED_BYTES_USED + prepared_bytes
+    )
+    bound_without = worker._physical_core_kv_bound(
+        TOTAL_HBM_BYTES, MEASURED_BYTES_USED
+    )
+
+    print(
+        f"prepared={prepared_bytes} B expected={operand_a.nbytes + operand_b.nbytes} B "
+        f"bound with={bound_with} B without={bound_without} B"
+    )
+    assert prepared_bytes == operand_a.nbytes + operand_b.nbytes
+    assert bound_with < bound_without
+
+
+def test_a_need_over_the_budget_is_refused_by_name(monkeypatch) -> None:
+    """A budget under the need refuses, naming both figures and the mode."""
+    monkeypatch.setenv("VLLM_NEURON_CPU_MODE", "1")
+    monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    # A fair share far under the need: the cache cannot take the served shape.
+    worker = _worker(host_bytes=32 * 1024**2)
+
+    with pytest.raises(RuntimeError) as refusal:
+        worker.determine_available_memory()
+
+    message = str(refusal.value)
+    print(f"refused: {message}")
+    assert f"{EXPECTED_NEED_BYTES / GIB:.3f} GiB" in message
+    assert "cpu mode" in message
+    assert "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB" in message
 
 
 def test_control_the_logical_core_budget_over_allocates(monkeypatch) -> None:
