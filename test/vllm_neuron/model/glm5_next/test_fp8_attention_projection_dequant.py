@@ -149,6 +149,7 @@ def test_every_scaled_attention_weight_downscales_and_the_other_families_hold():
         name for name in mapping
         if ".self_attn." in name and name.endswith("_weight")
         and name.rsplit(".", 1)[-1][: -len("_weight")] in loaders.DSA_SCALED_PROJECTIONS
+        and f"{name[: -len('_weight')]}_{loaders.FP8_SCALE_SUFFIX}" in mapping
     )
     downscaled = [name for name in attention if kinds[name] == "quantised_weight" and _downscales(name, as_list(mapping[name]))]
     dense = [n for n in mapping if ".mlp." in n and "experts" not in n and kinds[n] == "quantised_weight"]
