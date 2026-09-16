@@ -9,8 +9,8 @@ scheduler output, the way the worker calls it. Readings: the platform resolves o
 and async scheduling off from the model class, by name; warmup leaves no async-execution state;
 the first request returns integer token ids from the vLLM Sampler over the full vocabulary, each
 the argmax of the model's own logits; the spec-to-non-spec transition is read from the recorded
-fact and never taken without a speculative config; a sampled-token future that holds logits is
-refused by name, where it used to reach ``numpy``. The controls re-create the class as it stood,
+fact, never taken without a speculative config and taken when the fact and the config agree; a
+sampled-token future that holds logits is refused by name, where it used to reach ``numpy``. The controls re-create the class as it stood,
 declaring a sampler it does not have.
 """
 
@@ -20,6 +20,7 @@ import contextlib
 import logging
 import pathlib
 import traceback
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -455,3 +456,31 @@ def test_without_the_refusal_the_same_future_reaches_numpy(tmp_path, monkeypatch
     print(f"FIRSTREQ|control|frames={frames[-4:]}|message={message[:120]}")
     assert "BFloat16" in message, message
     assert frames[-3:] == ["_materialize_pending_async_output", "get_output", "_parse_rejection_sampling_output"], frames
+
+
+def test_the_transition_is_taken_when_the_fact_and_the_config_agree(tmp_path, monkeypatch):
+    """A recorded spec step under a speculative config breaks the async flow at the transition, handing on the last accepted token."""
+    landed._require_cpu_mode()
+    _declaring_a_sampler(monkeypatch)
+    root = landed._fixture()["root"]
+    prompt = _prompt()
+    config = _engine_config(async_scheduling=True)
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root)
+        _warm(runner)
+        _step(runner, _prefill_step(prompt, _groups(runner)))
+        accepted = torch.tensor([prompt[-1]], dtype=torch.int64)
+        runner.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+        runner.async_execution_buffer["prev_step_was_spec"] = True
+        runner.async_execution_buffer["futures_last_accepted_token"] = accepted
+        reasons = _recording(runner, monkeypatch)
+        with pytest.raises(TypeError) as raised:
+            runner.execute_model(_decode_step(position=len(prompt), generated=1, groups=_groups(runner)))
+    frames = _frames(raised)
+    print(f"FIRSTREQ|transition_taken|reasons={reasons}"
+          f"|bonus_is_the_planted_tensor={runner._transition_bonus_tensor is accepted}"
+          f"|composition_changed={runner._batch_composition_changed}|frames={frames[-3:]}")
+    assert reasons[:1] == ["spec\u2192non-spec transition"], reasons
+    assert runner._transition_bonus_tensor is accepted
+    assert runner._batch_composition_changed is True
+    assert frames[-3:] == ["_materialize_pending_async_output", "get_output", "_refuse_non_integer_future"], frames
