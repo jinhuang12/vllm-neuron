@@ -264,8 +264,10 @@ def test_the_first_request_returns_integer_token_ids(tmp_path):
         assert ids[0][0] == int(logits[0].float().argmax()), (label, ids)
         want = landed._reference_logits(fixture, torch.tensor(sequence, dtype=torch.int64))[0].float()
         spread = float((logits[0].float() - want).abs().max())
+        top = logits[0].float().topk(2)
         print(f"FIRSTREQ|logits|{label}|tokens={len(sequence)}|max_abs_delta={spread:.6g}"
-              f"|reference_argmax={int(want.argmax())}")
+              f"|reference_argmax={int(want.argmax())}|top2={top.indices.tolist()}"
+              f"|margin={float(top.values[0] - top.values[1]):.6g}")
         torch.testing.assert_close(logits[0].float(), want, rtol=LOGITS_RTOL, atol=LOGITS_ATOL)
 
 
