@@ -7,7 +7,7 @@ The declared acceptance command:
       test/vllm_neuron/worker/test_kv_cache_budget.py -s -rA --timeout 120 \\
       -p no:cacheprovider
 
-Eight items, one per declared conjunct. The KV cache layout is the registered one
+Nine items, one per declared conjunct. The KV cache layout is the registered one
 for this stack -- 11 latent-attention layers and 34 recurrent-state layers at
 block size 128, bfloat16, tensor-parallel degree 64 -- and every expected number
 below is arithmetic over those registered values, never a copy of what the code
@@ -365,6 +365,33 @@ def test_prepared_operands_count_once_towards_residency(monkeypatch) -> None:
     )
     assert prepared_bytes == operand_a.nbytes + operand_b.nbytes
     assert bound_with < bound_without
+
+
+def test_prepared_operands_on_the_meta_device_are_counted(monkeypatch) -> None:
+    """A model on meta reports its operands, and its parameter only once.
+
+    The compile path can hold the model on the meta device, where a tensor has no
+    memory and reports a zero pointer instead of raising. Reading that zero as an
+    identity would make every meta tensor after the first look already counted,
+    and the operand bytes would vanish in exactly the mode whose block count has
+    to match the device's.
+    """
+    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    operand = torch.zeros(1024, 512, dtype=torch.bfloat16, device="meta")
+    model = _FakeModel({"_prepared_kernel_operands": {"gate_up": operand}})
+    model.to("meta")
+    # The parameter itself, reachable twice: as a parameter and as a prepared
+    # attribute. It must be counted neither twice nor at all.
+    model._prepared_alias = model.weight
+
+    prepared_bytes = _worker(model=model)._prepared_operand_bytes()
+
+    print(
+        f"meta operand nbytes={operand.nbytes} counted={prepared_bytes} "
+        f"parameter nbytes={model.weight.nbytes} device={model.weight.device.type}"
+    )
+    assert model.weight.device.type == "meta"
+    assert prepared_bytes == operand.nbytes
 
 
 def test_a_need_over_the_budget_is_refused_by_name(monkeypatch) -> None:

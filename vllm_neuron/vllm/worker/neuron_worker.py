@@ -67,17 +67,24 @@ PHYSICAL_CORES_PER_LOGICAL_CORE = 2
 
 
 def _tensor_identity(tensor: torch.Tensor) -> Any:
-    """Return a key equal for two tensors that share the same memory."""
-    try:
-        return ("storage", tensor.untyped_storage().data_ptr())
-    except Exception:
-        pass
-    try:
-        return ("address", tensor.data_ptr())
-    except Exception:
-        # A device or meta tensor may expose neither. Fall back to the object,
-        # which counts a view of a counted tensor twice rather than dropping it.
-        return ("object", id(tensor))
+    """Return a key equal for two tensors that share the same memory.
+
+    A ZERO POINTER IS NO IDENTITY. A tensor on the meta device holds no memory
+    and reports zero from both readers rather than raising, and an empty tensor
+    reports zero too, so trusting the value would collapse every meta tensor in a
+    model onto one key and make each one after the first look already counted.
+    Such a tensor falls back to its own object instead. That cannot recognise two
+    meta views of one meta tensor, which counts bytes twice rather than dropping
+    them -- the safe direction for a bound, and disclosed as such.
+    """
+    for reader in (lambda: tensor.untyped_storage().data_ptr(), tensor.data_ptr):
+        try:
+            pointer = reader()
+        except Exception:
+            continue  # a device tensor may expose no storage and no address
+        if pointer:
+            return ("address", pointer)
+    return ("object", id(tensor))
 
 
 def _tensors_in(value: Any) -> list[torch.Tensor]:
