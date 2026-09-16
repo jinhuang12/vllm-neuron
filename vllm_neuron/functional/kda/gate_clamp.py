@@ -146,6 +146,12 @@ def gate_clamp_dispatch_counters() -> tuple[int, int]:
     )
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _GATE_CLAMP_COUNTERS.nki_dispatch += 1
+
+
 @nki.jit
 def kda_gate_clamp_kernel(g_hbm, a_hbm, bias_hbm, lower):
     """``lower * sigmoid(exp(A_log) * (g + bias))`` for one tile.
@@ -298,7 +304,7 @@ def kda_gate_clamp(
             )
         bias_col = bias.reshape(kdim, 1).to(torch.float32)
 
-    _GATE_CLAMP_COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     return wrap_nki(kda_gate_clamp_kernel)(
         g.to(torch.float32),
         a_log.reshape(1, 1).to(torch.float32),

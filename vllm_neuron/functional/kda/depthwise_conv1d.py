@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import logging
 
+import torch
 from torch import Tensor
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
@@ -316,6 +317,18 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def can_run_depthwise_conv1d(
     img: Tensor,
     filt: Tensor,
@@ -380,7 +393,7 @@ def depthwise_conv1d(
     if not can_run_depthwise_conv1d(
         img, filt, padding, stride, rhs_dilation, lhs_dilation, batch_group_count
     ):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "depthwise_conv1d: NKI route unavailable, using the substrate's "
             "torch reference (reference only, not the shipped path)"
@@ -395,7 +408,7 @@ def depthwise_conv1d(
             batch_group_count=batch_group_count,
         )
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     return wrap_nki(depthwise_conv1d_implicit_gemm)(
         img_ref=img,
         filter_ref=filt,

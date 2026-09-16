@@ -210,6 +210,12 @@ def mla_sparse_dispatch_counters() -> tuple[int, int]:
     )
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _MLA_SPARSE_COUNTERS.nki_dispatch += 1
+
+
 # THESE THREE TAKE POSITIONAL SHAPES ONLY, and no caller anywhere passes a keyword.
 # NKI's compiler DROPS a keyword-only parameter -- it discards the name instead of
 # applying the default -- so a helper written `def _sbuf(*shape, dtype=nl.float32)`
@@ -629,6 +635,12 @@ def mla_sparse_tiled_dispatch_counters() -> tuple[int, int]:
     )
 
 
+@torch._dynamo.assume_constant_result
+def _count_tiled_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _MLA_SPARSE_TILED_COUNTERS.nki_dispatch += 1
+
+
 def _latent_tiles(latent: int) -> tuple[tuple[int, int], ...]:
     """``(offset, extent)`` per PARTITION-axis latent tile. The last one may be ragged.
 
@@ -970,6 +982,12 @@ def mla_sparse_row_tiled_dispatch_counters() -> tuple[int, int]:
         _MLA_SPARSE_ROW_TILED_COUNTERS.nki_dispatch,
         _MLA_SPARSE_ROW_TILED_COUNTERS.torch_fallback,
     )
+
+
+@torch._dynamo.assume_constant_result
+def _count_row_tiled_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _MLA_SPARSE_ROW_TILED_COUNTERS.nki_dispatch += 1
 
 
 def _score_tiles(topk: int) -> tuple[tuple[int, int], ...]:
@@ -1486,7 +1504,7 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                 f"sentinel; got the range [{lo}, {hi}] against s_kv={s_kv}"
             )
 
-    _MLA_SPARSE_COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
 
     # `inc-glm53f-041`'s branch. The seam decides from the WIDTH ALONE: an exact-fit
     # latent keeps `-040`'s body and anything ragged or wider than one MM2 moving tile
@@ -1501,7 +1519,7 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     # difference is what a test can measure, and it is measured.
     tiled = latent % LATENT_TILE != 0 or latent > MOVING_MAX
     if tiled:
-        _MLA_SPARSE_TILED_COUNTERS.nki_dispatch += 1
+        _count_tiled_nki_dispatch()
 
     # `inc-glm53f-093`'s branch, added beside `-041`'s and on the same terms. The seam
     # decides from the SELECTED-ROW COUNT alone: a count wider than one MM1 moving tile
@@ -1515,7 +1533,7 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     # the seam counter and 1 here; an exact-fit, narrow call reads 1 and 0.
     rows_tiled = topk > MOVING_MAX
     if rows_tiled:
-        _MLA_SPARSE_ROW_TILED_COUNTERS.nki_dispatch += 1
+        _count_row_tiled_nki_dispatch()
 
     if rows_tiled:
         nope_entry = mla_sparse_attention_nope_row_tiled_kernel

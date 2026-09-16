@@ -204,6 +204,18 @@ def decode_tail_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
 def decode_tail_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the seam LAST dispatched, or ``None``.
 
@@ -620,9 +632,9 @@ def dsa_decode_tail_update(
 
     flat_tail = tail.reshape(TAIL_HALVES * pool_size, head_dim).contiguous()
 
-    _COUNTERS.nki_dispatch += 1
-    # The log and the identity read are FOLDED off the traced graph; the counter increment stays,
-    # because a plain int attribute store is a recorded side effect and not a host call.
+    _count_nki_dispatch()
+    # The counter, the log and the identity read are FOLDED off the traced graph: a counter
+    # store inside the trace becomes a value guard that fails on the first call after warmup.
     _record_nki_dispatch("step", pool_size, slot, head_dim)
     pooled, new_flat = wrap_nki(_decode_tail_update_nki)(
         flat_tail, key.contiguous(), score.contiguous(), ape.contiguous(), pool_size, slot
@@ -681,7 +693,7 @@ def dsa_decode_tail_update_at(
         )
     else:
         flat_tail = tail_rotated.reshape(TAIL_HALVES * pool_size, head_dim).contiguous()
-        _COUNTERS.nki_dispatch += 1
+        _count_nki_dispatch()
         _record_nki_dispatch_at("step_at", pool_size, head_dim)
         pooled, new_flat = wrap_nki(_decode_tail_update_nki)(
             flat_tail,
@@ -735,7 +747,7 @@ def _dsa_decode_tail_update_torch(
     tail: Tensor, key: Tensor, score: Tensor, ape: Tensor, position: int
 ) -> tuple[Tensor | None, Tensor]:
     """The single-step fallback, in torch. Counted, because it is a route the seam can take."""
-    _COUNTERS.torch_fallback += 1
+    _count_torch_fallback()
     pool_size = int(tail.shape[1])
     slot = slot_of(position, pool_size)
 

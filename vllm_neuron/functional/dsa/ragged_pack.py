@@ -172,6 +172,18 @@ def ragged_pack_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
 def ragged_pack_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel a seam LAST dispatched, or ``None``.
 
@@ -667,11 +679,12 @@ def dsa_ragged_pack(padded: Tensor, lengths: Sequence[int]) -> Tensor:
     pos, len_t, off_t = _metadata(checked, max_len, padded.device)
     flat = padded.reshape(batch * max_len, width).contiguous()
 
-    _COUNTERS.nki_dispatch += 1
-    # The log and the identity read are FOLDED off the traced graph. The helper takes a str and
-    # ints ONLY and reads the kernel as a module global: passing the kernel object is the measured
-    # defect that pattern exists to avoid. NO bare logging or other host call Dynamo refuses
-    # belongs on this branch. The counter increment stays: it is a plain int attribute store.
+    _count_nki_dispatch()
+    # The counter, the log and the identity read are FOLDED off the traced graph. The helper takes
+    # a str and ints ONLY and reads the kernel as a module global: passing the kernel object is the
+    # measured defect that pattern exists to avoid. NO bare logging or other host call Dynamo
+    # refuses belongs on this branch. A counter store inside the trace becomes a value guard that
+    # fails on the first call after warmup.
     _record_nki_dispatch("pack", batch, max_len, width, packed_len)
     return wrap_nki(_ragged_pack_nki)(flat, pos, len_t, off_t, packed_len)
 
@@ -713,7 +726,7 @@ def dsa_ragged_unpack(packed: Tensor, lengths: Sequence[int], max_len: int) -> T
 
     pos, len_t, off_t = _metadata(checked, max_len, packed.device)
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     _record_nki_dispatch("unpack", batch, max_len, width, packed_len)
     flat = wrap_nki(_ragged_unpack_nki)(packed.contiguous(), pos, len_t, off_t, max_len)
     return flat.reshape(batch, max_len, width)
@@ -726,7 +739,7 @@ def _dsa_ragged_pack_torch(padded: Tensor, lengths: Sequence[int]) -> Tensor:
     not admit. It increments its own counter so a test can state which route ran instead of
     assuming it.
     """
-    _COUNTERS.torch_fallback += 1
+    _count_torch_fallback()
     logger.info(
         "[dsa-ragged-pack] kernel=torch direction=pack batch=%d max_len=%d width=%d "
         "packed_len=%d reason=nki-route-unavailable",
@@ -744,7 +757,7 @@ def _dsa_ragged_unpack_torch(packed: Tensor, lengths: Sequence[int], max_len: in
     Zeros first and then writes the valid rows, so a padding position is a true ``+0.0`` here too
     and the oracle agrees with the kernel bit for bit rather than only numerically.
     """
-    _COUNTERS.torch_fallback += 1
+    _count_torch_fallback()
     logger.info(
         "[dsa-ragged-pack] kernel=torch direction=unpack batch=%d max_len=%d width=%d "
         "packed_len=%d reason=nki-route-unavailable",

@@ -387,6 +387,18 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def can_run_blockwise_fp8_moe(
     hidden_states: Tensor, rows: int, cols: int
 ) -> bool:
@@ -532,7 +544,7 @@ def blockwise_fp8_moe(
     cols = down_proj_weight.shape[-2]
 
     if not can_run_blockwise_fp8_moe(hidden_states, rows, cols):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "blockwise_fp8_moe: NKI route unavailable, using the torch path "
             "(oracle / constraint-violation fallback, not the shipped path)"
@@ -550,7 +562,7 @@ def blockwise_fp8_moe(
             **kernel_kwargs,
         )
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     # `wrap_nki(...)[NUM_SHARDS]` is the SPMD launch grid, not an output arity:
     # the kernel reads `nl.num_programs(axes=0)` as NUM_SHARDS (:80).
     wrapped = wrap_nki(_torch_compatible_blockwise_mm_baseline_shard_intermediate)
@@ -1044,6 +1056,12 @@ def gate_up_dispatch_counters() -> tuple[int, int]:
     return _GATE_UP_COUNTERS.nki_dispatch, _GATE_UP_COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_gate_up_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _GATE_UP_COUNTERS.nki_dispatch += 1
+
+
 @nki.jit
 def moe_gate_up_blockwise_fp8_kernel(
     hidden, weight_bank, scale_bank, row_index, expert_index, iota
@@ -1497,7 +1515,7 @@ def moe_gate_up_blockwise_fp8(
             f"to_gate_up_kernel_scale_operand rather than by hand."
         )
 
-    _GATE_UP_COUNTERS.nki_dispatch += 1
+    _count_gate_up_nki_dispatch()
     return wrap_nki(moe_gate_up_blockwise_fp8_kernel)[NUM_SHARDS](
         hidden_states.to(torch.bfloat16),
         # The bank's own rows, one ``128``-column block each. ``[E, H, 2*I]`` is
@@ -1611,6 +1629,12 @@ def swiglu_dispatch_counters() -> tuple[int, int]:
     return _SWIGLU_COUNTERS.nki_dispatch, _SWIGLU_COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_swiglu_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _SWIGLU_COUNTERS.nki_dispatch += 1
+
+
 def reset_down_dispatch_counters() -> None:
     """Zero the down limb's counters."""
     _DOWN_COUNTERS.nki_dispatch = 0
@@ -1620,6 +1644,12 @@ def reset_down_dispatch_counters() -> None:
 def down_dispatch_counters() -> tuple[int, int]:
     """``(nki_dispatch, torch_fallback)`` for the down limb. The second is 0 by construction."""
     return _DOWN_COUNTERS.nki_dispatch, _DOWN_COUNTERS.torch_fallback
+
+
+@torch._dynamo.assume_constant_result
+def _count_down_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _DOWN_COUNTERS.nki_dispatch += 1
 
 
 @nki.jit
@@ -1810,7 +1840,7 @@ def moe_swiglu_transposed(
         )
     _refuse_gate_up(problems)
 
-    _SWIGLU_COUNTERS.nki_dispatch += 1
+    _count_swiglu_nki_dispatch()
     return wrap_nki(moe_swiglu_transposed_kernel)[NUM_SHARDS](
         gate_up.to(torch.float32),
         _swiglu_bound_operand(gate_upper, up_upper, gate_up.device),
@@ -2069,7 +2099,7 @@ def moe_down_blockwise_fp8(
             f"from T rather than from this tensor."
         )
 
-    _DOWN_COUNTERS.nki_dispatch += 1
+    _count_down_nki_dispatch()
     return wrap_nki(moe_down_blockwise_fp8_kernel)[NUM_SHARDS](
         intermediate_t.to(torch.float32),
         weight_bank.reshape(-1, GATE_UP_SCALE_BLOCK),

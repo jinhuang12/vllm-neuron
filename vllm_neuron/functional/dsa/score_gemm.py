@@ -206,6 +206,18 @@ def score_gemm_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def score_gemm_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the seam LAST dispatched, or ``None``.
 
@@ -449,14 +461,14 @@ def dsa_score_gemm(q: Tensor, k: Tensor, weights: Tensor) -> Tensor:
     tokens, heads, head_dim, cands = _validate(q, k, weights)
 
     if not can_run_dsa_score_gemm(q, k, weights):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         return _dsa_score_gemm_torch(q, k, weights)
 
-    _COUNTERS.nki_dispatch += 1
-    # The log and the identity read are FOLDED off the traced graph. The helper takes ints only and
-    # reads the kernel as a module global; passing the kernel object is the measured defect that
-    # pattern exists to avoid. The counter increment stays -- a plain int attribute store is a
-    # recorded side effect, not a host call.
+    _count_nki_dispatch()
+    # The counter, the log and the identity read are FOLDED off the traced graph. The helper takes
+    # ints only and reads the kernel as a module global; passing the kernel object is the measured
+    # defect that pattern exists to avoid. A counter store inside the trace becomes a value guard
+    # that fails on the first call after warmup.
     _record_nki_dispatch(tokens, cands, heads, head_dim)
     # Same layout in, same layout out: a contiguous caller gets its own storage back, a strided
     # one gets a plain copy. Neither is a transposing relayout; the kernel turns the operands.

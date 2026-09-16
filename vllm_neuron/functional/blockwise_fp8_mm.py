@@ -403,6 +403,18 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def can_run_blockwise_fp8_mm(x: Tensor, rows: int, cols: int, tokens: int) -> bool:
     """Is the NKI route available *and* admissible for this geometry?
 
@@ -492,22 +504,22 @@ def blockwise_fp8_mm(
     cols = weight.shape[-1]
 
     if not can_run_blockwise_fp8_mm(x, rows, cols, tokens):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "blockwise_fp8_mm: NKI route unavailable, using the torch path "
             "(oracle / constraint-violation fallback, not the shipped path)"
         )
         return blockwise_fp8_mm_torch_oracle(x, weight, weight_scale)
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     # `inc-glm53f-090`: the operand's ARRIVAL FORM, and the one build site.
     # The counter increments only on the branch that actually builds, so a
     # reading of 0 over a forward step means the bridge did not run on it --
-    # which is the whole claim. The attribute store is the form already proven
-    # graph-safe at capture: ``_COUNTERS.nki_dispatch += 1`` one line above sits
-    # in this same function and `-022` part 1 captured 2/2 shapes with it there.
+    # which is the whole claim. The count is folded off the traced graph: a
+    # counter store inside the trace becomes a value guard that fails on the
+    # first call after warmup.
     if prebuilt_scale_t is None:
-        _BUILD_COUNTERS.scale_layout_builds += 1
+        _count_scale_layout_build()
         scale_t = to_kernel_scale_layout(weight_scale, rows, cols)
     else:
         scale_t = _checked_prebuilt_scale(prebuilt_scale_t, rows, cols)
@@ -613,3 +625,9 @@ def reset_scale_layout_builds() -> None:
 def scale_layout_builds() -> int:
     """How many operands the seam has built since the last reset."""
     return _BUILD_COUNTERS.scale_layout_builds
+
+
+@torch._dynamo.assume_constant_result
+def _count_scale_layout_build() -> None:
+    """Count one scale-layout build, off the traced graph."""
+    _BUILD_COUNTERS.scale_layout_builds += 1

@@ -251,6 +251,18 @@ def causal_bound_dispatch_counters() -> tuple[int, int]:
     return (_BOUND.nki_dispatch, _BOUND.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_bound_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _BOUND.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_bound_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _BOUND.nki_dispatch += 1
+
+
 def causal_bound_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the BOUND seam LAST dispatched, or ``None``.
 
@@ -271,6 +283,18 @@ def reset_causal_sentinel_dispatch_counters() -> None:
 def causal_sentinel_dispatch_counters() -> tuple[int, int]:
     """``(nki_dispatch, torch_fallback)`` for :func:`dsa_causal_sentinel` since its last reset."""
     return (_SENTINEL_COUNTERS.nki_dispatch, _SENTINEL_COUNTERS.torch_fallback)
+
+
+@torch._dynamo.assume_constant_result
+def _count_sentinel_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _SENTINEL_COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_sentinel_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _SENTINEL_COUNTERS.nki_dispatch += 1
 
 
 def causal_sentinel_kernel_identity() -> tuple[str, str] | None:
@@ -668,14 +692,14 @@ def dsa_causal_bound(scores: Tensor, causal_len: Tensor, pool_size: int) -> Tens
     rows = _validate_bound(scores, causal_len, pool_size)
 
     if not can_run_dsa_causal_bound(scores, causal_len, pool_size):
-        _BOUND.torch_fallback += 1
+        _count_bound_torch_fallback()
         return dsa_causal_bound_torch_oracle(scores, causal_len, pool_size)
 
     # The transport the device cannot pay for: the per-row length reaches `tensor_scalar` as a
     # COLUMN operand, so the reshape happens once here rather than per use on the device.
     clen_col = causal_len.reshape(rows, 1).contiguous()
 
-    _BOUND.nki_dispatch += 1
+    _count_bound_nki_dispatch()
     _record_bound_dispatch(rows, int(scores.shape[1]))
     return wrap_nki(_causal_bound_nki)(scores.contiguous(), clen_col, pool_size)
 
@@ -749,10 +773,10 @@ def dsa_causal_sentinel(values: Tensor, indices: Tensor, width: int) -> Tensor:
     rows = _validate_sentinel(values, indices, width)
 
     if not can_run_dsa_causal_sentinel(values, indices, width):
-        _SENTINEL_COUNTERS.torch_fallback += 1
+        _count_sentinel_torch_fallback()
         return dsa_causal_sentinel_torch_oracle(values, indices, width)
 
-    _SENTINEL_COUNTERS.nki_dispatch += 1
+    _count_sentinel_nki_dispatch()
     _record_sentinel_dispatch(rows, int(values.shape[1]), width)
     return wrap_nki(_causal_sentinel_nki)(values.contiguous(), indices.contiguous(), width)
 

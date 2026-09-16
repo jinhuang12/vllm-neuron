@@ -245,6 +245,18 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def doubling_stages(chunk: int) -> int:
     """Matmul stages the terminating Neumann series needs for a ``chunk``-wide tile.
 
@@ -739,7 +751,7 @@ def kda_intra_chunk(
         else 0.0
     )
     if not can_run_intra_chunk(q, n_chunks, chunk, kdim, vdim, gate_abs_max):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "kda_intra_chunk: NKI route unavailable, using the torch path "
             "(oracle only, never the shipped path)"
@@ -747,7 +759,7 @@ def kda_intra_chunk(
         return kda_intra_chunk_torch_oracle(q, k, v, beta, gk)
 
     consts = chunk_constants(chunk, device=q.device, dtype=q.dtype)
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     w, u, kg, a_inv, aqk = wrap_nki(kda_intra_chunk_kernel)(
         q_hbm=q,
         k_hbm=k,
@@ -953,6 +965,18 @@ def reset_inter_dispatch_counters() -> None:
 def inter_dispatch_counters() -> tuple[int, int]:
     """``(nki_dispatch, torch_fallback)`` since the last inter-chunk reset."""
     return _INTER_COUNTERS.nki_dispatch, _INTER_COUNTERS.torch_fallback
+
+
+@torch._dynamo.assume_constant_result
+def _count_inter_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _INTER_COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_inter_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _INTER_COUNTERS.nki_dispatch += 1
 
 
 def inter_chunk_constants(
@@ -1307,7 +1331,7 @@ def kda_inter_chunk(
         else 0.0
     )
     if not can_run_inter_chunk(q, n_chunks, chunk, kdim, vdim, gate_abs_max):
-        _INTER_COUNTERS.torch_fallback += 1
+        _count_inter_torch_fallback()
         logger.debug(
             "kda_inter_chunk: NKI route unavailable, using the torch path "
             "(oracle only, never the shipped path)"
@@ -1315,7 +1339,7 @@ def kda_inter_chunk(
         return kda_inter_chunk_torch_oracle(kg, w, u, gk, q, aqk, state=state)
 
     consts = inter_chunk_constants(chunk, kdim, vdim, device=kg.device, dtype=kg.dtype)
-    _INTER_COUNTERS.nki_dispatch += 1
+    _count_inter_nki_dispatch()
     o, final_state, v_new = wrap_nki(kda_inter_chunk_kernel)(
         kg_hbm=kg,
         w_hbm=w,

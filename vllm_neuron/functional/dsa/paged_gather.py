@@ -164,6 +164,18 @@ def paged_gather_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
 def paged_gather_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the seam LAST dispatched, or ``None``.
 
@@ -372,13 +384,14 @@ def dsa_paged_gather(
     pg = page_indices.reshape(-1, 1).to(torch.int32).contiguous()
     sl = slot_indices.reshape(-1, 1).to(torch.int32).contiguous()
 
-    _COUNTERS.nki_dispatch += 1
-    # The log and the identity read are FOLDED off the traced graph, on the landed
+    _count_nki_dispatch()
+    # The counter, the log and the identity read are FOLDED off the traced graph, on the landed
     # ``vllm_neuron/functional/dsa/topk_select.py:348`` pattern. The helper takes INTS ONLY
     # and reads the kernel as a module global: passing the kernel object is the measured
     # defect that pattern exists to avoid. NO bare logging or other host call Dynamo refuses
     # belongs on this branch -- it is the one branch the runner traces under
-    # ``fullgraph=True``. The counter increment stays: it is a plain int attribute store.
+    # ``fullgraph=True``. A counter store inside the trace becomes a value guard that fails
+    # on the first call after warmup.
     _record_nki_dispatch(tokens, width, page_size)
     return wrap_nki(_paged_gather_nki)(pages, pg, sl, page_size)
 
@@ -392,7 +405,7 @@ def _dsa_paged_gather_torch(
     does not admit. It increments its own counter so a test can state which route ran
     instead of assuming it.
     """
-    _COUNTERS.torch_fallback += 1
+    _count_torch_fallback()
     logger.info(
         "[dsa-paged-gather] kernel=torch tokens=%d width=%d page_size=%d "
         "reason=nki-route-unavailable",

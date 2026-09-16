@@ -146,6 +146,18 @@ def decode_dispatch_counters() -> tuple[int, int]:
     return _DECODE_COUNTERS.nki_dispatch, _DECODE_COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _DECODE_COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _DECODE_COUNTERS.nki_dispatch += 1
+
+
 @nki.jit
 def kda_decode_step_kernel(state_hbm, q_hbm, k_hbm, v_hbm, beta_hbm, gk_hbm):
     """Advance the KDA recurrent state by exactly ONE token.
@@ -332,14 +344,14 @@ def kda_decode_step(
         float(gk.float().abs().max().item()) if values_are_readable(gk) else 0.0
     )
     if not can_run_decode_step(state, kdim, vdim, gate_abs_max):
-        _DECODE_COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "kda_decode_step: NKI route unavailable, using the torch path "
             "(oracle only, never the shipped path)"
         )
         return kda_decode_step_torch_oracle(state, q, k, v, beta, gk)
 
-    _DECODE_COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     o, state_out = wrap_nki(kda_decode_step_kernel)(
         state_hbm=state,
         q_hbm=q,

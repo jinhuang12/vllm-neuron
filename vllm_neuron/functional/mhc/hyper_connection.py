@@ -410,6 +410,18 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def can_run_hyper_connection(
     x: Tensor, residual: Tensor, post_layer_mix: Tensor, comb_res_mix: Tensor
 ) -> bool:
@@ -453,7 +465,7 @@ def hyper_connection_combine(
         HyperConnectionError: on an inadmissible rank or extent.
     """
     if not can_run_hyper_connection(x, residual, post_layer_mix, comb_res_mix):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "hyper_connection_combine: NKI route unavailable, using the torch "
             "path (oracle only, not the shipped path)"
@@ -462,7 +474,7 @@ def hyper_connection_combine(
             x, residual, post_layer_mix, comb_res_mix
         )
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     return wrap_nki(hyper_connection_kernel)(
         x=x,
         residual=residual,

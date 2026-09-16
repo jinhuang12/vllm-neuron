@@ -159,6 +159,12 @@ def mla_projection_dispatch_counters() -> tuple[int, int]:
     )
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _MLA_PROJECTION_COUNTERS.nki_dispatch += 1
+
+
 def _sbuf(rows: int, cols: int):
     return nl.ndarray((rows, cols), dtype=nl.float32, buffer=nl.sbuf)
 
@@ -268,7 +274,7 @@ def mla_projection(x: Tensor, weight: Tensor) -> Tensor:
     odim = int(weight.shape[1])
     _require_mla_projection_admissible(seq, idim, odim)
 
-    _MLA_PROJECTION_COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     return wrap_nki(mla_projection_kernel)(
         x.t().contiguous().to(torch.float32),
         weight.to(torch.float32),

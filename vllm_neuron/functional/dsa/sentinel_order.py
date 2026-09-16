@@ -91,6 +91,18 @@ def sentinel_order_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def sentinel_order_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the seam last dispatched, or ``None``."""
     return _COUNTERS.last_kernel
@@ -209,9 +221,9 @@ def dsa_sentinel_order(pool_ids: Tensor) -> Tensor:
     """
     rows, k = _validate(pool_ids)
     if not can_run_dsa_sentinel_order(pool_ids):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         return _dsa_sentinel_order_torch(pool_ids)
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     _record_nki_dispatch(rows, k)
     return wrap_nki(_sentinel_order_nki)(pool_ids.contiguous())
 

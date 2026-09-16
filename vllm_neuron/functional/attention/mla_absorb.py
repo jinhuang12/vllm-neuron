@@ -201,6 +201,12 @@ def mla_absorb_dispatch_counters() -> tuple[int, int]:
     )
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _MLA_ABSORB_COUNTERS.nki_dispatch += 1
+
+
 def _sbuf(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.float32, buffer=nl.sbuf)
 
@@ -373,7 +379,7 @@ def mla_absorb(x: Tensor, w: Tensor) -> Tensor:
     ndim = int(w.shape[2])
     _require_mla_absorb_admissible(seq, heads, kdim, ndim)
 
-    _MLA_ABSORB_COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     out = wrap_nki(mla_absorb_kernel)(
         x.contiguous(),
         w.contiguous().to(torch.float32),

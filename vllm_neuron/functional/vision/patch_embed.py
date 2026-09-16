@@ -112,6 +112,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import torch
 from torch import Tensor
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
@@ -458,6 +459,18 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def can_run_patch_embed(
     x_in: Tensor,
     filters: Tensor,
@@ -516,7 +529,7 @@ def patch_embed(
     wrap is for.
     """
     if not can_run_patch_embed(x_in, filters, patch_size, bias, padding, dilation):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "patch_embed: NKI route unavailable, using the substrate's torch "
             "reference (reference only, not the shipped path)"
@@ -530,7 +543,7 @@ def patch_embed(
             dilation=dilation,
         )
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     return wrap_nki(conv3d)(
         x_in=x_in,
         filters=filters,

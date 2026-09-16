@@ -207,6 +207,18 @@ def index_expand_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def index_expand_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the seam LAST dispatched, or ``None``.
 
@@ -581,16 +593,16 @@ def dsa_index_expand(pool_ids: Tensor, seq_lens: Tensor, pool_size: int = INDEX_
     out_cols = index_expand_width(n_groups, pool_size)
 
     if not can_run_dsa_index_expand(pool_ids, seq_lens, pool_size):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         return _dsa_index_expand_torch(pool_ids, seq_lens, pool_size)
 
     # The transport the device cannot pay for: every per-row value reaches a `tensor_scalar` as a
     # COLUMN operand, so the lengths are reshaped once here rather than per use on the device.
     seq_col = seq_lens.reshape(rows, 1).contiguous()
 
-    _COUNTERS.nki_dispatch += 1
-    # The log and the identity read are FOLDED off the traced graph; the counter increment stays,
-    # because a plain int attribute store is a recorded side effect and not a host call.
+    _count_nki_dispatch()
+    # The counter, the log and the identity read are FOLDED off the traced graph: a counter
+    # store inside the trace becomes a value guard that fails on the first call after warmup.
     _record_nki_dispatch(rows, n_groups, pool_size, out_cols)
     return wrap_nki(_index_expand_nki)(
         pool_ids.contiguous(), seq_col, pool_size, pool_size - 1

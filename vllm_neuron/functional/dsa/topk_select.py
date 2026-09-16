@@ -142,6 +142,18 @@ def topk_select_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
 def topk_select_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the seam LAST dispatched, or ``None``.
 
@@ -336,15 +348,15 @@ def dsa_topk_select(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
     n_rows = int(flat.shape[0])
     config = _nki_config(n_rows, width, k, _nki_dtype_of(scores))
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     # B58-M1, second repair. The log and the identity read are FOLDED off the traced graph, the
     # way ``vllm_neuron/functional/topk.py:90-101`` folds ``_log_topk_choice``. The helper takes
     # INTS ONLY and reads ``rotational_topk`` itself: passing the kernel object was the first
     # repair's measured defect, because Dynamo will not reconstruct a frozen dataclass as a fold
     # argument. NO bare logging or other host call Dynamo refuses belongs on this branch -- it is
-    # the one branch the runner traces under ``fullgraph=True``. The counter increment stays: it
-    # is a plain int attribute store, and it is the landed seam pattern (``kda/gate_clamp.py``
-    # increments on its dispatch branch and logs on neither).
+    # the one branch the runner traces under ``fullgraph=True``. The counter is folded the same
+    # way: a counter store inside the trace becomes a value guard that fails on the first call
+    # after warmup.
     _record_nki_dispatch(n_rows, width, k)
     values, indices = wrap_nki(rotational_topk)[config.n_prgs](flat, config)
 
@@ -359,7 +371,7 @@ def _dsa_topk_select_torch(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
     kernel refuses. It increments its own counter so a test can state which route ran
     instead of assuming it.
     """
-    _COUNTERS.torch_fallback += 1
+    _count_torch_fallback()
     logger.info(
         "[dsa-topk] kernel=torch rows=%d width=%d k=%d reason=nki-route-unavailable",
         scores.numel() // int(scores.shape[-1]),

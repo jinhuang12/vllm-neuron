@@ -854,6 +854,18 @@ def dispatch_counters() -> tuple[int, int]:
     return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def can_run_sinkhorn(
     affinity: Tensor, rows: int, cols: int, block: int = MHC_STREAMS
 ) -> bool:
@@ -938,14 +950,14 @@ def sinkhorn_normalise(
     rows, cols = int(affinity.shape[0]), int(affinity.shape[1])
 
     if not can_run_sinkhorn(affinity, rows, cols, block):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         logger.debug(
             "sinkhorn_normalise: NKI route unavailable, using the torch path "
             "(oracle only, not the shipped path)"
         )
         return sinkhorn_torch_oracle(affinity, iters=iters)
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     return wrap_nki(sinkhorn_kernel)(affinity=affinity, iters=iters, block=block)
 
 
@@ -1001,7 +1013,7 @@ def sinkhorn_normalise_blocks(
             "simulator for a CPU-mode run."
         )
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     return wrap_nki(sinkhorn_blocks_kernel)(
         affinity_blocks=affinity_blocks, iters=iters
     )

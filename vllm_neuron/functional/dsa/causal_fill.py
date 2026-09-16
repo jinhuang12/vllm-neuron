@@ -135,6 +135,18 @@ def causal_fill_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
 def causal_fill_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel the seam LAST dispatched, or ``None``.
 
@@ -389,16 +401,16 @@ def dsa_causal_fill(positions: Tensor, width: int) -> Tensor:
     rows = _validate(positions, width)
 
     if not can_run_dsa_causal_fill(positions, width):
-        _COUNTERS.torch_fallback += 1
+        _count_torch_fallback()
         return dsa_causal_fill_torch_oracle(positions, width)
 
     # The transport the device cannot pay for: the per-row position reaches `tensor_scalar` as a
     # COLUMN operand, so the reshape happens once here rather than per use on the device.
     pos_col = positions.reshape(rows, 1).contiguous()
 
-    _COUNTERS.nki_dispatch += 1
-    # The log and the identity read are FOLDED off the traced graph; the counter increment stays,
-    # because a plain int attribute store is a recorded side effect and not a host call.
+    _count_nki_dispatch()
+    # The counter, the log and the identity read are FOLDED off the traced graph: a counter
+    # store inside the trace becomes a value guard that fails on the first call after warmup.
     _record_nki_dispatch(rows, width)
     return wrap_nki(_causal_fill_nki)(pos_col, width)
 

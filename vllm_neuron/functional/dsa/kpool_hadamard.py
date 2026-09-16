@@ -182,6 +182,18 @@ def kpool_hadamard_dispatch_counters() -> tuple[int, int]:
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch, off the traced graph: a store Dynamo reads becomes a guard."""
+    _COUNTERS.nki_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry, off the traced graph."""
+    _COUNTERS.torch_fallback += 1
+
+
 def kpool_hadamard_kernel_identity() -> tuple[str, str] | None:
     """``(module, qualname)`` of the kernel a seam LAST dispatched, or ``None``.
 
@@ -535,11 +547,11 @@ def dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tenso
     flat_k = slot_k.reshape(n_pools * pool_size, head_dim).contiguous()
     flat_score = slot_score.reshape(n_pools * pool_size, head_dim).contiguous()
 
-    _COUNTERS.nki_dispatch += 1
-    # The log and the identity read are FOLDED off the traced graph. The helper takes a str and
-    # ints ONLY and reads the kernel as a module global: passing the kernel object is the measured
-    # defect that pattern exists to avoid. The counter increment stays -- a plain int attribute
-    # store is a recorded side effect, not a host call.
+    _count_nki_dispatch()
+    # The counter, the log and the identity read are FOLDED off the traced graph. The helper takes
+    # a str and ints ONLY and reads the kernel as a module global: passing the kernel object is the
+    # measured defect that pattern exists to avoid. A counter store inside the trace becomes a
+    # value guard that fails on the first call after warmup.
     _record_nki_dispatch("fused", n_pools, pool_size, head_dim)
     return wrap_nki(_kpool_hadamard_nki)(
         flat_k, flat_score, ape.contiguous(), n_pools, pool_size
@@ -571,7 +583,7 @@ def dsa_hadamard128(x: Tensor) -> Tensor:
     if not can_run_dsa_hadamard128(x):
         return _dsa_hadamard128_torch(x)
 
-    _COUNTERS.nki_dispatch += 1
+    _count_nki_dispatch()
     _record_nki_dispatch("stage", n_rows, 1, head_dim)
     return wrap_nki(_hadamard128_nki)(x.contiguous(), n_rows)
 
@@ -605,7 +617,7 @@ def _dsa_kpool_hadamard_torch(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -
     softmax per ``(pool, channel)``; a ``dim=-1`` here would be the whole-vector softmax this
     module is not.
     """
-    _COUNTERS.torch_fallback += 1
+    _count_torch_fallback()
     weights = torch.softmax(slot_score.float() + ape.float().unsqueeze(0), dim=1)
     pooled = (weights * slot_k.float()).sum(dim=1)
     rotated = pooled @ hadamard_matrix(int(slot_k.shape[2]), device=slot_k.device).t()
@@ -614,6 +626,6 @@ def _dsa_kpool_hadamard_torch(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -
 
 def _dsa_hadamard128_torch(x: Tensor) -> Tensor:
     """The rotation alone, in torch. THE ORACLE, and the fallback path."""
-    _COUNTERS.torch_fallback += 1
+    _count_torch_fallback()
     rotated = x.float() @ hadamard_matrix(int(x.shape[1]), device=x.device).t()
     return (rotated * HADAMARD_SCALE).to(x.dtype)
