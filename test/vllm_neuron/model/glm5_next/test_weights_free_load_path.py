@@ -248,12 +248,19 @@ def _lite_loaded(tmp_path):
 def test_the_hook_materialises_every_declared_leaf_on_meta(
     tmp_path, single_rank_process_group
 ) -> None:
-    """No leaf is left None or shape-free, and every one of them is on meta."""
+    """No leaf is left None or shape-free, and every one of them is on meta.
+
+    A leaf the load-time preps released after copying it into kernel orientation is
+    accounted for by the release record, not counted as unset.
+    """
     model = _lite_loaded(tmp_path)
 
     declared = model.declared_parameter_names()
     by_name = dict(model.named_parameters())
-    none_count = sum(1 for name in declared if by_name.get(name) is None)
+    released = model.released_parameters()
+    none_count = sum(
+        1 for name in declared if by_name.get(name) is None and name not in released
+    )
     lazy_count = sum(
         1
         for parameter in by_name.values()
@@ -269,7 +276,7 @@ def test_the_hook_materialises_every_declared_leaf_on_meta(
     )
     say(
         "materialised",
-        f"declared={len(declared)}|named={len(by_name)}|none={none_count}",
+        f"declared={len(declared)}|named={len(by_name)}|released={len(released)}|none={none_count}",
         f"lazy={lazy_count}|off_meta={len(off_meta)}|shapeless={len(shapeless)}",
     )
     assert (none_count, lazy_count, off_meta, shapeless) == (0, 0, [], []), (
@@ -277,9 +284,10 @@ def test_the_hook_materialises_every_declared_leaf_on_meta(
         f"{len(off_meta)} off meta and {len(shapeless)} without a shape; a load "
         f"that leaves any of those cannot reach a forward"
     )
-    assert len(by_name) == len(declared), (
-        f"the hook materialised {len(by_name)} of {len(declared)} declared "
-        f"parameters, so the walk visited a different set than the declaration"
+    assert len(by_name) + len(released) == len(declared), (
+        f"the hook materialised {len(by_name)} and released {len(released)} of "
+        f"{len(declared)} declared parameters, so the walk visited a different set "
+        f"than the declaration"
     )
 
 

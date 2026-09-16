@@ -169,6 +169,31 @@ def _declare_parameters(module: nn.Module, *names: str) -> None:
     )
 
 
+#: Where a module records the checkpoint tensors it released once a load-time
+#: prep had copied them into kernel orientation, ``{attribute: (shape, dtype)}``.
+#: A plain attribute, like the prepared operands it accounts for, so it enters
+#: neither ``state_dict()`` nor ``named_parameters()``.
+RELEASED_PARAMETERS_ATTR = "_released_checkpoint_parameters"
+
+
+def _release_replaced_parameters(module: nn.Module, *names: str) -> int:
+    """Drop the checkpoint tensors a prep copied into kernel orientation. Returns how many."""
+    released = dict(getattr(module, RELEASED_PARAMETERS_ATTR, {}))
+    dropped = 0
+    for name in names:
+        tensor = getattr(module, name, None)
+        if tensor is None:
+            continue
+        released[name] = (tuple(tensor.shape), tensor.dtype)
+        if name in module._parameters:
+            module.register_parameter(name, None)
+        else:
+            setattr(module, name, None)
+        dropped += 1
+    setattr(module, RELEASED_PARAMETERS_ATTR, released)
+    return dropped
+
+
 # ---------------------------------------------------------------------------
 # Relayout on the host, because the device refuses a strided copy
 # ---------------------------------------------------------------------------
@@ -8862,6 +8887,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 names.append(f"{module_path}.{leaf}" if module_path else leaf)
         return tuple(names)
 
+    def released_parameters(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Every checkpoint parameter released after its load-time prep, by tree path."""
+        released: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
+        for module_path, module in self.named_modules():
+            for leaf, record in getattr(module, RELEASED_PARAMETERS_ATTR, {}).items():
+                released[f"{module_path}.{leaf}" if module_path else leaf] = record
+        return released
+
     # ── weight loading (``inc-glm53f-091``) ──────────────────────────────
 
     def _checkpoint_block_size(self) -> tuple[int, int]:
@@ -9445,6 +9478,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         Returns ``(projection prep calls, scale prep calls)``.
 
+        Once a prep has stored its operands, the checkpoint tensors it copied
+        from are released: the forward reads the prepared operands only, so the
+        originals would otherwise sit on the device beside them for the life of
+        the process. Each module records what it released under
+        :data:`RELEASED_PARAMETERS_ATTR`, and :meth:`released_parameters` reads
+        those records back by tree path.
+
         THE SINGLE PRODUCTION CALLER. Before this method
         ``prepare_projection_weights`` and ``prepare_scale_operands`` had ZERO
         production call sites -- every mention in ``vllm_neuron/`` was a test, a
@@ -9487,6 +9527,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # module. So the signature stays exactly as it landed.
                 if hasattr(type(module), "prepare_absorb_weights"):
                     module.prepare_absorb_weights()
+                attributes = getattr(type(module), "PROJECTION_PARAMETERS", {})
+                replaced = []
+                for name in names:
+                    weight = attributes.get(name, f"{name}{_WEIGHT_LEAF_SUFFIX}")
+                    replaced += [weight, self._sibling_scale_grid_name(weight)]
+                _release_replaced_parameters(module, *filter(None, replaced))
             # ``inc-glm53f-054a`` hand-off item (iv). The checkpoint's grids are at
             # 128-tile granularity and arrive in the loader's frame, so the bridge
             # runs HERE -- on the load path, after the shards are attached and
@@ -9524,14 +9570,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 ]
                 self._require_prep_operands_on_device(path, module, names, device)
                 operands = {}
+                replaced = []
                 for name in names:
                     leaf = f"{name}{_WEIGHT_LEAF_SUFFIX}"
+                    grid = self._sibling_scale_grid_name(leaf)
                     operands[leaf] = getattr(module, leaf)
-                    operands[f"{name}_scale"] = getattr(
-                        module, self._sibling_scale_grid_name(leaf)
-                    )
+                    operands[f"{name}_scale"] = getattr(module, grid)
+                    replaced += [leaf, grid]
                 module.prepare_scale_operands(**operands)
                 scale_calls += 1
+                _release_replaced_parameters(module, *replaced)
             # ``inc-glm53f-030d`` part (c), THE mHC BIND, on the same
             # ``hasattr`` gate the three steps above use. It fires on the two
             # decoder layer classes, and those two declare none of the three

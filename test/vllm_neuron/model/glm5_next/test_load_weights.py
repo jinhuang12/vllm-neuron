@@ -602,6 +602,21 @@ def single_rank_process_group(tmp_path):
         torch.distributed.destroy_process_group()
 
 
+@pytest.fixture(autouse=True)
+def _keep_the_loaded_tensors(monkeypatch):
+    """Hold the post-prep release off, so the tensors the loaders delivered stay readable.
+
+    Every item in this file measures what the loaders and the preps DELIVER, and reads
+    the delivered tensors after ``load_weights`` returns. The release that follows the
+    preps in production is measured by ``test_prepared_weight_release.py``.
+    """
+    from vllm_neuron.model.glm5_next import model_fp8
+
+    monkeypatch.setattr(
+        model_fp8, "_release_replaced_parameters", lambda module, *names: 0
+    )
+
+
 # --------------------------------------------------------------------------- #
 # (1) Every declared parameter is materialised AND loaded.
 # --------------------------------------------------------------------------- #
