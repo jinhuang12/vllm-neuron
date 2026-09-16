@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 
 _LOOPBACK_ADDRS = (None, "", "127.0.0.1", "localhost", "::1")
 
+#: Physical NeuronCores behind the logical core the runtime reports stats for.
+#: ``Runtime.get_vnc_memory_stats`` reports the logical core, while the runtime
+#: allocates and accounts device memory on each physical core of the pair.
+PHYSICAL_CORES_PER_LOGICAL_CORE = 2
+
 
 def validate_cross_node_master_addr(
     nnodes: int,
@@ -989,6 +994,96 @@ class NeuronWorker(WorkerBase):
             )
         return cap_fraction
 
+    def _get_graph_reserve_bytes(self) -> int:
+        """Return the validated per-physical-core graph reserve in bytes."""
+        try:
+            reserve_gib = float(envs.VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB must be a number of GiB. "
+                f"Got {os.getenv('VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB')!r}."
+            ) from exc
+        if not reserve_gib > 0 or reserve_gib == float("inf"):
+            raise RuntimeError(
+                "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB must be a finite, "
+                f"positive number of GiB. Got {reserve_gib}."
+            )
+        return int(reserve_gib * (1024**3))
+
+    def _physical_core_kv_bound(self, total_hbm_bytes: int, bytes_used: int) -> int:
+        """Return the KV bytes that still leave the graph its reserve.
+
+        Two clauses, because the runtime spreads a rank's tensors over the two
+        physical cores of its logical core but stages a graph's scratchpad on one
+        of them: the cache never exceeds what a single physical core has left
+        beside the reserve, and never exceeds what the pair has left once the
+        model's own tensors are counted against both reserves.
+        """
+        reserve_bytes = self._get_graph_reserve_bytes()
+        per_core_bytes = total_hbm_bytes // PHYSICAL_CORES_PER_LOGICAL_CORE
+        room_per_core = max(per_core_bytes - reserve_bytes, 0)
+        room_shared = max(
+            room_per_core * PHYSICAL_CORES_PER_LOGICAL_CORE - bytes_used, 0
+        )
+        return min(room_per_core, room_shared)
+
+    def _kv_cache_need_bytes(self) -> int | None:
+        """Return the bytes the KV cache needs to serve the configured load.
+
+        The need is the served workload rather than the free memory:
+        ``max_model_len`` tokens for each of ``max_num_seqs`` sequences, rounded
+        up to whole blocks. Block size, page size and the group layout are read
+        from the runner's own KV cache specs through vLLM's grouping, so a hybrid
+        recurrent/attention cache is measured as it will be allocated and no
+        block size is re-derived here. Returns None when the model reports no
+        cache to size, leaving the memory heuristic alone.
+        """
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_groups,
+            get_uniform_page_size,
+        )
+
+        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        if not kv_cache_spec:
+            return None
+        groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        if not groups:
+            return None
+
+        page_size = get_uniform_page_size([group.kv_cache_spec for group in groups])
+        # One pool per layer of the largest group; every group draws its blocks
+        # from the same pool, which is why the group count multiplies the blocks
+        # a request needs and the layer count multiplies their cost.
+        layers_per_pool = max(len(group.layer_names) for group in groups)
+        blocks_per_request = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(self.vllm_config),
+                page_size,
+            )
+            for group in groups
+        )
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        max_model_len = self.vllm_config.model_config.max_model_len
+        # Plus the pool's null block, which no request can be given.
+        num_blocks = blocks_per_request * max_num_seqs + 1
+        need_bytes = num_blocks * page_size * layers_per_pool
+
+        logger.info(
+            "KV cache need: %.3f GiB for %d sequence(s) of %d tokens "
+            "(%d blocks of %d B, %d block(s) per request, %d group(s), "
+            "%d layer(s) per pool)",
+            need_bytes / (1024**3),
+            max_num_seqs,
+            max_model_len,
+            num_blocks,
+            page_size,
+            blocks_per_request,
+            len(groups),
+            layers_per_pool,
+        )
+        return need_bytes
+
     def _determine_available_memory_cpu(self, gpu_mem_util: float) -> int:
         """Compute CPU-mode KV memory budget from fair-share host memory."""
         bytes_free = self._query_host_runtime_memory()
@@ -1014,8 +1109,12 @@ class NeuronWorker(WorkerBase):
     ) -> int:
         """Shared KV cache budget logic for both estimate and runtime paths.
 
-        Applies gpu_memory_utilization, cap-fraction guardrail, and min-KV
-        threshold check, then returns the available bytes for KV cache.
+        Applies gpu_memory_utilization, cap-fraction guardrail, the
+        physical-core graph reserve, and the min-KV threshold check, then returns
+        the available bytes for KV cache. The served need caps the result in
+        :meth:`determine_available_memory`, which is where the min-KV check is
+        deliberately not repeated: the floor asks whether the memory heuristic
+        collapsed, and a right-sized cache is below it on purpose.
         """
         total_budget = int(total_hbm_bytes * gpu_mem_util)
         # Preserve vLLM semantics: GMU applies to total device memory first.
@@ -1025,19 +1124,26 @@ class NeuronWorker(WorkerBase):
         # TODO: Replace this cap with a cleaner solution later.
         cap_fraction = self._get_kv_cap_fraction()
         heuristic_cap = int(total_budget * cap_fraction)
-        available = max(min(user_budget, heuristic_cap), 0)
+        # The graph reserve is a hardware bound on one physical core, so it is
+        # taken against total HBM and not against the GMU-scaled budget; GMU
+        # stays the operator's knob in the two terms above.
+        core_bound = self._physical_core_kv_bound(total_hbm_bytes, bytes_used)
+        available = max(min(user_budget, heuristic_cap, core_bound), 0)
 
-        logger.debug(
-            "KV cache heuristic: user_budget=%.2f GiB, cap=%.2f GiB "
+        logger.info(
+            "KV cache heuristic: user_budget=%.2f GiB, cap=%.2f GiB, "
+            "physical_core_bound=%.2f GiB "
             "(total_budget=%.2f GiB, total_hbm=%.2f GiB, bytes_used=%.2f GiB, "
-            "cap_fraction=%.2f), "
+            "cap_fraction=%.2f, graph_reserve=%.2f GiB per physical core), "
             "effective=%.2f GiB",
             user_budget / (1024**3),
             max(heuristic_cap, 0) / (1024**3),
+            core_bound / (1024**3),
             total_budget / (1024**3),
             total_hbm_bytes / (1024**3),
             bytes_used / (1024**3),
             cap_fraction,
+            self._get_graph_reserve_bytes() / (1024**3),
             available / (1024**3),
         )
 
@@ -1120,6 +1226,12 @@ class NeuronWorker(WorkerBase):
         local worker process. On Neuron device, queries runtime free HBM and
         applies gpu_memory_utilization.
 
+        The served need caps whichever heuristic ran: a cache larger than the
+        configured sequences can fill buys nothing and costs device memory the
+        compiled graph needs. Every path is capped by the same need, so the block
+        count stays identical between CPU compilation and execution, which the
+        compilation cache requires.
+
         Note: In vLLM v1, gpu_memory_utilization is applied inside the worker
         (not by vLLM core). The GPU worker does the same pattern.
 
@@ -1128,10 +1240,30 @@ class NeuronWorker(WorkerBase):
         """
         gpu_mem_util = self.cache_config.gpu_memory_utilization
         if envs.VLLM_NEURON_CPU_COMPILE:
-            return self._estimate_available_memory_neuron(gpu_mem_util)
-        if envs.VLLM_NEURON_CPU_MODE:
-            return self._determine_available_memory_cpu(gpu_mem_util)
-        return self._determine_available_memory_neuron(gpu_mem_util)
+            heuristic_bytes = self._estimate_available_memory_neuron(gpu_mem_util)
+        elif envs.VLLM_NEURON_CPU_MODE:
+            heuristic_bytes = self._determine_available_memory_cpu(gpu_mem_util)
+        else:
+            heuristic_bytes = self._determine_available_memory_neuron(gpu_mem_util)
+
+        need_bytes = self._kv_cache_need_bytes()
+        if need_bytes is None:
+            logger.warning(
+                "KV cache need unknown: the model reports no KV cache to size, "
+                "so the memory heuristic stands at %.2f GiB",
+                heuristic_bytes / (1024**3),
+            )
+            return heuristic_bytes
+
+        available = min(heuristic_bytes, need_bytes)
+        logger.info(
+            "KV cache budget: need=%.3f GiB, heuristic=%.2f GiB, "
+            "available=%.3f GiB",
+            need_bytes / (1024**3),
+            heuristic_bytes / (1024**3),
+            available / (1024**3),
+        )
+        return available
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """

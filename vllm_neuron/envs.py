@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
     VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: float = 0.30
+    VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB: float = 5.0
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_MLP_FORCE_TKG: bool = False
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
@@ -130,6 +131,22 @@ def maybe_convert_float(value: str | None) -> float | None:
     return float(value)
 
 
+#: Device memory a compiled graph keeps on one physical NeuronCore, in GiB.
+#:
+#: A logical NeuronCore is two physical cores, and the Neuron runtime allocates
+#: and accounts memory on each physical core separately. A staged graph puts its
+#: shared scratchpad and most of its code on one of the pair, so the KV cache
+#: budget has to leave that much room on a single physical core rather than on
+#: the logical pair.
+#:
+#: The value is the measurement rounded up with margin: a 64-rank load of the
+#: GLM-5.3-Flash prefill graph at bucket 1024 on trn2 reported 4.567 GiB on the
+#: even physical core of every rank (3.875 GiB shared scratchpad plus 705 MiB of
+#: graph), against 159.9 MiB on the odd one. Another model, another bucket or
+#: another compiler release moves it, which is what the override is for.
+DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Core System Variables ==================
     # Enable CPU fallback mode instead of using Neuron accelerators
@@ -172,6 +189,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_float(os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION"))
         if os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION") is not None
         else 0.30
+    ),
+    # Graph reserve (GiB) held back on each physical NeuronCore when the KV
+    # cache budget is computed. See DEFAULT_DEVICE_GRAPH_RESERVE_GIB above for
+    # the measurement the default comes from.
+    "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB": lambda: (
+        maybe_convert_float(os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB"))
+        if os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB") is not None
+        else DEFAULT_DEVICE_GRAPH_RESERVE_GIB
     ),
     # Local cache directory for model checkpoints
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
