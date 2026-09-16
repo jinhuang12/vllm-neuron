@@ -206,6 +206,9 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     return self.model_runner_output
 
                 # First call: materialize device future to CPU.
+                _refuse_non_integer_future(
+                    sampled_token_ids, self.model_runner_output.req_ids
+                )
                 if sampled_token_ids.ndim == 2 and sampled_token_ids.shape[1] > 1:
                     # Spec decode: rejection sampler output [bs, num_spec+1]
                     # with -1 padding for rejected positions. Strip -1s to
@@ -266,6 +269,22 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
 
         # Logprobs are computed in _sample() when on-device logits are available
         return self.model_runner_output
+
+
+def _refuse_non_integer_future(sampled_token_ids: torch.Tensor, req_ids: list[str]) -> None:
+    """Refuse a sampled-token future that holds no token ids, naming what it holds and whose it is.
+
+    On-device sampling hands the runner an integer tensor; a floating tensor here is the model's
+    logits, which no branch below can read as tokens.
+    """
+    if sampled_token_ids.is_floating_point() or sampled_token_ids.is_complex():
+        raise TypeError(
+            f"the async sampled_token_ids future for requests {list(req_ids)} is "
+            f"{sampled_token_ids.dtype} with shape {tuple(sampled_token_ids.shape)}, not an "
+            "integer token tensor: the model returned logits where on-device sampling was "
+            "expected to return token ids; serve it with on_device_sampling_config: null and "
+            "synchronous scheduling, or give the model an on-device sampler"
+        )
 
 
 def _reinterpret_uint32_as_int32(
@@ -7223,22 +7242,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 composition_changed = (
                     prev_req_ids is None or curr_req_ids != prev_req_ids
                 )
-                # Detect spec→non-spec transition: previous step had spec
-                # decode (prev future is [bs, num_spec+1]), current step is
-                # non-spec (no scheduled_spec_decode_tokens). In async mode
-                # the transition creates a CPU position mismatch because
-                # scheduler's num_computed_tokens_cpu reflects the previous
-                # spec step's optimistic advance but not its rejections —
-                # reading token_ids_cpu at that optimistic position gives
-                # garbage. Force a sync at this boundary by materializing
-                # and reconciling num_computed_tokens_cpu.
-                prev_future = self.async_execution_buffer.get(
-                    "futures_sampled_token_ids"
-                )
-                prev_was_spec = (
-                    isinstance(prev_future, torch.Tensor)
-                    and prev_future.ndim == 2
-                    and prev_future.shape[1] > 1
+                # Detect spec→non-spec transition: the previous real step ran
+                # the rejection sampler (recorded by sample_tokens as
+                # ``prev_step_was_spec``), current step is non-spec (no
+                # scheduled_spec_decode_tokens). In async mode the transition
+                # creates a CPU position mismatch because scheduler's
+                # num_computed_tokens_cpu reflects the previous spec step's
+                # optimistic advance but not its rejections — reading
+                # token_ids_cpu at that optimistic position gives garbage.
+                # Force a sync at this boundary by materializing and
+                # reconciling num_computed_tokens_cpu. The fact is read, never
+                # inferred from the future's shape: a model that returns
+                # logits also returns a 2-D tensor.
+                prev_was_spec = self.speculative_config is not None and bool(
+                    self.async_execution_buffer.get("prev_step_was_spec", False)
                 )
                 curr_is_nonspec = not bool(
                     scheduler_output.scheduled_spec_decode_tokens
@@ -7912,6 +7929,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ),
         )
         self.async_execution_buffer["async_output"] = async_output
+        # The fact the next step's transition check reads: whether THIS step
+        # ran the rejection sampler.
+        self.async_execution_buffer["prev_step_was_spec"] = (
+            spec_decode_metadata is not None
+        )
         return async_output
 
     def _maybe_swap_async_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
