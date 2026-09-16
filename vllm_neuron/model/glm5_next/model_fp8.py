@@ -9387,8 +9387,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ``inc-glm53f-054``: no module in this file declares a
         ``prepare_scale_operands`` for a bank yet, so the prep loop does not
         visit one.
+
+        A GRID THE MAP DECLARES AS ITS OWN PARAMETER IS NOT READ HERE. The
+        scaled attention projections pair the weight with its scale key so the
+        loader chooser downscales the bytes, and ALSO map the scale key to its
+        own parameter; that parameter path loads and compensates the grid, and a
+        plain attribute of the same name set here would shadow it.
         """
         checkpoint._ensure_indexed()
+        declared_grids: set[str] = set()
+        for keys in mappings.values():
+            key_list = [keys] if isinstance(keys, str) else list(keys)
+            if classify_mapped_keys(key_list) == MAPPED_KEY_SCALE_GRID:
+                declared_grids.add(key_list[0])
         read = 0
         for param_name, keys in mappings.items():
             key_list = [keys] if isinstance(keys, str) else list(keys)
@@ -9461,6 +9472,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if len(key_list) < 2 or len(scales) != 1:
                 # A lone scale grid already has its own parameter, and a bank
                 # takes the branch above.
+                continue
+            if scales[0] in declared_grids:
+                # The companion is a declared parameter: the parameter path
+                # loads and compensates it.
                 continue
             module_path, _, leaf = param_name.rpartition(".")
             attribute = self._sibling_scale_grid_name(leaf)

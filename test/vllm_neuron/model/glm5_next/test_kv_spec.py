@@ -990,8 +990,9 @@ def test_kv_spec_the_quantised_flag_does_not_move_the_param_name_side(model) -> 
     # (iv) The landed second assertion, kept.
     assert set(model.declared_parameter_names()) == quantised
 
-    # (v) Each scaled leaf's WEIGHT parameter maps to a SCALAR target, so the
-    #     scale key no longer shares it. On the base tree all 44 were lists.
+    # (v) Each scaled leaf's WEIGHT parameter maps to the weight key AND its
+    #     scale companion -- the pair the loader chooser downscales -- while the
+    #     scale key also has the parameter of its own that (ii) counted.
     mappings = build_weight_mappings(model.text_config, quantised=True)
     weight_names = [
         f"model.layers.{index}.self_attn.{leaf}_weight"
@@ -1000,9 +1001,18 @@ def test_kv_spec_the_quantised_flag_does_not_move_the_param_name_side(model) -> 
     ]
     assert len(weight_names) == 44
     list_valued = [n for n in weight_names if isinstance(mappings[n], list)]
-    assert not list_valued, (
-        f"{len(list_valued)} scaled-leaf weight parameters still carry a "
-        f"multi-key list: {sorted(list_valued)[:4]}"
+    unpaired = [
+        n
+        for n in weight_names
+        if not (
+            isinstance(mappings[n], list)
+            and len(mappings[n]) == 2
+            and mappings[n][1] == mappings[f"{n[: -len('_weight')]}_{FP8_SCALE_SUFFIX}"]
+        )
+    ]
+    assert not unpaired, (
+        f"{len(unpaired)} scaled-leaf weight parameters do not carry the "
+        f"[weight, scale] pair the chooser downscales: {sorted(unpaired)[:4]}"
     )
 
     _record(

@@ -537,21 +537,15 @@ def _add_dsa_attention(
     ckpt_attn = f"{ckpt_prefix}.self_attn"
     param_attn = f"{param_prefix}.self_attn"
 
-    # inc-glm53f-085 (WP5 repair) owns ONLY which parameter each of these four
-    # scale keys lands on. As landed, BOTH of a scaled projection's checkpoint
-    # keys were bound to the single parameter ``{leaf}_weight``, and the default
-    # loader -- no ``transform``, more than one slice -- refuses that with
-    # "should only take in a single slice but got N"
-    # (``vllm_neuron/utils/weight_loader.py:71-73``, an ``assert``, so under
-    # ``python -O`` it instead keeps slice 0 and drops the scale silently). Either
-    # way the scale slice reached no arithmetic. Splitting the keys gives the
-    # scale a parameter of its own, which is what ``model_fp8.py`` dequantises
-    # from. The checkpoint keys themselves are unchanged -- redistributed, never
-    # added to -- which is what ``c078g_dsa_keys`` 198 and
-    # ``c078g_dsa_scale_keys`` 44 hold fixed.
+    # A scaled projection's weight parameter maps to BOTH checkpoint keys, the
+    # shape the dense and shared MLP projections use, so the loader chooser
+    # reads a quantised weight and applies the trn2 downscale to the bytes. The
+    # scale key ALSO maps to a parameter of its own, which is what the attention
+    # dequantises from; the compensation on that grid pairs with the downscale
+    # on the bytes. The set of checkpoint keys referenced is unchanged.
     for leaf in DSA_SCALED_PROJECTIONS:
         keys = _quantised(ckpt_attn, leaf, quantised=quantised, skip=skip)
-        _add(mappings, f"{param_attn}.{leaf}_weight", keys[:1])
+        _add(mappings, f"{param_attn}.{leaf}_weight", keys)
         # Zero or one scale key: ``_quantised`` returns the companion only when
         # this leaf really carries one, so a leaf the checkpoint keeps in BF16
         # maps no scale parameter and asks the checkpoint for nothing new.

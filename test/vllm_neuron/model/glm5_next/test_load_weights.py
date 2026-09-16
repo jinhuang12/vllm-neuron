@@ -1109,13 +1109,20 @@ def _out_of_band_entries(mappings: dict[str, str | list[str]]) -> dict[str, str]
     ``slices[0]`` (``weight_loaders_fp8.py:1339``), so its scale reaches nothing
     through the reader and has to be read out of band. Derived from the map here
     rather than restated from a table, so this population and the production
-    reader's cannot disagree about which entries they mean.
+    reader's cannot disagree about which entries they mean. A companion the map
+    also declares as a single-key entry of its own is loaded by that parameter
+    and is not in this population.
     """
+    declared = {
+        _keys_of(mappings, name)[0]
+        for name in mappings
+        if len(_keys_of(mappings, name)) == 1 and _is_scale_key(_keys_of(mappings, name)[0])
+    }
     found: dict[str, str] = {}
     for name in mappings:
         keys = _keys_of(mappings, name)
         scales = [k for k in keys if _is_scale_key(k)]
-        if len(keys) >= 2 and len(scales) == 1:
+        if len(keys) >= 2 and len(scales) == 1 and scales[0] not in declared:
             found[name] = scales[0]
     return found
 
@@ -1896,17 +1903,16 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
         f"placeholder dtype that is not fp8, e.g. "
         f"{sorted(set(weight_names) - set(typed))[:4]}"
     )
-    # Each of them is a LONE key classified plain, which is the case the clause
-    # exists for. Without this the assertion above would also pass if -085 were
-    # reverted and the entries went back to being two-key lists.
-    lone_plain = [
+    # Each of them is the [weight, scale] pair classified as a quantised weight,
+    # the kind the chooser downscales and the placeholder types fp8 by kind.
+    paired = [
         name
         for name in weight_names
-        if len(_keys_of(real_mappings, name)) == 1
-        and classify_mapped_keys(real_mappings[name]) == MAPPED_KEY_PLAIN
+        if len(_keys_of(real_mappings, name)) == 2
+        and classify_mapped_keys(real_mappings[name]) == MAPPED_KEY_QUANTISED_WEIGHT
     ]
-    print(f"RULING_REAL_SCALED_WEIGHTS_THAT_ARE_LONE_PLAIN_KEYS={len(lone_plain)}")
-    assert len(lone_plain) == len(weight_names)
+    print(f"RULING_REAL_SCALED_WEIGHTS_THAT_ARE_PAIRED_QUANTISED_KEYS={len(paired)}")
+    assert len(paired) == len(weight_names)
 
     # The rule's control: an ordinary weight with no sibling scale entry still
     # takes the config dtype, so the clause did not simply type everything fp8.

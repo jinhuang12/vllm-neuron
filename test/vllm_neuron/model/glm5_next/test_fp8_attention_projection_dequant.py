@@ -131,3 +131,37 @@ def test_the_real_leaf_dequantises_to_its_checkpoint_value_under_the_squeeze(mon
     with safe_open(os.path.join(checkpoint, shard), "pt") as handle:
         product, reference, message = _read(handle, mapping, "checkpoint")
     assert torch.equal(product, reference), message
+
+
+def _downscales(name: str, keys: list[str]) -> bool:
+    """Whether the loader the model picks for these keys wraps the blockwise fp8 downscale."""
+    loader = loaders.loader_for_mapped_keys(keys, param_name=name, owner=None, geometry=None)
+    transform = getattr(loader, "transform", None)
+    return "wrap_with_blockwise_fp8_downscale" in getattr(transform, "__qualname__", "")
+
+
+def test_every_scaled_attention_weight_downscales_and_the_other_families_hold():
+    """All 44 scaled attention weights take a downscaling loader; dense 9, shared 126 and routed 126 keep their kinds."""
+    mapping = _mapping(FIXTURE)
+    as_list = lambda keys: [keys] if isinstance(keys, str) else list(keys)
+    kinds = {name: loaders.classify_mapped_keys(as_list(keys)) for name, keys in mapping.items()}
+    attention = sorted(
+        name for name in mapping
+        if ".self_attn." in name and name.endswith("_weight")
+        and name.rsplit(".", 1)[-1][: -len("_weight")] in loaders.DSA_SCALED_PROJECTIONS
+    )
+    downscaled = [name for name in attention if kinds[name] == "quantised_weight" and _downscales(name, as_list(mapping[name]))]
+    dense = [n for n in mapping if ".mlp." in n and "experts" not in n and kinds[n] == "quantised_weight"]
+    shared = [n for n in mapping if "shared_experts" in n and kinds[n] == "quantised_weight"]
+    routed = [n for n in mapping if kinds[n] == "stacked_bank"]
+    other = [n for n in mapping if kinds[n] == "quantised_weight" and n not in set(attention) | set(dense) | set(shared)]
+    print(
+        f"FP8DQ|census|attention_downscaled={len(downscaled)}/{len(attention)}|dense={len(dense)}"
+        f"|shared={len(shared)}|routed_banks={len(routed)}|other_quantised={len(other)}"
+        f"|dense_downscaled={sum(_downscales(n, as_list(mapping[n])) for n in dense)}"
+        f"|shared_downscaled={sum(_downscales(n, as_list(mapping[n])) for n in shared)}"
+    )
+    assert len(attention) == 44, f"the fixture maps {len(attention)} scaled attention weights, not 44"
+    assert len(downscaled) == 44, f"{44 - len(downscaled)} scaled attention weights miss the downscaling loader: {sorted(set(attention) - set(downscaled))[:4]}"
+    assert (len(dense), len(shared), len(routed), len(other)) == (9, 126, 126, 0)
+    assert all(_downscales(n, as_list(mapping[n])) for n in dense + shared)
