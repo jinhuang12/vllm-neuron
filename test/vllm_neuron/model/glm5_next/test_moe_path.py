@@ -1616,6 +1616,9 @@ def test_moe_path_routed_limbs_trace_under_fullgraph() -> None:
     intact = getattr(_seam_module, _LIMB_LAUNCH_ORDER[0])
     graphs: list = []
     got = _fullgraph(_limbs_over(intact), graphs)(*operands).to(torch.float32)
+    # The counters are folded off the traced graph: each adds one per TRACE, at trace time, and
+    # nothing on a cache hit. One compiled call is one trace, so the read equals the declared
+    # triple here; a second call of the same shapes would leave it unchanged.
     counters = _limb_counters()
     kernel_calls = [call for graph in graphs for call in _kernel_calls_in(graph)]
     declared_calls = sum(nki for nki, _fallback in DECLARED_LIMB_DISPATCHES)
@@ -1635,7 +1638,8 @@ def test_moe_path_routed_limbs_trace_under_fullgraph() -> None:
     )
     assert counters == DECLARED_LIMB_DISPATCHES, (
         f"the compiled limbs read {counters}, declared {DECLARED_LIMB_DISPATCHES}; "
-        f"a trace that returns without running the limbs proves nothing"
+        f"a trace that returns without running the limbs proves nothing (one count per trace, "
+        f"not per call)"
     )
     torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
 

@@ -150,7 +150,11 @@ def _translated(runner, leg: str) -> dict:
 
 
 def _full_graph(runner, leg: str) -> tuple[int, str | None, int]:
-    """One leg through the compiled entry: graphs kept, the refusal's first line, dispatches."""
+    """One leg through the compiled entry: graphs kept, the refusal's first line, dispatches.
+
+    The dispatch counter is folded off the traced graph, so it reads one per TRACE and nothing on
+    a cache hit; one leg is one trace here.
+    """
     capture = _CompiledCapture(runner.model)
     runner.capture_backend_model = capture
     before = sentinel_order.sentinel_order_dispatch_counters()[0]
@@ -274,7 +278,7 @@ def test_the_captures_compile_as_one_full_graph_each():
         graphs, refusal, dispatched = _full_graph(runner, leg)
         print(
             f"TRACE|FULLGRAPH|leg={leg} graphs={graphs} refusal={refusal} "
-            f"sentinel_dispatches={dispatched}"
+            f"sentinel_dispatches={dispatched} (one per trace, not per call)"
         )
         readings[leg] = (graphs, refusal)
     for leg, (graphs, refusal) in readings.items():
