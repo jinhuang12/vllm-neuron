@@ -11270,8 +11270,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return os.environ.get("VLLM_NEURON_DUMP_LAYER_STREAMS") or None
 
     def _layer_stream_kwargs(self) -> dict:
-        """The collection keyword for the model, empty unless a dump directory is set."""
-        if not self._layer_stream_dump_dir:
+        """The collection keyword for the model, empty unless a dump directory is set.
+
+        The directory is read through ``getattr``, the convention this file's converter
+        helpers already follow: the translation they belong to is measured on runners
+        allocated without ``__init__``, so a plain attribute read would refuse a step
+        that has nothing to do with this dump.
+        """
+        if not getattr(self, "_layer_stream_dump_dir", None):
             return {}
         return {"collect_layer_streams": True}
 

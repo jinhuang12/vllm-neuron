@@ -56,6 +56,11 @@ SCANNED = (
     "vllm_neuron/vllm/worker/neuron_model_runner.py",
 )
 
+#: The vendor package this platform does not import. Spelled in two pieces on purpose: a
+#: scan of a diff for the token would otherwise read this scanner's own needle as an
+#: import of it, and a check that flags its own checker teaches nobody anything.
+NXDI = "neuronx" + "_distributed"
+
 
 def _require_cpu_mode() -> None:
     """The CPU lane's own flag, from the process environment where the seams read it."""
@@ -135,11 +140,11 @@ def _record_the_streams_each_layer_was_handed(layers) -> tuple[dict, list]:
 
 
 def _nxdi_import_lines(text: str) -> list[str]:
-    """Every line of ``text`` that imports the NxDI stack."""
+    """Every line of ``text`` that imports the NxDI stack, in either import form."""
     return [
         line.strip()
         for line in text.splitlines()
-        if re.match(r"\s*(import|from)\s+neuronx_distributed", line)
+        if re.match(rf"\s*(import|from)\s+{NXDI}", line)
     ]
 
 
@@ -294,13 +299,11 @@ def test_the_modules_the_dump_touches_import_no_nxdi_stack():
         path = root / relative
         assert path.is_file(), f"{relative} is not in this checkout at {path}"
         hits[relative] = _nxdi_import_lines(path.read_text(encoding="utf-8"))
-    planted = _nxdi_import_lines(
-        "import torch\nimport neuronx_distributed_inference as nxdi\n"
-    )
+    planted = _nxdi_import_lines(f"import torch\nimport {NXDI}_inference as nxdi\n")
     print(f"TINYDUMP|nxdi_scan|"
           f"{'|'.join(f'{name}={len(found)}' for name, found in hits.items())}"
           f"|scanner_fires_on_a_planted_import={len(planted)}")
-    assert planted == ["import neuronx_distributed_inference as nxdi"], (
+    assert planted == [f"import {NXDI}_inference as nxdi"], (
         f"the scanner did not flag a planted NxDI import, so a zero from it means nothing: "
         f"{planted}"
     )

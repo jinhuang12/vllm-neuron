@@ -10135,6 +10135,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         """
         head = self._head_weight()
         quant_config = Glm5NextQuantConfig.from_model_config(self.config)
+        # THE KEYWORD IS ADDED, NOT PASSED AS FALSE. The keywords this root hands its
+        # stack are measured, so an ordinary forward has to hand over the six it always
+        # handed over and no seventh.
+        collecting = {"collect_layer_streams": True} if collect_layer_streams else {}
         stack_output = self.model(
             input_ids,
             layer_carriers=layer_carriers,
@@ -10143,7 +10147,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             moe_group=moe_group,
             tp_degree=tp_degree,
             expert_parallel_rank=expert_parallel_rank,
-            collect_layer_streams=collect_layer_streams,
+            **collecting,
         )
         if collect_layer_streams:
             hidden_states, layer_streams = stack_output
