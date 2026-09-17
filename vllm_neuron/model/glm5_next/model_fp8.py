@@ -7765,7 +7765,10 @@ class Glm5NextDSALayer(nn.Module):
                 # WHAT THE ATTENTION HALF WAS ACTUALLY HANDED: the stream the
                 # hyper-connection site collapsed, and that stream normalised. The norm
                 # is hoisted to a local so the tap and the call read one tensor.
-                collector += [single_stream, normed]
+                # EXTEND, NOT ``+=``: this is a closure over the caller's name, and an
+                # augmented assignment would bind it locally and make every read above
+                # unbound -- on the untapped path too.
+                collector.extend([single_stream, normed])
             attended = self.attention(
                 normed,
                 latent_cache=latent_cache,
