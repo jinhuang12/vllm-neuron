@@ -1436,12 +1436,13 @@ def wrap_with_blockwise_fp8_downscale(
     """Wrap a weight loader so its result is squeezed into the 240 range.
 
     Same shape as ``weight_loaders_static_fp8.py``'s
-    ``_wrap_with_fp8_downscale``: on a platform that needs no squeeze the
-    original loader is returned unwrapped, so the identity path costs nothing.
+    ``_wrap_with_fp8_downscale``, with one difference: on a platform that
+    needs no squeeze the result is still the WEIGHT slice, so an entry that
+    pairs a weight with its scale companion loads the same in both modes.
     """
-    if not needs_240_downscale():
-        return loader
     base_transform = loader.transform or (lambda slices, rank: slices[0][:])
+    if not needs_240_downscale():
+        return SafetensorsWeightLoader(transform=base_transform)
 
     def transform(slices, rank):
         return downscale_fp8_weight_bytes(base_transform(slices, rank))
