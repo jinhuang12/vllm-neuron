@@ -1948,6 +1948,7 @@ class Glm5NextRoutedExperts(nn.Module):
         moe_group: object | None = None,
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run this rank's routed experts through the block-quant NKI kernel.
 
@@ -2178,6 +2179,11 @@ class Glm5NextRoutedExperts(nn.Module):
             moe_group=moe_group,
             tp_degree=tp_degree,
         )
+        if collector is not None:
+            # THE MAPPING IS A DEVICE-ONLY READING. Nothing off the device holds it, and it is
+            # what says whether every real token reached all of its experts once the padded
+            # rows were blocked alongside it.
+            collector.append(token_position_to_id)
 
         # ---- The padding-token slot, appended AFTER the mapping. --------- #
         # The kernel reads a ``-1`` token position as the LAST row of
@@ -2649,6 +2655,7 @@ class Glm5NextRoutedExperts(nn.Module):
         moe_group: object | None = None,
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run this rank's routed experts over ``[T, H]`` tokens.
 
@@ -2691,6 +2698,7 @@ class Glm5NextRoutedExperts(nn.Module):
             moe_group=moe_group,
             tp_degree=tp_degree,
             expert_parallel_rank=expert_parallel_rank,
+            collector=collector,
         )
 
 
@@ -3638,7 +3646,15 @@ class Glm5NextMoEBlock(nn.Module):
             hidden_states.unsqueeze(0), router_gamma, text_config
         )
         if collector is not None:
-            collector += [_logits, _expert_index, expert_affinities]
+            # THE SELECTED WEIGHTS, GATHERED HERE rather than left to the reader: the bank
+            # returns affinities scattered over every expert, and the comparison asks for the
+            # chosen few's weights. The gather rides the collecting graph, so a run with no
+            # dump configured never performs it.
+            collector += [
+                _logits,
+                _expert_index,
+                torch.gather(expert_affinities, -1, _expert_index.long()),
+            ]
 
         routed_output = self.experts(
             normed_hidden_states,
@@ -3648,6 +3664,7 @@ class Glm5NextMoEBlock(nn.Module):
             moe_group=moe_group,
             tp_degree=tp_degree,
             expert_parallel_rank=expert_parallel_rank,
+            **({"collector": collector} if collector is not None else {}),
         )
 
         shared_experts = getattr(self, "shared_experts", None)
@@ -4760,6 +4777,7 @@ class Glm5NextKDALayer(nn.Module):
         real_tokens: torch.Tensor | int | None = None,
         row_mask: torch.Tensor | None = None,
         streams: torch.Tensor | None = None,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """The linear-attention half, mixed either by mHC or by a plain add.
 
@@ -4812,7 +4830,7 @@ class Glm5NextKDALayer(nn.Module):
         """
 
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
-            return self.attention(
+            attended = self.attention(
                 self._input_norm(single_stream),
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
@@ -4822,6 +4840,9 @@ class Glm5NextKDALayer(nn.Module):
                 real_tokens=real_tokens,
                 row_mask=row_mask,
             )
+            if collector is not None:
+                collector.append(attended)
+            return attended
 
         site = _mhc_attention_site(self, streams)
         if site is None:
@@ -7766,12 +7787,29 @@ def _build_layer(
 DUMP_STREAM_LAYERS = 6
 
 
-def dump_tap_layer(layers) -> int | None:
-    """The first layer that carries both sparse attention and a mixture of experts."""
-    for index, layer in enumerate(layers):
-        if isinstance(layer, Glm5NextDSALayer) and isinstance(layer.mlp, Glm5NextMoEBlock):
-            return index
-    return None
+#: How many layers are tapped inside. The first two that hold experts are where the residual
+#: error appears, and the second one is what tells a departure from a drift.
+DUMP_TAP_LAYERS = 2
+
+#: The tapped tensors of one layer, in the order the layer produces them.
+DUMP_TAP_NAMES = (
+    "attn_out",
+    "mlp_input_normed",
+    "router_logits",
+    "router_topk_indices",
+    "router_topk_weights",
+    "token_position_to_id",
+    "mlp_output",
+)
+
+
+def dump_tap_layers(layers) -> tuple[int, ...]:
+    """The layers tapped inside: the first ``DUMP_TAP_LAYERS`` that hold an expert block."""
+    holding = [
+        index for index, layer in enumerate(layers)
+        if isinstance(layer.mlp, Glm5NextMoEBlock)
+    ]
+    return tuple(holding[:DUMP_TAP_LAYERS])
 
 
 def _dump_layers(model: nn.Module):
@@ -7793,19 +7831,8 @@ def layer_dump_names(model: nn.Module) -> tuple[str, ...]:
     if layers is None:
         return ()
     names = [f"after_layer_{index}" for index in range(min(DUMP_STREAM_LAYERS, len(layers)))]
-    tap = dump_tap_layer(layers)
-    if tap is not None:
-        names += [
-            f"layer{tap}_{suffix}"
-            for suffix in (
-                "attention_output",
-                "mlp_input1",
-                "router_logits",
-                "router_topk_indices",
-                "router_affinities",
-                "mlp_output",
-            )
-        ]
+    for tap in dump_tap_layers(layers):
+        names += [f"layer{tap}_{suffix}" for suffix in DUMP_TAP_NAMES]
     return tuple(names)
 
 
@@ -8144,7 +8171,7 @@ class Glm5NextModel(nn.Module):
         # constant, so a three-layer stack taps the layer it actually has.
         collected: list[torch.Tensor] = []
         taps: list[torch.Tensor] = []
-        tap_layer = dump_tap_layer(layers) if collect_layer_streams else None
+        tap_layers = dump_tap_layers(layers) if collect_layer_streams else ()
         for index, (layer, carrier) in enumerate(zip(layers, carriers)):
             # ONE TENSOR, PASSED AS BOTH ARGUMENTS ON PURPOSE. The streams ARE this
             # layer's input, exactly as ``reference:1481-1491`` hands the four-stream
@@ -8155,7 +8182,7 @@ class Glm5NextModel(nn.Module):
                 streams,
                 **carrier,
                 streams=streams,
-                **({"collector": taps} if index == tap_layer else {}),
+                **({"collector": taps} if index in tap_layers else {}),
             )
             # THE FEED-FORWARD SITE, ``reference:1321-1327``. ``_ffn_half`` is
             # ``inc-glm53f-054a``'s and is CALLED, never edited: the site collapses
@@ -8166,7 +8193,7 @@ class Glm5NextModel(nn.Module):
             streams = site.forward(
                 streams,
                 lambda single_stream, layer=layer, collector=(
-                    taps if index == tap_layer else None
+                    taps if index in tap_layers else None
                 ): self._ffn_half(
                     layer,
                     single_stream,
