@@ -7262,7 +7262,11 @@ class Glm5NextMLAAttention(nn.Module):
         out_dtype = hidden_states.dtype
         return query.to(out_dtype), kv_latent.to(out_dtype)
 
-    def project_output(self, attn_out: torch.Tensor) -> torch.Tensor:
+    def project_output(
+        self,
+        attn_out: torch.Tensor,
+        collector: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """The output projection. ONE dispatch.
 
         ``attn_out`` is ``[tokens, heads, v_head_dim]`` or the same flattened to
@@ -7315,12 +7319,20 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{tuple(attn_out.shape)}"
             )
         projected = mla_projection(x.contiguous(), self._prepared_weight("o_proj"))
+        if collector is not None:
+            # THE PARTIAL IS CLONED AND THE INPUT IS NOT. The reduction below writes
+            # through its argument, so a tap holding ``projected`` would come back
+            # holding the sum instead of this rank's share.
+            collector += [x, projected.clone()]
         # Sum this rank's partial with every other rank's. ``None`` means one
         # rank, where the partial already is the whole sum.
         group = _resolve_tp_group()
         if group is not None:
             group.all_reduce(projected)
-        return projected.to(attn_out.dtype)
+        whole = projected.to(attn_out.dtype)
+        if collector is not None:
+            collector.append(whole)
+        return whole
 
     # -- the DECODE section -- D14 owner: ``inc-glm53f-042`` -------------------
     #
@@ -7365,6 +7377,7 @@ class Glm5NextMLAAttention(nn.Module):
         softmax_scale: float,
         batch_size: int = 1,
         prefill_end_position: torch.Tensor | int | None = None,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
@@ -7503,7 +7516,7 @@ class Glm5NextMLAAttention(nn.Module):
         reduced = mla_absorb(
             attended.to(hidden_states.dtype), self._absorb_weight("W_UV")
         )
-        return self.project_output(reduced)
+        return self.project_output(reduced, collector)
 
     def forward(
         self,
@@ -7521,6 +7534,7 @@ class Glm5NextMLAAttention(nn.Module):
         position: torch.Tensor | int | None = None,
         prefill_tail: torch.Tensor | None = None,
         prefill_end_position: torch.Tensor | int | None = None,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -7581,6 +7595,11 @@ class Glm5NextMLAAttention(nn.Module):
                 None if prefill_end_position is None else start_position
             ),
         )
+        if collector is not None:
+            # THE FIRST FIVE ROWS ONLY, and as the indexer emitted them: a static slice
+            # inside the trace, no cast, so a -1 stays the sentinel it is rather than
+            # becoming a float. A shorter batch yields the rows it has.
+            collector.append(topk_indices[:5])
         return self.attend(
             normed_hidden_states,
             latent_cache,
@@ -7588,6 +7607,7 @@ class Glm5NextMLAAttention(nn.Module):
             topk_indices,
             float(softmax_scale),
             prefill_end_position=prefill_end_position,
+            collector=collector,
         )
 
 
@@ -7740,8 +7760,14 @@ class Glm5NextDSALayer(nn.Module):
         """
 
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
+            normed = self._input_norm(single_stream)
+            if collector is not None:
+                # WHAT THE ATTENTION HALF WAS ACTUALLY HANDED: the stream the
+                # hyper-connection site collapsed, and that stream normalised. The norm
+                # is hoisted to a local so the tap and the call read one tensor.
+                collector += [single_stream, normed]
             attended = self.attention(
-                self._input_norm(single_stream),
+                normed,
                 latent_cache=latent_cache,
                 pool_cache=pool_cache,
                 seq_lens=seq_lens,
@@ -7754,6 +7780,7 @@ class Glm5NextDSALayer(nn.Module):
                 position=position,
                 prefill_tail=prefill_tail,
                 prefill_end_position=prefill_end_position,
+                **({"collector": collector} if collector is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
@@ -7801,6 +7828,19 @@ DUMP_STREAM_LAYERS = 6
 #: ``shared_output`` are each half's own result before the layer reduces them, so they read as
 #: partials on a sharded run; ``mlp_output`` and ``attention_output`` are taken after the
 #: reduction and are whole.
+#: The attention-side taps of one layer, in the order its forward appends them, and BEFORE
+#: ``attention_output`` because each is taken further inside the same call. They exist only where the
+#: attention module carries the sparse indexer: the KDA half emits no index rows and projects its
+#: output through no row-parallel matmul, so there is nothing at those names to read there.
+DUMP_DSA_TAP_NAMES = (
+    "attn_hc_collapsed",
+    "attn_input_normed",
+    "index_rows",
+    "o_proj_input",
+    "o_proj_partial",
+    "o_proj_reduced",
+)
+
 DUMP_TAP_NAMES = (
     "attention_output",
     "mlp_input1",
@@ -7829,9 +7869,11 @@ def dump_tap_layers(layers) -> tuple[int, ...]:
 
 def dump_tap_names(layer: nn.Module) -> tuple[str, ...]:
     """The tap names one layer contributes, in the order its forward appends them."""
+    indexer = getattr(getattr(layer, "attention", None), "indexer", None)
+    names = DUMP_DSA_TAP_NAMES if indexer is not None else ()
     if getattr(layer.mlp, "shared_experts", None) is None:
-        return tuple(name for name in DUMP_TAP_NAMES if name != "shared_output")
-    return DUMP_TAP_NAMES
+        return names + tuple(name for name in DUMP_TAP_NAMES if name != "shared_output")
+    return names + DUMP_TAP_NAMES
 
 
 def _dump_layers(model: nn.Module):

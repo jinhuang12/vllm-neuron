@@ -34,7 +34,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_neuron.model.glm5_next import model_fp8
 from vllm_neuron.model.glm5_next.model_fp8 import (
+    DUMP_DSA_TAP_NAMES,
     DUMP_STREAM_LAYERS,
     dump_tap_layers,
     dump_tap_names,
@@ -434,3 +436,170 @@ def test_the_modules_the_dump_touches_import_no_nxdi_stack():
     )
     for relative, found in hits.items():
         assert found == [], f"{relative} imports the NxDI stack: {found}"
+
+
+# ---------------------------------------------------------------------------
+# THE ATTENTION-SIDE TAPS
+# ---------------------------------------------------------------------------
+# Each item below runs one dumping prefill and reads the files against an oracle recorded
+# where the layer itself makes the tensor, so nothing here re-derives the model's arithmetic.
+
+
+def _dsa_tap_layer(layers):
+    """The first tapped layer whose attention carries the indexer, or None."""
+    for tap in dump_tap_layers(layers):
+        if getattr(getattr(layers[tap], "attention", None), "indexer", None) is not None:
+            return tap
+    return None
+
+
+def _dumped(save_dir, tap, suffix):
+    """One tap file, loaded."""
+    return torch.load(
+        save_dir / f"layer{tap}_{suffix}.pt", map_location="cpu", weights_only=True
+    )
+
+
+def _run_a_dumping_prefill(save_dir, monkeypatch):
+    """A dumping prefill on the tiny stack. Returns the layers, the tapped index and the runner."""
+    monkeypatch.setenv(DUMP_VARIABLE, str(save_dir))
+    fixture, root = _bound_root()
+    runner = _runner_for(root)
+    layers = list(root.model.layers)
+    tap = _dsa_tap_layer(layers)
+    if tap is None:
+        pytest.skip("this fixture taps no layer whose attention carries the sparse indexer")
+    return layers, tap, runner, root
+
+
+def test_the_attention_half_taps_are_the_collapsed_stream_and_its_norm(tmp_path, monkeypatch):
+    """``attn_hc_collapsed`` is what the half was handed and ``attn_input_normed`` is its norm."""
+    _require_cpu_mode()
+    save_dir = tmp_path / "layer-streams"
+    layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
+    layer = layers[tap]
+    # THE ORACLE IS THE NORM ITSELF: it receives exactly the collapsed stream and returns
+    # exactly the tensor the attention module is handed, so neither side is re-derived here.
+    seen = {}
+    norm = layer._input_norm
+
+    def _record_norm(single_stream):
+        normed = norm(single_stream)
+        seen["collapsed"] = single_stream.detach().clone()
+        seen["normed"] = normed.detach().clone()
+        return normed
+
+    monkeypatch.setattr(layer, "_input_norm", _record_norm)
+    _, output = _prefill(runner, root, _prompt())
+    NeuronModelRunner._take_layer_stream_dump(runner, output, is_prefill=True)
+
+    collapsed = _dumped(save_dir, tap, "attn_hc_collapsed")
+    normed = _dumped(save_dir, tap, "attn_input_normed")
+    print(f"TINYDUMP|attn_half_taps|layer={tap}|collapsed={tuple(collapsed.shape)}"
+          f"|normed={tuple(normed.shape)}|oracle_collapsed={tuple(seen['collapsed'].shape)}"
+          f"|equal_collapsed={torch.equal(collapsed, seen['collapsed'].float())}"
+          f"|equal_normed={torch.equal(normed, seen['normed'].float())}")
+    assert torch.equal(collapsed, seen["collapsed"].float()), (
+        f"layer{tap}_attn_hc_collapsed.pt is not the stream the attention half was handed; "
+        f"max abs delta {float((collapsed - seen['collapsed'].float()).abs().max())}"
+    )
+    assert torch.equal(normed, seen["normed"].float()), (
+        f"layer{tap}_attn_input_normed.pt is not that stream normalised; max abs delta "
+        f"{float((normed - seen['normed'].float()).abs().max())}"
+    )
+
+
+def test_the_index_rows_tap_holds_the_rows_the_indexer_emitted(tmp_path, monkeypatch):
+    """``index_rows`` is the indexer's first rows, unaltered, and every real column is causal."""
+    _require_cpu_mode()
+    save_dir = tmp_path / "layer-streams"
+    layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
+    seen = {}
+
+    def _record_indexer(module, args, output):
+        seen["emitted"] = output.detach().clone()
+
+    handle = layers[tap].attention.indexer.register_forward_hook(_record_indexer)
+    try:
+        output = _prefill(runner, root, _prompt())[1]
+    finally:
+        handle.remove()
+    NeuronModelRunner._take_layer_stream_dump(runner, output, is_prefill=True)
+
+    rows = _dumped(save_dir, tap, "index_rows")
+    emitted = seen["emitted"]
+    print(f"TINYDUMP|index_rows|layer={tap}|file={tuple(rows.shape)}|dtype={rows.dtype}"
+          f"|emitted={tuple(emitted.shape)}|sentinels={int((rows < 0).sum())}"
+          f"|max_index={int(rows.max())}")
+    assert rows.dtype is emitted.dtype, (
+        f"layer{tap}_index_rows.pt is {rows.dtype} and the indexer emitted {emitted.dtype}; "
+        f"a cast would turn the -1 sentinel into a number the comparison reads as a column"
+    )
+    assert int(rows.shape[0]) == min(5, int(emitted.shape[0])), (
+        f"the tap holds {int(rows.shape[0])} row(s); it declares the first five, or every row "
+        f"of a shorter batch ({int(emitted.shape[0])} here)"
+    )
+    assert torch.equal(rows, emitted[: int(rows.shape[0])]), (
+        f"layer{tap}_index_rows.pt is not the indexer's own first rows"
+    )
+    # THE CALLER PRECONDITION THE ROWS MUST MEET (``index_expand.py:48``): a real column of
+    # row ``i`` names a token inside that row's own sequence, and ``-1`` names no token.
+    # A fresh prefill starts at position 0, so row ``i``'s own position IS ``i``.
+    for row in range(int(rows.shape[0])):
+        real = rows[row][rows[row] >= 0]
+        if not int(real.numel()):
+            continue
+        assert int(real.max()) <= row, (
+            f"row {row} selects token {int(real.max())}, which is past its own position"
+        )
+
+
+def test_the_output_projection_taps_are_the_input_the_partial_and_the_whole(tmp_path, monkeypatch):
+    """The partial is this rank's own share: a reduce that adds is visible in one file only."""
+    _require_cpu_mode()
+    save_dir = tmp_path / "layer-streams"
+    layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
+    added = 7.0
+
+    class _AddingGroup:
+        """A stand-in for the tensor-parallel coordinator: it reduces by adding in place."""
+
+        @staticmethod
+        def all_reduce(tensor):
+            tensor.add_(added)
+
+    monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: _AddingGroup)
+    seen = {}
+    project = layers[tap].attention.project_output
+
+    def _record_projection(attn_out, collector=None):
+        seen["handed"] = attn_out.detach().clone()
+        return project(attn_out, collector)
+
+    monkeypatch.setattr(layers[tap].attention, "project_output", _record_projection)
+    _, output = _prefill(runner, root, _prompt())
+    NeuronModelRunner._take_layer_stream_dump(runner, output, is_prefill=True)
+
+    entered = _dumped(save_dir, tap, "o_proj_input")
+    partial = _dumped(save_dir, tap, "o_proj_partial")
+    whole = _dumped(save_dir, tap, "o_proj_reduced")
+    handed = seen["handed"]
+    delta = (whole - partial).abs()
+    print(f"TINYDUMP|o_proj_taps|layer={tap}|input={tuple(entered.shape)}"
+          f"|partial={tuple(partial.shape)}|reduced={tuple(whole.shape)}"
+          f"|handed={tuple(handed.shape)}|added={added}|delta_min={float(delta.min())}"
+          f"|delta_max={float(delta.max())}")
+    assert entered.shape[0] == handed.shape[0] and entered.ndim == 2, (
+        f"layer{tap}_o_proj_input.pt is {tuple(entered.shape)}; the projection reads its input "
+        f"as [tokens, this rank's value width] and was handed {tuple(handed.shape)}"
+    )
+    assert partial.shape == whole.shape, (
+        f"the partial is {tuple(partial.shape)} and the reduced whole is {tuple(whole.shape)}; "
+        f"a reduction changes values and not shape"
+    )
+    assert torch.allclose(delta, torch.full_like(delta, added), atol=1e-2), (
+        f"the reduce added {added} to every element, so the two files must differ by exactly "
+        f"that; they differ by {float(delta.min())}..{float(delta.max())}. A partial that "
+        f"carries the sum is the clone this tap needs, missing"
+    )
+
