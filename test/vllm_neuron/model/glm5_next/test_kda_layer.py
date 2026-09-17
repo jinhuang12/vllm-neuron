@@ -430,7 +430,7 @@ def case() -> SimpleNamespace:
             )
         )
 
-    def drive(hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+    def drive(hidden_states: torch.Tensor, is_prefill: bool, start_position: int) -> torch.Tensor:
         out = hidden_states
         for layer, (conv_state, recurrent_state) in zip(layers, bank):
             out = layer(
@@ -438,12 +438,13 @@ def case() -> SimpleNamespace:
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
                 is_prefill=is_prefill,
+                start_position=start_position,
                 chunk_size=DECLARED_CHUNK,
             )
         return out
 
     _reset_counters()
-    prefill_out = drive(tokens[:DECLARED_PREFILL_TOKENS], True)
+    prefill_out = drive(tokens[:DECLARED_PREFILL_TOKENS], True, 0)
     prefill_counts = _read_counters()
     prefill_state = [rs.clone() for _, rs in bank]
 
@@ -451,7 +452,7 @@ def case() -> SimpleNamespace:
     decode_rows = []
     for step in range(DECLARED_DECODE_STEPS):
         index = DECLARED_PREFILL_TOKENS + step
-        decode_rows.append(drive(tokens[index : index + 1], False))
+        decode_rows.append(drive(tokens[index : index + 1], False, index))
     decode_counts = _read_counters()
     decode_out = torch.cat(decode_rows, dim=0)
 
