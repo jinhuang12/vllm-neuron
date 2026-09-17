@@ -37,6 +37,7 @@ LEAF = "q_b_proj"
 BLOCK = 128
 QUANTUM = 2.0 ** -9
 NORMAL_BAND = 2.0 ** -5
+EVALUATION_SLACK = 2.0 ** -20  # fp32 rounding of the two products, where the difference sits exactly on the bound
 
 
 class Reading(NamedTuple):
@@ -94,11 +95,12 @@ def _within_one_quantum(reading: Reading) -> tuple[bool, str]:
     normal = reading.weight.float().abs() >= NORMAL_BAND
     mask = reading.reference != 0
     ratio = (reading.product[mask] / reading.reference[mask]).median().item()
-    within = bool(torch.all(diff <= bound))
+    within = bool(torch.all(diff <= bound * (1.0 + EVALUATION_SLACK)))
     exact = bool(torch.equal(reading.product[normal], reading.reference[normal]))
     row = (
         f"moved={int((diff > 0).sum())}/{diff.numel()}|max_abs_diff={diff.max().item():.6g}|max_bound={bound.max().item():.6g}"
-        f"|within_one_quantum={within}|normal_band_exact={exact}|normal_band_elements={int(normal.sum())}|ratio={ratio:.6f}"
+        f"|within_one_quantum={within}|slack={EVALUATION_SLACK:.3g}|normal_band_exact={exact}"
+        f"|normal_band_elements={int(normal.sum())}|ratio={ratio:.6f}"
     )
     print(f"FP8DQ|{reading.label}|quantum|{row}")
     return abs(ratio - 1.0) <= 1e-4 and within and exact, row
