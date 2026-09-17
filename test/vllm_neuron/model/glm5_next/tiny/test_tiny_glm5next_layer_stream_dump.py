@@ -201,6 +201,34 @@ def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
         layer.mlp.register_forward_hook(_record_output),
         bank.register_forward_hook(_record_routed),
     ]
+    indexer = getattr(layer.attention, "indexer", None)
+    if indexer is not None:
+        norm = layer._input_norm
+
+        def _record_norm(single_stream):
+            normed = norm(single_stream)
+            seen["attn_hc_collapsed"] = single_stream.detach().clone()
+            seen["attn_input_normed"] = normed.detach().clone()
+            return normed
+
+        def _record_index_rows(module, args, output):
+            seen["index_rows"] = output[:5].detach().clone()
+
+        project = layer.attention.project_output
+
+        def _record_projection(attn_out, collector=None):
+            # THE WIDTH THE PROJECTION READS is the flattened head axis, so the input's
+            # oracle is this same tensor reshaped -- a view, not a second arithmetic.
+            # ``o_proj_reduced`` needs no oracle of its own: it IS the attention module's
+            # return, which the hook above already holds, and the equality proves it.
+            seen["o_proj_input"] = (
+                attn_out.detach().to(torch.float32).reshape(int(attn_out.shape[0]), -1)
+            )
+            return project(attn_out, collector)
+
+        monkeypatch.setattr(layer, "_input_norm", _record_norm)
+        monkeypatch.setattr(layer.attention, "project_output", _record_projection)
+        handles.append(indexer.register_forward_hook(_record_index_rows))
     return seen, handles
 
 
@@ -345,7 +373,23 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
                     f"{top_k} experts each was given"
                 )
                 continue
-            want = tapped[tap][suffix]
+            if suffix == "o_proj_partial":
+                # THE PARTIAL'S OWN PROPERTY, and the only reading of it from outside the
+                # method: this fixture resolves no coordinator, so nothing is added between
+                # the partial and the whole and the two differ by the output cast alone.
+                # The reduce itself is read where a coordinator exists, in its own item.
+                reduced = _dumped(save_dir, tap, "o_proj_reduced")
+                cast = dumped.to(table.dtype).float()
+                same = torch.equal(cast, reduced)
+                print(f"TINYDUMP|tap|layer{tap}_{suffix}|shape={tuple(dumped.shape)}"
+                      f"|dtype={dumped.dtype}|is_the_whole_under_the_output_cast={same}")
+                assert same, (
+                    f"layer{tap}_o_proj_partial.pt is not the reduced whole under the output "
+                    f"cast, and no coordinator added anything; they differ by "
+                    f"{float((cast - reduced).abs().max())}"
+                )
+                continue
+            want = tapped[tap]["attention_output" if suffix == "o_proj_reduced" else suffix]
             want = want.to(table.dtype) if suffix == "mlp_output" else want
             want = want.float() if want.is_floating_point() else want
             same = torch.equal(dumped, want)
@@ -597,9 +641,18 @@ def test_the_output_projection_taps_are_the_input_the_partial_and_the_whole(tmp_
         f"the partial is {tuple(partial.shape)} and the reduced whole is {tuple(whole.shape)}; "
         f"a reduction changes values and not shape"
     )
-    assert torch.allclose(delta, torch.full_like(delta, added), atol=1e-2), (
-        f"the reduce added {added} to every element, so the two files must differ by exactly "
-        f"that; they differ by {float(delta.min())}..{float(delta.max())}. A partial that "
-        f"carries the sum is the clone this tap needs, missing"
+    # THE CAST IS PART OF THE CLAIM, so the oracle carries it rather than a tolerance
+    # absorbing it: the method adds in float32 and hands the whole back in the input's
+    # dtype, so the partial plus the added amount, under that same cast, IS the file.
+    want = (partial + added).to(handed.dtype).float()
+    same = torch.equal(whole, want)
+    print(f"TINYDUMP|o_proj_reduce|layer={tap}|cast_to={handed.dtype}"
+          f"|reduced_is_the_partial_plus_{added}_under_the_cast={same}")
+    assert same, (
+        f"the reduce added {added} to every element, so the reduced file must be the partial "
+        f"plus that under the output cast; they differ by "
+        f"{float((whole - want).abs().max())} and the raw gap is "
+        f"{float(delta.min())}..{float(delta.max())}. A partial that carries the sum is the "
+        f"clone this tap needs, missing"
     )
 
