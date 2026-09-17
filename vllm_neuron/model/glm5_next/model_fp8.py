@@ -7942,7 +7942,8 @@ class Glm5NextModel(nn.Module):
         moe_group: object | None = None,
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
-    ) -> torch.Tensor:
+        collect_layer_streams: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """The whole decoder stack: embed, expand to streams, every layer in config
         order, collapse, final norm.
 
@@ -8012,9 +8013,20 @@ class Glm5NextModel(nn.Module):
                 The registered TP=64 consumption form (``tp_degree`` 4,
                 ``expert_parallel_rank`` from ``get_neuron_ep_rank()``) is the
                 CALLER's to supply, so no degree is frozen at this site.
+            collect_layer_streams: hand the per-layer carrier back beside the
+                hidden state. Default False, which is the production route and
+                leaves this method returning exactly the tensor it always
+                returned. The caller that sets it is the runner, which writes
+                the tensors to disk AFTER the forward returns: this method
+                performs no I/O, holds no file path and reads no environment,
+                because a save call inside a traced forward is a graph break
+                rather than a dump.
 
         Returns:
-            ``[T, H]`` after the final RMSNorm, in the embedding table's dtype. The
+            ``[T, H]`` after the final RMSNorm, in the embedding table's dtype --
+            or, under ``collect_layer_streams``, that tensor and one
+            ``[T, hc_mult, H]`` carrier per layer, each the tensor the NEXT layer
+            was handed and the last the tensor the collapse consumed. The
             streams live only inside this method, and they carry the table's dtype
             the whole way: the expand copies it, both mHC sites cast their mixes back
             to it (``reference:1291``), the mean keeps it (``reference:302``) and the
@@ -8059,6 +8071,11 @@ class Glm5NextModel(nn.Module):
         # vector; ``contiguous`` is the reference's too, because the streams are
         # written independently from here on and a view would alias them.
         streams = embedded.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
+        # THE COLLECTION IS A LIST OF THE LOOP'S OWN REBINDINGS, appended after each
+        # layer's feed-forward site so the entry for layer i IS the tensor layer i+1
+        # is handed. It stays empty on the production route, so the loop below runs
+        # the same operations either way and nothing but a python append is added.
+        collected: list[torch.Tensor] = []
         for layer, carrier in zip(layers, carriers):
             # ONE TENSOR, PASSED AS BOTH ARGUMENTS ON PURPOSE. The streams ARE this
             # layer's input, exactly as ``reference:1481-1491`` hands the four-stream
@@ -8084,6 +8101,8 @@ class Glm5NextModel(nn.Module):
                     expert_parallel_rank=expert_parallel_rank,
                 ),
             )
+            if collect_layer_streams:
+                collected.append(streams)
         gain = self.norm_weight
         if gain is None:
             raise ValueError(
@@ -8095,7 +8114,10 @@ class Glm5NextModel(nn.Module):
         # stream axis, then the norm -- in that order, which is the order the
         # reference composes ``self.norm(self.hc_head(hidden_states))``.
         collapsed = streams.mean(dim=1).to(embedded.dtype)
-        return self._rms_norm(collapsed, gain)
+        normed = self._rms_norm(collapsed, gain)
+        if collect_layer_streams:
+            return normed, tuple(collected)
+        return normed
 
 
 # ---------------------------------------------------------------------------
@@ -9997,7 +10019,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         moe_group: object | None = None,
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
-    ) -> torch.Tensor:
+        collect_layer_streams: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
         THE EXCLUSION THAT STOOD HERE IS RETIRED BY ``inc-glm53f-030d``. This note
@@ -10092,10 +10115,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
             tp_degree: ranks sharding each expert's intermediate dimension.
             expert_parallel_rank: which rank's expert slice to select, as an
                 int64 device tensor (one graph for every rank) or a python int.
+            collect_layer_streams: return the stack's per-layer carriers after the
+                logits, as ADDITIONAL OUTPUTS OF THIS GRAPH. Default False, and
+                the runner adds the keyword only where it has a directory to write
+                them to, so an ordinary serve traces the signature it always
+                traced. The tuple is FLAT because these are graph outputs: a
+                nested tuple is one output to a caller and a structure the capture
+                has to flatten.
 
         Returns:
             ``[len(sampling_positions), vocab_size]`` logits, in the dtype the
-            head weight and the stack output share.
+            head weight and the stack output share -- or, under
+            ``collect_layer_streams``, that tensor first and then one
+            ``[T, hc_mult, H]`` carrier per layer of the stack.
 
         Raises:
             ValueError: when the head tensor this call needs was never loaded,
@@ -10103,7 +10135,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         """
         head = self._head_weight()
         quant_config = Glm5NextQuantConfig.from_model_config(self.config)
-        hidden_states = self.model(
+        stack_output = self.model(
             input_ids,
             layer_carriers=layer_carriers,
             quant_config=quant_config,
@@ -10111,6 +10143,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             moe_group=moe_group,
             tp_degree=tp_degree,
             expert_parallel_rank=expert_parallel_rank,
+            collect_layer_streams=collect_layer_streams,
         )
+        if collect_layer_streams:
+            hidden_states, layer_streams = stack_output
+        else:
+            hidden_states, layer_streams = stack_output, ()
         rows = torch.index_select(hidden_states, dim=0, index=sampling_positions)
-        return torch.nn.functional.linear(rows, head)
+        logits = torch.nn.functional.linear(rows, head)
+        if collect_layer_streams:
+            return (logits, *layer_streams)
+        return logits

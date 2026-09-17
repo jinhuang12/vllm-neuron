@@ -536,6 +536,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._on_device_logits: torch.Tensor | None = None
         self._debug_logits_dir: str | None = self.neuron_config.debug_logits_dir
         self._debug_logits_step_counter: int = 0
+        # The per-layer stream dump, read ONCE here and never again: the flag decides
+        # which signature the model traces, so a later read could disagree with the
+        # graph that was captured.
+        self._layer_stream_dump_dir: str | None = self._layer_stream_dump_dir_from_env()
+        self._layer_streams_dumped: bool = False
         self._tensor_replacer = None
 
         # Context parallelism: DCP rank for KV cache sharding.
@@ -6489,6 +6494,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
             **self._glm5next_parallel_kwargs(device=input_ids.device),
+            # THE DUMP KEYWORD RIDES THE ONE CONVERTER every call site goes through,
+            # so the graphs the warmup captures and the graphs the steps run carry the
+            # same signature. Absent unless a dump directory was configured.
+            **self._layer_stream_kwargs(),
         }
 
     def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
@@ -9073,6 +9082,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_name=neff_bucket_name,
         ).inc()
 
+        # The per-layer stream dump, taken off the output before anything below reads
+        # it: `is_prefill` is already decided here, and every branch after this line
+        # expects the output shape the model returns with no dump configured.
+        model_output = self._take_layer_stream_dump(
+            model_output, is_prefill=is_prefill
+        )
+
         # Parse model output based on on-device sampling and spec decode configuration
         self._on_device_logits = None
         last_accepted_token: torch.Tensor | None = None
@@ -11237,6 +11253,69 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             tensors[layer_name] = torch.load(buf, weights_only=True)
 
         torch.save(tensors, str(save_path))
+
+    # ------------------------------------------------------------------------
+    # PER-LAYER RESIDUAL STREAM DUMP
+    # ------------------------------------------------------------------------
+    # Enabled by VLLM_NEURON_DUMP_LAYER_STREAMS=<dir>, the KV dump's shape one level
+    # deeper: the tensors this wants live INSIDE the model, so the stack hands them
+    # back as extra graph outputs and the save happens HERE, after the forward has
+    # returned. Nothing on this path runs inside the trace -- a save, a log or an
+    # environment read in there is a graph break, not a dump -- and with the variable
+    # unset the model is handed no keyword at all and traces its ordinary signature.
+
+    @staticmethod
+    def _layer_stream_dump_dir_from_env() -> str | None:
+        """The directory VLLM_NEURON_DUMP_LAYER_STREAMS names, or None when it is unset."""
+        return os.environ.get("VLLM_NEURON_DUMP_LAYER_STREAMS") or None
+
+    def _layer_stream_kwargs(self) -> dict:
+        """The collection keyword for the model, empty unless a dump directory is set."""
+        if not self._layer_stream_dump_dir:
+            return {}
+        return {"collect_layer_streams": True}
+
+    def _take_layer_stream_dump(self, model_output: Any, *, is_prefill: bool) -> Any:
+        """Save a collecting forward's per-layer streams and return its logits alone.
+
+        Every step goes through here while the dump is configured, because every graph
+        captured under it carries the extra outputs; only the FIRST prefill is written.
+        """
+        if not self._layer_stream_dump_dir:
+            return model_output
+        if not isinstance(model_output, tuple):
+            logger.warning(
+                "layer stream dump: %s is set but the model returned %s rather than "
+                "a tuple, so no per-layer stream reached this step",
+                "VLLM_NEURON_DUMP_LAYER_STREAMS",
+                type(model_output).__name__,
+            )
+            return model_output
+        logits, streams = model_output[0], model_output[1:]
+        if not is_prefill or self._layer_streams_dumped:
+            return logits
+        self._layer_streams_dumped = True
+        rank = int(self.rank_tensor.item())
+        if rank != 0:
+            return logits
+        import pathlib
+
+        save_dir = pathlib.Path(self._layer_stream_dump_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        for index, stream in enumerate(streams):
+            # THE HOST MOVE TAKES A CONTIGUOUS TENSOR, and an async step hands this
+            # method futures instead, which resolve through ``cpu()`` alone.
+            if torch.is_tensor(stream):
+                host = stream.contiguous().to("cpu")
+            else:
+                host = stream.cpu()
+            torch.save(host.float(), str(save_dir / f"after_layer_{index}.pt"))
+        logger.info(
+            "layer stream dump: wrote %d per-layer tensors under %s",
+            len(streams),
+            save_dir,
+        )
+        return logits
 
     # ------------------------------------------------------------------------
     # TENSOR CAPTURE
