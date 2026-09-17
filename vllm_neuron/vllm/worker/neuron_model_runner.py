@@ -354,6 +354,30 @@ def _compute_slot_mapping_cpu(
         )
 
 
+def kv_cache_allocations(
+    kv_cache_config: KVCacheConfig,
+) -> list[tuple[int, list[str]]]:
+    """The raw buffers the runner allocates for a KV cache configuration, as (bytes, sharing layers) pairs."""
+    spec_of = {
+        name: group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        for name in group.layer_names
+    }
+    allocations: list[tuple[int, list[str]]] = []
+    for tensor in kv_cache_config.kv_cache_tensors:
+        recurrent = [
+            name
+            for name in tensor.shared_by
+            if isinstance(spec_of.get(name), MambaSpec)
+        ]
+        shared = [name for name in tensor.shared_by if name not in recurrent]
+        if shared:
+            allocations.append((tensor.size, shared))
+        for name in recurrent:
+            allocations.append((tensor.size, [name]))
+    return allocations
+
+
 def build_sampling_params_tensor(
     sampling_metadata, num_reqs: int, device: torch.device
 ) -> torch.Tensor:
@@ -10435,18 +10459,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # request. The whole cost is HBM: one window per latent layer.
         spare_bytes = self._latent_spare_bytes(kv_cache_config)
 
-        # Initialize the KV Cache tensors
+        # A RECURRENT LAYER NEVER SHARES A BUFFER. vLLM hands one tensor to the
+        # same-index layer of every group because each group's block table names
+        # disjoint blocks of it. A recurrent bank is addressed by request slot,
+        # the same slot in every layer, so two recurrent layers on one buffer
+        # read and overwrite each other's state, and a recurrent slot overlays
+        # the block of the same number in the latent layer sharing the buffer.
+        # Each recurrent layer therefore gets its own buffer of the shared
+        # tensor's size; the latent sharers keep the shared one, with its spare.
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for tensor in kv_cache_config.kv_cache_tensors:
-            spare = max(
-                (spare_bytes.get(layer_name, 0) for layer_name in tensor.shared_by),
-                default=0,
-            )
+        for size, owners in kv_cache_allocations(kv_cache_config):
+            spare = max((spare_bytes.get(name, 0) for name in owners), default=0)
             raw_tensor = torch.zeros(
-                tensor.size + spare, dtype=torch.int8, device=self.device
+                size + spare, dtype=torch.int8, device=self.device
             )
-            # Case where the KV cache is shared across layers
-            for layer_name in tensor.shared_by:
+            for layer_name in owners:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
 
         # Cache raw.view(dtype) per (raw_tensor, dtype) so layers pooled onto one

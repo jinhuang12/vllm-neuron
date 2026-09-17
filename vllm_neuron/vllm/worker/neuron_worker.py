@@ -1173,6 +1173,31 @@ class NeuronWorker(WorkerBase):
         )
         return need_bytes
 
+    def _kv_cache_footprint_bytes(self, need_bytes: int) -> int:
+        """Return the bytes the runner allocates for a KV cache budgeted at ``need_bytes``.
+
+        vLLM shares one tensor across the same-index layer of every group and
+        sizes its blocks from ``need_bytes``; the runner then gives each
+        recurrent layer its own buffer of that tensor's size, because a
+        recurrent bank is addressed by request slot and not by block. This
+        figure is what must fit the device. The latent spare window stays
+        outside it, as it stays outside the need.
+        """
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_config_from_groups,
+            get_kv_cache_groups,
+        )
+
+        from .neuron_model_runner import kv_cache_allocations
+
+        groups = get_kv_cache_groups(
+            self.vllm_config, self.model_runner.get_kv_cache_spec()
+        )
+        kv_cache_config = get_kv_cache_config_from_groups(
+            self.vllm_config, groups, need_bytes
+        )
+        return sum(size for size, _owners in kv_cache_allocations(kv_cache_config))
+
     def _determine_available_memory_cpu(self, gpu_mem_util: float) -> int:
         """Compute CPU-mode KV memory budget from fair-share host memory."""
         bytes_free = self._query_host_runtime_memory()
@@ -1359,13 +1384,16 @@ class NeuronWorker(WorkerBase):
             )
             return heuristic_bytes
 
-        if need_bytes > heuristic_bytes:
+        footprint_bytes = self._kv_cache_footprint_bytes(need_bytes)
+        if footprint_bytes > heuristic_bytes:
             raise RuntimeError(
                 f"The KV cache the served configuration needs does not fit the "
                 f"memory budget in {mode} mode. Need "
                 f"{need_bytes / (1024**3):.3f} GiB for "
                 f"{self.vllm_config.scheduler_config.max_num_seqs} sequence(s) of "
-                f"{self.vllm_config.model_config.max_model_len} tokens; budget "
+                f"{self.vllm_config.model_config.max_model_len} tokens, allocated "
+                f"as {footprint_bytes / (1024**3):.3f} GiB once every recurrent "
+                f"layer holds its own state bank; budget "
                 f"{heuristic_bytes / (1024**3):.3f} GiB, of which the graph "
                 f"reserve holds back "
                 f"{self._get_graph_reserve_bytes() / (1024**3):.2f} GiB on each "
@@ -1379,10 +1407,11 @@ class NeuronWorker(WorkerBase):
             )
 
         logger.info(
-            "KV cache budget in %s mode: need=%.3f GiB, heuristic=%.2f GiB, "
-            "available=%.3f GiB",
+            "KV cache budget in %s mode: need=%.3f GiB, allocated=%.3f GiB, "
+            "heuristic=%.2f GiB, available=%.3f GiB",
             mode,
             need_bytes / (1024**3),
+            footprint_bytes / (1024**3),
             heuristic_bytes / (1024**3),
             need_bytes / (1024**3),
         )

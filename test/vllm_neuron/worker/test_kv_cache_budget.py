@@ -7,7 +7,7 @@ The declared acceptance command:
       test/vllm_neuron/worker/test_kv_cache_budget.py -s -rA --timeout 120 \\
       -p no:cacheprovider
 
-Ten items, one per declared conjunct. The KV cache layout is the registered one
+Eleven items, one per declared conjunct. The KV cache layout is the registered one
 for this stack -- 11 latent-attention layers and 34 recurrent-state layers at
 block size 128, bfloat16, tensor-parallel degree 64 -- and every expected number
 below is arithmetic over those registered values, never a copy of what the code
@@ -67,6 +67,13 @@ BLOCKS_PER_GROUP_PER_SEQUENCE = -(-MAX_MODEL_LEN // BLOCK_SIZE_TOKENS)
 BLOCKS_PER_REQUEST = TOTAL_GROUPS * BLOCKS_PER_GROUP_PER_SEQUENCE
 EXPECTED_BLOCKS = BLOCKS_PER_REQUEST * MAX_NUM_SEQS + 1
 EXPECTED_NEED_BYTES = EXPECTED_BLOCKS * PAGE_SIZE_BYTES * LAYERS_PER_POOL
+# What the runner allocates once vLLM has sized the blocks from that need: the
+# latent pools as vLLM laid them out, plus one bank of the same size for every
+# recurrent layer, because a recurrent bank is addressed by request slot and
+# cannot share a tensor with any other layer.
+EXPECTED_FOOTPRINT_BYTES = (
+    EXPECTED_BLOCKS * PAGE_SIZE_BYTES * (LAYERS_PER_POOL + RECURRENT_LAYERS)
+)
 
 # The pool this increment first shipped, priced at one block per recurrent group:
 # the allocator refuses a full-length request in it, which one item measures.
@@ -83,6 +90,7 @@ _WORKER_METHODS = (
     "determine_available_memory",
     "_compute_kv_budget",
     "_kv_cache_need_bytes",
+    "_kv_cache_footprint_bytes",
     "_physical_core_kv_bound",
     "_prepared_operand_bytes",
     "_get_graph_reserve_bytes",
@@ -509,6 +517,46 @@ def test_a_need_over_the_budget_is_refused_by_name(monkeypatch) -> None:
     assert f"{EXPECTED_NEED_BYTES / GIB:.3f} GiB" in message
     assert "cpu mode" in message
     assert "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB" in message
+
+
+def test_the_allocation_adds_a_bank_per_recurrent_layer_and_fits_the_bound(
+    monkeypatch,
+) -> None:
+    """The runner's allocation is the need plus one bank per recurrent layer; it fits the physical-core bound, and a budget between the two refuses naming it."""
+    monkeypatch.setenv("VLLM_NEURON_CPU_MODE", "1")
+    monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    worker = _worker()
+
+    need = worker._kv_cache_need_bytes()
+    allocated = worker._kv_cache_footprint_bytes(need)
+    bound = worker._physical_core_kv_bound(
+        TOTAL_HBM_BYTES, MEASURED_BYTES_USED + worker._prepared_operand_bytes()
+    )
+    available = worker.determine_available_memory()
+
+    print(
+        f"need={need} B ({need / GIB:.4f} GiB) allocated={allocated} B "
+        f"({allocated / GIB:.4f} GiB) banks={LAYERS_PER_POOL}+{RECURRENT_LAYERS} "
+        f"blocks={EXPECTED_BLOCKS} page={PAGE_SIZE_BYTES} B "
+        f"bound={bound} B ({bound / GIB:.4f} GiB) available={available} B"
+    )
+    assert need == EXPECTED_NEED_BYTES
+    assert allocated == EXPECTED_FOOTPRINT_BYTES
+    assert available == need
+    assert allocated <= bound
+
+    # A budget the need fits and the allocation does not refuses, naming the allocation.
+    share = (need + allocated) // 2
+    between = _worker(
+        host_bytes=int(share / (GPU_MEMORY_UTILIZATION * worker._get_kv_cap_fraction()))
+    )
+    with pytest.raises(RuntimeError) as refusal:
+        between.determine_available_memory()
+    message = str(refusal.value)
+    print(f"refused: {message}")
+    assert f"{allocated / GIB:.3f} GiB" in message
+    assert f"{need / GIB:.3f} GiB" in message
 
 
 def test_control_the_logical_core_budget_over_allocates(monkeypatch) -> None:
