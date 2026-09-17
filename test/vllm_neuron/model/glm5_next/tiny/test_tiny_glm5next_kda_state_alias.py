@@ -18,6 +18,8 @@ each equal to the state the layer reaches when it runs alone.
 
 from __future__ import annotations
 
+import dataclasses
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -141,8 +143,20 @@ def _recurrent_layers(count: int) -> SimpleNamespace:
     )
 
 
-def _spec_with_real_recurrent_layers(root, layers) -> KVSpec:
-    """The tiny root's spec with its first layers reporting the real recurrent layers' own state geometry."""
+def _state_page_bytes(layer) -> int:
+    """The bytes one request slot of a recurrent layer's two states takes, as vLLM prices its page."""
+    attention = layer.attention
+    return sum(
+        math.prod(shape) * dtype.itemsize
+        for shape, dtype in (
+            (attention.kda_conv_state_shape, attention.kda_conv_state_dtype),
+            (attention.kda_recurrent_state_shape, attention.kda_recurrent_state_dtype),
+        )
+    )
+
+
+def _spec_with_real_recurrent_layers(root, layers, block_size: int) -> KVSpec:
+    """The tiny root's spec with its first layers reporting the real recurrent layers' own state geometry, and its attention layers widened until one attention page holds one recurrent slot, which the runner's page unification requires."""
     original = root.get_kv_spec().layers
     recurrent = [
         LayerSpec(
@@ -159,7 +173,13 @@ def _spec_with_real_recurrent_layers(root, layers) -> KVSpec:
         )
         for spec, layer in zip(original, layers)
     ]
-    return KVSpec(layers=recurrent + list(original[len(layers):]))
+    state_page = max(_state_page_bytes(layer) for layer in layers)
+    attention = []
+    for spec in original[len(layers):]:
+        per_token = block_size * int(spec.num_kv_heads) * spec.dtype.itemsize
+        width = -(-(-(-state_page // per_token)) // 128) * 128
+        attention.append(dataclasses.replace(spec, head_size=max(int(spec.head_size), width)))
+    return KVSpec(layers=recurrent + attention)
 
 
 def _reference_states(world: SimpleNamespace, rows: torch.Tensor) -> list[torch.Tensor]:
@@ -186,8 +206,13 @@ def test_two_steps_leave_each_recurrent_sharer_its_own_state(tmp_path, monkeypat
     world = _recurrent_layers(RECURRENT_LAYERS)
     config = first._engine_config()
     root = landed._fixture()["root"]
-    spec = _spec_with_real_recurrent_layers(root, world.layers)
+    spec = _spec_with_real_recurrent_layers(root, world.layers, int(config.cache_config.block_size))
     monkeypatch.setattr(root, "get_kv_spec", lambda: spec)
+    print(
+        f"ALIAS|spec|state_page={max(_state_page_bytes(layer) for layer in world.layers)}"
+        f"|attention_head_size={[int(layer.head_size) for layer in spec.layers[RECURRENT_LAYERS:]]}"
+        f"|block_size={int(config.cache_config.block_size)}"
+    )
     torch.manual_seed(layer_half.SEED + 1)
     rows = torch.randn(PREFILL_TOKENS + 1, world.hidden, dtype=torch.float32)
     blocks = list(range(1, 1 + landed._blocks_for(PREFILL_TOKENS + 1)))
