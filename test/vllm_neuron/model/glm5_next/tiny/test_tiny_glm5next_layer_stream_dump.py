@@ -36,8 +36,8 @@ import torch
 
 from vllm_neuron.model.glm5_next.model_fp8 import (
     DUMP_STREAM_LAYERS,
-    DUMP_TAP_NAMES,
     dump_tap_layers,
+    dump_tap_names,
     layer_dump_names,
 )
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
@@ -149,22 +149,25 @@ def _record_the_streams_each_layer_was_handed(layers) -> tuple[dict, list]:
 def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
     """Clones of the tensors one tapped layer claims, read where the layer itself makes them.
 
-    The attention output and the expert block's two ends come from module hooks. The router's
-    do not: ``route_tokens`` is a method, so the bank's own method is wrapped for the item and
-    its return recorded on the way out. The token mapping has no oracle here and needs none --
-    it is read against its own declared property below.
+    The attention output, the expert block's two ends and the routed half come from module
+    hooks. Two do not: ``route_tokens`` and ``shared_expert_mm`` are methods called directly,
+    so each is wrapped for the item and its return recorded on the way out. The token mapping
+    has no oracle here and needs none -- it is read against its own declared property below.
     """
     seen: dict[str, torch.Tensor] = {}
 
     def _record_attention(module, args, output):
-        seen["attn_out"] = output.detach().clone()
+        seen["attention_output"] = output.detach().clone()
 
     def _record_input(module, args, kwargs):
         normed = kwargs.get("normed_hidden_states", args[1] if len(args) > 1 else None)
-        seen["mlp_input_normed"] = normed.detach().clone()
+        seen["mlp_input1"] = normed.detach().clone()
 
     def _record_output(module, args, output):
         seen["mlp_output"] = output.detach().clone()
+
+    def _record_routed(module, args, output):
+        seen["routed_output"] = output.detach().clone()
 
     bank = layer.mlp.experts
     routed = bank.route_tokens
@@ -176,13 +179,25 @@ def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
         seen["router_topk_weights"] = torch.gather(
             affinities, -1, index.long()
         ).detach().clone()
+        seen["router_affinities"] = affinities.detach().clone()
         return logits, index, affinities
 
     monkeypatch.setattr(bank, "route_tokens", _record_router)
+    shared = getattr(layer.mlp, "shared_experts", None)
+    if shared is not None:
+        shared_mm = shared.shared_expert_mm
+
+        def _record_shared(*args, **kwargs):
+            output = shared_mm(*args, **kwargs)
+            seen["shared_output"] = output.detach().clone()
+            return output
+
+        monkeypatch.setattr(shared, "shared_expert_mm", _record_shared)
     handles = [
         layer.attention.register_forward_hook(_record_attention),
         layer.mlp.register_forward_pre_hook(_record_input, with_kwargs=True),
         layer.mlp.register_forward_hook(_record_output),
+        bank.register_forward_hook(_record_routed),
     ]
     return seen, handles
 
@@ -219,6 +234,11 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
         f"this stack of {len(layers)} layer(s) holds no layer with an expert block, so the "
         f"taps below would measure nothing"
     )
+    # TWO LAYERS ARE TAPPED ON A STACK THAT HOLDS TWO, and this fixture may hold one. The
+    # served model taps the first expert layer and the one after it; a stack whose first expert
+    # layer is also its last has no second to tap, and the row below says which case ran.
+    print(f"TINYDUMP|tap_layers|first={taps[0]}|tapped={list(taps)}|layers={len(layers)}"
+          f"|the_layer_after_the_first_holds_experts={len(taps) == 2}")
     tapped = {}
     for tap in taps:
         one, tap_handles = _record_one_tapped_layer(layers[tap], monkeypatch)
@@ -240,7 +260,7 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
     )
     expected = [f"after_layer_{index}" for index in range(kept)]
     for tap in taps:
-        expected += [f"layer{tap}_{suffix}" for suffix in DUMP_TAP_NAMES]
+        expected += [f"layer{tap}_{suffix}" for suffix in dump_tap_names(layers[tap])]
     assert names == tuple(expected), (
         f"the model names its dump {list(names)}, which is not the order this item reads"
     )
@@ -303,7 +323,7 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
     # is saved as it stands, so indices and positions are compared as choices, not as numbers.
     top_k = int(root.model.text_config.num_experts_per_tok)
     for tap in taps:
-        for suffix in DUMP_TAP_NAMES:
+        for suffix in dump_tap_names(layers[tap]):
             dumped = torch.load(
                 save_dir / f"layer{tap}_{suffix}.pt", map_location="cpu", weights_only=True
             )

@@ -3479,6 +3479,7 @@ class Glm5NextMoEBlock(nn.Module):
         up_proj_scale: torch.Tensor,
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``routed_output + shared_expert(hidden_states)`` -- the layer output.
 
@@ -3497,6 +3498,8 @@ class Glm5NextMoEBlock(nn.Module):
             up_proj_scale: as above.
             down_proj_scale: as above.
             quant_config: as above.
+            collector: when given, the shared half's own result is appended to it
+                on the way through, for the layer dump. Nothing else changes.
 
         The SwiGLU bound is not an argument here either, and it is not forwarded.
         The shared expert this block built holds it
@@ -3541,6 +3544,8 @@ class Glm5NextMoEBlock(nn.Module):
             down_proj_scale,
             quant_config,
         )
+        if collector is not None:
+            collector.append(shared_output)
 
         # Extents compared EXACTLY, before the add. ``torch`` would broadcast a
         # disagreeing extent silently and return a plausible tensor of the wrong
@@ -3646,14 +3651,15 @@ class Glm5NextMoEBlock(nn.Module):
             hidden_states.unsqueeze(0), router_gamma, text_config
         )
         if collector is not None:
-            # THE SELECTED WEIGHTS, GATHERED HERE rather than left to the reader: the bank
-            # returns affinities scattered over every expert, and the comparison asks for the
-            # chosen few's weights. The gather rides the collecting graph, so a run with no
-            # dump configured never performs it.
+            # BOTH FORMS OF THE WEIGHTS: the whole table as the bank returns it, scattered over
+            # every expert, and the chosen few gathered out of it. The comparison reads the table
+            # at its own reference's top-8, so both are needed and neither is recomputed on the
+            # host. The gather rides the collecting graph, so a run with no dump never performs it.
             collector += [
                 _logits,
                 _expert_index,
                 torch.gather(expert_affinities, -1, _expert_index.long()),
+                expert_affinities,
             ]
 
         routed_output = self.experts(
@@ -3667,6 +3673,9 @@ class Glm5NextMoEBlock(nn.Module):
             **({"collector": collector} if collector is not None else {}),
         )
 
+        if collector is not None:
+            collector.append(routed_output)
+
         shared_experts = getattr(self, "shared_experts", None)
         if shared_experts is None:
             return routed_output
@@ -3675,6 +3684,7 @@ class Glm5NextMoEBlock(nn.Module):
             normed_hidden_states,
             *shared_experts.scale_route_operands(),
             quant_config,
+            collector=collector,
         )
 
 
@@ -7787,29 +7797,41 @@ def _build_layer(
 DUMP_STREAM_LAYERS = 6
 
 
-#: How many layers are tapped inside. The first two that hold experts are where the residual
-#: error appears, and the second one is what tells a departure from a drift.
-DUMP_TAP_LAYERS = 2
-
-#: The tapped tensors of one layer, in the order the layer produces them.
+#: The tapped tensors of one layer, in the order the layer produces them. ``routed_output`` and
+#: ``shared_output`` are each half's own result before the layer reduces them, so they read as
+#: partials on a sharded run; ``mlp_output`` and ``attention_output`` are taken after the
+#: reduction and are whole.
 DUMP_TAP_NAMES = (
-    "attn_out",
-    "mlp_input_normed",
+    "attention_output",
+    "mlp_input1",
     "router_logits",
     "router_topk_indices",
     "router_topk_weights",
+    "router_affinities",
     "token_position_to_id",
+    "routed_output",
+    "shared_output",
     "mlp_output",
 )
 
 
 def dump_tap_layers(layers) -> tuple[int, ...]:
-    """The layers tapped inside: the first ``DUMP_TAP_LAYERS`` that hold an expert block."""
+    """The layers tapped inside: the first layer holding experts, and the next one that does."""
     holding = [
         index for index, layer in enumerate(layers)
         if isinstance(layer.mlp, Glm5NextMoEBlock)
     ]
-    return tuple(holding[:DUMP_TAP_LAYERS])
+    if not holding:
+        return ()
+    first = holding[0]
+    return (first, first + 1) if first + 1 in holding else (first,)
+
+
+def dump_tap_names(layer: nn.Module) -> tuple[str, ...]:
+    """The tap names one layer contributes, in the order its forward appends them."""
+    if getattr(layer.mlp, "shared_experts", None) is None:
+        return tuple(name for name in DUMP_TAP_NAMES if name != "shared_output")
+    return DUMP_TAP_NAMES
 
 
 def _dump_layers(model: nn.Module):
@@ -7832,7 +7854,7 @@ def layer_dump_names(model: nn.Module) -> tuple[str, ...]:
         return ()
     names = [f"after_layer_{index}" for index in range(min(DUMP_STREAM_LAYERS, len(layers)))]
     for tap in dump_tap_layers(layers):
-        names += [f"layer{tap}_{suffix}" for suffix in DUMP_TAP_NAMES]
+        names += [f"layer{tap}_{suffix}" for suffix in dump_tap_names(layers[tap])]
     return tuple(names)
 
 
