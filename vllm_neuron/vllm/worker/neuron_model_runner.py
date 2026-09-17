@@ -11308,20 +11308,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         save_dir = pathlib.Path(self._layer_stream_dump_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        for index, stream in enumerate(streams):
+        names = self._layer_stream_names(len(streams))
+        for name, stream in zip(names, streams):
             # THE HOST MOVE TAKES A CONTIGUOUS TENSOR, and an async step hands this
             # method futures instead, which resolve through ``cpu()`` alone.
             if torch.is_tensor(stream):
                 host = stream.contiguous().to("cpu")
             else:
                 host = stream.cpu()
-            torch.save(host.float(), str(save_dir / f"after_layer_{index}.pt"))
+            torch.save(host.float(), str(save_dir / f"{name}.pt"))
         logger.info(
-            "layer stream dump: wrote %d per-layer tensors under %s",
+            "layer stream dump: wrote %d tensors under %s",
             len(streams),
             save_dir,
         )
         return logits
+
+    def _layer_stream_names(self, count: int) -> tuple[str, ...]:
+        """The dump's file names, taken from the model that produced the tensors."""
+        from vllm_neuron.model.glm5_next.model_fp8 import layer_dump_names
+
+        model = getattr(self, "model", None)
+        names = layer_dump_names(model) if model is not None else ()
+        if len(names) == count:
+            return names
+        # THE MODEL AND THE GRAPH DISAGREE, so the names are not trustworthy and
+        # positional ones are. A diagnostic never fails a serve over its own labels.
+        logger.warning(
+            "layer stream dump: the model names %d tensors and the graph returned %d, "
+            "so the files are numbered instead",
+            len(names),
+            count,
+        )
+        return tuple(f"dump_{index}" for index in range(count))
 
     # ------------------------------------------------------------------------
     # TENSOR CAPTURE

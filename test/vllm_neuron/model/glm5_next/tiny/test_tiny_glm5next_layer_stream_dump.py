@@ -1,13 +1,14 @@
-"""The per-layer residual stream dump: configured it writes one file per layer, unset it does nothing.
+"""The layer dump: configured it writes the stack's own named tensors, unset it does nothing.
 
 WHAT THIS FILE MEASURES, on the tiny stack and through the runner's own converter:
 
   1. ``VLLM_NEURON_DUMP_LAYER_STREAMS=<dir>`` set -> the converter hands the model
-     ``collect_layer_streams``, the root returns the per-layer carriers after its logits, and
-     ``NeuronModelRunner._take_layer_stream_dump`` writes exactly one ``after_layer_<i>.pt``
-     per layer, each bit-equal to the tensor the NEXT layer was handed. The LAST file is
-     checked against the graph's own logits instead, because no layer follows it: collapsed
-     and normed the way the stack collapses and norms, it must reproduce them exactly.
+     ``collect_layer_streams``, the root returns the dump's tensors after its logits, and
+     ``NeuronModelRunner._take_layer_stream_dump`` writes one file per name the model
+     declares. An ``after_layer_<i>.pt`` is bit-equal to the tensor the NEXT layer was
+     handed; the last of them is checked against the graph's own logits instead, because no
+     layer follows it. The tapped layer's ``mlp_input1`` and ``mlp_output`` are bit-equal to
+     what hooks on that layer's own expert block saw.
   2. The variable unset -> the converter hands the model no such keyword, the forward returns
      a bare tensor, no file is written, and the logits are bit-equal to the configured run's.
   3. Neither module this dump touches imports the NxDI stack.
@@ -33,6 +34,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_neuron.model.glm5_next.model_fp8 import (
+    DUMP_STREAM_LAYERS,
+    dump_tap_layer,
+    layer_dump_names,
+)
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
 # The landed tiny fixtures, imported rather than re-built: the stack, its seeds and its dials
@@ -45,8 +51,11 @@ pytestmark = [pytest.mark.fast, pytest.mark.forked]
 #: The environment variable that configures the dump. Named once here, and read by the runner.
 DUMP_VARIABLE = "VLLM_NEURON_DUMP_LAYER_STREAMS"
 
-#: The file this dump writes per layer, the name the depth comparison reads.
+#: The file the dump writes per kept layer, the name the depth comparison reads.
 DUMP_NAME = "after_layer_{index}.pt"
+
+#: The tapped layer's two inner tensors, in the order the stack appends them.
+TAP_SUFFIXES = ("mlp_input1", "mlp_output")
 
 #: The modules the dump touches, relative to the repository root. The import scan below reads
 #: these whole rather than a diff, which covers every line the increment added and the lines
@@ -139,6 +148,24 @@ def _record_the_streams_each_layer_was_handed(layers) -> tuple[dict, list]:
     return seen, handles
 
 
+def _record_the_tapped_block(layer) -> tuple[dict, list]:
+    """Hooks that clone the tapped layer's expert-block input after its norm, and its output."""
+    seen: dict[str, torch.Tensor] = {}
+
+    def _record_input(module, args, kwargs):
+        normed = kwargs.get("normed_hidden_states", args[1] if len(args) > 1 else None)
+        seen["mlp_input1"] = normed.detach().clone()
+
+    def _record_output(module, args, output):
+        seen["mlp_output"] = output.detach().clone()
+
+    handles = [
+        layer.mlp.register_forward_pre_hook(_record_input, with_kwargs=True),
+        layer.mlp.register_forward_hook(_record_output),
+    ]
+    return seen, handles
+
+
 def _nxdi_import_lines(text: str) -> list[str]:
     """Every line of ``text`` that imports the NxDI stack, in either import form."""
     return [
@@ -163,7 +190,16 @@ def test_a_configured_dump_writes_one_file_per_layer_bit_equal_to_the_streams(
     fixture, root = _bound_root()
     runner = _runner_for(root)
     layers = list(root.model.layers)
+    names = layer_dump_names(root)
+    tap = dump_tap_layer(layers)
+    kept = min(DUMP_STREAM_LAYERS, len(layers))
     seen, handles = _record_the_streams_each_layer_was_handed(layers)
+    assert tap is not None, (
+        f"this stack of {len(layers)} layer(s) holds no sparse-attention layer with an "
+        f"expert block, so the taps below would measure nothing"
+    )
+    tapped, tap_handles = _record_the_tapped_block(layers[tap])
+    handles += tap_handles
     try:
         converted, output = _prefill(runner, root, _prompt())
     finally:
@@ -172,23 +208,28 @@ def test_a_configured_dump_writes_one_file_per_layer_bit_equal_to_the_streams(
 
     print(f"TINYDUMP|configured|dir={save_dir}|keyword_in_model_kwargs="
           f"{converted.get('collect_layer_streams')}|outputs={len(output)}"
-          f"|layers={len(layers)}|pre_hooks_recorded={sorted(seen)}")
+          f"|layers={len(layers)}|kept_streams={kept}|tap_layer={tap}|names={list(names)}"
+          f"|pre_hooks_recorded={sorted(seen)}|tapped={sorted(tapped)}")
     assert converted.get("collect_layer_streams") is True, (
         f"the converter handed the model {sorted(converted)}; a configured dump needs the "
         f"collection keyword on the one mapping every call site goes through"
     )
-    assert isinstance(output, tuple) and len(output) == 1 + len(layers), (
+    assert names == tuple(
+        [f"after_layer_{index}" for index in range(kept)]
+        + [f"layer{tap}_{suffix}" for suffix in TAP_SUFFIXES]
+    ), f"the model names its dump {list(names)}, which is not the order this item reads"
+    assert isinstance(output, tuple) and len(output) == 1 + len(names), (
         f"the root returned {type(output).__name__} of "
         f"{len(output) if isinstance(output, tuple) else 1}; a collecting forward returns "
-        f"the logits and one carrier per layer, flat"
+        f"the logits and one tensor per declared name, flat"
     )
 
     logits = NeuronModelRunner._take_layer_stream_dump(runner, output, is_prefill=True)
-    files = sorted(save_dir.glob("after_layer_*.pt"))
-    print(f"TINYDUMP|files|count={len(files)}|want={len(layers)}"
+    files = sorted(save_dir.glob("*.pt"))
+    print(f"TINYDUMP|files|count={len(files)}|want={len(names)}"
           f"|names={[f.name for f in files]}|logits_rows={tuple(logits.shape)}")
-    assert len(files) == len(layers), (
-        f"{len(files)} file(s) were written for {len(layers)} layer(s): {[f.name for f in files]}"
+    assert [f.name for f in files] == sorted(f"{name}.pt" for name in names), (
+        f"the dump wrote {[f.name for f in files]} for the names {list(names)}"
     )
     assert torch.is_tensor(logits), (
         f"the dump handed {type(logits).__name__} back to the step; every branch after it "
@@ -196,7 +237,7 @@ def test_a_configured_dump_writes_one_file_per_layer_bit_equal_to_the_streams(
     )
 
     table = root.model.embed_tokens_weight
-    for index in range(len(layers)):
+    for index in range(kept):
         dumped = torch.load(
             save_dir / DUMP_NAME.format(index=index), map_location="cpu", weights_only=True
         )
@@ -229,6 +270,23 @@ def test_a_configured_dump_writes_one_file_per_layer_bit_equal_to_the_streams(
                 f"after_layer_{index}.pt is not the tensor the final norm consumed; the "
                 f"replayed logits differ by {float((replayed - logits).abs().max())}"
             )
+
+    # THE TAPS ARE READ AGAINST THE BLOCK'S OWN HOOKS. The expert block returns the seams'
+    # dtype and the feed-forward half casts it back to the collapsed stream's, which is the
+    # table's, so the output oracle carries that cast and the input oracle needs none.
+    for suffix in TAP_SUFFIXES:
+        dumped = torch.load(
+            save_dir / f"layer{tap}_{suffix}.pt", map_location="cpu", weights_only=True
+        )
+        want = tapped[suffix]
+        want = want.to(table.dtype) if suffix == "mlp_output" else want
+        same = torch.equal(dumped, want.float())
+        print(f"TINYDUMP|tap|layer{tap}_{suffix}|shape={tuple(dumped.shape)}"
+              f"|dtype_on_the_hook={want.dtype}|bit_equal_to_the_hook={same}")
+        assert same, (
+            f"layer{tap}_{suffix}.pt is not what the hook on layer {tap}'s expert block "
+            f"saw; max abs delta {float((dumped - want.float()).abs().max())}"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -278,12 +336,12 @@ def test_an_unset_dump_writes_no_file_and_leaves_the_logits_bit_equal(tmp_path, 
         gated_runner, gated_output, is_prefill=True
     )
     same = torch.equal(gated_logits, plain_logits)
-    files = sorted(save_dir.glob("after_layer_*.pt"))
+    files = sorted(save_dir.glob("*.pt"))
     print(f"TINYDUMP|logits_unchanged|bit_equal={same}"
           f"|max_abs_delta={float((gated_logits - plain_logits).abs().max())}"
           f"|files_written_by_the_configured_run={len(files)}")
     assert same, "the configured run changed the logits the ungated run produced"
-    assert len(files) == len(list(gated_root.model.layers))
+    assert len(files) == len(layer_dump_names(gated_root))
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════

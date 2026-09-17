@@ -7754,6 +7754,44 @@ def _build_layer(
 # ---------------------------------------------------------------------------
 
 
+#: How many layers' output streams the dump keeps. The residual error is localised in the
+#: first few layers, and every further layer costs one graph output per rank.
+DUMP_STREAM_LAYERS = 6
+
+
+def dump_tap_layer(layers) -> int | None:
+    """The first layer that carries both sparse attention and a mixture of experts."""
+    for index, layer in enumerate(layers):
+        if isinstance(layer, Glm5NextDSALayer) and isinstance(layer.mlp, Glm5NextMoEBlock):
+            return index
+    return None
+
+
+def _dump_layers(model: nn.Module):
+    """The decoder layers, whether handed the stack, the root or a wrapped root."""
+    holder = model
+    for _ in range(3):
+        layers = getattr(holder, "layers", None)
+        if layers is not None:
+            return layers
+        holder = getattr(holder, "_model", None) or getattr(holder, "model", None)
+        if holder is None:
+            return None
+    return None
+
+
+def layer_dump_names(model: nn.Module) -> tuple[str, ...]:
+    """The dump's extra outputs, named in the order the stack returns them."""
+    layers = _dump_layers(model)
+    if layers is None:
+        return ()
+    names = [f"after_layer_{index}" for index in range(min(DUMP_STREAM_LAYERS, len(layers)))]
+    tap = dump_tap_layer(layers)
+    if tap is not None:
+        names += [f"layer{tap}_{suffix}" for suffix in ("mlp_input1", "mlp_output")]
+    return tuple(names)
+
+
 class Glm5NextModel(nn.Module):
     """The decoder stack, named ``model`` because the map's paths say so.
 
@@ -7814,6 +7852,7 @@ class Glm5NextModel(nn.Module):
         moe_group: object | None,
         tp_degree: int,
         expert_parallel_rank: int | torch.Tensor,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One layer's feed-forward contribution, WITHOUT its residual add.
 
@@ -7864,6 +7903,8 @@ class Glm5NextModel(nn.Module):
                 f"(weight_loaders_fp8.py:397) and nothing was loaded onto it"
             )
         normed = self._rms_norm(hidden_states, gain)
+        if collector is not None:
+            collector.append(normed)
         mlp = layer.mlp
         if isinstance(mlp, Glm5NextMoEBlock):
             out = mlp(
@@ -7930,7 +7971,10 @@ class Glm5NextModel(nn.Module):
         group = _resolve_tp_group()
         if group is not None:
             group.all_reduce(out)
-        return out.to(hidden_states.dtype)
+        mixed = out.to(hidden_states.dtype)
+        if collector is not None:
+            collector.append(mixed)
+        return mixed
 
     def forward(
         self,
@@ -8024,9 +8068,11 @@ class Glm5NextModel(nn.Module):
 
         Returns:
             ``[T, H]`` after the final RMSNorm, in the embedding table's dtype --
-            or, under ``collect_layer_streams``, that tensor and one
-            ``[T, hc_mult, H]`` carrier per layer, each the tensor the NEXT layer
-            was handed and the last the tensor the collapse consumed. The
+            or, under ``collect_layer_streams``, that tensor and the dump's
+            tensors: one ``[T, hc_mult, H]`` carrier for each of the first
+            ``DUMP_STREAM_LAYERS`` layers, each the tensor the NEXT layer was
+            handed, and then the tapped layer's own inner tensors, in the order
+            :func:`layer_dump_names` names them. The
             streams live only inside this method, and they carry the table's dtype
             the whole way: the expand copies it, both mHC sites cast their mixes back
             to it (``reference:1291``), the mean keeps it (``reference:302``) and the
@@ -8073,10 +8119,15 @@ class Glm5NextModel(nn.Module):
         streams = embedded.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
         # THE COLLECTION IS A LIST OF THE LOOP'S OWN REBINDINGS, appended after each
         # layer's feed-forward site so the entry for layer i IS the tensor layer i+1
-        # is handed. It stays empty on the production route, so the loop below runs
-        # the same operations either way and nothing but a python append is added.
+        # is handed. Both lists stay empty on the production route, so the loop below
+        # runs the same operations either way and nothing but a python append is added.
+        # The streams stop at ``DUMP_STREAM_LAYERS``; the taps are one layer's inner
+        # tensors, and which layer that is comes from the stack rather than from a
+        # constant, so a three-layer stack taps the layer it actually has.
         collected: list[torch.Tensor] = []
-        for layer, carrier in zip(layers, carriers):
+        taps: list[torch.Tensor] = []
+        tap_layer = dump_tap_layer(layers) if collect_layer_streams else None
+        for index, (layer, carrier) in enumerate(zip(layers, carriers)):
             # ONE TENSOR, PASSED AS BOTH ARGUMENTS ON PURPOSE. The streams ARE this
             # layer's input, exactly as ``reference:1481-1491`` hands the four-stream
             # tensor to the decoder layer; the keyword is this tree's route selector
@@ -8091,7 +8142,9 @@ class Glm5NextModel(nn.Module):
             site = _mhc_ffn_site(layer, streams)
             streams = site.forward(
                 streams,
-                lambda single_stream, layer=layer: self._ffn_half(
+                lambda single_stream, layer=layer, collector=(
+                    taps if index == tap_layer else None
+                ): self._ffn_half(
                     layer,
                     single_stream,
                     quant_config=quant_config,
@@ -8099,9 +8152,10 @@ class Glm5NextModel(nn.Module):
                     moe_group=moe_group,
                     tp_degree=tp_degree,
                     expert_parallel_rank=expert_parallel_rank,
+                    collector=collector,
                 ),
             )
-            if collect_layer_streams:
+            if collect_layer_streams and index < DUMP_STREAM_LAYERS:
                 collected.append(streams)
         gain = self.norm_weight
         if gain is None:
@@ -8116,7 +8170,7 @@ class Glm5NextModel(nn.Module):
         collapsed = streams.mean(dim=1).to(embedded.dtype)
         normed = self._rms_norm(collapsed, gain)
         if collect_layer_streams:
-            return normed, tuple(collected)
+            return normed, (*collected, *taps)
         return normed
 
 
