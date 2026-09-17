@@ -11316,7 +11316,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 host = stream.contiguous().to("cpu")
             else:
                 host = stream.cpu()
-            torch.save(host.float(), str(save_dir / f"{name}.pt"))
+            # FLOATING TENSORS ARE WIDENED, INTEGER ONES ARE NOT: the comparison reads
+            # fp32 values, and casting an expert index to float would hand it a number
+            # where it asked for a choice.
+            saved = host.float() if host.is_floating_point() else host
+            torch.save(saved, str(save_dir / f"{name}.pt"))
         logger.info(
             "layer stream dump: wrote %d tensors under %s",
             len(streams),

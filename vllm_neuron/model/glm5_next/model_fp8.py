@@ -3599,6 +3599,7 @@ class Glm5NextMoEBlock(nn.Module):
         moe_group: object | None = None,
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One sparse layer's MLP: route, run this rank's experts, add the shared.
 
@@ -3636,6 +3637,8 @@ class Glm5NextMoEBlock(nn.Module):
         _logits, _expert_index, expert_affinities = self.experts.route_tokens(
             hidden_states.unsqueeze(0), router_gamma, text_config
         )
+        if collector is not None:
+            collector += [_logits, _expert_index, expert_affinities]
 
         routed_output = self.experts(
             normed_hidden_states,
@@ -7647,6 +7650,7 @@ class Glm5NextDSALayer(nn.Module):
         prefill_tail: torch.Tensor | None = None,
         prefill_end_position: torch.Tensor | int | None = None,
         streams: torch.Tensor | None = None,
+        collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -7705,7 +7709,7 @@ class Glm5NextDSALayer(nn.Module):
         """
 
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
-            return self.attention(
+            attended = self.attention(
                 self._input_norm(single_stream),
                 latent_cache=latent_cache,
                 pool_cache=pool_cache,
@@ -7720,6 +7724,9 @@ class Glm5NextDSALayer(nn.Module):
                 prefill_tail=prefill_tail,
                 prefill_end_position=prefill_end_position,
             )
+            if collector is not None:
+                collector.append(attended)
+            return attended
 
         site = _mhc_attention_site(self, streams)
         if site is None:
@@ -7788,7 +7795,17 @@ def layer_dump_names(model: nn.Module) -> tuple[str, ...]:
     names = [f"after_layer_{index}" for index in range(min(DUMP_STREAM_LAYERS, len(layers)))]
     tap = dump_tap_layer(layers)
     if tap is not None:
-        names += [f"layer{tap}_{suffix}" for suffix in ("mlp_input1", "mlp_output")]
+        names += [
+            f"layer{tap}_{suffix}"
+            for suffix in (
+                "attention_output",
+                "mlp_input1",
+                "router_logits",
+                "router_topk_indices",
+                "router_affinities",
+                "mlp_output",
+            )
+        ]
     return tuple(names)
 
 
@@ -7910,6 +7927,7 @@ class Glm5NextModel(nn.Module):
             out = mlp(
                 hidden_states,
                 normed,
+                **({"collector": collector} if collector is not None else {}),
                 router_gamma=gain,
                 text_config=self.text_config,
                 quant_config=quant_config,
@@ -8133,7 +8151,12 @@ class Glm5NextModel(nn.Module):
             # tensor to the decoder layer; the keyword is this tree's route selector
             # (part (b)) and the positional is the one-stream route's operand, which
             # a bound layer refuses to take.
-            streams = layer(streams, **carrier, streams=streams)
+            streams = layer(
+                streams,
+                **carrier,
+                streams=streams,
+                **({"collector": taps} if index == tap_layer else {}),
+            )
             # THE FEED-FORWARD SITE, ``reference:1321-1327``. ``_ffn_half`` is
             # ``inc-glm53f-054a``'s and is CALLED, never edited: the site collapses
             # the streams, hands it the single ``[T, H]`` stream it has always taken,

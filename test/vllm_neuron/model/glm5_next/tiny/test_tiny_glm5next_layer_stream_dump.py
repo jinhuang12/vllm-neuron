@@ -54,8 +54,15 @@ DUMP_VARIABLE = "VLLM_NEURON_DUMP_LAYER_STREAMS"
 #: The file the dump writes per kept layer, the name the depth comparison reads.
 DUMP_NAME = "after_layer_{index}.pt"
 
-#: The tapped layer's two inner tensors, in the order the stack appends them.
-TAP_SUFFIXES = ("mlp_input1", "mlp_output")
+#: The tapped layer's inner tensors, in the order the stack appends them.
+TAP_SUFFIXES = (
+    "attention_output",
+    "mlp_input1",
+    "router_logits",
+    "router_topk_indices",
+    "router_affinities",
+    "mlp_output",
+)
 
 #: The modules the dump touches, relative to the repository root. The import scan below reads
 #: these whole rather than a diff, which covers every line the increment added and the lines
@@ -148,9 +155,17 @@ def _record_the_streams_each_layer_was_handed(layers) -> tuple[dict, list]:
     return seen, handles
 
 
-def _record_the_tapped_block(layer) -> tuple[dict, list]:
-    """Hooks that clone the tapped layer's expert-block input after its norm, and its output."""
+def _record_the_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
+    """Clones of every tensor the tapped layer's own taps claim, read where the layer makes it.
+
+    The attention output and the expert block's two ends come from module hooks. The router's
+    three tensors do not: ``route_tokens`` is a method, so the bank's own method is wrapped for
+    the duration of this item and its return recorded on the way out.
+    """
     seen: dict[str, torch.Tensor] = {}
+
+    def _record_attention(module, args, output):
+        seen["attention_output"] = output.detach().clone()
 
     def _record_input(module, args, kwargs):
         normed = kwargs.get("normed_hidden_states", args[1] if len(args) > 1 else None)
@@ -159,7 +174,19 @@ def _record_the_tapped_block(layer) -> tuple[dict, list]:
     def _record_output(module, args, output):
         seen["mlp_output"] = output.detach().clone()
 
+    bank = layer.mlp.experts
+    routed = bank.route_tokens
+
+    def _record_router(*args, **kwargs):
+        logits, index, affinities = routed(*args, **kwargs)
+        seen["router_logits"] = logits.detach().clone()
+        seen["router_topk_indices"] = index.detach().clone()
+        seen["router_affinities"] = affinities.detach().clone()
+        return logits, index, affinities
+
+    monkeypatch.setattr(bank, "route_tokens", _record_router)
     handles = [
+        layer.attention.register_forward_hook(_record_attention),
         layer.mlp.register_forward_pre_hook(_record_input, with_kwargs=True),
         layer.mlp.register_forward_hook(_record_output),
     ]
@@ -198,7 +225,7 @@ def test_a_configured_dump_writes_one_file_per_layer_bit_equal_to_the_streams(
         f"this stack of {len(layers)} layer(s) holds no sparse-attention layer with an "
         f"expert block, so the taps below would measure nothing"
     )
-    tapped, tap_handles = _record_the_tapped_block(layers[tap])
+    tapped, tap_handles = _record_the_tapped_layer(layers[tap], monkeypatch)
     handles += tap_handles
     try:
         converted, output = _prefill(runner, root, _prompt())
@@ -271,21 +298,24 @@ def test_a_configured_dump_writes_one_file_per_layer_bit_equal_to_the_streams(
                 f"replayed logits differ by {float((replayed - logits).abs().max())}"
             )
 
-    # THE TAPS ARE READ AGAINST THE BLOCK'S OWN HOOKS. The expert block returns the seams'
-    # dtype and the feed-forward half casts it back to the collapsed stream's, which is the
-    # table's, so the output oracle carries that cast and the input oracle needs none.
+    # THE TAPS ARE READ WHERE THE LAYER MAKES THEM. The expert block returns the seams' dtype
+    # and the feed-forward half casts it back to the collapsed stream's, which is the table's,
+    # so the output oracle carries that cast and no other oracle needs one. An integer tensor
+    # is saved as it stands, so the expert indices are compared as choices, not as numbers.
     for suffix in TAP_SUFFIXES:
         dumped = torch.load(
             save_dir / f"layer{tap}_{suffix}.pt", map_location="cpu", weights_only=True
         )
         want = tapped[suffix]
         want = want.to(table.dtype) if suffix == "mlp_output" else want
-        same = torch.equal(dumped, want.float())
+        want = want.float() if want.is_floating_point() else want
+        same = torch.equal(dumped, want)
         print(f"TINYDUMP|tap|layer{tap}_{suffix}|shape={tuple(dumped.shape)}"
-              f"|dtype_on_the_hook={want.dtype}|bit_equal_to_the_hook={same}")
+              f"|dtype={dumped.dtype}|bit_equal_to_the_layers_own_tensor={same}")
         assert same, (
-            f"layer{tap}_{suffix}.pt is not what the hook on layer {tap}'s expert block "
-            f"saw; max abs delta {float((dumped - want.float()).abs().max())}"
+            f"layer{tap}_{suffix}.pt is not the tensor layer {tap} made; it holds "
+            f"{tuple(dumped.shape)} of {dumped.dtype} against {tuple(want.shape)} of "
+            f"{want.dtype}"
         )
 
 
