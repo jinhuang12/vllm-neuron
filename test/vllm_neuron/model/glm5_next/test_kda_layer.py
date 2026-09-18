@@ -625,6 +625,29 @@ def test_kda_layer_a02_decode_carries_state_and_never_enters_a_chunked_seam(
 _BLOCK_SIZE_GRANULARITY = 64
 
 
+def _attention_spec_class(layer):
+    """The spec class the runner builds for one attention layer.
+
+    The runner reports a latent layer as ``MLAAttentionSpec`` and a windowed one as
+    ``SlidingWindowSpec``, and a latent page is HALF a full one: one latent buffer
+    where a plain layer holds K and V. A probe that builds the plain class for a
+    latent layer therefore reads a per-token slope twice the runner's, derives half
+    the block size the state page needs, and the runner then refuses the geometry
+    the probe called legal. The branch order here is the runner's own.
+    """
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        MLAAttentionSpec,
+        SlidingWindowSpec,
+    )
+
+    if getattr(layer, "latent_kv", False):
+        return MLAAttentionSpec
+    if layer.sliding_window_size is not None:
+        return SlidingWindowSpec
+    return FullAttentionSpec
+
+
 def _runner_block_size(resolved, cache_dtype) -> SimpleNamespace:
     """The block size to drive the runner at, DERIVED FROM THIS PROCESS'S DEGREE.
 
@@ -649,17 +672,18 @@ def _runner_block_size(resolved, cache_dtype) -> SimpleNamespace:
     ``attention_page < kda_page``, so a block size that makes the two pages
     exactly EQUAL takes neither branch and leaves ``page_size_padded`` at ``None``.
     At world size 1 the equality point is a whole number of tokens --
-    ``4,341,760 / 2,048 = 2,120`` exactly -- so a block size of "at least 2,120"
-    would land on it and the pad branch would not be taken. One granularity step
-    past it is the smallest admissible value, which is 2,176.
+    ``4,341,760 / 1,024 = 4,240`` exactly, the slope being the LATENT page's --
+    so a block size of "at least 4,240" would land on it and the pad branch would
+    not be taken. One granularity step past it is the smallest admissible value,
+    which is 4,288.
 
     A PROPERTY WORTH STATING, because it is why this is a re-pin and not a new
     number: at the registered degree this derivation returns the registered block
-    size. TP=64 gives a 67,840 B state page, ``67,840 // 2,048 + 1 = 34``, rounded
-    up to the granularity is 64, and the floor below raises it to 128. So the
+    size. TP=64 gives a 67,840 B state page, ``67,840 // 1,024 + 1 = 67``, rounded
+    up to the granularity is 128, and the floor below leaves it there. So the
     campaign's own geometry is a fixed point of this function.
     """
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm.v1.kv_cache_interface import MambaSpec
 
     # A PARTIALLY-SET LAYER BELONGS TO NEITHER PROBE SET, and that is what keeps
     # A04 alive. A04 clears one of the four fields on a deep copy and requires the
@@ -706,7 +730,7 @@ def _runner_block_size(resolved, cache_dtype) -> SimpleNamespace:
     # exactly ``attention_page`` is what closes that loop against the world.
     bytes_per_token = max(
         (
-            FullAttentionSpec(
+            _attention_spec_class(layer)(
                 block_size=1,
                 num_kv_heads=layer.num_kv_heads,
                 head_size=layer.head_size,

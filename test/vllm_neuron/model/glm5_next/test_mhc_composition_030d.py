@@ -1459,6 +1459,7 @@ def test_030d_the_ffn_site_runs_over_ffn_halfs_unchanged_return() -> None:
         )
         assert sorted(call["kwargs"]) == [
             "block_size",
+            "collector",
             "expert_parallel_rank",
             "moe_group",
             "quant_config",

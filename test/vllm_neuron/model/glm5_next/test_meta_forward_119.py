@@ -476,6 +476,8 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
                     f"the {leg} forward never entered the declared dispatch at {site}, so "
                     f"nothing stood in for {kernel} and its own answer to meta inputs "
                     f"decided this leg; entered: {sorted(set(entered))}"
+                    f"; held and never crossed: "
+                    f"{sorted(set(held) - {c.split('->', 1)[0] for c in crossed})}"
                     + (f". It stopped at {_site_of(error)}: {error}" if error else "")
                 )
             # AND THE STAND-DOWN IS READ WHERE THE PREDICATE IS ACTUALLY CONSULTED. At a site
