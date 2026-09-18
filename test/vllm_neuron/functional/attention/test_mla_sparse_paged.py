@@ -89,6 +89,11 @@ OVERLAY_MAGNITUDE = 16.0
 CHUNK = 1024
 CHUNK_AT = 3000
 
+#: The first and last row the chunk writes. THEY ARE SELECTED ON PURPOSE: an overlay short by its first
+#: 16-row block or by its last row leaves those rows holding the bank, and a selection that reads
+#: neither edge returns the reference bytes on a kernel that never wrote them.
+CHUNK_EDGES = (CHUNK_AT, CHUNK_AT + CHUNK - 1)
+
 
 def _bank(pages: int = BANK_PAGES, latent: int = LATENT) -> torch.Tensor:
     """The latent bank, every row distinguishable: row r column c holds (r * latent + c) / SPREAD."""
@@ -142,6 +147,21 @@ def _overlay_row(queries: torch.Tensor) -> torch.Tensor:
     lean = float(queries[0, 0].sum())
     return torch.full((1, LATENT), OVERLAY_MAGNITUDE if lean > 0 else -OVERLAY_MAGNITUDE,
                       dtype=torch.float32)
+
+
+def _with_rows(selected: torch.Tensor, wanted: tuple[int, ...]) -> torch.Tensor:
+    """The same selection with `wanted` rows put in place of INTERIOR columns, keeping every page edge.
+
+    An item that needs a particular row read cannot rely on the stride having picked it. The rows given
+    up are interior ones, because the page edges are a property the last item of this file asserts.
+    """
+    held = selected.clone()
+    spots = [index for index, one in enumerate(held[0].tolist())
+             if int(one) % PAGE not in (0, PAGE - 1)]
+    assert len(spots) >= len(wanted), "there are no interior columns to give the wanted rows"
+    for spot, row in zip(spots, wanted):
+        held[:, spot] = row
+    return held
 
 
 def _gathered_rows(table: list[int], selected: torch.Tensor, page: int = PAGE) -> set[int]:
@@ -388,7 +408,7 @@ def test_overlay_of_a_whole_prefill_chunk_is_what_the_gather_reads() -> None:
     rows = torch.arange(CHUNK_AT, CHUNK_AT + CHUNK)
     window = _window(bank, table).index_copy(0, rows, written)
     queries = _queries(1, 1, LATENT)
-    selected = _selected(1, len(table) * PAGE)
+    selected = _with_rows(_selected(1, len(table) * PAGE), CHUNK_EDGES)
     got = _paged(bank, table, selected, queries, written,
                  torch.tensor([[CHUNK_AT]], dtype=torch.int32))
     want = _oracle(window, selected, queries)
@@ -396,9 +416,14 @@ def test_overlay_of_a_whole_prefill_chunk_is_what_the_gather_reads() -> None:
     inside = int(((selected >= CHUNK_AT) & (selected < CHUNK_AT + CHUNK)).sum())
     _say("OVERLAY_CHUNK_WORST_ABS", f"{worst:.3e}")
     _say("OVERLAY_CHUNK_SELECTED_INSIDE", inside)
+    _say("OVERLAY_CHUNK_EDGES", ".".join(str(one) for one in CHUNK_EDGES))
     assert inside > 0, (
         f"none of this item's {TOPK} selected rows falls inside the overlaid chunk, so the width it "
         f"claims to read is not read"
+    )
+    assert all(one in selected[0].tolist() for one in CHUNK_EDGES), (
+        f"this item does not read both edges of the written chunk {CHUNK_EDGES}, so a chunk whose "
+        f"first or last block was never written returns the reference bytes and passes"
     )
     assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
         f"the overlaid chunk is not what the gather read: worst absolute difference {worst:.3e}"
@@ -440,8 +465,9 @@ def test_this_files_numbers_make_the_items_above_able_to_fail() -> None:
     CERTIFYING COMPONENT: this file's own numbers, against three ways they could hide a defect.
     (a) A selection whose offsets repeat per page is gathered onto itself when pages are swapped, so
     table 2 could not see order; the reading is that the two orders gather different bank rows.
-    (b) A selection without page edges cannot see a page copy short by one row; the reading is that
-    the first and last row of every page are selected.
+    (b) A selection without page edges cannot see a page copy short by one row, and one without the
+    written chunk's own edges cannot see an overlay short at either end; the readings are that the first
+    and last row of every page are selected, and that both chunk edges are.
     (c) A bank whose values saturate the softmax makes the output a copy of one gathered row, and the
     sentinel and overlay items then read no change on correct arithmetic; the readings are the three
     separations, each against the band the item it protects compares at, and the distance from the
@@ -453,7 +479,7 @@ def test_this_files_numbers_make_the_items_above_able_to_fail() -> None:
     ascending = _gathered_rows([5, 10], forward)
     swapped = _gathered_rows([10, 5], forward)
     edges = [index * PAGE + inside for index in range(BANK_PAGES) for inside in (0, PAGE - 1)]
-    wide_selected = _selected(1, BANK_PAGES * PAGE)
+    wide_selected = _with_rows(_selected(1, BANK_PAGES * PAGE), CHUNK_EDGES)
     uncovered = [one for one in edges if one not in wide_selected[0].tolist()]
     window = _window(bank, [5, 10])
     plain = _oracle(window, forward, queries)
@@ -475,6 +501,7 @@ def test_this_files_numbers_make_the_items_above_able_to_fail() -> None:
     _say("DATA_SWAP_ROWS_DIFFER", len(ascending ^ swapped))
     _say("DATA_OVERLAY_ONE_AT", at)
     _say("DATA_PAGE_EDGES_UNCOVERED", len(uncovered))
+    _say("DATA_CHUNK_EDGES_SELECTED", sum(one in wide_selected[0].tolist() for one in CHUNK_EDGES))
     _say("DATA_SENTINEL_APART", f"{float((sentinel - plain).abs().max()):.3e}")
     _say("DATA_OVERLAY_ONE_APART", f"{float((overlay - plain).abs().max()):.3e}")
     _say("DATA_OVERLAY_CHUNK_APART", f"{float((wide_overlaid - wide_plain).abs().max()):.3e}")
@@ -493,6 +520,10 @@ def test_this_files_numbers_make_the_items_above_able_to_fail() -> None:
             f"the {label} change is inside the band its own item compares at, so that item would "
             f"pass on a kernel which ignored the change entirely"
         )
+    assert all(one in wide_selected[0].tolist() for one in CHUNK_EDGES), (
+        f"the chunk overlay's own selection does not read both written edges {CHUNK_EDGES}, so an "
+        f"overlay short at either end is invisible to the item that certifies its width"
+    )
     assert nearest > ATOL, (
         f"the output sits {nearest:.3e} from one of its own gathered rows, so the softmax is putting "
         f"a single weight of 1 on that row and no item above can see a change to any other"
