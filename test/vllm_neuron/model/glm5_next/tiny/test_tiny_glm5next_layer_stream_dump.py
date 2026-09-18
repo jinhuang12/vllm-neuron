@@ -937,6 +937,10 @@ def test_the_seam_reads_this_steps_rows_even_when_the_bank_write_lands_later(tmp
         f"the bank already carries the write, so the deferral did not hold and a stale read is "
         f"indistinguishable from a written one here"
     )
+    assert not torch.equal(still_old, want), (
+        f"the rows the bank still holds are the written ones, so reading the bank's view instead "
+        f"would pass too and this item cannot tell the two reads apart"
+    )
     assert torch.equal(got, want), (
         f"the operand the seam consumed does not carry this step's rows: max abs delta "
         f"{float((got - want).abs().max())} under the bank's own cast, while the bank still holds "
