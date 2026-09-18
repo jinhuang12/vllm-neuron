@@ -2,25 +2,30 @@
 """Acceptance for the paged latent window: the sparse attention kernel assembles its window from a
 block table instead of slicing one ascending run of blocks out of the latent bank.
 
-EIGHT tests and NO `parametrize` decorator. Four carry `table` in their name and read the four block
+NINE tests and NO `parametrize` decorator. Four carry `table` in their name and read the four block
 layouts the design declares -- two scattered rows in either order, a row with a padding tail, and a
-full-length row. One carries `identical` and is the only exact claim in this file. One carries
-`sentinel`. Two carry `overlay` and read this step's own rows, at one row and at a whole prefill
-chunk.
+full-length row. One carries `identical` and reads the consecutive table. One carries `sentinel`. Two
+carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. The last needs
+no kernel at all: it reads that this file's own numbers make the differences the guards depend on
+visible.
 
-WHY THE ORACLE CLAIM IS A TOLERANCE AND NOT BIT-IDENTITY. The kernel contracts on the tensor engine
-in tiles and normalises with a running maximum; the oracle contracts in torch in one shot. The landed
-acceptance of this module reads the oracle at the section 3 module-comparison tolerance for exactly
-that reason, and no paged window changes it. What IS exact here is the `identical` item: a table whose
-pages are consecutive must produce the SAME BYTES as the unpaged call on the window those pages are,
-because both feed one identical staged window into one identical arithmetic. That item is what makes
-the four tolerance items mean something -- a page assembled at the wrong offset cannot pass it.
+EVERY TABLE ITEM MAKES TWO CLAIMS, ONE EXACT AND ONE A TOLERANCE. The exact claim is against the
+UNPAGED call on the window the table names: the same window through the same kernel must return the
+same bytes, because a paged load is a re-addressing of one identical load and nothing else. A page
+assembled at a wrong offset, loaded twice, or transposed into a wrong column cannot survive it.
+
+The tolerance claim is against the torch oracle, and it is a tolerance rather than bit-identity
+because the kernel contracts on the tensor engine in tiles and normalises with a running maximum
+while the oracle contracts in torch in one shot. The landed acceptance of this module reads the oracle
+at the landed module-comparison tolerance for that reason, and no paged window changes it. The two
+claims answer different questions: the exact one says the assembly re-addresses the same load, the
+tolerance one says the assembled window holds the latents the table names at all.
 
 THE WINDOW IS WHAT THE SELECTED ROWS INDEX. A table entry of -1 is padding: the load clamps it to
 page 0 so the DMA stays inside the bank, and those window columns carry no token because the producer
 never selects them. The `table_pad` item reads both halves of that sentence.
 
-The declared command, and the only one whose result the plan block quotes::
+The declared command for this file::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -37,8 +42,17 @@ import torch
 from vllm_neuron.functional.attention import mla_sparse as MS
 
 #: The served KV block, and the width every table entry addresses. A page is a whole number of the
-#: kernel's 16-row DMA transposes, which is why a paged load issues no more DMAs than an unpaged one.
+#: kernel's 16-row DMA transposes, so the transposes over the staged window are the unpaged ones.
 PAGE = 128
+
+#: THE SPREAD OF THE BANK'S VALUES IS LOAD-BEARING. The bank numbers its own rows, and an unscaled
+#: row index reaches 2 ** 21, which drives every score so far apart that the softmax becomes one
+#: weight of 1 and 127 of 0. Under that weighting the output is a copy of ONE gathered row, and an
+#: item that masks half the columns or overlays a row reads no change at all unless it happens to hit
+#: the chosen one -- the guards below would fail on correct arithmetic. Dividing by this power of two
+#: keeps every row exactly distinguishable and puts the scaled scores in single digits, where every
+#: selected row carries weight. The last item of this file reads that the spread is still observable.
+SPREAD = 2.0**18
 
 #: This checkpoint's own latent rank, and the head count the small items run at. The oracle's cost
 #: grows with both, so only the full-table and chunk-overlay items need more than two heads' worth.
@@ -49,7 +63,7 @@ HEADS = 2
 TOPK = 128
 SCALE = 0.1
 
-#: Section 3's bf16 module-comparison thresholds. READ FROM THE PLAN, NOT AUTHORED HERE.
+#: The landed bf16 module-comparison thresholds this module is already read at.
 RTOL = 1e-2
 ATOL = 1e-5
 
@@ -64,10 +78,10 @@ CHUNK_AT = 3000
 
 
 def _bank(pages: int = BANK_PAGES, latent: int = LATENT) -> torch.Tensor:
-    """The latent bank, every row distinguishable: row r column c holds r * latent + c."""
+    """The latent bank, every row distinguishable: row r column c holds (r * latent + c) / SPREAD."""
     rows = pages * PAGE
     down = torch.arange(rows, dtype=torch.float32).reshape(rows, 1) * latent
-    return down + torch.arange(latent, dtype=torch.float32).reshape(1, latent)
+    return (down + torch.arange(latent, dtype=torch.float32).reshape(1, latent)) / SPREAD
 
 
 def _window(bank: torch.Tensor, table: list[int]) -> torch.Tensor:
@@ -115,20 +129,33 @@ def _say(label: str, value: object) -> None:
 
 
 def _read_one_table(table: list[int], heads: int = HEADS) -> None:
-    """Run one table layout and read the kernel against the oracle on the window it names."""
+    """Run one table layout and read it twice: against the oracle, and against the unpaged call.
+
+    TWO CLAIMS PER TABLE. The oracle claim is a tolerance, for the reason the module docstring gives.
+    The unpaged claim is EXACT: the same window handed to the same kernel by the unpaged call must
+    return the same bytes, because a paged load is a re-addressing of one identical load and nothing
+    else. The exact claim is what a wrong page offset cannot survive; the tolerance claim is what says
+    the window holds the right latents at all.
+    """
     bank = _bank()
     window = _window(bank, table)
     queries = _queries(1, heads, LATENT)
     selected = _selected(1, window.shape[0])
     got = _paged(bank, table, selected, queries)
     want = _oracle(window, selected, queries)
+    unpaged = MS.mla_sparse_attention(queries, window, selected, SCALE)
     worst = float((got - want).abs().max())
     _say("TABLE", ".".join(str(page) for page in table))
     _say("WORST_ABS", f"{worst:.3e}")
+    _say("UNPAGED_MAX_ABS_DIFF", float((got - unpaged).abs().max()))
     assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
         f"the paged window disagrees with the oracle on table {table}: worst absolute difference "
         f"{worst:.3e} against rtol={RTOL} atol={ATOL}. A window assembled at the wrong page offset "
         f"reads another sequence's latents, which is the defect this increment exists to remove"
+    )
+    assert torch.equal(got, unpaged), (
+        f"the paged call on table {table} and the unpaged call on the window it names returned "
+        f"different bytes, so the page assembly is not a re-addressing of the same load"
     )
 
 
@@ -163,15 +190,21 @@ def test_table_with_a_padding_tail_agrees_with_the_oracle() -> None:
     selected = _selected(1, live)
     got = _paged(bank, table, selected, queries)
     want = _oracle(window, selected, queries)
+    unpaged = MS.mla_sparse_attention(queries, window, selected, SCALE)
     worst = float((got - want).abs().max())
     _say("PAD_TABLE_WORST_ABS", f"{worst:.3e}")
     _say("PAD_SELECTED_MAX", int(selected.max()))
+    _say("PAD_UNPAGED_MAX_ABS_DIFF", float((got - unpaged).abs().max()))
     assert int(selected.max()) < live, (
         f"this item's own selected rows reach into the padded page (max {int(selected.max())} "
         f"against {live} live rows), so it would not read the contract it claims to read"
     )
     assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
         f"a padded table entry moved the window: worst absolute difference {worst:.3e}"
+    )
+    assert torch.equal(got, unpaged), (
+        "the padded table's paged call and the unpaged call on the clamped window it names returned "
+        "different bytes, so the clamp does not load the page the window is read against"
     )
 
 
@@ -246,7 +279,7 @@ def test_overlay_of_one_written_row_is_what_the_gather_reads() -> None:
     bank = _bank()
     table = [5, 10]
     at = 200
-    written = torch.full((1, LATENT), -7.5, dtype=torch.float32)
+    written = torch.full((1, LATENT), -1.5, dtype=torch.float32)
     window = _window(bank, table).index_copy(0, torch.tensor([at]), written)
     queries = _queries(1, HEADS, LATENT)
     selected = _selected(1, len(table) * PAGE)
@@ -279,7 +312,7 @@ def test_overlay_of_a_whole_prefill_chunk_is_what_the_gather_reads() -> None:
     bank = _bank()
     table = list(range(BANK_PAGES))
     written = torch.arange(CHUNK, dtype=torch.float32).reshape(CHUNK, 1).expand(CHUNK, LATENT)
-    written = (written * -1.0 - 1.0).contiguous()
+    written = (written * (-LATENT / SPREAD) - 1.0).contiguous()
     rows = torch.arange(CHUNK_AT, CHUNK_AT + CHUNK)
     window = _window(bank, table).index_copy(0, rows, written)
     queries = _queries(1, 1, LATENT)
@@ -297,4 +330,54 @@ def test_overlay_of_a_whole_prefill_chunk_is_what_the_gather_reads() -> None:
     )
     assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
         f"the overlaid chunk is not what the gather read: worst absolute difference {worst:.3e}"
+    )
+
+
+def test_this_files_numbers_make_the_masked_and_overlaid_rows_visible() -> None:
+    """The data control, and the only item here that calls no kernel.
+
+    CERTIFYING COMPONENT: this file's own numbers. Three items above pass only if the change they make
+    is visible in the arithmetic at all -- the sentinel item's masked columns, and each overlay item's
+    written rows. Each reads its difference against ATOL, so a bank whose values drove the softmax to
+    one weight of 1 and the rest 0 would make those three items fail on correct arithmetic while
+    catching nothing: under that weighting the output is a copy of ONE gathered row, and masking or
+    overlaying any other row moves nothing. This item reads the three separations in the oracle alone,
+    and reads that the output is not a copy of a single gathered row.
+    """
+    bank = _bank()
+    table = [5, 10]
+    window = _window(bank, table)
+    queries = _queries(1, HEADS, LATENT)
+    live = _selected(1, len(table) * PAGE)
+    plain = _oracle(window, live, queries)
+    masked = live.clone()
+    masked[:, TOPK // 2:] = MS.SENTINEL_INDEX
+    sentinel_apart = float((_oracle(window, masked, queries) - plain).abs().max())
+    one = torch.full((1, LATENT), -1.5, dtype=torch.float32)
+    one_row = window.index_copy(0, torch.tensor([200]), one)
+    overlay_apart = float((_oracle(one_row, live, queries) - plain).abs().max())
+    wide = _bank()
+    wide_table = list(range(BANK_PAGES))
+    wide_window = _window(wide, wide_table)
+    chunk = torch.arange(CHUNK, dtype=torch.float32).reshape(CHUNK, 1).expand(CHUNK, LATENT)
+    chunk = (chunk * (-LATENT / SPREAD) - 1.0).contiguous()
+    wide_rows = torch.arange(CHUNK_AT, CHUNK_AT + CHUNK)
+    wide_queries = _queries(1, 1, LATENT)
+    wide_live = _selected(1, len(wide_table) * PAGE)
+    chunk_apart = float((_oracle(wide_window.index_copy(0, wide_rows, chunk), wide_live, wide_queries)
+                         - _oracle(wide_window, wide_live, wide_queries)).abs().max())
+    gathered = window[live[0].to(torch.int64)]
+    nearest = float((gathered - plain[0, 0]).abs().max(dim=1).values.min())
+    _say("DATA_SENTINEL_APART", f"{sentinel_apart:.3e}")
+    _say("DATA_OVERLAY_ONE_APART", f"{overlay_apart:.3e}")
+    _say("DATA_OVERLAY_CHUNK_APART", f"{chunk_apart:.3e}")
+    _say("DATA_NEAREST_GATHERED_ROW", f"{nearest:.3e}")
+    assert min(sentinel_apart, overlay_apart, chunk_apart) > ATOL, (
+        f"this file's numbers hide a change one of the items above depends on: sentinel "
+        f"{sentinel_apart:.3e}, one-row overlay {overlay_apart:.3e}, chunk overlay "
+        f"{chunk_apart:.3e}, all against atol={ATOL}"
+    )
+    assert nearest > ATOL, (
+        f"the output sits {nearest:.3e} from one of its own gathered rows, so the softmax is putting "
+        f"a single weight of 1 on that row and the guards above cannot see a change to any other"
     )

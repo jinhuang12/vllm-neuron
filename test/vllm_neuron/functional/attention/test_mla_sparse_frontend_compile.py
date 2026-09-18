@@ -25,6 +25,7 @@ test 3 reads the refusal.
 
 from __future__ import annotations
 
+import inspect
 import os
 import pathlib
 import re
@@ -46,6 +47,16 @@ _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2
 #: reached by the widths their own gate names, because the seam picks the body from the widths alone.
 LATENT, HEADS, TOPK_ROWS, PAGE, PAGES = 512, 64, 2048, 128, 32
 TOPK_NARROW, LATENT_RAGGED, ROPE = 512, 640, 64
+
+#: The three no-RoPE entries the paged window is assembled in, and the operands they have to declare
+#: for a paged call to reach the front end at all. THE DECLARATION IS READ BEFORE THE COMPILE, and the
+#: reason is a reading and not a precaution: `wrap_nki` binds a call by the parameters the entry
+#: declares and DROPS extra positional operands without a word. Against the entries as they stand, a
+#: paged call therefore compiles the unpaged kernel and reports no refusal, so the compile alone
+#: cannot tell a served paged entry from an unserved one.
+NOPE_ENTRIES = ("mla_sparse_attention_nope_row_tiled_kernel", "mla_sparse_attention_nope_kernel",
+                "mla_sparse_attention_nope_tiled_kernel")
+PAGED_PARAMETERS = ("block_table_hbm", "written_hbm", "write_offset_hbm", "page_size")
 
 
 def _emit(*fields: object) -> None:
@@ -182,7 +193,21 @@ def _read_the_child() -> list[dict[str, str]]:
 
 
 def test_the_front_end_accepts_the_paged_no_rope_entries() -> None:
-    """The three no-RoPE entries compile with a block table, this step's rows and a write offset."""
+    """The three no-RoPE entries DECLARE the paged operands, and then compile with them.
+
+    TWO CONJUNCTS IN THIS ORDER. The declaration is read first because an entry that does not declare
+    the paged operands is handed them and never sees them, so the compile below would read a clean
+    unpaged kernel and call it a paged pass.
+    """
+    declared = {name: tuple(inspect.signature(getattr(MS, name)).parameters) for name in NOPE_ENTRIES}
+    for name, parameters in declared.items():
+        _emit(f"declared={name}", f"parameters={'.'.join(parameters)}")
+    absent = {name: [one for one in PAGED_PARAMETERS if one not in parameters]
+              for name, parameters in declared.items()
+              if [one for one in PAGED_PARAMETERS if one not in parameters]}
+    assert absent == {}, (
+        f"an entry does not declare the paged operands, so a paged call to it drops them silently: "
+        f"{absent}")
     paged = [row for row in _read_the_child() if row["entry"].startswith("nope_")]
     assert len(paged) == 3, f"the child did not compile the three no-RoPE entries: {paged}"
     refused = [f"{row['entry']} x{row['x']}: {row['diagnostic']}"
@@ -227,7 +252,7 @@ def test_the_seam_refuses_a_paged_call_that_carries_a_rope_half() -> None:
 
 
 def test_no_call_site_in_the_module_expands_into_a_kernel_call() -> None:
-    """The census ruling 29 pairs with the compile: zero mapping or sequence expansions at call sites.
+    """The census the compile is paired with: zero mapping or sequence expansions at call sites.
 
     The front end refuses `**mapping` and `*sequence` in a call it parses, and a simulator run cannot
     see it, so the census is read over the module's own source text rather than inferred.
