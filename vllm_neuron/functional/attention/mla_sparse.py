@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse MLA latent attention, authored in NKI for this checkpoint's geometry.
+"""Sparse MLA latent attention with generic shape and score-tile parameters.
+
+The row-tiled entries load selected cache rows directly from HBM. They expose
+compile-time ``BLOCK_N`` (128, 256, 384, or 512) and ``STREAM_KV`` options. The
+existing public seam uses 512 and streaming; callers and tensor layouts do not
+change. ``STREAM_KV=False`` retains full-cache staging for explicit comparison.
+Dimensions come from input shapes. The existing geometry gate still applies.
 
 `inc-glm53f-040`. Per query, over the topk-selected cache rows::
 
@@ -990,59 +996,63 @@ def _count_row_tiled_nki_dispatch() -> None:
     _MLA_SPARSE_ROW_TILED_COUNTERS.nki_dispatch += 1
 
 
-def _score_tiles(topk: int) -> tuple[tuple[int, int], ...]:
+def _score_tiles(topk: int, block_n: int = MOVING_MAX) -> tuple[tuple[int, int], ...]:
     """``(offset, extent)`` per MM1 MOVING-axis score tile. At 2,048 this is 4 x 512.
 
     A LAST TILE MAY BE NARROWER, and it is never ragged in the sense `-041`'s tail is:
-    the gate admits only a multiple of :data:`KEY_CHUNK`, and :data:`MOVING_MAX` is
-    itself a multiple of it, so every extent this returns is a whole number of MM2 key
-    chunks. `topk=640` returns tiles of 512 and 128. That invariant is what lets the
+    the gate admits only a multiple of :data:`KEY_CHUNK`, and ``block_n`` must
+    also be a multiple of it. Each extent is therefore a whole number of MM2 key
+    chunks. At the default width, `topk=640` returns tiles of 512 and 128. That invariant is what lets the
     body chunk each tile without a partial-chunk case.
     """
     tiles = []
     offset = 0
     while offset < topk:
-        tiles.append((offset, min(MOVING_MAX, topk - offset)))
-        offset += MOVING_MAX
+        tiles.append((offset, min(block_n, topk - offset)))
+        offset += block_n
     return tuple(tiles)
 
 
+def _load_selected_rows(dst, cache_hbm, indices_hbm, offset, width):
+    """Gather one 128-row tile from HBM, widening to FP32 on the DMA.
+
+    The signed clamp makes every DMA address valid before the attention mask
+    removes sentinel columns. The gather preserves index order and duplicates.
+    """
+    rows = dst.shape[0]
+    raw = _sbuf_i32(rows, DMA_TRANSPOSE_ALIGN)[:, 0:1]
+    safe = _sbuf_i32(rows, DMA_TRANSPOSE_ALIGN)[:, 0:1]
+    nisa.dma_copy(dst=raw, src=indices_hbm.ap(
+        pattern=[[1, rows], [1, 1]], offset=offset))
+    nisa.tensor_scalar(dst=safe, data=raw, op0=nl.maximum, operand0=0)
+    nisa.dma_copy(dst=dst, src=cache_hbm.ap(
+        pattern=[[width, rows], [1, width]], vector_offset=safe, indirect_dim=0))
+
+
 def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
-                              q_pe_hbm=None, k_pe_hbm=None):
-    """Trace sparse latent attention with the SELECTED-ROW axis tiled, softmax carried.
+                              q_pe_hbm=None, k_pe_hbm=None,
+                              BLOCK_N=MOVING_MAX, STREAM_KV=True):
+    """Online sparse attention over score tiles with input-derived dimensions.
 
-    Same arithmetic as `-040`'s body per tile, and the same RoPE elision at trace time.
-    The difference is that the per-query work is done once per SCORE TILE and the
-    softmax is merged across the tiles, so the denominator and the output accumulator
-    are running values instead of one-shot ones.
+    ``BLOCK_N`` is the selected-key tile width. It must be a multiple of
+    ``KEY_CHUNK`` and fit the matmul moving axis. Changing it changes softmax
+    merge grouping; the default preserves the PR kernel's arithmetic order.
 
-    AT ONE SCORE TILE THIS IS `-040`'S BODY. The merge block is emitted only when there
-    is more than one tile -- a trace-time branch, not a run-time mask -- so a call at
-    ``topk <= MOVING_MAX`` traces `-040`'s instruction sequence with the Q transpose
-    hoisted above the (single-iteration) tile loop and one exact fp32 copy of the
-    accumulator added. Neither changes a value, which is why the acceptance can claim
-    BIT-IDENTITY there rather than a tolerance.
+    Streaming gathers ``[KEY_CHUNK, latent]`` FP32 rows. One transpose supplies
+    MM1, and MM2 reuses the gathered rows. Staging instead loads the full cache
+    once and gathers from SBUF. Both preserve duplicate indices and mask -1.
 
-    THE GATE'S GUARANTEE IS USED. The seam routes here only when the latent is an exact
-    multiple of :data:`LATENT_TILE` and fits one MM2 moving tile, because the
-    combination of both tilings is refused. So ``n_latent`` divides exactly and MM2's
-    moving extent is the whole latent. A DIRECT call on this entry point with a ragged
-    latent is outside what it serves; the seam is the supported caller.
-
-    Shapes are `-040`'s, with the selected-row count now unbounded above 1:
-        q_lift_hbm  [S, H, L]      the absorbed Q latent, per head
-        c_kv_hbm    [S_kv, L]      the latent KV cache
-        topk_hbm    [S, K] int32   the selected cache rows, per query
-        q_pe_hbm    [S, H, R]      present only when R > 0
-        k_pe_hbm    [S_kv, R]      present only when R > 0
-        out_hbm     [S, H, L]      written once per query
+    The public geometry gate restricts this body to exact latent tiles that fit
+    one MM2 moving tile. Other latent shapes keep the existing kernel routes.
     """
     seq, heads, latent = q_lift_hbm.shape
     s_kv = c_kv_hbm.shape[0]
     topk = topk_hbm.shape[1]
     n_latent = latent // LATENT_TILE
     rope = 0 if q_pe_hbm is None else q_pe_hbm.shape[2]
-    tiles = _score_tiles(topk)
+    assert KEY_CHUNK <= BLOCK_N <= MOVING_MAX and BLOCK_N % KEY_CHUNK == 0, (
+        "BLOCK_N must be a multiple of KEY_CHUNK in [KEY_CHUNK, MOVING_MAX]")
+    tiles = _score_tiles(topk, BLOCK_N)
     single = len(tiles) == 1
     # NOT ``max(extent for _, extent in tiles)``, and NOT ``for _, extent in tiles``.
     # That one line held two refusals. A comprehension or generator expression is
@@ -1058,20 +1068,18 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
             tile_max = tile[1]
     chunk_max = tile_max // KEY_CHUNK
 
-    # ---- the cache, transposed onto partitions ONCE for the whole call ----------
-    # `-040`'s exactly. The cache does not depend on which score tile is being served,
-    # so this stays outside both loops and the widened K costs nothing here.
-    # Built by a loop, not a comprehension, for the reason recorded at ``tile_max``
-    # above. Same tiles, same order, same name.
+    # The optional staged path reuses the full cache across queries. Streaming
+    # omits these allocations, so its SBUF use does not grow with cache length.
     c_sb = []
-    for _ in range(n_latent):
-        c_sb.append(_sbuf(LATENT_TILE, s_kv))
-    c_stage = _stage(c_kv_hbm, LATENT_TILE, s_kv)
-    for li in range(n_latent):
-        _transpose_rows(c_stage, c_kv_hbm, latent, s_kv, LATENT_TILE, li * LATENT_TILE)
-        nisa.tensor_copy(dst=c_sb[li], src=c_stage)
+    if not STREAM_KV:
+        for _ in range(n_latent):
+            c_sb.append(_sbuf(LATENT_TILE, s_kv))
+        c_stage = _stage(c_kv_hbm, LATENT_TILE, s_kv)
+        for li in range(n_latent):
+            _transpose_rows(c_stage, c_kv_hbm, latent, s_kv, LATENT_TILE, li * LATENT_TILE)
+            nisa.tensor_copy(dst=c_sb[li], src=c_stage)
     k_pe_sb = None
-    if rope > 0:
+    if rope > 0 and not STREAM_KV:
         k_pe_sb = _sbuf(rope, s_kv)
         k_pe_stage = _stage(k_pe_hbm, rope, s_kv)
         _transpose_rows(k_pe_stage, k_pe_hbm, rope, s_kv, rope, 0)
@@ -1099,6 +1107,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
     k_pe_g = _sbuf(rope, tile_max) if rope > 0 else None
+    k_pe_rows = _sbuf(KEY_CHUNK, _aligned(rope))[:, 0:rope] if rope > 0 and STREAM_KV else None
 
     # ---- the running state carried ACROSS score tiles ----------------------------
     # `run_pos` holds `softmax_scale * (running row max)` -- the POSITIVE form, because
@@ -1176,9 +1185,27 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                                sen, idx_sb)
 
                 # ---- gather this tile's cache rows: one instruction per latent tile ---
-                for li in range(n_latent):
-                    nisa.nc_n_gather(dst=c_g[:, li, 0:extent], data=c_sb[li],
-                                     indices=idx_sb[:, 0:extent])
+                if STREAM_KV:
+                    for ck in range(n_chunks):
+                        cs = ck * KEY_CHUNK
+                        _load_selected_rows(c_g_t[:, ck, :], c_kv_hbm, topk_hbm,
+                                            q_idx * topk + ks + cs, latent)
+                        for li in range(n_latent):
+                            gathered_ps = _psum(LATENT_TILE, KEY_CHUNK)
+                            nisa.nc_transpose(dst=gathered_ps, data=c_g_t[
+                                :, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE])
+                            nisa.tensor_copy(dst=c_g[:, li, cs:cs + KEY_CHUNK],
+                                             src=gathered_ps)
+                        if rope > 0:
+                            _load_selected_rows(k_pe_rows, k_pe_hbm, topk_hbm,
+                                                q_idx * topk + ks + cs, rope)
+                            rope_ps = _psum(rope, KEY_CHUNK)
+                            nisa.nc_transpose(dst=rope_ps, data=k_pe_rows)
+                            nisa.tensor_copy(dst=k_pe_g[:, cs:cs + KEY_CHUNK], src=rope_ps)
+                else:
+                    for li in range(n_latent):
+                        nisa.nc_n_gather(dst=c_g[:, li, 0:extent], data=c_sb[li],
+                                         indices=idx_sb[:, 0:extent])
 
                 # ---- MM1 over this tile: scores[H, extent] ---------------------------
                 scores_ps = _psum(heads, extent)
@@ -1190,22 +1217,24 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                         accumulate=(li > 0),
                     )
                 if rope > 0:
-                    nisa.nc_n_gather(dst=k_pe_g[:, 0:extent], data=k_pe_sb,
-                                     indices=idx_sb[0:rope, 0:extent])
+                    if not STREAM_KV:
+                        nisa.nc_n_gather(dst=k_pe_g[:, 0:extent], data=k_pe_sb,
+                                         indices=idx_sb[0:rope, 0:extent])
                     nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t[:, h0:h0 + heads],
                                    moving=k_pe_g[:, 0:extent], accumulate=True)
 
                 # ---- the gathered cache, transposed for MM2 --------------------------
-                for ck in range(n_chunks):
-                    cs = ck * KEY_CHUNK
-                    for li in range(n_latent):
-                        c_g_t_ps = _psum(KEY_CHUNK, LATENT_TILE)
-                        nisa.nc_transpose(dst=c_g_t_ps,
-                                          data=c_g[:, li, cs:cs + KEY_CHUNK])
-                        nisa.tensor_copy(
-                            dst=c_g_t[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE],
-                            src=c_g_t_ps,
-                        )
+                if not STREAM_KV:
+                    for ck in range(n_chunks):
+                        cs = ck * KEY_CHUNK
+                        for li in range(n_latent):
+                            c_g_t_ps = _psum(KEY_CHUNK, LATENT_TILE)
+                            nisa.nc_transpose(dst=c_g_t_ps,
+                                              data=c_g[:, li, cs:cs + KEY_CHUNK])
+                            nisa.tensor_copy(
+                                dst=c_g_t[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                                src=c_g_t_ps,
+                            )
 
                 # ---- softmax over THIS TILE's keys -- `-040`'s chain, verbatim -------
                 # Against the TILE's own max, which is the only max available yet. The
@@ -1304,32 +1333,26 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 
 @nki.jit
 def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
-                                               softmax_scale):
-    """The row-tiled R == 0 entry point, and the one this increment's acceptance runs."""
+                                               softmax_scale, BLOCK_N=MOVING_MAX,
+                                               STREAM_KV=True):
+    """NoPE sparse attention; optional tile parameters are compile-time constants."""
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm)
+    _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
+                              BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV)
     return out_hbm
 
 
 @nki.jit
 def mla_sparse_attention_rope_row_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
-                                               topk_hbm, softmax_scale):
-    """The row-tiled R > 0 entry point.
-
-    KEPT FOR `-040`'S AND `-041`'S REASON: this increment removes a bound on the
-    selected-row count, and serving the production row count only when there is no RoPE
-    half would swap one refused geometry for another and mint a refusal promising an
-    increment nobody owns. The RoPE limb contracts its own axis into the same score
-    tile, so it is row-tiled exactly like the latent limb and shares every line above.
-    IT IS AUTHORED AND NOT EXERCISED: this checkpoint is NoPE on the MLA half, so the
-    acceptance runs at R == 0 and this entry point traces only when a caller passes a
-    RoPE half. That is the same disclosure `-040` and `-041` each make.
-    """
+                                               topk_hbm, softmax_scale,
+                                               BLOCK_N=MOVING_MAX, STREAM_KV=True):
+    """Sparse attention with paired RoPE operands and compile-time tile options."""
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
     _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
-                              q_pe_hbm=q_pe_hbm, k_pe_hbm=k_pe_hbm)
+                              q_pe_hbm=q_pe_hbm, k_pe_hbm=k_pe_hbm,
+                              BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV)
     return out_hbm
 
 
