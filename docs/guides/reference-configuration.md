@@ -45,7 +45,7 @@ For conceptual overview and trade-offs, see [Bucketing and dynamic shapes](featu
 
 | Option | Type | Default | Description |
 | ---- | ---- | ---- | ---- |
-| `num_batched_tokens_buckets` | list[int] | Power-of-2 from 128 to `max_num_batched_tokens` | Compiled prefill token counts. Inputs padded to nearest bucket. Fewer = faster startup, more padding. Largest must equal `max_num_batched_tokens`. When segmented prefill is enabled, must match `kv_segment_size_buckets` (kernel constraint). |
+| `num_batched_tokens_buckets` | list[int] | Power-of-2 from 128 to `max_num_batched_tokens` | Compiled prefill token counts. Inputs padded to nearest bucket. Fewer = faster startup, more padding. Largest must equal `max_num_batched_tokens`. When segmented prefill is enabled, must match `kv_segment_size_buckets` unless the model supports independent query buckets (currently GLM-5.3-Flash). |
 | `num_seqs_buckets` | list[int] | Power-of-2 from 1 to `max_num_seqs` | Compiled decode batch sizes. Requests batched to smallest bucket >= current size. Largest must equal `max_num_seqs`. |
 | `kv_segment_size_buckets` | list[int] or null | null (disabled) | KV segment sizes for segmented attention kernel. Values must be in {512, 1024, 2048, 4096, 8192}, divisible by `block_size`. |
 | `decode_context_length_buckets` | list[int] or null | null (disabled) | Second decode bucketing dimension. Compiles smaller NEFFs sized to typical context lengths instead of `max_model_len`. Values must be ascending, < `max_model_len`, divisible by 128. |
@@ -328,8 +328,16 @@ vllm serve meta-llama/Llama-3.3-70B-Instruct \
 
 ### Prefix caching constraints
 
-- `kv_segment_size_buckets` and `num_batched_tokens_buckets` must
-  currently be identical (kernel constraint)
+- `kv_segment_size_buckets` and `num_batched_tokens_buckets` must be identical
+  unless the model supports independent query buckets. GLM-5.3-Flash supports
+  explicit `num_batched_tokens_buckets: [128, 1024]` with
+  `kv_segment_size_buckets: [1024]` and `max_num_batched_tokens: 1024`.
+  For a shorter single-request prefill, GLM keeps other model operators at
+  the largest configured width and trims only the sparse MLA query rows.
+  The platform derives this capability from the model class. Automatic bucket
+  selection stays unchanged.
+  This setting does not add prefix reuse for a fresh request or support for
+  noncontiguous sparse KV pages.
 - Only a single segment size is supported at this time
 - Block size must divide evenly into the segment size
 

@@ -7234,6 +7234,8 @@ class Glm5NextMLAAttention(nn.Module):
         batch_size: int = 1,
         prefill_end_position: torch.Tensor | int | None = None,
         collector: list[torch.Tensor] | None = None,
+        *,
+        active_mla_query_rows: int | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
@@ -7243,6 +7245,11 @@ class Glm5NextMLAAttention(nn.Module):
         ``[slots, NUM_LATENT_KV_HEADS, head_size]``, one latent per token, bf16 --
         and ``start_position`` is the slot the first of these tokens occupies.
         The cache is WRITTEN in place for those tokens and then READ WHOLE.
+
+        ``active_mla_query_rows`` is a static prefix selected by the runner.
+        Only the sparse attention call uses this shorter width. Projections and
+        cache writes keep all rows. Zero padding restores the attention output
+        to the ordinary operator width before absorb-out.
 
         THE WINDOW'S LENGTH IS A CONSTANT AND THE POSITION IS A TENSOR, and that
         pairing is the whole point of this signature. A graph is captured once and
@@ -7286,6 +7293,19 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{tuple(hidden_states.shape)}"
             )
         tokens = int(hidden_states.shape[0])
+        if active_mla_query_rows is not None:
+            if type(active_mla_query_rows) is not int or not (
+                1 <= active_mla_query_rows <= tokens
+            ):
+                raise Glm5NextMLADecodeError(
+                    f"active_mla_query_rows must be a static integer in [1, {tokens}]; "
+                    f"got {active_mla_query_rows!r}"
+                )
+            if topk_indices.ndim != 2 or topk_indices.shape[0] != tokens:
+                raise Glm5NextMLADecodeError(
+                    f"topk_indices must have {tokens} query rows before the active "
+                    f"prefix is selected; got {tuple(topk_indices.shape)}"
+                )
         latent = self.kv_lora_rank
         want_cache = (self.NUM_LATENT_KV_HEADS, self.head_size)
         if latent_cache.ndim != 3 or tuple(latent_cache.shape[1:]) != want_cache:
@@ -7380,10 +7400,30 @@ class Glm5NextMLAAttention(nn.Module):
                 f"sparse seam contracts {latent}"
             )
 
-        attended = mla_sparse_attention(q_lift, c_kv, topk_indices, softmax_scale)
+        if active_mla_query_rows is None or active_mla_query_rows == tokens:
+            attended = mla_sparse_attention(q_lift, c_kv, topk_indices, softmax_scale)
+        else:
+            attended = mla_sparse_attention(
+                q_lift[:active_mla_query_rows],
+                c_kv,
+                topk_indices[:active_mla_query_rows],
+                softmax_scale,
+            )
+            # The public seam returns FP32. Restore padding in that dtype before
+            # the existing model-dtype cast and absorb-out. These rows previously
+            # had attention values, so valid-row equivalence needs model tests.
+            attended = torch.cat(
+                (
+                    attended,
+                    attended.new_zeros(
+                        (tokens - active_mla_query_rows, *attended.shape[1:])
+                    ),
+                ),
+                dim=0,
+            )
         if collector is not None:
-            # THE SEAM'S OWN OUTPUT, before absorb-out, beside the query that entered it:
-            # the two operands a host can multiply back against the cache rows.
+            # The attention output, including restored padding, before absorb-out,
+            # beside the full-width query used to select the sparse prefix.
             collector.extend([attended, q_lift])
 
         # ABSORB-OUT. ``[S, H, 512] x [H, 512, 256] -> [S, H, 256]``: back to the
@@ -7412,6 +7452,7 @@ class Glm5NextMLAAttention(nn.Module):
         prefill_tail: torch.Tensor | None = None,
         prefill_end_position: torch.Tensor | int | None = None,
         collector: list[torch.Tensor] | None = None,
+        active_mla_query_rows: int | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -7485,6 +7526,10 @@ class Glm5NextMLAAttention(nn.Module):
             float(softmax_scale),
             prefill_end_position=prefill_end_position,
             collector=collector,
+            **(
+                {"active_mla_query_rows": active_mla_query_rows}
+                if active_mla_query_rows is not None else {}
+            ),
         )
 
 
@@ -7579,6 +7624,7 @@ class Glm5NextDSALayer(nn.Module):
         prefill_end_position: torch.Tensor | int | None = None,
         streams: torch.Tensor | None = None,
         collector: list[torch.Tensor] | None = None,
+        active_mla_query_rows: int | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -7661,6 +7707,10 @@ class Glm5NextDSALayer(nn.Module):
                 prefill_tail=prefill_tail,
                 prefill_end_position=prefill_end_position,
                 **({"collector": collector} if collector is not None else {}),
+                **(
+                    {"active_mla_query_rows": active_mla_query_rows}
+                    if active_mla_query_rows is not None else {}
+                ),
             )
             if collector is not None:
                 collector.append(attended)

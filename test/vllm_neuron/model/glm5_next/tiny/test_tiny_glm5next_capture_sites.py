@@ -210,6 +210,48 @@ def test_prefill_graph_capture_hands_the_root_its_carriers():
     landed._assert_route_predicate_r3("prefill-capture", before_seams, after_seams)
 
 
+def test_prefill_capture_with_independent_query_and_kv_lengths():
+    """Capture selects MLA Q128 while model operators and KV keep their full width."""
+    landed._require_cpu_mode()
+    root = landed._fixture()["root"]
+    caches = landed._runner_shaped_caches(root)
+    context_length = 4096
+    segment_size = 1024
+    # Reserve the full context for the synthetic block table. Recurrent state
+    # remains per request and does not grow with the query or KV window.
+    for spec in root.get_kv_spec().layers:
+        if spec.kda_recurrent_state_shape is None:
+            caches[spec.name] = [
+                torch.zeros(
+                    (context_length // item.MLA_PAGE_SIZE + 1, *bank.shape[1:]),
+                    dtype=bank.dtype,
+                )
+                for bank in caches[spec.name]
+            ]
+    root.bind_kv_cache(caches)
+    runner = _runner(root)
+    runner.max_model_len = context_length
+    runner.neuron_config.kv_segment_size_buckets = [segment_size]
+    runner.neuron_config.num_batched_tokens_buckets = [PREFILL_BUCKET, 1024]
+    backend = _StandInBackend(runner)
+    runner.capture_backend_model = backend
+
+    runner.extract_prefill_graphs(PREFILL_BUCKET, segment_size)
+
+    kwargs = _assert_translated("independent-prefill", backend.seen)
+    assert kwargs["input_ids"].shape[0] == 1024
+    assert torch.count_nonzero(kwargs["input_ids"][PREFILL_BUCKET:]) == 0
+    _assert_finite_logits("independent-prefill", backend.output, rows=1)
+    for carrier in kwargs["layer_carriers"]:
+        if "latent_cache" in carrier:
+            assert carrier["latent_cache"].shape[0] == segment_size + 1024
+            assert carrier["active_mla_query_rows"] == PREFILL_BUCKET
+            assert carrier["max_seq_len"] == context_length
+        else:
+            assert carrier["real_tokens"].tolist() == [[PREFILL_BUCKET]]
+            assert carrier["row_mask"].shape == (1, 1024, 1)
+
+
 # ══════════════════════════════════════════════════════════════════════════════════════
 # ITEM 2. the decode capture does the same, and is captured as a decode.
 # ══════════════════════════════════════════════════════════════════════════════════════

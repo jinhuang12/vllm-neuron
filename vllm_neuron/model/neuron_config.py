@@ -207,6 +207,10 @@ class NeuronConfig:
     # floor constant.
     block_quant_scale_min: float | None = None
 
+    # Internal capability resolved by the platform from the model class.
+    # This is not a user override for the segmented attention kernel contract.
+    _model_supports_independent_prefill_buckets: bool = False
+
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
         """Build NeuronConfig from a dictionary (e.g., from additional_config['neuron_config']).
@@ -291,6 +295,9 @@ class NeuronConfig:
             mhc_eps=config_dict.get("mhc_eps"),
             blockwise_fp8=config_dict.get("blockwise_fp8", False),
             block_quant_scale_min=config_dict.get("block_quant_scale_min"),
+            _model_supports_independent_prefill_buckets=config_dict.get(
+                "_model_supports_independent_prefill_buckets", False
+            ),
         )
 
     def __post_init__(self):
