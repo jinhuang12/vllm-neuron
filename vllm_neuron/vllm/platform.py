@@ -675,7 +675,7 @@ class NeuronPlatform(Platform):
 
     @classmethod
     def _resolve_sampling_from_the_model_class(cls, vllm_config: "VllmConfig") -> None:
-        """Turn on-device sampling and async scheduling off for a model class that declares no sampler.
+        """Resolve model capabilities and turn off unsupported device sampling.
 
         Such a class returns logits, which the async runner cannot read as token ids. An explicit
         on-device sampling config for it is refused. vLLM resolves the async-scheduling default
@@ -688,9 +688,14 @@ class NeuronPlatform(Platform):
         model_cls, arch = ModelRegistry.resolve_model_cls(
             model_config.architectures, model_config=model_config
         )
+        # Resolve this for every model, including models with a device sampler.
+        # Overwrite any caller value so it cannot bypass a kernel constraint.
+        neuron_config = vllm_config.additional_config.setdefault("neuron_config", {})
+        neuron_config["_model_supports_independent_prefill_buckets"] = bool(
+            getattr(model_cls, "supports_independent_prefill_buckets", False)
+        )
         if getattr(model_cls, "supports_on_device_sampling", True):
             return
-        neuron_config = vllm_config.additional_config.get("neuron_config", {})
         if neuron_config.get("on_device_sampling_config") is not None:
             raise ValueError(
                 f"{arch} has no on-device sampler: additional_config.neuron_config."

@@ -278,6 +278,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     #: The forward returns logits; the host's vLLM Sampler turns them into tokens.
     supports_on_device_sampling = False
+    #: GLM builds query and cached-KV carriers with independent lengths.
+    supports_independent_prefill_buckets = True
 
     def __init__(
         self,

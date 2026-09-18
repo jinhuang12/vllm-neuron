@@ -389,6 +389,8 @@ def resolve_segmented_prefill_config(
 def validate_kv_segment_size_buckets(
     buckets: Any,
     num_batched_tokens_buckets: list[int] | None,
+    *,
+    allow_independent_query_buckets: bool = False,
 ) -> list[int]:
     """Validate kv_segment_size_buckets configuration for segmented prefill.
 
@@ -400,15 +402,15 @@ def validate_kv_segment_size_buckets(
 
     Current kernel limitations (will be relaxed in the future):
         4. Only one segment size is supported (len == 1).
-        5. When num_batched_tokens_buckets is explicitly set by the user, it
-           must equal kv_segment_size_buckets because the segmented kernel
-           currently requires the prefill bucket length to be exactly the
-           segment size.
+        5. Explicit num_batched_tokens_buckets must equal kv_segment_size_buckets
+           unless the model supports independent query and cached-KV lengths.
 
     Args:
         buckets: List of segment size buckets to validate.
         num_batched_tokens_buckets: Explicitly configured batched tokens buckets,
             or None if not set by user.
+        allow_independent_query_buckets: Capability resolved from the model class.
+            Relaxes only the equality constraint, not segment validation.
 
     Returns:
         The validated bucket list.
@@ -462,8 +464,11 @@ def validate_kv_segment_size_buckets(
             f"{len(buckets)}: {buckets}."
         )
 
-    # 5. If user explicitly set num_batched_tokens_buckets, it must match
-    if num_batched_tokens_buckets is not None:
+    # 5. Keep query and KV buckets equal unless the model supports both lengths.
+    if (
+        num_batched_tokens_buckets is not None
+        and not allow_independent_query_buckets
+    ):
         # TODO: Remove this constraint once prefill bucket length is
         # decoupled from prior segment size in the segmented kernel.
         if num_batched_tokens_buckets != buckets:

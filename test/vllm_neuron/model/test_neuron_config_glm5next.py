@@ -76,6 +76,9 @@ BASE_FIELDS = (
 
 KNOB_NAMES = [name for name, _, _, _ in GLM5NEXT_KNOBS]
 
+# Model capabilities added after the original eight user configuration knobs.
+INTERNAL_FIELDS = ("_model_supports_independent_prefill_buckets",)
+
 
 def _field_names(cls):
     return [f.name for f in dataclasses.fields(cls)]
@@ -130,14 +133,17 @@ def test_new_fields_are_exactly_the_table():
     class -> table, so a field added by accident cannot hide outside the
     derivation record.
     """
-    added = [f for f in _field_names(NeuronConfig) if f not in BASE_FIELDS]
+    added = [
+        f for f in _field_names(NeuronConfig)
+        if f not in BASE_FIELDS + INTERNAL_FIELDS
+    ]
     assert sorted(added) == sorted(KNOB_NAMES)
 
 
 def test_field_count_delta():
-    """Before/after with the base stated: 19 base fields + N knobs."""
+    """Keep the original knob count separate from internal model capabilities."""
     assert len(BASE_FIELDS) == 19
-    assert len(_field_names(NeuronConfig)) == 19 + N
+    assert len(_field_names(NeuronConfig)) == 19 + N + len(INTERNAL_FIELDS)
 
 
 @pytest.mark.parametrize("name,default,probe,family", GLM5NEXT_KNOBS)

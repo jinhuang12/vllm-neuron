@@ -668,6 +668,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 validate_kv_segment_size_buckets(
                     buckets,
                     explicit_num_batched_tokens_buckets,
+                    allow_independent_query_buckets=(
+                        self.neuron_config._model_supports_independent_prefill_buckets
+                    ),
                 )
             )
             kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
@@ -709,6 +712,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 validate_kv_segment_size_buckets(
                     auto_kv_segment_size_buckets,
                     explicit_num_batched_tokens_buckets,
+                    allow_independent_query_buckets=(
+                        self.neuron_config._model_supports_independent_prefill_buckets
+                    ),
                 )
             )
             logger.info(
@@ -5603,6 +5609,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         request_starts=None,
         real_tokens: int | None = None,
         request_real_tokens=None,
+        active_mla_query_rows: int | None = None,
     ) -> list[dict]:
         """One mapping per layer, in stack order, each holding THAT layer's own state.
 
@@ -5971,6 +5978,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "max_seq_len": int(max_seq_len),
                 "page_size": int(geometry["page_size"]),
             }
+            if active_mla_query_rows is not None:
+                carrier["active_mla_query_rows"] = active_mla_query_rows
             if is_prefill:
                 carrier["slot_mapping"] = cls._glm5next_batch_pool_slot_mapping(
                     [(tokens, start_position)],
@@ -6111,6 +6120,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "paged latent cache, and this call site handed none"
             )
         input_ids = kwargs["input_ids"]
+        selected_query_rows = int(input_ids.shape[0])
+        active_mla_query_rows = None
+        query_buckets = getattr(
+            getattr(self, "neuron_config", None), "num_batched_tokens_buckets", None
+        )
+        operator_rows = max(query_buckets or [selected_query_rows])
+        bank_metadata = {
+            bank["name"]: metadata_map[bank["name"]]
+            for bank in banks if bank["name"] in metadata_map
+        }
+        if (
+            operator_rows > selected_query_rows
+            and any(bank["family"] == "self_attn" for bank in banks)
+            and all(
+                int(metadata["max_query_len"])
+                > int(metadata["decode_token_threshold"])
+                and len(
+                    self._glm5next_host_geometry(
+                        metadata, "host_num_computed_tokens", name
+                    )
+                ) == 1
+                for name, metadata in bank_metadata.items()
+            )
+        ):
+            # Keep model operators at the largest configured width. Only sparse
+            # MLA uses the selected prefix; real lengths still use that prefix.
+            input_ids = torch.cat(
+                [input_ids, input_ids.new_zeros(operator_rows - selected_query_rows)]
+            )
+            metadata_map = dict(metadata_map)
+            for name, metadata in bank_metadata.items():
+                metadata_map[name] = dict(metadata, max_query_len=operator_rows)
+            active_mla_query_rows = selected_query_rows
         tokens = int(input_ids.shape[0])
         # THE OPERAND WIDTH AND THE SEQUENCE'S END ARE TWO NUMBERS HERE. Every
         # tensor below is as wide as the bucket this step was padded to, and that
@@ -6167,8 +6209,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             request_rows = [[int(value) for value in row] for row in rows]
             request_starts = [int(value) for value in positions]
             request_tokens = self._glm5next_resolve_request_tokens(
-                real_counts, len(request_rows), tokens, name=f"KV layer '{name}'"
+                real_counts, len(request_rows), selected_query_rows,
+                name=f"KV layer '{name}'",
             )
+            if (
+                active_mla_query_rows is not None
+                and request_tokens[0] > active_mla_query_rows
+            ):
+                raise ValueError(
+                    f"KV layer '{name}' was handed {request_tokens[0]} real token(s) "
+                    f"for an active MLA prefix of {active_mla_query_rows} row(s)"
+                )
             for index, row in enumerate(request_rows):
                 if not row:
                     raise ValueError(
@@ -6309,7 +6360,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # derivation is a pure function of the builder's array and the batch's width, so
         # this second reading agrees with every group's by construction.
         request_tokens = self._glm5next_resolve_request_tokens(
-            real_counts, len(request_starts), tokens
+            real_counts, len(request_starts), selected_query_rows
         )
         text_config = self.model.text_config
         side_caches = self._glm5next_live_side_caches(banks)
@@ -6458,6 +6509,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # per row, so a second request handed the first one's padding would scan rows
             # that carry no token of its own sequence into its own state.
             request_real_tokens=request_tokens,
+            active_mla_query_rows=active_mla_query_rows,
         )
         # THE CURSOR ADVANCES ONLY ONCE THE CARRIERS EXIST. The call above refuses
         # several shapes of its own -- a multi-token decode, a bank whose paging
@@ -6490,7 +6542,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 int(request_starts[0]) + request_tokens[0]
             )
         return {
-            "input_ids": kwargs["input_ids"],
+            "input_ids": input_ids,
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
             **self._glm5next_parallel_kwargs(device=input_ids.device),
