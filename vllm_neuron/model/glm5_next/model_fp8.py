@@ -2109,17 +2109,25 @@ class Glm5NextRoutedExperts(nn.Module):
                     f"gate_up_proj_weight has H={int(gate_up_proj_weight.shape[1])} "
                     f"but hidden_states has H={hidden}"
                 )
-            if tuple(down_proj_weight.shape) != (num_experts, intermediate, hidden):
-                raise Glm5NextBlockQuantRouteError(
-                    f"down_proj_weight must be [E={num_experts}, "
-                    f"I_TP={intermediate}, H={hidden}], got shape "
-                    f"{tuple(down_proj_weight.shape)}"
-                )
+        # THE PARTITION IS READ BEFORE THE SECOND OPERAND'S SHAPE, because the
+        # expert count comes off the FIRST operand and every later shape is stated
+        # in terms of it. A bank truncated to another rank's width therefore fails
+        # both checks, and only this order names the cause: the bank disagrees with
+        # the partition, rather than a down projection whose extent "must be" a
+        # number this rank should never have derived.
         if num_experts != int(self.num_local_experts):
             raise Glm5NextBlockQuantRouteError(
                 f"the expert bank carries {num_experts} experts but this "
                 f"rank owns {self.num_local_experts}; the bank and the "
                 f"partition must agree"
+            )
+        if down_proj_weight is not None and tuple(down_proj_weight.shape) != (
+            num_experts, intermediate, hidden
+        ):
+            raise Glm5NextBlockQuantRouteError(
+                f"down_proj_weight must be [E={num_experts}, "
+                f"I_TP={intermediate}, H={hidden}], got shape "
+                f"{tuple(down_proj_weight.shape)}"
             )
         # ---- THE DISPATCH STEP. Global router columns -> this rank's slice.  #
         # ``inc-glm53f-032``'s landed note above says in its own words that
