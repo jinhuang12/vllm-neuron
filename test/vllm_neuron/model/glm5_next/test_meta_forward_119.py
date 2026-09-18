@@ -108,17 +108,20 @@ RAISES_RATHER_THAN_FALLING_BACK = f"{FUNCTIONAL}.mhc.sinkhorn"
 #: consults the predicate, the rebound name says nothing about what ran.
 STOOD_DOWN_ON_THE_PATH = f"{FUNCTIONAL}.mhc.hyper_connection"
 
-#: The six dispatch sites on this path that no stand-down can reach -- five that never consult
-#: their own predicate and one that refuses instead of falling back -- and the kernel each one
-#: enters. The seam's own declared stand-in is the seventh site, counted by its own list. Both
-#: legs reach all seven, so the premise reads them site by site.
+#: The dispatch sites on this path that no stand-down can reach -- they never consult their own
+#: predicate, or they refuse instead of falling back -- and the kernel each one enters. The
+#: seam's own declared stand-in is the last site, counted by its own list. Both legs reach all
+#: of them, so the premise reads them site by site.
+#:
+#: THE EXPERT SITE IS THE FUSED ONE, because that is the dispatch this model's packed bank takes:
+#: one entry replaces the three blockwise kernels the unpacked bank used to enter, and those
+#: three are the non-packed path's, covered where that path is driven. A site named here that
+#: the path no longer enters would fail this item for a route change rather than a defect.
 DECLARED_SITES = {
-    "mhc/sinkhorn.py:1005": "sinkhorn_blocks_kernel",
-    "attention/mla_projections.py:272": "mla_projection_kernel",
-    "attention/mla_absorb.py:322": "mla_absorb_kernel",
-    "moe/moe_blockwise_fp8.py:1354": "moe_gate_up_blockwise_fp8_kernel",
-    "moe/moe_blockwise_fp8.py:1638": "moe_swiglu_transposed_kernel",
-    "moe/moe_blockwise_fp8.py:1865": "moe_down_blockwise_fp8_kernel",
+    "mhc/sinkhorn.py:1017": "sinkhorn_blocks_kernel",
+    "attention/mla_projections.py:278": "mla_projection_kernel",
+    "attention/mla_absorb.py:383": "mla_absorb_kernel",
+    "moe/fused_fp8.py:19": "moe_fused_fp8_kernel",
 }
 
 #: The vendor's dispatch wrapper and the route predicate as they are BEFORE anything here
@@ -359,6 +362,15 @@ def _hold_every_dispatch_but_the_seam(monkeypatch, crossed: list[str]) -> list[s
     same two limbs as the stand-down reach every module, by name where the module is already
     imported and through the source where it is imported later.
     """
+    # A MODULE THAT BINDS ITS DISPATCH AT IMPORT TIME IS DROPPED FIRST, so the forward's own
+    # lazy import re-binds it under the hold below. ``moe/fused_fp8.py:19`` calls ``wrap_nki``
+    # at module level, so whichever test imported it first owns its boundary for the whole
+    # process: held after that import, this item would see the expert dispatch when it ran
+    # alone and miss it in a whole-tree run. Dropping the module makes the reading the same
+    # either way, and imports nothing itself.
+    # ``delitem`` and not ``del``: the fixture puts the ORIGINAL module back at teardown, so a
+    # later test finds the real boundary rather than this item's holder frozen into it.
+    monkeypatch.delitem(sys.modules, f"{FUNCTIONAL}.moe.fused_fp8", raising=False)
     held = []
     for name, module in sorted(sys.modules.items()):
         if not name.startswith(FUNCTIONAL) or module is seam:
