@@ -857,3 +857,97 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, 
         f"slots the write named and cannot witness a wrong offset"
     )
 
+
+class _WindowThatDefersItsWrite:
+    """A cache window whose out-of-place read is real and whose in-place write is only recorded."""
+
+    def __init__(self, window, pending):
+        self._window = window
+        self._pending = pending
+
+    def index_copy_(self, dim, index, source):
+        self._pending.append((dim, index.detach().clone(), source.detach().clone()))
+        return self
+
+    def index_copy(self, dim, index, source):
+        return self._window.index_copy(dim, index, source)
+
+
+class _BankThatDefersItsWrite:
+    """A bank double standing in for a device where an in-place write is not visible in its own graph."""
+
+    def __init__(self, bank):
+        self._bank = bank
+        self.pending: list = []
+
+    def __getattr__(self, name):
+        return getattr(self._bank, name)
+
+    def __getitem__(self, key):
+        return _WindowThatDefersItsWrite(self._bank[key], self.pending)
+
+    def let_the_deferred_writes_land(self):
+        """Apply what the forward only recorded, as a step boundary would."""
+        with torch.no_grad():
+            for dim, index, source in self.pending:
+                self._bank[:, 0, :].index_copy_(dim, index, source)
+
+
+def test_the_seam_reads_this_steps_rows_even_when_the_bank_write_lands_later(tmp_path, monkeypatch):
+    """The operand the seam consumes carries this step's latent while the bank still holds the old rows."""
+    _require_cpu_mode()
+    save_dir = tmp_path / "layer-streams"
+    layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
+    attention = layers[tap].attention
+    attend = attention.attend
+    stale = -3.0
+    seen = {}
+
+    def _hand_over_a_deferring_bank(hidden_states, latent_cache, *args, **kwargs):
+        # THE OLD ROWS ARE MADE RECOGNISABLE FIRST, so a stale read cannot be mistaken for a
+        # written one; the layer then works against the double instead of the bank itself.
+        with torch.no_grad():
+            latent_cache.fill_(stale)
+        seen["carrier"] = latent_cache
+        seen["double"] = _BankThatDefersItsWrite(latent_cache)
+        return attend(hidden_states, seen["double"], *args, **kwargs)
+
+    monkeypatch.setattr(attention, "attend", _hand_over_a_deferring_bank)
+    _, output = _prefill(runner, root, _prompt())
+    carrier, double = seen["carrier"], seen["double"]
+    NeuronModelRunner._take_layer_stream_dump(runner, output, is_prefill=True)
+
+    written = _dumped(save_dir, tap, "latent_written")
+    rows = _dumped(save_dir, tap, "write_rows")
+    cached = _dumped(save_dir, tap, "cache_rows")
+    bank_dtype = carrier.dtype
+    want = written.to(bank_dtype).float()
+    got = cached[rows.long()]
+    still_old = carrier[:, 0, :].float()[rows.long()]
+    print(f"TINYDUMP|deferred_bank|layer={tap}|deferred_writes={len(double.pending)}"
+          f"|rows={int(rows.numel())}|cast_to={bank_dtype}|stale={stale}"
+          f"|seam_carries_this_step={torch.equal(got, want)}"
+          f"|bank_still_old={torch.equal(still_old, torch.full_like(still_old, stale))}"
+          f"|max_abs_seam={float((got - want).abs().max())}")
+    assert double.pending, (
+        f"the double recorded no write, so the layer never wrote through the bank and this item "
+        f"tests nothing about a write that lands late"
+    )
+    assert torch.equal(still_old, torch.full_like(still_old, stale)), (
+        f"the bank already carries the write, so the deferral did not hold and a stale read is "
+        f"indistinguishable from a written one here"
+    )
+    assert torch.equal(got, want), (
+        f"the operand the seam consumed does not carry this step's rows: max abs delta "
+        f"{float((got - want).abs().max())} under the bank's own cast, while the bank still holds "
+        f"the old rows. The seam must read a window the write has been applied to, not the bank's view"
+    )
+
+    double.let_the_deferred_writes_land()
+    landed = carrier[:, 0, :].float()[rows.long()]
+    print(f"TINYDUMP|deferred_bank_persistence|layer={tap}|bank_carries_the_write="
+          f"{torch.equal(landed, want)}|max_abs={float((landed - want).abs().max())}")
+    assert torch.equal(landed, want), (
+        f"once the recorded write landed the bank still does not carry the written rows: max abs "
+        f"delta {float((landed - want).abs().max())}. The in-place write is what later steps read"
+    )

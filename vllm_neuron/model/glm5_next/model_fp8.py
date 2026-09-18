@@ -7491,18 +7491,26 @@ class Glm5NextMLAAttention(nn.Module):
             # values and slots the write carries. ``rows`` is narrowed for the file only;
             # the write keeps the int64 index it needs.
             collector.extend([kv_latent, rows.to(torch.int32)])
-        latent_cache[:, 0, :].index_copy_(
-            0, rows, kv_latent.to(latent_cache.dtype)
-        )
+        # ONE CAST, USED TWICE, so the value that persists and the value this step
+        # reads back cannot differ.
+        written = kv_latent.to(latent_cache.dtype)
+        # THE PERSISTING WRITE, through the window view into the caller's bank, for
+        # the steps that come after this one.
+        latent_cache[:, 0, :].index_copy_(0, rows, written)
 
         # THE CACHE READ. The WHOLE window, because its length is the bucket's and
         # not this step's. ``[S_kv, latent]`` is the shape the sparse seam
         # contracts, and it is now the same shape at every position.
-        c_kv = latent_cache[:, 0, :]
+        #
+        # OUT OF PLACE, SO THIS STEP'S ROWS ARE IN IT BY CONSTRUCTION. Reading the
+        # window back as a view leaves the seam depending on when the write above
+        # becomes visible inside one graph, and on device it observed the rows from
+        # before the write. This copy carries the written rows whether or not the
+        # write above has landed in the bank yet.
+        c_kv = latent_cache[:, 0, :].index_copy(0, rows, written)
         if collector is not None:
-            # CLONED: this is a view of the caller's bank, which a later step writes
-            # through, so the file would otherwise hold that later step's rows.
-            collector.append(c_kv.clone())
+            # The value the seam consumes, which is this tensor and not the bank.
+            collector.append(c_kv)
 
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention
