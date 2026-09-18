@@ -135,7 +135,7 @@ def benchmark(args, rows):
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
         write(output / f"cohort-{cohort:02}-window.json",
               {"start_unix": start, "end_unix": time.time(),
-               "scope": "Includes client startup and preliminary request; encloses the timed window."})
+               "scope": "Includes client startup; encloses the timed window. Extra requests depend on the installed client's ready-check policy."})
         result = json.loads((output / name).read_text())
         assert result["completed"] == 10, result
         assert result["total_output_tokens"] == 320, result

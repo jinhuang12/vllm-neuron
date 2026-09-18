@@ -95,7 +95,7 @@ repeat it. Raw checkpoint values up to 448 are rejected by the real packer.
 
 ## Reproduce
 
-From the source worktree on trn2-2, select an unused assigned logical core:
+From the source worktree on a Trainium2 host, select an unused assigned logical core:
 
 ```bash
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/bin/activate
@@ -125,14 +125,30 @@ python3 -m pytest -q experiments/glm53_moe_nki/test_model_integration.py \
   experiments/glm53_moe_nki/test_decode_rows.py
 ```
 
+Run the compact-row native verifier on an assigned core with the SDK active:
+
+```bash
+NEURON_EXECUTION_BACKEND=lite python experiments/glm53_moe_nki/verify_decode_rows.py \
+  --output /absolute/new-native-results --cases production small
+```
+
+It generates its own fixtures and checks changing routes, EP ranks, empty
+local routes, and repeated calls. It reports legacy-output preservation and
+CPU-reference agreement separately. Saved result JSON is not an input.
+
+The reusable [Docker runner](../../verification/glm53-moe/run_container.sh)
+provides `build`, `smoke`, `cpu-tests`, and `run` modes. Set `GLM53_SOURCE`,
+`GLM53_OUTPUT`, `GLM53_VENV`, and `GLM53_SDK` for the local checkout and SDK.
+Keep output outside the source tree. Hardware mode also requires the assigned
+`GLM53_NEURON_DEVICE` and `NEURON_RT_VISIBLE_CORES`.
+
 ## Evidence
 
 The [full-model report](../../verification/glm53-moe-fullmodel/RESULTS.md)
-records serving measurements and their limits. The [compact-row report](
-../../verification/glm53-moe/decode-rows-r1/README.md) records the current
-native component checks. Full NEFFs, NTFFs, timing traces, tensors, and the
-earlier fixed-shape optimization history remain on trn2-2 under
-`/home/ubuntu/glm53-moe-nki-20260917/`.
+records measurements, limits, and an immutable link to the original evidence.
+The [full-model tools](../../benchmarks/glm53_moe/full_model/README.md) support
+new baseline/candidate comparisons. Generated captures, graphs, timings, and
+logs belong in an external result directory; the tests generate their inputs.
 
 Larger fixtures retain the original CPU-oracle BF16-boundary failures at the
 unchanged tolerance. Exact preservation of existing device output is a

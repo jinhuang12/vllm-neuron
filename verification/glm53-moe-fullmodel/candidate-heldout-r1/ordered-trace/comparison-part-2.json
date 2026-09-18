@@ -1,8 +1,0 @@
-{
-  "left_sha256": "fc6ed9e7a31e5cd376c95bea161dc50bee6ad393a1da4db9f5806d509315d945",
-  "right_sha256": "0c9ba37c669b4b53a90047a0a7ceef3c478d62c48e4be784be2849f5f851ac5f",
-  "mismatches": [],
-  "max_absolute_logprob_delta": 0.0,
-  "required_absolute_logprob_delta": 0.0,
-  "pass": true
-}

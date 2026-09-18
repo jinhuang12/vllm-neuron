@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare or launch one arm of the frozen full-model comparison.
+"""Prepare or launch a GLM full-model comparison with a selected runtime config.
 
 The benchmark lead owns device scheduling. Plan and smoke expose no devices.
 Serve requires the exact SHA256 of the reviewed measurement contract.
@@ -42,12 +42,13 @@ def server_arguments(config: dict, weights: Path, output: Path, port: int,
 
 
 def build_plan(args: argparse.Namespace, image_id: str, token: str) -> dict:
-    config = json.loads((HERE / "config.json").read_text())
+    config_path = Path(args.config).resolve()
+    config = json.loads(config_path.read_text())
     source, weights, output, cache, deps, venv, sdk = (
         Path(getattr(args, name)).resolve()
         for name in ("source", "weights", "output", "cache", "deps", "venv", "sdk"))
     for writable in (output, cache):
-        for readonly in (source, weights, deps, venv, sdk, HERE):
+        for readonly in (source, weights, deps, venv, sdk, HERE, config_path):
             if writable == readonly or readonly in writable.parents or writable in readonly.parents:
                 raise ValueError(f"Writable and read-only mounts overlap: {writable}, {readonly}")
     env = dict(config["environment"])
@@ -72,6 +73,7 @@ def build_plan(args: argparse.Namespace, image_id: str, token: str) -> dict:
     for path in (source, weights, deps, venv, sdk):
         command.extend(["--mount", f"type=bind,src={path},dst={path},readonly"])
     command.extend(["--mount", f"type=bind,src={HERE},dst=/harness,readonly"])
+    command.extend(["--mount", f"type=bind,src={config_path},dst=/harness-config.json,readonly"])
     for path in (output, cache):
         command.extend(["--mount", f"type=bind,src={path},dst={path}"])
     # Keep temporary compiler files beside each arm's cache. Some NKI cache
@@ -83,7 +85,8 @@ def build_plan(args: argparse.Namespace, image_id: str, token: str) -> dict:
     for key, value in sorted(env.items()):
         command.extend(["--env", f"{key}={value}"])
     command.extend(["--workdir", str(output), image_id, str(venv / "bin/python"),
-                    "/harness/runtime.py", "--mode", "serve" if args.mode == "plan" else args.mode,
+                    "/harness/runtime.py", "--config", "/harness-config.json",
+                    "--mode", "serve" if args.mode == "plan" else args.mode,
                     "--source", str(source), "--deps", str(deps),
                     "--output", str(output), "--cache", str(cache), "--"])
     server = server_arguments(config, weights, output, args.port, not args.no_profile)
@@ -96,7 +99,7 @@ def build_plan(args: argparse.Namespace, image_id: str, token: str) -> dict:
             "image_id": image_id, "container_name": name, "run_token": token,
             "source": str(source), "weights": str(weights), "output": str(output),
             "cache": str(cache), "deps": str(deps),
-            "config": config, "config_sha256": sha256(HERE / "config.json"),
+            "config": config, "config_sha256": sha256(config_path),
             "contract": str(contract) if contract else None,
             "contract_sha256": contract_hash,
             "profile_routes_enabled": not args.no_profile,
@@ -108,6 +111,7 @@ def build_plan(args: argparse.Namespace, image_id: str, token: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["plan", "smoke", "serve"])
+    parser.add_argument("--config", type=Path, default=HERE / "config.json")
     parser.add_argument("--arm", required=True, choices=["baseline", "candidate", "postbaseline"])
     for name in ("source", "weights", "output", "cache", "deps"):
         parser.add_argument("--" + name, required=True)
@@ -120,7 +124,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.mode == "serve" and (not args.contract or not args.contract_sha256):
         parser.error("serve requires --contract and --contract-sha256 from the frozen plan")
-    config = json.loads((HERE / "config.json").read_text())
+    config = json.loads(args.config.read_text())
     image_id = subprocess.check_output(
         ["docker", "image", "inspect", "--format", "{{.Id}}", config["image"]], text=True).strip()
     if image_id != config["image_id"]:

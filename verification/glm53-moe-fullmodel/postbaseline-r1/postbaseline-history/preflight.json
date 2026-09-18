@@ -1,9 +1,0 @@
-{
-  "status": "PASS",
-  "input_sha256": {
-    "launch.json": "8cff120ece764ebd0d063ff5c155c1cc43cbe49108bab8ef750826528df698f9",
-    "fresh-process.json": "cc4f240109558afbb96089fafdaa54537be2be421ea6e735e9f498872324c91c",
-    "runtime.json": "2bdfec24dfac96bc5ca636d72e87c5d6e15fe91aaacc9a869cf5c15ff5a9aaa8",
-    "source-manifest.json": "e75a980283bda5fef9a4eb23d8164987550859db45af8407a758c5ea2ef93f8f"
-  }
-}

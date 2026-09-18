@@ -39,6 +39,7 @@ def source_manifest(source: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--mode", choices=["smoke", "serve"], required=True)
     for name in ("source", "deps", "output", "cache"):
         parser.add_argument("--" + name, type=Path, required=True)
@@ -60,11 +61,12 @@ def main() -> None:
         if name in ("transformers", "tokenizers") and (path is None or deps not in path.parents):
             raise RuntimeError(f"Dependency overlay was not selected: {path}")
     versions = {name: importlib.metadata.version(name) for name in PACKAGES}
-    if versions["transformers"] != "5.16.1" or versions["tokenizers"] != "0.23.1":
-        raise RuntimeError(f"Unexpected HF versions: {versions}")
+    config = json.loads(args.config.read_text())
+    for name, expected in config["runtime_versions"].items():
+        if versions[name] != expected:
+            raise RuntimeError(f"Unexpected {name} version: expected {expected}, found {versions[name]}")
     from vllm.config import ProfilerConfig
     from vllm_neuron.vllm.worker.neuron_profiler import NeuronProfilerConfig
-    config = json.loads(Path("/harness/config.json").read_text())
     profiler = ProfilerConfig(**config["profiler_config"])
     neuron_profiler = NeuronProfilerConfig(config["neuron_profiler"])
     manifest = source_manifest(source)
@@ -72,6 +74,7 @@ def main() -> None:
     report = {
         "status": "PASS", "mode": args.mode, "python": sys.version,
         "executable": sys.executable, "versions": versions, "modules": modules,
+        "config_sha256": file_hash(args.config),
         "source_tree_sha256": manifest["tree_sha256"],
         "devices_exposed": sorted(str(p) for p in Path("/dev").glob("neuron*")),
         "environment": {k: v for k, v in sorted(os.environ.items())

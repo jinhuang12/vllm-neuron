@@ -12,6 +12,7 @@ from benchmarks.glm53_moe.full_model.collect import collect
 
 def args(tmp_path, mode="serve"):
     return argparse.Namespace(mode=mode, arm="baseline", source=str(tmp_path / "source"),
+        config=HERE / "config.json",
         weights=str(tmp_path / "weights"), output=str(tmp_path / "output"),
         cache=str(tmp_path / "cache"), deps=str(tmp_path / "deps"),
         venv=str(tmp_path / "venv"), sdk=str(tmp_path / "sdk"),
@@ -80,6 +81,33 @@ def test_contract_hash_must_match(tmp_path):
         build_plan(a, "image-id", "run")
     a.contract_sha256 = sha256(contract)
     assert build_plan(a, "image-id", "run")["contract_sha256"] == sha256(contract)
+
+
+def test_selected_config_controls_launch_and_is_shared_with_runtime(tmp_path):
+    a = args(tmp_path)
+    config = json.loads(a.config.read_text())
+    config["server"]["max_model_len"] = 2048
+    config["runtime_versions"]["transformers"] = "test-version"
+    a.config = tmp_path / "selected-config.json"
+    a.config.write_text(json.dumps(config))
+    plan = build_plan(a, "image-id", "run")
+    assert plan["config"] == config
+    assert plan["config_sha256"] == sha256(a.config)
+    server = plan["server_arguments"]
+    assert server[server.index("--max-model-len") + 1] == "2048"
+    command = plan["docker_command"]
+    assert f"type=bind,src={a.config},dst=/harness-config.json,readonly" in command
+    assert command[command.index("--config") + 1] == "/harness-config.json"
+
+
+def test_config_cannot_live_in_writable_output(tmp_path):
+    a = args(tmp_path)
+    Path(a.output).mkdir()
+    original = a.config.read_text()
+    a.config = Path(a.output) / "config.json"
+    a.config.write_text(original)
+    with pytest.raises(ValueError, match="overlap"):
+        build_plan(a, "image-id", "run")
 
 
 def test_profiler_can_be_omitted_without_changing_geometry(tmp_path):

@@ -1,48 +1,0 @@
-INFO 09-18 03:56:07 [__init__.py:44] Available plugins for group vllm.platform_plugins:
-INFO 09-18 03:56:07 [__init__.py:46] - neuron -> vllm_neuron:register
-INFO 09-18 03:56:07 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
-2026-09-18 03:56:09,126 - INFO - staged_neff_load.py:105 - neff_load_registered|name=neuron_libtorch|wrapped=libtorch_neuronx_lite.compile.backend.compile|was_registered=False
-2026-09-18 03:56:09,126 - INFO - staged_neff_load.py:105 - neff_load_registered|name=neuron_libtorch|wrapped=libtorch_neuronx_lite.compile.backend.compile|was_registered=False
-2026-09-18 03:56:09,126 - INFO - xla_collectives.py:214 - ✓ Custom XLA implementations registered via torch.library.impl (all_reduce, all_gather, reduce_scatter, all_to_all)
-2026-09-18 03:56:09,127 - INFO - port_hold_patch.py:205 - Port-hold patch applied (EADDRINUSE file-rendezvous)
-2026-09-18 03:56:09,127 - INFO - port_hold_patch.py:205 - Port-hold patch applied (EADDRINUSE file-rendezvous)
-INFO 09-18 03:56:09 [__init__.py:237] Platform plugin neuron is activated
-WARNING 09-18 03:56:14 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
-Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x73ac6c2322a0>, trust_remote_code=False, seed=0, num_prompts=10, dataset_name='custom', no_stream=False, dataset_path='/home/ubuntu/glm53-moe-fullmodel-20260917/harness/workload.jsonl', no_oversample=False, skip_chat_template=True, enable_multimodal_chat=False, disable_shuffle=True, custom_output_len=32, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='vllm', base_url='http://127.0.0.1:18004', host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=1, model='/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9', input_len=None, output_len=None, tokenizer=None, tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='/home/ubuntu/glm53-moe-fullmodel-20260917/artifacts/postbaseline-r1/benchmark', result_filename='cohort-04.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='99', goodput=None, request_id_prefix='bench-c096416d-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
-Starting initial single prompt test run...
-Skipping endpoint ready check.
-Starting main benchmark run...
-Traffic request rate: inf
-Burstiness factor: 1.0 (Poisson process)
-Maximum request concurrency: 1
-  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:23<03:30, 23.34s/it] 20%|██        | 2/10 [00:46<03:06, 23.37s/it] 30%|███       | 3/10 [01:10<02:43, 23.37s/it] 40%|████      | 4/10 [01:33<02:20, 23.39s/it] 50%|█████     | 5/10 [01:56<01:56, 23.38s/it] 60%|██████    | 6/10 [02:20<01:33, 23.38s/it] 70%|███████   | 7/10 [02:43<01:10, 23.37s/it] 80%|████████  | 8/10 [03:06<00:46, 23.37s/it] 90%|█████████ | 9/10 [03:30<00:23, 23.37s/it]100%|██████████| 10/10 [03:53<00:00, 23.37s/it]100%|██████████| 10/10 [03:53<00:00, 23.37s/it]
-tip: install termplotlib and gnuplot to plot the metrics
-============ Serving Benchmark Result ============
-Successful requests:                     10        
-Failed requests:                         0         
-Maximum request concurrency:             1         
-Benchmark duration (s):                  233.72    
-Total input tokens:                      301       
-Total generated tokens:                  320       
-Request throughput (req/s):              0.04      
-Output token throughput (tok/s):         1.37      
-Peak output token throughput (tok/s):    2.00      
-Peak concurrent requests:                2.00      
-Total token throughput (tok/s):          2.66      
----------------Time to First Token----------------
-Mean TTFT (ms):                          6427.80   
-Median TTFT (ms):                        6426.87   
-P99 TTFT (ms):                           6432.63   
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          546.59    
-Median TPOT (ms):                        546.58    
-P99 TPOT (ms):                           547.70    
----------------Inter-token Latency----------------
-Mean ITL (ms):                           546.59    
-Median ITL (ms):                         547.25    
-P99 ITL (ms):                            550.04    
-----------------End-to-end Latency----------------
-Mean E2EL (ms):                          23372.05  
-Median E2EL (ms):                        23373.43  
-P99 E2EL (ms):                           23407.58  
-==================================================
