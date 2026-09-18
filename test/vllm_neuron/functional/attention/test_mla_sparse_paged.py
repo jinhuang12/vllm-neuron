@@ -90,12 +90,16 @@ def _selected(seq: int, window_rows: int, topk: int = TOPK) -> torch.Tensor:
 
 
 def _paged(bank, table, selected, queries, written=None, write_offset=None):
-    """The seam under test, called the way the runner will call it."""
+    """The seam under test, called the way the runner will call it.
+
+    The table travels as a COLUMN, `[pages, 1]` int32: the shape the page number is read out of on
+    device, and the shape every other index operand in this tree takes.
+    """
     offset = torch.zeros(1, 1, dtype=torch.int32) if write_offset is None else write_offset
     rows = torch.zeros(0, bank.shape[1], dtype=bank.dtype) if written is None else written
     return MS.mla_sparse_attention(
         queries, bank, selected, SCALE,
-        block_table_row=torch.tensor(table, dtype=torch.int32),
+        block_table_row=torch.tensor([[page] for page in table], dtype=torch.int32),
         written=rows, write_offset=offset, page_size=PAGE,
     )
 
