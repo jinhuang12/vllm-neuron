@@ -71,6 +71,8 @@ def _compile_each_entry() -> None:
     import torch
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
     from vllm_neuron.functional.attention import mla_sparse as live
 
     f32, i32 = torch.float32, torch.int32
@@ -83,15 +85,17 @@ def _compile_each_entry() -> None:
         """One no-RoPE entry with the bank, the table, this step's rows and the offset.
 
         The table is a COLUMN, `[pages, 1]`: that is the shape the probe read the page number out of,
-        and the shape every other index operand in this tree takes.
+        and the shape every other index operand in this tree takes. Every entry is called through
+        `wrap_nki`, which is how the seam calls it: a raw call takes the framework hop instead of
+        the compiler front end this item is here to read.
         """
-        return lambda: entry(
+        return lambda: wrap_nki(entry)(
             fake((1, HEADS, latent)), fake((PAGES * PAGE, latent)), fake((1, topk), i32), 0.1,
             fake((PAGES, 1), i32), fake((tokens, latent)), fake((1, 1), i32), PAGE)
 
     def unpaged_rope(entry, latent, topk):
         """One RoPE entry exactly as it stands today, on a window rather than a bank."""
-        return lambda: entry(
+        return lambda: wrap_nki(entry)(
             fake((1, HEADS, latent)), fake((1, HEADS, ROPE)), fake((window, latent)),
             fake((window, ROPE)), fake((1, topk), i32), 0.1)
 
