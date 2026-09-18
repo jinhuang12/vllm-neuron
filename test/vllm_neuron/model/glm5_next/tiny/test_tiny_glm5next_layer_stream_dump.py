@@ -46,6 +46,7 @@ from vllm_neuron.model.glm5_next.model_fp8 import (
     dump_tap_names,
     layer_dump_names,
 )
+from vllm_neuron.functional.attention import mla_sparse as mla_sparse_module
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
 # The landed tiny fixtures, imported rather than re-built: the stack, its seeds and its dials
@@ -230,8 +231,38 @@ def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
             )
             return project(attn_out, collector)
 
+        # THE LATENT TAPS' ORACLES COME FROM EITHER SIDE OF THE CACHE, not from the tap sites:
+        # the projection that makes the latent, and the seam that reads the window back. The
+        # clamp is recorded rather than re-derived, because a padded chunk gathers its rows and
+        # the raw latent would then not be what the write carried.
+        project_latent = layer.attention.project_query_and_latent
+
+        def _record_latent(hidden_states):
+            query, kv_latent = project_latent(hidden_states)
+            seen["latent_written"] = kv_latent.detach().clone()
+            return query, kv_latent
+
+        attend = layer.attention.attend
+
+        def _record_attend(hidden_states, latent_cache, *args, **kwargs):
+            seen["_clamped"] = kwargs.get("prefill_end_position") is not None
+            seen["_slots"] = int(latent_cache.shape[0])
+            return attend(hidden_states, latent_cache, *args, **kwargs)
+
+        seam = mla_sparse_module.mla_sparse_attention
+
+        def _record_seam(q_lift, c_kv, *args, **kwargs):
+            seen["q_lift"] = q_lift.detach().clone()
+            seen["cache_rows"] = c_kv.detach().clone()
+            attended = seam(q_lift, c_kv, *args, **kwargs)
+            seen["attended_latent"] = attended.detach().clone()
+            return attended
+
         monkeypatch.setattr(layer, "_input_norm", _record_norm)
         monkeypatch.setattr(layer.attention, "project_output", _record_projection)
+        monkeypatch.setattr(layer.attention, "project_query_and_latent", _record_latent)
+        monkeypatch.setattr(layer.attention, "attend", _record_attend)
+        monkeypatch.setattr(mla_sparse_module, "mla_sparse_attention", _record_seam)
         handles.append(indexer.register_forward_hook(_record_index_rows))
     return seen, handles
 
@@ -393,6 +424,39 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
                     f"{float((cast - reduced).abs().max())}"
                 )
                 continue
+            if suffix == "write_rows":
+                # THE SLOTS' OWN PROPERTY, and no oracle restates the write's arithmetic here:
+                # an unpadded prefill starting at slot zero writes consecutive slots, one per
+                # token, and every one of them lies inside the window it was handed.
+                slots = int(tapped[tap]["_slots"])
+                consecutive = torch.arange(
+                    int(dumped[0]), int(dumped[0]) + int(dumped.numel()), dtype=dumped.dtype
+                )
+                print(f"TINYDUMP|tap|layer{tap}_{suffix}|shape={tuple(dumped.shape)}"
+                      f"|dtype={dumped.dtype}|first={int(dumped[0])}|last={int(dumped[-1])}"
+                      f"|slots={slots}|consecutive={torch.equal(dumped, consecutive)}"
+                      f"|clamped={bool(tapped[tap]['_clamped'])}")
+                assert dumped.dtype is torch.int32, (
+                    f"layer{tap}_write_rows.pt is {dumped.dtype}; the slots are choices and a "
+                    f"float there is a number where a slot was asked for"
+                )
+                assert torch.equal(dumped, consecutive), (
+                    f"layer{tap}_write_rows.pt is {dumped.tolist()[:8]}...; this fixture prefills "
+                    f"unpadded, so the write names consecutive slots"
+                )
+                assert int(dumped.max()) < slots and int(dumped.min()) >= 0, (
+                    f"layer{tap}_write_rows.pt names slot {int(dumped.max())} in a window of "
+                    f"{slots}; a write outside the window reaches another sequence's rows"
+                )
+                continue
+            if suffix == "latent_written":
+                # THE ORACLE IS THE PROJECTION'S OWN RETURN, which is only what the write carries
+                # while nothing is gathered: a padded chunk collapses its rows onto the last real
+                # one, and this fixture must not be padding if this comparison is to mean anything.
+                assert not tapped[tap]["_clamped"], (
+                    f"this prefill padded its chunk, so the write gathered its rows and the "
+                    f"projection's own return is no longer the tensor it wrote"
+                )
             want = tapped[tap]["attention_output" if suffix == "o_proj_reduced" else suffix]
             want = want.to(table.dtype) if suffix == "mlp_output" else want
             want = want.float() if want.is_floating_point() else want
