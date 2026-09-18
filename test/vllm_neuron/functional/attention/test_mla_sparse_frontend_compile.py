@@ -8,13 +8,22 @@ the served shapes, inside a child process that pins the platform target in its e
 makes the toolchain read what it builds for from the environment, so the compile opens no device node,
 and the child counts its own open device nodes to prove it.
 
-FOUR tests, one per conjunct, and NO `parametrize`.
+FIVE tests, one per conjunct, and NO `parametrize`.
 
-  1. the three no-RoPE entries compile with a block table, this step's rows and a write offset;
-  2. the three RoPE entries still compile as they stand, which is also the control that a refusal in
-     test 1 belongs to the paged operands and not to this venue;
+  1. the three no-RoPE entries DECLARE the paged operands, last and in order, and then compile with a
+     block table, this step's rows and a write offset -- in the served dtype and in f32, with a bank
+     larger than the window, and with a one-row and a zero-row overlay;
+  2. the three RoPE entries still compile as they stand, in both dtypes, which is also the control that
+     a refusal in test 1 belongs to the paged operands and not to this venue;
   3. a paged call carrying a RoPE half is refused BY NAME at the seam;
-  4. no call site in the module expands a mapping or a sequence into a kernel call.
+  4. no call site in the module expands a mapping or a sequence into a kernel call;
+  5. a body that reads an undefined name IS refused, which is what makes the accepted rows of tests 1
+     and 2 evidence: a child that lost this venue accepts everything and reads nothing.
+
+THE DECLARATION IS READ BEFORE THE COMPILE, and the reason is a reading rather than a precaution:
+`wrap_nki` binds a call by the parameters the entry declares, in their declared order, and it DROPS
+extra positional operands without a word. Against entries that do not declare the paged operands, a
+paged call therefore compiles the unpaged kernel and reports no refusal at all.
 
 WHY THE PAGED PATH SERVES NO RoPE HALF. `k_pe` carries one row per KV row, exactly as the latent cache
 does, so a paged latent window would need a paged RoPE window beside it. This checkpoint's RoPE width
@@ -25,12 +34,16 @@ test 3 reads the refusal.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 import pathlib
 import re
 import subprocess
 import sys
+
+import nki
+import nki.language as nl
 
 from vllm_neuron.functional.attention import mla_sparse as MS
 
@@ -58,6 +71,12 @@ NOPE_ENTRIES = ("mla_sparse_attention_nope_row_tiled_kernel", "mla_sparse_attent
                 "mla_sparse_attention_nope_tiled_kernel")
 PAGED_PARAMETERS = ("block_table_hbm", "written_hbm", "write_offset_hbm", "page_size")
 
+#: The served latent cache is bf16 and holds more than one window, and the 16-row DMA transposes
+#: specialise on the operand dtype -- 16 rows of 2 bytes fill the line 8 rows of 4 bytes do. So the
+#: served dtype is compiled first, f32 beside it, and the bank larger than the window read through it.
+SERVED_DTYPE = "bfloat16"
+BANK_WINDOWS = 2
+
 
 def _emit(*fields: object) -> None:
     """Print one reading, one line, so a reader can anchor it by key."""
@@ -67,6 +86,21 @@ def _emit(*fields: object) -> None:
 def _flat(text: object, cap: int = 400) -> str:
     """One line of at most `cap` characters, whatever the text carried."""
     return " ".join(str(text).split())[:cap]
+
+
+@nki.jit
+def venue_control_unbound_name(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale):
+    """The venue control: a body that reads a name nothing in this module defines.
+
+    It is compiled in the same child as the entries and item 5 reads its refusal. Without it, a child
+    whose `wrap_nki` took the framework hop instead of the compiler front end would report every entry
+    as accepted and the compile items would pass on nothing -- which is how the paged item was hollow.
+    """
+    seq, heads, latent = q_lift_hbm.shape
+    out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
+    held = nl.ndarray((1, latent), dtype=nl.float32, buffer=nl.sbuf)
+    nl.store(out_hbm[0, 0:1], value=held * no_such_name_anywhere)  # noqa: F821
+    return out_hbm
 
 
 def _open_device_nodes() -> int:
@@ -86,44 +120,56 @@ def _compile_each_entry() -> None:
 
     from vllm_neuron.functional.attention import mla_sparse as live
 
-    f32, i32 = torch.float32, torch.int32
+    i32 = torch.int32
+    served, plain = getattr(torch, SERVED_DTYPE), torch.float32
     window = PAGES * PAGE
+    bank_rows = BANK_WINDOWS * window
 
-    def fake(shape, dtype=f32):
+    def fake(shape, dtype):
         return torch.empty(shape, dtype=dtype, device="meta")
 
-    def paged(entry, latent, topk, tokens):
+    def paged(entry, latent, topk, tokens, dtype):
         """One no-RoPE entry with the bank, the table, this step's rows and the offset.
 
-        The table is a COLUMN, `[pages, 1]`: that is the shape the probe read the page number out of,
-        and the shape every other index operand in this tree takes. Every entry is called through
-        `wrap_nki`, which is how the seam calls it: a raw call takes the framework hop instead of
-        the compiler front end this item is here to read.
+        The table is a COLUMN, `[pages, 1]`: the shape the probe read the page number out of, and the
+        shape every other index operand in this tree takes. The bank holds more rows than the window
+        the table reads through it, as the served one does. Every entry is called through `wrap_nki`,
+        which is how the seam calls it: a raw call takes the framework hop instead of the compiler
+        front end this item is here to read.
         """
         return lambda: wrap_nki(entry)(
-            fake((1, HEADS, latent)), fake((PAGES * PAGE, latent)), fake((1, topk), i32), 0.1,
-            fake((PAGES, 1), i32), fake((tokens, latent)), fake((1, 1), i32), PAGE)
+            fake((1, HEADS, latent), dtype), fake((bank_rows, latent), dtype), fake((1, topk), i32),
+            0.1, fake((PAGES, 1), i32), fake((tokens, latent), dtype), fake((1, 1), i32), PAGE)
 
-    def unpaged_rope(entry, latent, topk):
+    def unpaged_rope(entry, latent, topk, dtype):
         """One RoPE entry exactly as it stands today, on a window rather than a bank."""
         return lambda: wrap_nki(entry)(
-            fake((1, HEADS, latent)), fake((1, HEADS, ROPE)), fake((window, latent)),
-            fake((window, ROPE)), fake((1, topk), i32), 0.1)
+            fake((1, HEADS, latent), dtype), fake((1, HEADS, ROPE), dtype),
+            fake((window, latent), dtype), fake((window, ROPE), dtype), fake((1, topk), i32), 0.1)
 
-    cases = (
-        ("nope_row_tiled_paged", paged(live.mla_sparse_attention_nope_row_tiled_kernel,
-                                       LATENT, TOPK_ROWS, 1)),
-        ("nope_untiled_paged", paged(live.mla_sparse_attention_nope_kernel,
-                                     LATENT, TOPK_NARROW, 1)),
-        ("nope_latent_tiled_paged", paged(live.mla_sparse_attention_nope_tiled_kernel,
-                                          LATENT_RAGGED, TOPK_NARROW, 1)),
-        ("rope_row_tiled_unpaged", unpaged_rope(live.mla_sparse_attention_rope_row_tiled_kernel,
-                                                LATENT, TOPK_ROWS)),
-        ("rope_untiled_unpaged", unpaged_rope(live.mla_sparse_attention_rope_kernel,
-                                              LATENT, TOPK_NARROW)),
-        ("rope_latent_tiled_unpaged", unpaged_rope(live.mla_sparse_attention_rope_tiled_kernel,
-                                                   LATENT_RAGGED, TOPK_NARROW)),
+    shapes = (
+        ("row_tiled", live.mla_sparse_attention_nope_row_tiled_kernel,
+         live.mla_sparse_attention_rope_row_tiled_kernel, LATENT, TOPK_ROWS),
+        ("untiled", live.mla_sparse_attention_nope_kernel,
+         live.mla_sparse_attention_rope_kernel, LATENT, TOPK_NARROW),
+        ("latent_tiled", live.mla_sparse_attention_nope_tiled_kernel,
+         live.mla_sparse_attention_rope_tiled_kernel, LATENT_RAGGED, TOPK_NARROW),
     )
+    built = []
+    for shape, nope, rope, latent, topk in shapes:
+        # THREE PAGED OPERAND FORMS PER ENTRY: the served dtype with a decode step's one row, the same
+        # in f32, and the served dtype with a ZERO-row overlay, the form a step that writes no new
+        # latent hands the kernel.
+        built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_one_row", paged(nope, latent, topk, 1, served)))
+        built.append((f"nope_{shape}_paged_float32_one_row", paged(nope, latent, topk, 1, plain)))
+        built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_no_rows", paged(nope, latent, topk, 0, served)))
+        built.append((f"rope_{shape}_unpaged_{SERVED_DTYPE}", unpaged_rope(rope, latent, topk, served)))
+        built.append((f"rope_{shape}_unpaged_float32", unpaged_rope(rope, latent, topk, plain)))
+    built.append(("venue_control_unbound_name",
+                  lambda: wrap_nki(venue_control_unbound_name)(
+                      fake((1, HEADS, LATENT), plain), fake((window, LATENT), plain),
+                      fake((1, TOPK_ROWS), i32), 0.1)))
+    cases = tuple(built)
     _emit("venue", f"module={live.__file__}", f"torch={torch.__version__}",
           "cpu_compile=" + os.environ.get("VLLM_NEURON_CPU_COMPILE", "unset"),
           "target=" + os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE", "unset"),
@@ -202,14 +248,19 @@ def test_the_front_end_accepts_the_paged_no_rope_entries() -> None:
     declared = {name: tuple(inspect.signature(getattr(MS, name)).parameters) for name in NOPE_ENTRIES}
     for name, parameters in declared.items():
         _emit(f"declared={name}", f"parameters={'.'.join(parameters)}")
-    absent = {name: [one for one in PAGED_PARAMETERS if one not in parameters]
-              for name, parameters in declared.items()
-              if [one for one in PAGED_PARAMETERS if one not in parameters]}
-    assert absent == {}, (
-        f"an entry does not declare the paged operands, so a paged call to it drops them silently: "
-        f"{absent}")
+    # THE POSITIONS ARE THE READING, NOT ONLY THE NAMES: `wrap_nki` binds a call by the declared
+    # ORDER, so the four paged operands in another order would mis-bind the table onto the offset.
+    wrong = {name: parameters for name, parameters in declared.items()
+             if tuple(parameters[-len(PAGED_PARAMETERS):]) != PAGED_PARAMETERS}
+    assert wrong == {}, (
+        f"an entry does not declare the paged operands last and in order {PAGED_PARAMETERS}, so a "
+        f"paged call either drops them silently or binds them to the wrong parameter: {wrong}")
     paged = [row for row in _read_the_child() if row["entry"].startswith("nope_")]
-    assert len(paged) == 3, f"the child did not compile the three no-RoPE entries: {paged}"
+    assert len(paged) == 9, (
+        f"the child did not compile the three no-RoPE entries in all three paged operand forms: "
+        f"{[row['entry'] for row in paged]}")
+    assert len([row for row in paged if SERVED_DTYPE in row["entry"]]) == 6, (
+        f"the served dtype was not compiled: {[row['entry'] for row in paged]}")
     refused = [f"{row['entry']} x{row['x']}: {row['diagnostic']}"
                for row in paged if row["refused"] == "True"]
     assert refused == [], "the front end refused a paged entry: " + " ~ ".join(refused)
@@ -218,7 +269,9 @@ def test_the_front_end_accepts_the_paged_no_rope_entries() -> None:
 def test_the_front_end_still_accepts_the_rope_entries_as_they_stand() -> None:
     """The three RoPE entries compile unchanged, which is the control for the item above."""
     rope = [row for row in _read_the_child() if row["entry"].startswith("rope_")]
-    assert len(rope) == 3, f"the child did not compile the three RoPE entries: {rope}"
+    assert len(rope) == 6, (
+        f"the child did not compile the three RoPE entries in both dtypes: "
+        f"{[row['entry'] for row in rope]}")
     refused = [f"{row['entry']} x{row['x']}: {row['diagnostic']}"
                for row in rope if row["refused"] == "True"]
     assert refused == [], "the front end refused a RoPE entry this change does not touch: " + \
@@ -258,11 +311,36 @@ def test_no_call_site_in_the_module_expands_into_a_kernel_call() -> None:
     see it, so the census is read over the module's own source text rather than inferred.
     """
     source = pathlib.Path(MS.__file__).read_text()
-    # The lookbehind is the whole reading: this module DEFINES four helpers as `def name(*shape)`,
-    # and a census that counted a definition as a call site would read 5 and refuse a clean module.
-    found = re.findall(r"(?<!def )\b[\w.]+\(\s*(?:\*\*|\*)[A-Za-z_]", source)
+    # THE CENSUS WALKS CALL NODES, not the text: a pattern anchored on the first argument misses
+    # `f(a, *rest)` and `f(dst=x, **kw)`, and a definition's `*shape` is not a call node at all.
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        starred = sum(isinstance(one, ast.Starred) for one in node.args)
+        mapped = sum(one.arg is None for one in node.keywords)
+        if starred or mapped:
+            found.append(f"line {node.lineno}: {starred} positional, {mapped} mapping")
     _emit("expansion_census", f"sites={len(found)}", f"module={MS.__file__}")
     assert found == [], f"the module expands into a call at {len(found)} sites: {found}"
+
+
+def test_the_compile_venue_refuses_a_body_that_reads_an_undefined_name() -> None:
+    """The venue control, and what makes every other row of this file evidence.
+
+    A child that lost the venue -- the environment, or the library behind `wrap_nki` -- takes the
+    framework hop instead of the compiler front end and reports every entry as accepted. Then the two
+    compile items above pass on nothing. This item compiles one body that reads a name nothing defines
+    and reads its refusal, in the same child, in the same venue, under the same operands.
+    """
+    control = [row for row in _read_the_child() if row["entry"].startswith("venue_control")]
+    assert len(control) == 1, f"the child did not compile the venue control: {control}"
+    assert control[0]["refused"] == "True", (
+        "the venue accepted a body that reads an undefined name, so it never parsed a body and no "
+        "accepted row in this file is evidence of anything")
+    assert "unbound variable" in control[0]["diagnostic"], (
+        f"the venue refused the control for another reason than the unresolved name, so it is not the "
+        f"control this item claims: {control[0]['diagnostic']}")
 
 
 if __name__ == "__main__":
