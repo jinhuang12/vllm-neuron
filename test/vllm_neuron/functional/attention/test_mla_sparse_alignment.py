@@ -422,7 +422,8 @@ _PREFILL = {
 
 #: Decode traces one query; the rope geometry traces the rotary sites at their served width.
 _GEOMETRIES_READ = (("prefill", _PREFILL), ("decode", {**_PREFILL, "seq": 1}),
-                    ("rope", {**_PREFILL, "rope": 64}))
+                    ("rope", {**_PREFILL, "rope": 64}),
+                    ("rope_narrow", {**_PREFILL, "rope": 7}))
 
 #: What each geometry legitimately leaves to the host, by the source tensor a site reads and
 #: how many bodies read it: decode moves one query row per block, so each body's Q transpose
@@ -431,6 +432,7 @@ _DECLARED_HOST_EXPANDED = {
     "prefill": {},
     "decode": {"q_lift_hbm": 3},
     "rope": {"k_pe_hbm": 3, "q_pe_hbm": 3},
+    "rope_narrow": {"k_pe_hbm": 3, "q_pe_hbm": 3},
 }
 
 #: The names the module supplies to its OWN size and loop expressions. They are read off
