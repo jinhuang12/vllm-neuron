@@ -7486,6 +7486,11 @@ class Glm5NextMLAAttention(nn.Module):
             offsets = torch.minimum(offsets, end - start - 1)
             kv_latent = kv_latent.index_select(0, offsets)
         rows = start + offsets
+        if collector is not None:
+            # TAKEN BEFORE THE WRITE and after the clamp above, so these hold the very
+            # values and slots the write carries. ``rows`` is narrowed for the file only;
+            # the write keeps the int64 index it needs.
+            collector.extend([kv_latent, rows.to(torch.int32)])
         latent_cache[:, 0, :].index_copy_(
             0, rows, kv_latent.to(latent_cache.dtype)
         )
@@ -7494,6 +7499,10 @@ class Glm5NextMLAAttention(nn.Module):
         # not this step's. ``[S_kv, latent]`` is the shape the sparse seam
         # contracts, and it is now the same shape at every position.
         c_kv = latent_cache[:, 0, :]
+        if collector is not None:
+            # CLONED: this is a view of the caller's bank, which a later step writes
+            # through, so the file would otherwise hold that later step's rows.
+            collector.append(c_kv.clone())
 
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention
@@ -7508,6 +7517,10 @@ class Glm5NextMLAAttention(nn.Module):
             )
 
         attended = mla_sparse_attention(q_lift, c_kv, topk_indices, softmax_scale)
+        if collector is not None:
+            # THE SEAM'S OWN OUTPUT, before absorb-out, beside the query that entered it:
+            # the two operands a host can multiply back against the cache rows.
+            collector.extend([attended, q_lift])
 
         # ABSORB-OUT. ``[S, H, 512] x [H, 512, 256] -> [S, H, 256]``: back to the
         # head width ``project_output`` consumes. The cast is here rather than
@@ -7839,6 +7852,11 @@ DUMP_DSA_TAP_NAMES = (
     "attn_hc_collapsed",
     "attn_input_normed",
     "index_rows",
+    "latent_written",
+    "write_rows",
+    "cache_rows",
+    "attended_latent",
+    "q_lift",
     "o_proj_input",
     "o_proj_partial",
     "o_proj_reduced",

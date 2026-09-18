@@ -12,6 +12,10 @@ WHAT THIS FILE MEASURES, on the tiny stack and through the runner's own converte
   2. The variable unset -> the converter hands the model no such keyword, the forward returns
      a bare tensor, no file is written, and the logits are bit-equal to the configured run's.
   3. Neither module this dump touches imports the NxDI stack.
+  4. The latent-cache taps: the five names sit between the index rows and the projection in the
+     order the attention half appends them; the window file holds the window as it stood at the
+     tap even after a later write into the caller's bank; and the rows the write named carry the
+     values the write wrote, which a planted row offset breaks.
 
 The dump exists to be read on a device serve, so the save happens OUTSIDE the traced forward
 and the model is told what to collect through an argument. Nothing here writes to the model's
@@ -654,5 +658,125 @@ def test_the_output_projection_taps_are_the_input_the_partial_and_the_whole(tmp_
         f"{float((whole - want).abs().max())} and the raw gap is "
         f"{float(delta.min())}..{float(delta.max())}. A partial that carries the sum is the "
         f"clone this tap needs, missing"
+    )
+
+
+LATENT_TAP_NAMES = (
+    "latent_written",
+    "write_rows",
+    "cache_rows",
+    "attended_latent",
+    "q_lift",
+)
+
+
+def test_the_latent_taps_are_declared_between_the_index_rows_and_the_projection():
+    """The five names, in the order the attention half appends them, and nowhere else."""
+    names = list(DUMP_DSA_TAP_NAMES)
+    between = tuple(names[names.index("index_rows") + 1 : names.index("o_proj_input")])
+    print(f"TINYDUMP|latent_tap_census|declared={len(names)}|between={list(between)}"
+          f"|once_each={[names.count(name) for name in LATENT_TAP_NAMES]}")
+    assert between == LATENT_TAP_NAMES, (
+        f"the names between the index rows and the projection are {list(between)}; the "
+        f"attention half appends {list(LATENT_TAP_NAMES)} in that order, and the file names are "
+        f"positional, so any other order labels the wrong tensor"
+    )
+    assert [names.count(name) for name in LATENT_TAP_NAMES] == [1] * len(LATENT_TAP_NAMES), (
+        f"a latent tap name is declared more than once in {names}"
+    )
+
+
+def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, monkeypatch):
+    """The window file survives a later bank write, and the written rows carry the written values."""
+    _require_cpu_mode()
+    save_dir = tmp_path / "layer-streams"
+    layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
+    attention = layers[tap].attention
+    attend = attention.attend
+    seen = {}
+
+    def _record_attend(hidden_states, latent_cache, *args, **kwargs):
+        seen["carrier"] = latent_cache
+        return attend(hidden_states, latent_cache, *args, **kwargs)
+
+    monkeypatch.setattr(attention, "attend", _record_attend)
+    _, output = _prefill(runner, root, _prompt())
+    carrier = seen["carrier"]
+    window = carrier[:, 0, :].detach().clone()
+    # A LATER WRITE INTO THE CALLER'S BANK, after the forward and before the files are written:
+    # that is the window a decode step would leave behind. The tap holds a clone, so the file
+    # must still read the window as it stood at the tap -- and the second assertion below shows
+    # this write really landed, so the first one cannot pass by the write never happening.
+    sentinel = -9.0
+    with torch.no_grad():
+        carrier.fill_(sentinel)
+    NeuronModelRunner._take_layer_stream_dump(runner, output, is_prefill=True)
+
+    written = _dumped(save_dir, tap, "latent_written")
+    rows = _dumped(save_dir, tap, "write_rows")
+    cached = _dumped(save_dir, tap, "cache_rows")
+    attended = _dumped(save_dir, tap, "attended_latent")
+    lifted = _dumped(save_dir, tap, "q_lift")
+    bank_dtype = carrier.dtype
+    print(f"TINYDUMP|latent_taps|layer={tap}|written={tuple(written.shape)}/{written.dtype}"
+          f"|rows={tuple(rows.shape)}/{rows.dtype}|cached={tuple(cached.shape)}/{cached.dtype}"
+          f"|attended={tuple(attended.shape)}/{attended.dtype}"
+          f"|q_lift={tuple(lifted.shape)}/{lifted.dtype}|bank_dtype={bank_dtype}"
+          f"|window={tuple(window.shape)}|rows_first={rows[:4].tolist()}")
+    assert rows.dtype is torch.int32 and rows.ndim == 1, (
+        f"write_rows is {tuple(rows.shape)} of {rows.dtype}; the slots the write named are one "
+        f"integer per token, and a float there is a number where a slot was asked for"
+    )
+    assert written.ndim == 2 and int(written.shape[0]) == int(rows.numel()), (
+        f"latent_written is {tuple(written.shape)} against {int(rows.numel())} written row(s); "
+        f"the tap holds one latent per row the write names"
+    )
+    assert cached.shape == window.shape and int(cached.shape[1]) == int(written.shape[1]), (
+        f"cache_rows is {tuple(cached.shape)} and the window the layer was handed is "
+        f"{tuple(window.shape)}; the tap holds the whole window at the latent's own width"
+    )
+    for name, tensor in (("attended_latent", attended), ("q_lift", lifted)):
+        assert tensor.ndim == 3 and int(tensor.shape[0]) == int(written.shape[0]), (
+            f"{name} is {tuple(tensor.shape)}; the seam works in [tokens, heads, latent] and "
+            f"this prefill wrote {int(written.shape[0])} token(s)"
+        )
+        assert tensor.dtype is torch.float32, f"{name} is {tensor.dtype}; the dump widens floats"
+
+    filled = torch.full_like(cached, sentinel)
+    kept = torch.equal(cached, window.float())
+    print(f"TINYDUMP|cache_rows_clone|layer={tap}|equals_the_window_at_the_tap={kept}"
+          f"|equals_the_later_write={torch.equal(cached, filled)}|sentinel={sentinel}")
+    assert kept, (
+        f"cache_rows was written from a view of the bank, so the later write reached the file: "
+        f"max abs delta {float((cached - window.float()).abs().max())} against the window at the "
+        f"tap. This tap must clone"
+    )
+    assert not torch.equal(cached, filled), (
+        f"the later write into the bank did not land, so nothing here tests the clone"
+    )
+
+    # THE CAST IS PART OF THE IDENTITY: the write hands the bank ``kv_latent`` in the bank's own
+    # dtype, so the rows read back equal the written values UNDER that cast and not exactly.
+    want = written.to(bank_dtype).float()
+    got = cached[rows.long()]
+    same = torch.equal(got, want)
+    print(f"TINYDUMP|latent_write_identity|layer={tap}|cast_to={bank_dtype}|rows={int(rows.numel())}"
+          f"|equal_under_the_cast={same}|max_abs={float((got - want).abs().max())}")
+    assert same, (
+        f"the rows the write named do not carry the values it wrote: max abs delta "
+        f"{float((got - want).abs().max())} under the bank's own cast. Either the write did not "
+        f"land or the rows are not the ones it used"
+    )
+
+    # THE FIXED POINT: shift the rows by one and the identity must break, or it was reading a
+    # window whose rows are indistinguishable and would pass on the wrong slots too.
+    shifted = (rows.long() + 1).clamp(max=int(cached.shape[0]) - 1)
+    offset_got = cached[shifted]
+    broken = not torch.equal(offset_got, want)
+    print(f"TINYDUMP|latent_write_control|layer={tap}|offset=1|identity_breaks={broken}"
+          f"|max_abs={float((offset_got - want).abs().max())}")
+    assert broken, (
+        f"the identity still held with every row shifted by one, so it does not depend on the "
+        f"slots the write named and cannot witness a wrong offset"
     )
 
