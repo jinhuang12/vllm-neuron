@@ -269,6 +269,30 @@ def _refuses_every_route(*_args, **_kwargs) -> bool:
     return False
 
 
+def _drop_the_module_that_takes_its_dispatch_at_import(monkeypatch) -> None:
+    """Drop the one module that takes its dispatch at import, leaving the real one to put back.
+
+    ``moe/fused_fp8.py:19`` calls ``wrap_nki`` at module level, so whichever test imported it
+    first owns that module's boundary for the whole process: held after such an import, this
+    item would see the expert dispatch when it ran alone and miss it in a whole-tree run.
+    Dropped here, the forward's own lazy import takes the dispatch again under the hold, and
+    the reading is the same either way.
+
+    IT IS IMPORTED FIRST, before any part of the arm is installed, so that the fixture has the
+    module AT THE REAL BOUNDARY to put back at teardown. ``delitem`` records nothing for a key
+    the dict does not hold, so without that import what stays behind is the module this item's
+    own late import made, which keeps the holder in a module-level object that neither the undo
+    of a ``setattr`` nor the hand-back below can reach.
+    """
+    name = f"{FUNCTIONAL}.moe.fused_fp8"
+    at_the_real_boundary = importlib.import_module(name)
+    package, _, leaf = name.rpartition(".")
+    # Set to the value it already holds: what this records is the put-back of the package
+    # attribute, which the forward's own import rebinds to the module that holds the arm.
+    monkeypatch.setattr(sys.modules[package], leaf, at_the_real_boundary)
+    monkeypatch.delitem(sys.modules, name)
+
+
 def _stand_down_every_route_but_the_seam(monkeypatch) -> list[str]:
     """Refuse the NKI route in every functional module but the seam, and name those patched.
 
@@ -362,15 +386,6 @@ def _hold_every_dispatch_but_the_seam(monkeypatch, crossed: list[str]) -> list[s
     same two limbs as the stand-down reach every module, by name where the module is already
     imported and through the source where it is imported later.
     """
-    # A MODULE THAT BINDS ITS DISPATCH AT IMPORT TIME IS DROPPED FIRST, so the forward's own
-    # lazy import re-binds it under the hold below. ``moe/fused_fp8.py:19`` calls ``wrap_nki``
-    # at module level, so whichever test imported it first owns its boundary for the whole
-    # process: held after that import, this item would see the expert dispatch when it ran
-    # alone and miss it in a whole-tree run. Dropping the module makes the reading the same
-    # either way, and imports nothing itself.
-    # ``delitem`` and not ``del``: the fixture puts the ORIGINAL module back at teardown, so a
-    # later test finds the real boundary rather than this item's holder frozen into it.
-    monkeypatch.delitem(sys.modules, f"{FUNCTIONAL}.moe.fused_fp8", raising=False)
     held = []
     for name, module in sorted(sys.modules.items()):
         if not name.startswith(FUNCTIONAL) or module is seam:
@@ -448,6 +463,7 @@ def test_a07_a_captured_forward_completes_and_reads_no_value_off_a_tensor(
         return call
 
     monkeypatch.setattr(seam, "wrap_nki", stand_in)
+    _drop_the_module_that_takes_its_dispatch_at_import(monkeypatch)
     stood_down = _stand_down_every_route_but_the_seam(monkeypatch)
     held = _hold_every_dispatch_but_the_seam(monkeypatch, crossed)
 
