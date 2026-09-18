@@ -1,0 +1,6 @@
+{
+  "cohorts": 5,
+  "measured_requests": 50,
+  "measured_output_tokens": 1600,
+  "workload_sha256": "a785339b6f394d83e0361d8915bd6d7ef80405d1b981a7cc65b9793afcfa8388"
+}

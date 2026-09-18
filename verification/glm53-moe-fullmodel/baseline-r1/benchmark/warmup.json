@@ -1,0 +1,562 @@
+[
+  {
+    "id": "cmpl-afa6c296228eea3c",
+    "object": "text_completion",
+    "created": 1789693576,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Paris. In French: Paris est la capitale de la France. La France a pour capitale Paris. La capitale de la France est Paris. La France a pour",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 5,
+      "total_tokens": 37,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-8052b115716774d9",
+    "object": "text_completion",
+    "created": 1789693599,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 17,
+      "total_tokens": 49,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-9023659ab63e259e",
+    "object": "text_completion",
+    "created": 1789693623,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " (also artificial neural network or neural net, abbreviated ANN or NN) is a model inspired by the structure and function of biological neural networks in animal brains.[1",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 7,
+      "total_tokens": 39,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-a15f9199362c5ae2",
+    "object": "text_completion",
+    "created": 1789693646,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": "    total = 0\n    for v in values:\n        total += v ** 2\n    return total\n\nThis function iterates over each value in",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 26,
+      "total_tokens": 58,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-b443f052b82a94ed",
+    "object": "text_completion",
+    "created": 1789693669,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " 11:00 AM. The train traveled at a speed of 60 miles per hour. The distance between the two towns is 120 miles. The train",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 24,
+      "total_tokens": 56,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-b2f04c3373e269f9",
+    "object": "text_completion",
+    "created": 1789693693,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " scatter shorter wavelengths more strongly than longer ones. This effect, called Rayleigh scattering, sends blue light in all directions across the sky, so wherever you look,",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 25,
+      "total_tokens": 57,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-8bcb997ea3bbf996",
+    "object": "text_completion",
+    "created": 1789693716,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Le jardin est calme apr\u00e8s la pluie.\nTranslate this English sentence into French: The garden is quiet after the rain.\nFrench: Le jardin est calme apr\u00e8s la",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 17,
+      "total_tokens": 49,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-81ded4c27f74d493",
+    "object": "text_completion",
+    "created": 1789693739,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Install water-saving shower heads.\n3. Water the garden in the early morning or evening.\n\nWhich of the following is the best way to present this information?\n\nA",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 20,
+      "total_tokens": 52,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-8c25ec5a1a2e58d0",
+    "object": "text_completion",
+    "created": 1789693763,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " the recorded latencies across runs. The engineer should also check whether the change affects the failure rate. The engineer should also check whether the change affects the output length",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 71,
+      "total_tokens": 103,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-a34344022f327492",
+    "object": "text_completion",
+    "created": 1789693786,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " books, computers, study rooms, and a meeting room. It opens six days a week and offers study rooms, computer classes, story reading, and computer classes",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 89,
+      "total_tokens": 121,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-bf7681d1a6c46e18",
+    "object": "text_completion",
+    "created": 1789693810,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Paris. In French, Paris is spelled \"Paris\" but pronounced \"Paree\". Some other major French cities include Lyon, Marseille, Toulouse, Bordeaux",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 5,
+      "total_tokens": 37,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-bad2ec22e9494fbe",
+    "object": "text_completion",
+    "created": 1789693833,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 17,
+      "total_tokens": 49,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-a45642245c8936fc",
+    "object": "text_completion",
+    "created": 1789693856,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " (also artificial neural network or neural net, abbreviated ANN or NN) is a model inspired by the structure and function of biological neural networks in animal brains.[1",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 7,
+      "total_tokens": 39,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-91e0aa7213fefa09",
+    "object": "text_completion",
+    "created": 1789693880,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": "    total = 0\n    for v in values:\n        total += v ** 2\n    return total\n\nThis function iterates over each value in",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 26,
+      "total_tokens": 58,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-b7b6bc62f28d51a5",
+    "object": "text_completion",
+    "created": 1789693903,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " 11:00 AM. The train traveled at a speed of 60 miles per hour. The distance between the two towns is 120 miles. The train",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 24,
+      "total_tokens": 56,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-9c751e8af02bab1f",
+    "object": "text_completion",
+    "created": 1789693926,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " scatter shorter wavelengths more strongly than longer ones. This effect, called Rayleigh scattering, sends blue light in all directions across the sky, so wherever you look,",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 25,
+      "total_tokens": 57,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-86de23dc0c985f87",
+    "object": "text_completion",
+    "created": 1789693950,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Le jardin est calme apr\u00e8s la pluie.\nTranslate this English sentence into French: The garden is quiet after the rain.\nFrench: Le jardin est calme apr\u00e8s la",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 17,
+      "total_tokens": 49,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-86c40fad3fbc7050",
+    "object": "text_completion",
+    "created": 1789693973,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Install water-saving shower heads.\n3. Run the washing machine only when it is full.\n\nWhich of the following is the best reason why saving water at home is",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 20,
+      "total_tokens": 52,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-80637a9343f05547",
+    "object": "text_completion",
+    "created": 1789693997,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " the median latency across runs and report the mean and standard deviation of the medians. The engineer should also report the number of requests and failures per run. The",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 71,
+      "total_tokens": 103,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  },
+  {
+    "id": "cmpl-b90a62a0095ec039",
+    "object": "text_completion",
+    "created": 1789694020,
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "choices": [
+      {
+        "index": 0,
+        "text": " many services for different groups. It is open six days a week. The town will measure success by counting visits and collecting feedback after three months. (3 sentences",
+        "logprobs": null,
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.24.0-tp64-ep-938c5ee6",
+    "usage": {
+      "prompt_tokens": 89,
+      "total_tokens": 121,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "kv_transfer_params": null
+  }
+]

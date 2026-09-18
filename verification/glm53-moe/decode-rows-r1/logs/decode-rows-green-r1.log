@@ -1,0 +1,20 @@
+........................................                                 [100%]
+=============================== warnings summary ===============================
+../../../../opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings
+  /opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+vllm_neuron/functional/moe/moe_blockwise_fp8.py:420
+  /home/ubuntu/glm53-moe-nki-20260917/source/vllm_neuron/functional/moe/moe_blockwise_fp8.py:420: DeprecationWarning: nki.jit 'mode' parameter is deprecated, and its value is ignored.
+    @nki.jit(mode="trace")
+
+vllm_neuron/functional/moe/moe_cte.py:677
+  /home/ubuntu/glm53-moe-nki-20260917/source/vllm_neuron/functional/moe/moe_cte.py:677: DeprecationWarning: nki.jit 'mode' parameter is deprecated, and its value is ignored.
+    @nki.jit(mode="trace")
+
+vllm_neuron/functional/moe/moe_cte.py:766
+  /home/ubuntu/glm53-moe-nki-20260917/source/vllm_neuron/functional/moe/moe_cte.py:766: DeprecationWarning: nki.jit 'mode' parameter is deprecated, and its value is ignored.
+    @nki.jit(mode="trace")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+40 passed, 17 warnings in 8.09s

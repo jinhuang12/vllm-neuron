@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/bin/python",
+    "/home/ubuntu/glm53-moe-fullmodel-20260917/scripts/run_diagnostic_arm.py",
+    "--arm",
+    "postbaseline",
+    "--run",
+    "postbaseline-r1"
+  ],
+  "at_utc": "2026-09-18T03:32:03.643557+00:00",
+  "environment_overrides": {
+    "VLLM_NEURON_CPU_MODE": "1",
+    "PYTHONPATH": "/home/ubuntu/glm53-moe-fullmodel-20260917/deps:/home/ubuntu/glm53-moe-fullmodel-20260917/baseline-source",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "OMP_NUM_THREADS": "1",
+    "PYTHONOPTIMIZE": "0"
+  }
+}

@@ -7552,9 +7552,9 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
             f"load. The prep loop's gate is a type test and this class now "
             f"defines prepare_scale_operands, so the loop must have visited it"
         )
-        assert len(prepared) == 4, (
+        assert set(prepared) == {"packed_weights", "packed_scales"}, (
             f"{path} carries {len(prepared)} prepared kernel operands, not the "
-            f"four block_quant_expert_mm takes: {sorted(prepared)}"
+            f"two packed banks block_quant_expert_mm takes: {sorted(prepared)}"
         )
 
     # THE CONTROL. Same checkpoint, same widths, no shared expert.

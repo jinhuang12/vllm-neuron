@@ -1,0 +1,944 @@
+{
+  "left_sha256": "ece3dad67095765ee602fe9e1f80a4aedf11afb171aee5767183650386ffa923",
+  "right_sha256": "24d3ffa567fc044866e2468dcffed18ddf873b402a59e81759f27d671c119f81",
+  "mismatches": [
+    {
+      "prompt": 0,
+      "field": "token_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 0,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 3,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 4,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 5,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 6,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 7,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 8,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 10,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 11,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 12,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 13,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 14,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 15,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 16,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 17,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 19,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 20,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 21,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 22,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 23,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 24,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 25,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 26,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 27,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 28,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 29,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 30,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 0,
+      "step": 31,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 0,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 1,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 4,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 7,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 10,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 11,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 12,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 16,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 17,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 19,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 21,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 22,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 24,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 25,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 26,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 28,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 29,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 30,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 1,
+      "step": 31,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "field": "token_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 0,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 2,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 3,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 14,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 23,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 25,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 26,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 2,
+      "step": 31,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 3,
+      "step": 0,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 3,
+      "step": 7,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 3,
+      "step": 8,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 3,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 3,
+      "step": 13,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 3,
+      "step": 20,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 3,
+      "step": 21,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 0,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 4,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 6,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 11,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 13,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 24,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 26,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 27,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 4,
+      "step": 30,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 5,
+      "step": 1,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 5,
+      "step": 5,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 5,
+      "step": 13,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 5,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 5,
+      "step": 22,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 5,
+      "step": 24,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 5,
+      "step": 28,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 2,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 6,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 8,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 12,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 15,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 17,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 19,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 20,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 25,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 27,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 6,
+      "step": 28,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "field": "token_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 1,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 10,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 11,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 12,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 13,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 14,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 15,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 16,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 17,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 19,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 20,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 21,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 22,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 23,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 24,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 25,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 26,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 27,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 28,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 29,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 30,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 7,
+      "step": 31,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "field": "token_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 0,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 1,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 4,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 5,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 6,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 7,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 8,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 10,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 11,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 12,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 13,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 14,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 15,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 16,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 17,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 19,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 20,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 21,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 22,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 23,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 24,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 25,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 26,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 27,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 28,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 29,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 30,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 8,
+      "step": 31,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "field": "token_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 0,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 1,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 2,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 3,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 4,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 5,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 6,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 7,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 8,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 9,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 10,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 11,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 12,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 13,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 14,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 15,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 16,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 17,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 18,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 19,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 20,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 21,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 22,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 23,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 24,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 25,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 26,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 27,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 28,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 29,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 30,
+      "field": "top5_ids"
+    },
+    {
+      "prompt": 9,
+      "step": 31,
+      "field": "top5_ids"
+    }
+  ],
+  "max_absolute_logprob_delta": 7.575471848249435,
+  "required_absolute_logprob_delta": 0.0,
+  "pass": false
+}

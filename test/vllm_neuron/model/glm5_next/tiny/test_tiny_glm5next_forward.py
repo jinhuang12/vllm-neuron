@@ -316,9 +316,11 @@ _SEAM_REGISTRY = {
     # limbs dispatch separately and one summed pair could not tell which of them
     # took a torch route.
     #
-    # ALL THREE NOW MOVE, one dispatch each per MoE layer, and the block seam above
-    # reads ``(0, 0)``: the call site reaches the three limbs, not the vendor member.
-    # Its row stays as the negative -- a forward that went back to it fails below.
+    # Normal model forward now enters the fused seam once per MoE layer. Keep
+    # all legacy rows as negative checks: unexpected dispatches must still fail.
+    "moe_fused": (
+        "vllm_neuron.functional.moe.fused_fp8",
+        "fused_dispatch_counters", "reset_fused_dispatch_counters"),
     "moe_gate_up": (
         "vllm_neuron.functional.moe.moe_blockwise_fp8",
         "gate_up_dispatch_counters", "reset_gate_up_dispatch_counters"),
@@ -1744,8 +1746,8 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
         )
 
     # ---- THE LOAD-TIME PREP, once, as production runs it. The bank's forward reads
-    # its four kernel operands through ``_prepared_kernel_operand``, which REFUSES if
-    # this has not run -- that refusal is what makes "retiled once at load time, never
+    # its two packed banks through ``_prepared_kernel_operand``, which REFUSES if
+    # this has not run -- that refusal is what makes "packed once at load time, never
     # per forward step" checkable, so the item runs the prep rather than reaching past
     # it.
     built = module.prepare_scale_operands(
@@ -1756,10 +1758,10 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
         f"TINYFWD|routed_prep|operands={built}|params={parameters}"
         + "".join(f"|{bank}={counts}" for bank, counts in sorted(health.items()))
     )
-    if built != 4:
+    if built != 2:
         raise VacuousControlError(
             f"prepare_scale_operands built {built} operands and the bank's forward "
-            f"looks up 4"
+            f"looks up 2"
         )
     # ONLY THE THIRD COUNT IS ASSERTED, and the other two are reported. The publisher
     # emits the grid it was handed, so all three counts are zero by absence: there is
@@ -1872,12 +1874,10 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
         _quant_config(),
     )
     after = _read_seam_counters()
-    # ONE dispatch on each routed limb and nothing on the dense seam. The bank reaches
-    # the three limbs exactly once per forward and no dense projection at all, so naming
-    # only those three is what makes a forward which took the wrong route fail instead
-    # of passing on a total.
+    # One fused dispatch and no legacy or dense dispatch. The registry checks
+    # every omitted seam for zero entries as well as zero fallbacks.
     _assert_route_predicate(
-        "2 routed experts", {"moe_gate_up": 1, "moe_swiglu": 1, "moe_down": 1},
+        "2 routed experts", {"moe_fused": 1},
         before, after,
     )
 
@@ -2403,10 +2403,10 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
         f"TINYFWD|moe_prep|bank_operands={bank_built}|shared_operands={shared_built}"
         f"|params={parameters}"
     )
-    if bank_built != 4 or shared_built != 3:
+    if bank_built != 2 or shared_built != 3:
         raise VacuousControlError(
             f"the load-time preps built {bank_built} bank and {shared_built} "
-            f"shared operands; the two forwards look up 4 and 3"
+            f"shared operands; the two forwards look up 2 and 3"
         )
     if parameters >= MAX_PARAMETERS:
         raise VacuousControlError(
@@ -2527,7 +2527,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     # own control D discusses.
     _assert_route_predicate(
         "4 MoE block",
-        {"moe_gate_up": 1, "moe_swiglu": 1, "moe_down": 1,
+        {"moe_fused": 1,
          "blockwise_fp8_mm": 3, "noaux_tc_router": 1},
         before,
         after,
@@ -2832,7 +2832,7 @@ def test_tiny_moe_block_forward_matches_the_reference() -> None:
     after = _read_seam_counters()
     _assert_route_predicate(
         "4 MoE block, no shared expert",
-        {"moe_gate_up": 1, "moe_swiglu": 1, "moe_down": 1, "noaux_tc_router": 1},
+        {"moe_fused": 1, "noaux_tc_router": 1},
         before,
         after,
     )
@@ -4154,10 +4154,10 @@ def _stack_fixture(model=None) -> dict:
                 layer.mlp.experts, ("gate_proj_weight", "up_proj_weight", "down_proj_weight"), operands
             )
         )
-        if built != 4:
+        if built != 2:
             raise VacuousControlError(
                 f"the bank's load-time prep built {built} operands; its forward "
-                f"looks up 4"
+                f"looks up 2"
             )
         if getattr(layer.mlp, "shared_experts", None) is not None:
             raise VacuousControlError(
@@ -4805,9 +4805,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         "dsa_topk_select": 1 * STACK_LAYERS,
         "dsa_index_expand": 1 * STACK_LAYERS,
         "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-        "moe_gate_up": 1 * STACK_MOE_LAYERS,
-        "moe_swiglu": 1 * STACK_MOE_LAYERS,
-        "moe_down": 1 * STACK_MOE_LAYERS,
+        "moe_fused": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
         # ---- THE TWO mHC SEAMS, ``inc-glm53f-030d`` commit 4c. TWO SITES PER LAYER,
         # and each site's one call is one Sinkhorn and one combine: the attention half's
@@ -6141,9 +6139,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         "dsa_topk_select": 1 * STACK_LAYERS,
         "dsa_index_expand": 1 * STACK_LAYERS,
         "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
-        "moe_gate_up": 1 * STACK_MOE_LAYERS,
-        "moe_swiglu": 1 * STACK_MOE_LAYERS,
-        "moe_down": 1 * STACK_MOE_LAYERS,
+        "moe_fused": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
         # The two mHC seams, on item 6's figures and for item 6's reason: two sites per
         # layer, one Sinkhorn and one combine each. Declared again here rather than

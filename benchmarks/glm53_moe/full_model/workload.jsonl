@@ -1,0 +1,10 @@
+{"prompt":"The capital of France is","output_tokens":32}
+{"prompt":"I am gonna keep counting forever, 1 2 3 4 5","output_tokens":32}
+{"prompt":"In machine learning, a neural network","output_tokens":32}
+{"prompt":"A Python function that returns the sum of the squares in a list can be written as follows:\n\ndef sum_of_squares(values):\n","output_tokens":32}
+{"prompt":"The train left the station at nine in the morning. It reached the next town two hours later. The arrival time was","output_tokens":32}
+{"prompt":"A clear explanation of why the sky looks blue begins with sunlight. Sunlight contains many wavelengths, and the molecules in the atmosphere","output_tokens":32}
+{"prompt":"Translate this English sentence into French: The garden is quiet after the rain.\nFrench:","output_tokens":32}
+{"prompt":"The following list describes three ways to save water at home.\n1. Repair leaking taps.\n2.","output_tokens":32}
+{"prompt":"An engineer measures the latency of a server before and after a software change. The engineer keeps the machine, model weights, request order, output length, and serving configuration fixed. Each run starts after warmup. The engineer records all requests, including failures, and repeats the measurements in several groups. To decide whether the change improves performance, the engineer should compare","output_tokens":32}
+{"prompt":"Read this short report and complete its summary. A town opened a public library beside the railway station. The library has books, computers, study rooms, and a small meeting room. It opens six days each week. Students use the study rooms after school. Older residents attend computer classes in the morning. Volunteers read stories to children on Saturdays. The town plans to count visits and ask residents for feedback after three months.\nSummary: The new library provides","output_tokens":32}

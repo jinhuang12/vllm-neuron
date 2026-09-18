@@ -1,0 +1,161 @@
+{
+  "status": "PASS",
+  "mode": "serve",
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "executable": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/bin/python",
+  "versions": {
+    "torch": "2.11.0",
+    "vllm": "0.24.0",
+    "transformers": "5.16.1",
+    "tokenizers": "0.23.1",
+    "safetensors": "0.8.0",
+    "huggingface-hub": "1.27.0",
+    "numpy": "2.3.5",
+    "nki": "0.6.0+31049202112.g85070674",
+    "libtorch-neuronx-lite": "2.11.0.1.0.1284+f49d8626",
+    "neuronx-cc": "2.27.5334.0+f702b353",
+    "pydantic": "2.13.4",
+    "msgspec": "0.21.1",
+    "triton": "3.6.0",
+    "sentencepiece": "0.2.2"
+  },
+  "modules": {
+    "vllm_neuron": {
+      "path": "/home/ubuntu/glm53-moe-fullmodel-20260917/baseline-source/vllm_neuron/__init__.py",
+      "sha256": "85297cdbc29bd486c60d8d9e2776f49b1dd7be3a6a699aa07413dca9d78d3aa3"
+    },
+    "vllm": {
+      "path": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib/python3.12/site-packages/vllm/__init__.py",
+      "sha256": "fd3708e5a13abe98c566afd79a6b1987cef70c0548bb19c1218ff6a7f9d43346"
+    },
+    "torch": {
+      "path": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib/python3.12/site-packages/torch/__init__.py",
+      "sha256": "0387d8b811b289287479c8bfdf4e1dac3a71b246f938d82da1331cf2dc8bf001"
+    },
+    "transformers": {
+      "path": "/home/ubuntu/glm53-moe-fullmodel-20260917/deps/transformers/__init__.py",
+      "sha256": "46d39e8433a965a6c1dba61129eb3ccbcd19fdcec13acd5dc978d10b12ae4625"
+    },
+    "tokenizers": {
+      "path": "/home/ubuntu/glm53-moe-fullmodel-20260917/deps/tokenizers/__init__.py",
+      "sha256": "b1cee924695651af5c3dab98e8c34406ab355a2cc1d633228646c470210e649e"
+    },
+    "libtorch_neuronx_lite": {
+      "path": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib/python3.12/site-packages/libtorch_neuronx_lite/__init__.py",
+      "sha256": "b70d1fec2b880db1c7c611837f0c9d70251493297a3e1ce8f0306787ee654a16"
+    },
+    "nki": {
+      "path": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib/python3.12/site-packages/nki/__init__.py",
+      "sha256": "747cdfb1638e7585ac412c1cff036e73613abe6f1325da0cb1ed0ce383f7b93f"
+    }
+  },
+  "source_tree_sha256": "5817aa193c3409af726dc699f5fc16c4de8885d1aa6e01b72b1313f00b8f7a08",
+  "devices_exposed": [
+    "/dev/neuron0",
+    "/dev/neuron1",
+    "/dev/neuron10",
+    "/dev/neuron11",
+    "/dev/neuron12",
+    "/dev/neuron13",
+    "/dev/neuron14",
+    "/dev/neuron15",
+    "/dev/neuron2",
+    "/dev/neuron3",
+    "/dev/neuron4",
+    "/dev/neuron5",
+    "/dev/neuron6",
+    "/dev/neuron7",
+    "/dev/neuron8",
+    "/dev/neuron9"
+  ],
+  "environment": {
+    "HF_HOME": "/home/ubuntu/glm53-moe-fullmodel-20260917/cache/baseline/huggingface",
+    "HF_HUB_OFFLINE": "1",
+    "LD_LIBRARY_PATH": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib/python3.12/site-packages/cv2/../../lib64:/opt/aws/neuron/lib:/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/lib",
+    "NEURON_EXECUTION_BACKEND": "lite",
+    "NEURON_LIBTORCH_CACHE_ROOT": "/home/ubuntu/glm53-moe-fullmodel-20260917/cache/baseline",
+    "NEURON_LIBTORCH_PARALLEL_COMPILE_WORKERS": "4",
+    "NEURON_LOGICAL_NC_CONFIG": "2",
+    "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
+    "NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG": "1",
+    "NEURON_RT_LOG_LEVEL": "INFO",
+    "NEURON_RT_LOG_LEVEL_TDRV": "INFO",
+    "NEURON_RT_ROOT_COMM_ID": "localhost:62182",
+    "NEURON_SKIP_EFA_AFFINITY": "1",
+    "PATH": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONPATH": "/home/ubuntu/glm53-moe-fullmodel-20260917/deps:/home/ubuntu/glm53-moe-fullmodel-20260917/baseline-source",
+    "PYTHONUNBUFFERED": "1",
+    "TMPDIR": "/home/ubuntu/glm53-moe-fullmodel-20260917/cache/baseline/tmp",
+    "TRANSFORMERS_OFFLINE": "1",
+    "VIRTUAL_ENV": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0",
+    "VLLM_CACHE_ROOT": "/home/ubuntu/glm53-moe-fullmodel-20260917/cache/baseline",
+    "VLLM_LOGGING_LEVEL": "DEBUG",
+    "VLLM_NEURON_BACKEND": "",
+    "VLLM_NEURON_BARRIER_TIMEOUT": "28800",
+    "VLLM_NEURON_DISABLE_NKI_KERNELS": "0",
+    "VLLM_NEURON_DISABLE_PARALLEL_TRACE": "1",
+    "VLLM_NEURON_MLP_FORCE_TKG": "0",
+    "VLLM_NEURON_NEFF_LOAD_RUN": "ad13ddaaa5d243d1aeedd5dd70df7d94",
+    "VLLM_NEURON_SYNTHETIC_MODEL": "",
+    "VLLM_USE_V2_MODEL_RUNNER": "0",
+    "XDG_CACHE_HOME": "/home/ubuntu/glm53-moe-fullmodel-20260917/cache/baseline/xdg"
+  },
+  "profiler_config_validated": "ProfilerConfig(profiler='cuda', torch_profiler_dir='', torch_profiler_with_stack=True, torch_profiler_with_flops=False, torch_profiler_use_gzip=True, torch_profiler_dump_cuda_time_total=True, torch_profiler_record_shapes=False, torch_profiler_with_memory=False, ignore_frontend=False, delay_iterations=3, max_iterations=1, warmup_iterations=0, active_iterations=5, wait_iterations=0)",
+  "neuron_profiler_config_validated": {
+    "activities": [
+      "device_profile",
+      "system_profile"
+    ],
+    "neuron_cores": [
+      0
+    ],
+    "output_dir": "./neuron_profiles",
+    "sys_trace_max_events_per_nc": null
+  },
+  "server_arguments": [
+    "-m",
+    "vllm.entrypoints.openai.api_server",
+    "--model",
+    "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18004",
+    "--tensor-parallel-size",
+    "64",
+    "--enable-expert-parallel",
+    "--max-model-len",
+    "4096",
+    "--max-num-batched-tokens",
+    "1024",
+    "--max-num-seqs",
+    "1",
+    "--num-gpu-blocks-override",
+    "161",
+    "--block-size",
+    "128",
+    "--dtype",
+    "bfloat16",
+    "--quantization",
+    "fp8",
+    "--kv-cache-dtype",
+    "auto",
+    "--seed",
+    "0",
+    "--distributed-timeout-seconds",
+    "900",
+    "--enable-prefix-caching",
+    "--enable-chunked-prefill",
+    "--no-async-scheduling",
+    "--max-logprobs",
+    "5",
+    "--logprobs-mode",
+    "raw_logprobs",
+    "--profiler-config",
+    "{\"profiler\": \"cuda\", \"delay_iterations\": 3, \"max_iterations\": 1}",
+    "--additional-config",
+    "{\"neuron_config\": {\"ep_degree\": 16, \"kv_segment_size_buckets\": [1024], \"num_batched_tokens_buckets\": [1024], \"on_device_sampling_config\": null, \"enable_hybrid_kv_cache\": true}, \"neuron_profiler\": {\"neuron_cores\": [0], \"activities\": [\"device_profile\", \"system_profile\"], \"output_dir\": \"/home/ubuntu/glm53-moe-fullmodel-20260917/artifacts/baseline-heldout-r1/profiles\"}}"
+  ],
+  "server_cli_validated": true
+}

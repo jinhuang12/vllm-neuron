@@ -1,0 +1,8 @@
+{
+  "unix": 1789704094.2671137,
+  "reason": "All timed cohorts complete; controller count discrepancy retained for audit",
+  "container": "glm53-full-postbaseline-d07c9ba880bd43b4b6f4fa505e17e95c",
+  "returncode": 0,
+  "stdout": "glm53-full-postbaseline-d07c9ba880bd43b4b6f4fa505e17e95c\n",
+  "stderr": ""
+}

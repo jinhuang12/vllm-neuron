@@ -1,0 +1,30 @@
+{
+  "host": "trn2-1",
+  "files": {
+    "m4_actual.py": {
+      "source": "/home/ubuntu/glm53f-campaign/measure-m4/actual-r1-20260917T041610Z/m4_actual.py",
+      "sha256": "67b3ab1ea31158c5b5518e6eac1427e08ac48417dd7ea0c4e4ccd5376e16d2cf",
+      "excerpt": false
+    },
+    "battery.json": {
+      "source": "/home/ubuntu/glm53f-campaign/measure-m4/actual-r1-20260917T041610Z/battery.json",
+      "sha256": "6f2a9e4c124613ee9efd61934ddbddc0800698f4eb0a09e4c1f229016dce78dd",
+      "excerpt": false
+    },
+    "actual-manifest.json": {
+      "source": "/home/ubuntu/glm53f-campaign/measure-m4/actual-r1-20260917T041610Z/out/actual-manifest.json",
+      "sha256": "1dcda8e992275e184df5c24536824744bdea710a7a9c763ebdee950c4f8da87e",
+      "excerpt": false
+    },
+    "m4_compare.py": {
+      "source": "/home/ubuntu/glm53f-campaign/measure-m4/cmp-r1-20260917T095600Z/m4_compare.py",
+      "sha256": "0895a911404c6a405bb1c1d998dcd1e2136797ae46e993843c04ac2c3984c426",
+      "excerpt": false
+    },
+    "server-settings.log": {
+      "source": "/home/ubuntu/glm53f-campaign/lane-serve/c4-1024-r28-20260917T024930Z/server.log",
+      "sha256": "f17b2aeeda3535448416e5a777ee5f85bcd1903a21bb3d6944bc1435f0e7da80",
+      "excerpt": true
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "tree_sha256": "c366203b7643192407527bec6ff5866cfdf8773ab8bed80a101638aa9abf6c93",
+  "file_count": 257,
+  "build_metadata_sha256": {
+    "pyproject.toml": "a3e6e04356653d9ee8ee2672dfdd1b14fb6852ebb19b7eb50b15e0c53888e711",
+    "setup.py": "2ce64d057056c36de2a8d981b13af265fa53dc7e72f3b4df4256e439c89bb3a1"
+  },
+  "expected": "c366203b7643192407527bec6ff5866cfdf8773ab8bed80a101638aa9abf6c93",
+  "pass": true
+}

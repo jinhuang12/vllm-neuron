@@ -105,7 +105,7 @@ def _two_group_root(monkeypatch, rank: int, fixture: dict):
         built = bank.prepare_scale_operands(
             *item._prep_operands_from_the_module(bank, BANK_LEAVES, sliced)
         )
-        assert built == 4, built
+        assert built == 2, built
         rebound += 1
     assert rebound == item.STACK_LAYERS - item.STACK_FIRST_K_DENSE
     root.bind_kv_cache(landed._runner_shaped_caches(root))

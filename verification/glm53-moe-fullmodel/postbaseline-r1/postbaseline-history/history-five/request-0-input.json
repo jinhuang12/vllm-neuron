@@ -1,0 +1,17 @@
+{
+  "source_file": "/home/ubuntu/glm53-moe-fullmodel-20260917/artifacts/baseline-r1/repeat-diagnostic-1/request-0.json",
+  "source_sha256": "a62c7683c9f68aa331573233d17813c170d285dd75ac9b756869305d3301ae8b",
+  "body": {
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "prompt": "The capital of France is",
+    "max_tokens": 32,
+    "temperature": 0,
+    "seed": 0,
+    "ignore_eos": true,
+    "logprobs": 5,
+    "return_token_ids": true,
+    "return_tokens_as_token_ids": true,
+    "stream": false
+  },
+  "start_unix": 1789702205.5578876
+}

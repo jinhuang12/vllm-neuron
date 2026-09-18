@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/bin/python",
+    "/home/ubuntu/glm53-moe-fullmodel-20260917/harness/postbaseline_history.py",
+    "--replay-five",
+    "--root",
+    "/home/ubuntu/glm53-moe-fullmodel-20260917",
+    "--output",
+    "/home/ubuntu/glm53-moe-fullmodel-20260917/artifacts/postbaseline-r1",
+    "--inputs-sha256",
+    "f27f6b2602aabbb608d09e7d6aba7e27bb00eac6cd96aa04f6956767adce9d2a"
+  ],
+  "at_utc": "2026-09-18T03:30:05.500718+00:00",
+  "environment_overrides": {
+    "VLLM_NEURON_CPU_MODE": "1",
+    "PYTHONPATH": "/home/ubuntu/glm53-moe-fullmodel-20260917/deps:/home/ubuntu/glm53-moe-fullmodel-20260917/baseline-source",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "OMP_NUM_THREADS": "1",
+    "PYTHONOPTIMIZE": "0"
+  }
+}

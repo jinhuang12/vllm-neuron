@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "c0a7e5394cbbe4bcb8a691f0a56c908234289dc3",
+  "checkpoint_revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+  "image": "glm53-moe-verification:ubuntu24.04",
+  "image_id": "sha256:8b6d8ccd82c10303c7d2c85d76af025d16142912d8bac6642a10dadf8c776d5c",
+  "server": {
+    "tensor_parallel_size": 64,
+    "enable_expert_parallel": true,
+    "max_model_len": 4096,
+    "max_num_batched_tokens": 1024,
+    "max_num_seqs": 1,
+    "num_gpu_blocks_override": 161,
+    "block_size": 128,
+    "dtype": "bfloat16",
+    "quantization": "fp8",
+    "kv_cache_dtype": "auto",
+    "seed": 0,
+    "distributed_timeout_seconds": 900,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": true,
+    "async_scheduling": false,
+    "max_logprobs": 5,
+    "logprobs_mode": "raw_logprobs"
+  },
+  "additional_config": {
+    "neuron_config": {
+      "ep_degree": 16,
+      "kv_segment_size_buckets": [1024],
+      "num_batched_tokens_buckets": [1024],
+      "on_device_sampling_config": null,
+      "enable_hybrid_kv_cache": true
+    }
+  },
+  "profiler_config": {
+    "profiler": "cuda",
+    "delay_iterations": 3,
+    "max_iterations": 1
+  },
+  "neuron_profiler": {
+    "neuron_cores": [0],
+    "activities": ["device_profile", "system_profile"]
+  },
+  "environment": {
+    "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
+    "NEURON_LOGICAL_NC_CONFIG": "2",
+    "NEURON_EXECUTION_BACKEND": "lite",
+    "NEURON_RT_LOG_LEVEL": "INFO",
+    "NEURON_RT_LOG_LEVEL_TDRV": "INFO",
+    "NEURON_SKIP_EFA_AFFINITY": "1",
+    "NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG": "1",
+    "NEURON_LIBTORCH_PARALLEL_COMPILE_WORKERS": "4",
+    "VLLM_NEURON_BARRIER_TIMEOUT": "28800",
+    "VLLM_LOGGING_LEVEL": "DEBUG",
+    "VLLM_NEURON_BACKEND": "",
+    "VLLM_NEURON_SYNTHETIC_MODEL": "",
+    "VLLM_NEURON_DISABLE_PARALLEL_TRACE": "1",
+    "VLLM_NEURON_DISABLE_NKI_KERNELS": "0",
+    "VLLM_NEURON_MLP_FORCE_TKG": "0",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1"
+  }
+}

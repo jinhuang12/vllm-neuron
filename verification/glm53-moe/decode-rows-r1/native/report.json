@@ -1,0 +1,15 @@
+{
+  "status": "PASS",
+  "cases": {
+    "production": {
+      "status": "PASS",
+      "baseline_preservation": "PASS",
+      "cpu_oracle_gate": "PASS"
+    },
+    "small": {
+      "status": "PASS",
+      "baseline_preservation": "PASS",
+      "cpu_oracle_gate": "PASS"
+    }
+  }
+}

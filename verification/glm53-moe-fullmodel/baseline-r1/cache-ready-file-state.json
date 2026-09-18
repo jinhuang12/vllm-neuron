@@ -1,0 +1,56 @@
+{
+  "unix": 1789693040.9107687,
+  "cache": "/home/ubuntu/glm53-moe-fullmodel-20260917/cache/baseline",
+  "files": {
+    "neuron/compile_cache/301f479170329f3b9bffbc4f9c5736be/.compilation_complete": {
+      "size": 47,
+      "mtime_ns": 1789691385635669403,
+      "sha256": "95bce28dc0eceeff4eb92ca8868161544fe11721f930e94fbe61611d905f94d9"
+    },
+    "neuron/compile_cache/301f479170329f3b9bffbc4f9c5736be/fxgraph.txt": {
+      "size": 2928683,
+      "mtime_ns": 1789691233323951685,
+      "sha256": "ad550179986c0a2964af2da6392e37511b1a22953e55f5cd6f35f8b67cf35b1b"
+    },
+    "neuron/compile_cache/301f479170329f3b9bffbc4f9c5736be/graph.hlo": {
+      "size": 4214545,
+      "mtime_ns": 1789691334353148067,
+      "sha256": "d4fd437262faa5ccfaa1833a4748d322ba049df24a706c3ebed9f88af759734a"
+    },
+    "neuron/compile_cache/301f479170329f3b9bffbc4f9c5736be/graph_301f479170329f3b9bffbc4f9c5736be.neff": {
+      "size": 9136326,
+      "mtime_ns": 1789691383875705138,
+      "sha256": "dde8227e4bebeb7d182d49c96ec5246afabe9e84bdf4f9556df2d9a18a1be6dc"
+    },
+    "neuron/compile_cache/301f479170329f3b9bffbc4f9c5736be/log-neuron-cc.txt": {
+      "size": 2684605,
+      "mtime_ns": 1789691385596701934,
+      "sha256": "a2e2ebac8129c0940402ee314184ae8980e27b6fa3aa34f314fa400a0c918d43"
+    },
+    "neuron/compile_cache/c3f74100dfeed892706f9b3488c90c2b/.compilation_complete": {
+      "size": 48,
+      "mtime_ns": 1789692629514633943,
+      "sha256": "4b151cd0790ee69b0af3525b43e2de5ddc9422a448a48c0adf88dbaade3fa6e3"
+    },
+    "neuron/compile_cache/c3f74100dfeed892706f9b3488c90c2b/fxgraph.txt": {
+      "size": 3403205,
+      "mtime_ns": 1789691068358214883,
+      "sha256": "4c0642fcc8851e713dea54ae6e0710ddc4ea60373b86a827b5c4b9829fece7c5"
+    },
+    "neuron/compile_cache/c3f74100dfeed892706f9b3488c90c2b/graph.hlo": {
+      "size": 5027805,
+      "mtime_ns": 1789691334469227191,
+      "sha256": "c631d803f4d0c11f80a58d34e0bfba466e298261acf36f08623d549a4004a000"
+    },
+    "neuron/compile_cache/c3f74100dfeed892706f9b3488c90c2b/graph_c3f74100dfeed892706f9b3488c90c2b.neff": {
+      "size": 59921603,
+      "mtime_ns": 1789692619028974756,
+      "sha256": "3497404a18c1fd72d8d72155c2a3e67dba8cab9929faaf389931f7f7eb5aa0f2"
+    },
+    "neuron/compile_cache/c3f74100dfeed892706f9b3488c90c2b/log-neuron-cc.txt": {
+      "size": 3028417,
+      "mtime_ns": 1789692629478964259,
+      "sha256": "f3e94ed60f05e9c4abf367ec9757e565d8e5fc42a030f2db6129ca0db540dd3e"
+    }
+  }
+}

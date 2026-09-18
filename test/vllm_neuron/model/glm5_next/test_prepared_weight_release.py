@@ -57,8 +57,8 @@ MLP_LEAVES = {f"{name}_weight" for name in BANK_PROJECTIONS} | {
     f"{name}_{FP8_SCALE_SUFFIX}" for name in BANK_PROJECTIONS
 }
 
-#: The miniature's forward geometry. The bank's prep admits whole 256 blocks only, so
-#: the residual width is 256; every MLP intermediate is 512 so each grid has more than
+#: The miniature's forward geometry. The checkpoint loader admits whole 256 blocks,
+#: so the residual width is 256; every MLP intermediate is 512 so each grid has more than
 #: one block along both axes; the router selects exactly eight experts per token, so the
 #: bank holds eight.
 HIDDEN = 256
@@ -566,6 +566,7 @@ def test_every_forward_is_byte_equal_with_the_release_on_and_off(
     """(t4) One MoE-block forward, the dense MLP, the MLA projections and the indexer stage,
     run on the released tree, are byte-equal to the same runs on a twin loaded with the
     release held off."""
+    monkeypatch.setenv("NKI_SIMULATOR", "1")
     impl = _impl()
     directory = _written_checkpoint(tmp_path)
     with monkeypatch.context() as held:
@@ -604,6 +605,7 @@ def test_releasing_the_shared_expert_makes_its_forward_refuse(
     """(t5, control) A declaration that releases the shared expert's six tensors makes
     the MoE-block forward raise from ``scale_route_operands``, which is why the class
     declares none."""
+    monkeypatch.setenv("NKI_SIMULATOR", "1")
     impl = _impl()
     directory = _written_checkpoint(tmp_path)
     monkeypatch.setattr(

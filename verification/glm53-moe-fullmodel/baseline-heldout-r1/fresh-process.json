@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "arm": "baseline",
+  "contract_sha256": "df470e4526ee8ca311bdf5dc43dc06efa8106626ee1159d0150fa37eac62c9e8",
+  "run_token": "ad13ddaaa5d243d1aeedd5dd70df7d94",
+  "container_name": "glm53-full-baseline-ad13ddaaa5d243d1aeedd5dd70df7d94",
+  "launch_sha256": "8bc3438b06023e006b9b2cf40582eda90a23a59ce1cacc27a0a8b17041cd982b",
+  "fresh_process": true,
+  "model_requests_before_capture": 0,
+  "exclusive_request_owner": "ordered_trace.py",
+  "prelaunch_neuron_state_sha256": "3ded3792fdccb4cfb820701641ea4aa10b28e65ff0e850629ba08a3466bddb9d"
+}

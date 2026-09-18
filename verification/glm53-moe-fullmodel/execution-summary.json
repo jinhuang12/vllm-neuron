@@ -1,0 +1,341 @@
+{
+  "schema_version": 1,
+  "scope": "Separate live graph identity; profile attribution cannot establish a certified critical-path or removable-time bound.",
+  "baseline": {
+    "status": "PARTIAL",
+    "rank": 0,
+    "logical_core_mode": 2,
+    "full_model_dispatch_proven": true,
+    "complete_moe_occupied_time_fraction": null,
+    "observed_moe_occupied_time_lower_bound_fraction": null,
+    "global_critical_path_fraction": null,
+    "reasons": [
+      "Trace loss makes interval quality uncertain; retain the observed ratio without a lower-bound claim"
+    ],
+    "script_sha256": "664d22f259e254ec1619152546dfb59c29df6220b03b49d1045b688c410b4ba2",
+    "device_profile": {
+      "device_profile_name": "glm53-baseline-0a07810c_i-0129669e797df0ec6_pid_1042_nc_0_session_0",
+      "instance_id": "i-0129669e797df0ec6",
+      "process_id": 1042,
+      "nc_id": 0,
+      "session_id": 0,
+      "model_id": null
+    },
+    "execution": {
+      "execution_index": 0,
+      "neff_name": "graph_301f479170329f3b9bffbc4f9c5736be.neff",
+      "execution_start_ts": 0,
+      "execution_end_ts": 526429722,
+      "num_subgraphs": 2,
+      "row_count": 103966873
+    },
+    "live_execution": {
+      "model_id": 657241191315650,
+      "flow_id": [
+        "1"
+      ],
+      "start_ts": 1789695298999310896,
+      "end_ts": 1789695299525740618,
+      "duration_ns": 526429722,
+      "events": [
+        {
+          "id": 3320,
+          "name": "nc_exec_running",
+          "start_ts": 1789695298999310896,
+          "end_ts": 1789695299525739198,
+          "duration_ns": 526428302,
+          "trace_event_source": "neuron_hw",
+          "instance_id": "i-0129669e797df0ec6",
+          "process_id": 1042,
+          "thread_id": 1,
+          "nc_idx": 0,
+          "pcore_idx": 5,
+          "worker_gid": 0,
+          "flow_id": [
+            "1"
+          ],
+          "framework_stream_id": null,
+          "extra_attributes_json": "{\"model_id\":657241191315650}"
+        },
+        {
+          "id": 3316,
+          "name": "nc_exec_running",
+          "start_ts": 1789695298999310896,
+          "end_ts": 1789695299525740618,
+          "duration_ns": 526429722,
+          "trace_event_source": "neuron_hw",
+          "instance_id": "i-0129669e797df0ec6",
+          "process_id": 1042,
+          "thread_id": 1,
+          "nc_idx": 0,
+          "pcore_idx": 4,
+          "worker_gid": 0,
+          "flow_id": [
+            "1"
+          ],
+          "framework_stream_id": null,
+          "extra_attributes_json": "{\"model_id\":657241191315650}"
+        }
+      ],
+      "device_duration_ns": 526429722,
+      "duration_difference_ns": 0,
+      "maximum_duration_difference_ns": 1052859,
+      "device_to_system_offset_ns": 1789695298999310896
+    },
+    "neff_sha256": "dde8227e4bebeb7d182d49c96ec5246afabe9e84bdf4f9556df2d9a18a1be6dc",
+    "neff_name": "graph_301f479170329f3b9bffbc4f9c5736be.neff",
+    "graph_key": "301f479170329f3b9bffbc4f9c5736be",
+    "graph_dispatch": {
+      "moe_gate_up_blockwise_fp8_kernel": 42,
+      "moe_swiglu_transposed_kernel": 42,
+      "moe_down_blockwise_fp8_kernel": 42
+    },
+    "rank0_pid": 1042,
+    "execution_binding_method": "Same captured worker, one device execution and one live model; unique LNC2 duration match anchors relative device timestamps",
+    "source_attributed_interval_fraction": 0.6495146506944378,
+    "trace_loss_warning": true,
+    "limits": "Rank0 diagnostic only. Trace loss can invalidate interval durations; a loss-affected ratio is not a certified lower bound. This is not a global critical-path or E2E removable fraction."
+  },
+  "candidate": {
+    "identity": {
+      "neff_name": "graph_b2ff34a704b9fb261d9d5e3322cf727c.neff",
+      "neff_sha256": "4f13ffb9201ab210b3a3f0cffb162b167bc77b6d9683e1f1a0498741f145510b",
+      "graph_key": "b2ff34a704b9fb261d9d5e3322cf727c",
+      "fx_sha256": "c5d00515145f37a1a99a6befe1f15e4c2996b64fa2aa676780814f61534ab1f0",
+      "counts": {
+        "moe_fused_fp8_kernel": 42
+      },
+      "layers": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44
+      ],
+      "execution": {
+        "execution_index": 0,
+        "neff_name": "graph_b2ff34a704b9fb261d9d5e3322cf727c.neff",
+        "execution_start_ts": 0,
+        "execution_end_ts": 93259784,
+        "num_subgraphs": 2,
+        "row_count": 12376939
+      },
+      "tables": {
+        "Metadata.parquet": [
+          {
+            "profile_schema_version": "7.13.0",
+            "ntff_version": 7,
+            "num_physical_cores": 1,
+            "vnc_enabled": false,
+            "first_hw_timestamp": 0,
+            "last_hw_timestamp": 93259784,
+            "first_ts": "1970-01-01 00:00:00 +0000 UTC",
+            "last_ts": "1970-01-01 00:00:00.093259784 +0000 UTC",
+            "dma_ddr_bandwidth": 434999984128.0,
+            "num_dma_engines_per_neuroncore": 16,
+            "hbm_ddr_bandwidth": 716000002048.0,
+            "tensor_engine_num_rows": 128,
+            "tensor_engine_num_cols": 128,
+            "tensor_engine_clock_freq": 2.4000000953674316,
+            "vector_engine_clock_freq": 0.9600000381469727,
+            "vector_engine_num_channels": 128,
+            "scalar_engine_clock_freq": 1.2000000476837158,
+            "scalar_engine_num_channels": 128,
+            "gpsimd_engine_clock_freq": 1.2000000476837158,
+            "gpsimd_engine_num_channels": 128,
+            "neuroncore_clock_freq": 1.2000000476837158,
+            "ticks_per_nanosec": 1000,
+            "instance_type": "trn2.48xlarge",
+            "runtime_version": "2.34.10 (ac18d)",
+            "collectives_version": "2.34.10 ()",
+            "driver_version": "2.30.0 ()",
+            "explorer_version": "2.32.0.498-b1f3998",
+            "compiler_version": null,
+            "nki_version": null,
+            "neuroncore_idx": 4,
+            "neuron_device_idx": 0,
+            "ultraserver_id": null,
+            "ultraserver_type": null,
+            "ultraserver_size": null,
+            "ultraserver_instance_index": null,
+            "s3_bucket_path": null,
+            "profile_name": "glm53-candidate-606b9147",
+            "explorer_build_time": "2026-08-10T05:09:49Z",
+            "is_simulation": false
+          }
+        ],
+        "NeffHeader.parquet": [
+          {
+            "network_name": "/home/ubuntu/glm53-moe-fullmodel-20260917/cache/candidate/neuron/compile_cache/b2ff34a704b9fb261d9d5e3322cf727c/dev0_63.rank0/graph_b2ff34a704b9fb261d9d5e3322cf727c.neff",
+            "uuid": "69cc711ad034c2a24351e220431f7ffe",
+            "hash": "69cc711ad034c2a24351e220431f7ffe",
+            "enabled_features": "queue-set-instances, on-chip-functions, imcpy-bound-check, fma-multi-dim, virtual-core, v3-2x-4x-dve-perf-mode, dge, pool-rsqrt, dge-cast, vector-dge, dma-rearm, hw-dge",
+            "header_size": 1024,
+            "data_size": 7125275,
+            "major_version": 2,
+            "minor_version": 0,
+            "package_version": "2",
+            "build_version": "",
+            "cc_participant_count": 64,
+            "neuroncore_count": null,
+            "logical_neuroncore_count": 1,
+            "pcore_count_per_lnc": 2
+          }
+        ],
+        "Warning.parquet": [
+          {
+            "message": "Missing additional dynamic DMA metadata, reported DMA values may be inaccurate. To enable more accurate DMA data, re-capture with --enable-dge-notifs flag or set NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 before running. Note: DGE notifications are disabled by default as they can cause execution timeouts on some models.",
+            "category": "Missing Data"
+          },
+          {
+            "message": "Notification from block DMA of type DMA were dropped. This can cause corresponding data to be incorrect.",
+            "category": "Missing Data"
+          },
+          {
+            "message": "Current NEFF is missing compiler metrics. Please re-compile using latest version of the compiler",
+            "category": "Missing Data"
+          },
+          {
+            "message": "Missing HLO stats in the NEFF, `model_flops` and `mfu_hlo_estimated_percent` summary metrics will not be available. Consider the metrics (hardware_flops - transpose_flops) and mfu_inst_estimated_percent instead.",
+            "category": "Missing Data"
+          },
+          {
+            "message": "Inputs and weights size is greater than total measured HBM read/write bytes, summary metric for mbu_min_read_util_percent will be inaccurate. This can happen if inputs/weights are partially accessed.",
+            "category": "Unknown"
+          }
+        ]
+      }
+    },
+    "binding": {
+      "rank0_pids_from_server_log": [
+        1042
+      ],
+      "device_profile": {
+        "device_profile_name": "glm53-candidate-606b9147_i-0129669e797df0ec6_pid_1042_nc_0_session_0",
+        "instance_id": "i-0129669e797df0ec6",
+        "process_id": 1042,
+        "nc_id": 0,
+        "session_id": 0,
+        "model_id": null
+      },
+      "instruction_rows": 1417094,
+      "instruction_physical_cores": [
+        0,
+        1
+      ],
+      "system_events": [
+        {
+          "id": 3320,
+          "name": "nc_exec_running",
+          "start_ts": 1789698196453036282,
+          "end_ts": 1789698196546293739,
+          "duration_ns": 93257457,
+          "trace_event_source": "neuron_hw",
+          "instance_id": "i-0129669e797df0ec6",
+          "process_id": 1042,
+          "thread_id": 1,
+          "nc_idx": 0,
+          "pcore_idx": 5,
+          "worker_gid": 0,
+          "flow_id": [
+            "1"
+          ],
+          "framework_stream_id": null,
+          "extra_attributes_json": "{\"model_id\":655864607015312}"
+        },
+        {
+          "id": 3316,
+          "name": "nc_exec_running",
+          "start_ts": 1789698196453036282,
+          "end_ts": 1789698196546296067,
+          "duration_ns": 93259785,
+          "trace_event_source": "neuron_hw",
+          "instance_id": "i-0129669e797df0ec6",
+          "process_id": 1042,
+          "thread_id": 1,
+          "nc_idx": 0,
+          "pcore_idx": 4,
+          "worker_gid": 0,
+          "flow_id": [
+            "1"
+          ],
+          "framework_stream_id": null,
+          "extra_attributes_json": "{\"model_id\":655864607015312}"
+        }
+      ],
+      "scope": "Separate executed-graph identity evidence. Original analysis remains UNAVAILABLE because metadata core count conflicts with instruction/system/header tables. No occupied-time or critical-path estimate."
+    },
+    "analysis": {
+      "status": "UNAVAILABLE",
+      "rank": 0,
+      "logical_core_mode": 2,
+      "full_model_dispatch_proven": false,
+      "complete_moe_occupied_time_fraction": null,
+      "observed_moe_occupied_time_lower_bound_fraction": null,
+      "global_critical_path_fraction": null,
+      "reasons": [
+        "ValueError: Device trace is not a real LNC2 capture"
+      ],
+      "script_sha256": "664d22f259e254ec1619152546dfb59c29df6220b03b49d1045b688c410b4ba2"
+    }
+  },
+  "source_records": [
+    {
+      "path": "baseline-r1/profile-analysis-r2/analysis.json",
+      "sha256": "2671640411086254e4f0e7925d1aff6e7fd74e376c00a9d766c66ae412f06faf"
+    },
+    {
+      "path": "candidate-r1/profile-evidence/reviewer-identity.json",
+      "sha256": "2a39d12f89b087a4286f5acc2d886a2ba302182e388fa8560627e41a0a0c9c75"
+    },
+    {
+      "path": "candidate-r1/profile-evidence/reviewer-binding.json",
+      "sha256": "eb0f34000d20f72a8f33e44a1cf0d1984027f77f22ebd1619a00052c0d853ef7"
+    },
+    {
+      "path": "candidate-r1/profile-evidence/analysis.json",
+      "sha256": "bc89875ac6c8a27bef8c13b1b07593fb4ed133d8d7f3f16f44aec73dd3b928d6"
+    },
+    {
+      "path": "candidate-r1/fused-row-shapes.json",
+      "sha256": "57a1363130dcd4bb572e3125f8694a7c41ddd831752ad37bfd051704a6d94b71"
+    }
+  ]
+}

@@ -1885,12 +1885,10 @@ class Glm5NextRoutedExperts(nn.Module):
     # router-call-site row, and for the same reason: the routed bank is where
     # the expert weights and the partition live.
     #
-    # D5(b): THE INNER KERNELS ARE CALLED DIRECTLY. The public ``moe_cte``
-    # dispatcher will not forward block scales, so this site enters the three
-    # routed limbs -- ``moe_gate_up_blockwise_fp8``, ``moe_swiglu_transposed``,
-    # ``moe_down_blockwise_fp8`` -- instead of the dispatcher. It reaches no
-    # fused block seam: the routing the limbs take is an operand, so one call
-    # per limb per layer covers every block.
+    # The public ``moe_cte`` dispatcher does not forward block scales. Normal
+    # model calls use the fused kernel with load-time packed banks. Direct
+    # callers can still pass the four legacy operands for the three limbs.
+    # Both routes consume the same device mapping and emit FP32 contributions.
     #
     # NO QUANTISATION ENUM MEMBER IS NAMED OR ADDED (plan section 11 constraint
     # B.6, and the ``-023`` section above already declares the same negative).
@@ -1938,19 +1936,26 @@ class Glm5NextRoutedExperts(nn.Module):
         self,
         hidden_states: torch.Tensor,
         expert_affinities: torch.Tensor,
-        gate_up_proj_weight: torch.Tensor,
-        down_proj_weight: torch.Tensor,
-        gate_up_scale_operands: torch.Tensor,
-        down_scale_operands: torch.Tensor,
+        gate_up_proj_weight: torch.Tensor | None,
+        down_proj_weight: torch.Tensor | None,
+        gate_up_scale_operands: torch.Tensor | None,
+        down_scale_operands: torch.Tensor | None,
         quant_config: Glm5NextQuantConfig,
         *,
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
+        packed_weights: torch.Tensor | None = None,
+        packed_scales: torch.Tensor | None = None,
         collector: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Run this rank's routed experts through the block-quant NKI kernel.
+        """Route, compute and combine this rank's block-quant expert outputs.
+
+        Normal model calls supply both packed banks and leave the four legacy
+        operands as None. Direct callers can still supply those four operands
+        to run the existing three-kernel chain. Both paths use the same routing,
+        padding, FP32 contribution combine, and final activation dtype.
 
         Args:
             hidden_states: ``[T, H]`` real tokens only -- the kernel's
@@ -1996,6 +2001,9 @@ class Glm5NextRoutedExperts(nn.Module):
                 leave it ``None``; a sharded one supplies the real group rather
                 than having this site invent one.
             tp_degree: ranks sharding each expert's intermediate dimension.
+            packed_weights: optional packed FP8 bank [E, 3*(I/128), 128, H/128, 128].
+            packed_scales: matching FP32 scales [E, 3*(I/128), H/128]. Supply
+                both packed banks or neither. They replace the four legacy operands.
 
         Returns:
             ``[T, H]`` -- the padding-token row is sliced off. The dtype is the
@@ -2050,29 +2058,68 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"{tuple(hidden_states.shape)}"
             )
         tokens, hidden = (int(extent) for extent in hidden_states.shape)
-        if gate_up_proj_weight.dim() != 4 or gate_up_proj_weight.shape[2] != 2:
-            raise Glm5NextBlockQuantRouteError(
-                f"gate_up_proj_weight must be [E, H, 2, I_TP], got shape "
-                f"{tuple(gate_up_proj_weight.shape)}"
-            )
-        num_experts = int(gate_up_proj_weight.shape[0])
-        intermediate = int(gate_up_proj_weight.shape[-1])
+        using_packed = packed_weights is not None or packed_scales is not None
+        if using_packed:
+            if packed_weights is None or packed_scales is None:
+                raise Glm5NextBlockQuantRouteError("Supply both packed weights and scales")
+            if any(value is not None for value in (
+                gate_up_proj_weight, down_proj_weight,
+                gate_up_scale_operands, down_scale_operands,
+            )):
+                raise Glm5NextBlockQuantRouteError(
+                    "Packed banks replace the four legacy expert operands; do not supply both"
+                )
+            if (
+                packed_weights.ndim != 5
+                or packed_weights.shape[1] < 3
+                or packed_weights.shape[1] % 3
+                or packed_weights.shape[2] != TILE_SIZE
+                or packed_weights.shape[4] != TILE_SIZE
+                or packed_weights.shape[3] * TILE_SIZE != hidden
+            ):
+                raise Glm5NextBlockQuantRouteError(
+                    "packed_weights must be [E, 3*(I/128), 128, H/128, 128] "
+                    f"for hidden width {hidden}, got {tuple(packed_weights.shape)}"
+                )
+            num_experts = int(packed_weights.shape[0])
+            intermediate = int(packed_weights.shape[1]) // 3 * TILE_SIZE
+            if tuple(packed_scales.shape) != (
+                num_experts, packed_weights.shape[1], packed_weights.shape[3]
+            ):
+                raise Glm5NextBlockQuantRouteError(
+                    "packed_scales must match the packed weight tiles"
+                )
+        else:
+            if any(value is None for value in (
+                gate_up_proj_weight, down_proj_weight,
+                gate_up_scale_operands, down_scale_operands,
+            )):
+                raise Glm5NextBlockQuantRouteError(
+                    "Supply both packed banks or all four legacy expert operands"
+                )
+            if gate_up_proj_weight.dim() != 4 or gate_up_proj_weight.shape[2] != 2:
+                raise Glm5NextBlockQuantRouteError(
+                    f"gate_up_proj_weight must be [E, H, 2, I_TP], got shape "
+                    f"{tuple(gate_up_proj_weight.shape)}"
+                )
+            num_experts = int(gate_up_proj_weight.shape[0])
+            intermediate = int(gate_up_proj_weight.shape[-1])
+            if int(gate_up_proj_weight.shape[1]) != hidden:
+                raise Glm5NextBlockQuantRouteError(
+                    f"gate_up_proj_weight has H={int(gate_up_proj_weight.shape[1])} "
+                    f"but hidden_states has H={hidden}"
+                )
+            if tuple(down_proj_weight.shape) != (num_experts, intermediate, hidden):
+                raise Glm5NextBlockQuantRouteError(
+                    f"down_proj_weight must be [E={num_experts}, "
+                    f"I_TP={intermediate}, H={hidden}], got shape "
+                    f"{tuple(down_proj_weight.shape)}"
+                )
         if num_experts != int(self.num_local_experts):
             raise Glm5NextBlockQuantRouteError(
-                f"gate_up_proj_weight carries {num_experts} experts but this "
+                f"the expert bank carries {num_experts} experts but this "
                 f"rank owns {self.num_local_experts}; the bank and the "
                 f"partition must agree"
-            )
-        if int(gate_up_proj_weight.shape[1]) != hidden:
-            raise Glm5NextBlockQuantRouteError(
-                f"gate_up_proj_weight has H={int(gate_up_proj_weight.shape[1])} "
-                f"but hidden_states has H={hidden}"
-            )
-        if tuple(down_proj_weight.shape) != (num_experts, intermediate, hidden):
-            raise Glm5NextBlockQuantRouteError(
-                f"down_proj_weight must be [E={num_experts}, "
-                f"I_TP={intermediate}, H={hidden}], got shape "
-                f"{tuple(down_proj_weight.shape)}"
             )
         # ---- THE DISPATCH STEP. Global router columns -> this rank's slice.  #
         # ``inc-glm53f-032``'s landed note above says in its own words that
@@ -2212,39 +2259,54 @@ class Glm5NextRoutedExperts(nn.Module):
             [expert_affinities_masked, pad_masked], dim=0
         )
 
-        # ---- THE COMPOSITION: three kernels for the whole layer. ---------- #
-        # The routing is INSIDE the limbs -- each one takes the mapping and picks its
-        # own rows, its own expert weight slab and its own affinities on device. So
-        # this site launches three kernels for a whole MoE layer rather than three per
-        # token block, and no expert weight is ever copied to make an operand
-        # contiguous. The mechanisms are the three the `-113` probe read MATCH on
-        # under lease event 229: the indirect row gather, the index vector computed on
-        # device, and the ``(1, 1)`` int32 expert index offsetting a weight buffer.
-        pre_activation = moe_gate_up_blockwise_fp8(
-            padded_hidden,
-            gate_up_proj_weight,
-            gate_up_scale_operands,
-            token_position_to_id,
-            block_to_expert,
-            block,
-        )
-        # THE BOUNDS GO INTO THE ACTIVATION KERNEL, both of them, and the asymmetry is
-        # the checkpoint's: ``gate`` is bounded above only and ``up`` on both sides
-        # (``modeling_glm5_next.py:139``). The vendor seam took four clamp arguments
-        # for this same work; the activation limb now takes the two numbers that
-        # describe it.
-        contribution = moe_down_blockwise_fp8(
-            moe_swiglu_transposed(
-                pre_activation, self.swiglu_limit, self.swiglu_limit
-            ),
-            down_proj_weight,
-            down_scale_operands,
-            expert_affinities_masked,
-            token_position_to_id,
-            block_to_expert,
-            block,
-            tokens,
-        )
+        # Both paths gather tokens and expert tiles on device, clamp gate from
+        # above and up on both sides, then apply affinity after down projection.
+        if using_packed:
+            from vllm_neuron.functional.moe.fused_fp8 import (
+                PackedExperts,
+                fused_fp8_experts,
+            )
+            from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+                _swiglu_bound_operand,
+            )
+
+            # Each block stores its real tokens first and has at most T of
+            # them. Keep that prefix for the kernel and the FP32 combine.
+            rows = min(tokens, block)
+            kernel_row_ids = token_position_to_id.reshape(-1, block)[:, :rows].contiguous()
+            token_position_to_id = kernel_row_ids.reshape(-1)
+            contribution = fused_fp8_experts(
+                padded_hidden.to(torch.bfloat16),
+                PackedExperts(packed_weights, packed_scales),
+                kernel_row_ids,
+                block_to_expert.reshape(-1, 1),
+                expert_affinities_masked.reshape(tokens + 1, num_experts),
+                _swiglu_bound_operand(
+                    self.swiglu_limit, self.swiglu_limit, hidden_states.device
+                ),
+            )
+        else:
+            # Preserve the direct-call interface for the existing chain.
+            pre_activation = moe_gate_up_blockwise_fp8(
+                padded_hidden,
+                gate_up_proj_weight,
+                gate_up_scale_operands,
+                token_position_to_id,
+                block_to_expert,
+                block,
+            )
+            contribution = moe_down_blockwise_fp8(
+                moe_swiglu_transposed(
+                    pre_activation, self.swiglu_limit, self.swiglu_limit
+                ),
+                down_proj_weight,
+                down_scale_operands,
+                expert_affinities_masked,
+                token_position_to_id,
+                block_to_expert,
+                block,
+                tokens,
+            )
 
         # ---- BACK TO TOKEN ORDER: one scatter-add over the whole emission. ---- #
         # WHERE THE ROUTER WEIGHT MULTIPLIED: after the down projection, inside the
@@ -2257,14 +2319,8 @@ class Glm5NextRoutedExperts(nn.Module):
         # breaks the linearity". Measured at up to 76.9% per-token error against a 1%
         # tolerance in ``increments/probe-054a-affinity-scaling-mode-r1.out``.
         #
-        # THIS SCATTER IS DELIBERATELY NOT ON THE DEVICE, and it is the one piece of
-        # routing that is not. A token selected by top-k experts appears in top-k
-        # blocks, so a device scatter has to ACCUMULATE, and the probe's arm 2
-        # certified an indirect scatter that WRITES. An accumulating read-modify-write
-        # through the same access pattern is a mechanism this campaign has not
-        # measured, and getting it wrong loses contributions silently. One
-        # ``index_add`` over the whole emission is not the rejected per-block unroll:
-        # it moves no weight and it runs once for the layer.
+        # Accumulate all expert contributions in token order with one device
+        # index_add. Keep this combine in FP32 before restoring the input dtype.
         wanted = torch.where(
             token_position_to_id < 0,
             torch.full_like(token_position_to_id, tokens),
@@ -2279,12 +2335,9 @@ class Glm5NextRoutedExperts(nn.Module):
 
     # ── load-time operand prep -- hand-off item (i) of ``inc-glm53f-054a`` ──
     #
-    # WHAT THIS SECTION IS FOR. ``block_quant_expert_mm`` above takes the fused
-    # ``[E_local, H, 2, I_TP]`` gate/up bank, the retiled ``[E_local, I_TP, H]``
-    # down bank, and the two FLAT consumer scale emissions. The checkpoint
-    # stores none of those: ``__init__`` declares three per-projection weights
-    # and no scale parameter at all. This section builds all four, ONCE, at load
-    # time, and holds them on the module.
+    # ``block_quant_expert_mm`` consumes one packed weight bank and one packed
+    # scale bank. The checkpoint supplies three weights and three matching
+    # scale grids. Build both packed banks once at load time and retain them.
     #
     # IT ENROLLS IN A LANDED LOOP AND EDITS NO LINE OF IT.
     # ``Glm5NextForConditionalGeneration._run_load_time_preps`` is the single
@@ -2307,7 +2360,7 @@ class Glm5NextRoutedExperts(nn.Module):
     # rather than an expert bank's. The hook contract is unchanged: same name, six
     # keyword operands, an int return.
 
-    #: Where :meth:`prepare_scale_operands` leaves its four operands. A class
+    #: Where :meth:`prepare_scale_operands` leaves its two packed banks. A class
     #: attribute for the reason the shared expert's own is one: the name is part
     #: of the contract between the builder and the reader, and neither should
     #: spell it twice.
@@ -2338,76 +2391,19 @@ class Glm5NextRoutedExperts(nn.Module):
         up_proj_scale: torch.Tensor,
         down_proj_scale: torch.Tensor,
     ) -> int:
-        """Build this rank's four kernel operands ONCE. Returns how many.
+        """Pack this rank's prepared FP8 weights and scales once. Return 2.
 
-        Hand-off item (i) of ``inc-glm53f-054a``. The argument list mirrors the
-        shared expert's own -- same names, same order -- because both are called
-        by the same loop from the same derivation, and a divergent order at one
-        of them is a mis-wiring no shape check would see.
+        The loader supplies gate/up weights [E, I, H], down weights [E, H, I],
+        and their matching [128, 128] block grids. It has already squeezed
+        weight bytes into the finite Trainium2 range and compensated scales.
+        This method only changes layout; it does not rescale or requantize.
 
-        Args:
-            gate_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3, this rank's slice.
-            up_proj_weight: ``[E_local, I_TP, H]`` fp8-e4m3.
-            down_proj_weight: ``[E_local, H, I_TP]`` fp8-e4m3.
-            gate_proj_scale: ``[E_local, I_TP//128, H//128]`` fp32, the
-                checkpoint's own block grid.
-            up_proj_scale: the same, for ``up_proj_weight``.
-            down_proj_scale: ``[E_local, H//128, I_TP//128]`` fp32.
-
-        Returns:
-            How many operands were built -- ``4`` on every successful call: the
-            fused gate/up bank, its kernel scale operand, the down bank and its
-            kernel scale operand.
-
-        Raises:
-            Glm5NextBlockQuantRouteError: on a missing operand, a weight that is
-                not 3-D, or an expert count that disagrees with this rank's
-                partition. All three are structural. The publisher's three health
-                counts -- ``emitted_unsupplied``, ``input_scales_dropped`` and
-                ``inexact_rescales`` -- are RECORDED on this module rather than
-                refused on, and every one of them is zero because no scale is
-                remapped: the grid the checkpoint shipped is the grid the kernels
-                index.
-
-        THOSE ARE THE LOADER'S ORIENTATIONS AND NOT THE KERNEL'S, which is why
-        the body below transposes two of the three banks on the way in and one on
-        the way out. The registered parameter layout IS the checkpoint layout:
-        ``weight_loaders_fp8.py`` passes ``is_storage_transposed=False`` and says
-        in its own words that every consumer transposes at compute time instead,
-        and each bank is that checkpoint's per-expert slices stacked on a new
-        LEADING axis with no transpose (``_stack_local_expert_weights``,
-        ``_stack_local_expert_scales``). The checkpoint stores one ``nn.Linear``
-        weight per expert, ``[out, in]``, which the reference confirms at
-        ``../../../artifacts/campaigns/glm-5.3-flash-port/design/reference/modeling_glm5_next.py:116-117``:
-        gate and up are ``[I, H]``, down is ``[H, I]``.
-
-        AN EARLIER REVISION OF THIS BLOCK NAMED THE KERNEL'S ORIENTATIONS HERE,
-        and that was worse than merely wrong. It would have led a reader to
-        transpose DOWN, whose consumer scale shape is the PRODUCT of the two block
-        counts and so identical either way -- the wrong repair passes every shape
-        check anything could write and mis-assigns every scale. The gate for this
-        increment therefore measures which axis arrives as the producer's ``rows``,
-        and plants that exact pair to show the check rejects it.
-
-        THERE IS NO MERGE TO CHECK. The half-slot emission and its ``NaN`` fill
-        belonged to the vendor seam's flat scale tensor, which no limb here reads:
-        each half's kernel operand is built from that half's own checkpoint grid,
-        so the two never share a tensor and neither can leave a slot unwritten.
+        Real tensors are packed on the CPU and moved back to the source
+        device. Meta tensors follow the same layout without reading values.
+        Only the two packed banks remain in the prepared operand dictionary.
+        The load hook releases the six source tensors after this method.
         """
-        from vllm_neuron.functional.moe.blockwise_fp8_retile import (
-            DOWN,
-            GATE_UP,
-            retile_block_scales,
-        )
-        from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
-            to_down_kernel_scale_operand,
-            to_gate_up_kernel_scale_operand,
-        )
-
-        #: The producer's fusion selector is an ``int``: its own flat index is
-        #: ``(h_block * 2 + gate_or_up) * i_256 + i_block``, so 0 is the gate
-        #: half and 1 the up half.
-        gate_half, up_half = 0, 1
+        from vllm_neuron.functional.moe.fused_fp8_pack import pack_experts
 
         supplied = {
             "gate_proj_weight": gate_proj_weight,
@@ -2421,60 +2417,16 @@ class Glm5NextRoutedExperts(nn.Module):
         if missing:
             raise Glm5NextBlockQuantRouteError(
                 f"prepare_scale_operands needs all six operands and {missing} "
-                f"are absent; load the checkpoint before preparing the kernel "
-                f"operands"
+                "are absent; load the checkpoint before preparing the kernel operands"
             )
         for name in ("gate_proj_weight", "up_proj_weight", "down_proj_weight"):
             weight = supplied[name]
-            if weight.dim() != 3:
+            if weight.dim() != 3 or int(weight.shape[0]) != int(self.num_local_experts):
                 raise Glm5NextBlockQuantRouteError(
-                    f"{name} must be [E_local, ., .] to give the retile its "
-                    f"bank extents, got shape {tuple(weight.shape)}"
-                )
-            experts = int(weight.shape[0])
-            if experts != int(self.num_local_experts):
-                raise Glm5NextBlockQuantRouteError(
-                    f"{name} carries {experts} experts but this rank owns "
-                    f"{self.num_local_experts}; the bank and the partition must "
-                    f"agree. A global bank reaching this rank is a load-time "
-                    f"error, not something to slice here, because slicing it "
-                    f"quietly would put a different rank's experts behind this "
-                    f"rank's router columns"
+                    f"{name} must be [E_local={self.num_local_experts}, ., .], "
+                    f"got shape {tuple(weight.shape)}"
                 )
 
-        # ---- THE PRODUCER'S VIEW. ``retile_block_scales`` reads its weight as
-        # ``(E, rows, cols)`` where ROWS IS THE H AXIS and COLS THE I AXIS, for
-        # BOTH projections: its own refusal text is ``weights must be (E, H, I)``
-        # and ``test_moe_path.py``'s landed call site states the same convention in
-        # words before doing it. So gate and up, registered ``[E, I_TP, H]``, are
-        # handed over in the ``(E, H, I_TP)`` view; down, registered
-        # ``[E, H, I_TP]``, is already in that view and is passed unchanged.
-        #
-        # EACH GRID MOVES WITH ITS WEIGHT, never alone. The producer derives the
-        # grid it expects from the weight it received --
-        # ``want_scales = (experts, rows // TILE_SIZE, cols // TILE_SIZE)`` -- so a
-        # weight transposed by itself is refused where it happens. The dangerous
-        # pair is the opposite one: a weight and its grid transposed TOGETHER where
-        # neither should be, which for DOWN changes no shape anywhere and every
-        # value everywhere.
-        #
-        # A DENSE BUFFER IS THE FORM THE PRODUCER IS KNOWN TO WORK ON. Every landed
-        # call of it hands a freshly built contiguous tensor, and the kernel-operand
-        # builders below read the same pair.
-        #
-        # EVERYTHING BELOW COMPUTES ON HOST COPIES AND WRITES TO THE DEVICE ONCE, and
-        # the hop happens here, before the first materialisation. These six operands
-        # are device-resident -- the caller's pre-flight says so one line before the
-        # call -- and the Neuron backend has no strided copy: a transpose, a permute or
-        # a slice made dense on the device raises ``Expected self.is_contiguous() to be
-        # true, but got false``, which the runner already writes down at
-        # ``vllm/worker/neuron_model_runner.py:4136``. That covers this method's own
-        # transposes AND every producer it calls: the two kernel-operand builders each
-        # broadcast a flat grid across the partition axis with
-        # ``expand(...).contiguous()``. On host copies
-        # all of that is ordinary torch, and one move at the end puts the finished
-        # operands where the forward wants them -- cheaper than the round trip per
-        # relayout it replaces, and it leaves no producer holding a device tensor.
         device = gate_proj_weight.device
         (
             gate_proj_weight,
@@ -2483,124 +2435,32 @@ class Glm5NextRoutedExperts(nn.Module):
             gate_proj_scale,
             up_proj_scale,
             down_proj_scale,
-        ) = _on_the_host(
-            gate_proj_weight,
-            up_proj_weight,
-            down_proj_weight,
-            gate_proj_scale,
-            up_proj_scale,
-            down_proj_scale,
-        )
-        gate = retile_block_scales(
-            gate_proj_weight.transpose(1, 2).contiguous(),
-            gate_proj_scale.transpose(1, 2).contiguous(),
-            GATE_UP,
-            gate_half,
-        )
-        up = retile_block_scales(
-            up_proj_weight.transpose(1, 2).contiguous(),
-            up_proj_scale.transpose(1, 2).contiguous(),
-            GATE_UP,
-            up_half,
-        )
-        down = retile_block_scales(down_proj_weight, down_proj_scale, DOWN)
-
-        # NO FUSION MERGE OF PUBLISHED SCALES, AND THAT IS THIS CHANGE. The publisher
-        # used to coarsen each half onto a flat ``256``-block layout, writing one
-        # fusion half per call and leaving the other half NaN, so the two emissions
-        # had to be merged and the merge had to be checked for slots neither half
-        # wrote. There is no coarser layout now and no NaN sentinel in it: each half
-        # publishes the grid it was handed, at the granularity the kernels index, so
-        # there is nothing to merge and no hole a merge could leave. The fusion the
-        # kernels do see is the stack two blocks below, whose axis is asserted by the
-        # operand builders' own shape checks.
-        #
-        # ---- THE KERNEL LIMBS' OPERANDS, from the checkpoint's own bytes. The three
-        # NKI limbs consume the checkpoint at its own ``[128, 128]`` granularity, so
-        # their operands are built from the six arguments this method received. That
-        # is now the same pair the publisher returns; they are built from the
-        # arguments rather than from its result so that the orientation each limb
-        # needs is visible at the line that produces it.
-        #
-        # ORIENTATION, WHICH IS THE SAME RULE THE RETILE VIEW USES ABOVE. Gate and
-        # up are registered ``[E, I_TP, H]`` and the limb contracts H on axis 0, so
-        # each moves into the ``(E, H, I_TP)`` view together with its grid; down is
-        # registered ``[E, H, I_TP]`` and the down limb contracts I, so it moves the
-        # other way. Every grid travels with its own weight.
-        gate_up_kernel_weight = torch.stack(
-            (
-                gate_proj_weight.transpose(1, 2).contiguous(),
-                up_proj_weight.transpose(1, 2).contiguous(),
-            ),
+        ) = _on_the_host(*supplied.values())
+        # Each scale grid moves with its weight. Gate and up share a fusion
+        # axis; down keeps contraction-major order. These are host/meta copies.
+        gate_up = torch.stack(
+            (gate_proj_weight.transpose(1, 2), up_proj_weight.transpose(1, 2)),
             dim=2,
-        )
-        gate_up_kernel_grid = torch.stack(
-            (
-                gate_proj_scale.transpose(1, 2).contiguous(),
-                up_proj_scale.transpose(1, 2).contiguous(),
-            ),
+        ).contiguous()
+        gate_up_grid = torch.stack(
+            (gate_proj_scale.transpose(1, 2), up_proj_scale.transpose(1, 2)),
             dim=2,
+        ).contiguous()
+        packed = pack_experts(
+            gate_up.reshape(gate_up.shape[0], gate_up.shape[1], -1),
+            down_proj_weight.transpose(1, 2).contiguous(),
+            gate_up_grid,
+            down_proj_scale.transpose(1, 2).contiguous(),
         )
-        down_kernel_weight = down_proj_weight.transpose(1, 2).contiguous()
-        down_kernel_grid = down_proj_scale.transpose(1, 2).contiguous()
-        rows = int(gate_up_kernel_weight.shape[1])
-        cols = int(gate_up_kernel_weight.shape[3])
-        # One operand per expert, stacked. The expert axis is the caller's loop in
-        # both helpers, and this loop is load-time work rather than forward work.
-        gate_up_scale_operands = torch.stack(
-            [
-                to_gate_up_kernel_scale_operand(gate_up_kernel_grid[expert], rows, cols)
-                for expert in range(int(gate_up_kernel_weight.shape[0]))
-            ]
-        )
-        down_scale_operands = torch.stack(
-            [
-                to_down_kernel_scale_operand(down_kernel_grid[expert], cols, rows)
-                for expert in range(int(down_kernel_weight.shape[0]))
-            ]
-        )
-
-        # ---- THE ONE WRITE TO THE DEVICE. Four operands, four moves, after every
-        # relayout and every producer has run on the host.
-        (
-            gate_up_kernel_weight,
-            gate_up_scale_operands,
-            down_kernel_weight,
-            down_scale_operands,
-        ) = _on_the_device(
-            device,
-            gate_up_kernel_weight,
-            gate_up_scale_operands,
-            down_kernel_weight,
-            down_scale_operands,
-        )
-        prepared = {
-            "gate_up_proj_weight": gate_up_kernel_weight,
-            "gate_up_scale_operands": gate_up_scale_operands,
-            "down_proj_weight": down_kernel_weight,
-            "down_scale_operands": down_scale_operands,
-        }
+        weights, scales = _on_the_device(device, packed.weights, packed.scales)
+        prepared = {"packed_weights": weights, "packed_scales": scales}
         setattr(self, self.PREPARED_KERNEL_OPERANDS_ATTR, prepared)
+        # Packing is a byte permutation. No scale is dropped or merged and
+        # no weight is rescaled. Retain the existing health record's meaning.
         setattr(
             self,
             self.RETILE_HEALTH_ATTR,
-            {
-                "gate": (
-                    gate.emitted_unsupplied,
-                    gate.input_scales_dropped,
-                    gate.inexact_rescales,
-                ),
-                "up": (
-                    up.emitted_unsupplied,
-                    up.input_scales_dropped,
-                    up.inexact_rescales,
-                ),
-                "down": (
-                    down.emitted_unsupplied,
-                    down.input_scales_dropped,
-                    down.inexact_rescales,
-                ),
-            },
+            {name: (0, 0, 0) for name in ("gate", "up", "down")},
         )
         return len(prepared)
 
@@ -2616,7 +2476,7 @@ class Glm5NextRoutedExperts(nn.Module):
         if not prepared:
             raise Glm5NextBlockQuantRouteError(
                 "prepare_scale_operands() has not run; this bank's kernel "
-                "operands are retiled once at load time, never per forward step"
+                "operands are packed once at load time, never per forward step"
             )
         return prepared[name]
 
@@ -2625,8 +2485,8 @@ class Glm5NextRoutedExperts(nn.Module):
     # WHAT THIS METHOD IS: the composition, and nothing else. Every piece it
     # needs is already landed. ``block_quant_expert_mm`` above does the route
     # dispatch, the global-to-local expert mapping, the padding slot and the
-    # kernel call; ``prepare_scale_operands`` built the four operands that method
-    # takes, once, at load time. So this method looks those four up by the names
+    # kernel call; ``prepare_scale_operands`` built the two packed banks that method
+    # takes, once, at load time. So this method looks those banks up by the names
     # that method declares and calls it. It authors no numerics, no layout and no
     # refusal of its own -- a refusal here would be a second authority on an
     # extent the callee already checks, and two refusals on one extent is how
@@ -2683,21 +2543,17 @@ class Glm5NextRoutedExperts(nn.Module):
         return self.block_quant_expert_mm(
             hidden_states=hidden_states,
             expert_affinities=expert_affinities,
-            gate_up_proj_weight=self._prepared_kernel_operand(
-                "gate_up_proj_weight"
-            ),
-            down_proj_weight=self._prepared_kernel_operand("down_proj_weight"),
-            gate_up_scale_operands=self._prepared_kernel_operand(
-                "gate_up_scale_operands"
-            ),
-            down_scale_operands=self._prepared_kernel_operand(
-                "down_scale_operands"
-            ),
+            gate_up_proj_weight=None,
+            down_proj_weight=None,
+            gate_up_scale_operands=None,
+            down_scale_operands=None,
             quant_config=quant_config,
             block_size=block_size,
             moe_group=moe_group,
             tp_degree=tp_degree,
             expert_parallel_rank=expert_parallel_rank,
+            packed_weights=self._prepared_kernel_operand("packed_weights"),
+            packed_scales=self._prepared_kernel_operand("packed_scales"),
             collector=collector,
         )
 

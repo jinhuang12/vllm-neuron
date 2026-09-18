@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "arm": "postbaseline",
+  "contract_sha256": "df470e4526ee8ca311bdf5dc43dc06efa8106626ee1159d0150fa37eac62c9e8",
+  "run_token": "d07c9ba880bd43b4b6f4fa505e17e95c",
+  "container_name": "glm53-full-postbaseline-d07c9ba880bd43b4b6f4fa505e17e95c",
+  "launch_sha256": "8cff120ece764ebd0d063ff5c155c1cc43cbe49108bab8ef750826528df698f9",
+  "fresh_process": true,
+  "model_requests_before_capture": 0,
+  "exclusive_request_owner": "postbaseline_history.py",
+  "prelaunch_neuron_state_sha256": "b0858a1230520b47905a5b6335f2349a55e4a1ef0e9b38b68bf9615c9d649473"
+}

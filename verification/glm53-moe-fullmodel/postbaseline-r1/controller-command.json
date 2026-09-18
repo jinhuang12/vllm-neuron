@@ -1,0 +1,6 @@
+[
+  "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/bin/python",
+  "/home/ubuntu/glm53-moe-fullmodel-20260917/harness/postbaseline_history.py",
+  "--inputs-sha256",
+  "f27f6b2602aabbb608d09e7d6aba7e27bb00eac6cd96aa04f6956767adce9d2a"
+]

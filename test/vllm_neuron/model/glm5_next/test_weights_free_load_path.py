@@ -4,8 +4,8 @@
 A CPU-compile start never loads weights: the runner calls no loader and moves the
 whole module to meta (``neuron_model_runner.py:1358-1367``). A bind for that route
 therefore receives meta operands, and the items here read what it does with them:
-the bind, the whole shape-only load through the real loader, and the two value
-censuses that load walks into. The CPU arm is measured beside the meta one, because
+the bind, the whole shape-only load through the real loader, and preparation
+without value reads. The CPU arm is measured beside the meta one, because
 the load path that ships today must bind exactly as it did.
 """
 
@@ -388,24 +388,23 @@ def test_the_pipelined_load_completes_on_the_shape_only_reader(
 
 
 # --------------------------------------------------------------------------- #
-# (8) Both censuses that read values are reached on the meta pass, and skip.     #
+# (8) Compensation skips value reads, and routed banks pack on meta.           #
 # --------------------------------------------------------------------------- #
-def test_the_meta_pass_reaches_both_value_censuses_and_skips_them(
+def test_the_meta_pass_skips_value_reads_and_packs_routed_banks(
     tmp_path, single_rank_process_group
 ) -> None:
-    """Reached, not merely guarded: the load walks into both and both record it.
+    """The real meta load compensates scales and prepares every routed bank.
 
-    One tree carries both halves: the dense MLP at layer 0 reaches the block-scale
-    compensation through its own scale-grid prep, and the three expert banks reach
-    the retile through theirs. A pass on a tree that reaches neither would read
-    green off code no load had entered.
+    The fused route keeps each 128-wide quantization tile. It does not need the
+    legacy retile census. Its two packed tensors must still exist on meta after
+    the six source tensors have been released.
     """
     from vllm_neuron.functional.moe import blockwise_fp8_retile
     from vllm_neuron.model.glm5_next import weight_loaders_fp8
 
     weight_loaders_fp8.SKIPPED_VALUE_CENSUSES.clear()
     blockwise_fp8_retile.SKIPPED_VALUE_CENSUSES.clear()
-    _meta_load(tmp_path, "census", with_bank=True)
+    model, _reader = _meta_load(tmp_path, "census", with_bank=True)
     compensated = list(weight_loaders_fp8.SKIPPED_VALUE_CENSUSES)
     retiled = list(blockwise_fp8_retile.SKIPPED_VALUE_CENSUSES)
     say("census-skips", f"compensate={len(compensated)}|retile={len(retiled)}")
@@ -414,8 +413,15 @@ def test_the_meta_pass_reaches_both_value_censuses_and_skips_them(
         f"module; the block-scale census reads three numbers before the platform "
         f"gate, so a pass that never reaches it proves nothing"
     )
-    assert retiled.count("retile_block_scales") >= 1, (
-        f"the shape-only load recorded {sorted(set(retiled))} in the retile "
-        f"module; the retile allocates from values it reads, so a pass that never "
-        f"reaches it leaves that branch unread"
-    )
+    assert not retiled, "The fused route must retain the original scale tiles"
+    banks = [module for module in model.modules()
+             if isinstance(module, _impl().Glm5NextRoutedExperts)]
+    assert banks, "This fixture must include routed banks"
+    for bank in banks:
+        prepared = getattr(bank, bank.PREPARED_KERNEL_OPERANDS_ATTR)
+        assert set(prepared) == {"packed_weights", "packed_scales"}
+        assert all(tensor.device.type == "meta" for tensor in prepared.values())
+        assert all(getattr(bank, name) is None for name in bank.RELEASED_AFTER_PREP)
+        assert getattr(bank, bank.RETILE_HEALTH_ATTR) == {
+            name: (0, 0, 0) for name in ("gate", "up", "down")
+        }

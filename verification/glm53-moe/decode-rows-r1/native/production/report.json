@@ -1,0 +1,365 @@
+{
+  "status": "PASS",
+  "baseline_preservation": "PASS",
+  "cpu_oracle_gate": "PASS",
+  "scope": "Prepared routed-expert model forward with device mapping and FP32 combine; no model server",
+  "hidden": 4096,
+  "intermediate": 512,
+  "tokens": 1,
+  "mapping_block": 256,
+  "compact_rows": 1,
+  "local_experts": 18,
+  "global_experts": 36,
+  "top_k": 8,
+  "prepared_operand_count": 2,
+  "released_source_count": 6,
+  "checks": {
+    "bit_exact_to_legacy": true,
+    "both_routes_finite": true,
+    "repeated_inputs_bit_exact": true,
+    "one_compile_per_route": true,
+    "one_fused_dispatch": true,
+    "three_legacy_dispatches": true,
+    "compiled_compact_row_width": true
+  },
+  "fused_row_shapes": [
+    [
+      8,
+      1
+    ]
+  ],
+  "results": [
+    {
+      "case": "mixed_rank0",
+      "ep_rank": 0,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 3.0517578125e-05,
+        "l2": 6.04562041343744e-05,
+        "relative_l2": 0.00022538802820654615,
+        "cosine": 0.9999999746007133,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 3.0517578125e-05,
+        "l2": 6.04562041343744e-05,
+        "relative_l2": 0.00022538802820654615,
+        "cosine": 0.9999999746007133,
+        "outside_tolerance": 0
+      },
+      "repeat_of": null,
+      "repeat_bit_exact": null,
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    },
+    {
+      "case": "changed_affinity_rank0",
+      "ep_rank": 0,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 7.450580596923828e-09,
+        "l2": 7.450580596923828e-09,
+        "relative_l2": 1.3711445458546017e-08,
+        "cosine": 0.9999999999999998,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 7.450580596923828e-09,
+        "l2": 7.450580596923828e-09,
+        "relative_l2": 1.3711445458546017e-08,
+        "cosine": 0.9999999999999998,
+        "outside_tolerance": 0
+      },
+      "repeat_of": null,
+      "repeat_bit_exact": null,
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    },
+    {
+      "case": "mixed_rank1",
+      "ep_rank": 1,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 0.0,
+        "l2": 0.0,
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 0.0,
+        "l2": 0.0,
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "outside_tolerance": 0
+      },
+      "repeat_of": null,
+      "repeat_bit_exact": null,
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    },
+    {
+      "case": "empty_rank1",
+      "ep_rank": 1,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 0.0,
+        "l2": 0.0,
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 0.0,
+        "l2": 0.0,
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "outside_tolerance": 0
+      },
+      "repeat_of": null,
+      "repeat_bit_exact": null,
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    },
+    {
+      "case": "local_top8_rank0",
+      "ep_rank": 0,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 6.103515625e-05,
+        "l2": 9.955028518229975e-05,
+        "relative_l2": 0.000141914424438429,
+        "cosine": 0.9999999899334185,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 6.103515625e-05,
+        "l2": 9.955028518229975e-05,
+        "relative_l2": 0.000141914424438429,
+        "cosine": 0.9999999899334185,
+        "outside_tolerance": 0
+      },
+      "repeat_of": null,
+      "repeat_bit_exact": null,
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    },
+    {
+      "case": "repeat_mixed_rank0",
+      "ep_rank": 0,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 3.0517578125e-05,
+        "l2": 6.04562041343744e-05,
+        "relative_l2": 0.00022538802820654615,
+        "cosine": 0.9999999746007133,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 3.0517578125e-05,
+        "l2": 6.04562041343744e-05,
+        "relative_l2": 0.00022538802820654615,
+        "cosine": 0.9999999746007133,
+        "outside_tolerance": 0
+      },
+      "repeat_of": "mixed_rank0",
+      "repeat_bit_exact": {
+        "compact": true,
+        "legacy": true
+      },
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    },
+    {
+      "case": "repeat_local_top8_rank0",
+      "ep_rank": 0,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 6.103515625e-05,
+        "l2": 9.955028518229975e-05,
+        "relative_l2": 0.000141914424438429,
+        "cosine": 0.9999999899334185,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 6.103515625e-05,
+        "l2": 9.955028518229975e-05,
+        "relative_l2": 0.000141914424438429,
+        "cosine": 0.9999999899334185,
+        "outside_tolerance": 0
+      },
+      "repeat_of": "local_top8_rank0",
+      "repeat_bit_exact": {
+        "compact": true,
+        "legacy": true
+      },
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    },
+    {
+      "case": "repeat_local_top8_rank0_again",
+      "ep_rank": 0,
+      "shape": [
+        1,
+        4096
+      ],
+      "compact_finite": true,
+      "legacy_finite": true,
+      "bit_exact_to_legacy": true,
+      "compact_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 6.103515625e-05,
+        "l2": 9.955028518229975e-05,
+        "relative_l2": 0.000141914424438429,
+        "cosine": 0.9999999899334185,
+        "outside_tolerance": 0
+      },
+      "legacy_cpu_oracle": {
+        "allclose": true,
+        "atol": 1e-05,
+        "rtol": 0.03,
+        "finite": true,
+        "max_abs": 6.103515625e-05,
+        "l2": 9.955028518229975e-05,
+        "relative_l2": 0.000141914424438429,
+        "cosine": 0.9999999899334185,
+        "outside_tolerance": 0
+      },
+      "repeat_of": "local_top8_rank0",
+      "repeat_bit_exact": {
+        "compact": true,
+        "legacy": true
+      },
+      "compile_counts": {
+        "compact": 1,
+        "legacy": 1
+      }
+    }
+  ],
+  "source_sha256": {
+    "vllm_neuron/model/glm5_next/model_fp8.py": "6c8948978030845c83cc11b2acba91f6eca5ae8fa7f5cb119d558687d7494f2d",
+    "vllm_neuron/functional/moe/moe_blockwise.py": "9847d8f80df07cbbf6218ab0284d51ac57fd226424c54d38dcc8409756ad57c0",
+    "vllm_neuron/functional/moe/moe_blockwise_fp8.py": "344d8a2cbcd04a974655ed6edaf3e7cd8d2d06ae15e2f2ccc1f354a33194db7b",
+    "vllm_neuron/functional/moe/moe_fused_fp8.py": "520a0b042eedd7908652db479eef8ae05299d05cbba4649893d598b2be5a4931",
+    "vllm_neuron/functional/moe/fused_fp8.py": "77c69d2eeac52aef609338e1dc4909e1deb70af6075dd682f0b02d0a9d6c61cd",
+    "vllm_neuron/functional/moe/fused_fp8_pack.py": "730c3b5ad4b8d56ea614e754c348155164c915bf5bb21c341f198b4e7b29a70a",
+    "vllm_neuron/functional/moe/fused_fp8_config.py": "a5e4605b4290a6053bb4ced1b7733edb3e965db3a0bb67bc468a0f050092ce3d",
+    "experiments/glm53_moe_nki/verify_decode_rows.py": "ccaa072c36d697c6e52ef3f31614a65d8511762c281154e87fa3a84ea9dd4e31"
+  },
+  "limits": "Fixed CPU gate: atol=1e-5, rtol=3e-2. Baseline agreement does not turn an inherited CPU failure into a pass. No serving or performance claim."
+}

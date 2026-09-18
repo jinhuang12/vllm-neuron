@@ -1,0 +1,17 @@
+{
+  "source_file": "/home/ubuntu/glm53-moe-fullmodel-20260917/artifacts/baseline-r1/repeat-diagnostic-1/request-3.json",
+  "source_sha256": "d423a68e53af41426cea4cf86d12950391c867090f428ae551a230fbaadfb5cb",
+  "body": {
+    "model": "/home/ubuntu/glm53-moe-fullmodel-20260917/models/GLM-5.3-Flash-04c4e9e9",
+    "prompt": "I am gonna keep counting forever, 1 2 3 4 5",
+    "max_tokens": 32,
+    "temperature": 0,
+    "seed": 0,
+    "ignore_eos": true,
+    "logprobs": 5,
+    "return_token_ids": true,
+    "return_tokens_as_token_ids": true,
+    "stream": false
+  },
+  "start_unix": 1789702276.1657097
+}

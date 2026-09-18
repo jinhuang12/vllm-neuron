@@ -1,0 +1,14 @@
+{"status": "PASS", "stage": "CPU-only SDK preflight", "production_tree_sha256": "c366203b7643192407527bec6ff5866cfdf8773ab8bed80a101638aa9abf6c93", "production_file_count": 257, "build_metadata_sha256": {"pyproject.toml": "a3e6e04356653d9ee8ee2672dfdd1b14fb6852ebb19b7eb50b15e0c53888e711", "setup.py": "2ce64d057056c36de2a8d981b13af265fa53dc7e72f3b4df4256e439c89bb3a1"}, "runtime_versions": {"torch": "2.11.0", "vllm": "0.24.0", "transformers": "5.16.1", "tokenizers": "0.23.1", "safetensors": "0.8.0", "huggingface-hub": "1.27.0", "numpy": "2.3.5", "nki": "0.6.0+31049202112.g85070674", "libtorch-neuronx-lite": "2.11.0.1.0.1284+f49d8626", "neuronx-cc": "2.27.5334.0+f702b353", "pydantic": "2.13.4", "msgspec": "0.21.1", "triton": "3.6.0", "sentencepiece": "0.2.2"}, "source_module_origin": "/home/ubuntu/glm53-moe-fullmodel-20260917/pr-snapshot-source/vllm_neuron/__init__.py", "devices_exposed": [], "read_only_mounts": {"/home/ubuntu/glm53-moe-fullmodel-20260917/pr-snapshot-source": true, "/home/ubuntu/glm53-moe-fullmodel-20260917/deps": true, "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0": true, "/opt/aws/neuron": true}, "test_count_expected": 63}
+PYTEST_MODULE_SPEC_ORIGIN=/home/ubuntu/glm53-moe-fullmodel-20260917/pr-snapshot-source/vllm_neuron/__init__.py
+INFO 09-18 03:07:58 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 09-18 03:07:58 [__init__.py:46] - neuron -> vllm_neuron:register
+INFO 09-18 03:07:58 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 09-18 03:07:58 [__init__.py:237] Platform plugin neuron is activated
+2026-09-18 03:07:58,486 - INFO - staged_neff_load.py:105 - neff_load_registered|name=neuron_libtorch|wrapped=libtorch_neuronx_lite.compile.backend.compile|was_registered=False
+2026-09-18 03:07:58,486 - INFO - staged_neff_load.py:105 - neff_load_registered|name=neuron_libtorch|wrapped=libtorch_neuronx_lite.compile.backend.compile|was_registered=False
+2026-09-18 03:07:58,487 - INFO - port_hold_patch.py:205 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-09-18 03:07:58,487 - INFO - port_hold_patch.py:205 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+PYTEST_MODULE_FILE=/home/ubuntu/glm53-moe-fullmodel-20260917/pr-snapshot-source/vllm_neuron/__init__.py
+PYTEST_MODULE_SHA=85297cdbc29bd486c60d8d9e2776f49b1dd7be3a6a699aa07413dca9d78d3aa3
+...............................................................          [100%]
+63 passed, 1840 warnings in 128.83s (0:02:08)

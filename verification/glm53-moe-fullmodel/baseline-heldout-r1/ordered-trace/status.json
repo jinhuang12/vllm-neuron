@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "status": "CAPTURED",
+  "arm": "baseline",
+  "scope": "Exact preservation on this fresh-process ordered trace only; not HF correctness or prompt independence.",
+  "contract_sha256": "df470e4526ee8ca311bdf5dc43dc06efa8106626ee1159d0150fa37eac62c9e8",
+  "driver_sha256": "4c78a0159b19e02bc602db3aca07fd61284faff7d64f807da91c4ee8871dbc0b",
+  "original_AA_repeatability_gate": "FAIL, retained unchanged",
+  "supplement_does_not_pass_original_correctness_gate": true,
+  "started_utc": "2026-09-18T02:30:58.162596+00:00",
+  "completed_requests": 20,
+  "completed_output_tokens": 640,
+  "parts": [
+    {
+      "capture_sha256": "e14ab323222cea4e282476530d8c9e81f790735962c07ad3df329be0e39cfc66",
+      "workload_sha256": "51b27523400b70285602421fa8de17cc01327fd9cf027316a56931b1e04a1f97",
+      "requests": 10,
+      "output_tokens": 320,
+      "raw_sha256": {
+        "request-00.json": "38db08c6a83856c1f7b1a4b17061881ee4b050201d314ece3e30601471c0253a",
+        "request-01.json": "7706ef2fcb1e2527ee360dc9358a9b55a3b9bb2f8c9732fc4fada538dcdca5a8",
+        "request-02.json": "18bf604681289136592a543fc00545bcb0da5c508d7225c80755dbae2512411d",
+        "request-03.json": "ffdce56eeec26997b012d67d956283e2cd765f1afa8598d8b9dbd5b489912dc6",
+        "request-04.json": "7d04aecfd925992803c65c9abbaeb7e5bb2e7bf68187098d44d6418fe1c52496",
+        "request-05.json": "c48282b3cb33447c5d1060ba9cf2d8ff9e530939e20ab3eaa34d392010172543",
+        "request-06.json": "0c046ab6527d522efa02a1ca0ba62ef18adc2fc74535b6485cd6b2d1f0db09b9",
+        "request-07.json": "36bd9756de719f2c285a8131ca4483beb16b52fe74d9642a187e4ee19ce7e1da",
+        "request-08.json": "e8ed6614745c09c26d3aec2d65875114c76e429fb7ed63fe02112c0c286d443d",
+        "request-09.json": "d250a537fa3e80a23e32540494278a20dd1e1f7470f7c002ef85e4c8e7cefd98"
+      }
+    },
+    {
+      "capture_sha256": "fc6ed9e7a31e5cd376c95bea161dc50bee6ad393a1da4db9f5806d509315d945",
+      "workload_sha256": "bd8773f973e9630e261385649e85166a0f17bfcb62b05a1b18798bc15bd7557e",
+      "requests": 10,
+      "output_tokens": 320,
+      "raw_sha256": {
+        "request-00.json": "67ec54b25a1e0cdb734f753bfae91b1c307e59e8679d3b2a7874b56e9ed780a6",
+        "request-01.json": "e1651024a88deaa50fca5fc80c9788ff2e8753f161b7ac353fea33fec9c65c5f",
+        "request-02.json": "58692a5eb379a6e7df32487561f2e231936bda51eb19c6006f9b1393a1e80094",
+        "request-03.json": "f57a3e45577753f49c8d3cafa9d1100f842569c1b16756899af6bbe9a0f919fd",
+        "request-04.json": "344d88db600c24708083561522c388b4c4fcde9c57d7859bac33f1a518cb9927",
+        "request-05.json": "e3673418793e85a8b70597e3b895f2e29ee19b675c2ce0df2cd314cb1f715cbe",
+        "request-06.json": "6fae0681bec204ed3e7bf8ade6df3d9f730aba60b8c46af88baf37493fc4cbd8",
+        "request-07.json": "cc239ba7e0ab1075f3d4008ce1fbf5814a66ccf931c48ee15ec2cd9b7c37ae7d",
+        "request-08.json": "dfbc64e549c6ed27d2852e1fc4367cf9743509f0eac6a8d3eaca42d82ba2c28f",
+        "request-09.json": "e5811bfdb07fd9ac56b4f92ec7cb1b570bb9607a7fa7e8b144202ab7a1687f6d"
+      }
+    }
+  ],
+  "run_token": "ad13ddaaa5d243d1aeedd5dd70df7d94",
+  "container_name": "glm53-full-baseline-ad13ddaaa5d243d1aeedd5dd70df7d94",
+  "finished_utc": "2026-09-18T02:47:20.798080+00:00"
+}

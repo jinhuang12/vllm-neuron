@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "frozen_before_new_captures_utc": "2026-09-18T02:20:01.449548+00:00",
+  "purpose": "Exact preservation of PR4 behavior on one new ordered request trace under matching fresh-process startup. This does not establish HF correctness or prompt independence.",
+  "prior_contract_sha256": "2965fe097dba8f8c6b97e12fedbfaf69aa4549d3462a3dba1255eef92053e924",
+  "prior_results": {
+    "original_AA_repeatability_gate": "FAIL, retained unchanged",
+    "A1_B1": "Exact tokens, finish fields, top-five token sets and raw log probabilities; delta0",
+    "A2_B2": "Exact tokens, finish fields, top-five token sets and raw log probabilities; delta0",
+    "selection_note": "This supplemental test follows observed diagnostic matches. Its twenty new request positions have not been captured on either arm."
+  },
+  "baseline_revision": "c0a7e5394cbbe4bcb8a691f0a56c908234289dc3",
+  "baseline_production_tree_sha256": "5817aa193c3409af726dc699f5fc16c4de8885d1aa6e01b72b1313f00b8f7a08",
+  "candidate_production_tree_sha256": "c366203b7643192407527bec6ff5866cfdf8773ab8bed80a101638aa9abf6c93",
+  "candidate_archive_manifest_sha256": "3e30f6ec46b4f1ca0821dfd1eeb2d7e52cfca357267138c5433cc090d251fb46",
+  "checkpoint_revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+  "checkpoint_target_manifest_sha256": "e8f57b91f30c7a2f319124798c2b8a6ffa40189aa0ca5e56bb8ea8a6f5c34edc",
+  "image_id": "sha256:8b6d8ccd82c10303c7d2c85d76af025d16142912d8bac6642a10dadf8c776d5c",
+  "config_sha256": "8b5baae3f8a0be956f4ed5923c4087b84b7ef6abc73efdf60dee4884fcba3e57",
+  "runtime_versions": {
+    "torch": "2.11.0",
+    "vllm": "0.24.0",
+    "transformers": "5.16.1",
+    "tokenizers": "0.23.1",
+    "safetensors": "0.8.0",
+    "huggingface-hub": "1.27.0",
+    "numpy": "2.3.5",
+    "nki": "0.6.0+31049202112.g85070674",
+    "libtorch-neuronx-lite": "2.11.0.1.0.1284+f49d8626",
+    "neuronx-cc": "2.27.5334.0+f702b353",
+    "pydantic": "2.13.4",
+    "msgspec": "0.21.1",
+    "triton": "3.6.0",
+    "sentencepiece": "0.2.2"
+  },
+  "client_sha256": "e9c64d9584624ee63bf607171b0d89db2f308b13d2049ae8ed420c96f00e434b",
+  "sequence": [
+    {
+      "file": "part-1.jsonl",
+      "sha256": "51b27523400b70285602421fa8de17cc01327fd9cf027316a56931b1e04a1f97",
+      "requests": 10
+    },
+    {
+      "file": "part-2.jsonl",
+      "sha256": "bd8773f973e9630e261385649e85166a0f17bfcb62b05a1b18798bc15bd7557e",
+      "requests": 10
+    }
+  ],
+  "order": [
+    0,
+    0,
+    7,
+    3,
+    9,
+    1,
+    1,
+    6,
+    2,
+    8,
+    4,
+    5,
+    0,
+    5,
+    7,
+    7,
+    2,
+    9,
+    6,
+    3
+  ],
+  "startup": {
+    "fresh_processes": true,
+    "checkpoint_and_source_read_only": true,
+    "same_server_config": true,
+    "same_sdk_and_overlay": true,
+    "use_existing_arm_compile_cache": true,
+    "intrinsic_server_warmup": "Unchanged serving startup from the pinned source/config; retain logs and actual graph identities.",
+    "model_requests_before_capture": "None. Health checks are permitted. No manual probe, benchmark warmup, profiling request, or earlier user request.",
+    "external_request_concurrency": 1
+  },
+  "capture": {
+    "parts_in_order": [
+      1,
+      2
+    ],
+    "reset_between_parts": false,
+    "intervening_model_requests": false,
+    "requests": 20,
+    "output_tokens_per_request": 32,
+    "ignore_eos": true,
+    "temperature": 0,
+    "seed": 0,
+    "logprobs": 5,
+    "raw_prompt_and_generated_token_ids": true,
+    "client": "Use unchanged experiment.py capture with the explicit part file, then the next part."
+  },
+  "comparison": {
+    "client": "Unchanged experiment.py compare, corresponding part1 and part2 only.",
+    "required_fields": "Exact prompt IDs, generated token IDs, finish and stop reasons, top-five token sets, and raw log probabilities.",
+    "logprob_absolute_tolerance": 0.0,
+    "required_passes": 2
+  },
+  "failure_policy": "Retain every attempt. No request retries, prompt replacement, sequence shift, subsequence selection, or resetting between parts. Any request or comparison failure fails this supplemental gate. Record harness failures separately; do not discard them.",
+  "timing_separation": "Use dedicated fresh correctness processes. Do not insert the new held-out prompts before the post-baseline timing control.",
+  "performance_policy": "Retain the original workload,20 warmups,5 cohorts,statistics and thresholds. Replay original baseline prehistory including the five recorded repeat diagnostics before postbaseline timing. Record the original A/B prehistory difference as a control limitation; do not retroactively relabel diagnostic data.",
+  "publish_policy": "A PR may claim exact preservation only on the recorded paired traces if both new comparisons pass. It must retain the original A/A failure and existing HF-accuracy limitation. Repeatable serving speedup still requires the unchanged performance gates, runtime/dispatch/compile evidence, postbaseline control, and independent final review. This supplement does not mark the original correctness gate passed."
+}

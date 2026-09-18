@@ -1,0 +1,16 @@
+{
+  "checks": {
+    "image_id_equal": true,
+    "config_equal": true,
+    "contract_sha_equal": true,
+    "weights_path_equal": true,
+    "deps_path_equal": true,
+    "environment_equal_except_run_paths": true,
+    "server_arguments_equal_except_profile_output": true,
+    "effective_versions_equal": true,
+    "effective_module_hashes_equal": true,
+    "effective_device_paths_equal": true
+  },
+  "pass": true,
+  "scope": "Runtime provenance at process startup; does not establish model correctness or execution."
+}

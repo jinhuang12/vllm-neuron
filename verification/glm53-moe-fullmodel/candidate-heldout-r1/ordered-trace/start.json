@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "status": "RUNNING",
+  "arm": "candidate",
+  "scope": "Exact preservation on this fresh-process ordered trace only; not HF correctness or prompt independence.",
+  "contract_sha256": "df470e4526ee8ca311bdf5dc43dc06efa8106626ee1159d0150fa37eac62c9e8",
+  "driver_sha256": "4c78a0159b19e02bc602db3aca07fd61284faff7d64f807da91c4ee8871dbc0b",
+  "original_AA_repeatability_gate": "FAIL, retained unchanged",
+  "supplement_does_not_pass_original_correctness_gate": true,
+  "started_utc": "2026-09-18T02:49:00.231000+00:00",
+  "completed_requests": 0,
+  "completed_output_tokens": 0,
+  "parts": []
+}

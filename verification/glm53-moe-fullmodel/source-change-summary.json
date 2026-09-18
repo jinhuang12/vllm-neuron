@@ -1,0 +1,22 @@
+{
+  "baseline_commit": "c0a7e5394cbbe4bcb8a691f0a56c908234289dc3",
+  "baseline_production_tree_sha256": "5817aa193c3409af726dc699f5fc16c4de8885d1aa6e01b72b1313f00b8f7a08",
+  "candidate_production_tree_sha256": "c366203b7643192407527bec6ff5866cfdf8773ab8bed80a101638aa9abf6c93",
+  "added": {
+    "vllm_neuron/functional/moe/fused_fp8.py": "77c69d2eeac52aef609338e1dc4909e1deb70af6075dd682f0b02d0a9d6c61cd",
+    "vllm_neuron/functional/moe/fused_fp8_config.py": "a5e4605b4290a6053bb4ced1b7733edb3e965db3a0bb67bc468a0f050092ce3d",
+    "vllm_neuron/functional/moe/fused_fp8_pack.py": "730c3b5ad4b8d56ea614e754c348155164c915bf5bb21c341f198b4e7b29a70a",
+    "vllm_neuron/functional/moe/moe_fused_fp8.py": "520a0b042eedd7908652db479eef8ae05299d05cbba4649893d598b2be5a4931"
+  },
+  "changed": {
+    "vllm_neuron/model/glm5_next/model_fp8.py": {
+      "baseline": "a2a4ef6e2ffe9024cc4bb6b3f1c680af935c8211c020f85badd05089d365ffc9",
+      "candidate": "6c8948978030845c83cc11b2acba91f6eca5ae8fa7f5cb119d558687d7494f2d"
+    }
+  },
+  "removed": [],
+  "manifest_sha256": {
+    "baseline-r1/source-manifest.json": "e75a980283bda5fef9a4eb23d8164987550859db45af8407a758c5ea2ef93f8f",
+    "candidate-r1/source-manifest.json": "b22b8f16bc0277bd8cdf2fbc96f214dbfcfe2762d68b0c59c8adc025e3e232db"
+  }
+}
