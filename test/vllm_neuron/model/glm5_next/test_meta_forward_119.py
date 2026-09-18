@@ -278,8 +278,9 @@ def _drop_the_module_that_takes_its_dispatch_at_import(monkeypatch) -> None:
     Dropped here, the forward's own lazy import takes the dispatch again under the hold, and
     the reading is the same either way.
 
-    IT IS IMPORTED FIRST, before any part of the arm is installed, so that the fixture has the
-    module AT THE REAL BOUNDARY to put back at teardown. ``delitem`` records nothing for a key
+    IT IS IMPORTED FIRST, before the stand-down and the hold below -- the two that its own
+    import could otherwise read -- so that the fixture has the module AT THE REAL BOUNDARY to
+    put back at teardown. ``delitem`` records nothing for a key
     the dict does not hold, so without that import what stays behind is the module this item's
     own late import made, which keeps the holder in a module-level object that neither the undo
     of a ``setattr`` nor the hand-back below can reach.
