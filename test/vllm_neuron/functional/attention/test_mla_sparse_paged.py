@@ -76,6 +76,14 @@ ATOL = 1e-5
 #: table is the widest window this configuration reaches, and page 10 addresses a real page.
 BANK_PAGES = 32
 
+#: THE ONE-ROW OVERLAY'S MAGNITUDE, and why it is not a small number. The reading it has to make is
+#: "this row was read", compared at the band the item's own tolerance allows, roughly rtol times the
+#: output. A row whose value sits inside the bank's own range of [0, 8] carries about the weight its
+#: neighbours carry, moves the weighted output by under one part in a hundred, and is invisible at that
+#: band. Twice the bank's widest value wins the softmax outright -- in the SIGN the head's own query sum
+#: rewards, which is why the row is built from the queries rather than written down here.
+OVERLAY_MAGNITUDE = 16.0
+
 #: The prefill chunk this campaign serves, and the row the chunk overlay starts at -- not a multiple
 #: of the page, so the overlay is read at an offset no page boundary hides.
 CHUNK = 1024
@@ -123,11 +131,34 @@ def _selected(seq: int, window_rows: int, topk: int = TOPK, page: int = PAGE) ->
 
 
 def _interior(selected: torch.Tensor) -> int:
-    """One selected row that is not its page's first or last, so an overlay there is gathered."""
-    for column in selected[0].tolist():
-        if int(column) % PAGE not in (0, PAGE - 1):
-            return int(column)
-    raise AssertionError("every selected row is a page edge, so no overlay row can be read")
+    """The LAST selected row that is not its page's first or last, so the overlay lands deep."""
+    inside = [int(one) for one in selected[0].tolist() if int(one) % PAGE not in (0, PAGE - 1)]
+    assert inside, "every selected row is a page edge, so no overlay row could be read"
+    return inside[-1]
+
+
+def _overlay_row(queries: torch.Tensor) -> torch.Tensor:
+    """This step's one written row, in the sign the first head's query sum puts weight on."""
+    lean = float(queries[0, 0].sum())
+    return torch.full((1, LATENT), OVERLAY_MAGNITUDE if lean > 0 else -OVERLAY_MAGNITUDE,
+                      dtype=torch.float32)
+
+
+def _gathered_rows(table: list[int], selected: torch.Tensor, page: int = PAGE) -> set[int]:
+    """Which BANK rows a table gathers under this selection, as integers.
+
+    The bank row index is the reading, never a bank value: the values are the row index divided by a
+    power of two, so reading one and truncating it to an integer collapses whole pages onto one number
+    and makes two different gathers look identical.
+    """
+    window = [max(entry, 0) * page + inside for entry in table for inside in range(page)]
+    return {window[int(column)] for column in selected[0].tolist()}
+
+
+def _chunk_rows() -> torch.Tensor:
+    """The prefill chunk this step writes, one distinguishable row each, below the bank's range."""
+    held = torch.arange(CHUNK, dtype=torch.float32).reshape(CHUNK, 1).expand(CHUNK, LATENT)
+    return (held * (-LATENT / SPREAD) - 1.0).contiguous()
 
 
 def _paged(bank, table, selected, queries, written=None, write_offset=None, page: int = PAGE):
@@ -321,7 +352,7 @@ def test_overlay_of_one_written_row_is_what_the_gather_reads() -> None:
     queries = _queries(1, HEADS, LATENT)
     selected = _selected(1, len(table) * PAGE)
     at = _interior(selected)
-    written = torch.full((1, LATENT), -1.5, dtype=torch.float32)
+    written = _overlay_row(queries)
     window = _window(bank, table).index_copy(0, torch.tensor([at]), written)
     stale = _oracle(_window(bank, table), selected, queries)
     got = _paged(bank, table, selected, queries, written, torch.tensor([[at]], dtype=torch.int32))
@@ -353,8 +384,7 @@ def test_overlay_of_a_whole_prefill_chunk_is_what_the_gather_reads() -> None:
     """
     bank = _bank()
     table = list(range(BANK_PAGES))
-    written = torch.arange(CHUNK, dtype=torch.float32).reshape(CHUNK, 1).expand(CHUNK, LATENT)
-    written = (written * (-LATENT / SPREAD) - 1.0).contiguous()
+    written = _chunk_rows()
     rows = torch.arange(CHUNK_AT, CHUNK_AT + CHUNK)
     window = _window(bank, table).index_copy(0, rows, written)
     queries = _queries(1, 1, LATENT)
@@ -420,9 +450,8 @@ def test_this_files_numbers_make_the_items_above_able_to_fail() -> None:
     bank = _bank()
     queries = _queries(1, HEADS, LATENT)
     forward = _selected(1, 2 * PAGE)
-    rows = forward[0].to(torch.int64)
-    ascending = {int(one) for one in _window(bank, [5, 10])[rows][:, 0]}
-    swapped = {int(one) for one in _window(bank, [10, 5])[rows][:, 0]}
+    ascending = _gathered_rows([5, 10], forward)
+    swapped = _gathered_rows([10, 5], forward)
     edges = [index * PAGE + inside for index in range(BANK_PAGES) for inside in (0, PAGE - 1)]
     wide_selected = _selected(1, BANK_PAGES * PAGE)
     uncovered = [one for one in edges if one not in wide_selected[0].tolist()]
@@ -432,20 +461,19 @@ def test_this_files_numbers_make_the_items_above_able_to_fail() -> None:
     masked[:, TOPK // 2:] = MS.SENTINEL_INDEX
     sentinel = _oracle(window, masked, queries)
     at = _interior(forward)
-    one_row = window.index_copy(0, torch.tensor([at]),
-                                torch.full((1, LATENT), -1.5, dtype=torch.float32))
+    one_row = window.index_copy(0, torch.tensor([at]), _overlay_row(queries))
     overlay = _oracle(one_row, forward, queries)
     wide_window = _window(bank, list(range(BANK_PAGES)))
-    chunk = torch.arange(CHUNK, dtype=torch.float32).reshape(CHUNK, 1).expand(CHUNK, LATENT)
-    chunk = (chunk * (-LATENT / SPREAD) - 1.0).contiguous()
+    chunk = _chunk_rows()
     wide_queries = _queries(1, 1, LATENT)
     wide_plain = _oracle(wide_window, wide_selected, wide_queries)
     wide_overlaid = _oracle(
         wide_window.index_copy(0, torch.arange(CHUNK_AT, CHUNK_AT + CHUNK), chunk),
         wide_selected, wide_queries)
-    gathered = window[rows]
+    gathered = window[forward[0].to(torch.int64)]
     nearest = float((gathered - plain[0, 0]).abs().max(dim=1).values.min())
     _say("DATA_SWAP_ROWS_DIFFER", len(ascending ^ swapped))
+    _say("DATA_OVERLAY_ONE_AT", at)
     _say("DATA_PAGE_EDGES_UNCOVERED", len(uncovered))
     _say("DATA_SENTINEL_APART", f"{float((sentinel - plain).abs().max()):.3e}")
     _say("DATA_OVERLAY_ONE_APART", f"{float((overlay - plain).abs().max()):.3e}")
