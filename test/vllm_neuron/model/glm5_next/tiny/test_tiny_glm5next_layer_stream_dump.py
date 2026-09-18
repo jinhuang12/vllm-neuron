@@ -450,12 +450,25 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
                 )
                 continue
             if suffix == "latent_written":
-                # THE ORACLE IS THE PROJECTION'S OWN RETURN, which is only what the write carries
-                # while nothing is gathered: a padded chunk collapses its rows onto the last real
-                # one, and this fixture must not be padding if this comparison is to mean anything.
-                assert not tapped[tap]["_clamped"], (
-                    f"this prefill padded its chunk, so the write gathered its rows and the "
-                    f"projection's own return is no longer the tensor it wrote"
+                # THE ORACLE IS THE PROJECTION'S OWN RETURN, which is what the write carried only
+                # while no row was collapsed onto another. A BINDING clamp repeats the last real
+                # slot, so the slots the write named are consecutive exactly when nothing was
+                # gathered -- and that is read from the sibling file rather than from the clamp
+                # argument, which can be present and still bind nothing at all.
+                named = _dumped(save_dir, tap, "write_rows")
+                gathered = not torch.equal(
+                    named,
+                    torch.arange(
+                        int(named[0]), int(named[0]) + int(named.numel()), dtype=named.dtype
+                    ),
+                )
+                print(f"TINYDUMP|latent_written_precondition|layer={tap}"
+                      f"|rows_gathered={gathered}|clamp_argument_given="
+                      f"{bool(tapped[tap]['_clamped'])}")
+                assert not gathered, (
+                    f"the write collapsed rows onto one another, so the projection's own return "
+                    f"is no longer the tensor it wrote and this comparison would read a gather "
+                    f"as a defect"
                 )
             want = tapped[tap]["attention_output" if suffix == "o_proj_reduced" else suffix]
             want = want.to(table.dtype) if suffix == "mlp_output" else want
