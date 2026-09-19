@@ -617,6 +617,12 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     # Both of these take the UNCHECKED cores, for the tracer reason written on
     # them. `_require_blocks_admissible` on the seam is what refuses a bad shape.
     col_goal = _column_target_unchecked(int(rows_per_block), int(cols_per_block))
+    # Decode uses one token block per call. Keep larger token batches on the
+    # SDK default so prefill and boundary shapes retain the compiler-selected
+    # engine placement that existing coverage exercises.
+    block_scalar_engine = (
+        nisa.vector_engine if int(t_extent) == 1 else nisa.unknown_engine
+    )
 
     out = nl.ndarray(
         (t_extent, rows_per_block, cols_per_block),
@@ -688,16 +694,17 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
                 )
                 nisa.tensor_scalar(
                     dst=row_den[idx][i], data=r_sum, op0=nl.add,
-                    operand0=SINKHORN_DENOM_EPS,
+                    operand0=SINKHORN_DENOM_EPS, engine=block_scalar_engine,
                 )
                 nisa.reciprocal(dst=row_scale[idx][i], data=row_den[idx][i])
                 nisa.tensor_scalar(
                     dst=row_scale[idx][i], data=row_scale[idx][i],
                     op0=nl.multiply, operand0=float(row_goal),
+                    engine=block_scalar_engine,
                 )
                 nisa.tensor_scalar(
                     dst=work[idx][i], data=work[idx][i], op0=nl.multiply,
-                    operand0=row_scale[idx][i],
+                    operand0=row_scale[idx][i], engine=block_scalar_engine,
                 )
 
             # ---- column pass. A block's column sum runs over its ROWS, which
@@ -714,12 +721,12 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
                 )
             nisa.tensor_scalar(
                 dst=col_sum[idx], data=col_sum[idx], op0=nl.add,
-                operand0=SINKHORN_DENOM_EPS,
+                operand0=SINKHORN_DENOM_EPS, engine=block_scalar_engine,
             )
             nisa.reciprocal(dst=col_scale[idx], data=col_sum[idx])
             nisa.tensor_scalar(
                 dst=col_scale[idx], data=col_scale[idx], op0=nl.multiply,
-                operand0=float(col_goal),
+                operand0=float(col_goal), engine=block_scalar_engine,
             )
             for i in range(rows_per_block):
                 nisa.tensor_tensor(

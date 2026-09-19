@@ -1333,6 +1333,85 @@ def test_blocks_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
     )
 
 
+def test_blocks_kernel_engine_scope_is_decode_only() -> None:
+    """The explicit Vector engine is only the T=1 decode branch.
+
+    Larger token batches must keep the SDK default engine choice so prefill and
+    boundary shapes do not inherit a decode-only profile decision. This is a
+    source-level guard because CPU simulator numerics cannot observe engine
+    placement.
+    """
+    module = sys.modules[_MODULE]
+    tree = ast.parse(pathlib.Path(module.__file__).read_text())
+    [fn] = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sinkhorn_blocks_kernel"
+    ]
+    assignments = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "block_scalar_engine"
+                for target in node.targets)
+    ]
+    assert len(assignments) == 1
+    value = assignments[0].value
+    assert isinstance(value, ast.IfExp)
+    assert ast.unparse(value.test) == "int(t_extent) == 1"
+    assert ast.unparse(value.body) == "nisa.vector_engine"
+    assert ast.unparse(value.orelse) == "nisa.unknown_engine"
+
+    engine_sites = []
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Call) and ast.unparse(node.func) == "nisa.tensor_scalar"):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "engine":
+                engine_sites.append(ast.unparse(keyword.value))
+    assert engine_sites == ["block_scalar_engine"] * 5
+
+
+@pytest.mark.parametrize(
+    ("tokens", "streams", "iters", "changed_path"),
+    [
+        (1, MHC_STREAMS, SINKHORN_ITERS, True),
+        (1, 2, 1, True),
+        (2, MHC_STREAMS, SINKHORN_ITERS, False),
+        (127, 2, 1, False),
+        (128, 2, 1, False),
+        (129, 2, 1, False),
+        (1024, 2, 1, False),
+    ],
+)
+def test_blocks_kernel_decode_branch_and_prefill_boundaries_match_oracle(
+    tokens: int, streams: int, iters: int, changed_path: bool,
+) -> None:
+    """Changed T=1 and unchanged T>1 shapes keep the same Sinkhorn result.
+
+    The changed cases are the decode branch that will need native bitwise proof.
+    The T>1 cases are boundary guards for the unchanged automatic-engine path.
+    """
+    rng = torch.Generator().manual_seed(530919 + tokens * 17 + streams * 31 + iters)
+    logits = torch.randn(tokens, streams, streams, generator=rng)
+    blocks = torch.softmax(logits, dim=-1) + SINKHORN_DENOM_EPS
+
+    reset_dispatch_counters()
+    label = f"blocks-engine-T{tokens}-S{streams}-I{iters}"
+    with _SimulatorCounter() as sim:
+        got = sinkhorn_normalise_blocks(blocks, iters=iters).to(torch.float32)
+    reading = _assert_route(sim, 1, label)
+    path = "changed-decode" if changed_path else "unchanged-default"
+    print(f"[{label}] path={path} {reading}")
+
+    want = _blocks_oracle_authored_here(blocks, iters=iters)
+    abs_err = float((got - want).abs().max())
+    rel_err = float(((got - want).abs() / (want.abs() + ATOL)).max())
+    print(
+        f"[{label}] max_abs_error={abs_err:.6e} max_rel_error={rel_err:.6e} "
+        f"rtol={RTOL} atol={ATOL}"
+    )
+    torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
+
+
 def test_the_blocks_seam_has_no_torch_path_at_all(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
