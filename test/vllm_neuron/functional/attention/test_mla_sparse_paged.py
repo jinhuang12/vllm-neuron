@@ -2,14 +2,16 @@
 """Acceptance for the paged latent window: the sparse attention kernel assembles its window from a
 block table instead of slicing one ascending run of blocks out of the latent bank.
 
-TWELVE tests and NO `parametrize` decorator. Four carry `table` in their name and read the four block
-layouts the design declares -- two scattered rows in either order, a row with a padding tail, and a
+FOURTEEN tests and NO `parametrize` decorator. Four carry `table` in their name and read four block
+layouts -- two scattered rows in either order, a row with a padding tail, and a
 full-length row. One carries `identical` and reads the consecutive table. One carries `sentinel`. Two
 carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. One reads a
 second block size, so a body that hardcodes the served one fails. One reads that a selected row past the
 staged window is refused against the WINDOW's length and not the bank's. One puts a scattered table, a
-padding tail and an overlay in a single call, which no other item combines. The last calls no kernel: it reads
-that this file's own numbers can see what the items above claim to see.
+padding tail and an overlay in a single call, which no other item combines. One reads a page WIDER than
+one staging piece, so a body that stages a page in one transfer fails. One reads the row-tiled body,
+which is the body a served top-k reaches and which the twelve items before it never enter. The last
+calls no kernel: it reads that this file's own numbers can see what the items above claim to see.
 
 EVERY WINDOW CLAIM IS MADE TWICE, ONE EXACT AND ONE A TOLERANCE. The exact claim is against the
 UNPAGED call on the window the table names: the same window through the same kernel must return the
@@ -100,7 +102,7 @@ BANK_PAGES = 32
 #: written down here.
 OVERLAY_MAGNITUDE = 16.0
 
-#: The prefill chunk this campaign serves, and the row the chunk overlay starts at -- not a multiple
+#: The served prefill chunk, and the row the chunk overlay starts at -- not a multiple
 #: of the page, so the overlay is read at an offset no page boundary hides.
 CHUNK = 1024
 CHUNK_AT = 3000
@@ -243,7 +245,7 @@ def _read_one_table(table: list[int], heads: int = HEADS) -> None:
     assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
         f"the paged window disagrees with the oracle on table {table}: worst absolute difference "
         f"{worst:.3e} against rtol={RTOL} atol={ATOL}. A window assembled at the wrong page offset "
-        f"reads another sequence's latents, which is the defect this increment exists to remove"
+        f"reads another sequence's latents, which is the defect the block table removes"
     )
     assert torch.equal(got, unpaged), (
         f"the paged call on table {table} and the unpaged call on the window it names returned "
