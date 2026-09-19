@@ -19,6 +19,11 @@ TWO tests, one per conjunct, and NO ``parametrize``:
   2. the same call with the pad removed is REFUSED, which is what makes test 1 a reading rather than a
      habit: a venue that had lost the bound would take the kernel with the pad or without it.
 
+WHERE THE BOUND BINDS, counted once: at the served block of 4,096 with ``max_model_len`` 4,096 a step
+writes at most one 1,024-row prefill chunk and never reaches the window's last row, while at a 128-row
+block a step that fills its pages does reach it -- and both are staged INSIDE the tile, because the pad
+is on the tile and not on the step.
+
 BOTH ITEMS READ A TRACE AND NO VALUE, so the latent rank here is the kernel's own tile width and the
 values of the staged window are read at the served rank by ``test_mla_sparse_paged.py``. Every bank is
 two pages WIDER than its window, as every bank in this tree is: a bank the size of its window puts the

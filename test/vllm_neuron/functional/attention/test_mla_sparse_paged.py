@@ -6,8 +6,8 @@ SIXTEEN tests and NO `parametrize` decorator. Four carry `table` in their name a
 layouts -- two scattered rows in either order, a row with a padding tail, and a
 full-length row. One carries `identical` and reads the consecutive table. One carries `sentinel`. Two
 carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. One reads an
-overlay whose rows FILL the window, at two widths the staging writes in ONE transfer, and one fills a
-window that takes TWO transfers, so the second lands at a runtime row offset. One reads a
+overlay whose rows FILL the window, at three widths -- two the staging writes in ONE transfer and the
+SERVED block, which takes 32 -- and one fills a window of TWO transfers. One reads a
 second block size, so a body that hardcodes the served one fails. One reads that a selected row past the
 staged window is refused against the WINDOW's length and not the bank's. One puts a scattered table, a
 padding tail and an overlay in a single call, which no other item combines. One reads a page WIDER than
@@ -94,6 +94,13 @@ ATOL = 1e-5
 #: The bank holds thirty-two pages: the served model length over the served block, so a full-length
 #: table is the widest window this configuration reaches, and page 10 addresses a real page.
 BANK_PAGES = 32
+
+#: THE SERVED BLOCK SIZE, and a bank of two of them. One item stages a whole served block, which the
+#: staging writes in 32 transfers of 128 rows, so a reading that only ever fills a single transfer's
+#: worth of window cannot stand for the served geometry. The bank is counted in `PAGE` rows, as
+#: `_bank` counts, and two served blocks are 64 of them.
+PAGE_SERVED = 4096
+SERVED_BANK_PAGES = 2 * PAGE_SERVED // PAGE
 
 #: THE ONE-ROW OVERLAY'S MAGNITUDE, and why it is not a small number. The reading it has to make is
 #: "this row was read", compared at the band the item's own tolerance allows, roughly rtol times the
@@ -459,25 +466,27 @@ def test_overlay_of_a_whole_prefill_chunk_is_what_the_gather_reads() -> None:
 
 
 def test_an_overlay_that_fills_the_window_is_read_row_for_row() -> None:
-    """An overlay whose rows FILL the staged window, at two window widths, read against one-step torch.
+    """An overlay whose rows FILL the staged window, at three widths, read against one-step torch.
 
-    CERTIFYING COMPONENT: the boundary the staging splits. A destination pattern covering every row of
-    the window from a runtime offset cannot be shown to land inside the window, so the staging writes
-    such an overlay in two chunks instead of one. BOTH ARMS SIT ON THAT BOUNDARY -- a window of one
-    128-row page, split 127 rows then 1, and a window of 64 rows, narrower than the staging piece,
-    split 63 then 1 -- and each is compared with the window torch builds by writing the same rows in
-    ONE step, so a split that dropped, repeated or misplaced a row cannot pass. The window's LAST row
-    is selected in both arms, which is the row the one-row chunk carries.
+    CERTIFYING COMPONENT: the boundary the staged pad answers. A step whose rows reach the window's
+    LAST row puts the overlay's destination end on the tile's end, which the traced venue reads as one
+    element past it; the tile therefore carries pad rows no body reads. ALL THREE ARMS SIT ON THAT
+    BOUNDARY -- a window of one 128-row page, one of 64 rows, narrower than a staging transfer, and one
+    of THE SERVED BLOCK, 4,096 rows filled by 32 transfers -- and each is compared with the window torch
+    builds by writing the same rows in ONE step, so a transfer that dropped, repeated or misplaced a row
+    cannot pass. The window's LAST row is selected in every arm, which is the row the bound is about.
     """
-    for page, entry in ((PAGE, 7), (PAGE_ALT, 5)):
-        bank = _bank()
+    for page, entry, pages in ((PAGE, 7, BANK_PAGES), (PAGE_ALT, 5, BANK_PAGES),
+                               (PAGE_SERVED, 1, SERVED_BANK_PAGES)):
+        bank = _bank(pages)
         table = [entry]
         width = page
         down = torch.arange(width, dtype=torch.float32).reshape(width, 1).expand(width, LATENT)
         written = (down * (-LATENT / SPREAD) - 1.0).contiguous()
         window = _window(bank, table, page=page).index_copy(0, torch.arange(width), written)
         queries = _queries(1, 1, LATENT)
-        columns = [pick % width for pick in range(TOPK)]
+        columns = [(pick * max(1, width // TOPK)) % width for pick in range(TOPK)]
+        columns[-1] = width - 1
         selected = torch.tensor([columns], dtype=torch.int32)
         got = _paged(bank, table, selected, queries, written,
                      torch.tensor([[0]], dtype=torch.int32), page=page)
