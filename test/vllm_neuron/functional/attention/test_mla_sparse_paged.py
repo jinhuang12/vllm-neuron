@@ -58,6 +58,13 @@ PAGE_ALT = 64
 #: number itself. The served interim block is 4,096, which is 32 pieces; every other item here is one.
 PAGE_WIDE = 256
 
+#: A SELECTED-ROW COUNT PAST THE MOVING TILE WIDTH, which is what routes a call to the row-tiled body.
+#: Every item above runs at `TOPK` and reaches the untiled body; the served indexer emits 2,048, so the
+#: row-tiled body is the one production takes, and it loads the window in its own way.
+TOPK_ROWS = 1024
+STREAMED_TABLE = [7, 2]
+STREAMED_OVERLAY_AT = 200
+
 #: THE SPREAD OF THE BANK'S VALUES IS LOAD-BEARING. The bank numbers its own rows, and an unscaled row
 #: index reaches 2 ** 21, which drives every score so far apart that the softmax becomes one weight of
 #: 1 and 127 of 0. Under that weighting the output is a copy of ONE gathered row, and an item that
@@ -560,6 +567,74 @@ def test_a_scattered_table_a_padding_tail_and_an_overlay_in_one_call() -> None:
     assert not torch.allclose(got, stale, rtol=RTOL, atol=ATOL), (
         "the overlay moved nothing in the combined call, so this item would pass on a kernel that "
         "stages the pages over this step's own rows"
+    )
+
+
+def _rows_selected(window_rows: int, topk: int = TOPK_ROWS) -> torch.Tensor:
+    """`topk` columns over a shorter window: every row read, most of them more than once."""
+    stride = 7
+    return torch.tensor([[(pick * stride) % window_rows for pick in range(topk)]], dtype=torch.int32)
+
+
+def _staged_path(bank, table, selected, queries, written=None, at=None):
+    """The same paged call through the entry point, on the STAGED load path instead of the streamed one.
+
+    Ten positional operands: the four the entry always took, the four paged ones, then the two tile
+    parameters this base declares after them. The tile width keeps its default, so the load path is the
+    only difference from the seam's own call.
+    """
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    return wrap_nki(MS.mla_sparse_attention_nope_row_tiled_kernel)(
+        queries, bank, selected, float(SCALE),
+        torch.tensor([[entry] for entry in table], dtype=torch.int32),
+        written, at, PAGE, MS.MOVING_MAX, False)
+
+
+def test_the_row_tiled_body_reads_the_staged_window_the_same_way() -> None:
+    """The body PRODUCTION takes reads the staged window, and reads it the same as every other path.
+
+    CERTIFYING COMPONENT: the row-tiled body's own load. It gathers selected rows out of the cache
+    operand with an indirect DMA instead of transposing the cache, so with a paged call that gather
+    reads a window staged in private memory. Every item above runs at a selected-row count inside one
+    moving tile and reaches the untiled body, which never does that.
+
+    THREE READINGS, each exact. Against the unpaged call on the window the table names; against the same
+    paged call on this body's other load path, which stages the window it is handed; and with one row
+    overlaid, against the overlaid window. A refusal here is a question about where the window may be
+    staged, and it is reported rather than worked around.
+    """
+    bank = _bank()
+    table = STREAMED_TABLE
+    queries = _queries(1, HEADS, LATENT)
+    window = _window(bank, table)
+    selected = _rows_selected(window.shape[0])
+    overlay = _overlay_row(queries)
+    overlaid = window.clone()
+    overlaid[STREAMED_OVERLAY_AT] = overlay[0]
+    at = torch.tensor([[STREAMED_OVERLAY_AT]], dtype=torch.int32)
+    got = _paged(bank, table, selected, queries)
+    unpaged = _unpaged(window, selected, queries)
+    staged = _staged_path(bank, table, selected, queries)
+    written = _paged(bank, table, selected, queries, written=overlay, write_offset=at)
+    _say("ROW_TILED_TOPK", TOPK_ROWS)
+    _say("ROW_TILED_UNPAGED_MAX_ABS_DIFF", float((got - unpaged).abs().max()))
+    _say("ROW_TILED_STAGED_MAX_ABS_DIFF", float((got - staged).abs().max()))
+    assert TOPK_ROWS > MS.MOVING_MAX, (
+        f"topk={TOPK_ROWS} does not reach the row-tiled body, so this item reads the same body as "
+        f"every item above it"
+    )
+    assert torch.equal(got, unpaged), (
+        "the row-tiled body returned different bytes for the paged window and for the unpaged call on "
+        "the window the table names, so streaming out of the staged window is not the same load"
+    )
+    assert torch.equal(got, staged), (
+        "the row-tiled body's two load paths disagree on one window: the streamed gather and the "
+        "staged transpose returned different bytes"
+    )
+    assert torch.equal(written, _unpaged(overlaid, selected, queries)), (
+        "with one row overlaid, the row-tiled body and the unpaged call on the overlaid window "
+        "returned different bytes, so the overlay is not what the streamed gather reads"
     )
 
 
