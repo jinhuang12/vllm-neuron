@@ -3433,7 +3433,6 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
         start_position=0,
         softmax_scale=MLA_SOFTMAX_SCALE,
         max_seq_len=MLA_TOKENS,
-        page_size=MLA_PAGE_SIZE,
         slot_mapping=operands["slot_mapping"],
         **paged_operands(latent_cache, 0, int(normed.shape[0]), page=MLA_PAGE_SIZE),
     )
@@ -3538,7 +3537,6 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
             start_position=0,
             softmax_scale=MLA_SOFTMAX_SCALE,
             max_seq_len=MLA_TOKENS,
-            page_size=MLA_PAGE_SIZE,
             slot_mapping=operands["slot_mapping"],
             **paged_operands(
                 _mla_latent_cache(attention), 0, int(normed.shape[0]),
@@ -3579,7 +3577,6 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
             start_position=0,
             softmax_scale=MLA_SOFTMAX_SCALE,
             max_seq_len=MLA_TOKENS,
-            page_size=MLA_PAGE_SIZE,
             slot_mapping=operands["slot_mapping"],
             **paged_operands(
                 _mla_latent_cache(attention), 0, int(normed.shape[0]),

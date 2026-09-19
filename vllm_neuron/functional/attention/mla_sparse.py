@@ -270,21 +270,26 @@ STAGE_ROWS = LATENT_TILE
 
 
 def _clamped_page(table_hbm, entry: int):
-    """A ``[1, 1]`` int32 tile holding ``block_table[entry]``, the -1 pad clamped onto page 0."""
-    raw = _sbuf_i32(1, 1)
+    """A ``[1, 1]`` int32 tile holding ``block_table[entry]``, the -1 pad clamped onto page 0.
+
+    Each tile is declared a whole 32-byte line wide and one column of it is used, the width
+    the transposes' own tiles take: the allocator packs tiles back to back per partition, so
+    a four-byte row would move every tile placed after it off the line.
+    """
+    raw = _sbuf_i32(1, _aligned(1))[:, 0:1]
     nisa.dma_copy(dst=raw, src=table_hbm.ap(pattern=[[1, 1], [1, 1]], offset=entry))
-    floor = _sbuf_i32(1, 1)
+    floor = _sbuf_i32(1, _aligned(1))[:, 0:1]
     nisa.memset(dst=floor, value=SENTINEL_INDEX)
-    live = _sbuf_i32(1, 1)
+    live = _sbuf_i32(1, _aligned(1))[:, 0:1]
     nisa.tensor_tensor(dst=live, data1=floor, data2=raw, op=nl.less)
-    held = _sbuf_i32(1, 1)
+    held = _sbuf_i32(1, _aligned(1))[:, 0:1]
     nisa.tensor_tensor(dst=held, data1=raw, data2=live, op=nl.multiply)
     return held
 
 
 def _piece_of_page(page, pieces: int, piece: int):
     """A ``[1, 1]`` int32 tile holding ``page * pieces + piece``: which whole piece of the bank to read."""
-    held = _sbuf_i32(1, 1)
+    held = _sbuf_i32(1, _aligned(1))[:, 0:1]
     nisa.tensor_scalar(dst=held, data=page, op0=nl.multiply, operand0=pieces)
     nisa.tensor_scalar(dst=held, data=held, op0=nl.add, operand0=piece)
     return held
@@ -292,7 +297,7 @@ def _piece_of_page(page, pieces: int, piece: int):
 
 def _write_row(offset_hbm, ahead: int):
     """A ``[1, 1]`` int32 tile holding this step's own write row, plus ``ahead`` rows."""
-    held = _sbuf_i32(1, 1)
+    held = _sbuf_i32(1, _aligned(1))[:, 0:1]
     nisa.dma_copy(dst=held, src=offset_hbm.ap(pattern=[[1, 1], [1, 1]], offset=0))
     if ahead > 0:
         nisa.tensor_scalar(dst=held, data=held, op0=nl.add, operand0=ahead)

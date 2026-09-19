@@ -704,7 +704,21 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
             f"layer {index}'s runner-built carrier LOST {sorted(set(want) - set(got))}, "
             f"which the landed prefill carrier declares"
         )
-        assert tuple(got["latent_cache"].shape) == tuple(want["latent_cache"].shape)
+        # RE-PINNED: the reading this replaces, verbatim: "the runner-built cache has the
+        # landed carrier's shape". Both sides hand the WHOLE bank they allocated now, and the
+        # two banks differ on purpose, so the row's own geometry is read against the landed
+        # carrier and the row COUNT against this file's own bank.
+        assert tuple(got["latent_cache"].shape[1:]) == tuple(
+            want["latent_cache"].shape[1:]), (
+            f"layer {index}'s runner-built cache has rows shaped "
+            f"{tuple(got['latent_cache'].shape[1:])} where the landed carrier's rows are "
+            f"{tuple(want['latent_cache'].shape[1:])}"
+        )
+        assert int(got["latent_cache"].shape[0]) == E2E_BANK_BLOCKS * item.MLA_PAGE_SIZE, (
+            f"layer {index}'s runner-built cache holds {int(got['latent_cache'].shape[0])} "
+            f"row(s) where this file's bank holds "
+            f"{E2E_BANK_BLOCKS * item.MLA_PAGE_SIZE}; the carrier hands the whole bank"
+        )
         # RE-PINNED (D17.1): ORIGINAL READING `int(got["start_position"])`, one
         # number for every family. NEW VALUE: the LINEAR family's position is ONE
         # int32 tensor with a row per request, while the SPARSE family's stays a

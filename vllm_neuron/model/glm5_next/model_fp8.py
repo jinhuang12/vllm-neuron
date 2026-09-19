@@ -7434,8 +7434,10 @@ class Glm5NextMLAAttention(nn.Module):
         if collector is not None:
             # ONE ENTRY, as before: the dump's names are positional, so a second tap here
             # would rename every tensor after it. This is the tensor the seam gathers
-            # from, which is the bank now rather than a window of it.
-            collector.append(c_kv)
+            # from, which is the bank now rather than a window of it. A COPY, because the
+            # bank is the caller's and a later step writes into it: a view would make the
+            # dump report the bank as it is when the files are written, not at this tap.
+            collector.append(c_kv.detach().clone())
 
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention

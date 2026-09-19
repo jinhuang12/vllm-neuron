@@ -2576,7 +2576,6 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
                 start_position=start,
                 softmax_scale=SOFTMAX_SCALE,
                 max_seq_len=PREFILL_TOKENS if phase == "prefill" else PREFILL_TOKENS + 1,
-                page_size=PAGE_SIZE,
                 slot_mapping=kwargs.get("slot_mapping"),
                 tail=None if phase == "prefill" else caches["tail"],
                 position=kwargs.get("position"),
