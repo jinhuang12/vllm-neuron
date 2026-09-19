@@ -304,24 +304,24 @@ def _write_row(offset_hbm, ahead: int):
     return held
 
 
-def _overlay_chunk(window: int) -> int:
-    """How many window rows one overlay transfer writes: capped one row short of the window.
-
-    THE OVERLAY NEVER WRITES THE WINDOW IN ONE WHOLE-ROW PATTERN. Its destination row is a runtime
-    value, so a pattern covering every row of the window cannot be shown to land inside it, and the
-    traced venue reads such a pattern as one element past the end. Only a step whose rows FILL its
-    window is split by this cap, and at the served block size no step ever does.
-    """
-    if STAGE_ROWS < window:
-        return STAGE_ROWS
-    return window - 1 if window > 1 else 1
+#: Rows the staged window carries BEYOND the window itself, never read by any body.
+#:
+#: The overlay's destination row is a runtime value, and the traced venue reads such a pattern's END
+#: as an index into the staged tile: a step whose rows fill the window reaches one element past the
+#: tile and is refused there, whatever width the transfers are chunked at. These rows put that end
+#: inside the tile at every window and step. The pad is a whole :data:`STAGE_ALIGN` block rather than
+#: one row because the bodies size their own SBUF tiles from this tile's row count, where 16 rows of a
+#: two- or four-byte dtype are whole 32-byte lines.
+STAGE_PAD = STAGE_ALIGN
 
 
 def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int):
     """Assemble the window a block table names in HBM, with this step's own rows overlaid on top.
 
-    The returned ``[pages * page_size, latent]`` tile is read by the bodies exactly as an unpaged cache
-    is: the page assembly is a re-addressing of one load and changes nothing downstream of it.
+    The returned tile is read by the bodies exactly as an unpaged cache is: the page assembly is a
+    re-addressing of one load and changes nothing downstream of it. It carries :data:`STAGE_PAD` rows
+    beyond the window, which no selected row reaches -- the seam bounds a selected row by the WINDOW,
+    ``pages * page_size``, and never by this tile's own row count.
 
     THE WINDOW IS STAGED IN HBM RATHER THAN STRAIGHT INTO SBUF because the overlay's DESTINATION row is
     a runtime value. One HBM tile makes one runtime offset legal for the page reads and for the overlay
@@ -336,7 +336,8 @@ def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int)
     span = page_size if page_size < STAGE_ROWS else STAGE_ROWS
     pieces = page_size // span
     banked = bank_hbm.reshape((bank_hbm.shape[0] // span, span, latent))
-    staged = nl.ndarray((pages * page_size, latent), dtype=bank_hbm.dtype, buffer=nl.private_hbm)
+    staged = nl.ndarray((pages * page_size + STAGE_PAD, latent), dtype=bank_hbm.dtype,
+                        buffer=nl.private_hbm)
     for entry in range(pages):
         page = _clamped_page(table_hbm, entry)
         for piece in range(pieces):
@@ -348,9 +349,8 @@ def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int)
             nisa.dma_copy(dst=staged.ap(pattern=[[latent, span], [1, latent]],
                                         offset=(entry * page_size + piece * span) * latent),
                           src=hold)
-    chunk = _overlay_chunk(pages * page_size)
-    for start in range(0, tokens, chunk):
-        rows = tokens - start if tokens - start < chunk else chunk
+    for start in range(0, tokens, STAGE_ROWS):
+        rows = tokens - start if tokens - start < STAGE_ROWS else STAGE_ROWS
         fresh = nl.ndarray((rows, latent), dtype=bank_hbm.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=fresh, src=written_hbm.ap(pattern=[[latent, rows], [1, latent]],
                                                     offset=start * latent))

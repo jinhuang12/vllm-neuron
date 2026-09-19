@@ -6,8 +6,8 @@ SIXTEEN tests and NO `parametrize` decorator. Four carry `table` in their name a
 layouts -- two scattered rows in either order, a row with a padding tail, and a
 full-length row. One carries `identical` and reads the consecutive table. One carries `sentinel`. Two
 carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. One reads an
-overlay whose rows FILL the window, at two window widths, which is the case the staging writes in two
-chunks, and one reads that those two chunks write what a single whole write writes. One reads a
+overlay whose rows FILL the window, at two widths the staging writes in ONE transfer, and one fills a
+window that takes TWO transfers, so the second lands at a runtime row offset. One reads a
 second block size, so a body that hardcodes the served one fails. One reads that a selected row past the
 staged window is refused against the WINDOW's length and not the bank's. One puts a scattered table, a
 padding tail and an overlay in a single call, which no other item combines. One reads a page WIDER than
@@ -499,41 +499,43 @@ def test_an_overlay_that_fills_the_window_is_read_row_for_row() -> None:
         )
 
 
-def test_a_split_overlay_writes_what_one_whole_write_writes() -> None:
-    """The window filled in two chunks, 127 rows then 1, holds the bytes ONE whole write leaves.
+def test_a_step_that_fills_a_two_chunk_window_is_read_row_for_row() -> None:
+    """A step whose rows fill a TWO-PAGE window is written in two transfers and read row for row.
 
-    CERTIFYING COMPONENT: the cap itself, rather than the window it produces. The item above reads that
-    the split window holds the latents the step wrote; this one reads that the SPLIT is the only
-    difference the cap makes, by running the same call again with the chunk rule replaced by one that
-    writes the window in a single pattern. That single pattern is the form the traced venue refuses and
-    this venue accepts, so the comparison is available here and nowhere else. Byte equality then says
-    the cap re-chunks one write and changes nothing about it. The shipped rule is put back whether the
-    reading passes or fails.
+    CERTIFYING COMPONENT: the chunking, on a window the staging cannot write in one transfer. The item
+    above fills a window the size of one transfer, so its overlay is a single pattern; this one fills
+    256 rows, which the staging writes as 128 rows and 128 more at a runtime row offset carried on
+    chip. Both edges of BOTH chunks are selected, so a chunk written at the wrong row, dropped or
+    repeated cannot return the reference bytes. The window is read against the same rows written into
+    it by torch in ONE step, exactly and at the tolerance.
     """
     bank = _bank()
-    table = [7]
-    width = PAGE
+    table = [7, 2]
+    width = 2 * PAGE
     down = torch.arange(width, dtype=torch.float32).reshape(width, 1).expand(width, LATENT)
     written = (down * (-LATENT / SPREAD) - 1.0).contiguous()
+    window = _window(bank, table).index_copy(0, torch.arange(width), written)
     queries = _queries(1, 1, LATENT)
-    selected = torch.tensor([[pick % width for pick in range(TOPK)]], dtype=torch.int32)
-    at = torch.tensor([[0]], dtype=torch.int32)
-    capped = _paged(bank, table, selected, queries, written, at)
-    shipped = MS._overlay_chunk
-    try:
-        MS._overlay_chunk = lambda window: window
-        whole = _paged(bank, table, selected, queries, written, at)
-    finally:
-        MS._overlay_chunk = shipped
-    _say("SPLIT_CHUNK_ROWS", f"{MS._overlay_chunk(width)}.{width}")
-    _say("SPLIT_MAX_ABS_DIFF", float((capped - whole).abs().max()))
-    assert MS._overlay_chunk(width) == width - 1, (
-        f"this reading only compares a split against a whole write while the shipped rule splits a "
-        f"{width}-row window; it returned {MS._overlay_chunk(width)} rows, so nothing was split here"
+    edges = (0, PAGE - 1, PAGE, width - 1)
+    columns = [edges[pick % len(edges)] if pick < len(edges) else pick % width for pick in range(TOPK)]
+    selected = torch.tensor([sorted(set(columns)) + [width - 1] * (TOPK - len(set(columns)))],
+                            dtype=torch.int32)
+    got = _paged(bank, table, selected, queries, written, torch.tensor([[0]], dtype=torch.int32))
+    want = _oracle(window, selected, queries)
+    worst = float((got - want).abs().max())
+    _say("TWO_CHUNK_WORST_ABS", f"{worst:.3e}")
+    _say("TWO_CHUNK_EDGES", ".".join(str(edge) for edge in edges))
+    assert all(edge in selected[0].tolist() for edge in edges), (
+        f"this reading needs both edges of both chunks selected and the selection holds "
+        f"{sorted(set(selected[0].tolist()))[:8]}, so a misplaced chunk could pass unseen"
     )
-    assert torch.equal(capped, whole), (
-        f"the {width}-row overlay written in two chunks and written in one returned different bytes, "
-        f"so the cap moved, dropped or repeated a row instead of only re-chunking the write"
+    assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
+        f"the step filling a {width}-row window in two chunks is not what the gather read: worst "
+        f"absolute difference {worst:.3e}"
+    )
+    assert torch.equal(got, _unpaged(window, selected, queries)), (
+        f"the two-chunk step read through the paged call and through the unpaged call on the window "
+        f"written in one step returned different bytes, so a chunk landed at the wrong row"
     )
 
 
