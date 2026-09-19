@@ -370,8 +370,8 @@ def test_bind_kv_cache_maps_every_sparse_layer_onto_its_own_slots():
               f"|view={tuple(view.shape)}|slots={bank['slots']}")
         # RE-PINNED: both numbers were `E2E_BLOCKS * page`. The reading
         # this replaces, verbatim: "the flattened view covers the whole bank, one row per
-        # slot, and `slots` reports that same count". It still does; the BANK grew by one
-        # spare window, so the count the view and `slots` agree on is the bank's.
+        # slot, and `slots` reports that same count". It still does; this file allocates more
+        # blocks than the sequence needs, so the count they agree on is the bank's.
         assert tuple(view.shape) == (
             E2E_BANK_BLOCKS * item.MLA_PAGE_SIZE,
             1,
