@@ -12,8 +12,9 @@ the strict argmax of the model's logits under a one-id head bias the item adds o
 argmax of the reference under the same bias; a request whose generation crosses into a block that is NOT its
 neighbour returns those ids through three steps, the last of which attends the second block out of the bank
 instead of off the overlay, with two controls beside it -- the bank slot the table names holds that step's
-own latent while the block a slice reader would have used does not, and the logits MOVE when the last step is
-handed a slice reader's row; the spec-to-non-spec transition is read from the recorded
+own latent while the block a slice reader would have used does not, and the SEAM'S OUTPUT MOVES past this
+file's equality tolerance when the last step is handed a slice reader's row, the two steps before it staying
+bit-identical; the spec-to-non-spec transition is read from the recorded
 fact, never taken without a speculative config and taken when the fact and the config agree; a
 sampled-token future that holds logits is refused by name, where it used to reach ``numpy``. The controls re-create the class as it stood,
 declaring a sampler it does not have.
@@ -296,9 +297,9 @@ def _watching_the_seam(monkeypatch, plant: tuple[int, ...] | None = None) -> dic
     """Record what each sparse call overlays and what it RETURNS, and optionally plant a slice reader's row.
 
     The seam's own return is recorded because that is the tensor the block table feeds: a wrong page reaches
-    the head through forty-five layers and a residual stream, which dilutes it, while the layer's own output
-    carries it undiluted. Both are keyed by the bank's ``data_ptr``, so a call is paired with the bank it
-    overlays rather than by the order the layers happen to run in.
+    the head through this root's three layers and a residual stream, which dilutes it, while the layer's own
+    output carries it undiluted. Both are keyed by the bank's ``data_ptr``, so a call is paired with the bank
+    it overlays rather than by the order the layers happen to run in.
 
     ``plant`` replaces the request's own entries in the table row, leaving the bucket's padding as it
     arrived. The switch starts OFF so the steps before the one under test write where the real table says;
@@ -537,8 +538,8 @@ def test_a_first_request_crossing_into_a_block_that_is_not_adjacent_returns_the_
 
     WHAT DISCRIMINATES IS THE TWO CONTROLS BELOW AND NOT THIS ITEM'S EQUALITY, and the numbers say so: a
     slice reader's table moves this step's logits by 0.0078 against the 0.0130 this file compares at, so the
-    head dilutes the wrong page below the tolerance after forty-five layers. The controls read the bank slot
-    and the seam's own output instead, where the difference is undiluted.
+    head holds the wrong page below the tolerance even in a root of three layers. The controls read the bank
+    slot and the seam's own output instead, where the difference is undiluted.
     """
     landed._require_cpu_mode()
     fixture = landed._fixture()
@@ -603,24 +604,24 @@ def test_the_crossing_requests_row_lands_in_the_block_the_table_names(tmp_path, 
 
 
 def test_the_crossing_logits_move_when_the_second_block_is_read_as_a_slice(tmp_path, monkeypatch):
-    """The falsifying control: hand the third step a slice reader's table and the logits have to move.
+    """The falsifying control: hand the third step a slice reader's table and the seam's output has to move.
 
     The item above would pass on a consumer that ignored the table and read the prompt's block plus the one
     after it, unless reading that wrong page changes what comes back. So the same three steps run twice, both
     filling the bank through the real table, and in the second the LAST step is handed a row of consecutive
     blocks: the row the selection force-includes is then taken from a page this request never wrote.
 
-    WHAT IS ASSERTED IS A DIFFERENCE AT ALL, and that is the whole falsification: both runs are
-    deterministic -- one rank, temperature 0, one seeded prompt, the same steps in the same order -- so a
-    consumer that never read the table past its first entry would return the same tensors to the last bit and
-    the delta would be exactly zero. Any nonzero delta is the table being read.
+    THE SEAM'S DELTA IS GRADED AGAINST THIS FILE'S OWN EQUALITY TOLERANCE, which is what makes the reading a
+    discrimination and not a mere inequality: the wrong page moved the layer's output by 0.665 where that
+    tolerance is 0.0246, a factor of twenty-seven, so the difference is far outside the band the head is
+    compared in. The head's own delta is graded ABOVE ZERO only, because it measured 0.0078 against 0.0130
+    and stays inside that band -- the finding this control exists to record, and the reason the seam and the
+    bank are what discriminate here.
 
-    THE MAGNITUDES ARE READINGS AND NOT THRESHOLDS, because nothing here bounds the attention weight the
-    selection puts on one row, and a threshold nobody can derive would be a number chosen to pass. Both are
-    printed against the tolerance this file compares equality at: the head's delta measured 0.0078 against
-    0.0130, which is why the item above cannot be the thing that discriminates, and the seam's own delta is
-    carried beside it so a later round can tighten this control on a measured figure instead of a hoped-for
-    one.
+    THE FIRST TWO STEPS HAVE TO BE BIT-IDENTICAL between the runs, and that is the third conjunct: the
+    planted row is switched on for the last step alone, so a seam return or a logits row that differed
+    earlier would mean the two runs diverged for some reason of their own and the last step's delta would
+    grade that divergence instead of the table.
     """
     landed._require_cpu_mode()
     fixture = landed._fixture()
@@ -647,9 +648,18 @@ def test_the_crossing_logits_move_when_the_second_block_is_read_as_a_slice(tmp_p
           f"|honest_id={honest.ids[2]}|slice_id={lying.ids[2]}")
     assert lying.planted, "no sparse call was handed the planted row, so this control read nothing"
     assert all(before != after for before, after in lying.planted), lying.planted[0]
-    assert moved > 0.0, (
-        "the layer returned the same tensor when its last step was handed a page this request never wrote, "
-        "so on this leg the table is not read past its first entry"
+    for step in (0, 1):
+        seam_same = torch.equal(attended["honest"][step][2], attended["slice"][step][2])
+        head_same = torch.equal(honest.logits[step], lying.logits[step])
+        print(f"FIRSTREQ|crossing_isolation|step={step + 1}|seam_return_is_bit_identical={int(seam_same)}"
+              f"|logits_are_bit_identical={int(head_same)}")
+        assert seam_same and head_same, (
+            f"the runs already differed at step {step + 1}, before the planted row was switched on, so the "
+            f"last step's delta below would grade that divergence and not the block table"
+        )
+    assert moved > tolerance, (
+        f"the wrong page moved the layer's output by {moved:.6g}, inside the {tolerance:.6g} this file "
+        f"compares tensors equal at, so a slice reader's table is not distinguishable at the seam either"
     )
     assert head_moved > 0.0, head_moved
 
