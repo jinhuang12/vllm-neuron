@@ -335,8 +335,15 @@ def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int)
             nisa.dma_copy(dst=staged.ap(pattern=[[latent, span], [1, latent]],
                                         offset=(entry * page_size + piece * span) * latent),
                           src=hold)
-    for start in range(0, tokens, STAGE_ROWS):
-        rows = tokens - start if tokens - start < STAGE_ROWS else STAGE_ROWS
+    # THE OVERLAY NEVER WRITES THE WINDOW IN ONE WHOLE-TILE PATTERN. Its destination row is a
+    # runtime value, so a pattern covering every row of ``staged`` cannot be shown to land inside
+    # the tile, and the traced venue reads it as one row past the end. A chunk is therefore capped
+    # one row short of the window; only a step whose rows fill the window exactly is split, and at
+    # the served block size the cap never binds.
+    window = pages * page_size
+    chunk = STAGE_ROWS if STAGE_ROWS < window else (window - 1 if window > 1 else 1)
+    for start in range(0, tokens, chunk):
+        rows = tokens - start if tokens - start < chunk else chunk
         fresh = nl.ndarray((rows, latent), dtype=bank_hbm.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=fresh, src=written_hbm.ap(pattern=[[latent, rows], [1, latent]],
                                                     offset=start * latent))
