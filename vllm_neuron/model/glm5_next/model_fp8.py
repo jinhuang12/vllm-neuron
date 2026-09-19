@@ -7244,15 +7244,27 @@ class Glm5NextMLAAttention(nn.Module):
         collector: list[torch.Tensor] | None = None,
         *,
         active_mla_query_rows: int | None = None,
+        block_table_row: torch.Tensor,
+        latent_slots: torch.Tensor,
+        page_size: int,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
-        tokens at once and a decode step passes one. ``latent_cache`` is a WINDOW
-        of this layer's latent cache in the model's own declared spec layout --
+        tokens at once and a decode step passes one. ``latent_cache`` is the WHOLE
+        latent bank in the model's own declared spec layout --
         ``[slots, NUM_LATENT_KV_HEADS, head_size]``, one latent per token, bf16 --
-        and ``start_position`` is the slot the first of these tokens occupies.
-        The cache is WRITTEN in place for those tokens and then READ WHOLE.
+        and ``block_table_row`` names which of its ``page_size``-row blocks this
+        request holds, as a ``[pages, 1]`` int32 column with ``-1`` in unused
+        entries. ``start_position`` is the row this step's first token occupies in
+        the WINDOW those blocks make, and ``latent_slots`` is ``[tokens]`` int64:
+        the PHYSICAL bank row each of this step's tokens is written to.
+
+        THE BANK TRAVELS WHOLE AND THE PAGES ARE NAMED, which is what lets a
+        request hold blocks that are not one ascending run. The kernel assembles
+        the window from the table, so nothing here slices the bank, nothing needs
+        spare blocks past a request's last one, and the write goes to the physical
+        rows the runner computed from the same table.
 
         ``active_mla_query_rows`` is a static prefix selected by the runner.
         Only the sparse attention call uses this shorter width. Projections and
@@ -7260,12 +7272,12 @@ class Glm5NextMLAAttention(nn.Module):
         to the ordinary operator width before absorb-out.
 
         THE WINDOW'S LENGTH IS A CONSTANT AND THE POSITION IS A TENSOR, and that
-        pairing is the whole point of this signature. A graph is captured once and
-        replayed at every position, so a length derived from a position -- the
-        earlier ``[: start + tokens]`` read -- compiled a context of exactly the
-        captured length and matched no other step. The caller therefore hands a
-        window whose length is fixed for the bucket, and the position arrives as a
-        tensor so no host read of it can specialise the graph either.
+        pairing is still the point of this signature. A graph is captured once and
+        replayed at every position, so a length derived from a position compiled a
+        context of exactly the captured length and matched no other step. The
+        table's width is fixed for the bucket, so the window it names is too, and
+        the position arrives as a tensor so no host read of it can specialise the
+        graph either.
 
         WHAT BOUNDS THE READ, NOW THAT THE LENGTH DOES NOT. Rows of the window
         past this sequence's context hold other pages, so they must never be
@@ -7278,12 +7290,11 @@ class Glm5NextMLAAttention(nn.Module):
         caller that hands indices outside the context is the one error this
         method cannot catch, and the acceptance reads the bound host-side instead.
 
-        WHY ``batch_size`` IS A PARAMETER AND NOT INFERRED. ``latent_cache`` here
-        is ONE sequence's slots, because MLA caches one latent per token per
-        layer and this checkpoint's serving constraint G1 is ``B == 1``. A caller
-        serving more than one sequence would have to loop, and the named refusal
-        below says so rather than letting a second sequence's tokens land in the
-        first one's slots. The parameter exists to make that constraint a
+        WHY ``batch_size`` IS A PARAMETER AND NOT INFERRED. ``block_table_row`` is
+        ONE request's row and the kernel assembles ONE window per dispatch, so a
+        caller serving more than one sequence would have to loop. The named
+        refusal below says so rather than attending one request's window with
+        another's queries. The parameter exists to make that constraint a
         measurement: the acceptance asserts the refusal is raised BY NAME and
         that no seam counter moves, which distinguishes a refusal from a silent
         skip.
@@ -7291,9 +7302,10 @@ class Glm5NextMLAAttention(nn.Module):
         if int(batch_size) != 1:
             raise Glm5NextMLADecodeError(
                 f"the MLA decode path serves one sequence at a time (constraint "
-                f"G1, batch_size == 1); got batch_size={batch_size}. The latent "
-                f"cache passed here is a single sequence's slots, so a larger "
-                f"batch would write one sequence's latents into another's slots"
+                f"G1, batch_size == 1); got batch_size={batch_size}. One block "
+                f"table names one request's window, and the kernel assembles one "
+                f"window per dispatch, so a larger batch would attend one "
+                f"request's rows with another request's queries"
             )
         if hidden_states.ndim != 2 or int(hidden_states.shape[1]) != self.hidden_size:
             raise Glm5NextMLADecodeError(
@@ -7323,18 +7335,36 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{tuple(latent_cache.shape)}"
             )
         slots = int(latent_cache.shape[0])
-        # A SHAPE CHECK, NOT A POSITION CHECK. The window has to be long enough to
-        # hold this step's own tokens, and that reads off the shape, which is real
-        # even on a meta tensor. Whether the POSITION plus these tokens stays
-        # inside the sequence's own pages is arithmetic on values, and checking it
-        # here would need a host read of a tensor in a traced region. The runner
-        # owns that check: it sizes the window and it computes the position, so it
-        # can refuse before the trace. This method no longer duplicates it.
-        if tokens > slots:
+        page = int(page_size)
+        if page < 1 or slots % page:
             raise Glm5NextMLADecodeError(
-                f"these {tokens} token(s) cannot fit a cache window of {slots} "
-                f"slot(s); the window's length is fixed for the bucket and the "
-                f"runner sizes it, so a window this short is the caller's error"
+                f"the latent bank is paged, so its {slots} slot(s) must be whole "
+                f"blocks of page_size; got page_size={page_size!r}"
+            )
+        if block_table_row.ndim != 2 or int(block_table_row.shape[1]) != 1:
+            raise Glm5NextMLADecodeError(
+                f"block_table_row must be [pages, 1] -- the column the kernel reads "
+                f"the page number out of; got {tuple(block_table_row.shape)}"
+            )
+        window = int(block_table_row.shape[0]) * page
+        # A SHAPE CHECK, NOT A POSITION CHECK. The window the table names has to be
+        # long enough to hold this step's own tokens, and that reads off the shapes,
+        # which are real even on a meta tensor. Whether the POSITION plus these
+        # tokens stays inside the request's own pages is arithmetic on values, and
+        # checking it here would need a host read of a tensor in a traced region.
+        # The runner owns that check: it builds the row and it computes the
+        # position, so it can refuse before the trace.
+        if tokens > window:
+            raise Glm5NextMLADecodeError(
+                f"these {tokens} token(s) cannot fit the window this block table "
+                f"names, {int(block_table_row.shape[0])} block(s) of {page} = "
+                f"{window} slot(s); the table's width is fixed for the bucket and "
+                f"the runner sizes it, so a window this short is the caller's error"
+            )
+        if latent_slots.ndim != 1 or int(latent_slots.shape[0]) != tokens:
+            raise Glm5NextMLADecodeError(
+                f"latent_slots must carry one physical bank row per token, [{tokens}]; "
+                f"got {tuple(latent_slots.shape)}"
             )
         start = _int64_scalar(start_position, latent_cache.device)
 
@@ -7345,10 +7375,10 @@ class Glm5NextMLAAttention(nn.Module):
         # token as well as its context -- the same set a prefill of the same
         # tokens would see, which is what makes the two comparable.
         #
-        # WHY AN INDEXED WRITE RATHER THAN A SLICE. A slice needs two host ints,
-        # and the position is a tensor here. ``index_copy_`` takes the rows as a
-        # tensor instead, and it writes THROUGH the window view into the caller's
-        # bank -- the same in-place contract the slice had. The row count is
+        # WHY AN INDEXED WRITE RATHER THAN A SLICE. The rows this step writes are
+        # its request's PHYSICAL bank rows, which the blocks the table names put
+        # wherever the allocator put them; ``index_copy_`` takes them as a tensor
+        # and no arithmetic on the position happens here. The row count is
         # ``tokens``, a shape, so the write's own shape is constant too.
         offsets = torch.arange(tokens, device=latent_cache.device)
         # A PADDED CHUNK CARRIES ROWS THAT ARE NOT THE SEQUENCE'S, and they must not
@@ -7369,10 +7399,15 @@ class Glm5NextMLAAttention(nn.Module):
             end = _int64_scalar(prefill_end_position, latent_cache.device)
             offsets = torch.minimum(offsets, end - start - 1)
             kv_latent = kv_latent.index_select(0, offsets)
-        rows = start + offsets
+        # THE WRITE'S ROWS ARE THE RUNNER'S, computed from the same block table that
+        # travels beside them, and already carrying the clamp above: a padded chunk's
+        # trailing rows repeat the last real slot, so the repeated writes are
+        # idempotent for the same reason the clamped gather is.
+        rows = latent_slots
         if collector is not None:
             # TAKEN BEFORE THE WRITE and after the clamp above, so these hold the very
-            # values and slots the write carries. ``rows`` is narrowed for the file only;
+            # values and slots the write carries -- PHYSICAL bank rows now, which is
+            # what a dump reader has to index the bank by. Narrowed for the file only;
             # the write keeps the int64 index it needs.
             collector.extend([kv_latent, rows.to(torch.int32)])
         # ONE CAST, USED TWICE, so the value that persists and the value this step
@@ -7382,19 +7417,24 @@ class Glm5NextMLAAttention(nn.Module):
         # the steps that come after this one.
         latent_cache[:, 0, :].index_copy_(0, rows, written)
 
-        # THE CACHE READ. The WHOLE window, because its length is the bucket's and
-        # not this step's. ``[S_kv, latent]`` is the shape the sparse seam
-        # contracts, and it is now the same shape at every position.
+        # THE CACHE READ. The WHOLE bank, as a view, and the block table beside it.
+        # The seam assembles the window the table names and no copy of it is made
+        # here: a window-sized copy per layer per step is exactly the cost the
+        # paging removes, and the table is what makes the pages the seam gathers
+        # the request's own.
         #
-        # OUT OF PLACE, SO THIS STEP'S ROWS ARE IN IT BY CONSTRUCTION. Reading the
-        # window back as a view leaves the seam depending on when the write above
-        # becomes visible inside one graph, and on device it observed the rows from
-        # before the write. This copy carries the written rows whether or not the
-        # write above has landed in the bank yet.
-        c_kv = latent_cache[:, 0, :].index_copy(0, rows, written)
+        # THIS STEP'S ROWS TRAVEL BESIDE THE BANK rather than inside it. Reading
+        # them back out of the bank would leave the seam depending on when the write
+        # above becomes visible inside one graph, and on device it observed the rows
+        # from before the write. ``written`` and ``write_offset`` hand the seam the
+        # same values the write carries, and it overlays them on the window it
+        # assembles, so what it attends is right whether or not the write has landed.
+        c_kv = latent_cache[:, 0, :]
+        at = start.reshape(1, 1).to(torch.int32)
         if collector is not None:
-            # The value the seam consumes, which is this tensor and not the bank.
-            collector.append(c_kv)
+            # The operands the seam consumes: the bank it gathers from, the pages it
+            # gathers, and the rows it overlays at ``at``.
+            collector.extend([c_kv, block_table_row, at])
 
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention
@@ -7409,13 +7449,26 @@ class Glm5NextMLAAttention(nn.Module):
             )
 
         if active_mla_query_rows is None or active_mla_query_rows == tokens:
-            attended = mla_sparse_attention(q_lift, c_kv, topk_indices, softmax_scale)
+            attended = mla_sparse_attention(
+                q_lift,
+                c_kv,
+                topk_indices,
+                softmax_scale,
+                block_table_row=block_table_row,
+                written=written,
+                write_offset=at,
+                page_size=page,
+            )
         else:
             attended = mla_sparse_attention(
                 q_lift[:active_mla_query_rows],
                 c_kv,
                 topk_indices[:active_mla_query_rows],
                 softmax_scale,
+                block_table_row=block_table_row,
+                written=written,
+                write_offset=at,
+                page_size=page,
             )
             # The public seam returns FP32. Restore padding in that dtype before
             # the existing model-dtype cast and absorb-out. These rows previously
@@ -7454,6 +7507,8 @@ class Glm5NextMLAAttention(nn.Module):
         softmax_scale: float,
         max_seq_len: int,
         page_size: int,
+        block_table_row: torch.Tensor,
+        latent_slots: torch.Tensor,
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
         position: torch.Tensor | int | None = None,
@@ -7503,6 +7558,13 @@ class Glm5NextMLAAttention(nn.Module):
         the same ring on the prefill leg, where the indexer seeds this chunk's
         remainder. See :meth:`Glm5NextDSAIndexer.forward` for what each means and
         why ``max_seq_len`` is a python int.
+
+        ``block_table_row`` AND ``latent_slots`` PASS STRAIGHT THROUGH to
+        :meth:`attend`, which owns both contracts: the latent bank travels whole
+        now, the row names the blocks this request's window is built from, and the
+        slots are where this step's own rows are persisted. ``page_size`` is the
+        same number for both readers -- the indexer's pool pages and the latent
+        bank's blocks are one page size, which the runner refuses to let disagree.
         """
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
@@ -7534,6 +7596,9 @@ class Glm5NextMLAAttention(nn.Module):
             float(softmax_scale),
             prefill_end_position=prefill_end_position,
             collector=collector,
+            block_table_row=block_table_row,
+            latent_slots=latent_slots,
+            page_size=int(page_size),
             **(
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}
@@ -7625,6 +7690,8 @@ class Glm5NextDSALayer(nn.Module):
         softmax_scale: float,
         max_seq_len: int,
         page_size: int,
+        block_table_row: torch.Tensor,
+        latent_slots: torch.Tensor,
         slot_mapping: torch.Tensor | None = None,
         tail: torch.Tensor | None = None,
         position: torch.Tensor | int | None = None,
@@ -7676,7 +7743,9 @@ class Glm5NextDSALayer(nn.Module):
         is ``attend()``'s own contract and ``pool_cache``, ``tail`` and
         ``prefill_tail`` are the indexer's. See :meth:`Glm5NextDSAIndexer.forward`
         for what each means, which leg each belongs to, and why ``max_seq_len`` is
-        a python int. ``streams`` is ``[T, S, H]`` or
+        a python int. ``block_table_row`` and ``latent_slots`` belong to the paged
+        latent bank and are handed on unread: the attention half's callee owns both
+        contracts and a second reading here is a second authority on one extent. ``streams`` is ``[T, S, H]`` or
         ``None``; the return is ``[T, H]`` in the input dtype on the one-stream
         route and ``[T, S, H]`` in the STREAMS' OWN DTYPE on the streams route.
 
@@ -7709,6 +7778,8 @@ class Glm5NextDSALayer(nn.Module):
                 softmax_scale=float(softmax_scale),
                 max_seq_len=int(max_seq_len),
                 page_size=int(page_size),
+                block_table_row=block_table_row,
+                latent_slots=latent_slots,
                 slot_mapping=slot_mapping,
                 tail=tail,
                 position=position,

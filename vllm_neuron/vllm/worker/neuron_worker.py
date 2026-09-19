@@ -1180,8 +1180,9 @@ class NeuronWorker(WorkerBase):
         sizes its blocks from ``need_bytes``; the runner then gives each
         recurrent layer its own buffer of that tensor's size, because a
         recurrent bank is addressed by request slot and not by block. This
-        figure is what must fit the device. The latent spare window stays
-        outside it, as it stays outside the need.
+        figure is what must fit the device, and no bank is grown past it: a latent
+        layer reads the pages its block table names, so nothing reads past the
+        blocks the scheduler handed out.
         """
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,

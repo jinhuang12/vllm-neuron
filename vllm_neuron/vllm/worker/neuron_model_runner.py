@@ -4350,9 +4350,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         upstream's InputBatch width. This is the width the warmup builder hands over and
         the width a prefill graph is captured with, since a prefill never trims it back.
 
-        ONE ARITHMETIC, TWO READERS. The KV allocator sizes each latent bank's spare
-        window from this same number, and a spare that disagreed with the width actually
-        handed over would be the wrong size in exactly the case it exists for.
+        ONE ARITHMETIC, TWO READERS. The sparse carrier pads each request's block
+        table to this same width, and a table padded to a different width than the
+        graph was captured with is the one shape a captured graph cannot serve.
         """
         dcp_block_size = int(block_size) * max(self._dcp_size, 1)
         blocks = -(-int(context_length) // dcp_block_size)
@@ -4961,7 +4961,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @staticmethod
     def _glm5next_latent_slot_mapping(
-        *, rows, starts, tokens: int, block_size: int, padded_rows: int = 0, device
+        *, rows, starts, tokens: int, block_size: int, padded_rows: int = 0,
+        reals=None, device
     ) -> torch.Tensor:
         """``[Σ tokens + padded_rows]`` int64: each token's PHYSICAL latent slot.
 
@@ -4971,10 +4972,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bank's flattened sequence view (``model_fp8.py:9135``), which is why the
         latent write can consume it instead of deriving a contiguous run.
 
-        NO PRODUCT PATH CONSUMES THIS YET. The latent write that takes it arrives with
-        the paged sparse gather that lifts the carrier's contiguity refusal; until then
-        the sparse carrier hands the layer one contiguous window. It is kept rather
-        than deleted because the equality it must satisfy is asserted today.
+        THE SPARSE CARRIER CONSUMES IT. The latent bank travels whole now and the
+        layer's persisting write takes these rows, so a request's pages may sit
+        anywhere in the bank.
+
+        ``reals`` CLAMPS A CHUNK'S PADDED ROWS TO ITS LAST REAL TOKEN rather than
+        masking them. Those rows hold no token, and the layer already repeats the last
+        real token's LATENT into them; a repeated write of the same value to the same
+        slot changes nothing, while a sentinel would need a masked write that an
+        indexed copy cannot express. ``padded_rows`` is the other padding -- whole rows
+        past the batch's requests -- and those keep the sentinel below. Absent,
+        every row of every request counts as real.
 
         THE PADDED ROWS CARRY ``PAD_SLOT_ID`` AND NOT THE PADDING VALUE THE KV
         MACHINERY WRITES. That value is ``NULL_BLOCK_ID``, which is ZERO (``:95``),
@@ -4985,10 +4993,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         address, so the mask is legible to the consumer rather than trusted.
         """
         slots: list[int] = []
-        for row, start in zip(rows, starts):
+        table = [list(row) for row in rows]
+        limits = (
+            [int(tokens)] * len(table) if reals is None else [int(one) for one in reals]
+        )
+        for row, start, real in zip(table, starts, limits):
             for offset in range(int(tokens)):
-                position = int(start) + offset
-                block = int(row[position // int(block_size)])
+                position = int(start) + min(offset, max(real - 1, 0))
+                page = position // int(block_size)
+                if page >= len(row):
+                    raise ValueError(
+                        f"position {position} falls in block {page} of a table row that "
+                        f"names {len(row)} block(s); the row and the position come from "
+                        f"one step and a position outside the row has no slot"
+                    )
+                block = int(row[page])
                 slots.append(block * int(block_size) + position % int(block_size))
         slots.extend([PAD_SLOT_ID] * int(padded_rows))
         # BUILT ON THE HOST AND MOVED ONCE, the rule the pool mapping states:
@@ -5620,7 +5639,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         THE KEYS ARE EACH FAMILY'S OWN DECLARED KEYWORDS. A sparse (DSA) layer takes
         ``latent_cache``, ``pool_cache``, ``seq_lens``, ``start_position``,
-        ``softmax_scale``, ``max_seq_len`` and ``page_size``, plus ``slot_mapping``
+        ``softmax_scale``, ``max_seq_len``, ``page_size``, ``block_table_row`` and
+        ``latent_slots``, plus ``slot_mapping``
         and the ring it seeds -- ``prefill_tail`` with ``prefill_end_position`` --
         on the prefill leg, or ``tail`` and ``position`` on the decode leg
         (``model_fp8.py:6696-6713``); a linear (KDA) layer takes ``conv_state``,
@@ -5646,13 +5666,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         the earlier one wrote, which the receiving layer can only know from how
         many tokens are already computed.
 
-        ONE SEQUENCE PER CALL, REFUSED RATHER THAN MIS-SLICED. The latent cache a
-        DSA layer takes is one sequence's slots in position order, and
-        ``inc-glm53f-051``'s interface record states that nothing below this point
-        detects a wrong or shared cache set. So the paged bank is sliced by ONE
-        ascending run of blocks and anything else refuses by name: gathering a
-        scattered block table is not this increment's work, and a wrong slice would
-        write this sequence's latents into another sequence's slots.
+        THE BANK TRAVELS WHOLE AND THE PAGES ARE NAMED. A DSA layer used to be handed
+        one contiguous slice of the bank, which made a scattered block table a
+        refusal; it is now handed the bank itself, the request's block table as a
+        ``[pages, 1]`` int32 column with ``-1`` in the entries the bucket pads, and
+        ``latent_slots``, each token's PHYSICAL bank row. The kernel gathers the pages
+        the table names, so the allocator may place them anywhere, and no window-sized
+        copy is made per layer per step. ONE SEQUENCE PER CALL still refuses by name
+        below: one table names one request's window and the kernel assembles one
+        window per dispatch.
 
         ONE GEOMETRY PER BANK, NOT ONE FOR THE WHOLE STACK. ``geometries`` pairs with
         ``banks`` positionally and each entry carries THAT layer's own ``block_ids``,
@@ -5841,33 +5863,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
                 continue
             if len(state_slots) != 1:
-                # THE SPARSE FAMILY STILL THREADS ONE SEQUENCE, and this is where that
-                # boundary lives now. Its carrier is ONE CONTIGUOUS SLICE of the paged
-                # latent bank, and two requests' pages are not one run, so a second
-                # request cannot be expressed here at all -- the paged gather inside
-                # the kernel is what lifts it. The linear family
-                # above is already concurrent, so the refusal is the sparse family's
-                # rather than the whole forward's.
+                # THE SPARSE FAMILY STILL THREADS ONE SEQUENCE, and the reason has moved.
+                # The pages no longer have to be one run -- the kernel gathers them by
+                # the block table this carrier hands it -- but ONE TABLE NAMES ONE
+                # REQUEST'S WINDOW and the kernel assembles one window per dispatch, so
+                # a second request's rows would be attended with the first request's
+                # queries. Lifting this means a table axis through the kernel, which is
+                # its own increment. The linear family above is already concurrent, so
+                # the refusal is the sparse family's rather than the whole forward's.
                 raise ValueError(
-                    f"KV layer '{bank['name']}' is a sparse-attention layer and takes "
-                    f"ONE contiguous slice of the paged latent bank, so it serves one "
-                    f"sequence per forward; this call carries {len(state_slots)} "
-                    f"request(s). The paged gather inside the kernel is what lifts "
-                    f"this, not the runner"
+                    f"KV layer '{bank['name']}' is a sparse-attention layer and one "
+                    f"block table names one request's window, so it serves one sequence "
+                    f"per forward; this call carries {len(state_slots)} request(s). A "
+                    f"table axis through the kernel is what lifts this, not the runner"
                 )
             ids = [int(value) for value in geometry["block_ids"]]
             if not ids:
                 raise ValueError(
                     f"KV layer '{bank['name']}' was handed an empty block-table row; "
                     f"a GLM-5.3-Flash request needs at least one KV block"
-                )
-            if any(later - earlier != 1 for earlier, later in zip(ids, ids[1:])):
-                raise ValueError(
-                    f"this half slices one sequence out of the paged latent bank by a "
-                    f"single ascending run of blocks, and KV layer '{bank['name']}' "
-                    f"was handed {ids}, which is not one run; gathering scattered "
-                    f"blocks is not inc-glm53f-054b's work and a wrong slice would "
-                    f"write this sequence's latents into another sequence's slots"
                 )
             block_size = int(bank["block_size"])
             if int(geometry["page_size"]) != block_size:
@@ -5888,17 +5902,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"request's recurrent state and its indexer state live at one "
                     f"slot number"
                 )
-            latent = bank["latent_cache"][
-                ids[0] * block_size : (ids[-1] + 1) * block_size
-            ]
             # THE WRITE HAS TO LAND IN THE REQUEST'S OWN PAGES, AND THIS IS WHERE THAT
-            # IS DECIDED NOW. The layer writes rows `start_position` through
-            # `start_position + tokens` of the window it is handed. It used to refuse a
-            # write past the end of what it was given, because what it was given WAS the
-            # request's pages; the window is longer than those pages by design, so the
-            # same check inside the layer can no longer see the difference -- a write
-            # past the request's last page lands on a neighbour's rows, inside the
-            # window, in silence.
+            # IS DECIDED. The layer writes this chunk's rows at window positions
+            # `start_position` through `start_position + real`, and it resolves them
+            # through the block table, whose padded entries are `-1` and read as page 0.
+            # So a write past the request's last page lands on page 0's rows -- another
+            # sequence's -- in silence, and the layer cannot see it: inside the graph
+            # the position is a tensor.
             #
             # IT CANNOT MOVE ANY FURTHER IN THAN HERE. The check is arithmetic on the
             # position's VALUE, and past this point the position is a tensor whose value
@@ -5912,19 +5922,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"KV layer '{bank['name']}' was handed {real} real token(s) at "
                     f"position {int(start_position)} against {len(ids)} block(s) of "
                     f"{block_size} slot(s), which is {own_slots} slot(s) of this "
-                    f"request's own pages; the window this layer reads is longer than "
-                    f"those pages, so a write outside them would land on another "
-                    f"sequence's rows without shortening anything"
+                    f"request's own pages; a write outside them would land on the rows "
+                    f"a padded table entry resolves to, which are another sequence's"
                 )
-            # THE WINDOW SLICE. Its LENGTH is the bucket's, so one captured graph
-            # serves every position; the request's own pages sit at the front of it
-            # and the position bounds what is written. Two refusals guard the form.
+            # THE TABLE'S WIDTH IS THE BUCKET'S, not this request's, so one captured
+            # graph serves every length: the request's pages come first and the rest of
+            # the row is `-1`. Two refusals guard that form.
             if "window_blocks" not in geometry:
                 raise ValueError(
                     f"KV layer '{bank['name']}' was handed a geometry with no "
-                    f"'window_blocks'; the window this layer reads has a length that is "
-                    f"fixed for the bucket, and a caller that does not state that length "
-                    f"cannot be given a window one captured graph can serve"
+                    f"'window_blocks'; the block table this layer reads has a width that "
+                    f"is fixed for the bucket, and a caller that does not state that "
+                    f"width cannot be given a table one captured graph can serve"
                 )
             window_blocks = int(geometry["window_blocks"])
             if len(ids) > window_blocks:
@@ -5934,35 +5943,34 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"sequence; a request longer than its bucket cannot be served by "
                     f"this window"
                 )
-            base = ids[0] * block_size
-            window = window_blocks * block_size
-            bank_slots = int(bank["latent_cache"].shape[0])
-            if base + window > bank_slots:
-                # THE ALLOCATION IS SHORT, AND CLAMPING THE BASE IS NOT THE REMEDY. A
-                # torch slice past the end does not raise: it returns a SHORTER view,
-                # which is how a bucket-constant length silently becomes a per-request
-                # one where a captured graph cannot see it. Clamping the base instead
-                # would keep the length and move every write onto another sequence's
-                # rows. So the bank owes a spare window of blocks past the last one a
-                # request can be given, and the runner's allocator is where
-                # that headroom is added -- not here.
-                raise ValueError(
-                    f"KV layer '{bank['name']}'s bank holds {bank_slots} slot(s) and a "
-                    f"window of {window} slot(s) from block {ids[0]} would end at "
-                    f"{base + window}; the bank needs a spare {window_blocks} block(s) "
-                    f"past the last block a request can be given, and neither a "
-                    f"shortened view nor a clamped base is a substitute"
-                )
-            latent = bank["latent_cache"][base : base + window]
-            if int(latent.shape[0]) != window:
-                raise ValueError(
-                    f"KV layer '{bank['name']}' produced a window of "
-                    f"{int(latent.shape[0])} slot(s) where {window} was asked for; the "
-                    f"window's length is what one captured graph depends on"
-                )
+            # THE BANK ITSELF, no slice and no copy: the pages this request holds are
+            # named by the table beside it and gathered inside the kernel. The bank owes
+            # no spare blocks any more -- nothing reads past the last block a request
+            # can be given, because nothing reads a run.
+            latent = bank["latent_cache"]
             device = latent.device
             carrier = {
                 "latent_cache": latent,
+                # THE BLOCK TABLE, PADDED TO THE BUCKET'S WIDTH WITH `-1`, as the
+                # `[pages, 1]` int32 column the kernel reads a page number out of.
+                # Built on the host and moved once, the rule every operand here keeps.
+                "block_table_row": torch.tensor(
+                    [[one] for one in ids]
+                    + [[-1]] * (window_blocks - len(ids)),
+                    dtype=torch.int32,
+                ).to(device),
+                # EACH TOKEN'S PHYSICAL BANK ROW, which is what the layer's persisting
+                # write consumes now that its rows are not a run. The padded rows of a
+                # chunk repeat the last real token's slot, matching the clamp the layer
+                # applies to the VALUES it writes, so the repeat is idempotent.
+                "latent_slots": cls._glm5next_latent_slot_mapping(
+                    rows=[ids],
+                    starts=[start_position],
+                    tokens=int(tokens),
+                    block_size=block_size,
+                    reals=[real],
+                    device=device,
+                ),
                 # THE REQUEST'S OWN ROW OF EACH SIDE CACHE. The slot is the one
                 # the request table assigned, so two requests in one batch reach
                 # two disjoint views and neither can see the other's pool.
@@ -6267,8 +6275,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # the position it was captured at; a length taken from the block table's
             # width would be the whole model length on the prefill leg, because that
             # width falls back to `max_model_len` when a group has no context bucket
-            # (`:4325-4344`). The seam copies every row of the window into on-chip
-            # memory, so that width is not merely wasteful -- it does not fit.
+            # (`:4325-4344`). The kernel stages every page the table names before it
+            # gathers, one transfer per page, so that width is paid on every dispatch.
             #
             # Both numbers below are python ints the metadata already carries, so the
             # window is constant per captured graph without reading a tensor value:
@@ -6317,9 +6325,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             window_blocks = min(table_width, max(1, span_blocks))
             geometries.append(
                 {
-                    # THE FIRST REQUEST'S PAGES ARE WHAT THE SPARSE FAMILY SLICES, and it
-                    # refuses a second request by name in the carrier builder, so this
-                    # entry can never answer for a request it does not describe.
+                    # THE FIRST REQUEST'S PAGES ARE WHAT THE SPARSE FAMILY NAMES in its
+                    # block table, and it refuses a second request by name in the carrier
+                    # builder, so this entry can never answer for a request it does not
+                    # describe.
                     "block_ids": request_rows[0][: blocks_used[0]],
                     "state_slot": request_rows[0][0],
                     "page_size": block_size,
@@ -10441,29 +10450,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return (num_blocks, num_kv_heads, block_size // 2, head_size, 2)
         return (num_blocks, num_kv_heads, block_size, head_size)
 
-    def _latent_spare_bytes(self, kv_cache_config: KVCacheConfig) -> dict[str, int]:
-        """Extra bytes each latent layer's bank needs, keyed by layer name.
-
-        The names come from the KV-cache GROUPS rather than from a model attribute,
-        because the groups are what carry each layer's spec and the spec class is what
-        says a bank is latent. A stack with two families therefore grows its latent group
-        and leaves its recurrent group at the size the engine budgeted.
-
-        The spare is ONE WINDOW: the aligned block-table width, which is the widest window
-        the converter can hand a layer of this group, times that group's page in bytes.
-        """
-        spare: dict[str, int] = {}
-        for group in kv_cache_config.kv_cache_groups:
-            spec = group.kv_cache_spec
-            if not isinstance(spec, MLAAttentionSpec):
-                continue
-            blocks = self._aligned_table_width(
-                context_length=self.max_model_len, block_size=spec.block_size
-            )
-            for layer_name in group.layer_names:
-                spare[layer_name] = blocks * spec.page_size_bytes
-        return spare
-
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -10510,23 +10496,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             is_pooling_model=self.is_pooling_model,
         )
 
-        # A LATENT BANK IS ALLOCATED WITH A SPARE WINDOW PAST THE SCHEDULER'S BLOCKS.
-        # A layer of this family is handed a WINDOW of its bank whose length is fixed
-        # for the bucket, not the pages this step happens to occupy, so one captured
-        # graph serves every position. A request placed at the last block the scheduler
-        # can give it then needs slots past that block, and a torch slice past the end
-        # of a bank does not raise -- it returns a SHORTER view, which turns the
-        # bucket-constant length back into a per-request one where a captured graph
-        # cannot see it. The remedy is space, and it belongs here: the carrier builder
-        # refuses the short bank by name rather than shortening the view or clamping the
-        # window's base onto a neighbour's rows.
+        # NO BANK IS GROWN PAST THE SCHEDULER'S BLOCKS. A latent layer used to be
+        # handed a contiguous WINDOW of its bank, longer than the pages a request
+        # holds, so a request at the last block the scheduler can give it needed slots
+        # past that block and every latent bank carried one spare window of HBM. The
+        # layer now reads the pages its block table names, so nothing is read past the
+        # request's own blocks and the spare has no reader. The bytes go back.
         #
-        # THE SCHEDULER'S BLOCK COUNT IS UNTOUCHED. ``kv_cache_config.num_blocks`` is
-        # what hands out blocks and it is not read here; only the bytes behind each
-        # latent tensor grow, so the spare blocks exist and are never allocated to a
-        # request. The whole cost is HBM: one window per latent layer.
-        spare_bytes = self._latent_spare_bytes(kv_cache_config)
-
         # A RECURRENT LAYER NEVER SHARES A BUFFER. vLLM hands one tensor to the
         # same-index layer of every group because each group's block table names
         # disjoint blocks of it. A recurrent bank is addressed by request slot,
@@ -10534,13 +10510,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # read and overwrite each other's state, and a recurrent slot overlays
         # the block of the same number in the latent layer sharing the buffer.
         # Each recurrent layer therefore gets its own buffer of the shared
-        # tensor's size; the latent sharers keep the shared one, with its spare.
+        # tensor's size; the latent sharers keep the shared one.
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for size, owners in kv_cache_allocations(kv_cache_config):
-            spare = max((spare_bytes.get(name, 0) for name in owners), default=0)
-            raw_tensor = torch.zeros(
-                size + spare, dtype=torch.int8, device=self.device
-            )
+            raw_tensor = torch.zeros(size, dtype=torch.int8, device=self.device)
             for layer_name in owners:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
 
