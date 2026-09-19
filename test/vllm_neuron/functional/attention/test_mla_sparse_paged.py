@@ -2,11 +2,13 @@
 """Acceptance for the paged latent window: the sparse attention kernel assembles its window from a
 block table instead of slicing one ascending run of blocks out of the latent bank.
 
-TEN tests and NO `parametrize` decorator. Four carry `table` in their name and read the four block
+TWELVE tests and NO `parametrize` decorator. Four carry `table` in their name and read the four block
 layouts the design declares -- two scattered rows in either order, a row with a padding tail, and a
 full-length row. One carries `identical` and reads the consecutive table. One carries `sentinel`. Two
 carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. One reads a
-second block size, so a body that hardcodes the served one fails. The last calls no kernel: it reads
+second block size, so a body that hardcodes the served one fails. One reads that a selected row past the
+staged window is refused against the WINDOW's length and not the bank's. One puts a scattered table, a
+padding tail and an overlay in a single call, which no other item combines. The last calls no kernel: it reads
 that this file's own numbers can see what the items above claim to see.
 
 EVERY WINDOW CLAIM IS MADE TWICE, ONE EXACT AND ONE A TOLERANCE. The exact claim is against the
@@ -456,6 +458,64 @@ def test_a_second_block_size_is_read_from_the_operand_and_not_assumed() -> None:
     assert torch.equal(got, _unpaged(window, selected, queries)), (
         f"at a page size of {PAGE_ALT} the paged call and the unpaged call on the window the table "
         f"names returned different bytes, so the page size is not read from the operand"
+    )
+
+
+def test_a_selected_row_past_the_staged_window_is_refused() -> None:
+    """The bound is the WINDOW the table names, never the bank the pages come from.
+
+    CERTIFYING COMPONENT: the seam's range check under a paged call. The bank holds 4,096 rows and this
+    table stages 256 of them, so a selected row of 300 indexes the bank but not the window; gathering it
+    would read a page this request was never given. The unpaged call is bounded by the cache it is handed
+    and this call must be bounded by the window, not by the bank behind it.
+    """
+    bank = _bank()
+    table = [5, 10]
+    queries = _queries(1, HEADS, LATENT)
+    selected = _with_rows(_selected(1, len(table) * PAGE), (len(table) * PAGE + 44,))
+    message = ""
+    try:
+        _paged(bank, table, selected, queries)
+    except MS.MlaSparseAttentionError as refusal:
+        message = " ".join(str(refusal).split())
+    _say("PAST_WINDOW_REFUSAL", message or "none")
+    assert str(len(table) * PAGE) in message, (
+        f"a selected row past the staged window was not refused against the window's own length "
+        f"{len(table) * PAGE}: {message or 'it was not refused at all'}"
+    )
+
+
+def test_a_scattered_table_a_padding_tail_and_an_overlay_in_one_call() -> None:
+    """The three parts of the change in ONE call, which no item above combines.
+
+    CERTIFYING COMPONENT: that the page loop, the clamp and the overlay compose. Each is read alone
+    above; a kernel can pass all three and still order the overlay before the page that covers it, or
+    clamp using an offset the overlay moved.
+    """
+    bank = _bank()
+    table = [10, 5, -1]
+    queries = _queries(1, HEADS, LATENT)
+    live = (len(table) - 1) * PAGE
+    selected = _selected(1, live)
+    at = _interior(selected)
+    written = _overlay_row(queries)
+    window = _window(bank, table).index_copy(0, torch.tensor([at]), written)
+    got = _paged(bank, table, selected, queries, written, torch.tensor([[at]], dtype=torch.int32))
+    want = _oracle(window, selected, queries)
+    stale = _oracle(_window(bank, table), selected, queries)
+    worst = float((got - want).abs().max())
+    _say("COMBINED_AT", at)
+    _say("COMBINED_WORST_ABS", f"{worst:.3e}")
+    assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
+        f"the scattered table, the padded tail and the overlay do not compose: worst absolute "
+        f"difference {worst:.3e}"
+    )
+    assert torch.equal(got, _unpaged(window, selected, queries)), (
+        "the combined call and the unpaged call on the window it names returned different bytes"
+    )
+    assert not torch.allclose(got, stale, rtol=RTOL, atol=ATOL), (
+        "the overlay moved nothing in the combined call, so this item would pass on a kernel that "
+        "stages the pages over this step's own rows"
     )
 
 
