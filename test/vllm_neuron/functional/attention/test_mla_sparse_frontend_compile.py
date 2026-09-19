@@ -136,10 +136,16 @@ def _compile_each_entry() -> None:
         the table reads through it, as the served one does. Every entry is called through `wrap_nki`,
         which is how the seam calls it: a raw call takes the framework hop instead of the compiler
         front end this item is here to read.
+
+        `tokens = 0` IS THE STEP THAT WRITES NOTHING, and it hands the overlay operands as None rather
+        than as zero-row tensors: the front end builds a tile per tensor operand and refuses a
+        zero-extent shape by name, so the absent overlay travels as an absent operand.
         """
+        rows = fake((tokens, latent), dtype) if tokens else None
+        at = fake((1, 1), i32) if tokens else None
         return lambda: wrap_nki(entry)(
             fake((1, HEADS, latent), dtype), fake((bank_rows, latent), dtype), fake((1, topk), i32),
-            0.1, fake((PAGES, 1), i32), fake((tokens, latent), dtype), fake((1, 1), i32), PAGE)
+            0.1, fake((PAGES, 1), i32), rows, at, PAGE)
 
     def unpaged_rope(entry, latent, topk, dtype):
         """One RoPE entry exactly as it stands today, on a window rather than a bank."""
@@ -158,11 +164,11 @@ def _compile_each_entry() -> None:
     built = []
     for shape, nope, rope, latent, topk in shapes:
         # THREE PAGED OPERAND FORMS PER ENTRY: the served dtype with a decode step's one row, the same
-        # in f32, and the served dtype with a ZERO-row overlay, the form a step that writes no new
+        # in f32, and the served dtype with NO overlay at all, the form a step that writes no new
         # latent hands the kernel.
         built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_one_row", paged(nope, latent, topk, 1, served)))
         built.append((f"nope_{shape}_paged_float32_one_row", paged(nope, latent, topk, 1, plain)))
-        built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_no_rows", paged(nope, latent, topk, 0, served)))
+        built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_no_overlay", paged(nope, latent, topk, 0, served)))
         built.append((f"rope_{shape}_unpaged_{SERVED_DTYPE}", unpaged_rope(rope, latent, topk, served)))
         built.append((f"rope_{shape}_unpaged_float32", unpaged_rope(rope, latent, topk, plain)))
     built.append(("venue_control_unbound_name",

@@ -1774,12 +1774,14 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     c_kv_in = _kernel_operand(c_kv)
     topk_i32 = topk_indices.contiguous().to(torch.int32)
     if block_table_row is not None:
-        rows = c_kv_in[:0] if written is None else _kernel_operand(written)
-        at = torch.zeros(1, 1, dtype=torch.int32) if write_offset is None else write_offset
+        # A STEP THAT WRITES NOTHING HANDS NO OVERLAY OPERANDS AT ALL, rather than empty ones: the
+        # kernel front end builds one tile per tensor operand and refuses a zero-extent shape by name.
+        overlaid = written is not None and int(written.shape[0]) > 0
+        rows = _kernel_operand(written) if overlaid else None
+        at = write_offset.contiguous().to(torch.int32) if overlaid else None
         return wrap_nki(nope_entry)(
             q_lift_in, c_kv_in, topk_i32, float(softmax_scale),
-            block_table_row.contiguous().to(torch.int32), rows,
-            at.contiguous().to(torch.int32), int(page_size)
+            block_table_row.contiguous().to(torch.int32), rows, at, int(page_size)
         )
     if rope == 0:
         return wrap_nki(nope_entry)(
