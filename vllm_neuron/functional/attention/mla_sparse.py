@@ -1635,6 +1635,11 @@ def _require_paged(c_kv: Tensor, block_table_row: Tensor, written: Tensor | None
                 f"write_offset must be a [1, 1] int32 tensor, read on device; got shape "
                 f"{tuple(write_offset.shape)}"
             )
+        # THE POSITION IS CHECKED EAGERLY AND NOWHERE ELSE: a tracer makes the value
+        # unreadable, so an extracted graph carries no refusal for it. What holds in a
+        # graph is the runner's sizing -- the window spans this step's context plus its
+        # query rows -- and a configuration that clips that sizing to the bucket's table
+        # width would overlay past the staged window with nothing to refuse it.
         if values_are_readable(write_offset):
             at = int(write_offset[0, 0])
             if at < 0 or at + tokens > window:

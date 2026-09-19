@@ -24,6 +24,14 @@ writes at most one 1,024-row prefill chunk and never reaches the window's last r
 block a step that fills its pages does reach it -- and both are staged INSIDE the tile, because the pad
 is on the tile and not on the step.
 
+THE OTHER BOUND, counted the same way: ``write_offset + tokens <= window`` is checked eagerly and never
+in a graph, so what holds it at the served values is arithmetic rather than a refusal. The runner sizes
+the window from this step's own leg, its context plus its query rows, and clips that to the bucket's
+table width; at ``max_model_len`` 4,096 with prefill chunks of at most 1,024 the sum is at most 4,096,
+which is 32 blocks of 128 or one of 4,096 and reaches no clip at either block size. A configuration
+whose sizing DOES clip would overlay past the staged window on device with nothing to refuse it, so the
+producer chain is the bound and this file reads the tile's own bound only.
+
 BOTH ITEMS READ A TRACE AND NO VALUE, so the latent rank here is the kernel's own tile width and the
 values of the staged window are read at the served rank by ``test_mla_sparse_paged.py``. Every bank is
 two pages WIDER than its window, as every bank in this tree is: a bank the size of its window puts the
