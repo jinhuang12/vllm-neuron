@@ -7432,9 +7432,10 @@ class Glm5NextMLAAttention(nn.Module):
         c_kv = latent_cache[:, 0, :]
         at = start.reshape(1, 1).to(torch.int32)
         if collector is not None:
-            # The operands the seam consumes: the bank it gathers from, the pages it
-            # gathers, and the rows it overlays at ``at``.
-            collector.extend([c_kv, block_table_row, at])
+            # ONE ENTRY, as before: the dump's names are positional, so a second tap here
+            # would rename every tensor after it. This is the tensor the seam gathers
+            # from, which is the bank now rather than a window of it.
+            collector.append(c_kv)
 
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention
