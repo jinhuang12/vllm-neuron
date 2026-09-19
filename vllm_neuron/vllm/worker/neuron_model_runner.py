@@ -6205,8 +6205,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             # ONE ROW AND ONE CACHED LENGTH PER REQUEST, in the batch's own order. The
             # refusal that stood here -- one sequence per forward -- has moved to the
-            # SPARSE family's carrier, where the contiguous slice is actually taken: the
-            # linear family serves a batch, and a walk that turned every two-request
+            # SPARSE family's carrier, where one block table is built for one request:
+            # the linear family serves a batch, and a walk that turned every two-request
             # step away before either family was reached could not deliver one.
             #
             # EACH REQUEST ADVANCES BY ITS OWN REAL TOKENS, which the input builder
@@ -6357,10 +6357,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         is_prefill = legs.pop()
         request_starts = list(starts.pop())
         # THE SCALAR IS THE FIRST REQUEST'S, and it is what the sparse family reads.
-        # That family still serves one sequence per forward -- its carrier is one
-        # contiguous slice of the paged latent bank -- and refuses a second request BY
-        # NAME in the carrier builder, so the scalar can never reach an answer for a
-        # request it does not describe.
+        # That family still serves one sequence per forward -- one block table names one
+        # request's window -- and refuses a second request BY NAME in the carrier
+        # builder, so the scalar can never reach an answer for a request it does not
+        # describe.
         start_position = request_starts[0]
         # AND SO IS THE REAL LENGTH THE SPARSE FAMILY PAGES AND POOLS BY. The counts are
         # derived once more here, from the agreed cached lengths rather than from
