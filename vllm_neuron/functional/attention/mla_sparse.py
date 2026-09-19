@@ -262,6 +262,92 @@ def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
         )
 
 
+#: How many window rows one staging DMA moves: the SBUF partition bound, which is also the
+#: latent partition tile. A block wider than this is staged in that many pieces, and the bank
+#: is ADDRESSED in pieces of it, so that every runtime offset is a whole piece index and no
+#: access pattern has to carry a trace-time offset and a tensor-borne one at once.
+STAGE_ROWS = LATENT_TILE
+
+
+def _clamped_page(table_hbm, entry: int):
+    """A ``[1, 1]`` int32 tile holding ``block_table[entry]``, the -1 pad clamped onto page 0."""
+    raw = _sbuf_i32(1, 1)
+    nisa.dma_copy(dst=raw, src=table_hbm.ap(pattern=[[1, 1], [1, 1]], offset=entry))
+    floor = _sbuf_i32(1, 1)
+    nisa.memset(dst=floor, value=SENTINEL_INDEX)
+    live = _sbuf_i32(1, 1)
+    nisa.tensor_tensor(dst=live, data1=floor, data2=raw, op=nl.less)
+    held = _sbuf_i32(1, 1)
+    nisa.tensor_tensor(dst=held, data1=raw, data2=live, op=nl.multiply)
+    return held
+
+
+def _piece_of_page(page, pieces: int, piece: int):
+    """A ``[1, 1]`` int32 tile holding ``page * pieces + piece``: which whole piece of the bank to read."""
+    held = _sbuf_i32(1, 1)
+    nisa.tensor_scalar(dst=held, data=page, op0=nl.multiply, operand0=pieces)
+    nisa.tensor_scalar(dst=held, data=held, op0=nl.add, operand0=piece)
+    return held
+
+
+def _write_row(offset_hbm, ahead: int):
+    """A ``[1, 1]`` int32 tile holding this step's own write row, plus ``ahead`` rows."""
+    held = _sbuf_i32(1, 1)
+    nisa.dma_copy(dst=held, src=offset_hbm.ap(pattern=[[1, 1], [1, 1]], offset=0))
+    if ahead > 0:
+        nisa.tensor_scalar(dst=held, data=held, op0=nl.add, operand0=ahead)
+    return held
+
+
+def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int):
+    """Assemble the window a block table names in HBM, with this step's own rows overlaid on top.
+
+    The returned ``[pages * page_size, latent]`` tile is read by the bodies exactly as an unpaged cache
+    is: the page assembly is a re-addressing of one load and changes nothing downstream of it.
+
+    THE WINDOW IS STAGED IN HBM RATHER THAN STRAIGHT INTO SBUF because the overlay's DESTINATION row is
+    a runtime value. One HBM tile makes one runtime offset legal for the page reads and for the overlay
+    alike, and leaves the transposes below untouched.
+
+    THE PAGES ARE READ BEFORE THE OVERLAY, never the other way round: this step's rows sit at positions
+    the pages also cover, so a page copy issued afterwards would put the cache back over them.
+    """
+    latent = bank_hbm.shape[1]
+    pages = table_hbm.shape[0]
+    tokens = 0 if written_hbm is None else written_hbm.shape[0]
+    span = page_size if page_size < STAGE_ROWS else STAGE_ROWS
+    pieces = page_size // span
+    banked = bank_hbm.reshape((bank_hbm.shape[0] // span, span, latent))
+    staged = nl.ndarray((pages * page_size, latent), dtype=bank_hbm.dtype, buffer=nl.private_hbm)
+    for entry in range(pages):
+        page = _clamped_page(table_hbm, entry)
+        for piece in range(pieces):
+            hold = nl.ndarray((span, latent), dtype=bank_hbm.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=hold,
+                          src=banked.ap(pattern=[[latent, span], [1, latent]], offset=0,
+                                        scalar_offset=_piece_of_page(page, pieces, piece),
+                                        indirect_dim=0))
+            nisa.dma_copy(dst=staged.ap(pattern=[[latent, span], [1, latent]],
+                                        offset=(entry * page_size + piece * span) * latent),
+                          src=hold)
+    for start in range(0, tokens, STAGE_ROWS):
+        rows = tokens - start if tokens - start < STAGE_ROWS else STAGE_ROWS
+        fresh = nl.ndarray((rows, latent), dtype=bank_hbm.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=fresh, src=written_hbm.ap(pattern=[[latent, rows], [1, latent]],
+                                                    offset=start * latent))
+        nisa.dma_copy(dst=staged.ap(pattern=[[latent, rows], [1, latent]], offset=0,
+                                    scalar_offset=_write_row(offset_hbm, start), indirect_dim=0),
+                      src=fresh)
+    return staged
+
+
+def _window_of(c_kv_hbm, table_hbm, written_hbm, offset_hbm, page_size: int):
+    """The cache the body reads: the staged window when a block table is given, else the cache itself."""
+    if table_hbm is None:
+        return c_kv_hbm
+    return _staged_window(c_kv_hbm, table_hbm, written_hbm, offset_hbm, page_size)
+
+
 def _queries_per_block(seq: int, heads: int) -> int:
     """Queries whose Q rows fill one 16-row transpose, when the head count and sequence allow."""
     if DGE_TRANSPOSE_ROWS % heads == 0 and seq % (DGE_TRANSPOSE_ROWS // heads) == 0:
@@ -537,7 +623,9 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
 
 
 @nki.jit
-def mla_sparse_attention_nope_kernel(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale):
+def mla_sparse_attention_nope_kernel(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale,
+                                     block_table_hbm=None, written_hbm=None,
+                                     write_offset_hbm=None, page_size=0):
     """The R == 0 entry point: sparse latent attention with NO RoPE limb.
 
     This is THIS CHECKPOINT'S path and the one the acceptance exercises. It is a
@@ -546,7 +634,9 @@ def mla_sparse_attention_nope_kernel(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_sca
     """
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm)
+    window_hbm = _window_of(c_kv_hbm, block_table_hbm, written_hbm, write_offset_hbm,
+                            page_size)
+    _attention_body(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, out_hbm)
     return out_hbm
 
 
@@ -882,11 +972,15 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
 
 @nki.jit
 def mla_sparse_attention_nope_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
-                                           softmax_scale):
+                                           softmax_scale, block_table_hbm=None,
+                                           written_hbm=None, write_offset_hbm=None,
+                                           page_size=0):
     """The tiled R == 0 entry point, and the one this increment's acceptance runs."""
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm)
+    window_hbm = _window_of(c_kv_hbm, block_table_hbm, written_hbm, write_offset_hbm,
+                            page_size)
+    _attention_body_tiled(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, out_hbm)
     return out_hbm
 
 
@@ -1333,12 +1427,20 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 
 @nki.jit
 def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
-                                               softmax_scale, BLOCK_N=MOVING_MAX,
+                                               softmax_scale, block_table_hbm=None,
+                                               written_hbm=None, write_offset_hbm=None,
+                                               page_size=0, BLOCK_N=MOVING_MAX,
                                                STREAM_KV=True):
-    """NoPE sparse attention; optional tile parameters are compile-time constants."""
+    """NoPE sparse attention; the paged operands and the tile parameters are each optional.
+
+    The paged operands are declared BEFORE the tile parameters so that a paged call reaches
+    ``page_size`` without passing a tile parameter it has no opinion about.
+    """
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
+    window_hbm = _window_of(c_kv_hbm, block_table_hbm, written_hbm, write_offset_hbm,
+                            page_size)
+    _attention_body_row_tiled(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, out_hbm,
                               BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV)
     return out_hbm
 
@@ -1437,14 +1539,111 @@ def _kernel_operand(t: Tensor) -> Tensor:
     return t.to(torch.float32)
 
 
+def _require_paged(c_kv: Tensor, block_table_row: Tensor, written: Tensor | None,
+                   write_offset: Tensor | None, page_size: int,
+                   k_pe: Tensor | None) -> int:
+    """Raise unless these paged operands name a window this kernel can stage; return its length."""
+    if k_pe is not None:
+        raise MlaSparseAttentionError(
+            "a paged window and a RoPE half are refused together: k_pe is a SECOND window "
+            "beside the latent one, one row per cache row, and nothing here pages it. This "
+            "checkpoint's RoPE width is 0 and the limb is elided at trace time, so pass "
+            "block_table_row with no q_pe/k_pe, or the gathered window with them"
+        )
+    page_size = int(page_size)
+    if page_size < 1:
+        raise MlaSparseAttentionError(
+            f"page_size is the served block size and travels as a trace-time int; got "
+            f"{page_size}. It is specialised into the graph, so a block-size change is a "
+            f"recompile rather than a runtime operand"
+        )
+    if page_size % STAGE_ROWS != 0 and STAGE_ROWS % page_size != 0:
+        raise MlaSparseAttentionError(
+            f"a page is staged in whole pieces of {STAGE_ROWS} rows, the SBUF partition "
+            f"bound, so the block size must be a multiple of it or divide it; got "
+            f"page_size={page_size}"
+        )
+    if block_table_row.ndim != 2 or int(block_table_row.shape[1]) != 1:
+        raise MlaSparseAttentionError(
+            f"block_table_row must be [pages, 1], the column the page number is read out "
+            f"of; got shape {tuple(block_table_row.shape)}"
+        )
+    pages = int(block_table_row.shape[0])
+    if pages < 1:
+        raise MlaSparseAttentionError(
+            "block_table_row must name at least one page; got none"
+        )
+    bank_rows, bank_latent = (int(d) for d in c_kv.shape)
+    if bank_rows % page_size != 0:
+        raise MlaSparseAttentionError(
+            f"c_kv is the whole latent BANK when a block table is present, so its rows must "
+            f"be whole pages; got {bank_rows} rows against page_size={page_size}"
+        )
+    window = pages * page_size
+    if values_are_readable(block_table_row):
+        lo, hi = int(block_table_row.min()), int(block_table_row.max())
+        if lo < SENTINEL_INDEX or hi >= bank_rows // page_size:
+            raise MlaSparseAttentionError(
+                f"every page number must index the bank or be the {SENTINEL_INDEX} pad; got "
+                f"the range [{lo}, {hi}] against {bank_rows // page_size} pages in the bank"
+            )
+    tokens = 0 if written is None else int(written.shape[0])
+    if written is not None:
+        if written.ndim != 2 or int(written.shape[1]) != bank_latent:
+            raise MlaSparseAttentionError(
+                f"written must be [tokens, latent] with c_kv's latent rank {bank_latent}; "
+                f"got shape {tuple(written.shape)}"
+            )
+        if tokens > window:
+            raise MlaSparseAttentionError(
+                f"written carries more rows than the window holds; got {tokens} rows "
+                f"against a window of {window} = {pages} pages of {page_size}"
+            )
+        if _kernel_operand(written).dtype != _kernel_operand(c_kv).dtype:
+            raise MlaSparseAttentionError(
+                f"written is overlaid onto the staged window and is copied without a cast, "
+                f"so it must read as c_kv's dtype; got {written.dtype} against {c_kv.dtype}"
+            )
+    if tokens > 0 and write_offset is None:
+        raise MlaSparseAttentionError(
+            f"written carries {tokens} rows and no write_offset says where they sit in the "
+            f"window; pass a [1, 1] int32 row offset"
+        )
+    if write_offset is not None:
+        if write_offset.ndim != 2 or tuple(int(d) for d in write_offset.shape) != (1, 1):
+            raise MlaSparseAttentionError(
+                f"write_offset must be a [1, 1] int32 tensor, read on device; got shape "
+                f"{tuple(write_offset.shape)}"
+            )
+        if values_are_readable(write_offset):
+            at = int(write_offset[0, 0])
+            if at < 0 or at + tokens > window:
+                raise MlaSparseAttentionError(
+                    f"this step's {tokens} written rows must land inside the window; got "
+                    f"write_offset={at} against a window of {window}"
+                )
+    return window
+
+
 def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                          softmax_scale: float, q_pe: Tensor | None = None,
-                         k_pe: Tensor | None = None) -> Tensor:
+                         k_pe: Tensor | None = None,
+                         block_table_row: Tensor | None = None,
+                         written: Tensor | None = None,
+                         write_offset: Tensor | None = None,
+                         page_size: int = 0) -> Tensor:
     """The counted seam. Returns ``[S, H, L]`` float32.
 
     ``q_lift`` is ``[S, H, L]``, ``c_kv`` is ``[S_kv, L]``, ``topk_indices`` is
     ``[S, K]`` integer. ``q_pe`` ``[S, H, R]`` and ``k_pe`` ``[S_kv, R]`` are the
     RoPE half and are BOTH present or BOTH absent; absent is this checkpoint.
+
+    ``block_table_row`` ``[pages, 1]`` int32 makes the call PAGED: ``c_kv`` is then the whole
+    latent bank rather than one window, the table names which of its ``page_size``-row blocks
+    this query's window is built from, and ``written`` ``[tokens, L]`` at row ``write_offset``
+    ``[1, 1]`` is this step's own rows overlaid on top of it. A selected row indexes the
+    WINDOW, ``pages * page_size`` rows, exactly as it indexes ``c_kv`` in an unpaged call --
+    so a caller that gathers its own window keeps calling this seam unchanged.
     """
     if q_lift.ndim != 3:
         raise MlaSparseAttentionError(
@@ -1478,6 +1677,9 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
             f"{int(topk_indices.shape[0])} rows against seq={seq}"
         )
     topk = int(topk_indices.shape[1])
+    if block_table_row is not None:
+        s_kv = _require_paged(c_kv, block_table_row, written, write_offset, page_size, k_pe)
+
     rope = 0
     if q_pe is not None:
         if q_pe.ndim != 3 or k_pe.ndim != 2:
@@ -1571,6 +1773,14 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     q_lift_in = _kernel_operand(q_lift)
     c_kv_in = _kernel_operand(c_kv)
     topk_i32 = topk_indices.contiguous().to(torch.int32)
+    if block_table_row is not None:
+        rows = c_kv_in[:0] if written is None else _kernel_operand(written)
+        at = torch.zeros(1, 1, dtype=torch.int32) if write_offset is None else write_offset
+        return wrap_nki(nope_entry)(
+            q_lift_in, c_kv_in, topk_i32, float(softmax_scale),
+            block_table_row.contiguous().to(torch.int32), rows,
+            at.contiguous().to(torch.int32), int(page_size)
+        )
     if rope == 0:
         return wrap_nki(nope_entry)(
             q_lift_in, c_kv_in, topk_i32, float(softmax_scale)
