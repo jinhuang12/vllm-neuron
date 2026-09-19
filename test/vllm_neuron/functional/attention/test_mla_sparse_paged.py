@@ -2,10 +2,12 @@
 """Acceptance for the paged latent window: the sparse attention kernel assembles its window from a
 block table instead of slicing one ascending run of blocks out of the latent bank.
 
-FOURTEEN tests and NO `parametrize` decorator. Four carry `table` in their name and read four block
+FIFTEEN tests and NO `parametrize` decorator. Four carry `table` in their name and read four block
 layouts -- two scattered rows in either order, a row with a padding tail, and a
 full-length row. One carries `identical` and reads the consecutive table. One carries `sentinel`. Two
-carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. One reads a
+carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. One reads an
+overlay whose rows FILL the window, at two window widths, which is the case the staging writes in two
+chunks. One reads a
 second block size, so a body that hardcodes the served one fails. One reads that a selected row past the
 staged window is refused against the WINDOW's length and not the bank's. One puts a scattered table, a
 padding tail and an overlay in a single call, which no other item combines. One reads a page WIDER than
@@ -454,6 +456,47 @@ def test_overlay_of_a_whole_prefill_chunk_is_what_the_gather_reads() -> None:
         "the overlaid window through the paged call and through the unpaged call returned different "
         "bytes, so a chunk written one row off or one row short would pass unseen"
     )
+
+
+def test_an_overlay_that_fills_the_window_is_read_row_for_row() -> None:
+    """An overlay whose rows FILL the staged window, at two window widths, read against one-step torch.
+
+    CERTIFYING COMPONENT: the boundary the staging splits. A destination pattern covering every row of
+    the window from a runtime offset cannot be shown to land inside the window, so the staging writes
+    such an overlay in two chunks instead of one. BOTH ARMS SIT ON THAT BOUNDARY -- a window of one
+    128-row page, split 127 rows then 1, and a window of 64 rows, narrower than the staging piece,
+    split 63 then 1 -- and each is compared with the window torch builds by writing the same rows in
+    ONE step, so a split that dropped, repeated or misplaced a row cannot pass. The window's LAST row
+    is selected in both arms, which is the row the one-row chunk carries.
+    """
+    for page, entry in ((PAGE, 7), (PAGE_ALT, 5)):
+        bank = _bank()
+        table = [entry]
+        width = page
+        down = torch.arange(width, dtype=torch.float32).reshape(width, 1).expand(width, LATENT)
+        written = (down * (-LATENT / SPREAD) - 1.0).contiguous()
+        window = _window(bank, table, page=page).index_copy(0, torch.arange(width), written)
+        queries = _queries(1, 1, LATENT)
+        columns = [pick % width for pick in range(TOPK)]
+        selected = torch.tensor([columns], dtype=torch.int32)
+        got = _paged(bank, table, selected, queries, written,
+                     torch.tensor([[0]], dtype=torch.int32), page=page)
+        want = _oracle(window, selected, queries)
+        worst = float((got - want).abs().max())
+        _say(f"OVERLAY_FILLS_WINDOW_{page}_WORST_ABS", f"{worst:.3e}")
+        _say(f"OVERLAY_FILLS_WINDOW_{page}_ROWS", f"{width}.{len(set(columns))}")
+        assert width - 1 in columns and 0 in columns, (
+            f"this arm reads neither the first nor the last row of the {width}-row window, so a split "
+            f"that lost its tail chunk would return the same bytes"
+        )
+        assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
+            f"the overlay filling a {width}-row window is not what the gather read: worst absolute "
+            f"difference {worst:.3e}"
+        )
+        assert torch.equal(got, _unpaged(window, selected, queries)), (
+            f"the {width}-row overlay read through the paged call and through the unpaged call on the "
+            f"window written in one step returned different bytes, so the split moved a row"
+        )
 
 
 def test_a_second_block_size_is_read_from_the_operand_and_not_assumed() -> None:
