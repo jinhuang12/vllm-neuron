@@ -13,7 +13,7 @@ WHAT THIS FILE MEASURES, on the tiny stack and through the runner's own converte
      a bare tensor, no file is written, and the logits are bit-equal to the configured run's.
   3. Neither module this dump touches imports the NxDI stack.
   4. The latent-cache taps: the five names sit between the index rows and the projection in the
-     order the attention half appends them; the window file holds the window as it stood at the
+     order the attention half appends them; the cache file holds the bank as it stood at the
      tap even after a later write into the caller's bank; and the rows the write named carry the
      values the write wrote, which a planted row offset breaks.
 
@@ -232,7 +232,7 @@ def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
             return project(attn_out, collector)
 
         # THE LATENT TAPS' ORACLES COME FROM EITHER SIDE OF THE CACHE, not from the tap sites:
-        # the projection that makes the latent, and the seam that reads the window back. The
+        # the projection that makes the latent, and the seam the bank is handed to. The
         # clamp is recorded rather than re-derived, because a padded chunk gathers its rows and
         # the raw latent would then not be what the write carried.
         project_latent = layer.attention.project_query_and_latent
@@ -245,8 +245,18 @@ def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
         attend = layer.attention.attend
 
         def _record_attend(hidden_states, latent_cache, *args, **kwargs):
+            # RE-PINNED: ``_slots`` is the BANK's row count now, because the layer is handed
+            # the bank itself rather than a window of it. Which of those rows belong to the
+            # request is the TABLE's answer, so the table and the page size are recorded
+            # beside it and the row reading below is made against them. They are read out of
+            # the keywords rather than defaulted: the layer declares both as required, so an
+            # absent one is this wrapper's KeyError and not a silent None.
             seen["_clamped"] = kwargs.get("prefill_end_position") is not None
             seen["_slots"] = int(latent_cache.shape[0])
+            seen["_pages"] = [
+                int(entry) for entry in kwargs["block_table_row"].flatten().tolist()
+            ]
+            seen["_page_size"] = int(kwargs["page_size"])
             return attend(hidden_states, latent_cache, *args, **kwargs)
 
         seam = mla_sparse_module.mla_sparse_attention
@@ -427,14 +437,20 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
             if suffix == "write_rows":
                 # THE SLOTS' OWN PROPERTY, and no oracle restates the write's arithmetic here:
                 # an unpadded prefill starting at slot zero writes consecutive slots, one per
-                # token, and every one of them lies inside the window it was handed.
+                # token, and this fixture's table names its pages in ascending order from
+                # block zero, so the PHYSICAL rows are those same consecutive numbers.
                 slots = int(tapped[tap]["_slots"])
+                page = int(tapped[tap]["_page_size"])
+                named = [entry for entry in tapped[tap]["_pages"] if entry >= 0]
+                written_pages = sorted({int(row) // page for row in dumped.tolist()})
                 consecutive = torch.arange(
                     int(dumped[0]), int(dumped[0]) + int(dumped.numel()), dtype=dumped.dtype
                 )
                 print(f"TINYDUMP|tap|layer{tap}_{suffix}|shape={tuple(dumped.shape)}"
                       f"|dtype={dumped.dtype}|first={int(dumped[0])}|last={int(dumped[-1])}"
-                      f"|slots={slots}|consecutive={torch.equal(dumped, consecutive)}"
+                      f"|bank_rows={slots}|page={page}|pages_the_table_names={len(named)}"
+                      f"|pages_written={written_pages[:8]}"
+                      f"|consecutive={torch.equal(dumped, consecutive)}"
                       f"|clamped={bool(tapped[tap]['_clamped'])}")
                 assert dumped.dtype is torch.int32, (
                     f"layer{tap}_write_rows.pt is {dumped.dtype}; the slots are choices and a "
@@ -445,8 +461,17 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
                     f"unpadded, so the write names consecutive slots"
                 )
                 assert int(dumped.max()) < slots and int(dumped.min()) >= 0, (
-                    f"layer{tap}_write_rows.pt names slot {int(dumped.max())} in a window of "
-                    f"{slots}; a write outside the window reaches another sequence's rows"
+                    f"layer{tap}_write_rows.pt names bank row {int(dumped.max())} in a bank of "
+                    f"{slots} row(s); a row outside the bank is no slot at all"
+                )
+                # RE-PINNED: the bound above was the WINDOW the layer was handed, and the layer
+                # is handed the whole bank now, so it no longer separates this request's rows
+                # from another's. The table does: a written row belongs to a block the
+                # request's own table names, or it is a page this request does not hold.
+                assert set(written_pages) <= set(named), (
+                    f"layer{tap}_write_rows.pt writes page(s) {written_pages[:8]} and the table "
+                    f"this step was handed names {named[:8]}; a row outside the request's own "
+                    f"pages reaches another sequence's rows"
                 )
                 continue
             if suffix == "latent_written":
@@ -763,8 +788,8 @@ def test_the_latent_taps_are_declared_between_the_index_rows_and_the_projection(
     )
 
 
-def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, monkeypatch):
-    """The window file survives a later bank write, and the written rows carry the written values."""
+def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_bank(tmp_path, monkeypatch):
+    """The cache file survives a later bank write, and the written rows carry the written values."""
     _require_cpu_mode()
     save_dir = tmp_path / "layer-streams"
     layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
@@ -773,16 +798,18 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, 
     seen = {}
 
     def _record_attend(hidden_states, latent_cache, *args, **kwargs):
+        # THE CARRIER IS THE WHOLE BANK NOW, so this records the bank itself; the keywords the
+        # layer declares travel on untouched.
         seen["carrier"] = latent_cache
         return attend(hidden_states, latent_cache, *args, **kwargs)
 
     monkeypatch.setattr(attention, "attend", _record_attend)
     _, output = _prefill(runner, root, _prompt())
     carrier = seen["carrier"]
-    window = carrier[:, 0, :].detach().clone()
+    bank_at_the_tap = carrier[:, 0, :].detach().clone()
     # A LATER WRITE INTO THE CALLER'S BANK, after the forward and before the files are written:
-    # that is the window a decode step would leave behind. The tap holds a clone, so the file
-    # must still read the window as it stood at the tap -- and the second assertion below shows
+    # that is the bank a decode step would leave behind. The tap holds a clone, so the file
+    # must still read the bank as it stood at the tap -- and the second assertion below shows
     # this write really landed, so the first one cannot pass by the write never happening.
     sentinel = -9.0
     with torch.no_grad():
@@ -799,7 +826,7 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, 
           f"|rows={tuple(rows.shape)}/{rows.dtype}|cached={tuple(cached.shape)}/{cached.dtype}"
           f"|attended={tuple(attended.shape)}/{attended.dtype}"
           f"|q_lift={tuple(lifted.shape)}/{lifted.dtype}|bank_dtype={bank_dtype}"
-          f"|window={tuple(window.shape)}|rows_first={rows[:4].tolist()}")
+          f"|bank={tuple(bank_at_the_tap.shape)}|rows_first={rows[:4].tolist()}")
     assert rows.dtype is torch.int32 and rows.ndim == 1, (
         f"write_rows is {tuple(rows.shape)} of {rows.dtype}; the slots the write named are one "
         f"integer per token, and a float there is a number where a slot was asked for"
@@ -808,9 +835,12 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, 
         f"latent_written is {tuple(written.shape)} against {int(rows.numel())} written row(s); "
         f"the tap holds one latent per row the write names"
     )
-    assert cached.shape == window.shape and int(cached.shape[1]) == int(written.shape[1]), (
-        f"cache_rows is {tuple(cached.shape)} and the window the layer was handed is "
-        f"{tuple(window.shape)}; the tap holds the whole window at the latent's own width"
+    assert cached.shape == bank_at_the_tap.shape and int(cached.shape[1]) == int(
+        written.shape[1]
+    ), (
+        f"cache_rows is {tuple(cached.shape)} and the bank the layer was handed is "
+        f"{tuple(bank_at_the_tap.shape)}; the tap holds the whole bank at the latent's own "
+        f"width, which is what the seam gathers its pages out of"
     )
     for name, tensor in (("attended_latent", attended), ("q_lift", lifted)):
         assert tensor.ndim == 3 and int(tensor.shape[0]) == int(written.shape[0]), (
@@ -820,13 +850,13 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, 
         assert tensor.dtype is torch.float32, f"{name} is {tensor.dtype}; the dump widens floats"
 
     filled = torch.full_like(cached, sentinel)
-    kept = torch.equal(cached, window.float())
-    print(f"TINYDUMP|cache_rows_clone|layer={tap}|equals_the_window_at_the_tap={kept}"
+    kept = torch.equal(cached, bank_at_the_tap.float())
+    print(f"TINYDUMP|cache_rows_clone|layer={tap}|equals_the_bank_at_the_tap={kept}"
           f"|equals_the_later_write={torch.equal(cached, filled)}|sentinel={sentinel}")
     assert kept, (
         f"cache_rows was written from a view of the bank, so the later write reached the file: "
-        f"max abs delta {float((cached - window.float()).abs().max())} against the window at the "
-        f"tap. This tap must clone"
+        f"max abs delta {float((cached - bank_at_the_tap.float()).abs().max())} against the bank "
+        f"at the tap. This tap must clone"
     )
     assert not torch.equal(cached, filled), (
         f"the later write into the bank did not land, so nothing here tests the clone"
@@ -846,7 +876,7 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, 
     )
 
     # THE FIXED POINT: shift the rows by one and the identity must break, or it was reading a
-    # window whose rows are indistinguishable and would pass on the wrong slots too.
+    # bank whose rows are indistinguishable and would pass on the wrong slots too.
     shifted = (rows.long() + 1).clamp(max=int(cached.shape[0]) - 1)
     offset_got = cached[shifted]
     broken = not torch.equal(offset_got, want)
@@ -858,33 +888,41 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_window(tmp_path, 
     )
 
 
-class _WindowThatDefersItsWrite:
-    """A cache window whose out-of-place read is real and whose in-place write is only recorded."""
+class _ViewThatDefersItsWrite:
+    """A bank view whose in-place write is only recorded, so the bank keeps its old rows."""
 
-    def __init__(self, window, pending):
-        self._window = window
+    def __init__(self, view, pending):
+        self._view = view
         self._pending = pending
 
     def index_copy_(self, dim, index, source):
         self._pending.append((dim, index.detach().clone(), source.detach().clone()))
         return self
 
-    def index_copy(self, dim, index, source):
-        return self._window.index_copy(dim, index, source)
-
 
 class _BankThatDefersItsWrite:
-    """A bank double standing in for a device where an in-place write is not visible in its own graph."""
+    """A bank double standing in for a device where an in-place write is not visible in its own graph.
+
+    THE FIRST VIEW IT HANDS OUT ONLY RECORDS ITS WRITE and every later one is the bank's own,
+    unwritten. The layer takes one view to write this step's rows through and one to hand the
+    seam, in that order, so the seam is given a bank that does not carry them yet. The item
+    asserts both counts: a layer that took the views in the other order would write for real
+    through the second, and the count reddens rather than the deferral passing silently.
+    """
 
     def __init__(self, bank):
         self._bank = bank
         self.pending: list = []
+        self.views = 0
 
     def __getattr__(self, name):
         return getattr(self._bank, name)
 
     def __getitem__(self, key):
-        return _WindowThatDefersItsWrite(self._bank[key], self.pending)
+        self.views += 1
+        if self.views == 1:
+            return _ViewThatDefersItsWrite(self._bank[key], self.pending)
+        return self._bank[key]
 
     def let_the_deferred_writes_land(self):
         """Apply what the forward only recorded, as a step boundary would."""
@@ -894,14 +932,30 @@ class _BankThatDefersItsWrite:
 
 
 def test_the_seam_reads_this_steps_rows_even_when_the_bank_write_lands_later(tmp_path, monkeypatch):
-    """The operand the seam consumes carries this step's latent while the bank still holds the old rows."""
+    """This step's rows ride beside the bank, so the seam attends them before the write lands.
+
+    RE-PINNED. The layer used to hand the seam an OUT-OF-PLACE copy of the window with this
+    step's rows already in it, and the reading was that the copy carried them while the bank
+    did not. The seam is handed the bank itself now, plus ``written`` and ``write_offset``, and
+    overlays the rows on the window it assembles -- so the bank operand is EXPECTED to be
+    stale here, and what carries this step is read where it now travels:
+
+      * the bank the seam was handed holds none of this step's rows (the old reading, turned
+        around, and the sentinel makes it unmistakable);
+      * the rows it was handed beside the bank ARE the values the write carried;
+      * and the very same dispatch, replayed once the deferred write has landed, returns what
+        it returned over the stale bank -- which is the claim that the overlay, and not the
+        state of the bank, is what the seam attends.
+    """
     _require_cpu_mode()
     save_dir = tmp_path / "layer-streams"
     layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
     attention = layers[tap].attention
     attend = attention.attend
+    seam = mla_sparse_module.mla_sparse_attention
     stale = -3.0
     seen = {}
+    dispatches: list[tuple] = []
 
     def _hand_over_a_deferring_bank(hidden_states, latent_cache, *args, **kwargs):
         # THE OLD ROWS ARE MADE RECOGNISABLE FIRST, so a stale read cannot be mistaken for a
@@ -910,9 +964,22 @@ def test_the_seam_reads_this_steps_rows_even_when_the_bank_write_lands_later(tmp
             latent_cache.fill_(stale)
         seen["carrier"] = latent_cache
         seen["double"] = _BankThatDefersItsWrite(latent_cache)
-        return attend(hidden_states, seen["double"], *args, **kwargs)
+        seen["inside"] = True
+        try:
+            return attend(hidden_states, seen["double"], *args, **kwargs)
+        finally:
+            seen["inside"] = False
+
+    def _record_the_dispatch(q_lift, c_kv, *args, **kwargs):
+        # EVERY SPARSE LAYER OF THE STACK ENTERS THIS SEAM, and only the tapped layer's bank
+        # is the deferring one, so the flag above is what keeps this record the tapped layer's.
+        attended = seam(q_lift, c_kv, *args, **kwargs)
+        if seen.get("inside"):
+            dispatches.append((q_lift, c_kv, args, dict(kwargs), attended.detach().clone()))
+        return attended
 
     monkeypatch.setattr(attention, "attend", _hand_over_a_deferring_bank)
+    monkeypatch.setattr(mla_sparse_module, "mla_sparse_attention", _record_the_dispatch)
     _, output = _prefill(runner, root, _prompt())
     carrier, double = seen["carrier"], seen["double"]
     NeuronModelRunner._take_layer_stream_dump(runner, output, is_prefill=True)
@@ -922,36 +989,65 @@ def test_the_seam_reads_this_steps_rows_even_when_the_bank_write_lands_later(tmp
     cached = _dumped(save_dir, tap, "cache_rows")
     bank_dtype = carrier.dtype
     want = written.to(bank_dtype).float()
-    got = cached[rows.long()]
-    still_old = carrier[:, 0, :].float()[rows.long()]
+    handed = cached[rows.long()]
     print(f"TINYDUMP|deferred_bank|layer={tap}|deferred_writes={len(double.pending)}"
-          f"|rows={int(rows.numel())}|cast_to={bank_dtype}|stale={stale}"
-          f"|seam_carries_this_step={torch.equal(got, want)}"
-          f"|bank_still_old={torch.equal(still_old, torch.full_like(still_old, stale))}"
-          f"|max_abs_seam={float((got - want).abs().max())}")
+          f"|views={double.views}|dispatches={len(dispatches)}|rows={int(rows.numel())}"
+          f"|cast_to={bank_dtype}|stale={stale}"
+          f"|bank_operand_still_old={torch.equal(handed, torch.full_like(handed, stale))}"
+          f"|max_abs_bank={float((handed - want).abs().max())}")
     assert double.pending, (
         f"the double recorded no write, so the layer never wrote through the bank and this item "
         f"tests nothing about a write that lands late"
     )
-    assert torch.equal(still_old, torch.full_like(still_old, stale)), (
-        f"the bank already carries the write, so the deferral did not hold and a stale read is "
-        f"indistinguishable from a written one here"
+    assert double.views == 2, (
+        f"the layer took {double.views} view(s) of the bank; it takes one to write this step's "
+        f"rows through and one to hand the seam, so any other count means the deferral did not "
+        f"cover the write or the operand is not the bank"
     )
-    assert not torch.equal(still_old, want), (
-        f"the rows the bank still holds are the written ones, so reading the bank's view instead "
+    assert len(dispatches) == 1, (
+        f"the tapped layer entered the seam {len(dispatches)} time(s); one dispatch assembles "
+        f"one window, and the replay below reads that one dispatch"
+    )
+    assert torch.equal(handed, torch.full_like(handed, stale)), (
+        f"the bank the seam was handed already carries this step's rows, so the deferral did not "
+        f"hold and an overlay that carried nothing would pass here too"
+    )
+    assert not torch.equal(handed, want), (
+        f"the rows the bank still holds are the written ones, so a seam that read the bank alone "
         f"would pass too and this item cannot tell the two reads apart"
     )
-    assert torch.equal(got, want), (
-        f"the operand the seam consumed does not carry this step's rows: max abs delta "
-        f"{float((got - want).abs().max())} under the bank's own cast, while the bank still holds "
-        f"the old rows. The seam must read a window the write has been applied to, not the bank's view"
+
+    # WHAT CARRIES THIS STEP INSTEAD: the values the write carried, handed to the seam beside
+    # the bank under its own keyword. The cast is part of the identity for the reason the tap
+    # item records -- the write hands the bank its latent in the bank's dtype.
+    q_lift, operand, args, kwargs, attended = dispatches[0]
+    overlaid = kwargs["written"].detach().to(bank_dtype).float()
+    print(f"TINYDUMP|deferred_bank_overlay|layer={tap}|written={tuple(overlaid.shape)}"
+          f"|is_the_write={torch.equal(overlaid, want)}"
+          f"|write_offset={kwargs['write_offset'].flatten().tolist()}"
+          f"|max_abs={float((overlaid - want).abs().max())}")
+    assert torch.equal(overlaid, want), (
+        f"the rows the seam was handed beside the bank are not the values the write carried: max "
+        f"abs delta {float((overlaid - want).abs().max())} under the bank's own cast"
+    )
+    assert int(kwargs["write_offset"].flatten()[0]) == 0, (
+        f"this fixture prefills from position 0, so the row the overlay sits at is 0; the seam "
+        f"was handed {kwargs['write_offset'].flatten().tolist()}"
     )
 
     double.let_the_deferred_writes_land()
     landed = carrier[:, 0, :].float()[rows.long()]
+    replayed = seam(q_lift, operand, *args, **kwargs)
     print(f"TINYDUMP|deferred_bank_persistence|layer={tap}|bank_carries_the_write="
-          f"{torch.equal(landed, want)}|max_abs={float((landed - want).abs().max())}")
+          f"{torch.equal(landed, want)}|max_abs={float((landed - want).abs().max())}"
+          f"|replay_is_bit_equal={torch.equal(replayed, attended)}"
+          f"|max_abs_replay={float((replayed - attended).abs().max())}")
     assert torch.equal(landed, want), (
         f"once the recorded write landed the bank still does not carry the written rows: max abs "
         f"delta {float((landed - want).abs().max())}. The in-place write is what later steps read"
+    )
+    assert torch.equal(replayed, attended), (
+        f"the same dispatch attended something else once the bank carried this step's rows, so "
+        f"what it read over the stale bank was not this step: max abs delta "
+        f"{float((replayed - attended).abs().max())}. The overlay is what must carry the rows"
     )

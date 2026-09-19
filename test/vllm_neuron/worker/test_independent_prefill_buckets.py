@@ -277,7 +277,11 @@ def test_sparse_prefix_keeps_model_width_and_real_request_extent(real_tokens, ca
 
     sparse, linear = converted["layer_carriers"]
     assert sparse["active_mla_query_rows"] == 128
-    assert sparse["latent_cache"].shape[0] == 2048
+    # THE BANK TRAVELS WHOLE and the window is what the block table names, so the length
+    # the leg sizes is read off the table's width. It was read off this view before.
+    assert sparse["latent_cache"].shape[0] == 4096
+    assert sparse["block_table_row"].shape == (16, 1)
+    assert sparse["latent_slots"].shape == (1024,)
     assert sparse["seq_lens"].shape == (1024,)
     assert sparse["slot_mapping"].shape == (1024,)
     assert torch.all(sparse["slot_mapping"][real:] == -1)
@@ -303,7 +307,8 @@ def test_sparse_prefix_conversion_uses_host_metadata_during_capture():
     assert converted["input_ids"].shape == (1024,)
     assert converted["input_ids"].device.type == "meta"
     assert sparse["active_mla_query_rows"] == 128
-    assert sparse["latent_cache"].shape[0] == 2048
+    assert sparse["latent_cache"].shape[0] == 4096
+    assert sparse["block_table_row"].shape == (16, 1)
     assert linear["row_mask"].shape == (1, 1024, 1)
     assert runner._glm5next_side_cache_positions == {}
 
@@ -332,7 +337,8 @@ def test_decode_and_largest_query_keep_original_operands(width):
         assert "prefill_end_position" not in sparse
         assert int(sparse["position"]) == 0
     else:
-        assert sparse["latent_cache"].shape[0] == 2048
+        assert sparse["latent_cache"].shape[0] == 4096
+        assert sparse["block_table_row"].shape == (16, 1)
         assert int(sparse["prefill_end_position"]) == width
 
 
@@ -343,7 +349,10 @@ def test_direct_runner_without_query_config_keeps_original_width():
     assert converted["input_ids"] is kwargs["input_ids"]
     sparse, linear = converted["layer_carriers"]
     assert "active_mla_query_rows" not in sparse
-    assert sparse["latent_cache"].shape[0] == 1152
+    assert sparse["latent_cache"].shape[0] == 4096
+    # NINE BLOCKS, the span this leg sizes with no bucket stated, and the window is
+    # those blocks: the table's width carries the number this view used to carry.
+    assert sparse["block_table_row"].shape == (9, 1)
     assert linear["row_mask"].shape == (1, 128, 1)
 
 

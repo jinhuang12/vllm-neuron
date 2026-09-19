@@ -9,14 +9,15 @@ the second one -- the array the input builder leaves, and the four places the co
 reads it: the block run, the ring cursor, the ring's end and the pools a chunk completes.
 
 WHY EACH READING IS A SERVING FAILURE AND NOT A TIDINESS POINT. Blocks are allocated for
-the REAL count, so a run taken from the padded width names row entries the request was
-never given and the carrier builder refuses it ("not one run"). A cursor left at the
-bucket refuses the request's own first decode, which arrives at the real position. A ring
-end past the sequence seeds slots that hold no token of it, and a pool completed on
+the REAL count, so a table taken from the padded width names row entries the request was
+never given -- zero on a fresh table, which is a real page -- and the rows this step writes
+are resolved through that table, so they land on another sequence's slots. A cursor left at
+the bucket refuses the request's own first decode, which arrives at the real position. A
+ring end past the sequence seeds slots that hold no token of it, and a pool completed on
 padding members is pooled by the next completion.
 
 WHAT THIS FILE DOES NOT MEASURE, stated so the gap is not read as coverage. The operand
-WIDTHS: ``seq_lens``, ``slot_mapping`` and the window all keep the bucket's width by
+WIDTHS: ``seq_lens``, ``slot_mapping`` and the block table all keep the bucket's width by
 design, and the capture-shape items own that. The model's forward: the converter is what
 changed and the converter is what runs here; the tiny generation and its reference live
 in ``test_tiny_glm5next_e2e.py``. One request per step, which this half refuses to
@@ -68,7 +69,8 @@ REAL_BLOCKS = -(-REAL_TOKENS // item.MLA_PAGE_SIZE)
 WIDE_PADDED = 2 * item.STACK_TOKENS
 WIDE_REAL = item.STACK_TOKENS
 
-#: The request's own pages, and the window that has to hold the PADDED chunk's rows.
+#: The request's own pages, and the block-table WIDTH the padded chunk needs: the attention
+#: half refuses a table whose pages name fewer rows than the step it is handed carries.
 WIDE_REAL_BLOCKS = -(-WIDE_REAL // item.MLA_PAGE_SIZE)
 WIDE_WINDOW_BLOCKS = -(-WIDE_PADDED // item.MLA_PAGE_SIZE)
 
@@ -213,17 +215,24 @@ def test_the_request_length_array_meets_its_four_declared_properties():
 
 
 def test_a_padded_prefill_is_served_on_the_row_the_request_was_really_allocated():
-    """The run covers the sequence's pages; the row's later entries are not the request's.
+    """The table names the sequence's pages; the row's later entries are not the request's.
 
     THE ROW IS THE PRODUCTION SHAPE and that is the whole item: the scheduler allocates
     for the real count and the block table is handed over at its full width, so the
-    entries past the allocation belong to no request. A run taken from the padded width
-    reaches them, and the carrier builder refuses the step by name rather than slicing
-    them ("not one run").
+    entries past the allocation belong to no request. A table taken from the padded width
+    names them, and every row this step writes is resolved through that table, so the
+    write would land on pages another sequence holds.
 
-    THE CONTROL IS THE ROW ITSELF: if its padded run were one ascending run, the step
-    would be served either way and this item would measure nothing, so the run is
-    checked before the step is taken.
+    WHAT IS READ, NOW THAT NOTHING REFUSES IT. The carrier builder used to refuse a block
+    run that was not one ascending run ("not one run"); the kernel gathers the pages the
+    table names, so a scattered table is served and there is no refusal left to pin. The
+    readings are therefore positive ones: the carrier names the request's OWN blocks, in
+    the order it was given them, with `-1` in every entry the bucket pads, and every
+    token's physical slot lies inside those blocks.
+
+    THE CONTROL IS THE ROW ITSELF: if its padded entries continued the request's own run,
+    a table taken from the padded width would name the same pages and this item would
+    measure nothing, so the row is checked before the step is taken.
     """
     e2e._require_cpu_mode()
     row = _served_row()
@@ -244,9 +253,38 @@ def test_a_padded_prefill_is_served_on_the_row_the_request_was_really_allocated(
         runner, row=row, width=BUCKET_TOKENS, cached=0, sampling_row=REAL_TOKENS - 1
     )
     served = len(kwargs["layer_carriers"])
-    print(f"INC133|served_on_the_real_row|carriers={served}|cursor={runner._glm5next_side_cache_cursor}")
+    # THE TABLE AND THE SLOTS ARE READ FROM EVERY SPARSE CARRIER, as sets, so a stack whose
+    # layers disagree about which pages the request holds reddens on the count of answers
+    # rather than on whichever layer this item happened to look at.
+    tables = {
+        tuple(int(entry) for entry in carrier["block_table_row"].flatten().tolist())
+        for carrier in kwargs["layer_carriers"]
+        if "block_table_row" in carrier
+    }
+    slot_ranges = {
+        (int(carrier["latent_slots"].min()), int(carrier["latent_slots"].max()))
+        for carrier in kwargs["layer_carriers"]
+        if "latent_slots" in carrier
+    }
+    want_table = tuple(range(REAL_BLOCKS)) + (-1,) * (ROW_WIDTH - REAL_BLOCKS)
+    names_its_own = tables == {want_table}
+    print(f"INC133|served_on_the_real_row|carriers={served}"
+          f"|cursor={runner._glm5next_side_cache_cursor}|distinct_tables={len(tables)}"
+          f"|names_the_requests_own_blocks={names_its_own}"
+          f"|allocated={REAL_BLOCKS}|row_width={ROW_WIDTH}|padded_entries="
+          f"{ROW_WIDTH - REAL_BLOCKS}|slot_ranges={sorted(slot_ranges)}")
     assert served == len(runner.model.glm5next_layer_banks), (
-        "the step must be served: the run covers the request's own pages and stops there"
+        "the step must be served: the table names the request's own pages and pads the rest"
+    )
+    assert tables == {want_table}, (
+        f"every sparse carrier must name the request's {REAL_BLOCKS} allocated block(s) in "
+        f"the order the row gives them and pad the rest of its {ROW_WIDTH} entry(ies) with "
+        f"-1; a table built from the padded width names entries this request never got"
+    )
+    assert slot_ranges == {(0, REAL_TOKENS - 1)}, (
+        f"the physical slots must run from this request's first row to its last real one "
+        f"({REAL_TOKENS - 1}), which are inside the {REAL_BLOCKS} page(s) it holds; a slot "
+        f"past them was resolved through an entry the request was never given"
     )
 
 

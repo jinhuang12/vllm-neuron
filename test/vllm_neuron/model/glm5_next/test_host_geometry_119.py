@@ -32,10 +32,10 @@ THE SIX HOST-GEOMETRY ITEMS
   single request is refused as four.
 * A04 -- the rule made mechanical. A device tensor placed under a host key is refused BY NAME
   rather than converted, so a call site written later cannot reintroduce the defect quietly.
-* A05 -- the view rule, and the base-passing control. The slice handed to a layer spans whole
-  pages from the request's first page, covers ``start_position + tokens``, and is an ALIAS of
-  the bank rather than a copy. This item reads the same at the base, because it is about the
-  rule the converter has always implemented rather than about the source it reads.
+* A05 -- the view rule. The layer is handed the bank ITSELF, the pages it may write are the
+  ones its own block table names, and a write through the rows the carrier hands it lands in
+  the bank rather than in a copy. This item used to read the same at the base and no longer
+  can: the pages now arrive under two keys the base does not carry.
 * A06 -- the second host read on the same path. Every MLA layer of every step calls
   ``mla_sparse_attention`` (``model_fp8.py:6873``), whose range refusal read the selected-row
   range with ``int(...)``. The seam now reaches its dispatch on a captured step's own
@@ -49,7 +49,7 @@ THE WIDTH ITEM, ON THE SAME CONVERTER
   from that entry. This item reads the same at the base, because the base checks no width
   either; it is here to hold this candidate's own width rule to the shape the runner builds.
 
-THE BASE ARM, DECLARED: A01, A02, A03, A04 and A06 FAIL; A05 and B01 PASS.
+THE BASE ARM, DECLARED: A01, A02, A03, A04, A05 and A06 FAIL; B01 PASSES.
 
 RE-PINNED AFTER THE PAGED-WINDOW WORK. The converter hands a layer a window whose length is
 the leg's bucket span, so the view is WIDER than the step's own pages and the position
@@ -58,6 +58,15 @@ A02 and A03, and the position reads in A01 and A06, which asked a ``meta`` tenso
 it does not hold. Each original is quoted verbatim where it was replaced. A05 keeps its
 base-passing arm on purpose -- it pins whole pages and coverage rather than the exact length,
 which the window's own acceptance file measures.
+
+RE-PINNED AGAIN, NOW THAT THE BANK TRAVELS WHOLE. The window slice is gone: a layer is handed
+the bank itself, its request's block table as a ``[pages, 1]`` int32 column padded with ``-1``,
+and ``latent_slots``, each token's physical bank row. So a view LENGTH no longer says anything
+about a request -- every carrier's is the bank's -- and the readings that measured a request
+through that length are made on the two new keys instead, where the same risk sits: a table
+that named another sequence's pages, or rows that addressed them, is what those readings now
+catch. Five items moved: A01, A02, A03 and A05 read the bank plus the pages, and A06 slices
+the bank it is handed. A05 loses the base-passing arm this costs, which is recorded above.
 
 CONVENTIONS. The runner is stood up with ``__new__`` and given only the attributes the
 converter reads, which is this campaign's landed harness shape
@@ -84,6 +93,11 @@ PAGE = 4
 #: The latent bank: pages, and the width one slot holds.
 BANK_PAGES = 32
 LATENT_WIDTH = 8
+
+#: The bank's own row count, which is what a sparse carrier hands a layer: the whole bank,
+#: no slice and no copy. It is the same number at every position and for every request,
+#: which is why the readings about a request are made on its block table instead.
+BANK_SLOTS = BANK_PAGES * PAGE
 
 #: Recurrent state slots in the linear-attention bank. RE-PINNED: the converter no longer
 #: reads a state slot off the block row -- it hands each request a slot of its own table --
@@ -112,17 +126,43 @@ DECODE_THRESHOLD = 1
 MAX_MODEL_LEN = BANK_PAGES * PAGE
 
 
-def _window_slots(row) -> int:
-    """The carrier view's length for an entry ``_entry`` built from ``row``.
+def _table_blocks(row) -> int:
+    """The block table's width for an entry ``_entry`` built from ``row``.
 
-    The converter hands a layer a window whose length is the LEG's bucket span capped by
-    the declared blocks per sequence, and no longer this step's own pages. Every entry in
-    this file declares both numbers off the same row -- the blocks per sequence is the row's
-    width and the segment is that width in slots -- so the span always reaches the cap and
-    the window is the row's whole width. That is one number per item and it does not move
-    with the position, which is the property the window exists to give.
+    The table the converter hands a layer is as wide as the LEG's bucket span capped by the
+    declared blocks per sequence, and never as wide as this step's own pages: a width that
+    followed the step would be a new graph at every step. Every entry in this file declares
+    both numbers off the same row -- the blocks per sequence is the row's width and the
+    segment is that width in slots -- so the span always reaches the cap and the table is
+    the row's whole width. That is one number per item and it does not move with the
+    position, which is the property the padded table exists to give.
     """
-    return len(row) * PAGE
+    return len(row)
+
+
+def _padded_table(row, pages: int) -> list[int]:
+    """The block ids a carrier built from ``row`` names, at ``pages`` pages of its own.
+
+    The request's pages come first, in the order the row gives them, and every entry the
+    bucket pads is ``-1``. Both halves are read: a table that dropped the order would page
+    another sequence's rows, and one that padded with a block number would address page 0.
+    """
+    return [int(value) for value in row[:pages]] + [-1] * (_table_blocks(row) - pages)
+
+
+def _physical_rows(row, *, start: int, tokens: int) -> list[int]:
+    """Each of this step's tokens as a PHYSICAL bank row, by the runner's own formula.
+
+    At one context-parallel rank a slot is ``block_number * block_size + block_offset``
+    (``neuron_model_runner.py:330-334``), and that number is the row index of the bank the
+    carrier hands over. It is restated here because it is the address the layer's write
+    consumes now that the rows of a request are not a run.
+    """
+    rows: list[int] = []
+    for offset in range(int(tokens)):
+        position = int(start) + offset
+        rows.append(int(row[position // PAGE]) * PAGE + position % PAGE)
+    return rows
 
 
 def _text_config() -> SimpleNamespace:
@@ -290,14 +330,24 @@ def test_a01_a_capture_on_meta_builds_its_carriers() -> None:
     carriers = translated["layer_carriers"]
     assert len(carriers) == 2
     sparse, linear = carriers
-    # RE-PINNED: the view's length is the window's, not this step's pages, because a length
-    # that follows the position is a new graph at every step. The reading this
-    # replaces, verbatim: "Eight tokens at position 0 occupy two pages of four" —
-    # `assert int(sparse["latent_cache"].shape[0]) == 2 * PAGE`. Those two pages are still
-    # the ones this step writes, and they are the front of the window, so the second line
-    # keeps the original claim.
-    assert int(sparse["latent_cache"].shape[0]) == _window_slots(host_row)
-    assert int(sparse["latent_cache"].shape[0]) >= 2 * PAGE
+    # RE-PINNED AGAIN: the carrier is the bank ITSELF, no slice and no copy, so its length
+    # is the bank's at every step. The two readings this replaces, verbatim:
+    # `assert int(sparse["latent_cache"].shape[0]) == _window_slots(host_row)` and
+    # `assert int(sparse["latent_cache"].shape[0]) >= 2 * PAGE`, the second of which kept
+    # the original "eight tokens at position 0 occupy two pages of four". Those two pages
+    # are still the ones this step writes, and they are named by the two keys below.
+    assert sparse["latent_cache"] is banks[0]["latent_cache"]
+    assert int(sparse["latent_cache"].shape[0]) == BANK_SLOTS
+    # THE PAGES, AS FORM ONLY. This item's carrier is on `meta`, where a tensor has a shape
+    # and no values, so what is read here is the shape a captured graph is compiled for: the
+    # table is the bucket's width and the rows are one per token of the step. The VALUES are
+    # read where they exist, on the CPU steps in A02 and A05.
+    assert tuple(sparse["block_table_row"].shape) == (_table_blocks(host_row), 1)
+    assert sparse["block_table_row"].dtype == torch.int32
+    assert sparse["block_table_row"].device.type == "meta"
+    assert tuple(sparse["latent_slots"].shape) == (tokens,)
+    assert sparse["latent_slots"].dtype == torch.int64
+    assert sparse["latent_slots"].device.type == "meta"
     # RE-PINNED: the position arrives as a tensor -- for the window's own reason, that a
     # host number here is baked into the graph it was captured with -- and this item's
     # carrier is on `meta`, where a value does not exist to be read. The reading this
@@ -336,8 +386,10 @@ def test_a02_the_host_row_is_the_one_the_slice_follows() -> None:
     """A serving-shaped step whose two halves name different pages.
 
     The host row names pages 4 and 5 of the bank; the device row names pages 500 and 501,
-    which the bank does not have. A slice taken from the device row is empty, so the item
-    reads the difference rather than inferring it.
+    which the bank does not have. So the two halves are told apart by the pages the carrier
+    names and by the bank rows it hands the layer, which is a difference read rather than
+    inferred: a carrier built from the device row names page 500 and addresses row 2000 of a
+    bank that holds 128.
     """
     cpu = torch.device("cpu")
     banks = [_sparse_bank(cpu)]
@@ -356,15 +408,25 @@ def test_a02_the_host_row_is_the_one_the_slice_follows() -> None:
     translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
 
     carrier = translated["layer_carriers"][0]
-    # RE-PINNED: the length is the window's, which is one number for every position in the
-    # bucket where the step's own pages were a different number each step. The reading
-    # this replaces, verbatim: "Six
-    # tokens at position 0 occupy two pages, and they are the host row's first two" —
-    # `assert int(carrier["latent_cache"].shape[0]) == 2 * PAGE`. Which row the view follows
-    # is what this item measures, and the pointer line below is what measures it.
-    assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)
     bank = banks[0]["latent_cache"]
-    assert carrier["latent_cache"].data_ptr() == bank[4 * PAGE].data_ptr()
+    # RE-PINNED AGAIN: the carrier is the whole bank, so its length and its pointer are the
+    # bank's whatever row the converter read, and neither can tell the two halves apart any
+    # more. The two readings this replaces, verbatim:
+    # `assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)` and
+    # `assert carrier["latent_cache"].data_ptr() == bank[4 * PAGE].data_ptr()`, the second
+    # of which carried this item's whole measurement -- which half the converter read.
+    assert int(carrier["latent_cache"].shape[0]) == BANK_SLOTS
+    assert carrier["latent_cache"].data_ptr() == bank.data_ptr()
+    # WHERE THAT MEASUREMENT LIVES NOW. Six tokens at position 0 occupy two pages, and they
+    # are the host row's first two: the table names pages 4 and 5 and pads the bucket's
+    # remaining two entries, and the rows the layer writes are those pages' own. The device
+    # row's pages 500 and 501 satisfy neither reading -- their rows are outside this bank.
+    pages = -(-tokens // PAGE)
+    assert pages == 2
+    assert carrier["block_table_row"].flatten().tolist() == _padded_table(host_row, pages)
+    assert carrier["latent_slots"].tolist() == _physical_rows(
+        host_row, start=0, tokens=tokens
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,14 +455,20 @@ def test_a03_a_padded_device_table_does_not_decide_the_request_count() -> None:
 
     translated = runner._glm5next_model_kwargs(_kwargs(banks, entry, tokens=tokens, device=cpu))
 
-    # RE-PINNED: the length is the window's, which for this two-entry row is two pages, and
-    # it is that length at every position rather than at this one. The
-    # reading this replaces, verbatim:
+    # RE-PINNED AGAIN: the length is the bank's, at every position and for every request.
+    # The reading this replaces, verbatim:
+    # `assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)`, which
+    # replaced "four tokens at position 0 occupy one page" --
     # `assert int(translated["layer_carriers"][0]["latent_cache"].shape[0]) == PAGE`. What
     # this item measures is that the step was NOT refused as a four-request batch, and a
-    # carrier that exists at all is that reading.
+    # carrier that exists at all is that reading; the two lines after it say what that
+    # carrier holds -- this request's one page, and the bucket's second entry padded.
     carrier = translated["layer_carriers"][0]
-    assert int(carrier["latent_cache"].shape[0]) == _window_slots(host_row)
+    assert int(carrier["latent_cache"].shape[0]) == BANK_SLOTS
+    assert carrier["block_table_row"].flatten().tolist() == _padded_table(host_row, 1)
+    assert carrier["latent_slots"].tolist() == _physical_rows(
+        host_row, start=0, tokens=tokens
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -437,20 +505,19 @@ def test_a04_a_device_tensor_under_a_host_key_is_refused_by_name() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# A05. The view rule, and the control that passes at the base.
+# A05. The view rule: the bank itself, and the rows this step may write.
 # ══════════════════════════════════════════════════════════════════════════════
 def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     """The rule the converter implements, read back off one continuing step.
 
-    THE RULE. The slice spans the whole pages the request's own tokens occupy, counted from
-    the request's first page: ``ceil((start_position + tokens) / page)`` pages. It therefore
-    covers ``start_position + tokens`` slots, which is the bound the layer checks before it
-    writes (``model_fp8.py:6840-6845``), and its rows are the request's own.
+    THE RULE. The layer is handed the bank, and the pages the request's own tokens occupy
+    are named beside it: ``ceil((start_position + tokens) / page)`` entries of its block
+    table, from the request's first page, and one physical bank row per token of the step.
 
-    WHY THE ALIAS MATTERS. The layer writes this step's latents THROUGH the slice
-    (``model_fp8.py:6855``) and reads slot 0 to the last written slot back out of it
-    (``model_fp8.py:6859``). A basic slice is a view, so both land in the bank. A gather
-    would return a copy, and the write would be discarded where the next step reads.
+    WHY THE ALIAS MATTERS. The layer writes this step's latents THROUGH what it is handed
+    (``model_fp8.py:6855``) at the rows it is handed, and a later step reads them back out
+    of the bank. The carrier is the bank itself, so both land there. A copy would be
+    discarded where the next step reads.
 
     RE-PINNED. The length is now the bucket's window and the read is the whole of it,
     because the old length was derived from the position and therefore held only for the
@@ -462,6 +529,12 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
     still read below: the view starts at the request's first page, it COVERS the step's own
     slots, and it aliases the bank. What changed is that covering is no longer exactness --
     a length that tracked the position is what pinned a captured graph to one position.
+
+    RE-PINNED AGAIN, AND THE BASE-PASSING ARM GOES WITH IT. There is no slice left to read a
+    request out of: the carrier is the bank, so the clauses above are read on the two keys
+    the pages arrive under, which the base does not carry. The whole-pages clause is the
+    table's entries, the coverage clause is the physical row of every token, and the alias
+    clause is the write below, which now goes through those rows.
     """
     cpu = torch.device("cpu")
     banks = [_sparse_bank(cpu)]
@@ -481,25 +554,29 @@ def test_a05_the_carrier_view_spans_whole_pages_and_aliases_the_bank() -> None:
 
     carrier = translated["layer_carriers"][0]
     view = carrier["latent_cache"]
+    host_row = [4, 5, 6, 7, 8]
     pages = -(-(cached + tokens) // PAGE)
     assert pages == 3
-    # RE-PINNED: `assert int(view.shape[0]) == pages * PAGE` became the two clauses of that
-    # reading which survive the window -- whole pages, and enough of them for this step.
-    # `pages` counts THIS step's, and a length counted that way moves as the step does.
-    # The EXACT length is the window's now and belongs to the item that measures the window;
-    # pinning it here would also cost this item its base-passing arm, which is the whole
-    # reason it is in the file.
-    assert int(view.shape[0]) % PAGE == 0
-    assert int(view.shape[0]) >= pages * PAGE
-    # The layer's own bound: the step's last slot is inside the slice it was handed.
-    assert int(view.shape[0]) >= cached + tokens
+    # RE-PINNED AGAIN: the three readings this replaces, verbatim --
+    # `assert int(view.shape[0]) % PAGE == 0`, `assert int(view.shape[0]) >= pages * PAGE`
+    # and `assert int(view.shape[0]) >= cached + tokens` -- were what survived of
+    # `assert int(view.shape[0]) == pages * PAGE` while the carrier was a window. A length
+    # says nothing about a request now, so each clause is read where its risk moved: the
+    # whole-pages clause is the table's own entries, which are this request's first `pages`
+    # and then the bucket's padding, and the coverage clause is one bank row per token of
+    # the step, each one inside the page its own position falls in.
+    assert int(view.shape[0]) == BANK_SLOTS
+    assert carrier["block_table_row"].flatten().tolist() == _padded_table(host_row, pages)
+    rows = _physical_rows(host_row, start=cached, tokens=tokens)
+    assert carrier["latent_slots"].tolist() == rows
     # The position's VALUE, read here because this item's carrier is on CPU: A01's is on
     # `meta`, where the tensor has a form but no value.
     assert int(carrier["start_position"]) == cached
-    # The slice starts at the request's first page, and it is the bank's own storage.
+    # The carrier is the bank's own storage, from its first slot, and the write the layer
+    # makes goes to the rows it was handed rather than to a window position.
     bank = banks[0]["latent_cache"]
-    assert view.data_ptr() == bank[4 * PAGE].data_ptr()
-    view[cached : cached + tokens, 0, :] = 1.0
+    assert view.data_ptr() == bank.data_ptr()
+    view[rows, 0, :] = 1.0
     assert bool(bank[4 * PAGE + cached].eq(1.0).all())
     assert bool(bank[4 * PAGE + cached - 1].eq(0.0).all())
 
@@ -521,11 +598,11 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     kernel boundary does with ``meta`` inputs after that is NOT measured here -- that is
     a vendor question and ``D01`` in ``test_meta_forward_119.py`` reports it.
 
-    THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, sliced the
-    way the layer slices it (``model_fp8.py:6855``, ``model_fp8.py:6859``), and the scale is the
-    carrier's own. The selected-row width is the seam's declared tile, ``KEY_CHUNK``,
-    imported rather than typed: the admissibility clause requires a positive multiple of it
-    (``mla_sparse.py:1293-1299``).
+    THE GEOMETRY IS THE CONVERTER'S. The cache side is the carrier the runner built, taken
+    the way the layer takes it (``model_fp8.py:6855``, ``model_fp8.py:6859``) -- the bank
+    whole -- and the scale is the carrier's own. The selected-row width is the seam's
+    declared tile, ``KEY_CHUNK``, imported rather than typed: the admissibility clause
+    requires a positive multiple of it (``mla_sparse.py:1293-1299``).
     """
     from vllm_neuron.functional.attention import mla_sparse as seam
 
@@ -545,12 +622,12 @@ def test_a06_the_seam_reaches_its_dispatch_on_meta_tensors() -> None:
     carrier = runner._glm5next_model_kwargs(
         _kwargs(banks, entry, tokens=tokens, device=meta)
     )["layer_carriers"][0]
-    # RE-PINNED: the cache side is sliced the way the layer slices it, and the layer now
-    # reads the window WHOLE, so the extent it reads is the bucket's and not this step's.
+    # RE-PINNED: the cache side is the bank the carrier hands over, taken whole, because the
+    # kernel stages the pages the block table names rather than reading a run off a position.
     # The reading this replaces, verbatim:
     # `start = int(carrier["start_position"])` then
     # `c_kv = carrier["latent_cache"][: start + tokens, 0, :]`. That `int()` cannot answer on
-    # a `meta` carrier, and reading a length off the position is what the window removed.
+    # a `meta` carrier, and reading a length off the position is what the paged table removed.
     c_kv = carrier["latent_cache"][:, 0, :]
     q_lift = torch.zeros((1, 1, LATENT_WIDTH), dtype=torch.float32, device=meta)
     selected = torch.zeros((1, seam.KEY_CHUNK), dtype=torch.int32, device=meta)

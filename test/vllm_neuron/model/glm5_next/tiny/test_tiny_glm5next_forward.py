@@ -92,6 +92,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from test.vllm_neuron.model.glm5_next.test_mla_decode import paged_operands
 from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
 from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE, TILE_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
@@ -3179,7 +3180,11 @@ def _mla_pool_cache(*, pages: int = MLA_PAGES) -> torch.Tensor:
 
 
 def _mla_latent_cache(attention, *, tokens: int = MLA_TOKENS) -> torch.Tensor:
-    """The latent cache at the layer's OWN declared spec, one latent per token.
+    """The latent cache at the layer's OWN declared spec, in whole blocks.
+
+    WHOLE BLOCKS AND NOT ONE ROW PER TOKEN: the path takes the bank and a block table
+    naming its pages, so a bank a block does not divide is refused by name. The rows
+    past the tokens hold nothing and no selection names them.
 
     ``head_size`` is read off the module rather than typed, because the module
     derives it from two config fields and a cache built from a literal would stop
@@ -3194,7 +3199,8 @@ def _mla_latent_cache(attention, *, tokens: int = MLA_TOKENS) -> torch.Tensor:
     ``inc-glm53f-042``'s own items.
     """
     return torch.zeros(
-        tokens, attention.NUM_LATENT_KV_HEADS, int(attention.head_size),
+        -(-int(tokens) // MLA_PAGE_SIZE) * MLA_PAGE_SIZE,
+        attention.NUM_LATENT_KV_HEADS, int(attention.head_size),
         dtype=torch.float32,
     )
 
@@ -3429,6 +3435,7 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
         max_seq_len=MLA_TOKENS,
         page_size=MLA_PAGE_SIZE,
         slot_mapping=operands["slot_mapping"],
+        **paged_operands(latent_cache, 0, int(normed.shape[0]), page=MLA_PAGE_SIZE),
     )
     after = _read_seam_counters()
     # EVERY FIGURE IS READ OFF A LANDED, GREEN TABLE FOR THIS SAME COMPOSITION
@@ -3533,6 +3540,10 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
             max_seq_len=MLA_TOKENS,
             page_size=MLA_PAGE_SIZE,
             slot_mapping=operands["slot_mapping"],
+            **paged_operands(
+                _mla_latent_cache(attention), 0, int(normed.shape[0]),
+                page=MLA_PAGE_SIZE,
+            ),
         )
     unprepared_after = _read_seam_counters()
     moved = {
@@ -3570,6 +3581,10 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
             max_seq_len=MLA_TOKENS,
             page_size=MLA_PAGE_SIZE,
             slot_mapping=operands["slot_mapping"],
+            **paged_operands(
+                _mla_latent_cache(attention), 0, int(normed.shape[0]),
+                page=MLA_PAGE_SIZE,
+            ),
         )
     print("TINYFWD|mla_control|branch=forward before the absorb split|refused=True")
 
@@ -4241,16 +4256,18 @@ def _stack_carriers(layers, selection: dict) -> list:
     """One carrier mapping per layer, in stack order, each with its OWN caches.
 
     Both caches are written in place by the path, so two layers sharing one would
-    have the second reading the first's latents. The eight keys are exactly
+    have the second reading the first's latents. The keys are exactly
     ``Glm5NextDSALayer.forward``'s required keyword set plus ``slot_mapping``;
     ``tail`` and ``position`` are the decode leg's and are left at their defaults,
-    which is what makes this the PREFILL leg.
+    which is what makes this the PREFILL leg. The bank travels whole, so the block
+    table and the physical slots travel beside it.
     """
+    banks = [
+        _mla_latent_cache(layer.self_attn, tokens=STACK_TOKENS) for layer in layers
+    ]
     return [
         {
-            "latent_cache": _mla_latent_cache(
-                layer.self_attn, tokens=STACK_TOKENS
-            ),
+            "latent_cache": bank,
             "pool_cache": _mla_pool_cache(pages=STACK_PAGES),
             "seq_lens": selection["seq_lens"],
             "start_position": 0,
@@ -4258,8 +4275,9 @@ def _stack_carriers(layers, selection: dict) -> list:
             "max_seq_len": STACK_TOKENS,
             "page_size": MLA_PAGE_SIZE,
             "slot_mapping": selection["slot_mapping"],
+            **paged_operands(bank, 0, STACK_TOKENS, page=MLA_PAGE_SIZE),
         }
-        for layer in layers
+        for bank in banks
     ]
 
 

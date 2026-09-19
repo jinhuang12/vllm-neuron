@@ -15,6 +15,10 @@ block's registered acceptance over that thread:
      a KV page size where the root declares an FP8 weight-quant block.
   4. The registered acceptance itself: eight generated tokens whose logits match a torch
      reference composed from ``-054a``'s landed oracles, at the registered tolerance.
+  5. The paging itself: a request whose pages sit in a different ORDER and in different
+     places in the bank produces the same logits, bit for bit, as one whose pages are a
+     single ascending run at its front. That is the property the block table exists for,
+     and it is the one reading in this file with no tolerance in it.
 
 THE BIND IS EXERCISED, NOT ASSUMED. The last item runs the root's forward with carriers built by
 the runner's own helpers out of a runner-shaped cache dict, and then requires the RUNNER'S OWN
@@ -103,12 +107,10 @@ def _aligned_blocks(slots: int) -> int:
 #: is the whole point -- a window whose length moved with the position pinned the graph.
 E2E_WINDOW_BLOCKS = _aligned_blocks(E2E_MAX_SEQ_LEN)
 
-#: The banks this file allocates: the last block a request can be given, plus one whole spare
-#: window past it. The window's length is fixed for the bucket, so a request placed near the
-#: end of a bank sized to the sequence alone would need a window that runs off the end --
-#: which the carrier builder refuses rather than shortening the view. The spare is the
-#: ALIGNED width, not the sequence's block count, since that is the length actually handed
-#: over. The runner's own allocator owes the same spare in production.
+#: The banks this file allocates: more blocks than the sequence needs. Nothing reads past a
+#: request's own pages any more, so the extra blocks are not headroom a window needs -- they
+#: are room for a request whose pages are somewhere other than the bank's front, which is
+#: what the scattered-pages item hands the builder.
 E2E_BANK_BLOCKS = E2E_BLOCKS + E2E_WINDOW_BLOCKS
 
 #: The recurrent-state geometry the substituted spec reports. Small and arbitrary: the mapper
@@ -178,13 +180,10 @@ def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
     It described the runner before the latent cache became one buffer; the branch below now
     keys on the layer's own declaration, so both classes are still mirrored here.
 
-    RE-PINNED: the block dim is ``E2E_BANK_BLOCKS`` and was
-    ``E2E_BLOCKS``, the sequence's own blocks. The reading this replaces, kept verbatim: "a
-    layer that declares a latent cache gets ONE bank of ``[blocks, num_kv_heads, block_size,
-    head_size]``" -- the shape is that same shape and only ``blocks`` moved. A carrier is now
-    handed a window whose length is the bucket's, so a bank sized to the sequence alone has
-    no room for the window the warmup path asks for at block 0 and the builder refuses
-    before the model is entered.
+    THE BLOCK DIM IS ``E2E_BANK_BLOCKS`` and not the sequence's own ``E2E_BLOCKS``: only
+    ``blocks`` moved, and the shape is the runner's own. The extra blocks are where the
+    scattered-pages item puts a request's pages, which is a thing the bank has to have room
+    for now that a request's pages need not be at its front.
     """
     caches: dict[str, list[torch.Tensor]] = {}
     for layer_spec in root.get_kv_spec().layers:
@@ -273,12 +272,10 @@ def _geometries(banks, *, block_ids, state_slot: int, page_size: int | None = No
     between the group's page and the bank's own paging compares two independently sourced
     numbers instead of one number twice.
 
-    RE-PINNED: the builder now also requires the WINDOW's length in blocks, because the
-    slice it hands a layer is the bucket's window and not this request's pages. The
-    original reading of this helper was the three keys above and a slice of exactly the
-    blocks named here; `window_blocks` defaults to `len(block_ids)`, which is that same
-    slice, so every landed item reads what it read before and only a caller that asks
-    for a longer window gets one.
+    THE BUILDER ALSO REQUIRES THE BLOCK TABLE'S WIDTH, which is the bucket's and not this
+    request's: the row it hands a layer is padded to that width with ``-1``. It defaults to
+    ``len(block_ids)`` here, the unpadded row, so every landed item reads what it read
+    before and only a caller that asks for a wider table gets padding.
     """
     page = item.MLA_PAGE_SIZE if page_size is None else page_size
     ids = [int(value) for value in block_ids]
@@ -1253,14 +1250,21 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
     for index, (bank, carrier) in enumerate(zip(banks, carriers)):
         if bank["family"] == "self_attn":
             page = int(bank["block_size"])
-            want = bank["latent_cache"][sparse_row[0] * page]
-            print(f"TINYE2E|group_slice|{index}|sparse|first_block={sparse_row[0]}"
+            print(f"TINYE2E|group_table|{index}|sparse|row={sparse_row}"
+                  f"|table={carrier['block_table_row'].flatten().tolist()}"
                   f"|slots={int(carrier['latent_cache'].shape[0])}")
-            assert carrier["latent_cache"].data_ptr() == want.data_ptr(), (
-                f"layer {index} is sparse and its latent slice does not start at its own "
-                f"group's first block"
+            assert carrier["latent_cache"].data_ptr() == bank["latent_cache"].data_ptr(), (
+                f"layer {index} is sparse and its carrier is not a view of its own "
+                f"group's bank"
             )
-            assert int(carrier["latent_cache"].shape[0]) == len(sparse_row) * page
+            assert int(carrier["latent_cache"].shape[0]) == int(
+                bank["latent_cache"].shape[0]
+            )
+            assert carrier["block_table_row"].flatten().tolist() == list(sparse_row), (
+                f"layer {index} is sparse and its block table does not name its own "
+                f"group's blocks"
+            )
+            assert carrier["latent_slots"].tolist()[0] == sparse_row[0] * page
         else:
             # RE-PINNED (D17.1). ORIGINAL READING, kept beside the new one so the
             # change is legible: this asserted the carrier was a view of
@@ -1331,12 +1335,14 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
         _generic(tokens=tokens, metadata=single, sampling_row=tokens - 1)
     )
     sparse_index = next(i for i, bank in enumerate(banks) if bank["family"] == "self_attn")
-    per_layer_ptr = carriers[sparse_index]["latent_cache"].data_ptr()
-    single_ptr = control["layer_carriers"][sparse_index]["latent_cache"].data_ptr()
-    print(f"TINYE2E|group_control|per_layer={per_layer_ptr}|single_table={single_ptr}"
-          f"|differ={per_layer_ptr != single_ptr}")
-    assert per_layer_ptr != single_ptr, (
-        "the single-table mapping produced the same sparse slice as the per-layer one, so "
+    # THE TABLE IS WHERE THE LOOKUP SHOWS. Every carrier is a view of the same bank now, so
+    # a pointer cannot tell the two mappings apart; the pages each one named can.
+    per_layer_row = carriers[sparse_index]["block_table_row"].flatten().tolist()
+    single_row = control["layer_carriers"][sparse_index]["block_table_row"].flatten().tolist()
+    print(f"TINYE2E|group_control|per_layer={per_layer_row}|single_table={single_row}"
+          f"|differ={per_layer_row != single_row}")
+    assert per_layer_row != single_row, (
+        "the single-table mapping named the same sparse pages as the per-layer one, so "
         "this item is not measuring the per-layer lookup at all"
     )
 
@@ -2553,4 +2559,116 @@ def test_a_real_decode_with_no_open_sequence_is_still_refused_by_name():
     assert after is None, (
         f"the synthetic step at position 0 opened a cursor at {after}; a step that is not a "
         f"real sequence step must leave the ring unclaimed"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ITEM 18. scattered pages give the same logits, bit for bit, as pages in one run.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_scattered_pages_give_the_same_logits_as_pages_in_one_run():
+    """The whole point of the paging, end to end: WHERE a request's pages sit cannot matter.
+
+    TWO ARMS, ONE PROMPT. Each arm runs the same prefill through the same stack with the
+    same weights and the same token ids. One arm's request holds its pages in one ascending
+    run at the front of the bank; the other holds the same number of pages in a different
+    ORDER and at different places in it. The logits must be equal BIT FOR BIT: no tolerance
+    belongs here, because the two arms compute the same arithmetic on the same values and a
+    difference could only come from reading the wrong rows.
+
+    THE CONTROLS COME FIRST AND EACH IS POSITIVE. The two block tables must differ, the two
+    sets of physical slots must differ, and the scattered arm's bank must hold its written
+    latents in pages the contiguous arm never touched. Without those three the item would
+    pass on a builder that quietly ignored the table and wrote both arms to the same rows.
+    """
+    _require_cpu_mode()
+
+    contiguous = list(range(PROMPT_BLOCKS))
+    scattered = [PROMPT_BLOCKS + offset for offset in reversed(range(PROMPT_BLOCKS))]
+    assert contiguous != scattered
+    assert len(set(scattered)) == len(scattered)
+    steps = [later - earlier for earlier, later in zip(scattered, scattered[1:])]
+    print(f"TINYE2E|scatter|contiguous={contiguous}|scattered={scattered}|steps={steps}")
+    assert any(step != 1 for step in steps), (
+        "the scattered arm's pages are one ascending run, so the item is not reading the "
+        "scattered case at all"
+    )
+
+    input_ids = torch.randint(
+        0,
+        item.STACK_VOCAB_SIZE,
+        (item.STACK_TOKENS,),
+        generator=torch.Generator().manual_seed(item.SEED_STACK_IDS),
+        dtype=torch.int64,
+    )
+    positions = torch.tensor(item.ROOT_SAMPLING_POSITIONS, dtype=torch.long)
+
+    # ONE FIXTURE, TWO BANKS. The arms must differ in WHERE the pages are and in nothing
+    # else, so they share the weights: two fixtures would compare two models unless every
+    # weight in them were seeded, and that is a premise this item would be resting on
+    # rather than reading. A fresh cache dict per arm is what keeps the banks independent.
+    root = _fixture()["root"]
+
+    def run(block_ids):
+        """One prefill through runner-built carriers naming ``block_ids``."""
+        caches = _runner_shaped_caches(root)
+        root.bind_kv_cache(caches)
+        banks = root.glm5next_layer_banks
+        text_config = root.text_config
+        side = NeuronModelRunner._glm5next_side_caches(
+            banks,
+            index_kpool=int(text_config.index_kpool),
+            index_head_dim=int(text_config.index_head_dim),
+            max_seq_len=item.STACK_TOKENS,
+            request_slots=E2E_STATE_SLOTS,
+        )
+        carriers = NeuronModelRunner._glm5next_layer_carriers(
+            banks,
+            side,
+            geometries=_geometries(banks, block_ids=block_ids, state_slot=0),
+            is_prefill=True,
+            tokens=item.STACK_TOKENS,
+            start_position=0,
+            softmax_scale=item.MLA_SOFTMAX_SCALE,
+            max_seq_len=item.STACK_TOKENS,
+            index_kpool=int(text_config.index_kpool),
+        )
+        logits = root.forward(
+            input_ids, layer_carriers=carriers, sampling_positions=positions
+        )
+        sparse = next(
+            carrier for bank, carrier in zip(banks, carriers)
+            if bank["family"] == "self_attn"
+        )
+        return logits, sparse
+
+    run_logits, run_sparse = run(contiguous)
+    scatter_logits, scatter_sparse = run(scattered)
+    assert tuple(run_logits.shape) == tuple(scatter_logits.shape)
+
+    print(f"TINYE2E|scatter_tables"
+          f"|one_run={run_sparse['block_table_row'].flatten().tolist()}"
+          f"|scattered={scatter_sparse['block_table_row'].flatten().tolist()}")
+    assert not torch.equal(
+        run_sparse["block_table_row"], scatter_sparse["block_table_row"]
+    )
+    print(f"TINYE2E|scatter_slots|one_run={run_sparse['latent_slots'].tolist()}"
+          f"|scattered={scatter_sparse['latent_slots'].tolist()}")
+    assert not torch.equal(run_sparse["latent_slots"], scatter_sparse["latent_slots"])
+
+    # THE ROWS REALLY LANDED SOMEWHERE ELSE: every page the scattered arm wrote is a page
+    # the contiguous arm never named, so the equality below is about the gather and not
+    # about two runs that wrote the same rows.
+    page = int(item.MLA_PAGE_SIZE)
+    written = sorted({int(slot) // page for slot in scatter_sparse["latent_slots"]})
+    print(f"TINYE2E|scatter_written_pages|{written}|one_run={contiguous}")
+    assert written and not set(written) & set(contiguous)
+
+    same = bool(torch.equal(run_logits, scatter_logits))
+    print(f"TINYE2E|scatter_logits|shape={tuple(run_logits.shape)}"
+          f"|dtype={run_logits.dtype}|bit_for_bit={same}")
+    assert same, (
+        "the same prompt produced different logits from pages held in a different order, "
+        "so the gather is reading rows by where they sit rather than by what the table names"
     )

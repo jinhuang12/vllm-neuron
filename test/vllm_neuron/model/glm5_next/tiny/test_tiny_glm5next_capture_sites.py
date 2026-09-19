@@ -46,8 +46,8 @@ CARRIER_KWARG_KEYS = [
     "sampling_positions", "tp_degree",
 ]
 
-#: The prefill bucket the capture drives: the fixture's own stack length, so the block run
-#: the translation slices is the run the landed prefill items already measure.
+#: The prefill bucket the capture drives: the fixture's own stack length, so the blocks the
+#: translation names are the ones the landed prefill items already measure.
 PREFILL_BUCKET = item.STACK_TOKENS
 
 #: One request, one token -- the shape the decode capture builds, and the only decode shape
@@ -242,9 +242,30 @@ def test_prefill_capture_with_independent_query_and_kv_lengths():
     assert kwargs["input_ids"].shape[0] == 1024
     assert torch.count_nonzero(kwargs["input_ids"][PREFILL_BUCKET:]) == 0
     _assert_finite_logits("independent-prefill", backend.output, rows=1)
-    for carrier in kwargs["layer_carriers"]:
+    # THE CARRIERS PAIR WITH THE BANKS POSITIONALLY, which is how the sparse rows below can
+    # be read against the bank the caller allocated rather than against a number restated
+    # here (``neuron_model_runner.py`` builds them by walking the bound banks in order).
+    for carrier, bank in zip(kwargs["layer_carriers"], root.glm5next_layer_banks):
         if "latent_cache" in carrier:
-            assert carrier["latent_cache"].shape[0] == segment_size + 1024
+            # RE-PINNED: the carrier holds the WHOLE latent bank, so its row count is the
+            # bank's own and says nothing about where the request sits. The reading this
+            # replaces, verbatim: "assert carrier["latent_cache"].shape[0] == segment_size
+            # + 1024" -- a window slice whose LENGTH was the bucket's, which is what a
+            # captured graph is compiled for. That length is now the BLOCK TABLE's width
+            # times the page, and the second reading below pins it: the request's position
+            # moves its pages around inside the bank and moves neither shape.
+            print(f"CAPTURESITE|independent-prefill|bank_rows="
+                  f"{int(carrier['latent_cache'].shape[0])}|slots={int(bank['slots'])}"
+                  f"|table={tuple(carrier['block_table_row'].shape)}"
+                  f"|page={int(carrier['page_size'])}"
+                  f"|latent_slots={tuple(carrier['latent_slots'].shape)}")
+            assert carrier["latent_cache"].shape[0] == int(bank["slots"])
+            assert carrier["latent_cache"] is bank["latent_cache"]
+            assert (
+                carrier["block_table_row"].shape[0] * int(carrier["page_size"])
+                == segment_size + 1024
+            )
+            assert carrier["latent_slots"].shape[0] == 1024
             assert carrier["active_mla_query_rows"] == PREFILL_BUCKET
             assert carrier["max_seq_len"] == context_length
         else:

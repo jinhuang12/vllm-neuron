@@ -62,6 +62,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from test.vllm_neuron.model.glm5_next.test_mla_decode import paged_operands
+
 # --------------------------------------------------------------------------- #
 # THE REGISTERED TOLERANCE PAIR. Cited, never re-authored: it is the plan block's
 # own, and this file spells no second pair (P9).
@@ -322,8 +324,10 @@ def _caches(cfg):
         "pool_cache": torch.zeros(
             PAGES * PAGE_SIZE, int(cfg.index_head_dim), dtype=torch.bfloat16
         ),
+        # WHOLE BLOCKS: the bank travels whole beside a table naming its pages.
         "latent_cache": torch.zeros(
-            PREFILL_TOKENS + STEPS, 1, TINY_HEAD_SIZE, dtype=torch.float32
+            -(-(PREFILL_TOKENS + STEPS) // PAGE_SIZE) * PAGE_SIZE,
+            1, TINY_HEAD_SIZE, dtype=torch.float32,
         ),
         "tail": torch.zeros(2, int(cfg.index_kpool), int(cfg.index_head_dim), dtype=torch.bfloat16),
     }
@@ -367,6 +371,7 @@ def _populate_caches(block, cfg, caches) -> None:
         page_size=PAGE_SIZE,
         slot_mapping=_prefill_slot_mapping(PREFILL_TOKENS, int(cfg.index_kpool)),
         tail=None,
+        **paged_operands(caches["latent_cache"], 0, PREFILL_TOKENS, page=PAGE_SIZE),
     )
 
 
@@ -387,6 +392,7 @@ def _step_block_kwargs(caches, step: int) -> dict:
         "page_size": PAGE_SIZE,
         "tail": caches["tail"],
         "position": position,
+        **paged_operands(caches["latent_cache"], position, 1, page=PAGE_SIZE),
     }
 
 

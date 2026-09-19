@@ -231,6 +231,29 @@ def report_and_check(label: str, got: torch.Tensor, reference: torch.Tensor) -> 
     )
 
 
+PAGE = 128                 # the bank's block size here: one staging piece per block
+
+
+def paged_operands(cache, start, tokens, *, page=PAGE):
+    """The three paged operands for a bank a request holds every block of, in order.
+
+    THE IDENTITY TABLE IS THE CONTIGUOUS CASE, which is what every item in this file
+    measured before the bank travelled whole: page ``p`` sits at page ``p``, so a
+    selected row still indexes the bank directly and a token at position ``start + i``
+    is still written at slot ``start + i``. A scattered table is a different reading and
+    the end-to-end item that compares the two owns it.
+
+    THE OTHER FILES THAT CALL THIS PATH IMPORT IT, at their own page size. Two copies of
+    this arithmetic are two things that can disagree about what the contiguous case is.
+    """
+    pages = int(cache.shape[0]) // int(page)
+    return {
+        "block_table_row": torch.arange(pages, dtype=torch.int32).reshape(pages, 1),
+        "latent_slots": torch.arange(start, start + tokens, dtype=torch.int64),
+        "page_size": int(page),
+    }
+
+
 def seeded_cache(module, gen, *, rows: int = CONTEXT_ROWS, steps: int = DECODE_STEPS):
     """The latent cache, seeded directly.
 
@@ -238,9 +261,15 @@ def seeded_cache(module, gen, *, rows: int = CONTEXT_ROWS, steps: int = DECODE_S
     declared spec -- one KV head of ``head_size`` per token -- so the context rows are
     filled with values and the step slots left empty. That is what lets the acceptance
     use the production 2,048-row context without paying for a 2,048-token forward pass.
+
+    IT HOLDS WHOLE BLOCKS. The path takes the whole bank and a block table naming the
+    pages of it this request holds, so a bank of a length no block divides is refused
+    by name; the rows past the context and the steps are seeded with nothing and
+    selected by nothing.
     """
+    slots = -(-(rows + steps) // PAGE) * PAGE
     cache = torch.zeros(
-        (rows + steps, module.NUM_LATENT_KV_HEADS, module.head_size),
+        (slots, module.NUM_LATENT_KV_HEADS, module.head_size),
         dtype=torch.bfloat16,
     )
     cache[:rows, 0, :] = torch.randn(
@@ -322,6 +351,7 @@ def run_decode_steps(
                 selection[step : step + 1],
                 scale,
                 batch_size=BATCH,
+                **paged_operands(cache, start + step, 1),
             )
         )
     return torch.cat(out, dim=0)
@@ -547,7 +577,8 @@ def test_item_b_i_decode_matches_the_prefill_slice_for_every_step() -> None:
     hidden, selection, scale = decode_inputs(module, gen)
 
     prefill = module.attend(
-        hidden, cache.clone(), CONTEXT_ROWS, selection, scale, batch_size=BATCH
+        hidden, cache.clone(), CONTEXT_ROWS, selection, scale, batch_size=BATCH,
+        **paged_operands(cache, CONTEXT_ROWS, int(hidden.shape[0])),
     )
     decode = run_decode_steps(module, cache.clone(), hidden, selection, scale)
     say("B_I_PREFILL_SHAPE", tuple(prefill.shape), prefill.dtype)
@@ -649,12 +680,12 @@ def test_item_b_iii_the_written_latent_reads_back_bit_identical() -> None:
     """
     module, _, _, gen = build_attention()
     # One SPARE slot past the three the path writes, so control 2 has something untouched
-    # to read. RE-PINNED: the original reading here was "attend() reads
-    # [:start + tokens], so a trailing row is never gathered". attend() now reads the
-    # WHOLE window, because a length taken from the position pinned the captured graph to
-    # one position. The spare row is still never GATHERED and this item still reads what it
-    # read before, for a different reason: `decode_inputs` selects prior context rows plus
-    # each step's own slot and nothing else, so no selection names the spare row.
+    # to read. The whole window is read -- a length taken from the position would pin a
+    # captured graph to one position -- and the spare row is still never GATHERED:
+    # `decode_inputs` selects prior context rows plus each step's own slot and nothing
+    # else, so no selection names it. The bank holds whole blocks, so the rows past the
+    # spare are untouched too; this reads the first of them, the one the step count
+    # names, because that is the row a write running off its slot would land in.
     cache = seeded_cache(module, gen, steps=DECODE_STEPS + 1)
     hidden, selection, scale = decode_inputs(module, gen)
     spare = CONTEXT_ROWS + DECODE_STEPS
@@ -802,7 +833,8 @@ def test_item_c_a_larger_batch_raises_a_named_error_first() -> None:
     reset_counters()
     with pytest.raises(model_fp8.Glm5NextMLADecodeError) as caught:
         module.attend(
-            hidden, cache.clone(), CONTEXT_ROWS, selection, scale, batch_size=2
+            hidden, cache.clone(), CONTEXT_ROWS, selection, scale, batch_size=2,
+            **paged_operands(cache, CONTEXT_ROWS, int(hidden.shape[0])),
         )
     message = " ".join(str(caught.value).split())
     say("C_RAISED_TYPE", type(caught.value).__name__)
@@ -818,7 +850,7 @@ def test_item_c_a_larger_batch_raises_a_named_error_first() -> None:
     # would produce the same reading as a refusal that correctly precedes dispatch.
     # This runs AFTER they are asserted, so it cannot influence them.
     module.attend(hidden[:1], cache.clone(), CONTEXT_ROWS, selection[:1], scale,
-                  batch_size=BATCH)
+                  batch_size=BATCH, **paged_operands(cache, CONTEXT_ROWS, 1))
     admissible = read_counters()
     say("C_CONTROL_ONE_ADMISSIBLE_CALL", admissible)
     assert admissible["sparse_040"] == 1
@@ -874,7 +906,8 @@ def test_item_d_route_predicate_five_counter_readings_on_every_arm() -> None:
 
     reset_counters()
     module.attend(hidden, cache.clone(), CONTEXT_ROWS, selection, scale,
-                  batch_size=BATCH)
+                  batch_size=BATCH,
+                  **paged_operands(cache, CONTEXT_ROWS, int(hidden.shape[0])))
     prefill_counts = read_counters()
     say("D_PREFILL_REFERENCE_ARM_ONE_CALL", prefill_counts)
     assert prefill_counts == {

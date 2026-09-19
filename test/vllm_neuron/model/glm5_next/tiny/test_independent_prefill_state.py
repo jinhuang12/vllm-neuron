@@ -94,8 +94,20 @@ def _step(runner, ids, *, width, cached, sampling_rows):
         if "latent_cache" in carrier:
             prefix = 128 if configured and width == 128 else None
             assert carrier.get("active_mla_query_rows") == prefix
-            cache_rows = SEGMENT + operator_rows if width > 1 else CONTEXT
-            assert carrier["latent_cache"].shape[0] == cache_rows
+            # RE-PINNED: the carrier holds the WHOLE bank, which this fixture allocates as
+            # CONTEXT // page blocks of page rows, so its row count is CONTEXT on both legs
+            # and no longer moves with the leg. The reading this replaces, verbatim:
+            # "cache_rows = SEGMENT + operator_rows if width > 1 else CONTEXT" against
+            # `latent_cache.shape[0]` -- a window slice whose length was the bucket's. That
+            # bucket-constant length is the BLOCK TABLE's width times the page now, so it is
+            # read there, where a captured graph's shape actually comes from.
+            assert carrier["latent_cache"].shape[0] == CONTEXT
+            window_rows = SEGMENT + operator_rows if width > 1 else CONTEXT
+            assert (
+                carrier["block_table_row"].shape[0] * int(carrier["page_size"])
+                == window_rows
+            )
+            assert carrier["latent_slots"].shape[0] == operator_rows
             assert carrier["seq_lens"].shape[0] == operator_rows
         else:
             assert "active_mla_query_rows" not in carrier
@@ -123,6 +135,9 @@ def _snapshot(runner, end):
                 snapshots[f"kda.{index}.{name}"] = value[own].clone()
                 assert torch.count_nonzero(value[own]) > 0
         else:
+            # THE BANK IS READ BY PHYSICAL ROW, which is what the carrier hands the layer
+            # now: this request holds the row's first pages, so its own slots are 0..end and
+            # a row past them carries no token of it.
             latent = bank["latent_cache"]
             assert torch.count_nonzero(latent[end:]) == 0, "padding wrote latent slots"
             snapshots[f"dsa.{index}.latent"] = latent[:end].clone()
@@ -169,7 +184,11 @@ def test_query_bucket_preserves_valid_logits_and_owned_state(
     original_sparse = mla_sparse.mla_sparse_attention
 
     def record_sparse(query, cache, indices, scale, *args, **kwargs):
-        sparse_calls.append((query.shape[0], cache.shape[0], indices.shape[0]))
+        # THE OPERAND IS THE WHOLE BANK NOW and the window the seam attends is the one its
+        # block table names, so both are recorded: the bank's rows, which are the same at
+        # every position, and the table's width times the page, which is the leg's bucket.
+        window = int(kwargs["block_table_row"].shape[0]) * int(kwargs["page_size"])
+        sparse_calls.append((query.shape[0], cache.shape[0], indices.shape[0], window))
         return original_sparse(query, cache, indices, scale, *args, **kwargs)
 
     monkeypatch.setattr(mla_sparse, "mla_sparse_attention", record_sparse)
@@ -185,12 +204,15 @@ def test_query_bucket_preserves_valid_logits_and_owned_state(
         runner = _runner(root, caller_prefix=caller_prefix)
         sparse_calls.clear()
         prefill = _step(runner, ids[:-1], width=width, cached=0, sampling_rows=sampling_rows)
-        cache_rows = SEGMENT + (1024 if caller_prefix else width)
-        assert sparse_calls == [(width, cache_rows, width)] * 2
+        # RE-PINNED: the third number was the operand's own row count and is the bank's now;
+        # the window the table names is the fourth. The prefill's window is the segment plus
+        # the query rows, as it was, and the decode's is the whole block table.
+        window_rows = SEGMENT + (1024 if caller_prefix else width)
+        assert sparse_calls == [(width, CONTEXT, width, window_rows)] * 2
         before_decode = _snapshot(runner, real_tokens)
         sparse_calls.clear()
         decode = _step(runner, ids[-1:], width=1, cached=real_tokens, sampling_rows=[0])
-        assert sparse_calls == [(1, CONTEXT, 1)] * 2
+        assert sparse_calls == [(1, CONTEXT, 1, CONTEXT)] * 2
         readings[width] = (prefill, before_decode, decode, _snapshot(runner, real_tokens + 1))
     small, large = readings[128], readings[1024]
     for phase, index in (("prefill", 0), ("decode", 2)):

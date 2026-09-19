@@ -113,6 +113,8 @@ from collections import Counter
 import pytest
 import torch
 
+from test.vllm_neuron.model.glm5_next.test_mla_decode import paged_operands
+
 # --------------------------------------------------------------------------- #
 # THE DECLARED GEOMETRY. Every value is the checkpoint's or is derived from a gate this file
 # names, and the derivation is stated beside it, because a reader needs to know which numbers
@@ -2219,8 +2221,11 @@ def per_layer_caches(cfg, layers: int, *, tokens: int = PREFILL_TOKENS) -> list[
     return [
         {
             "pool_cache": torch.zeros(rows, head_dim, dtype=torch.bfloat16),
+            # WHOLE BLOCKS: the layer takes the bank and a table naming its pages, and a
+            # bank no block divides is refused by name.
             "latent_cache": torch.zeros(
-                int(tokens) + DECODE_STEPS, 1, TINY_HEAD_SIZE, dtype=torch.float32
+                -(-(int(tokens) + DECODE_STEPS) // PAGE_SIZE) * PAGE_SIZE,
+                1, TINY_HEAD_SIZE, dtype=torch.float32,
             ),
             "tail": torch.zeros(2, pool, head_dim, dtype=torch.bfloat16),
         }
@@ -2575,6 +2580,9 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
                 slot_mapping=kwargs.get("slot_mapping"),
                 tail=None if phase == "prefill" else caches["tail"],
                 position=kwargs.get("position"),
+                **paged_operands(
+                    caches["latent_cache"], start, int(got.shape[0]), page=PAGE_SIZE
+                ),
             )
         monkeypatch.undo()
         # BOTH of the spy's lists are carried across, and this line is the repair. Round 1 merged

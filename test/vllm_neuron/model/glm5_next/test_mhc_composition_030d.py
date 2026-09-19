@@ -238,6 +238,11 @@ def _call_kwargs(family: str) -> dict[str, object]:
         "softmax_scale": 1.0,
         "max_seq_len": 8,
         "page_size": 4,
+        # THE PAGED OPERANDS the sparse forward declares. Shapes, not values: this
+        # family's carrier names the blocks its request holds and the bank rows its
+        # tokens are written to, and the stub below reads neither.
+        "block_table_row": torch.zeros((1, 1), dtype=torch.int32),
+        "latent_slots": torch.zeros(1, dtype=torch.int64),
     }
 
 

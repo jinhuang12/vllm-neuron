@@ -16,9 +16,9 @@ cache as ``[: start + tokens]``, whose length grows with every decode step, and 
 layer chose its entering state with a python branch on the same value.
 
 ITEMS 9 TO 12 ARE THE RUNNER'S SIDE OF THE SAME RULE, on the four things a layer can
-no longer do for itself: the ALLOCATION that makes item 3's refusal unreachable in a
-serve, the write bound that moved out of the layer once the window grew longer than a
-request's pages, the indexer's sequence bound, which stays a python int and
+no longer do for itself: the ALLOCATION, which grows no bank past the blocks the
+scheduler hands out, the write bound that moved out of the layer once the position
+became a tensor, the indexer's sequence bound, which stays a python int and
 therefore had to stop moving, and the two ring positions, which stopped being python
 ints and are now built here.
 
@@ -31,16 +31,17 @@ assert the position no longer reaches a python int there. Nothing here captures 
 dynamo graph -- that reading is a host-side end-to-end one on the serving run, and this
 file must not be read as making it.
 
-EVERY ITEM FAILS AT THE BASE. Items 1 and 2 because the base's window is the request's
-own blocks, so its length moves with the position; item 3 because the base has no
-headroom refusal to raise; item 4 because the base hands a python int; items 5 and 6
+EVERY ITEM FAILS AT THE BASE. Items 1 and 2 because the base hands a slice of the bank
+whose length moves with the position, and no block table beside it; item 3 because the
+base refuses a request whose blocks are not one ascending run and refuses a bank that
+carries no headroom; item 4 because the base hands a python int; items 5 and 6
 because the base's source carries the two host reads this change removed; item 7
 because the base sizes the window from the request's own blocks and an earlier draft
 sized it from the block table's width, and the item names both wrong answers; item 8
 because the base's decode window is this step's own two blocks where the bucket is ten;
-item 9 because the base's allocator adds no spare window and has no method to ask for
-one; item 10 because the base builds the carrier without a word and leaves the write to
-a layer whose own bound is now the whole window; item 11 because the base's bound is
+item 9 because the base grows every latent bank by one window of headroom it no longer
+has a reader for; item 10 because the base builds the carrier without a word and leaves
+the write to a layer whose own bound is a window it no longer receives; item 11 because the base's bound is
 this step's end position, which is a different number at each of the two steps; item 12
 because the base builds both ring positions from a python int, so neither reaches a ring
 seam as a tensor and the builder's own source spells an int cast and a sum where the
@@ -87,10 +88,11 @@ DECLARED_PAGE_SIZE = 8
 #: builder slices rows and never inspects the width -- so it is this file's own number
 #: and deliberately not the checkpoint's, which would suggest a dial was registered here.
 DECLARED_HEAD_SIZE = 16
-#: The bucket's block-table width: the window's length in blocks.
+#: The bucket's block-table width, which is the width every request's block table is
+#: padded to and the window those blocks make.
 DECLARED_WINDOW_BLOCKS = 4
-#: Blocks the bank holds. It carries a spare window past the last block a request is
-#: given here, which is the headroom item 3 reads.
+#: Blocks the bank holds. More than any request here is given, so a table that named the
+#: bank's own base rather than the request's pages would be visible.
 DECLARED_BANK_BLOCKS = 12
 #: How many sequences the modelled engine admits at once, which is the axis the
 #: converter's per-sequence caches carry. One: this file drives one request's shapes.
@@ -115,6 +117,8 @@ DECLARED_TOKENS = 1
 #: The carrier keys a sparse layer is handed, as the landed builder writes them.
 DECLARED_SPARSE_CARRIER_KEYS = {
     "latent_cache",
+    "block_table_row",
+    "latent_slots",
     "pool_cache",
     "seq_lens",
     "start_position",
@@ -209,11 +213,12 @@ def _bank(head_size: int, *, blocks: int = DECLARED_BANK_BLOCKS, device="cpu") -
 
 def _geometry(*, position: int, window_blocks: int = DECLARED_WINDOW_BLOCKS,
               tokens: int = DECLARED_TOKENS) -> dict:
-    """This request's pages at ``position``, plus the window's length in blocks.
+    """This request's pages at ``position``, plus the block table's width.
 
-    The block run is the ascending run the builder requires, and it is exactly as long
-    as the request needs at this position -- which is the number the base's window used
-    and the number this block's window no longer uses.
+    The blocks are one ascending run because that is the simplest thing to write, not
+    because the builder requires it any more; item 3 hands it a scattered row. The run is
+    exactly as long as the request needs at this position -- the number the base's window
+    length followed, and a number nothing downstream reads now.
     """
     used = max(1, -(-(position + tokens) // DECLARED_PAGE_SIZE))
     return {
@@ -262,14 +267,17 @@ def _world():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ITEM 1. The window has ONE length at two positions.
+# ITEM 1. Every operand has ONE shape at two positions.
 # ══════════════════════════════════════════════════════════════════════════════
-def test_the_window_the_layer_is_handed_has_one_length_at_two_positions() -> None:
-    """The defect, read directly: the length the layer sees must not move with the position.
+def test_every_operand_the_layer_is_handed_has_one_shape_at_two_positions() -> None:
+    """The defect, read directly: no shape the layer sees may move with the position.
 
     The two positions are chosen so the request occupies a DIFFERENT number of blocks at
     each -- that difference is exactly what the base's window length followed, and it is
-    what a captured graph cannot survive.
+    what a captured graph cannot survive. Three operands carry the risk now: the bank,
+    whose length is the bank's; the block table, whose width is the bucket's; and the
+    slots, one row per token. The tables at the two positions must DIFFER in content, or
+    this item would pass on a builder that named the same pages for every request.
     """
     _require_cpu_mode()
     text_config, bank = _world()
@@ -288,24 +296,42 @@ def test_the_window_the_layer_is_handed_has_one_length_at_two_positions() -> Non
         "tell a constant window from a request-shaped one"
     )
 
-    say("I1_WINDOW_SHAPES", tuple(low["latent_cache"].shape),
+    say("I1_BANK_SHAPES", tuple(low["latent_cache"].shape),
         tuple(high["latent_cache"].shape))
     assert tuple(low["latent_cache"].shape) == tuple(high["latent_cache"].shape)
     assert tuple(low["latent_cache"].shape) == (
-        DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE,
+        DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE,
         1,
         head_size,
     )
 
+    say("I1_TABLE_SHAPES", tuple(low["block_table_row"].shape),
+        tuple(high["block_table_row"].shape))
+    assert tuple(low["block_table_row"].shape) == (DECLARED_WINDOW_BLOCKS, 1)
+    assert tuple(high["block_table_row"].shape) == (DECLARED_WINDOW_BLOCKS, 1)
+    say("I1_SLOT_SHAPES", tuple(low["latent_slots"].shape),
+        tuple(high["latent_slots"].shape))
+    assert tuple(low["latent_slots"].shape) == (DECLARED_TOKENS,)
+    assert tuple(high["latent_slots"].shape) == (DECLARED_TOKENS,)
+
+    # THE TABLES DIFFER, which is what makes the three shape readings above a reading
+    # about a constant SHAPE rather than about a constant operand.
+    say("I1_TABLES_DIFFER", low["block_table_row"].flatten().tolist(),
+        high["block_table_row"].flatten().tolist())
+    assert not torch.equal(low["block_table_row"], high["block_table_row"])
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ITEM 2. The window is the BUCKET's block count, and it starts at the request's page.
+# ITEM 2. The bank travels whole, and the table names the request's own pages.
 # ══════════════════════════════════════════════════════════════════════════════
-def test_the_window_is_the_buckets_block_count_and_starts_at_the_requests_page() -> None:
-    """Two conjuncts: the length is the bucket's, and the base is still the request's.
+def test_the_bank_travels_whole_and_the_table_names_the_requests_pages() -> None:
+    """Three conjuncts: the bank is the bank, it is a VIEW, and the table is the request's.
 
-    A window of the right length that started at the bank's own base would put every
-    write on another sequence's rows, so the length alone is not the property.
+    The bank alone says nothing about whose rows are read -- every request is handed the
+    same tensor. What makes the rows this request's is the table: its first entries are
+    the blocks the request holds, in order, and the rest is the padding the bucket's
+    width needs. A table naming the bank's own base instead would read another
+    sequence's rows, so the entries are read one by one rather than counted.
     """
     _require_cpu_mode()
     text_config, bank = _world()
@@ -313,54 +339,106 @@ def test_the_window_is_the_buckets_block_count_and_starts_at_the_requests_page()
     carrier = _carrier(bank, text_config, position=DECLARED_LOW_POSITION,
                        geometry=geometry)
 
-    window = DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE
-    say("I2_WINDOW_SLOTS", int(carrier["latent_cache"].shape[0]), f"want={window}")
-    assert int(carrier["latent_cache"].shape[0]) == window
+    slots = DECLARED_BANK_BLOCKS * DECLARED_PAGE_SIZE
+    say("I2_BANK_SLOTS", int(carrier["latent_cache"].shape[0]), f"want={slots}")
+    assert int(carrier["latent_cache"].shape[0]) == slots
     assert len(geometry["block_ids"]) < DECLARED_WINDOW_BLOCKS, (
-        "this request already occupies the whole window, so the item could not tell "
-        "the bucket's length from the request's"
+        "this request already occupies the whole table, so the item could not tell "
+        "the request's own entries from the padding"
     )
 
-    first_slot = bank["latent_cache"][DECLARED_FIRST_BLOCK * DECLARED_PAGE_SIZE]
-    say("I2_WINDOW_STARTS_AT", DECLARED_FIRST_BLOCK * DECLARED_PAGE_SIZE)
-    assert carrier["latent_cache"].data_ptr() == first_slot.data_ptr(), (
-        "the window does not start at this request's own first page, so its writes "
-        "would land on another sequence's rows"
+    # NO COPY. A copy of the bank per layer per step is the cost the paging removes, and
+    # a copy would also leave the layer writing into a tensor the next step never reads.
+    say("I2_THE_CARRIER_IS_A_VIEW_OF_THE_BANK",
+        carrier["latent_cache"].data_ptr() == bank["latent_cache"].data_ptr())
+    assert carrier["latent_cache"].data_ptr() == bank["latent_cache"].data_ptr()
+
+    row = carrier["block_table_row"]
+    want = geometry["block_ids"] + [-1] * (DECLARED_WINDOW_BLOCKS - len(geometry["block_ids"]))
+    say("I2_TABLE_ROW", row.flatten().tolist(), f"want={want}", row.dtype)
+    assert row.dtype == torch.int32
+    assert row.flatten().tolist() == want, (
+        "the table does not name this request's own pages in order, so the rows the "
+        "kernel gathers are not this request's"
     )
+
+    # THE SLOTS ARE PHYSICAL ROWS OF THE BANK, derived from the very blocks above.
+    first = geometry["block_ids"][0] * DECLARED_PAGE_SIZE + DECLARED_LOW_POSITION
+    say("I2_LATENT_SLOTS", carrier["latent_slots"].tolist(), f"first={first}")
+    assert carrier["latent_slots"].tolist() == [first]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ITEM 3. A bank without the spare window refuses BY NAME.
+# ITEM 3. SCATTERED pages are carried, and a bank with no headroom is carried.
 # ══════════════════════════════════════════════════════════════════════════════
-def test_a_bank_without_the_spare_window_refuses_by_name() -> None:
-    """A slice past the end of a bank returns a SHORTER view instead of raising.
+def test_scattered_pages_are_carried_and_a_bank_with_no_headroom_is_carried() -> None:
+    """The two refusals this change removes, stated as what is now ACCEPTED.
 
-    That is the whole reason this refusal exists: a shortened view turns the constant
-    length back into a per-request one exactly where a captured graph cannot see it. The
-    control below reads the silent truncation directly, so the refusal is measured
-    against the behaviour it replaces rather than asserted on its own.
+    THE RUNNER USED TO REFUSE BOTH. A request whose blocks were not one ascending run
+    could not be expressed, because the carrier was one contiguous slice of the bank; and
+    a bank with no blocks past the last one the scheduler can hand out was refused,
+    because that slice ran off the end. The layer reads the pages its table names now, so
+    neither case is a refusal and both are read here directly.
+
+    ACCEPTANCE IS NOT BLANKET, which is the falsifier this item needs: the same call with
+    more blocks than the bucket's table holds still refuses by name, so what is being read
+    is the removal of two particular refusals rather than a builder that stopped checking.
     """
     _require_cpu_mode()
-    text_config, _ = _world()
-    short = _bank(DECLARED_HEAD_SIZE, blocks=DECLARED_FIRST_BLOCK + 1)
+    text_config, bank = _world()
 
-    base = DECLARED_FIRST_BLOCK * DECLARED_PAGE_SIZE
-    window = DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE
-    truncated = short["latent_cache"][base : base + window]
-    say("I3_CONTROL_THE_SLICE_TRUNCATES_SILENTLY",
-        int(truncated.shape[0]), f"asked={window}")
-    assert int(truncated.shape[0]) < window, (
-        "this bank is long enough for the window, so the item is not reading the "
-        "short-bank case at all"
+    # ARM 1: pages in no ascending order at all, one of them behind the first.
+    scattered = [DECLARED_FIRST_BLOCK + 5, DECLARED_FIRST_BLOCK, DECLARED_FIRST_BLOCK + 2]
+    steps = [later - earlier for earlier, later in zip(scattered, scattered[1:])]
+    say("I3_CONTROL_THE_PAGES_ARE_NOT_ONE_RUN", scattered, f"steps={steps}")
+    assert any(step != 1 for step in steps), (
+        "these pages are one ascending run, so the arm is not reading the scattered case"
+    )
+    geometry = {
+        "block_ids": scattered,
+        "state_slot": DECLARED_STATE_SLOT,
+        "page_size": DECLARED_PAGE_SIZE,
+        "window_blocks": DECLARED_WINDOW_BLOCKS,
+    }
+    carrier = _carrier(bank, text_config, position=DECLARED_LOW_POSITION,
+                       geometry=geometry)
+    want = scattered + [-1] * (DECLARED_WINDOW_BLOCKS - len(scattered))
+    say("I3_SCATTERED_TABLE", carrier["block_table_row"].flatten().tolist(),
+        f"want={want}")
+    assert carrier["block_table_row"].flatten().tolist() == want
+    first = scattered[0] * DECLARED_PAGE_SIZE + DECLARED_LOW_POSITION
+    say("I3_SCATTERED_SLOTS", carrier["latent_slots"].tolist(), f"first={first}")
+    assert carrier["latent_slots"].tolist() == [first], (
+        "the slot is not in the page the table names first, so the write and the "
+        "gather disagree about where this token's row lives"
     )
 
+    # ARM 2: a bank holding exactly the blocks a request can be given and not one more.
+    # The window those blocks make runs past its end, and nothing reads past them now.
+    tight_blocks = DECLARED_FIRST_BLOCK + 1
+    tight = _bank(DECLARED_HEAD_SIZE, blocks=tight_blocks)
+    say("I3_CONTROL_THE_BANK_IS_SHORTER_THAN_THE_WINDOW",
+        tight_blocks * DECLARED_PAGE_SIZE,
+        f"window={DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE}")
+    assert tight_blocks * DECLARED_PAGE_SIZE < DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE
+    tight_carrier = _carrier(tight, text_config, position=DECLARED_LOW_POSITION,
+                             geometry=_geometry(position=DECLARED_LOW_POSITION))
+    say("I3_TIGHT_BANK_SLOTS", int(tight_carrier["latent_cache"].shape[0]))
+    assert int(tight_carrier["latent_cache"].shape[0]) == tight_blocks * DECLARED_PAGE_SIZE
+
+    # THE FALSIFIER: more blocks than the bucket's table holds is still a refusal.
+    too_many = {
+        "block_ids": [DECLARED_FIRST_BLOCK + offset
+                      for offset in range(DECLARED_WINDOW_BLOCKS + 1)],
+        "state_slot": DECLARED_STATE_SLOT,
+        "page_size": DECLARED_PAGE_SIZE,
+        "window_blocks": DECLARED_WINDOW_BLOCKS,
+    }
     with pytest.raises(ValueError) as caught:
-        _carrier(short, text_config, position=DECLARED_LOW_POSITION,
-                 geometry=_geometry(position=DECLARED_LOW_POSITION))
+        _carrier(bank, text_config, position=DECLARED_LOW_POSITION, geometry=too_many)
     message = " ".join(str(caught.value).split())
-    say("I3_MESSAGE", message[:190])
-    assert "spare" in message
-    assert "clamped base" in message
+    say("I3_MORE_BLOCKS_THAN_THE_BUCKET", message[:190])
+    assert "block table holds" in message
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -582,7 +660,9 @@ def test_the_converter_sizes_the_window_from_the_legs_bucket() -> None:
     ))
     carriers = converted["layer_carriers"]
     assert len(carriers) == 1, f"one bank was handed {len(carriers)} carrier(s)"
-    slots = int(carriers[0]["latent_cache"].shape[0])
+    # THE WINDOW IS THE TABLE'S WIDTH NOW. The bank travels whole, so its row count says
+    # nothing about the window; the rows the kernel assembles are the ones this row names.
+    slots = int(carriers[0]["block_table_row"].shape[0]) * DECLARED_PAGE_SIZE
 
     say("I7_CANDIDATES",
         f"bucket_span={span_blocks * DECLARED_PAGE_SIZE}",
@@ -638,7 +718,9 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
     converted = runner._glm5next_model_kwargs(_converter_kwargs(
         [bank], _decode_metadata([bank]), DECLARED_TOKENS
     ))
-    slots = int(converted["layer_carriers"][0]["latent_cache"].shape[0])
+    slots = int(
+        converted["layer_carriers"][0]["block_table_row"].shape[0]
+    ) * DECLARED_PAGE_SIZE
 
     say("I8_WINDOW_SLOTS", slots,
         f"bucket={DECLARED_TABLE_WIDTH * DECLARED_PAGE_SIZE}",
@@ -656,88 +738,62 @@ def test_the_decode_legs_window_is_its_context_bucket() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ITEM 9. The ALLOCATOR gives every latent bank the spare window item 3 refuses
-# a bank for lacking, and the two numbers are the same number.
+# ITEM 9. The ALLOCATOR grows no bank past the blocks the scheduler hands out.
 # ══════════════════════════════════════════════════════════════════════════════
-def test_the_allocator_sizes_the_spare_window_the_carrier_builder_requires() -> None:
-    """Item 3's production counterpart: what makes that refusal unreachable in a serve.
+def test_the_allocator_grows_no_bank_past_the_schedulers_blocks() -> None:
+    """Item 3's production counterpart: the headroom that existed, and its reader.
 
-    ITEM 3 READS A BANK SIZED BY HAND. This one asks the allocator how much spare it
-    gives a latent bank, and then drives the REAL carrier builder against a bank of
-    exactly that size at the LAST block a request can be given -- the one placement
-    where a window running off the end is reachable. The pair is the reading: a spare
-    that were too small would pass the first assertion and be refused by the second.
+    THE BASE GREW EVERY LATENT BANK BY ONE WINDOW. A layer was handed a contiguous slice
+    whose length was the bucket's, so a request placed at the LAST block the scheduler can
+    give it needed slots past that block, and the allocator bought them. Nothing reads
+    past a request's own blocks now, so the headroom has no reader and the bytes go back.
 
-    THE SPARE IS THE ALIGNED BLOCK-TABLE WIDTH, which is the widest window the
-    converter can hand a layer of this group, and the item asks the runner for that
-    number too rather than restating the arithmetic.
+    THE PLACEMENT IS THE READING. This drives the real carrier builder at that last block,
+    on a bank holding exactly the schedulable blocks, and the source of the allocator
+    beside it: the first says the placement needs no headroom, the second says none is
+    bought. Either alone would leave the other open.
     """
-    from vllm.v1.kv_cache_interface import (
-        KVCacheConfig,
-        KVCacheGroupSpec,
-        KVCacheTensor,
-        MLAAttentionSpec,
-    )
-
     _require_cpu_mode()
     text_config, _ = _world()
     runner = _runner(text_config, [])
-    name = "model.layers.0.self_attn"
-    spec = MLAAttentionSpec(
-        block_size=DECLARED_PAGE_SIZE,
-        num_kv_heads=1,
-        head_size=DECLARED_HEAD_SIZE,
-        dtype=torch.bfloat16,
-    )
+
     schedulable_blocks = DECLARED_TABLE_WIDTH
-    config = KVCacheConfig(
-        num_blocks=schedulable_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=spec.page_size_bytes * schedulable_blocks, shared_by=[name]
-            )
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)],
-    )
-
-    spare_bytes = runner._latent_spare_bytes(config)
-    spare_blocks = spare_bytes[name] // spec.page_size_bytes
-    declared_width = runner._aligned_table_width(
-        context_length=runner.max_model_len, block_size=DECLARED_PAGE_SIZE
-    )
-    say("I9_SPARE", f"blocks={spare_blocks}", f"aligned_width={declared_width}",
-        f"schedulable={schedulable_blocks}")
-    assert spare_blocks == declared_width
-    assert spare_blocks > 0
-
-    # THE PLACEMENT THE SPARE EXISTS FOR: the last block the scheduler can give, with
-    # a window as wide as the spare. Sized as the allocator sizes it, this must serve.
     last_block = schedulable_blocks - 1
-    bank = _bank(DECLARED_HEAD_SIZE, blocks=schedulable_blocks + spare_blocks)
+    bank = _bank(DECLARED_HEAD_SIZE, blocks=schedulable_blocks)
     geometry = {
         "block_ids": [last_block],
         "state_slot": DECLARED_STATE_SLOT,
         "page_size": DECLARED_PAGE_SIZE,
-        "window_blocks": spare_blocks,
+        "window_blocks": DECLARED_WINDOW_BLOCKS,
     }
-    carrier = _carrier(bank, text_config, position=0, geometry=geometry)
-    slots = int(carrier["latent_cache"].shape[0])
-    say("I9_WINDOW_AT_THE_LAST_BLOCK", slots,
-        f"want={spare_blocks * DECLARED_PAGE_SIZE}")
-    assert slots == spare_blocks * DECLARED_PAGE_SIZE
+    # The control for the placement: the window this table's width names ends well past
+    # the bank, which is exactly the case the headroom was bought for.
+    window_end = last_block * DECLARED_PAGE_SIZE + DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE
+    say("I9_CONTROL_THE_WINDOW_WOULD_END_PAST_THE_BANK", window_end,
+        f"bank={schedulable_blocks * DECLARED_PAGE_SIZE}")
+    assert window_end > schedulable_blocks * DECLARED_PAGE_SIZE
 
-    # MUST-FAIL ARM: the same placement on a bank sized WITHOUT the spare is refused,
-    # so the first arm is reading the spare and not a bank that was large anyway.
-    with pytest.raises(ValueError) as caught:
-        _carrier(
-            _bank(DECLARED_HEAD_SIZE, blocks=schedulable_blocks),
-            text_config,
-            position=0,
-            geometry=geometry,
-        )
-    message = " ".join(str(caught.value).split())
-    say("I9_WITHOUT_THE_SPARE", message[:190])
-    assert "spare" in message
+    carrier = _carrier(bank, text_config, position=0, geometry=geometry)
+    say("I9_THE_LAST_BLOCK_IS_SERVED_WITH_NO_HEADROOM",
+        int(carrier["latent_cache"].shape[0]),
+        carrier["block_table_row"].flatten().tolist(),
+        carrier["latent_slots"].tolist())
+    assert int(carrier["latent_cache"].shape[0]) == schedulable_blocks * DECLARED_PAGE_SIZE
+    assert carrier["latent_slots"].tolist() == [last_block * DECLARED_PAGE_SIZE]
+
+    # THE ALLOCATOR'S OWN SOURCE. The bytes it asks for are the bytes the configuration
+    # names, and the method the base called to size the headroom is gone.
+    source = _code_of(NeuronModelRunner.initialize_kv_cache)
+    say("I9_ALLOCATES_EXACTLY_THE_CONFIGURED_SIZE",
+        "torch.zeros(size, dtype=torch.int8" in source)
+    assert "torch.zeros(size, dtype=torch.int8" in source
+    assert "size + spare" not in source, (
+        "the allocator still adds headroom to a configured size, so the bytes did not "
+        "go back"
+    )
+    say("I9_NO_SPARE_METHOD_REMAINS",
+        hasattr(NeuronModelRunner, "_latent_spare_bytes"))
+    assert not hasattr(NeuronModelRunner, "_latent_spare_bytes")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -746,11 +802,12 @@ def test_the_allocator_sizes_the_spare_window_the_carrier_builder_requires() -> 
 def test_a_write_outside_the_requests_own_pages_is_refused_runner_side() -> None:
     """The guard the layer can no longer make, at the last place the value is a number.
 
-    THE LAYER USED TO MAKE IT. It refused a write past the end of the cache slice it
-    was handed, and that slice WAS the request's pages. The window is longer than
-    those pages by design, so the same check inside the layer now passes and the write
-    lands on a neighbour's rows inside the window, silently. The control below reads
-    that silence directly on the layer's own bound.
+    THE LAYER USED TO MAKE IT. It refused a write past the end of the cache slice it was
+    handed, and that slice WAS the request's pages. The layer is handed the whole bank
+    now, and the table's padded entries resolve to page 0, so a write past this request's
+    last page lands on another sequence's rows with nothing short or out of range about
+    it. Inside the graph the position is a tensor, so the layer cannot read it at all.
+    The control below reads that silence on the width the table declares.
     """
     _require_cpu_mode()
     text_config, bank = _world()
@@ -764,8 +821,8 @@ def test_a_write_outside_the_requests_own_pages_is_refused_runner_side() -> None
         "window_blocks": DECLARED_WINDOW_BLOCKS,
     }
 
-    # THE CONTROL: the layer's own bound is the WINDOW's length, which this write is
-    # well inside, so nothing downstream of the runner can catch it.
+    # THE CONTROL: the write is inside the window the table's width names, so nothing
+    # downstream of the runner can catch it.
     own_slots = own_blocks * DECLARED_PAGE_SIZE
     window_slots = DECLARED_WINDOW_BLOCKS * DECLARED_PAGE_SIZE
     say("I10_CONTROL", f"position={position}", f"tokens={tokens}",

@@ -16,6 +16,12 @@ repaired derivation at chunk start 0, where a landed operand pins it, and again 
 start, where the indexer's own rule does. With ``GLM53F_130_EXPECT_BASE=1`` B01 asserts the
 PRE-REPAIR reading instead -- one converting site in ``_glm5next_pool_slot_mapping`` -- which
 is this file's control arm, and ``GLM53F_130_RUNNER_FILE`` points it at the source to read.
+
+B03 NAMES THE TWO OPERANDS THE SPARSE CARRIER GAINED when the latent bank began travelling
+whole: ``block_table_row``, the request's pages, and ``latent_slots``, each token's physical
+bank row. Both are the rule this file is about -- the table is constructed with its dtype
+and moved once, and the rows come from a ``_glm5next_`` helper, which is inside B01's census.
+Under the control arm B03 reads the pre-repair carrier instead, which names neither key.
 """
 
 from __future__ import annotations
@@ -49,6 +55,17 @@ DTYPES = frozenset({
 
 #: The one converting site the pre-repair tree carries, as ``(line, helper)``.
 BASE_OFFENDERS = ((4821, "_glm5next_pool_slot_mapping"),)
+
+#: The helper whose mappings ARE the carriers, read by name rather than by position.
+CARRIER_HELPER = "_glm5next_layer_carriers"
+
+#: The two keys the sparse carrier gained with the paged latent bank: the request's block
+#: table, and each token's physical row of that bank.
+PAGED_KEYS = ("block_table_row", "latent_slots")
+
+#: The helper the physical rows come from. It is a ``_glm5next_`` name, so whatever it
+#: builds is already inside B01's census above.
+SLOTS_HELPER = "_glm5next_latent_slot_mapping"
 
 #: A second prefill chunk: it starts past 0 and its pools close on the sequence's boundaries.
 CHUNK_START = 33
@@ -145,6 +162,26 @@ def _census(path: pathlib.Path) -> tuple[int, list[tuple[int, str]]]:
     return helpers, offenders
 
 
+def _carrier_entries(path: pathlib.Path) -> dict[str, ast.AST]:
+    """``key -> the expression built under it`` for every mapping the carrier helper builds.
+
+    The keys are the layers' own keywords, so reading them off the source is reading the
+    operand set itself. Each key is unique across the two families' mappings, which is why
+    one flat reading is enough.
+    """
+    entries: dict[str, ast.AST] = {}
+    for node in ast.walk(ast.parse(path.read_text())):
+        if not isinstance(node, ast.FunctionDef) or node.name != CARRIER_HELPER:
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Dict):
+                continue
+            for key, value in zip(inner.keys, inner.values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    entries.setdefault(key.value, value)
+    return entries
+
+
 def _runner_path() -> pathlib.Path:
     """The file the runner under test was imported from, or the one asked for."""
     import vllm_neuron.vllm.worker.neuron_model_runner as runner
@@ -214,4 +251,63 @@ def test_b02_the_pool_slots_are_int32_and_hold_at_a_chunked_start() -> None:
     assert not torch.equal(shifted, first), (
         "the derivation ignores start_position, so a second prefill chunk would pool on "
         "the chunk's own boundaries instead of the sequence's"
+    )
+
+
+def test_b03_the_paged_carrier_operands_are_built_on_the_host_and_moved_once() -> None:
+    """The two operands the paged latent bank added, read where they are constructed.
+
+    THE BANK TRAVELS WHOLE NOW, so the pages a request holds reach the layer as their own
+    operands: a ``[pages, 1]`` int32 block table, and one physical bank row per token. Both
+    are built on the host and moved once -- the table by naming its dtype at construction
+    and moving the result, the rows by the ``_glm5next_`` helper this census already reads.
+    A table constructed with ``device=`` and cast afterwards is the refusal this file exists
+    for, one operand later.
+    """
+    _require_cpu_mode()
+    path = _runner_path()
+    entries = _carrier_entries(path)
+    present = [key for key in PAGED_KEYS if key in entries]
+    print(f"B03|carrier|file={path}|keys={len(entries)}|paged={present or 'none'}")
+
+    if _expect_base():
+        assert not present, (
+            f"the pre-repair carrier hands a window slice and names neither paged "
+            f"operand; read {present} in {path}"
+        )
+        return
+
+    assert list(present) == list(PAGED_KEYS), (
+        f"the carrier names {present} of the paged operands {list(PAGED_KEYS)}; the layer "
+        f"takes these as keywords, so a missing one is served as a default in {path}"
+    )
+
+    table = entries["block_table_row"]
+    assert (
+        isinstance(table, ast.Call)
+        and isinstance(table.func, ast.Attribute)
+        and table.func.attr == "to"
+    ), "the block table does not end in a move, so it is not built on the host"
+    built = table.func.value
+    assert isinstance(built, ast.Call), (
+        "the block table is moved from something that is not a construction"
+    )
+    keywords = {keyword.arg for keyword in built.keywords}
+    assert "dtype" in keywords, (
+        "the block table's dtype is not declared where the tensor is built, so it can "
+        "only be reached by a cast -- and the cast would run after the move"
+    )
+    assert "device" not in keywords, (
+        "the block table is constructed on the device it is then moved to; a converting "
+        "copy of a tensor already on the device is what the eager backend refuses"
+    )
+
+    slots = entries["latent_slots"]
+    assert isinstance(slots, ast.Call) and getattr(slots.func, "attr", "") == SLOTS_HELPER, (
+        f"the physical rows do not come from {SLOTS_HELPER}, so they are outside the "
+        f"census B01 makes over every _glm5next_ helper"
+    )
+    assert any(keyword.arg == "device" for keyword in slots.keywords), (
+        f"{SLOTS_HELPER} is called without a device, so the rows it builds on the host "
+        f"never reach the one the carrier's other operands live on"
     )

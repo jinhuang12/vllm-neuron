@@ -15,8 +15,8 @@ below raises that refusal instead of reading a value, and the helper-level items
 raise ``AttributeError`` for methods base does not have. An item that passed at
 base would be measuring nothing. THAT REFUSAL IS NOW THE SPARSE FAMILY'S: the walk
 admits a batch, the linear family serves it, and the sparse carrier refuses a
-second request by name because its slice is contiguous -- which is the arm A1's
-fourth item reads. THE FIRST EXCEPTION is the prefill-warmup arm of A2,
+second request by name because one block table names one request's window -- which
+is the arm A1's fourth item reads. THE FIRST EXCEPTION is the prefill-warmup arm of A2,
 which passes at base BECAUSE base served that step: it is a regression arm, it
 pins the base's behaviour, and it fails on the bytes of this increment's fifth
 commit, which is where review round 1 found the regression. THE SECOND EXCEPTION is
@@ -34,8 +34,9 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   read and fails that write). The CONVERTER arm: a two-request batch on a linear
   stack is served end to end and each request's ring records its own advance
   (tripwire: the previous commit's walk refused a second row). The SPARSE arm: on a
-  hybrid stack the same batch is refused by name at the sparse carrier, which takes
-  one contiguous slice of the paged latent bank.
+  hybrid stack the same batch is refused by name at the sparse carrier, because one
+  block table names one request's window and the kernel assembles one window per
+  dispatch.
 * A2, TEN ARMS -- a finished request's slot is reused and the state it hands over READS
   zero, which is not the same as being written at hand-out: the side caches are rebuilt
   rather than cleared in place, and nothing is written to the recurrent banks there at
@@ -81,6 +82,13 @@ THE ITEMS HERE, and each names the tripwire it must fail on.
   the padding value the KV machinery writes is ``NULL_BLOCK_ID``, which is zero and
   therefore a REAL slot; the item asserts that value is inside the addressable range
   before asserting no padded entry lands there.
+* A8 -- a SCATTERED block table is SERVED, and the carrier names its pages in the
+  order it was given them: the bank travels whole, the table pads to the bucket's
+  width with ``-1``, and each token's physical bank row comes from the page its own
+  position falls in. Tripwire: the refusal this replaces, which turned away any row
+  that was not one ascending run. The row here is neither adjacent nor ascending, and
+  the same item derives what a sorted row would address and requires it to differ, so
+  a carrier that lost the order fails rather than passes by coincidence.
 
 STILL TO COME IN THIS FILE: A5's write-and-read-back clause, the
 interleaved-vs-sequential differential and the R-3 seam readings, which belong to
@@ -164,9 +172,21 @@ DECLARED_DECODE_THRESHOLD = 1
 DECLARED_CACHED_LENGTHS = (7, 19)
 
 #: The two requests' block rows. Neither is a prefix of the other and the second
-#: is deliberately not one ascending run continuing the first, so a stack-wide
-#: contiguous slice cannot serve both.
+#: is deliberately not one ascending run continuing the first, so no single slice of
+#: the bank can serve both; the sparse carrier names one request's pages instead and
+#: refuses the second request, which is the arm A1's fourth item reads.
 DECLARED_SPARSE_ROWS = ((0, 1), (4, 5))
+
+#: A ROW WHOSE PAGES ARE NEITHER ADJACENT NOR ASCENDING, which is the shape the
+#: contiguity refusal used to turn away and the carrier now serves. Both entries are
+#: pages this file's bank holds, so the rows they address are real.
+DECLARED_SCATTERED_ROW = (4, 1)
+
+#: A step that STRADDLES the two entries of that row, so the order the carrier names
+#: them in is readable off the rows it hands the layer: it opens two tokens before the
+#: page boundary and ends two past it.
+DECLARED_SCATTERED_START = DECLARED_PAGE_SIZE - 2
+DECLARED_SCATTERED_TOKENS = 4
 
 #: The decode bucket A7 pads up to. Two real requests in a bucket of four leaves
 #: two padded rows, which is the case the padding writer produces.
@@ -439,9 +459,9 @@ def _side_caches(banks):
 def _carriers_for(banks, side, *, slot: int, rows, cached: int, is_prefill: bool):
     """One request's carriers at a given slot, built by the code under test.
 
-    The window's length is this request's own row count, which is the slice the
-    builder handed back before the length became a required key, so the items
-    below read what they read before it did.
+    The block table's width is this request's own row count, so nothing is padded
+    here: a bucket wider than the row is A8's reading, and the items below read what
+    they read before the width became a required key.
     """
     ids = [int(value) for value in rows]
     geometries = [
@@ -474,7 +494,7 @@ def _carriers_for_requests(banks, side, *, tokens: int, requests: int, is_prefil
     refusal reads, and it is passed explicitly rather than inferred from the token
     count -- inferring it is exactly the conflation the refusal used to make.
 
-    The window's length is the row count, as above: these items must reach the
+    The block table's width is the row count, as above: these items must reach the
     request-count refusal, and a geometry the walk turns away first would let them
     pass on a message they never asked for.
     """
@@ -636,10 +656,11 @@ def test_a1_each_requests_carrier_is_a_view_of_its_own_bank_row() -> None:
     BANK's own row to change while the first request's row does not -- a copy
     leaves the bank untouched and fails there.
 
-    ONE FAMILY, DELIBERATELY. The sparse family still takes one contiguous slice of
-    the paged latent bank, so a second request cannot be expressed in its carrier
-    at all; the arm below reads that refusal by name. This item is the linear
-    family's, which is the half that becomes concurrent here.
+    ONE FAMILY, DELIBERATELY. The sparse family's carrier names ONE request's window
+    in one block table, and the kernel assembles one window per dispatch, so a second
+    request cannot be expressed in it at all; the arm below reads that refusal by
+    name. This item is the linear family's, which is the half that becomes concurrent
+    here.
     """
     _require_cpu_mode()
     banks = _linear_banks(_banks())
@@ -797,12 +818,18 @@ def test_a1_a_two_request_linear_batch_is_served_through_the_converter() -> None
 
 
 def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
-    """The sparse carrier is one contiguous slice, so it says so instead of guessing.
+    """One block table names one request's window, so the carrier says so instead of guessing.
 
-    THE TRIPWIRE: a builder that silently served the first request's slice for a
-    two-request batch would hand both requests one sequence's latents. The refusal
-    names the paged gather as what lifts it, so the boundary is readable at the
-    failure rather than only in the plan.
+    RE-PINNED: the reason moved and the message with it. The pages no longer have to be
+    one run -- the kernel gathers the pages the table names, which is what A8 reads --
+    but one table still names ONE request's window and the kernel assembles one window
+    per dispatch, so a second request's rows would be attended with the first request's
+    queries. The match this replaces, verbatim: ``match="ONE contiguous slice"``.
+
+    THE TRIPWIRE: a builder that silently served the first request's table for a
+    two-request batch would hand both requests one sequence's latents. The refusal names
+    the table axis through the kernel as what lifts it, so the boundary is readable at
+    the failure rather than only in the plan.
     """
     _require_cpu_mode()
     banks = _banks()
@@ -817,7 +844,7 @@ def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
         for _ in banks
     ]
 
-    with pytest.raises(ValueError, match="ONE contiguous slice"):
+    with pytest.raises(ValueError, match="one block table names one request's window"):
         NeuronModelRunner._glm5next_layer_carriers(
             banks,
             side,
@@ -840,17 +867,21 @@ def test_a1_the_converter_hands_a_two_request_batch_to_the_sparse_refusal() -> N
     every family's table and said the whole forward threads one sequence. That is no
     longer true: the linear family is concurrent. So the batch now travels through the
     walk, the identity pairing and the position arms, and meets the refusal at the
-    SPARSE carrier, which names the contiguous latent slice and the increment that
+    SPARSE carrier, which names the one window a block table carries and the work that
     lifts it.
 
-    THE TRIPWIRE: a builder that served the first request's slice for the whole batch
+    RE-PINNED with the item above, and for its reason: the message names the table
+    rather than a contiguous slice. The match this replaces, verbatim:
+    ``match="ONE contiguous slice"``.
+
+    THE TRIPWIRE: a builder that served the first request's table for the whole batch
     would hand both requests one sequence's latents, silently.
     """
     _require_cpu_mode()
     banks = _banks()
     runner = _runner(banks)
 
-    with pytest.raises(ValueError, match="ONE contiguous slice"):
+    with pytest.raises(ValueError, match="one block table names one request's window"):
         _two_request_step(
             runner,
             banks,
@@ -1749,4 +1780,121 @@ def test_a7_padded_decode_rows_carry_a_sentinel_and_never_slot_zero() -> None:
             f"padded row {offset} carries the KV machinery's own padding value, so "
             f"the mask was not applied and a padded latent would land in slot "
             f"{NULL_BLOCK_ID}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A8. A scattered block table is SERVED, and its pages are named in order.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_a8_a_scattered_block_table_is_served_and_named_in_order() -> None:
+    """The refusal this replaces is stated as the fact that replaced it.
+
+    WHAT THE CARRIER USED TO DO. A sparse layer was handed ONE CONTIGUOUS SLICE of the
+    paged latent bank, so a row whose blocks were not one ascending run refused by name.
+    The kernel gathers the pages a block table names now, so the bank travels whole and
+    the pages travel beside it: nothing about the allocator's choice of pages is refused
+    here any more, and this item reads the acceptance rather than the absence of a
+    message.
+
+    THE THREE READINGS. The carrier's latent cache IS the bank -- one pointer, one row
+    count, no slice and no copy. The block table names this request's pages IN THE ORDER
+    GIVEN and pads the rest of the bucket's width with ``-1``, which is the entry value
+    the layer's own refusal calls out. And each of this step's tokens carries the
+    PHYSICAL bank row of the page its own position falls in.
+
+    THE TRIPWIRE, DERIVED IN THE SAME ITEM. The row straddles its two entries, so a
+    carrier that sorted the row, or that ignored it and walked the bank from its first
+    page, addresses different rows. The sorted row's own addresses are derived below and
+    the item requires them to DIFFER, so it cannot pass on a carrier that lost the order.
+    """
+    _require_cpu_mode()
+    banks = _banks()
+    side = _side_caches(banks)
+    ids = [int(value) for value in DECLARED_SCATTERED_ROW]
+    if sorted(ids) == ids:
+        raise VacuousControlError(
+            f"this item needs a row that is not one ascending run, which is what the "
+            f"old refusal turned away; it declares {ids}"
+        )
+    # ONE PADDED ENTRY, so the bucket's width is wider than this request's pages and the
+    # padding value is read rather than assumed absent.
+    padded = len(ids) + 1
+    geometries = [
+        {
+            "block_ids": ids,
+            "state_slot": 0,
+            "page_size": DECLARED_PAGE_SIZE,
+            "window_blocks": padded,
+        }
+        for _ in banks
+    ]
+
+    carriers = NeuronModelRunner._glm5next_layer_carriers(
+        banks,
+        side,
+        geometries=geometries,
+        is_prefill=True,
+        tokens=DECLARED_SCATTERED_TOKENS,
+        start_position=DECLARED_SCATTERED_START,
+        softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
+        max_seq_len=DECLARED_SCATTERED_START + DECLARED_SCATTERED_TOKENS,
+        index_kpool=DECLARED_INDEX_KPOOL,
+    )
+
+    index = next(
+        position for position, bank in enumerate(banks) if bank["family"] == "self_attn"
+    )
+    carrier = carriers[index]
+    bank = banks[index]["latent_cache"]
+    want = _physical_slots(
+        rows=[ids],
+        cached=[DECLARED_SCATTERED_START],
+        tokens=DECLARED_SCATTERED_TOKENS,
+        block_size=DECLARED_PAGE_SIZE,
+    ).tolist()
+    if_sorted = _physical_slots(
+        rows=[sorted(ids)],
+        cached=[DECLARED_SCATTERED_START],
+        tokens=DECLARED_SCATTERED_TOKENS,
+        block_size=DECLARED_PAGE_SIZE,
+    ).tolist()
+    print(f"KEYED|a8|row={ids}|window_blocks={padded}"
+          f"|table={carrier['block_table_row'].flatten().tolist()}"
+          f"|slots={carrier['latent_slots'].tolist()}|if_sorted={if_sorted}")
+
+    # ---- THE BANK, WHOLE: the pages are named beside it, so nothing is cut out of it.
+    assert carrier["latent_cache"].data_ptr() == bank.data_ptr(), (
+        "the carrier's latent cache does not start at the bank's first slot, so it is a "
+        "slice of the bank and the table beside it addresses the wrong rows"
+    )
+    assert int(carrier["latent_cache"].shape[0]) == DECLARED_BLOCKS * DECLARED_PAGE_SIZE, (
+        f"the carrier holds {int(carrier['latent_cache'].shape[0])} slot(s) where the "
+        f"bank holds {DECLARED_BLOCKS * DECLARED_PAGE_SIZE}"
+    )
+
+    # ---- THE TABLE: this request's pages in order, padded to the bucket's width.
+    assert carrier["block_table_row"].dtype == torch.int32
+    assert tuple(carrier["block_table_row"].shape) == (padded, 1), (
+        f"the table is {tuple(carrier['block_table_row'].shape)} where the bucket's "
+        f"width is {padded} page(s) of one column"
+    )
+    assert carrier["block_table_row"].flatten().tolist() == ids + [-1], (
+        f"the table names {carrier['block_table_row'].flatten().tolist()} for a request "
+        f"holding {ids}; the pages come in the order given and the bucket's remaining "
+        f"entry is -1, which is the value the layer's own refusal reads"
+    )
+
+    # ---- THE ROWS: each token's physical bank row, through the page it falls in.
+    assert carrier["latent_slots"].dtype == torch.int64
+    assert carrier["latent_slots"].tolist() == want, (
+        f"the carrier hands the layer rows {carrier['latent_slots'].tolist()} where this "
+        f"step's tokens live at {want}; a write at another row lands in a page this "
+        f"request was never given"
+    )
+    if want == if_sorted:
+        raise VacuousControlError(
+            f"a sorted row addresses the same rows {if_sorted}, so this item does not "
+            f"measure that the table's order was kept"
         )

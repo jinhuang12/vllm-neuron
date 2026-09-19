@@ -72,8 +72,8 @@ from test.vllm_neuron.worker.test_get_kv_cache_spec_hybrid import (
 #: once so the whole file follows a rename of it.
 LATENT_FIELD = "latent_kv"
 
-#: The longest sequence the fake runner admits. The allocator reads it to size each
-#: latent bank's spare window, so it is named here rather than inline below.
+#: The longest sequence the fake runner admits, handed to ``InputBatch`` as
+#: ``max_model_len``.
 DECLARED_MAX_MODEL_LEN = 256
 
 #: Blocks the budget below buys at the one-buffer page. Two is enough to catch a
@@ -205,11 +205,6 @@ def _drive(kv_cache_config, model, monkeypatch: pytest.MonkeyPatch) -> dict:
     )
     fake._kv_cache_is_fp8_packed = MethodType(runner._kv_cache_is_fp8_packed, fake)
     fake._k_cache_alloc_shape = runner._k_cache_alloc_shape
-    # RE-PINNED: the allocator now asks itself how much spare window each latent bank
-    # owes, so the two methods that answer are bound the same way as the two above.
-    fake._dcp_size = 1
-    fake._aligned_table_width = MethodType(runner._aligned_table_width, fake)
-    fake._latent_spare_bytes = MethodType(runner._latent_spare_bytes, fake)
 
     # A model with no mapper of its own gets a collector, so the arms that do not
     # read the mapper still exercise the real bind call rather than skipping it.
@@ -262,25 +257,6 @@ def _bytes_of(tensors) -> int:
     return sum(t.numel() * t.element_size() for t in tensors)
 
 
-def _spare_blocks(spec) -> int:
-    """The spare window, in blocks, a latent bank of this spec is allocated.
-
-    A layer of this family reads a WINDOW of its bank whose length is fixed for the
-    bucket, so the bank holds one whole window past the last block a request can be
-    given. The width is asked of the runner's OWN method: a number this file derived for
-    itself could agree with a wrong allocator.
-    """
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec
-
-    if not isinstance(spec, MLAAttentionSpec):
-        return 0
-    runner = _runner_module().NeuronModelRunner
-    shell = SimpleNamespace(_dcp_size=1)
-    return MethodType(runner._aligned_table_width, shell)(
-        context_length=DECLARED_MAX_MODEL_LEN, block_size=spec.block_size
-    )
-
-
 # T01 -- the latent layers report the MLA page, half the two-buffer page.
 def test_t01_latent_layers_report_the_one_buffer_page() -> None:
     """11 latent entries on the MLA spec class, at exactly half the old page."""
@@ -320,12 +296,7 @@ def test_t01_latent_layers_report_the_one_buffer_page() -> None:
 def test_t02_a_fixed_budget_buys_twice_the_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same bytes hold 8 blocks at the one-buffer page and 4 at the old one.
-
-    The bank the allocator returns is wider than either, by the spare window a latent
-    layer's bucket-constant view needs; what the BUDGET buys is the number this item is
-    about, and both are read below.
-    """
+    """The same bytes hold 8 blocks at the one-buffer page and 4 at the old one."""
     raw = _raw_fixture()
     layers = _fake_layers(raw)
     specs = _call(layers)
@@ -351,12 +322,7 @@ def test_t02_a_fixed_budget_buys_twice_the_blocks(
         t02_blocks=sorted(blocks),
         t02_control_blocks=sorted(control_blocks),
     )
-    # RE-PINNED: a latent bank carries one spare window past the blocks the budget buys.
-    # The reading this replaces, verbatim: `assert blocks == {BLOCKS_AT_ONE_BUFFER}`. The
-    # line below is the one this item is about -- what the BUDGET buys at this page -- and
-    # it is untouched, so the doubling the item measures still reads off the budget.
-    spare = _spare_blocks(specs[attention_names[0]])
-    assert blocks == {BLOCKS_AT_ONE_BUFFER + spare}
+    assert blocks == {BLOCKS_AT_ONE_BUFFER}
     assert budget // one_buffer == BLOCKS_AT_ONE_BUFFER
 
     # MUST-FAIL ARM: the two-buffer page over the identical budget is asserted to
@@ -434,20 +400,14 @@ def test_t04_the_mapper_reads_the_one_allocated_bank(
     )
     assert {len(caches[n]) for n in attention_names} == {1}
     assert record["latent_bank"].data_ptr() == caches[name][0].data_ptr()
-    # RE-PINNED: both shapes carry the spare window the bank is allocated with. The
-    # readings this replaces, verbatim: the bank was
-    # `(BLOCKS_AT_ONE_BUFFER, 1, REGISTERED_HYBRID_BLOCK_SIZE, head_size)` and the
-    # sequence view `(BLOCKS_AT_ONE_BUFFER * REGISTERED_HYBRID_BLOCK_SIZE, 1, head_size)`.
-    # The two still agree with each other and with the storage, which is the item.
-    blocks = BLOCKS_AT_ONE_BUFFER + _spare_blocks(specs[name])
     assert tuple(record["latent_bank"].shape) == (
-        blocks,
+        BLOCKS_AT_ONE_BUFFER,
         1,
         REGISTERED_HYBRID_BLOCK_SIZE,
         head_size,
     )
     assert tuple(record["latent_cache"].shape) == (
-        blocks * REGISTERED_HYBRID_BLOCK_SIZE,
+        BLOCKS_AT_ONE_BUFFER * REGISTERED_HYBRID_BLOCK_SIZE,
         1,
         head_size,
     )
