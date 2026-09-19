@@ -19,18 +19,25 @@ TWO tests, one per conjunct, and NO ``parametrize``:
   2. the same call with the pad removed is REFUSED, which is what makes test 1 a reading rather than a
      habit: a venue that had lost the bound would take the kernel with the pad or without it.
 
-WHERE THE BOUND BINDS, counted once: at the served block of 4,096 with ``max_model_len`` 4,096 a step
-writes at most one 1,024-row prefill chunk and never reaches the window's last row, while at a 128-row
-block a step that fills its pages does reach it -- and both are staged INSIDE the tile, because the pad
-is on the tile and not on the step.
+WHERE THE BOUND BINDS, counted once: the pad is on the TILE and not on the step, so every geometry below
+stages inside it. At the served block of 128 a 2,048-token request's second chunk writes rows 1,024 to
+2,047 of a 2,048-row window and DOES reach that window's last row, so the bound binds in the served
+geometry and not only in a fixture; at a 4,096-row block one 1,024-row chunk never reaches it.
 
 THE OTHER BOUND, counted the same way: ``write_offset + tokens <= window`` is checked eagerly and never
-in a graph, so what holds it at the served values is arithmetic rather than a refusal. The runner sizes
-the window from this step's own leg, its context plus its query rows, and clips that to the bucket's
-table width; at ``max_model_len`` 4,096 with prefill chunks of at most 1,024 the sum is at most 4,096,
-which is 32 blocks of 128 or one of 4,096 and reaches no clip at either block size. A configuration
-whose sizing DOES clip would overlay past the staged window on device with nothing to refuse it, so the
-producer chain is the bound and this file reads the tile's own bound only.
+in a graph, so what holds it at the served values is the PRODUCER CHAIN and not a refusal the kernel
+carries. The window is sized from the BUCKET, not from this step's context: on a prefill leg the runner
+takes ``kv_segment_size_buckets[0]`` plus the chunk's own query rows and divides by the block size,
+clipping to the table width, and on a decode leg it takes the table width whole
+(``neuron_model_runner.py:6308-6325``). At the served configuration -- segment 1,024, chunks of 1,024,
+block 128, ``max_model_len`` 4,096 -- that is ``min(32, ceil(2048 / 128)) == 16`` blocks, so a prefill
+window is 2,048 rows and NOT the model length, while a decode window is the table's 32 blocks. The
+offsets that reach a graph are therefore 0 and 1,024 only, and ``1024 + 1024 == 2048`` fills that window
+to its last row exactly -- which is why the pad this file reads is load-bearing at the served block size
+and not only in the fixtures. A request that would need more blocks than the bucket's window is REFUSED
+on the host before any graph runs (``:5939-5945``), so at block 128 a prompt longer than 2,048 tokens is
+turned away rather than overlaid past the window; the measured workload's longest prompt is 216 tokens.
+This file reads the tile's own bound and leaves that chain to the runner's own items.
 
 BOTH ITEMS READ A TRACE AND NO VALUE, so the latent rank here is the kernel's own tile width and the
 values of the staged window are read at the served rank by ``test_mla_sparse_paged.py``. Every bank is
