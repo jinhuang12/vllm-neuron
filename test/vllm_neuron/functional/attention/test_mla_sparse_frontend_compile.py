@@ -230,7 +230,7 @@ def _entry_rows(printed: list[str]) -> list[dict[str, str]]:
 
 
 def _read_the_child() -> list[dict[str, str]]:
-    """Run one compile child and return its entry rows, after the three readings that qualify them."""
+    """Run one compile child and return its entry rows, after the four readings that qualify them."""
     printed = _rows_from_a_child()
     child = [line for line in printed if line.startswith(ROW + "|child|")]
     assert child and "|rc=0|" in child[0], (
@@ -241,6 +241,11 @@ def _read_the_child() -> list[dict[str, str]]:
     rows = _entry_rows(printed)
     assert {row["neuron_fds"] for row in rows} == {"0"}, (
         f"a compile opened a device node, so it was not a device-free compile: {rows}")
+    # EVERY CHILD QUALIFIES ITSELF. The control kernel compiles in this child too, and a child that
+    # accepted it never parsed a body, which would make every accepted row below meaningless.
+    control = [row for row in rows if row["entry"].startswith("venue_control")]
+    assert control and control[0]["refused"] == "True", (
+        f"this child accepted a body that reads an undefined name, so it read no body at all: {control}")
     return rows
 
 

@@ -66,7 +66,8 @@ SPREAD = 2.0**18
 LATENT = 512
 HEADS = 2
 
-#: The smallest admissible selected-row count, and the scale the landed acceptance uses.
+#: The smallest admissible selected-row count, and one fixed scale, applied identically to the kernel
+#: and to the oracle it is read against.
 TOPK = 128
 SCALE = 0.1
 
@@ -82,8 +83,9 @@ BANK_PAGES = 32
 #: "this row was read", compared at the band the item's own tolerance allows, roughly rtol times the
 #: output. A row whose value sits inside the bank's own range of [0, 8] carries about the weight its
 #: neighbours carry, moves the weighted output by under one part in a hundred, and is invisible at that
-#: band. Twice the bank's widest value wins the softmax outright -- in the SIGN the head's own query sum
-#: rewards, which is why the row is built from the queries rather than written down here.
+#: band. Twice the bank's widest value carries enough weight to move the output far outside it -- in the
+#: SIGN the head's own query sum rewards, which is why the row is built from the queries rather than
+#: written down here.
 OVERLAY_MAGNITUDE = 16.0
 
 #: The prefill chunk this campaign serves, and the row the chunk overlay starts at -- not a multiple
@@ -251,6 +253,10 @@ def test_table_ten_then_five_agrees_with_the_oracle() -> None:
     CERTIFYING COMPONENT: that the window follows the table's ORDER and not the page numbers'. The
     order is observable because the two pages are read at different in-page offsets, so swapping them
     changes the gathered rows rather than permuting them; the last item of this file reads that.
+
+    THE EXACT CLAIM IS WHAT BINDS THE ORDER HERE. Both orders gather 64 rows from each page, so the
+    oracle claim's band is far wider than the tilt a swap leaves in the output; the byte comparison
+    against the unpaged call on the ordered window is what a swapped load cannot pass.
     """
     _read_one_table([10, 5])
 
