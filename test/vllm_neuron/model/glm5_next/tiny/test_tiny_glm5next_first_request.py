@@ -49,6 +49,13 @@ PREFILL_BUCKET = item.STACK_TOKENS
 DECODE_BATCH = 1
 #: vLLM keeps block 0 as the null block, so a scheduler hands out blocks from 1.
 FIRST_BLOCK = 1
+#: The page the serving configuration asks for. At this page the whole prompt sits in ONE block and the
+#: generation is what crosses into the second, which is the crossing a served request makes; at this root's own
+#: page of four the prompt already spans thirty-two blocks and no crossing is left to read.
+SERVED_PAGE = 128
+#: A NON-ADJACENT table: block numbers with holes between them, which a recycled pool hands out routinely. The
+#: gap is what makes the table a table -- a reader that treated it as a slice would take the holes as content.
+CROSSING_TABLE = (FIRST_BLOCK, FIRST_BLOCK + 3)
 #: The tolerance the end-to-end file compares the root's logits at.
 LOGITS_RTOL, LOGITS_ATOL = 1e-2, 1e-5
 #: The head bias the first-request item adds to the root's logits outside the model: +8 at one of the two ids the
@@ -78,7 +85,8 @@ def _parallel_state(tmp_path, vllm_config):
             dist_state.destroy_distributed_environment()
 
 
-def _engine_config(*, async_scheduling: bool | None = None, on_device_sampling: bool | None = None):
+def _engine_config(*, async_scheduling: bool | None = None, on_device_sampling: bool | None = None,
+                   page: int = item.MLA_PAGE_SIZE):
     """The engine config the worker builds for this root; ``None`` leaves a knob unset, as a serve does."""
     # The last prefill bucket must equal max_num_batched_tokens; the prompt picks the first.
     neuron_config: dict = {
@@ -93,7 +101,7 @@ def _engine_config(*, async_scheduling: bool | None = None, on_device_sampling: 
         max_model_len=landed.E2E_MAX_SEQ_LEN,
         max_num_seqs=landed.E2E_MAX_NUM_SEQS,
         max_num_batched_tokens=landed.E2E_MAX_SEQ_LEN,
-        block_size=item.MLA_PAGE_SIZE,
+        block_size=page,
         enforce_eager=True,
         enable_prefix_caching=False,
         async_scheduling=async_scheduling,
@@ -138,10 +146,10 @@ def _resolution(config) -> dict:
     }
 
 
-def _kv_cache_config(runner: NeuronModelRunner) -> KVCacheConfig:
+def _kv_cache_config(runner: NeuronModelRunner, num_blocks: int | None = None) -> KVCacheConfig:
     """One group per distinct spec, one tensor per layer, the generation's blocks plus the null block."""
     specs = runner.get_kv_cache_spec()
-    num_blocks = landed.E2E_BLOCKS + 1
+    num_blocks = landed.E2E_BLOCKS + 1 if num_blocks is None else num_blocks
     groups: list[KVCacheGroupSpec] = []
     for name, spec in specs.items():
         for group in groups:
@@ -157,12 +165,12 @@ def _kv_cache_config(runner: NeuronModelRunner) -> KVCacheConfig:
     return KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=tensors, kv_cache_groups=groups)
 
 
-def _runner(vllm_config, root) -> NeuronModelRunner:
+def _runner(vllm_config, root, num_blocks: int | None = None) -> NeuronModelRunner:
     """The real runner on the tiny root, the model bound in place of ``load_model``."""
     runner = NeuronModelRunner(vllm_config, device=torch.device("cpu"))
     runner.model = root
     runner.vocab_size = item.STACK_VOCAB_SIZE
-    runner.initialize_kv_cache(_kv_cache_config(runner))
+    runner.initialize_kv_cache(_kv_cache_config(runner, num_blocks))
     return runner
 
 
@@ -197,9 +205,9 @@ def _prompt() -> list[int]:
     ).tolist()
 
 
-def _prefill_step(prompt: list[int], groups: int) -> SchedulerOutput:
+def _prefill_step(prompt: list[int], groups: int, table: tuple[int, ...] | None = None) -> SchedulerOutput:
     """A new request's whole prompt, padded to its bucket the way the scheduler pads it."""
-    blocks = list(range(FIRST_BLOCK, FIRST_BLOCK + landed.PROMPT_BLOCKS))
+    blocks = list(table) if table is not None else list(range(FIRST_BLOCK, FIRST_BLOCK + landed.PROMPT_BLOCKS))
     new = NewRequestData(
         req_id=REQUEST,
         prompt_token_ids=prompt,
@@ -225,10 +233,12 @@ def _prefill_step(prompt: list[int], groups: int) -> SchedulerOutput:
     return step
 
 
-def _decode_step(position: int, generated: int, groups: int) -> SchedulerOutput:
+def _decode_step(position: int, generated: int, groups: int, page: int = item.MLA_PAGE_SIZE,
+                 table: tuple[int, ...] | None = None) -> SchedulerOutput:
     """The request's next token at ``position``, with the block that position opens."""
-    opens_block = position % item.MLA_PAGE_SIZE == 0
-    new_block = FIRST_BLOCK + position // item.MLA_PAGE_SIZE
+    opens_block = position % page == 0
+    index = position // page
+    new_block = table[index] if table is not None else FIRST_BLOCK + index
     cached = CachedRequestData(
         req_ids=[REQUEST],
         resumed_req_ids=set(),
@@ -407,6 +417,49 @@ def test_the_first_request_returns_integer_token_ids(tmp_path):
               f"|bias={HEAD_BIAS_ID}:+{HEAD_BIAS:g}")
         assert ids[0][0] == int(want.argmax()), (label, ids, int(want.argmax()))
         assert ties == 1 and margin > tolerance, (label, top.indices.tolist(), margin, tolerance)
+        torch.testing.assert_close(logits[0].float(), want, rtol=LOGITS_RTOL, atol=LOGITS_ATOL)
+
+
+def test_a_first_request_crossing_into_a_block_that_is_not_adjacent_returns_the_same_ids(tmp_path):
+    """At the served page the prompt fills one block and the generation crosses into a NON-ADJACENT second.
+
+    The table is what the layer reads a page number out of, so a table with a hole in it is the case a slice
+    cannot serve: the prompt's block and the block the first decode opens are not neighbours, and the ids must
+    still be the argmax of the reference under the same bias the item above adds.
+    """
+    landed._require_cpu_mode()
+    fixture = landed._fixture()
+    root = fixture["root"]
+    bias = _head_bias(root)
+    prompt = _prompt()
+    config = _engine_config(page=SERVED_PAGE)
+    holes = tuple(second - first - 1 for first, second in zip(CROSSING_TABLE, CROSSING_TABLE[1:]))
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root, num_blocks=max(CROSSING_TABLE) + 1)
+        _warm(runner)
+        prefill_logits, prefill = _step(
+            runner, _prefill_step(prompt, _groups(runner), table=CROSSING_TABLE)
+        )
+        first_ids = prefill.sampled_token_ids
+        decode_logits, decode = _step(runner, _decode_step(
+            position=len(prompt), generated=1, groups=_groups(runner), page=SERVED_PAGE,
+            table=CROSSING_TABLE,
+        ))
+        second_ids = decode.sampled_token_ids
+    print(f"FIRSTREQ|crossing|page={SERVED_PAGE}|table={list(CROSSING_TABLE)}|holes={list(holes)}"
+          f"|prompt_tokens={len(prompt)}|prefill={first_ids}|decode={second_ids}")
+    assert holes and all(hole >= 1 for hole in holes), holes
+    assert len(prompt) == SERVED_PAGE, (len(prompt), SERVED_PAGE)
+    for label, ids, logits, sequence in (
+        ("prefill", first_ids, prefill_logits, prompt),
+        ("decode", second_ids, decode_logits, prompt + first_ids[0]),
+    ):
+        assert ids == [[int(ids[0][0])]] and type(ids[0][0]) is int, (label, ids)
+        want = landed._reference_logits(fixture, torch.tensor(sequence, dtype=torch.int64))[0].float() + bias
+        spread = float((logits[0].float() - want).abs().max())
+        print(f"FIRSTREQ|crossing_logits|{label}|tokens={len(sequence)}|max_abs_delta={spread:.6g}"
+              f"|id={ids[0][0]}|reference_argmax={int(want.argmax())}")
+        assert ids[0][0] == int(want.argmax()), (label, ids, int(want.argmax()))
         torch.testing.assert_close(logits[0].float(), want, rtol=LOGITS_RTOL, atol=LOGITS_ATOL)
 
 
