@@ -304,7 +304,8 @@ def _write_row(offset_hbm, ahead: int):
     return held
 
 
-#: Rows the staged window carries BEYOND the window itself, never read by any body.
+#: Rows the staged window carries BEYOND the window itself: the staging transposes carry them onto
+#: SBUF with the window, and nothing selects, reduces or contracts them.
 #:
 #: The overlay's destination row is a runtime value, and the traced venue reads such a pattern's END
 #: as an index into the staged tile: a step whose rows fill the window reaches one element past the
