@@ -304,6 +304,19 @@ def _write_row(offset_hbm, ahead: int):
     return held
 
 
+def _overlay_chunk(window: int) -> int:
+    """How many window rows one overlay transfer writes: capped one row short of the window.
+
+    THE OVERLAY NEVER WRITES THE WINDOW IN ONE WHOLE-ROW PATTERN. Its destination row is a runtime
+    value, so a pattern covering every row of the window cannot be shown to land inside it, and the
+    traced venue reads such a pattern as one element past the end. Only a step whose rows FILL its
+    window is split by this cap, and at the served block size no step ever does.
+    """
+    if STAGE_ROWS < window:
+        return STAGE_ROWS
+    return window - 1 if window > 1 else 1
+
+
 def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int):
     """Assemble the window a block table names in HBM, with this step's own rows overlaid on top.
 
@@ -335,13 +348,7 @@ def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int)
             nisa.dma_copy(dst=staged.ap(pattern=[[latent, span], [1, latent]],
                                         offset=(entry * page_size + piece * span) * latent),
                           src=hold)
-    # THE OVERLAY NEVER WRITES THE WINDOW IN ONE WHOLE-TILE PATTERN. Its destination row is a
-    # runtime value, so a pattern covering every row of ``staged`` cannot be shown to land inside
-    # the tile, and the traced venue reads it as one row past the end. A chunk is therefore capped
-    # one row short of the window; only a step whose rows fill the window exactly is split, and at
-    # the served block size the cap never binds.
-    window = pages * page_size
-    chunk = STAGE_ROWS if STAGE_ROWS < window else (window - 1 if window > 1 else 1)
+    chunk = _overlay_chunk(pages * page_size)
     for start in range(0, tokens, chunk):
         rows = tokens - start if tokens - start < chunk else chunk
         fresh = nl.ndarray((rows, latent), dtype=bank_hbm.dtype, buffer=nl.sbuf)

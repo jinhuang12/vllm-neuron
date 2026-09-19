@@ -2,12 +2,12 @@
 """Acceptance for the paged latent window: the sparse attention kernel assembles its window from a
 block table instead of slicing one ascending run of blocks out of the latent bank.
 
-FIFTEEN tests and NO `parametrize` decorator. Four carry `table` in their name and read four block
+SIXTEEN tests and NO `parametrize` decorator. Four carry `table` in their name and read four block
 layouts -- two scattered rows in either order, a row with a padding tail, and a
 full-length row. One carries `identical` and reads the consecutive table. One carries `sentinel`. Two
 carry `overlay` and read this step's own rows, at one row and at a whole prefill chunk. One reads an
 overlay whose rows FILL the window, at two window widths, which is the case the staging writes in two
-chunks. One reads a
+chunks, and one reads that those two chunks write what a single whole write writes. One reads a
 second block size, so a body that hardcodes the served one fails. One reads that a selected row past the
 staged window is refused against the WINDOW's length and not the bank's. One puts a scattered table, a
 padding tail and an overlay in a single call, which no other item combines. One reads a page WIDER than
@@ -497,6 +497,44 @@ def test_an_overlay_that_fills_the_window_is_read_row_for_row() -> None:
             f"the {width}-row overlay read through the paged call and through the unpaged call on the "
             f"window written in one step returned different bytes, so the split moved a row"
         )
+
+
+def test_a_split_overlay_writes_what_one_whole_write_writes() -> None:
+    """The window filled in two chunks, 127 rows then 1, holds the bytes ONE whole write leaves.
+
+    CERTIFYING COMPONENT: the cap itself, rather than the window it produces. The item above reads that
+    the split window holds the latents the step wrote; this one reads that the SPLIT is the only
+    difference the cap makes, by running the same call again with the chunk rule replaced by one that
+    writes the window in a single pattern. That single pattern is the form the traced venue refuses and
+    this venue accepts, so the comparison is available here and nowhere else. Byte equality then says
+    the cap re-chunks one write and changes nothing about it. The shipped rule is put back whether the
+    reading passes or fails.
+    """
+    bank = _bank()
+    table = [7]
+    width = PAGE
+    down = torch.arange(width, dtype=torch.float32).reshape(width, 1).expand(width, LATENT)
+    written = (down * (-LATENT / SPREAD) - 1.0).contiguous()
+    queries = _queries(1, 1, LATENT)
+    selected = torch.tensor([[pick % width for pick in range(TOPK)]], dtype=torch.int32)
+    at = torch.tensor([[0]], dtype=torch.int32)
+    capped = _paged(bank, table, selected, queries, written, at)
+    shipped = MS._overlay_chunk
+    try:
+        MS._overlay_chunk = lambda window: window
+        whole = _paged(bank, table, selected, queries, written, at)
+    finally:
+        MS._overlay_chunk = shipped
+    _say("SPLIT_CHUNK_ROWS", f"{MS._overlay_chunk(width)}.{width}")
+    _say("SPLIT_MAX_ABS_DIFF", float((capped - whole).abs().max()))
+    assert MS._overlay_chunk(width) == width - 1, (
+        f"this reading only compares a split against a whole write while the shipped rule splits a "
+        f"{width}-row window; it returned {MS._overlay_chunk(width)} rows, so nothing was split here"
+    )
+    assert torch.equal(capped, whole), (
+        f"the {width}-row overlay written in two chunks and written in one returned different bytes, "
+        f"so the cap moved, dropped or repeated a row instead of only re-chunking the write"
+    )
 
 
 def test_a_second_block_size_is_read_from_the_operand_and_not_assumed() -> None:
