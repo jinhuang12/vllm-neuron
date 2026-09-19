@@ -9,7 +9,11 @@ scheduler output, the way the worker calls it. Readings: the platform resolves o
 and async scheduling off from the model class, by name; warmup leaves no async-execution state;
 the first request returns integer token ids from the vLLM Sampler over the full vocabulary, each
 the strict argmax of the model's logits under a one-id head bias the item adds outside the model, and the
-argmax of the reference under the same bias; the spec-to-non-spec transition is read from the recorded
+argmax of the reference under the same bias; a request whose generation crosses into a block that is NOT its
+neighbour returns those ids through three steps, the last of which attends the second block out of the bank
+instead of off the overlay, with two controls beside it -- the bank slot the table names holds that step's
+own latent while the block a slice reader would have used does not, and the logits MOVE when the last step is
+handed a slice reader's row; the spec-to-non-spec transition is read from the recorded
 fact, never taken without a speculative config and taken when the fact and the config agree; a
 sampled-token future that holds logits is refused by name, where it used to reach ``numpy``. The controls re-create the class as it stood,
 declaring a sampler it does not have.
@@ -33,6 +37,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 import vllm_neuron.vllm.worker.neuron_model_runner as runner_module
+from vllm_neuron.functional.attention import mla_sparse as sparse_seam
 from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
@@ -56,6 +61,18 @@ SERVED_PAGE = 128
 #: A NON-ADJACENT table: block numbers with holes between them, which a recycled pool hands out routinely. The
 #: gap is what makes the table a table -- a reader that treated it as a slice would take the holes as content.
 CROSSING_TABLE = (FIRST_BLOCK, FIRST_BLOCK + 3)
+#: THE STEP THAT READS THE SECOND BLOCK OUT OF THE BANK, and the reason this file drives a second decode at
+#: all. The layer hands the kernel this step's own rows beside the window and the kernel overlays them after
+#: it copies the pages, so every row a step writes is supplied by the overlay and not by the page it lands
+#: in. At position 128 that row IS the second block's only populated row, so the page the table's second
+#: entry names is never read there and the same logits come back whichever block the entry holds. One step
+#: later the row written is 129 and row 128 comes off the BANK, out of that page. The selection reaches it
+#: whatever the scores say: the indexer appends the incomplete final pool's own token indices and derives
+#: the tail itself, so a sequence of 130 over a pool of four appends exactly 128 and 129.
+BANK_READ_POSITION = 129
+#: The block a reader that took the table for a slice would put after the prompt's, which this request never
+#: names. The falsifying control below hands the layer a row of these and requires the logits to move.
+SLICE_BLOCK = FIRST_BLOCK + 1
 #: The tolerance the end-to-end file compares the root's logits at.
 LOGITS_RTOL, LOGITS_ATOL = 1e-2, 1e-5
 #: The head bias the first-request item adds to the root's logits outside the model: +8 at one of the two ids the
@@ -263,6 +280,97 @@ def _decode_step(position: int, generated: int, groups: int, page: int = item.ML
     return step
 
 
+def _sparse_bank(runner: NeuronModelRunner):
+    """The sparse family's latent bank and its page: the tensor the layer reads its pages out of."""
+    banks = getattr(runner.model, "glm5next_layer_banks", None)
+    assert banks, "the runner's model carries no layer banks, so no bank row can be read here"
+    for bank in banks:
+        if bank["family"] == "self_attn":
+            return bank["latent_cache"], int(bank["block_size"])
+    raise AssertionError("the model carries no sparse self-attention bank")
+
+
+def _tapping_the_overlay(monkeypatch) -> dict:
+    """Record the rows and the offset every sparse call overlays, keyed by the bank it overlays onto."""
+    real = sparse_seam.mla_sparse_attention
+    seen: dict = {}
+
+    def recorded(queries, cache, *args, **kwargs):
+        written = kwargs.get("written")
+        if written is not None:
+            seen.setdefault(cache.data_ptr(), []).append(
+                (written.detach().clone(), int(kwargs["write_offset"][0, 0]))
+            )
+        return real(queries, cache, *args, **kwargs)
+
+    monkeypatch.setattr(sparse_seam, "mla_sparse_attention", recorded)
+    return seen
+
+
+def _planting_a_slice_table(monkeypatch, table: tuple[int, ...]) -> dict:
+    """Hand every sparse call the row a reader that took the table for a slice would have built.
+
+    The switch starts OFF so the steps before the one under test run on the real table and write where it
+    says; only the step the control names reads the planted row, against a bank the real table filled. The
+    padding past the request's own entries is left as it arrived, because the width is the bucket's.
+    """
+    real = sparse_seam.mla_sparse_attention
+    state: dict = {"on": False, "rows": []}
+
+    def planted(queries, cache, *args, **kwargs):
+        row = kwargs.get("block_table_row")
+        if state["on"] and row is not None:
+            replacement = row.clone()
+            for entry in range(min(len(table), int(replacement.shape[0]))):
+                replacement[entry, 0] = int(table[entry])
+            state["rows"].append((row[:, 0].tolist(), replacement[:, 0].tolist()))
+            kwargs["block_table_row"] = replacement
+        return real(queries, cache, *args, **kwargs)
+
+    monkeypatch.setattr(sparse_seam, "mla_sparse_attention", planted)
+    return state
+
+
+def _crossing_run(tmp_path, root, prompt: list[int], *, monkeypatch=None, tap: bool = False,
+                  plant: tuple[int, ...] | None = None):
+    """One crossing request driven three steps: the prompt, the step that opens the second block, and the
+    step that reads that block out of the bank. Returns the ids, the logits, the bank and what was tapped.
+
+    ``plant`` turns the slice table on for the THIRD step only, which is the one the bank serves.
+    """
+    config = _engine_config(page=SERVED_PAGE)
+    overlay: dict = {}
+    switch: dict = {}
+    with _parallel_state(tmp_path, config):
+        runner = _runner(config, root, num_blocks=max(CROSSING_TABLE) + 1)
+        _warm(runner)
+        if tap:
+            overlay = _tapping_the_overlay(monkeypatch)
+        if plant is not None:
+            switch = _planting_a_slice_table(monkeypatch, plant)
+        groups = _groups(runner)
+        steps = (
+            _prefill_step(prompt, groups, table=CROSSING_TABLE),
+            _decode_step(position=len(prompt), generated=1, groups=groups, page=SERVED_PAGE,
+                         table=CROSSING_TABLE),
+            _decode_step(position=BANK_READ_POSITION, generated=2, groups=groups, page=SERVED_PAGE,
+                         table=CROSSING_TABLE),
+        )
+        ids: list = []
+        logits: list = []
+        for step in steps:
+            if switch and len(logits) == 2:
+                switch["on"] = True
+            step_logits, output = _step(runner, step)
+            logits.append(step_logits)
+            ids.append(output.sampled_token_ids)
+        bank, page = _sparse_bank(runner)
+        pointer = bank.data_ptr()
+        bank = bank.detach().clone()
+    return SimpleNamespace(ids=ids, logits=logits, bank=bank, page=page, pointer=pointer,
+                           overlay=overlay, planted=switch.get("rows", []))
+
+
 def _groups(runner: NeuronModelRunner) -> int:
     """How many KV-cache groups the runner allocated, one block list per group in every step."""
     return len(runner.kv_cache_config.kv_cache_groups)
@@ -426,34 +534,29 @@ def test_a_first_request_crossing_into_a_block_that_is_not_adjacent_returns_the_
     The table is what the layer reads a page number out of, so a table with a hole in it is the case a slice
     cannot serve: the prompt's block and the block the first decode opens are not neighbours, and the ids must
     still be the argmax of the reference under the same bias the item above adds.
+
+    THREE STEPS AND NOT TWO, which is what makes the second block's page load-bearing here. The kernel
+    overlays the rows a step writes onto the staged window after it copies the pages, so a step's own rows
+    never come from a page: two steps would read the second block's only populated row off the overlay and
+    pass on whichever block the table named. The third step writes 129 and attends 128 from the bank, out of
+    the page the table's second entry names, and the two controls below read that dependence directly.
     """
     landed._require_cpu_mode()
     fixture = landed._fixture()
     root = fixture["root"]
     bias = _head_bias(root)
     prompt = _prompt()
-    config = _engine_config(page=SERVED_PAGE)
     holes = tuple(second - first - 1 for first, second in zip(CROSSING_TABLE, CROSSING_TABLE[1:]))
-    with _parallel_state(tmp_path, config):
-        runner = _runner(config, root, num_blocks=max(CROSSING_TABLE) + 1)
-        _warm(runner)
-        prefill_logits, prefill = _step(
-            runner, _prefill_step(prompt, _groups(runner), table=CROSSING_TABLE)
-        )
-        first_ids = prefill.sampled_token_ids
-        decode_logits, decode = _step(runner, _decode_step(
-            position=len(prompt), generated=1, groups=_groups(runner), page=SERVED_PAGE,
-            table=CROSSING_TABLE,
-        ))
-        second_ids = decode.sampled_token_ids
+    run = _crossing_run(tmp_path, root, prompt)
+    first_ids, second_ids, third_ids = run.ids
     print(f"FIRSTREQ|crossing|page={SERVED_PAGE}|table={list(CROSSING_TABLE)}|holes={list(holes)}"
-          f"|prompt_tokens={len(prompt)}|prefill={first_ids}|decode={second_ids}")
+          f"|prompt_tokens={len(prompt)}|prefill={first_ids}|decode={second_ids}|bank_read={third_ids}"
+          f"|bank_read_position={BANK_READ_POSITION}")
     assert holes and all(hole >= 1 for hole in holes), holes
     assert len(prompt) == SERVED_PAGE, (len(prompt), SERVED_PAGE)
-    for label, ids, logits, sequence in (
-        ("prefill", first_ids, prefill_logits, prompt),
-        ("decode", second_ids, decode_logits, prompt + first_ids[0]),
-    ):
+    sequences = (prompt, prompt + first_ids[0], prompt + first_ids[0] + second_ids[0])
+    for label, ids, logits, sequence in zip(("prefill", "decode", "bank_read"), run.ids, run.logits,
+                                            sequences):
         assert ids == [[int(ids[0][0])]] and type(ids[0][0]) is int, (label, ids)
         want = landed._reference_logits(fixture, torch.tensor(sequence, dtype=torch.int64))[0].float() + bias
         spread = float((logits[0].float() - want).abs().max())
@@ -461,6 +564,70 @@ def test_a_first_request_crossing_into_a_block_that_is_not_adjacent_returns_the_
               f"|id={ids[0][0]}|reference_argmax={int(want.argmax())}")
         assert ids[0][0] == int(want.argmax()), (label, ids, int(want.argmax()))
         torch.testing.assert_close(logits[0].float(), want, rtol=LOGITS_RTOL, atol=LOGITS_ATOL)
+
+
+def test_the_crossing_requests_row_lands_in_the_block_the_table_names(tmp_path, monkeypatch):
+    """The bank row the third step attends is the second table entry's page, carrying position 128's latent.
+
+    The step that opens the second block overlays its own row, so what proves the write reached the page the
+    table named is the BANK: the slot the runner's own formula gives for position 128 -- the table's second
+    entry times the page -- has to hold that step's latent and not the next step's, and the block a slice
+    reader would have used has to hold something else. Both distances are printed, because a row that merely
+    sits closer to one than the other would satisfy an inequality without being the row.
+    """
+    landed._require_cpu_mode()
+    fixture = landed._fixture()
+    prompt = _prompt()
+    run = _crossing_run(tmp_path, fixture["root"], prompt, monkeypatch=monkeypatch, tap=True)
+    writes = run.overlay.get(run.pointer, [])
+    overlaid = {offset: rows for rows, offset in writes}
+    assert len(prompt) in overlaid and BANK_READ_POSITION in overlaid, sorted(overlaid)
+    named = run.bank[CROSSING_TABLE[1] * run.page, 0, :].float()
+    other = run.bank[SLICE_BLOCK * run.page, 0, :].float()
+    at_128 = overlaid[len(prompt)][0].float()
+    at_129 = overlaid[BANK_READ_POSITION][0].float()
+    near = float((named - at_128).abs().max())
+    far = float((named - at_129).abs().max())
+    scale = float(at_128.abs().max())
+    slice_gap = float((other - at_128).abs().max())
+    zeros = int((other == 0).all())
+    print(f"FIRSTREQ|crossing_bank|slot={CROSSING_TABLE[1] * run.page}|page={run.page}"
+          f"|offsets_overlaid={sorted(overlaid)}|latent_scale={scale:.6g}"
+          f"|delta_to_position_{len(prompt)}={near:.6g}|delta_to_position_{BANK_READ_POSITION}={far:.6g}"
+          f"|slice_block={SLICE_BLOCK}|slice_delta={slice_gap:.6g}|slice_row_all_zero={zeros}")
+    assert scale > 0, at_128
+    assert near <= LOGITS_RTOL * scale, (near, scale)
+    assert near < far, (near, far)
+    assert slice_gap > LOGITS_RTOL * scale, (slice_gap, scale)
+
+
+def test_the_crossing_logits_move_when_the_second_block_is_read_as_a_slice(tmp_path, monkeypatch):
+    """The falsifying control: hand the third step a slice reader's table and the logits have to move.
+
+    The item above would pass on a consumer that ignored the table and read the prompt's block plus the one
+    after it, unless reading that wrong page changes what comes back. So the same three steps run again with
+    the bank filled by the real table and the LAST step handed a row of consecutive blocks instead: the row
+    the selection force-includes is then taken from a page this request never wrote. The control requires the
+    logits to differ by more than the tolerance the item above compares at -- a run that came back inside it
+    would mean the item's pass says nothing about the table.
+    """
+    landed._require_cpu_mode()
+    fixture = landed._fixture()
+    root = fixture["root"]
+    prompt = _prompt()
+    honest = _crossing_run(tmp_path, root, prompt)
+    slice_table = (CROSSING_TABLE[0], SLICE_BLOCK)
+    lying = _crossing_run(tmp_path, root, prompt, monkeypatch=monkeypatch, plant=slice_table)
+    moved = float((honest.logits[2][0].float() - lying.logits[2][0].float()).abs().max())
+    scale = float(honest.logits[2][0].float().abs().max())
+    tolerance = LOGITS_RTOL * scale + LOGITS_ATOL
+    print(f"FIRSTREQ|crossing_falsifier|planted={list(slice_table)}|rows_planted={len(lying.planted)}"
+          f"|first_row={lying.planted[0] if lying.planted else None}"
+          f"|max_abs_delta={moved:.6g}|tolerance={tolerance:.6g}"
+          f"|honest_id={honest.ids[2]}|slice_id={lying.ids[2]}")
+    assert lying.planted, "no sparse call was handed the planted row, so this control read nothing"
+    assert all(before != after for before, after in lying.planted), lying.planted[0]
+    assert moved > tolerance, (moved, tolerance)
 
 
 def test_the_transition_is_read_from_the_recorded_fact(tmp_path, monkeypatch):
