@@ -8,7 +8,7 @@ the served shapes, inside a child process that pins the platform target in its e
 makes the toolchain read what it builds for from the environment, so the compile opens no device node,
 and the child counts its own open device nodes to prove it.
 
-FIVE tests, one per conjunct, and NO `parametrize`.
+SIX tests, one per conjunct, and NO `parametrize`.
 
   1. the three no-RoPE entries DECLARE the paged operands, last and in order, and then compile with a
      block table, this step's rows and a write offset -- in the served dtype and in f32, with a bank
@@ -18,7 +18,9 @@ FIVE tests, one per conjunct, and NO `parametrize`.
   3. a paged call carrying a RoPE half is refused BY NAME at the seam;
   4. no call site in the module expands a mapping or a sequence into a kernel call;
   5. a body that reads an undefined name IS refused, which is what makes the accepted rows of tests 1
-     and 2 evidence: a child that lost this venue accepts everything and reads nothing.
+     and 2 evidence: a child that lost this venue accepts everything and reads nothing;
+  6. the row-tiled entries still DEFAULT to the tile options production serves, because no caller
+     passes either one.
 
 THE DECLARATION IS READ BEFORE THE COMPILE, and the reason is a reading rather than a precaution:
 `wrap_nki` binds a call by the parameters the entry declares, in their declared order, and it DROPS
@@ -74,6 +76,13 @@ PAGED_PARAMETERS = ("block_table_hbm", "written_hbm", "write_offset_hbm", "page_
 #: The parameter the paged operands follow. Reading them from here rather than from the end of the
 #: signature leaves room for the compile-time tile options the row-tiled entries declare after them.
 SCALE_PARAMETER = "softmax_scale"
+
+#: The two entries that declare compile-time tile options, and the option values production runs at. No
+#: caller passes either option -- the seam calls the entry with operands alone -- so these DEFAULTS are
+#: the served configuration, and a moved default silently changes the body every served call compiles.
+ROW_TILED_ENTRIES = ("mla_sparse_attention_nope_row_tiled_kernel",
+                     "mla_sparse_attention_rope_row_tiled_kernel")
+SERVED_TILE_DEFAULTS = {"BLOCK_N": 512, "STREAM_KV": True}
 
 #: The served latent cache is bf16 and holds more than one window, and the 16-row DMA transposes
 #: specialise on the operand dtype -- 16 rows of 2 bytes fill the line 8 rows of 4 bytes do. So the
@@ -377,6 +386,25 @@ def test_the_compile_venue_refuses_a_body_that_reads_an_undefined_name() -> None
     assert "unbound variable" in control[0]["diagnostic"], (
         f"the venue refused the control for another reason than the unresolved name, so it is not the "
         f"control this item claims: {control[0]['diagnostic']}")
+
+
+def test_the_row_tiled_entries_keep_the_served_tile_option_defaults() -> None:
+    """The row-tiled entries default to the served tile options: a 512-key tile, streamed rows.
+
+    The seam calls the entry with operands alone and passes neither option, so the defaults ARE the
+    served configuration. A moved default would change the body every served call compiles without
+    changing one call site, and no other item in this tree reads them.
+    """
+    served = {}
+    for name in ROW_TILED_ENTRIES:
+        declared = inspect.signature(getattr(MS, name)).parameters
+        served[name] = {option: declared[option].default for option in SERVED_TILE_DEFAULTS}
+        _emit(f"tile_defaults={name}",
+              *(f"{option}={value}" for option, value in served[name].items()))
+    moved = {name: values for name, values in served.items() if values != SERVED_TILE_DEFAULTS}
+    assert moved == {}, (
+        f"a row-tiled entry no longer defaults to the tile options production serves "
+        f"{SERVED_TILE_DEFAULTS}, so served calls compile another body than the measured one: {moved}")
 
 
 if __name__ == "__main__":
