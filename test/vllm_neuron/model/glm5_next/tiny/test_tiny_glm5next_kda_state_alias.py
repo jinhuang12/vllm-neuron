@@ -239,10 +239,18 @@ def test_two_steps_leave_each_recurrent_sharer_its_own_state(tmp_path, monkeypat
                 banks, tokens=tokens, sparse_row=blocks, state_row=[blocks[0]],
                 sparse_cached=cached, state_cached=cached,
             )
-            carriers = runner._glm5next_model_kwargs(
+            kwargs = runner._glm5next_model_kwargs(
                 landed._generic(tokens=tokens, metadata=metadata, sampling_row=tokens - 1)
-            )["layer_carriers"]
+            )
+            carriers = kwargs["layer_carriers"]
+            # THE RUNNER PADS AN UNPADDED PREFILL TO THE WIDEST CONFIGURED BUCKET and builds
+            # every carrier at that width, so the layers run on rows as wide as the input_ids
+            # it returned. The real rows are still `tokens` of them; `row_mask` is what tells
+            # a layer which rows those are.
             out = rows[cached : cached + tokens]
+            width = int(kwargs["input_ids"].shape[0])
+            if width > tokens:
+                out = torch.cat([out, out.new_zeros(width - tokens, world.hidden)])
             for layer, carrier in zip(world.layers, carriers):
                 out = layer(out, **carrier, chunk_size=layer_half.DECLARED_CHUNK)
             return carriers
