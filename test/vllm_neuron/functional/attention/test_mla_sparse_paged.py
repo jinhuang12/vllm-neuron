@@ -53,6 +53,11 @@ PAGE = 128
 #: the chunk offset are aligned to.
 PAGE_ALT = 64
 
+#: A page WIDER than one staging piece. The window is staged in pieces of 128 rows, the SBUF partition
+#: bound, so at this size every page is two pieces and the piece index is arithmetic rather than the page
+#: number itself. The served interim block is 4,096, which is 32 pieces; every other item here is one.
+PAGE_WIDE = 256
+
 #: THE SPREAD OF THE BANK'S VALUES IS LOAD-BEARING. The bank numbers its own rows, and an unscaled row
 #: index reaches 2 ** 21, which drives every score so far apart that the softmax becomes one weight of
 #: 1 and 127 of 0. Under that weighting the output is a copy of ONE gathered row, and an item that
@@ -464,6 +469,39 @@ def test_a_second_block_size_is_read_from_the_operand_and_not_assumed() -> None:
     assert torch.equal(got, _unpaged(window, selected, queries)), (
         f"at a page size of {PAGE_ALT} the paged call and the unpaged call on the window the table "
         f"names returned different bytes, so the page size is not read from the operand"
+    )
+
+
+def test_a_page_wider_than_one_staging_piece_is_read_whole() -> None:
+    """A page of 256 rows is two staging pieces, and both halves of every page are read.
+
+    CERTIFYING COMPONENT: the piece loop. At every other page size in this file a page is one piece and
+    the piece index IS the page number, so a body that stages only a page's first 128 rows, or that
+    computes the piece index wrongly, passes every one of them. Here the second half of each page carries
+    selected rows, so a short or misindexed piece returns other bank values.
+    """
+    bank = _bank()
+    table = [7, 2]
+    queries = _queries(1, HEADS, LATENT)
+    window = _window(bank, table, page=PAGE_WIDE)
+    selected = _selected(1, window.shape[0], page=PAGE_WIDE)
+    halves = [int(one) % PAGE_WIDE // PAGE for one in selected[0].tolist()]
+    got = _paged(bank, table, selected, queries, page=PAGE_WIDE)
+    want = _oracle(window, selected, queries)
+    worst = float((got - want).abs().max())
+    _say("WIDE_PAGE", PAGE_WIDE)
+    _say("WIDE_PAGE_SECOND_PIECE_ROWS", halves.count(1))
+    _say("WIDE_PAGE_WORST_ABS", f"{worst:.3e}")
+    assert halves.count(0) and halves.count(1), (
+        f"this selection reads only piece {set(halves)} of each {PAGE_WIDE}-row page, so a body that "
+        f"staged one piece and skipped the other would pass"
+    )
+    assert torch.allclose(got, want, rtol=RTOL, atol=ATOL), (
+        f"at a page size of {PAGE_WIDE} the paged window disagrees with the oracle: {worst:.3e}"
+    )
+    assert torch.equal(got, _unpaged(window, selected, queries)), (
+        f"at a page size of {PAGE_WIDE} the paged call and the unpaged call on the window the table "
+        f"names returned different bytes, so a page wider than one staging piece is not assembled whole"
     )
 
 

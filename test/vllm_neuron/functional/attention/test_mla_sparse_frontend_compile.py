@@ -71,6 +71,10 @@ NOPE_ENTRIES = ("mla_sparse_attention_nope_row_tiled_kernel", "mla_sparse_attent
                 "mla_sparse_attention_nope_tiled_kernel")
 PAGED_PARAMETERS = ("block_table_hbm", "written_hbm", "write_offset_hbm", "page_size")
 
+#: The parameter the paged operands follow. Reading them from here rather than from the end of the
+#: signature leaves room for the compile-time tile options the row-tiled entries declare after them.
+SCALE_PARAMETER = "softmax_scale"
+
 #: The served latent cache is bf16 and holds more than one window, and the 16-row DMA transposes
 #: specialise on the operand dtype -- 16 rows of 2 bytes fill the line 8 rows of 4 bytes do. So the
 #: served dtype is compiled first, f32 beside it, and the bank larger than the window read through it.
@@ -147,6 +151,18 @@ def _compile_each_entry() -> None:
             fake((1, HEADS, latent), dtype), fake((bank_rows, latent), dtype), fake((1, topk), i32),
             0.1, fake((PAGES, 1), i32), rows, at, PAGE)
 
+    def paged_staged(entry, latent, topk, dtype):
+        """The row-tiled entry on a paged window with the STAGED load path instead of the streamed one.
+
+        Ten positional operands: the four the entry always took, the four paged ones, then the two tile
+        parameters this base declares after them. Only the load path differs from the arm above -- the
+        tile width keeps its default -- so the pair reads that BOTH paths accept a staged window.
+        """
+        return lambda: wrap_nki(entry)(
+            fake((1, HEADS, latent), dtype), fake((bank_rows, latent), dtype), fake((1, topk), i32),
+            0.1, fake((PAGES, 1), i32), fake((1, latent), dtype), fake((1, 1), i32), PAGE,
+            live.MOVING_MAX, False)
+
     def unpaged_rope(entry, latent, topk, dtype):
         """One RoPE entry exactly as it stands today, on a window rather than a bank."""
         return lambda: wrap_nki(entry)(
@@ -169,6 +185,9 @@ def _compile_each_entry() -> None:
         built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_one_row", paged(nope, latent, topk, 1, served)))
         built.append((f"nope_{shape}_paged_float32_one_row", paged(nope, latent, topk, 1, plain)))
         built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_no_overlay", paged(nope, latent, topk, 0, served)))
+        if shape == "row_tiled":
+            built.append((f"nope_{shape}_paged_{SERVED_DTYPE}_staged_path",
+                          paged_staged(nope, latent, topk, served)))
         built.append((f"rope_{shape}_unpaged_{SERVED_DTYPE}", unpaged_rope(rope, latent, topk, served)))
         built.append((f"rope_{shape}_unpaged_float32", unpaged_rope(rope, latent, topk, plain)))
     built.append(("venue_control_unbound_name",
@@ -261,16 +280,22 @@ def test_the_front_end_accepts_the_paged_no_rope_entries() -> None:
         _emit(f"declared={name}", f"parameters={'.'.join(parameters)}")
     # THE POSITIONS ARE THE READING, NOT ONLY THE NAMES: `wrap_nki` binds a call by the declared
     # ORDER, so the four paged operands in another order would mis-bind the table onto the offset.
-    wrong = {name: parameters for name, parameters in declared.items()
-             if tuple(parameters[-len(PAGED_PARAMETERS):]) != PAGED_PARAMETERS}
+    # THEY ARE READ WHERE THEY SIT AND NOT AT THE TAIL, because an entry may declare compile-time tile
+    # options after them; what a paged call needs is the four immediately after the scale, in order.
+    wrong = {}
+    for name, parameters in declared.items():
+        at = parameters.index(SCALE_PARAMETER) + 1
+        if tuple(parameters[at:at + len(PAGED_PARAMETERS)]) != PAGED_PARAMETERS:
+            wrong[name] = parameters
     assert wrong == {}, (
-        f"an entry does not declare the paged operands last and in order {PAGED_PARAMETERS}, so a "
-        f"paged call either drops them silently or binds them to the wrong parameter: {wrong}")
+        f"an entry does not declare the paged operands right after {SCALE_PARAMETER} and in order "
+        f"{PAGED_PARAMETERS}, so a paged call either drops them silently or binds them to the wrong "
+        f"parameter: {wrong}")
     paged = [row for row in _read_the_child() if row["entry"].startswith("nope_")]
-    assert len(paged) == 9, (
-        f"the child did not compile the three no-RoPE entries in all three paged operand forms: "
-        f"{[row['entry'] for row in paged]}")
-    assert len([row for row in paged if SERVED_DTYPE in row["entry"]]) == 6, (
+    assert len(paged) == 10, (
+        f"the child did not compile the three no-RoPE entries in all three paged operand forms, plus "
+        f"the row-tiled entry on the staged load path: {[row['entry'] for row in paged]}")
+    assert len([row for row in paged if SERVED_DTYPE in row["entry"]]) == 7, (
         f"the served dtype was not compiled: {[row['entry'] for row in paged]}")
     refused = [f"{row['entry']} x{row['x']}: {row['diagnostic']}"
                for row in paged if row["refused"] == "True"]
